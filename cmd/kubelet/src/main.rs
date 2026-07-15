@@ -24,6 +24,10 @@ struct Cli {
     #[arg(long, env = "NODE_NAME")]
     node_name: Option<String>,
 
+    /// Pod CIDR for this node, written to the Node's spec.podCIDR.
+    #[arg(long, env = "POD_CIDR")]
+    pod_cidr: Option<String>,
+
     /// CRI socket path (only used with --runtime=cri).
     #[arg(long, env = "CRI_SOCKET")]
     cri_socket: Option<String>,
@@ -103,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
     let config = KubeletConfig {
         node_name,
         api_server_url: cli.apiserver,
+        pod_cidr: cli.pod_cidr,
         ..Default::default()
     };
     let kubelet = Kubelet::new(config, runtime, images, migration);

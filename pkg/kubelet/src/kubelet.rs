@@ -4,7 +4,7 @@
 
 use crate::cri::{ImageService, MigrationService, RuntimeService};
 use crate::node_status::NodeReporter;
-use crate::pod_manager::PodManager;
+use crate::pod_manager::{PodManager, RemovalReason};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::time::{self, Duration};
@@ -15,6 +15,8 @@ use tracing::{debug, error, info, warn};
 pub struct KubeletConfig {
     pub node_name: String,
     pub api_server_url: String,
+    /// Pod CIDR for this node, written to `spec.podCIDR` when set.
+    pub pod_cidr: Option<String>,
     pub heartbeat_interval: Duration,
     pub sync_interval: Duration,
 }
@@ -24,6 +26,7 @@ impl Default for KubeletConfig {
         Self {
             node_name: hostname(),
             api_server_url: "http://localhost:6443".into(),
+            pod_cidr: None,
             heartbeat_interval: Duration::from_secs(10),
             sync_interval: Duration::from_secs(2),
         }
@@ -37,6 +40,7 @@ pub struct Kubelet {
     migration: Arc<dyn MigrationService>,
     reporter: NodeReporter,
     api_client: reqwest::Client,
+    node_ip: String,
 }
 
 impl Kubelet {
@@ -46,8 +50,16 @@ impl Kubelet {
         images: Arc<dyn ImageService>,
         migration: Arc<dyn MigrationService>,
     ) -> Self {
-        let reporter = NodeReporter::new(&config.api_server_url, &config.node_name);
+        let reporter = NodeReporter::with_pod_cidr(
+            &config.api_server_url,
+            &config.node_name,
+            config.pod_cidr.clone(),
+        );
         let pod_manager = Arc::new(PodManager::new(runtime, images, &config.node_name));
+
+        let node_ip = crate::node_status::detect_node_ip()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
 
         Self {
             config,
@@ -55,6 +67,7 @@ impl Kubelet {
             migration,
             reporter,
             api_client: reqwest::Client::new(),
+            node_ip,
         }
     }
 
@@ -68,9 +81,10 @@ impl Kubelet {
         // Spawn heartbeat task
         let reporter_url = self.config.api_server_url.clone();
         let node_name = self.config.node_name.clone();
+        let pod_cidr = self.config.pod_cidr.clone();
         let heartbeat_interval = self.config.heartbeat_interval;
         tokio::spawn(async move {
-            let reporter = NodeReporter::new(&reporter_url, &node_name);
+            let reporter = NodeReporter::with_pod_cidr(&reporter_url, &node_name, pod_cidr);
             let mut interval = time::interval(heartbeat_interval);
             loop {
                 interval.tick().await;
@@ -112,15 +126,50 @@ impl Kubelet {
             .collect();
 
         // Sync pod states
-        let updates = self.pod_manager.sync_pods(&my_pods).await;
+        let outcome = self.pod_manager.sync_pods(&my_pods).await;
 
         // Report status updates back to API server
-        for update in &updates {
+        for update in &outcome.updates {
             if let Err(e) = self.report_pod_status(update).await {
                 error!(
                     "Failed to report status for {}/{}: {e}",
                     update.namespace, update.name
                 );
+            }
+        }
+
+        // Confirm terminating pods: containers are down, so force-delete the
+        // pod object to finish the API-side deletion. Orphaned pods are already
+        // gone from the API server — nothing to confirm.
+        for removed in &outcome.removed {
+            if removed.reason != RemovalReason::Deleting {
+                continue;
+            }
+            let path = format!(
+                "{}/api/v1/namespaces/{}/pods/{}?gracePeriodSeconds=0",
+                self.config.api_server_url, removed.namespace, removed.name
+            );
+            match self.api_client.delete(&path).send().await {
+                Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 404 => {
+                    info!(
+                        "Confirmed deletion of pod {}/{}",
+                        removed.namespace, removed.name
+                    );
+                }
+                Ok(resp) => {
+                    warn!(
+                        "Failed to confirm deletion of {}/{}: HTTP {}",
+                        removed.namespace,
+                        removed.name,
+                        resp.status()
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to confirm deletion of {}/{}: {e}",
+                        removed.namespace, removed.name
+                    );
+                }
             }
         }
 
@@ -359,7 +408,7 @@ impl Kubelet {
                         "running": {"startedAt": &now}
                     }),
                     "terminated" => serde_json::json!({
-                        "terminated": {"exitCode": 0, "finishedAt": &now}
+                        "terminated": {"exitCode": cs.exit_code, "finishedAt": &now}
                     }),
                     _ => serde_json::json!({
                         "waiting": {"reason": "ContainerCreating"}
@@ -403,7 +452,7 @@ impl Kubelet {
             "phase": &update.phase,
             "conditions": conditions,
             "containerStatuses": container_statuses,
-            "hostIP": "127.0.0.1",
+            "hostIP": &self.node_ip,
             "startTime": &now
         });
 
