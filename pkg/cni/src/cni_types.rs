@@ -92,7 +92,7 @@ fn default_vtep_name() -> String {
 }
 
 /// Route configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RouteConfig {
     pub dst: String,
     #[serde(default)]
@@ -162,5 +162,81 @@ impl CniErrorResult {
             msg: msg.to_string(),
             details: String::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CONFIG_JSON: &str = r#"{
+        "cniVersion": "1.0.0",
+        "name": "rk-net",
+        "type": "bridge",
+        "bridge": "rk-br0",
+        "isGateway": true,
+        "ipMasq": true,
+        "ipam": {
+            "type": "host-local",
+            "subnet": "10.244.1.0/24",
+            "gateway": "10.244.1.1"
+        }
+    }"#;
+
+    #[test]
+    fn test_config_parses() {
+        let cfg: CniConfig = serde_json::from_str(CONFIG_JSON).unwrap();
+        assert_eq!(cfg.cni_version, "1.0.0");
+        assert_eq!(cfg.name, "rk-net");
+        assert_eq!(cfg.plugin_type, "bridge");
+        assert_eq!(cfg.bridge, "rk-br0");
+        assert!(cfg.is_gateway);
+        assert!(cfg.ip_masq);
+        assert_eq!(cfg.ipam.ipam_type, "host-local");
+        assert_eq!(cfg.ipam.subnet, "10.244.1.0/24");
+        assert_eq!(cfg.ipam.gateway, "10.244.1.1");
+    }
+
+    #[test]
+    fn test_config_roundtrip() {
+        let cfg: CniConfig = serde_json::from_str(CONFIG_JSON).unwrap();
+        let serialized = serde_json::to_string(&cfg).unwrap();
+        let reparsed: CniConfig = serde_json::from_str(&serialized).unwrap();
+
+        // Camel-case keys survive the round-trip.
+        assert!(serialized.contains("\"cniVersion\""));
+        assert!(serialized.contains("\"isGateway\""));
+        assert_eq!(reparsed.cni_version, cfg.cni_version);
+        assert_eq!(reparsed.name, cfg.name);
+        assert_eq!(reparsed.plugin_type, cfg.plugin_type);
+        assert_eq!(reparsed.ipam.subnet, cfg.ipam.subnet);
+    }
+
+    #[test]
+    fn test_result_roundtrip() {
+        let result = CniResult {
+            cni_version: "1.0.0".into(),
+            interfaces: vec![CniInterface {
+                name: "eth0".into(),
+                mac: "aa:bb:cc:dd:ee:ff".into(),
+                sandbox: "/var/run/netns/pod".into(),
+            }],
+            ips: vec![CniIpConfig {
+                address: "10.244.1.2/24".into(),
+                gateway: Some("10.244.1.1".into()),
+                interface: Some(0),
+            }],
+            routes: vec![RouteConfig {
+                dst: "0.0.0.0/0".into(),
+                gw: "10.244.1.1".into(),
+            }],
+            dns: CniDns::default(),
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        let reparsed: CniResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(reparsed.ips[0].address, "10.244.1.2/24");
+        assert_eq!(reparsed.ips[0].gateway.as_deref(), Some("10.244.1.1"));
+        assert_eq!(reparsed.routes[0].gw, "10.244.1.1");
     }
 }

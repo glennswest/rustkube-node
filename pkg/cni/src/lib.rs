@@ -11,4 +11,6 @@ pub mod ebpf_encap;
 pub mod ipam;
 pub mod vxlan;
 
-pub use cni_types::{CniConfig, CniResult, CniError};
+pub use bridge::{BridgePlan, NetlinkOps, RecordingNetlinkOps};
+pub use cni_types::{CniConfig, CniError, CniResult};
+pub use ipam::{AllocStore, DiskStore, HostLocalIpam, MemStore};
