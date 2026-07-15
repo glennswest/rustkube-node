@@ -32,12 +32,12 @@ Binaries and systemd units use **exact upstream names** (`kubelet`,
 - Shared types come from rustkube's `apimachinery` crate via a **sibling path
   dependency**:
   ```toml
-  apimachinery = { path = "../rustkube/crates/apimachinery" }
+  apimachinery = { path = "../rustkube/pkg/apimachinery" }
   ```
   So check out `rustkube` as a sibling directory:
   ```
   projects/
-    rustkube/        # control plane (has crates/apimachinery)
+    rustkube/        # control plane (has pkg/apimachinery)
     rustkube-node/   # this repo
   ```
 
