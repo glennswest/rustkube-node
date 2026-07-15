@@ -4,7 +4,7 @@
 //! and applies them to the node.
 
 use crate::endpoints::sync_services_and_endpoints;
-use crate::iptables;
+use crate::iptables::{self, RuleApplier};
 use crate::service_map::ServiceMap;
 use std::time::Duration;
 use tokio::time;
@@ -33,14 +33,25 @@ pub struct ServiceProxy {
     config: ProxyConfig,
     service_map: ServiceMap,
     client: reqwest::Client,
+    /// Dataplane seam: real `iptables-restore` on Linux, no-op elsewhere.
+    applier: Box<dyn RuleApplier>,
 }
 
 impl ServiceProxy {
+    /// Construct a proxy using the platform-default rule applier
+    /// (`iptables-restore` on Linux, a no-op applier on other platforms).
     pub fn new(config: ProxyConfig) -> Self {
+        Self::with_applier(config, iptables::default_applier())
+    }
+
+    /// Construct a proxy with an explicit [`RuleApplier`], allowing tests (and
+    /// non-Linux hosts) to inject a mock/no-op dataplane.
+    pub fn with_applier(config: ProxyConfig, applier: Box<dyn RuleApplier>) -> Self {
         Self {
             config,
             service_map: ServiceMap::new(),
             client: reqwest::Client::new(),
+            applier,
         }
     }
 
@@ -79,7 +90,7 @@ impl ServiceProxy {
         let services = self.service_map.get_all();
         let rules = iptables::generate_rules(&services);
 
-        if let Err(e) = iptables::apply_rules(&rules).await {
+        if let Err(e) = self.applier.apply(&rules).await {
             error!("Failed to apply iptables rules: {e}");
         }
     }
