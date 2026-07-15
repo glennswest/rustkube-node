@@ -1,0 +1,83 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kubelet",
+    "crates/kube-proxy",
+    "crates/cni",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+repository = "https://github.com/glennswest/rustkube-node"
+
+[workspace.dependencies]
+# Shared types — sibling path dep on rustkube's apimachinery crate (single
+# source of truth; matches the multi-repo path-dep pattern used across the
+# effort). Requires the `rustkube` repo checked out as a sibling directory.
+apimachinery = { path = "../rustkube/pkg/apimachinery" }
+
+# Kubernetes types — pinned to K8s 1.32 (must match rustkube/apimachinery)
+k8s-openapi = { version = "0.24", features = ["v1_32"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+# gRPC (CRI client)
+tonic = { version = "0.12", features = ["tls"] }
+tonic-build = { version = "0.12" }
+prost = { version = "0.13" }
+prost-types = { version = "0.13" }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+serde_yaml = { version = "0.9" }
+
+# Error handling
+thiserror = { version = "2" }
+anyhow = { version = "1" }
+
+# Observability
+tracing = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+metrics = { version = "0.24" }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Utilities
+rand = { version = "0.8" }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+base64 = { version = "0.22" }
+bytes = { version = "1" }
+futures = { version = "0.3" }
+async-trait = { version = "0.1" }
+dashmap = { version = "6" }
+parking_lot = { version = "0.12" }
+url = { version = "2" }
+regex = { version = "1" }
+
+# Networking
+nix = { version = "0.29", features = ["net", "socket", "ioctl", "process"] }
+rtnetlink = { version = "0.14" }
+socket2 = { version = "0.5" }
+ipnet = { version = "2" }
+
+# OCI container runtime (youki libcontainer)
+libcontainer = { version = "0.6", default-features = false, features = ["v2"] }
+oci-spec = { version = "0.9" }
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# TLS (rustls only — no OpenSSL)
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "tls12"] }
+
+# Testing
+tempfile = { version = "3" }

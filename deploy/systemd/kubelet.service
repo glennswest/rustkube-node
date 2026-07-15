@@ -1,0 +1,18 @@
+[Unit]
+Description=Kubernetes Node Agent (kubelet)
+Documentation=https://kubernetes.io/docs/
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# APISERVER_URL / NODE_NAME / CRI_SOCKET resolve the flags via clap env binding.
+EnvironmentFile=-/etc/kubernetes/kubelet
+ExecStart=/usr/bin/kubelet $KUBELET_ARGS
+Restart=always
+RestartSec=2s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

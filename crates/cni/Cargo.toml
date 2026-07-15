@@ -1,0 +1,24 @@
+[package]
+name = "cni"
+description = "CNI plugins for RustKube (bridge, VXLAN, IPAM)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+apimachinery = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+ipnet = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
