@@ -111,7 +111,7 @@ impl EbpfEncap {
     ///
     /// ```no_run
     /// use std::net::Ipv4Addr;
-    /// use rk_cni::ebpf_encap::EbpfEncap;
+    /// use cni::ebpf_encap::EbpfEncap;
     ///
     /// let encap = EbpfEncap::new(100, Ipv4Addr::new(192, 168, 1, 10));
     /// ```

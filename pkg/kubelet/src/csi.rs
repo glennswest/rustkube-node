@@ -31,7 +31,7 @@
 //! # Example Usage
 //!
 //! ```no_run
-//! use rk_kubelet::csi::{UnixCsiClient, setup_volume, teardown_volume};
+//! use kubelet::csi::{UnixCsiClient, setup_volume, teardown_volume};
 //! use std::path::PathBuf;
 //!
 //! # async fn example() -> anyhow::Result<()> {
