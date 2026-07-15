@@ -1,0 +1,22 @@
+# Binary crate for the `kubelet` command. Package name is suffixed because the
+# binary and its library both use the upstream name `kubelet` (no `kube-`
+# prefix); the produced binary is exactly `kubelet`.
+[package]
+name = "kubelet-cmd"
+description = "Kubernetes node agent (kubelet) — command entrypoint"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kubelet"
+path = "src/main.rs"
+
+[dependencies]
+kubelet = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

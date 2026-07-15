@@ -2,8 +2,7 @@
 //! planned) for ClusterIP/NodePort, watching Services + Endpoints from the API.
 
 use clap::Parser;
-use kube_proxy::proxy::ProxyConfig;
-use kube_proxy::ServiceProxy;
+use proxy::{ProxyConfig, ServiceProxy};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]

@@ -22,9 +22,6 @@ uuid = { workspace = true }
 clap = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-[[bin]]
-name = "kubelet"
-path = "src/bin/kubelet.rs"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libcontainer = { workspace = true }

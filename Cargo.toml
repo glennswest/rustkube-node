@@ -1,9 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/kubelet",
-    "crates/kube-proxy",
-    "crates/cni",
+    "pkg/kubelet",
+    "pkg/proxy",
+    "pkg/cni",
+    "cmd/kubelet",
+    "cmd/kube-proxy",
 ]
 
 [workspace.package]
@@ -18,6 +20,11 @@ repository = "https://github.com/glennswest/rustkube-node"
 # source of truth; matches the multi-repo path-dep pattern used across the
 # effort). Requires the `rustkube` repo checked out as a sibling directory.
 apimachinery = { path = "../rustkube/pkg/apimachinery" }
+
+# Internal libs (pkg/) — consumed by the cmd/ binary crates
+kubelet = { path = "pkg/kubelet" }
+proxy = { path = "pkg/proxy" }
+cni = { path = "pkg/cni" }
 
 # Kubernetes types — pinned to K8s 1.32 (must match rustkube/apimachinery)
 k8s-openapi = { version = "0.24", features = ["v1_32"] }

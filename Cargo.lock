@@ -1045,15 +1045,8 @@ name = "kube-proxy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "apimachinery",
- "chrono",
  "clap",
- "dashmap",
- "rand 0.8.7",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
+ "proxy",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1080,6 +1073,18 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "kubelet-cmd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "kubelet",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1598,6 +1603,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a5d4d7b8601c814cfb36bcebb79f0e61e45e1e93640cf778837833bbed05c372"
 dependencies = [
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "proxy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "apimachinery",
+ "chrono",
+ "clap",
+ "dashmap",
+ "rand 0.8.7",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -1,5 +1,5 @@
 [package]
-name = "kube-proxy"
+name = "proxy"
 description = "Service proxy for RustKube (iptables/eBPF)"
 version.workspace = true
 edition.workspace = true
@@ -21,6 +21,3 @@ rand = { workspace = true }
 clap = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-[[bin]]
-name = "kube-proxy"
-path = "src/bin/kube-proxy.rs"

@@ -11,4 +11,4 @@ pub mod netpol;
 pub mod proxy;
 pub mod service_map;
 
-pub use proxy::ServiceProxy;
+pub use proxy::{ProxyConfig, ServiceProxy};

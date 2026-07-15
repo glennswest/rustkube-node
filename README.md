@@ -10,11 +10,14 @@ development; the code stays upstream-shaped and monorepo-mergeable.
 
 ## Components
 
-| Binary | Crate | Role |
-|--------|-------|------|
-| `kubelet` | `crates/kubelet` | Node agent — registration, pod lifecycle, health probes, CRI/native/VM runtime |
-| `kube-proxy` | `crates/kube-proxy` | Service dataplane — iptables (today) / eBPF (planned) for ClusterIP/NodePort |
-| — | `crates/cni` | CNI plugins (bridge, host-local IPAM, VXLAN) |
+Upstream-shaped: thin `cmd/<component>` binaries over `pkg/<lib>` libraries
+(same layout as [rustkube](https://github.com/glennswest/rustkube)).
+
+| Binary | cmd → pkg | Role |
+|--------|-----------|------|
+| `kubelet` | `cmd/kubelet` → `pkg/kubelet` | Node agent — registration, pod lifecycle, health probes, CRI/native/VM runtime |
+| `kube-proxy` | `cmd/kube-proxy` → `pkg/proxy` | Service dataplane — iptables (today) / eBPF (planned) for ClusterIP/NodePort |
+| — | `pkg/cni` | CNI plugins (bridge, host-local IPAM, VXLAN) |
 
 Binaries and systemd units use **exact upstream names** (`kubelet`,
 `kube-proxy`, `kubelet.service`, `kube-proxy.service`), config under
