@@ -1,0 +1,12 @@
+Package: rustkube-node
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: Glenn West <glennswest@neuralcloudcomputing.com>
+Section: admin
+Priority: optional
+Depends: iproute2
+Description: RustKube node components (kubelet, kube-proxy)
+ Drop-in Kubernetes node components in Rust from the rustkube project:
+ kubelet (node agent; CRI v1 over gRPC to CRI-O/containerd) and kube-proxy
+ (iptables service dataplane). Uses exact upstream names and config paths
+ under /etc/kubernetes.

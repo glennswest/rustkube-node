@@ -36,6 +36,8 @@ mod linux {
         state_dir: PathBuf,
         /// sandbox_id → SandboxState
         sandboxes: RwLock<HashMap<String, SandboxState>>,
+        /// Standard CNI invoker (Cilium by default). None → host networking.
+        cni: Option<cni::CniInvoker>,
     }
 
     #[derive(Debug, Clone)]
@@ -43,6 +45,8 @@ mod linux {
         id: String,
         config: PodSandboxConfig,
         ip: String,
+        /// Network namespace path, when CNI networking is set up.
+        netns: Option<String>,
         containers: Vec<String>,
     }
 
@@ -57,7 +61,14 @@ mod linux {
                 root_dir,
                 state_dir,
                 sandboxes: RwLock::new(HashMap::new()),
+                cni: None,
             }
+        }
+
+        /// Use standard CNI plugins (e.g. Cilium) for pod sandbox networking.
+        pub fn with_cni(mut self, invoker: Option<cni::CniInvoker>) -> Self {
+            self.cni = invoker;
+            self
         }
 
         fn container_root(&self, id: &str) -> PathBuf {
@@ -66,6 +77,53 @@ mod linux {
 
         fn container_state(&self, id: &str) -> PathBuf {
             self.state_dir.join(id)
+        }
+
+        /// Create a named network namespace for a sandbox and return its path.
+        fn create_netns(sandbox_id: &str) -> Result<String, CriError> {
+            let output = std::process::Command::new("ip")
+                .args(["netns", "add", sandbox_id])
+                .output()
+                .map_err(|e| CriError::Runtime(format!("ip netns add: {e}")))?;
+            if !output.status.success() {
+                return Err(CriError::Runtime(format!(
+                    "ip netns add {sandbox_id}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )));
+            }
+            Ok(format!("/run/netns/{sandbox_id}"))
+        }
+
+        fn delete_netns(sandbox_id: &str) {
+            let _ = std::process::Command::new("ip")
+                .args(["netns", "del", sandbox_id])
+                .output();
+        }
+
+        /// Tear down CNI networking for a sandbox (idempotent).
+        async fn teardown_network(&self, sandbox_id: &str) {
+            let (config, netns) = {
+                let mut sandboxes = self.sandboxes.write().await;
+                match sandboxes.get_mut(sandbox_id) {
+                    Some(s) => (s.config.clone(), s.netns.take()),
+                    None => return,
+                }
+            };
+
+            let Some(netns) = netns else { return };
+            if let Some(invoker) = &self.cni {
+                let pod = cni::PodNetwork::new(
+                    sandbox_id,
+                    &netns,
+                    &config.namespace,
+                    &config.name,
+                    &config.uid,
+                );
+                if let Err(e) = invoker.del(&pod).await {
+                    warn!("CNI DEL failed for sandbox {sandbox_id}: {e}");
+                }
+            }
+            Self::delete_netns(sandbox_id);
         }
 
         /// Build an OCI runtime spec from our container config.
@@ -86,22 +144,11 @@ mod linux {
                 .map_err(|e| CriError::Runtime(format!("root spec: {e}")))?;
 
             // Process
-            let mut process_builder = ProcessBuilder::default();
-
             let mut args = config.command.clone();
             args.extend(config.args.clone());
             if args.is_empty() {
                 args = vec!["/bin/sh".to_string()];
             }
-
-            process_builder
-                .args(args)
-                .cwd(if config.working_dir.is_empty() {
-                    "/".to_string()
-                } else {
-                    config.working_dir.clone()
-                })
-                .terminal(config.tty);
 
             // Environment variables
             let env: Vec<String> = config
@@ -109,9 +156,16 @@ mod linux {
                 .iter()
                 .map(|(k, v)| format!("{k}={v}"))
                 .collect();
-            process_builder.env(env);
 
-            let process = process_builder
+            let process = ProcessBuilder::default()
+                .args(args)
+                .cwd(if config.working_dir.is_empty() {
+                    "/".to_string()
+                } else {
+                    config.working_dir.clone()
+                })
+                .terminal(config.tty)
+                .env(env)
                 .build()
                 .map_err(|e| CriError::Runtime(format!("process spec: {e}")))?;
 
@@ -154,23 +208,22 @@ mod linux {
             }
 
             // Linux resources (cgroups v2)
-            let mut linux_builder = LinuxBuilder::default();
-
             let mut resources_builder = LinuxResourcesBuilder::default();
 
             if config.cpu_quota > 0 || config.cpu_shares > 0 {
                 let mut cpu_builder = LinuxCpuBuilder::default();
                 if config.cpu_quota > 0 {
-                    cpu_builder.quota(config.cpu_quota);
-                    cpu_builder.period(config.cpu_period as u64);
+                    cpu_builder = cpu_builder
+                        .quota(config.cpu_quota)
+                        .period(config.cpu_period as u64);
                 }
                 if config.cpu_shares > 0 {
-                    cpu_builder.shares(config.cpu_shares as u64);
+                    cpu_builder = cpu_builder.shares(config.cpu_shares as u64);
                 }
                 let cpu = cpu_builder
                     .build()
                     .map_err(|e| CriError::Runtime(format!("cpu spec: {e}")))?;
-                resources_builder.cpu(cpu);
+                resources_builder = resources_builder.cpu(cpu);
             }
 
             if config.memory_limit_bytes > 0 {
@@ -178,15 +231,15 @@ mod linux {
                     .limit(config.memory_limit_bytes)
                     .build()
                     .map_err(|e| CriError::Runtime(format!("memory spec: {e}")))?;
-                resources_builder.memory(memory);
+                resources_builder = resources_builder.memory(memory);
             }
 
             let resources = resources_builder
                 .build()
                 .map_err(|e| CriError::Runtime(format!("resources spec: {e}")))?;
-            linux_builder.resources(resources);
 
-            let linux = linux_builder
+            let linux = LinuxBuilder::default()
+                .resources(resources)
                 .build()
                 .map_err(|e| CriError::Runtime(format!("linux spec: {e}")))?;
 
@@ -233,14 +286,50 @@ mod linux {
             std::fs::create_dir_all(&config.log_directory)
                 .map_err(|e| CriError::Runtime(format!("create log dir: {e}")))?;
 
-            // For now, use host networking (sandbox IP = host IP)
-            // Full CNI integration in Phase 2
-            let ip = "10.244.0.2".to_string();
+            // Pod networking: standard CNI (Cilium by default) when
+            // configured, otherwise fall back to host networking.
+            let (ip, netns) = if let Some(invoker) = &self.cni {
+                let netns = Self::create_netns(&sandbox_id)?;
+                let pod = cni::PodNetwork::new(
+                    &sandbox_id,
+                    &netns,
+                    &config.namespace,
+                    &config.name,
+                    &config.uid,
+                );
+                match invoker.add(&pod).await {
+                    Ok(result) => {
+                        let ip = result
+                            .ips
+                            .first()
+                            .map(|i| i.address.split('/').next().unwrap_or("").to_string())
+                            .unwrap_or_default();
+                        if ip.is_empty() {
+                            let _ = invoker.del(&pod).await;
+                            Self::delete_netns(&sandbox_id);
+                            return Err(CriError::Runtime(format!(
+                                "CNI ADD returned no IP for {}/{}",
+                                config.namespace, config.name
+                            )));
+                        }
+                        info!("CNI assigned {ip} to sandbox {sandbox_id}");
+                        (ip, Some(netns))
+                    }
+                    Err(e) => {
+                        Self::delete_netns(&sandbox_id);
+                        return Err(CriError::Runtime(format!("CNI ADD failed: {e}")));
+                    }
+                }
+            } else {
+                warn!("No CNI configured — sandbox {sandbox_id} uses host networking");
+                ("10.244.0.2".to_string(), None)
+            };
 
             let state = SandboxState {
                 id: sandbox_id.clone(),
                 config: config.clone(),
                 ip,
+                netns,
                 containers: Vec::new(),
             };
 
@@ -264,6 +353,10 @@ mod linux {
                 let _ = self.stop_container(cid, 10).await;
             }
 
+            // Release the pod IP and netns at stop (CRI semantics: network
+            // teardown happens in StopPodSandbox, not Remove).
+            self.teardown_network(sandbox_id).await;
+
             Ok(())
         }
 
@@ -282,6 +375,9 @@ mod linux {
             for cid in &container_ids {
                 let _ = self.remove_container(cid).await;
             }
+
+            // In case StopPodSandbox was skipped.
+            self.teardown_network(sandbox_id).await;
 
             // Remove sandbox state
             self.sandboxes.write().await.remove(sandbox_id);
@@ -395,7 +491,7 @@ mod linux {
 
             let state_dir = self.container_state(container_id);
 
-            match Container::load(&state_dir) {
+            match Container::load(state_dir.clone()) {
                 Ok(mut container) => {
                     // Send SIGTERM, then SIGKILL after timeout
                     let _ = container.kill(nix::sys::signal::Signal::SIGTERM, true);
@@ -422,7 +518,7 @@ mod linux {
 
             let state_dir = self.container_state(container_id);
 
-            if let Ok(mut container) = Container::load(&state_dir) {
+            if let Ok(mut container) = Container::load(state_dir.clone()) {
                 let _ = container.delete(true);
             }
 
@@ -440,7 +536,7 @@ mod linux {
         ) -> Result<ContainerStatusInfo, CriError> {
             let state_dir = self.container_state(container_id);
 
-            let state = match Container::load(&state_dir) {
+            let state = match Container::load(state_dir.clone()) {
                 Ok(container) => {
                     let status = container.state.status;
                     match status {
@@ -508,7 +604,7 @@ mod linux {
 
             // Use nsenter to exec into container's namespaces
             let state_dir = self.container_state(container_id);
-            let container = Container::load(&state_dir)
+            let container = Container::load(state_dir.clone())
                 .map_err(|e| CriError::Runtime(format!("load container for exec: {e}")))?;
 
             let pid = container
@@ -566,7 +662,7 @@ mod linux {
             let mut checkpoint_dirs = Vec::new();
             for cid in &container_ids {
                 let state_dir = self.container_state(cid);
-                let container = Container::load(&state_dir)
+                let container = Container::load(state_dir.clone())
                     .map_err(|e| CriError::Migration(format!("load container {cid}: {e}")))?;
 
                 let pid = container
@@ -765,6 +861,9 @@ pub mod stub {
 
     impl NativeRuntime {
         pub fn new() -> Self { Self }
+
+        /// No-op off Linux; CNI networking requires a Linux kernel.
+        pub fn with_cni(self, _invoker: Option<cni::CniInvoker>) -> Self { self }
     }
 
     #[async_trait]

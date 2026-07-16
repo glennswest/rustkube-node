@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 kubelet = { workspace = true }
+cni = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

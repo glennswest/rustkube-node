@@ -7,7 +7,7 @@
 
 use clap::Parser;
 use kubelet::{
-    detect_cri_socket, CriClient, Kubelet, KubeletConfig, NativeImageService, NativeRuntime,
+    detect_cri_socket, CriGrpcClient, Kubelet, KubeletConfig, NativeImageService, NativeRuntime,
     VmRuntime, VmmBackend,
 };
 use std::sync::Arc;
@@ -39,6 +39,18 @@ struct Cli {
     /// VMM backend for --runtime=vm.
     #[arg(long, default_value = "auto", value_parser = ["auto", "cloud-hypervisor", "qemu", "firecracker"])]
     vmm: String,
+
+    /// CNI network config directory (Cilium writes 05-cilium.conflist here).
+    #[arg(long, env = "CNI_CONF_DIR", default_value = "/etc/cni/net.d")]
+    cni_conf_dir: String,
+
+    /// CNI plugin binary directory.
+    #[arg(long, env = "CNI_BIN_DIR", default_value = "/opt/cni/bin")]
+    cni_bin_dir: String,
+
+    /// Disable CNI networking (pods use host networking). For dev only.
+    #[arg(long, default_value_t = false)]
+    no_cni: bool,
 }
 
 #[tokio::main]
@@ -61,6 +73,28 @@ async fn main() -> anyhow::Result<()> {
         cli.apiserver
     );
 
+    // Standard CNI for the native/VM-fallback runtimes (with --runtime=cri
+    // the external runtime invokes CNI itself). Cilium is the expected
+    // default plugin; anything spec-compliant in the conf dir works.
+    let cni_invoker = if cli.no_cni {
+        tracing::warn!("CNI disabled (--no-cni) — pods will use host networking");
+        None
+    } else {
+        let invoker = cni::CniInvoker::new(
+            cli.cni_conf_dir.clone(),
+            vec![std::path::PathBuf::from(&cli.cni_bin_dir)],
+        );
+        match invoker.network_ready() {
+            Ok(name) => tracing::info!("CNI network '{name}' configured ({})", cli.cni_conf_dir),
+            Err(e) => tracing::warn!(
+                "CNI not ready yet ({e}) — pod sandbox creation will fail until a \
+                 network config appears in {} (e.g. install Cilium)",
+                cli.cni_conf_dir
+            ),
+        }
+        Some(invoker)
+    };
+
     let (runtime, images, migration): (
         Arc<dyn kubelet::cri::RuntimeService>,
         Arc<dyn kubelet::cri::ImageService>,
@@ -81,7 +115,7 @@ async fn main() -> anyhow::Result<()> {
                 (rt as _, img as _, mig)
             } else {
                 tracing::error!("no VMM found, falling back to native runtime");
-                let rt = Arc::new(NativeRuntime::new());
+                let rt = Arc::new(NativeRuntime::new().with_cni(cni_invoker));
                 let img = Arc::new(NativeImageService::new());
                 let mig = rt.clone() as Arc<dyn kubelet::cri::MigrationService>;
                 (rt as _, img as _, mig)
@@ -89,15 +123,14 @@ async fn main() -> anyhow::Result<()> {
         }
         "cri" => {
             let socket = cli.cri_socket.clone().unwrap_or_else(detect_cri_socket);
-            tracing::info!("kubelet using CRI runtime ({})", socket);
-            let rt = Arc::new(CriClient::new(&socket));
-            let img = Arc::new(CriClient::new(&socket));
+            tracing::info!("kubelet using CRI runtime via gRPC ({})", socket);
+            let rt = Arc::new(CriGrpcClient::new(&socket));
             let mig = rt.clone() as Arc<dyn kubelet::cri::MigrationService>;
-            (rt as _, img as _, mig)
+            (rt.clone() as _, rt as _, mig)
         }
         _ => {
             tracing::info!("kubelet using native runtime (libcontainer)");
-            let rt = Arc::new(NativeRuntime::new());
+            let rt = Arc::new(NativeRuntime::new().with_cni(cni_invoker));
             let img = Arc::new(NativeImageService::new());
             let mig = rt.clone() as Arc<dyn kubelet::cri::MigrationService>;
             (rt as _, img as _, mig)

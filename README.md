@@ -17,11 +17,26 @@ Upstream-shaped: thin `cmd/<component>` binaries over `pkg/<lib>` libraries
 |--------|-----------|------|
 | `kubelet` | `cmd/kubelet` → `pkg/kubelet` | Node agent — registration, pod lifecycle, health probes, CRI/native/VM runtime |
 | `kube-proxy` | `cmd/kube-proxy` → `pkg/proxy` | Service dataplane — iptables (today) / eBPF (planned) for ClusterIP/NodePort |
-| — | `pkg/cni` | CNI plugins (bridge, host-local IPAM, VXLAN) |
+| — | `pkg/cni` | Standard CNI invoker (libcni-style) + built-in plugins (bridge, host-local IPAM, VXLAN) |
 
 Binaries and systemd units use **exact upstream names** (`kubelet`,
 `kube-proxy`, `kubelet.service`, `kube-proxy.service`), config under
 `/etc/kubernetes/` — so this is a drop-in node.
+
+## Runtime & networking defaults
+
+- **Container runtime: CRI-O over gRPC** (`--runtime=cri`). The kubelet speaks
+  the CRI v1 protocol over the Unix socket (`/run/crio/crio.sock`) — the same
+  protocol OpenShift uses — via a tonic client generated from the vendored
+  kubernetes/cri-api proto (K8s 1.32, `pkg/kubelet/proto/api.proto`). This
+  gets full OCI image ecosystem compatibility for free. containerd works too.
+- **CNI: standard plugins, default Cilium.** With CRI-O, the runtime invokes
+  CNI itself from `/etc/cni/net.d` (Cilium writes `05-cilium.conflist`).
+  For the native/VM runtimes, the kubelet invokes the standard CNI protocol
+  directly (`pkg/cni/src/invoker.rs`) — any spec-compliant plugin works.
+- The **native runtime** (`--runtime=native`, youki libcontainer, no
+  containerd) and **VM runtime** (`--runtime=vm`) are experimental paths.
+- Test target: **x86_64 Linux**.
 
 ## Relationship to rustkube
 
@@ -44,7 +59,8 @@ Binaries and systemd units use **exact upstream names** (`kubelet`,
 ## Build
 
 ```bash
-# requires ../rustkube checked out as a sibling
+# requires ../rustkube checked out as a sibling, and `protoc` on the build
+# host (CRI gRPC codegen)
 cargo build --release            # produces target/release/{kubelet,kube-proxy}
 cargo build --release --target x86_64-unknown-linux-musl   # static
 ```

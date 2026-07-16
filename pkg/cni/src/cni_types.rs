@@ -103,8 +103,11 @@ pub struct RouteConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CniResult {
+    #[serde(default)]
     pub cni_version: String,
+    #[serde(default)]
     pub interfaces: Vec<CniInterface>,
+    #[serde(default)]
     pub ips: Vec<CniIpConfig>,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,

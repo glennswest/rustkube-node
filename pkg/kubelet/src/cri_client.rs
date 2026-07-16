@@ -571,11 +571,12 @@ fn which_crictl() -> Option<String> {
 
 /// Default CRI socket paths to try.
 pub fn detect_cri_socket() -> String {
+    // CRI-O first — it's the default runtime for rustkube nodes.
     let candidates = [
-        "/run/containerd/containerd.sock",
         "/run/crio/crio.sock",
-        "/var/run/containerd/containerd.sock",
         "/var/run/crio/crio.sock",
+        "/run/containerd/containerd.sock",
+        "/var/run/containerd/containerd.sock",
         "/var/run/dockershim.sock",
     ];
 

@@ -8,6 +8,11 @@ license.workspace = true
 
 [dependencies]
 apimachinery = { workspace = true }
+cni = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+tower = { version = "0.5" }
+hyper-util = { version = "0.1" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -27,3 +32,9 @@ tracing-subscriber = { workspace = true }
 libcontainer = { workspace = true }
 oci-spec = { workspace = true }
 nix = { workspace = true }
+
+[dev-dependencies]
+tokio-stream = { workspace = true, features = ["net"] }
+
+[build-dependencies]
+tonic-build = { workspace = true }
