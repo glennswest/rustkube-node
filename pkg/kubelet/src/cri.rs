@@ -24,7 +24,7 @@ pub enum PodSandboxState {
 }
 
 /// Pod sandbox configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PodSandboxConfig {
     pub name: String,
     pub uid: String,
@@ -37,10 +37,16 @@ pub struct PodSandboxConfig {
     pub labels: HashMap<String, String>,
     pub annotations: HashMap<String, String>,
     pub port_mappings: Vec<PortMapping>,
+    /// Share the host network namespace (pod.spec.hostNetwork).
+    pub host_network: bool,
+    /// Share the host PID namespace (pod.spec.hostPID).
+    pub host_pid: bool,
+    /// Share the host IPC namespace (pod.spec.hostIPC).
+    pub host_ipc: bool,
 }
 
 /// Port mapping for a pod sandbox.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PortMapping {
     pub protocol: String,
     pub container_port: i32,
@@ -49,7 +55,7 @@ pub struct PortMapping {
 }
 
 /// Container configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ContainerConfig {
     pub name: String,
     pub attempt: u32,
@@ -68,14 +74,33 @@ pub struct ContainerConfig {
     pub cpu_quota: i64,
     pub cpu_shares: i64,
     pub memory_limit_bytes: i64,
+    /// securityContext.privileged — full host access (Cilium agent needs this).
+    pub privileged: bool,
+    /// securityContext.readOnlyRootFilesystem.
+    pub readonly_rootfs: bool,
+    /// securityContext.capabilities.add (Linux capability names, e.g. NET_ADMIN).
+    pub add_capabilities: Vec<String>,
+}
+
+/// Mount propagation mode (matches CRI MountPropagation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MountPropagation {
+    /// No propagation (default).
+    #[default]
+    Private,
+    /// Host → container only.
+    HostToContainer,
+    /// Bidirectional (host ↔ container) — needed for e.g. the bpf fs mount.
+    Bidirectional,
 }
 
 /// Mount specification.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Mount {
     pub container_path: String,
     pub host_path: String,
     pub readonly: bool,
+    pub propagation: MountPropagation,
 }
 
 /// Container status information.

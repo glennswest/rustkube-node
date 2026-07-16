@@ -330,6 +330,9 @@ fn sandbox_config() -> PodSandboxConfig {
         labels: HashMap::new(),
         annotations: HashMap::new(),
         port_mappings: vec![],
+        host_network: true,
+        host_pid: false,
+        host_ipc: false,
     }
 }
 
@@ -357,6 +360,10 @@ async fn full_pod_flow_over_unix_socket() {
     assert_eq!(meta.namespace, "default");
     assert_eq!(meta.uid, "uid-1");
     assert_eq!(sent.dns_config.unwrap().servers, vec!["10.96.0.10"]);
+    // hostNetwork=true → sandbox network namespace mode NODE.
+    let ns = sent.linux.unwrap().security_context.unwrap().namespace_options.unwrap();
+    assert_eq!(ns.network, proto::NamespaceMode::Node as i32);
+    assert_eq!(ns.pid, proto::NamespaceMode::Pod as i32);
 
     let status = client.pod_sandbox_status(&sandbox_id).await.unwrap();
     assert_eq!(status.ip, "10.0.42.9");
@@ -388,6 +395,9 @@ async fn full_pod_flow_over_unix_socket() {
         cpu_quota: 20_000,
         cpu_shares: 204,
         memory_limit_bytes: 64 * 1024 * 1024,
+        privileged: true,
+        readonly_rootfs: false,
+        add_capabilities: vec!["NET_ADMIN".into()],
     };
     let container_id = client
         .create_container(&sandbox_id, &container, &config)
@@ -400,9 +410,14 @@ async fn full_pod_flow_over_unix_socket() {
     assert_eq!(sent.command, vec!["sleep"]);
     assert_eq!(sent.envs[0].key, "FOO");
     assert_eq!(sent.envs[0].value, "bar");
-    let resources = sent.linux.unwrap().resources.unwrap();
+    let linux = sent.linux.unwrap();
+    let resources = linux.resources.unwrap();
     assert_eq!(resources.cpu_quota, 20_000);
     assert_eq!(resources.memory_limit_in_bytes, 64 * 1024 * 1024);
+    // securityContext: privileged + NET_ADMIN reach the wire.
+    let sc = linux.security_context.unwrap();
+    assert!(sc.privileged);
+    assert_eq!(sc.capabilities.unwrap().add_capabilities, vec!["NET_ADMIN"]);
 
     client.start_container(&container_id).await.unwrap();
 

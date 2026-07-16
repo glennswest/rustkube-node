@@ -102,8 +102,45 @@ fn to_proto_sandbox_config(config: &PodSandboxConfig) -> proto::PodSandboxConfig
             .collect(),
         labels: config.labels.clone().into_iter().collect(),
         annotations: config.annotations.clone().into_iter().collect(),
-        linux: Some(proto::LinuxPodSandboxConfig::default()),
+        linux: Some(proto::LinuxPodSandboxConfig {
+            security_context: Some(proto::LinuxSandboxSecurityContext {
+                namespace_options: Some(namespace_options(
+                    config.host_network,
+                    config.host_pid,
+                    config.host_ipc,
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
         ..Default::default()
+    }
+}
+
+/// Build CRI NamespaceOption from host-namespace-sharing flags. NODE = share
+/// the host namespace; POD = the sandbox's own (default).
+fn namespace_options(host_network: bool, host_pid: bool, host_ipc: bool) -> proto::NamespaceOption {
+    let mode = |host: bool| {
+        if host {
+            proto::NamespaceMode::Node as i32
+        } else {
+            proto::NamespaceMode::Pod as i32
+        }
+    };
+    proto::NamespaceOption {
+        network: mode(host_network),
+        pid: mode(host_pid),
+        ipc: mode(host_ipc),
+        ..Default::default()
+    }
+}
+
+fn to_proto_propagation(p: crate::cri::MountPropagation) -> i32 {
+    use crate::cri::MountPropagation::*;
+    match p {
+        Private => proto::MountPropagation::PropagationPrivate as i32,
+        HostToContainer => proto::MountPropagation::PropagationHostToContainer as i32,
+        Bidirectional => proto::MountPropagation::PropagationBidirectional as i32,
     }
 }
 
@@ -135,6 +172,7 @@ fn to_proto_container_config(config: &ContainerConfig) -> proto::ContainerConfig
                 container_path: m.container_path.clone(),
                 host_path: m.host_path.clone(),
                 readonly: m.readonly,
+                propagation: to_proto_propagation(m.propagation),
                 ..Default::default()
             })
             .collect(),
@@ -151,7 +189,15 @@ fn to_proto_container_config(config: &ContainerConfig) -> proto::ContainerConfig
                 memory_limit_in_bytes: config.memory_limit_bytes,
                 ..Default::default()
             }),
-            security_context: None,
+            security_context: Some(proto::LinuxContainerSecurityContext {
+                privileged: config.privileged,
+                readonly_rootfs: config.readonly_rootfs,
+                capabilities: Some(proto::Capability {
+                    add_capabilities: config.add_capabilities.clone(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
         }),
         ..Default::default()
     }

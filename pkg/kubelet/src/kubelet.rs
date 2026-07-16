@@ -269,6 +269,7 @@ impl Kubelet {
                     labels: std::collections::HashMap::new(),
                     annotations: std::collections::HashMap::new(),
                     port_mappings: vec![],
+                    ..Default::default()
                 };
 
                 match self.migration.prepare_migration_target(&config).await {
@@ -363,6 +364,7 @@ impl Kubelet {
                         labels: std::collections::HashMap::new(),
                         annotations: std::collections::HashMap::new(),
                         port_mappings: vec![],
+                        ..Default::default()
                     };
 
                     match self.migration.restore_pod(&checkpoint_ref, &config).await {

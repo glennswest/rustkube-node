@@ -8,8 +8,8 @@
 //! drive container restarts and readiness.
 
 use crate::cri::{
-    ContainerConfig, ContainerState, CriError, ImageService, Mount, PodSandboxConfig,
-    RuntimeService,
+    ContainerConfig, ContainerState, CriError, ImageService, Mount, MountPropagation,
+    PodSandboxConfig, RuntimeService,
 };
 use crate::health::{run_probe, ProbeResult};
 use serde_json::Value;
@@ -212,6 +212,7 @@ impl PodManager {
         info!("Starting pod {namespace}/{name}");
 
         let sandbox_config = build_sandbox_config(pod);
+        let volumes = resolve_volumes(pod);
 
         // Create pod sandbox
         let sandbox_id = self.runtime.run_pod_sandbox(&sandbox_config).await?;
@@ -245,7 +246,7 @@ impl PodManager {
             let image_ref = self.images.pull_image(image).await?;
 
             // Build container config
-            let container_config = build_container_config(container_spec, &image_ref);
+            let container_config = build_container_config(container_spec, &image_ref, &volumes);
 
             // Create container
             let container_id = self
@@ -578,9 +579,10 @@ impl PodManager {
         };
 
         let image = spec["image"].as_str().unwrap_or("");
+        let volumes = resolve_volumes(&state.pod);
         let result = async {
             let image_ref = self.images.pull_image(image).await?;
-            let mut config = build_container_config(spec, &image_ref);
+            let mut config = build_container_config(spec, &image_ref, &volumes);
             config.attempt = restart_count;
             let cid = self
                 .runtime
@@ -742,7 +744,50 @@ fn build_sandbox_config(pod: &Value) -> PodSandboxConfig {
         labels: extract_labels(pod),
         annotations: HashMap::new(),
         port_mappings: vec![],
+        host_network: pod["spec"]["hostNetwork"].as_bool().unwrap_or(false),
+        host_pid: pod["spec"]["hostPID"].as_bool().unwrap_or(false),
+        host_ipc: pod["spec"]["hostIPC"].as_bool().unwrap_or(false),
     }
+}
+
+/// Resolve a pod's `spec.volumes` to host paths keyed by volume name, for the
+/// volume types we can back with a host directory today:
+///   - `hostPath`   → the given host path (created if `type` requests it)
+///   - `emptyDir`   → a per-pod scratch dir under /var/lib/kubelet
+/// configMap/secret/projected are not materialized yet (they need apiserver
+/// reads) — a mount referencing them resolves to an empty per-pod dir so the
+/// container still starts. Returns name → host_path.
+fn resolve_volumes(pod: &Value) -> HashMap<String, String> {
+    let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
+    let mut map = HashMap::new();
+    let volumes = match pod["spec"]["volumes"].as_array() {
+        Some(v) => v,
+        None => return map,
+    };
+    for vol in volumes {
+        let name = match vol["name"].as_str() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        let host_path = if let Some(hp) = vol["hostPath"]["path"].as_str() {
+            // hostPath.type: DirectoryOrCreate/Directory create the dir.
+            let typ = vol["hostPath"]["type"].as_str().unwrap_or("");
+            if matches!(typ, "DirectoryOrCreate" | "Directory" | "") {
+                let _ = std::fs::create_dir_all(hp);
+            }
+            hp.to_string()
+        } else {
+            // emptyDir (and, for now, configMap/secret/projected fallback):
+            // a per-pod scratch directory.
+            let dir = format!(
+                "/var/lib/kubelet/pods/{uid}/volumes/kubernetes.io~empty-dir/{name}"
+            );
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        };
+        map.insert(name, host_path);
+    }
+    map
 }
 
 fn probe_initial_delay(probe: &Value) -> u64 {
@@ -764,7 +809,11 @@ fn extract_labels(pod: &Value) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
-fn build_container_config(spec: &Value, image_ref: &str) -> ContainerConfig {
+fn build_container_config(
+    spec: &Value,
+    image_ref: &str,
+    volumes: &HashMap<String, String>,
+) -> ContainerConfig {
     let name = spec["name"].as_str().unwrap_or("unnamed").to_string();
 
     let command: Vec<String> = spec["command"]
@@ -795,13 +844,30 @@ fn build_container_config(spec: &Value, image_ref: &str) -> ContainerConfig {
         .as_array()
         .map(|a| {
             a.iter()
-                .map(|m| Mount {
-                    container_path: m["mountPath"].as_str().unwrap_or("").to_string(),
-                    host_path: String::new(), // resolved later from volumes
-                    readonly: m["readOnly"].as_bool().unwrap_or(false),
+                .filter_map(|m| {
+                    let vol_name = m["name"].as_str().unwrap_or("");
+                    // Skip mounts whose volume we couldn't resolve to a host
+                    // path rather than bind-mounting an empty string.
+                    let host_path = volumes.get(vol_name)?.clone();
+                    Some(Mount {
+                        container_path: m["mountPath"].as_str().unwrap_or("").to_string(),
+                        host_path,
+                        readonly: m["readOnly"].as_bool().unwrap_or(false),
+                        propagation: match m["mountPropagation"].as_str() {
+                            Some("Bidirectional") => MountPropagation::Bidirectional,
+                            Some("HostToContainer") => MountPropagation::HostToContainer,
+                            _ => MountPropagation::Private,
+                        },
+                    })
                 })
                 .collect()
         })
+        .unwrap_or_default();
+
+    let sc = &spec["securityContext"];
+    let add_capabilities: Vec<String> = sc["capabilities"]["add"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
 
     let cpu_request = spec["resources"]["requests"]["cpu"]
@@ -832,6 +898,9 @@ fn build_container_config(spec: &Value, image_ref: &str) -> ContainerConfig {
         cpu_quota: parse_cpu_quota(cpu_request),
         cpu_shares: parse_cpu_shares(cpu_request),
         memory_limit_bytes: parse_memory_bytes(mem_request),
+        privileged: sc["privileged"].as_bool().unwrap_or(false),
+        readonly_rootfs: sc["readOnlyRootFilesystem"].as_bool().unwrap_or(false),
+        add_capabilities,
     }
 }
 
@@ -1104,6 +1173,70 @@ mod tests {
 
     fn simple_container() -> Value {
         json!({"name": "app", "image": "busybox:latest"})
+    }
+
+    #[test]
+    fn sandbox_config_reads_host_namespaces() {
+        let mut p = pod("uid-1", "web", "Always", simple_container());
+        p["spec"]["hostNetwork"] = json!(true);
+        p["spec"]["hostPID"] = json!(true);
+        let sc = build_sandbox_config(&p);
+        assert!(sc.host_network);
+        assert!(sc.host_pid);
+        assert!(!sc.host_ipc);
+    }
+
+    #[test]
+    fn resolve_volumes_maps_hostpath_and_emptydir() {
+        let p = json!({
+            "metadata": {"uid": "uid-9"},
+            "spec": {"volumes": [
+                {"name": "bpf", "hostPath": {"path": "/sys/fs/bpf", "type": "DirectoryOrCreate"}},
+                {"name": "scratch", "emptyDir": {}}
+            ]}
+        });
+        let v = resolve_volumes(&p);
+        assert_eq!(v.get("bpf").map(String::as_str), Some("/sys/fs/bpf"));
+        assert_eq!(
+            v.get("scratch").map(String::as_str),
+            Some("/var/lib/kubelet/pods/uid-9/volumes/kubernetes.io~empty-dir/scratch")
+        );
+    }
+
+    #[test]
+    fn container_config_resolves_mounts_and_security_context() {
+        let mut volumes = HashMap::new();
+        volumes.insert("bpf".to_string(), "/sys/fs/bpf".to_string());
+        let spec = json!({
+            "name": "cilium-agent",
+            "image": "cilium:latest",
+            "securityContext": {
+                "privileged": true,
+                "readOnlyRootFilesystem": true,
+                "capabilities": {"add": ["NET_ADMIN", "SYS_MODULE"]}
+            },
+            "volumeMounts": [
+                {"name": "bpf", "mountPath": "/sys/fs/bpf", "mountPropagation": "Bidirectional"},
+                {"name": "missing", "mountPath": "/nope"}
+            ]
+        });
+        let c = build_container_config(&spec, "cilium@sha", &volumes);
+        assert!(c.privileged);
+        assert!(c.readonly_rootfs);
+        assert_eq!(c.add_capabilities, vec!["NET_ADMIN", "SYS_MODULE"]);
+        // Only the resolvable mount is included; the unresolved one is dropped.
+        assert_eq!(c.mounts.len(), 1);
+        assert_eq!(c.mounts[0].host_path, "/sys/fs/bpf");
+        assert_eq!(c.mounts[0].container_path, "/sys/fs/bpf");
+        assert_eq!(c.mounts[0].propagation, MountPropagation::Bidirectional);
+    }
+
+    #[test]
+    fn container_config_defaults_are_unprivileged() {
+        let c = build_container_config(&simple_container(), "img", &HashMap::new());
+        assert!(!c.privileged);
+        assert!(c.add_capabilities.is_empty());
+        assert!(c.mounts.is_empty());
     }
 
     #[tokio::test]
