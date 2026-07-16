@@ -1,0 +1,53 @@
+#cloud-config
+# rknode1 — rustkube-node worker under test. CRI-O + CNI plugins +
+# rustkube-node kubelet/kube-proxy, pointed at the throwaway rkmaster1.
+# All provisioning in cloud-init (no post-boot SSH dependency).
+hostname: ${hostname}
+fqdn: ${fqdn}
+prefer_fqdn_over_hostname: true
+manage_etc_hosts: true
+
+users:
+  - name: ${ci_user}
+    groups: [wheel, adm, systemd-journal]
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: true
+    ssh_authorized_keys:
+%{ for key in ssh_keys ~}
+      - ${key}
+%{ endfor ~}
+
+ssh_pwauth: false
+disable_root: false
+package_update: true
+package_upgrade: false
+packages:
+  - qemu-guest-agent
+  - cri-o
+  - containernetworking-plugins
+
+write_files:
+  # kubelet: plaintext HTTP to rkmaster1, explicit NODE_NAME (systemd doesn't
+  # export HOSTNAME — see rustkube-node#4), CRI-O via CRI gRPC.
+  - path: /etc/kubernetes/kubelet
+    permissions: "0644"
+    content: |
+      APISERVER_URL=${apiserver_url}
+      NODE_NAME=${fqdn}
+      KUBELET_ARGS=--runtime=cri
+  - path: /etc/kubernetes/kube-proxy
+    permissions: "0644"
+    content: |
+      APISERVER_URL=${apiserver_url}
+      NODE_NAME=${fqdn}
+      KUBE_PROXY_ARGS=
+
+runcmd:
+  - [ systemctl, enable, --now, qemu-guest-agent ]
+  - [ systemctl, enable, --now, crio ]
+  - [ dnf, install, -y, "${rustkube_node_rpm_url}" ]
+  - [ systemctl, enable, --now, kubelet ]
+  - [ systemctl, enable, --now, kube-proxy ]
+
+final_message: "${fqdn} rustkube-node worker cloud-init complete in $UPTIME seconds"

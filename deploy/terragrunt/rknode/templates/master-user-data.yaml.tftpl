@@ -1,0 +1,75 @@
+#cloud-config
+# rkmaster1 — throwaway rustkube control plane for node testing.
+# Single-node fastetcd + kube-apiserver/controller/scheduler, PLAINTEXT
+# (the rustkube-node kubelet is HTTP-only today). Everything installs in
+# cloud-init — no dependency on post-boot SSH (the reliable rustkube pattern).
+hostname: ${hostname}
+fqdn: ${fqdn}
+prefer_fqdn_over_hostname: true
+manage_etc_hosts: true
+
+users:
+  - name: ${ci_user}
+    groups: [wheel, adm, systemd-journal]
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: true
+    ssh_authorized_keys:
+%{ for key in ssh_keys ~}
+      - ${key}
+%{ endfor ~}
+
+ssh_pwauth: false
+disable_root: false
+package_update: true
+package_upgrade: false
+packages:
+  - qemu-guest-agent
+
+write_files:
+  # Single-node fastetcd member (plaintext etcd v3 wire protocol).
+  - path: /etc/fastetcd/fastetcd.conf
+    permissions: "0644"
+    content: |
+      ETCD_NAME=${hostname}
+      ETCD_DATA_DIR=/var/lib/fastetcd/data
+      ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      ETCD_INITIAL_ADVERTISE_PEER_URLS=http://${node_ip}:2380
+      ETCD_ADVERTISE_CLIENT_URLS=http://${node_ip}:2379
+      ETCD_INITIAL_CLUSTER=${hostname}=http://${node_ip}:2380
+      ETCD_INITIAL_CLUSTER_TOKEN=rknode-test
+      ETCD_INITIAL_CLUSTER_STATE=new
+
+  # kube-apiserver: plaintext HTTP, anonymous allowed (no TLS/RBAC this phase).
+  - path: /etc/kubernetes/kube-apiserver
+    permissions: "0644"
+    content: |
+      ETCD_SERVERS=http://127.0.0.1:2379
+      KUBE_APISERVER_ARGS=
+  - path: /etc/kubernetes/kube-controller-manager
+    permissions: "0644"
+    content: |
+      APISERVER_URL=http://127.0.0.1:6443
+      KUBE_CONTROLLER_MANAGER_ARGS=
+  - path: /etc/kubernetes/kube-scheduler
+    permissions: "0644"
+    content: |
+      APISERVER_URL=http://127.0.0.1:6443
+      KUBE_SCHEDULER_ARGS=
+
+runcmd:
+  - [ systemctl, enable, --now, qemu-guest-agent ]
+  # Only make the kubernetes state dir. Do NOT pre-create the fastetcd data
+  # dir — the fastetcd RPM/service owns /var/lib/fastetcd as user `fastetcd`
+  # and creates data/ itself; a root-owned data/ makes fastetcd crashloop with
+  # "storage io: Permission denied".
+  - [ mkdir, -p, /var/lib/kubernetes ]
+  - [ dnf, install, -y, "${fastetcd_rpm_url}" ]
+  - [ systemctl, enable, --now, fastetcd ]
+  - [ dnf, install, -y, "${rustkube_rpm_url}" ]
+  - [ systemctl, enable, --now, kube-apiserver ]
+  - [ systemctl, enable, --now, kube-controller-manager ]
+  - [ systemctl, enable, --now, kube-scheduler ]
+
+final_message: "${fqdn} rustkube control plane cloud-init complete in $UPTIME seconds"
