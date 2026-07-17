@@ -43,6 +43,11 @@ impl CriGrpcClient {
         // Unix socket.
         let channel = Endpoint::try_from("http://[::1]:50051")
             .expect("static endpoint URI")
+            // Default per-request deadline: bounds any hung CRI call (e.g. a
+            // RunPodSandbox blocked on CNI) so it can't stall the sync loop.
+            // Image pulls and exec override this with their own longer/explicit
+            // deadlines below.
+            .timeout(std::time::Duration::from_secs(120))
             .connect_with_connector_lazy(tower::service_fn({
                 let path = path.clone();
                 move |_: Uri| {
@@ -60,6 +65,15 @@ impl CriGrpcClient {
             socket_path: path,
         }
     }
+}
+
+/// Wrap a message in a tonic Request with an explicit per-request deadline,
+/// overriding the channel default (used where the default is wrong — long
+/// image pulls, and exec honoring the caller's probe timeout).
+fn timed<T>(msg: T, secs: u64) -> tonic::Request<T> {
+    let mut r = tonic::Request::new(msg);
+    r.set_timeout(std::time::Duration::from_secs(secs));
+    r
 }
 
 fn rpc_err(e: tonic::Status) -> CriError {
@@ -452,14 +466,20 @@ impl RuntimeService for CriGrpcClient {
         cmd: &[String],
         timeout: i64,
     ) -> Result<ExecSyncResult, CriError> {
+        // Honor the caller's exec/probe timeout as the RPC deadline (+5s slack
+        // so the runtime returns its own timeout rather than us cancelling).
+        let deadline = timeout.max(0) as u64 + 5;
         let resp = self
             .runtime
             .clone()
-            .exec_sync(proto::ExecSyncRequest {
-                container_id: container_id.to_string(),
-                cmd: cmd.to_vec(),
-                timeout,
-            })
+            .exec_sync(timed(
+                proto::ExecSyncRequest {
+                    container_id: container_id.to_string(),
+                    cmd: cmd.to_vec(),
+                    timeout,
+                },
+                deadline,
+            ))
             .await
             .map_err(rpc_err)?
             .into_inner();
@@ -475,17 +495,21 @@ impl RuntimeService for CriGrpcClient {
 #[async_trait]
 impl ImageService for CriGrpcClient {
     async fn pull_image(&self, image: &str) -> Result<String, CriError> {
+        // Image pulls can be large — allow well beyond the 120s channel default.
         let resp = self
             .images
             .clone()
-            .pull_image(proto::PullImageRequest {
-                image: Some(proto::ImageSpec {
-                    image: image.to_string(),
-                    ..Default::default()
-                }),
-                auth: None,
-                sandbox_config: None,
-            })
+            .pull_image(timed(
+                proto::PullImageRequest {
+                    image: Some(proto::ImageSpec {
+                        image: image.to_string(),
+                        ..Default::default()
+                    }),
+                    auth: None,
+                    sandbox_config: None,
+                },
+                600,
+            ))
             .await
             .map_err(|e| CriError::ImagePull(format!("{image}: {}", e.message())))?
             .into_inner();

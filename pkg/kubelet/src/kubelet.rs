@@ -489,7 +489,36 @@ impl Kubelet {
 }
 
 fn hostname() -> String {
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("NODE_NAME"))
-        .unwrap_or_else(|_| "localhost".to_string())
+    detect_node_name()
+}
+
+/// Determine this node's name: NODE_NAME/HOSTNAME env (systemd doesn't export
+/// HOSTNAME to services, so this often misses), then the real system hostname,
+/// then "localhost" as a last resort.
+pub fn detect_node_name() -> String {
+    std::env::var("NODE_NAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+        .or_else(system_hostname)
+        .unwrap_or_else(|| "localhost".to_string())
+}
+
+/// The kernel/system hostname, independent of the (often-unset-under-systemd)
+/// HOSTNAME env var. Reads /proc on Linux, falls back to the `hostname` command.
+fn system_hostname() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    if let Ok(h) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
+        let h = h.trim();
+        if !h.is_empty() {
+            return Some(h.to_string());
+        }
+    }
+    let out = std::process::Command::new("hostname").output().ok()?;
+    let h = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if h.is_empty() {
+        None
+    } else {
+        Some(h)
+    }
 }

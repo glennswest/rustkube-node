@@ -80,6 +80,9 @@ pub struct PodManager {
     api_client: reqwest::Client,
     /// This node's IP, for the downward API `status.hostIP`.
     node_ip: String,
+    /// Kubelet state root; per-pod volume dirs live under `<state_root>/pods`.
+    /// Overridable in tests. Default `/var/lib/kubelet`.
+    state_root: String,
 }
 
 impl PodManager {
@@ -106,6 +109,7 @@ impl PodManager {
             api_url: api_url.trim_end_matches('/').to_string(),
             api_client: reqwest::Client::new(),
             node_ip: node_ip.to_string(),
+            state_root: "/var/lib/kubelet".to_string(),
         }
     }
 
@@ -259,7 +263,7 @@ impl PodManager {
                 hp.to_string()
             } else if !vol["configMap"].is_null() {
                 let cm = vol["configMap"]["name"].as_str().unwrap_or("");
-                let dir = pod_volume_dir(uid, "configmap", &name);
+                let dir = pod_volume_dir(&self.state_root, uid, "configmap", &name);
                 let data = self
                     .fetch_configmap(namespace, cm)
                     .await
@@ -268,19 +272,100 @@ impl PodManager {
                 dir
             } else if !vol["secret"].is_null() {
                 let sec = vol["secret"]["secretName"].as_str().unwrap_or("");
-                let dir = pod_volume_dir(uid, "secret", &name);
+                let dir = pod_volume_dir(&self.state_root, uid, "secret", &name);
                 let decoded = self.fetch_secret_decoded(namespace, sec).await;
                 materialize_secret_files(&dir, decoded.as_ref());
                 dir
+            } else if let Some(sources) = vol["projected"]["sources"].as_array() {
+                // Projected volume (e.g. kube-api-access: SA token + CA + downward API).
+                let dir = pod_volume_dir(&self.state_root, uid, "projected", &name);
+                let _ = std::fs::create_dir_all(&dir);
+                self.materialize_projected(pod, namespace, &dir, sources).await;
+                dir
             } else {
-                // emptyDir (and projected/other, for now): per-pod scratch dir.
-                let dir = pod_volume_dir(uid, "empty-dir", &name);
+                // emptyDir (and other unhandled types): per-pod scratch dir.
+                let dir = pod_volume_dir(&self.state_root, uid, "empty-dir", &name);
                 let _ = std::fs::create_dir_all(&dir);
                 dir
             };
             map.insert(name, host_path);
         }
         map
+    }
+
+    /// Materialize a projected volume's sources into `dir`: serviceAccountToken
+    /// (via TokenRequest, best-effort), configMap, secret, and downwardAPI.
+    async fn materialize_projected(
+        &self,
+        pod: &Value,
+        namespace: &str,
+        dir: &str,
+        sources: &[Value],
+    ) {
+        for src in sources {
+            if let Some(sat) = src.get("serviceAccountToken").filter(|v| !v.is_null()) {
+                let path = sat["path"].as_str().unwrap_or("token");
+                let sa = pod["spec"]["serviceAccountName"].as_str().unwrap_or("default");
+                let aud = sat["audience"].as_str();
+                if let Some(token) = self.request_sa_token(namespace, sa, aud).await {
+                    let _ = std::fs::write(format!("{dir}/{path}"), token);
+                }
+            } else if let Some(cm) = src.get("configMap").filter(|v| !v.is_null()) {
+                let name = cm["name"].as_str().unwrap_or("");
+                let data = self
+                    .fetch_configmap(namespace, name)
+                    .await
+                    .and_then(|o| o["data"].as_object().cloned());
+                write_projected_items(dir, cm["items"].as_array(), data.as_ref());
+            } else if let Some(sec) = src.get("secret").filter(|v| !v.is_null()) {
+                let name = sec["name"].as_str().unwrap_or("");
+                let decoded = self.fetch_secret_decoded(namespace, name).await;
+                if let Some(data) = decoded {
+                    let asmap: serde_json::Map<String, Value> =
+                        data.into_iter().map(|(k, v)| (k, Value::String(v))).collect();
+                    write_projected_items(dir, sec["items"].as_array(), Some(&asmap));
+                }
+            } else if let Some(dw) = src.get("downwardAPI").filter(|v| !v.is_null()) {
+                if let Some(items) = dw["items"].as_array() {
+                    for it in items {
+                        let path = it["path"].as_str().unwrap_or("");
+                        if let Some(fp) = it["fieldRef"]["fieldPath"].as_str() {
+                            if let Some(val) = self.downward_field(pod, fp, None) {
+                                let _ = std::fs::write(format!("{dir}/{path}"), val);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Request a ServiceAccount token via the TokenRequest API (best-effort;
+    /// None if the apiserver doesn't support it or the call fails).
+    async fn request_sa_token(
+        &self,
+        namespace: &str,
+        sa: &str,
+        audience: Option<&str>,
+    ) -> Option<String> {
+        if self.api_url.is_empty() {
+            return None;
+        }
+        let body = serde_json::json!({
+            "apiVersion": "authentication.k8s.io/v1",
+            "kind": "TokenRequest",
+            "spec": { "audiences": audience.map(|a| vec![a]).unwrap_or_default() }
+        });
+        let url = format!(
+            "{}/api/v1/namespaces/{namespace}/serviceaccounts/{sa}/token",
+            self.api_url
+        );
+        let resp = self.api_client.post(&url).json(&body).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let v: Value = resp.json().await.ok()?;
+        v["status"]["token"].as_str().map(String::from)
     }
 
     /// Sync desired pods (from API server) with actual running pods.
@@ -397,6 +482,74 @@ impl PodManager {
     }
 
     /// Start a new pod: create sandbox, pull images, create+start containers.
+    /// Run `spec.initContainers` in order, each to a successful (exit 0)
+    /// completion, before the app containers start. A non-zero exit or a
+    /// runtime error aborts pod start (the caller reports Failed; the
+    /// controller/next sync retries).
+    async fn run_init_containers(
+        &self,
+        pod: &Value,
+        sandbox_id: &str,
+        sandbox_config: &PodSandboxConfig,
+        volumes: &HashMap<String, String>,
+        pod_ip: Option<&str>,
+    ) -> Result<(), CriError> {
+        let inits = match pod["spec"]["initContainers"].as_array() {
+            Some(a) if !a.is_empty() => a.clone(),
+            _ => return Ok(()),
+        };
+        let ns = pod["metadata"]["namespace"].as_str().unwrap_or("default");
+        let name = pod["metadata"]["name"].as_str().unwrap_or("");
+
+        for spec in &inits {
+            let cname = spec["name"].as_str().unwrap_or("init");
+            let image = spec["image"].as_str().unwrap_or("");
+            info!("Init container {ns}/{name}/{cname}: pulling {image}");
+            let image_ref = self.images.pull_image(image).await?;
+            let envs = self.resolve_env(pod, spec, pod_ip).await;
+            let mounts = resolve_mounts(spec, volumes);
+            let config = build_container_config(spec, &image_ref, envs, mounts);
+            let cid = self
+                .runtime
+                .create_container(sandbox_id, &config, sandbox_config)
+                .await?;
+            self.runtime.start_container(&cid).await?;
+            info!("Init container {ns}/{name}/{cname} started, waiting for completion");
+
+            // Poll until the init container exits (bounded).
+            let mut waited = 0u64;
+            const POLL_MS: u64 = 500;
+            const MAX_WAIT_MS: u64 = 120_000;
+            loop {
+                let status = self.runtime.container_status(&cid).await?;
+                match status.state {
+                    ContainerState::Exited => {
+                        if status.exit_code != 0 {
+                            let _ = self.runtime.remove_container(&cid).await;
+                            return Err(CriError::Runtime(format!(
+                                "init container {cname} exited with code {}",
+                                status.exit_code
+                            )));
+                        }
+                        info!("Init container {ns}/{name}/{cname} completed");
+                        let _ = self.runtime.remove_container(&cid).await;
+                        break;
+                    }
+                    _ => {
+                        if waited >= MAX_WAIT_MS {
+                            let _ = self.runtime.stop_container(&cid, 5).await;
+                            let _ = self.runtime.remove_container(&cid).await;
+                            return Err(CriError::Timeout);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(POLL_MS)).await;
+                        waited += POLL_MS;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn start_pod(&self, pod: &Value) -> Result<PodStatusUpdate, CriError> {
         let name = pod["metadata"]["name"].as_str().unwrap_or("");
         let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default");
@@ -418,6 +571,11 @@ impl PodManager {
         } else {
             Some(sandbox_status.ip.clone())
         };
+
+        // Run init containers to completion (in order) before the app
+        // containers — each must exit 0. A failure aborts pod start.
+        self.run_init_containers(pod, &sandbox_id, &sandbox_config, &volumes, pod_ip.as_deref())
+            .await?;
 
         // Process containers
         let containers = pod["spec"]["containers"]
@@ -950,9 +1108,41 @@ fn build_sandbox_config(pod: &Value) -> PodSandboxConfig {
     }
 }
 
-/// Per-pod volume directory: /var/lib/kubelet/pods/<uid>/volumes/<kind>/<name>.
-fn pod_volume_dir(uid: &str, kind: &str, name: &str) -> String {
-    format!("/var/lib/kubelet/pods/{uid}/volumes/kubernetes.io~{kind}/{name}")
+/// Per-pod volume directory: <state_root>/pods/<uid>/volumes/kubernetes.io~<kind>/<name>.
+fn pod_volume_dir(state_root: &str, uid: &str, kind: &str, name: &str) -> String {
+    format!("{state_root}/pods/{uid}/volumes/kubernetes.io~{kind}/{name}")
+}
+
+/// Write projected configMap/secret source data into `dir`. With `items`,
+/// only the listed keys are written at their `path`; without, every key is
+/// written at its own name.
+fn write_projected_items(
+    dir: &str,
+    items: Option<&Vec<Value>>,
+    data: Option<&serde_json::Map<String, Value>>,
+) {
+    let data = match data {
+        Some(d) => d,
+        None => return,
+    };
+    match items {
+        Some(items) => {
+            for it in items {
+                let key = it["key"].as_str().unwrap_or("");
+                let path = it["path"].as_str().unwrap_or(key);
+                if let Some(s) = data.get(key).and_then(|v| v.as_str()) {
+                    let _ = std::fs::write(format!("{dir}/{path}"), s);
+                }
+            }
+        }
+        None => {
+            for (key, val) in data {
+                if let Some(s) = val.as_str() {
+                    let _ = std::fs::write(format!("{dir}/{key}"), s);
+                }
+            }
+        }
+    }
 }
 
 /// Write each ConfigMap data entry as a file `<dir>/<key>` (0644).
@@ -1179,6 +1369,8 @@ mod tests {
         next_id: AtomicU32,
         /// Exit code exec_sync returns (probes).
         exec_exit_code: Mutex<i32>,
+        /// Container names that exit immediately on start (init containers) → code.
+        exit_on_start: Mutex<HashMap<String, i32>>,
         removed_sandboxes: Mutex<Vec<String>>,
         removed_containers: Mutex<Vec<String>>,
     }
@@ -1193,6 +1385,23 @@ mod tests {
 
         fn set_exec_exit_code(&self, code: i32) {
             *self.exec_exit_code.lock().unwrap() = code;
+        }
+
+        /// Make a container (by name) exit with `code` immediately when started.
+        fn set_exit_on_start(&self, name: &str, code: i32) {
+            self.exit_on_start.lock().unwrap().insert(name.to_string(), code);
+        }
+
+        fn created_names(&self) -> Vec<String> {
+            let mut v: Vec<String> = self
+                .containers
+                .lock()
+                .unwrap()
+                .values()
+                .map(|c| c.name.clone())
+                .collect();
+            v.sort();
+            v
         }
 
         fn container_ids(&self) -> Vec<String> {
@@ -1283,7 +1492,13 @@ mod tests {
             let c = containers
                 .get_mut(container_id)
                 .ok_or_else(|| CriError::NotFound(container_id.to_string()))?;
-            c.state = ContainerState::Running;
+            // Init containers exit immediately on start when configured to.
+            if let Some(&code) = self.exit_on_start.lock().unwrap().get(&c.name) {
+                c.state = ContainerState::Exited;
+                c.exit_code = code;
+            } else {
+                c.state = ContainerState::Running;
+            }
             Ok(())
         }
 
@@ -1370,7 +1585,11 @@ mod tests {
 
     fn manager() -> (Arc<FakeRuntime>, PodManager) {
         let rt = Arc::new(FakeRuntime::default());
-        let mgr = PodManager::new(rt.clone(), rt.clone(), NODE);
+        let mut mgr = PodManager::new(rt.clone(), rt.clone(), NODE);
+        // Write pod volume dirs under a writable temp root in tests.
+        let tmp = std::env::temp_dir().join(format!("rk-kubelet-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        mgr.state_root = tmp.to_string_lossy().into_owned();
         (rt, mgr)
     }
 
@@ -1402,6 +1621,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn init_container_runs_before_app_and_success_starts_pod() {
+        let (rt, mgr) = manager();
+        rt.set_exit_on_start("setup", 0); // init container exits 0
+        let mut p = pod("uid-1", "web", "Always", simple_container());
+        p["spec"]["initContainers"] = json!([{"name": "setup", "image": "busybox:latest"}]);
+
+        let outcome = mgr.sync_pods(&[p]).await;
+        assert_eq!(outcome.updates.len(), 1);
+        assert_eq!(outcome.updates[0].phase, "Running");
+        // App container is created; init container was removed after completing.
+        assert_eq!(rt.created_names(), vec!["app".to_string()]);
+        assert!(rt.removed_containers.lock().unwrap().iter().any(|_| true));
+    }
+
+    #[tokio::test]
+    async fn init_container_failure_fails_pod() {
+        let (rt, mgr) = manager();
+        rt.set_exit_on_start("setup", 1); // init container exits non-zero
+        let mut p = pod("uid-1", "web", "Always", simple_container());
+        p["spec"]["initContainers"] = json!([{"name": "setup", "image": "busybox:latest"}]);
+
+        let outcome = mgr.sync_pods(&[p]).await;
+        assert_eq!(outcome.updates[0].phase, "Failed");
+        // App container never created because init failed.
+        assert!(!rt.created_names().contains(&"app".to_string()));
+    }
+
+    #[tokio::test]
+    async fn projected_volume_writes_configmap_and_downward_files() {
+        // No apiserver → SA token/configMap fetches are skipped, but the
+        // downwardAPI source is materialized from pod context.
+        let (_rt, mgr) = manager();
+        let mut p = pod("uid-5", "web", "Always", simple_container());
+        p["spec"]["volumes"] = json!([{
+            "name": "kube-api-access",
+            "projected": {"sources": [
+                {"downwardAPI": {"items": [
+                    {"path": "namespace", "fieldRef": {"fieldPath": "metadata.namespace"}}
+                ]}}
+            ]}
+        }]);
+        let v = mgr.resolve_volumes(&p).await;
+        let dir = v.get("kube-api-access").expect("projected volume resolved");
+        assert!(dir.contains("kubernetes.io~projected"));
+        // The downward file was written with the namespace.
+        let content = std::fs::read_to_string(format!("{dir}/namespace")).unwrap_or_default();
+        assert_eq!(content, "default");
+    }
+
+    #[test]
+    fn detect_node_name_prefers_env() {
+        // NODE_NAME wins when set; the function never returns empty.
+        std::env::set_var("NODE_NAME", "explicit-node");
+        assert_eq!(crate::kubelet::detect_node_name(), "explicit-node");
+        std::env::remove_var("NODE_NAME");
+        assert!(!crate::kubelet::detect_node_name().is_empty());
+    }
+
+    #[tokio::test]
     async fn resolve_volumes_maps_hostpath_and_emptydir() {
         let (_rt, mgr) = manager();
         let p = json!({
@@ -1413,10 +1691,10 @@ mod tests {
         });
         let v = mgr.resolve_volumes(&p).await;
         assert_eq!(v.get("bpf").map(String::as_str), Some("/sys/fs/bpf"));
-        assert_eq!(
-            v.get("scratch").map(String::as_str),
-            Some("/var/lib/kubelet/pods/uid-9/volumes/kubernetes.io~empty-dir/scratch")
-        );
+        assert!(v
+            .get("scratch")
+            .unwrap()
+            .ends_with("/pods/uid-9/volumes/kubernetes.io~empty-dir/scratch"));
     }
 
     #[test]

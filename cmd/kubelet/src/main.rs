@@ -62,11 +62,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let node_name = cli.node_name.clone().unwrap_or_else(|| {
-        std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("NODE_NAME"))
-            .unwrap_or_else(|_| "localhost".to_string())
-    });
+    let node_name = cli
+        .node_name
+        .clone()
+        .unwrap_or_else(kubelet::detect_node_name);
     tracing::info!(
         "kubelet starting — node={node_name} runtime={} apiserver={}",
         cli.runtime,
