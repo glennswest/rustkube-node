@@ -55,11 +55,17 @@ impl Kubelet {
             &config.node_name,
             config.pod_cidr.clone(),
         );
-        let pod_manager = Arc::new(PodManager::new(runtime, images, &config.node_name));
-
         let node_ip = crate::node_status::detect_node_ip()
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "127.0.0.1".to_string());
+
+        let pod_manager = Arc::new(PodManager::with_api(
+            runtime,
+            images,
+            &config.node_name,
+            &config.api_server_url,
+            &node_ip,
+        ));
 
         Self {
             config,

@@ -74,6 +74,12 @@ pub struct PodManager {
     images: Arc<dyn ImageService>,
     pods: RwLock<HashMap<String, PodState>>, // uid → PodState
     node_name: String,
+    /// API server base URL, for reading ConfigMaps/Secrets referenced by env
+    /// `valueFrom` and configMap/secret volumes. Empty → those reads are skipped.
+    api_url: String,
+    api_client: reqwest::Client,
+    /// This node's IP, for the downward API `status.hostIP`.
+    node_ip: String,
 }
 
 impl PodManager {
@@ -82,12 +88,199 @@ impl PodManager {
         images: Arc<dyn ImageService>,
         node_name: &str,
     ) -> Self {
+        Self::with_api(runtime, images, node_name, "", "127.0.0.1")
+    }
+
+    pub fn with_api(
+        runtime: Arc<dyn RuntimeService>,
+        images: Arc<dyn ImageService>,
+        node_name: &str,
+        api_url: &str,
+        node_ip: &str,
+    ) -> Self {
         Self {
             runtime,
             images,
             pods: RwLock::new(HashMap::new()),
             node_name: node_name.to_string(),
+            api_url: api_url.trim_end_matches('/').to_string(),
+            api_client: reqwest::Client::new(),
+            node_ip: node_ip.to_string(),
         }
+    }
+
+    /// Fetch a ConfigMap's `data` map (namespaced). None on any failure.
+    async fn fetch_configmap(&self, namespace: &str, name: &str) -> Option<Value> {
+        if self.api_url.is_empty() {
+            return None;
+        }
+        let url = format!(
+            "{}/api/v1/namespaces/{namespace}/configmaps/{name}",
+            self.api_url
+        );
+        let resp = self.api_client.get(&url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.json::<Value>().await.ok()
+    }
+
+    /// Fetch a Secret and return its `data` with values base64-decoded to strings.
+    async fn fetch_secret_decoded(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Option<HashMap<String, String>> {
+        if self.api_url.is_empty() {
+            return None;
+        }
+        let url = format!(
+            "{}/api/v1/namespaces/{namespace}/secrets/{name}",
+            self.api_url
+        );
+        let resp = self.api_client.get(&url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let obj: Value = resp.json().await.ok()?;
+        let data = obj["data"].as_object()?;
+        let mut out = HashMap::new();
+        for (k, v) in data {
+            if let Some(b64) = v.as_str() {
+                if let Ok(bytes) = base64_decode(b64) {
+                    out.insert(k.clone(), String::from_utf8_lossy(&bytes).into_owned());
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// Resolve a container's env: literal `value` plus `valueFrom`
+    /// (fieldRef downward API, configMapKeyRef, secretKeyRef).
+    async fn resolve_env(
+        &self,
+        pod: &Value,
+        container_spec: &Value,
+        pod_ip: Option<&str>,
+    ) -> Vec<(String, String)> {
+        let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default");
+        let mut out = Vec::new();
+        let env = match container_spec["env"].as_array() {
+            Some(e) => e,
+            None => return out,
+        };
+        for e in env {
+            let name = match e["name"].as_str() {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            if let Some(v) = e["value"].as_str() {
+                out.push((name, v.to_string()));
+                continue;
+            }
+            let vf = &e["valueFrom"];
+            if let Some(path) = vf["fieldRef"]["fieldPath"].as_str() {
+                if let Some(v) = self.downward_field(pod, path, pod_ip) {
+                    out.push((name, v));
+                }
+            } else if !vf["configMapKeyRef"].is_null() {
+                let cm = vf["configMapKeyRef"]["name"].as_str().unwrap_or("");
+                let key = vf["configMapKeyRef"]["key"].as_str().unwrap_or("");
+                if let Some(obj) = self.fetch_configmap(namespace, cm).await {
+                    if let Some(v) = obj["data"][key].as_str() {
+                        out.push((name, v.to_string()));
+                    }
+                }
+            } else if !vf["secretKeyRef"].is_null() {
+                let sec = vf["secretKeyRef"]["name"].as_str().unwrap_or("");
+                let key = vf["secretKeyRef"]["key"].as_str().unwrap_or("");
+                if let Some(data) = self.fetch_secret_decoded(namespace, sec).await {
+                    if let Some(v) = data.get(key) {
+                        out.push((name, v.clone()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Resolve a downward-API `fieldRef.fieldPath` against the pod + node context.
+    fn downward_field(&self, pod: &Value, path: &str, pod_ip: Option<&str>) -> Option<String> {
+        // metadata.labels['x'] / metadata.annotations['x']
+        if let Some(rest) = path.strip_prefix("metadata.labels['") {
+            let key = rest.strip_suffix("']")?;
+            return Some(pod["metadata"]["labels"][key].as_str().unwrap_or("").to_string());
+        }
+        if let Some(rest) = path.strip_prefix("metadata.annotations['") {
+            let key = rest.strip_suffix("']")?;
+            return Some(
+                pod["metadata"]["annotations"][key]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+            );
+        }
+        let v = match path {
+            "metadata.name" => pod["metadata"]["name"].as_str().unwrap_or("").to_string(),
+            "metadata.namespace" => pod["metadata"]["namespace"].as_str().unwrap_or("default").to_string(),
+            "metadata.uid" => pod["metadata"]["uid"].as_str().unwrap_or("").to_string(),
+            "spec.nodeName" => self.node_name.clone(),
+            "spec.serviceAccountName" => pod["spec"]["serviceAccountName"]
+                .as_str()
+                .unwrap_or("default")
+                .to_string(),
+            "status.hostIP" => self.node_ip.clone(),
+            "status.podIP" => pod_ip.unwrap_or("").to_string(),
+            _ => return None,
+        };
+        Some(v)
+    }
+
+    /// Resolve `spec.volumes` to host paths, materializing configMap/secret
+    /// volumes to files under the pod dir. hostPath/emptyDir handled inline.
+    async fn resolve_volumes(&self, pod: &Value) -> HashMap<String, String> {
+        let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
+        let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default");
+        let mut map = HashMap::new();
+        let volumes = match pod["spec"]["volumes"].as_array() {
+            Some(v) => v,
+            None => return map,
+        };
+        for vol in volumes {
+            let name = match vol["name"].as_str() {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            let host_path = if let Some(hp) = vol["hostPath"]["path"].as_str() {
+                let typ = vol["hostPath"]["type"].as_str().unwrap_or("");
+                if matches!(typ, "DirectoryOrCreate" | "Directory" | "") {
+                    let _ = std::fs::create_dir_all(hp);
+                }
+                hp.to_string()
+            } else if !vol["configMap"].is_null() {
+                let cm = vol["configMap"]["name"].as_str().unwrap_or("");
+                let dir = pod_volume_dir(uid, "configmap", &name);
+                let data = self
+                    .fetch_configmap(namespace, cm)
+                    .await
+                    .and_then(|o| o["data"].as_object().cloned());
+                materialize_files(&dir, data.as_ref(), false);
+                dir
+            } else if !vol["secret"].is_null() {
+                let sec = vol["secret"]["secretName"].as_str().unwrap_or("");
+                let dir = pod_volume_dir(uid, "secret", &name);
+                let decoded = self.fetch_secret_decoded(namespace, sec).await;
+                materialize_secret_files(&dir, decoded.as_ref());
+                dir
+            } else {
+                // emptyDir (and projected/other, for now): per-pod scratch dir.
+                let dir = pod_volume_dir(uid, "empty-dir", &name);
+                let _ = std::fs::create_dir_all(&dir);
+                dir
+            };
+            map.insert(name, host_path);
+        }
+        map
     }
 
     /// Sync desired pods (from API server) with actual running pods.
@@ -212,7 +405,7 @@ impl PodManager {
         info!("Starting pod {namespace}/{name}");
 
         let sandbox_config = build_sandbox_config(pod);
-        let volumes = resolve_volumes(pod);
+        let volumes = self.resolve_volumes(pod).await;
 
         // Create pod sandbox
         let sandbox_id = self.runtime.run_pod_sandbox(&sandbox_config).await?;
@@ -245,8 +438,11 @@ impl PodManager {
             info!("Pulling image {image} for {namespace}/{name}/{container_name}");
             let image_ref = self.images.pull_image(image).await?;
 
-            // Build container config
-            let container_config = build_container_config(container_spec, &image_ref, &volumes);
+            // Build container config (resolve env valueFrom + mounts first).
+            let envs = self.resolve_env(pod, container_spec, pod_ip.as_deref()).await;
+            let mounts = resolve_mounts(container_spec, &volumes);
+            let container_config =
+                build_container_config(container_spec, &image_ref, envs, mounts);
 
             // Create container
             let container_id = self
@@ -579,10 +775,14 @@ impl PodManager {
         };
 
         let image = spec["image"].as_str().unwrap_or("");
-        let volumes = resolve_volumes(&state.pod);
-        let result = async {
+        let volumes = self.resolve_volumes(&state.pod).await;
+        let envs = self
+            .resolve_env(&state.pod, spec, state.pod_ip.as_deref())
+            .await;
+        let mounts = resolve_mounts(spec, &volumes);
+        let result = async move {
             let image_ref = self.images.pull_image(image).await?;
-            let mut config = build_container_config(spec, &image_ref, &volumes);
+            let mut config = build_container_config(spec, &image_ref, envs, mounts);
             config.attempt = restart_count;
             let cid = self
                 .runtime
@@ -750,44 +950,93 @@ fn build_sandbox_config(pod: &Value) -> PodSandboxConfig {
     }
 }
 
-/// Resolve a pod's `spec.volumes` to host paths keyed by volume name, for the
-/// volume types we can back with a host directory today:
-///   - `hostPath`   → the given host path (created if `type` requests it)
-///   - `emptyDir`   → a per-pod scratch dir under /var/lib/kubelet
-/// configMap/secret/projected are not materialized yet (they need apiserver
-/// reads) — a mount referencing them resolves to an empty per-pod dir so the
-/// container still starts. Returns name → host_path.
-fn resolve_volumes(pod: &Value) -> HashMap<String, String> {
-    let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
-    let mut map = HashMap::new();
-    let volumes = match pod["spec"]["volumes"].as_array() {
-        Some(v) => v,
-        None => return map,
-    };
-    for vol in volumes {
-        let name = match vol["name"].as_str() {
-            Some(n) => n.to_string(),
-            None => continue,
-        };
-        let host_path = if let Some(hp) = vol["hostPath"]["path"].as_str() {
-            // hostPath.type: DirectoryOrCreate/Directory create the dir.
-            let typ = vol["hostPath"]["type"].as_str().unwrap_or("");
-            if matches!(typ, "DirectoryOrCreate" | "Directory" | "") {
-                let _ = std::fs::create_dir_all(hp);
+/// Per-pod volume directory: /var/lib/kubelet/pods/<uid>/volumes/<kind>/<name>.
+fn pod_volume_dir(uid: &str, kind: &str, name: &str) -> String {
+    format!("/var/lib/kubelet/pods/{uid}/volumes/kubernetes.io~{kind}/{name}")
+}
+
+/// Write each ConfigMap data entry as a file `<dir>/<key>` (0644).
+fn materialize_files(dir: &str, data: Option<&serde_json::Map<String, Value>>, _binary: bool) {
+    let _ = std::fs::create_dir_all(dir);
+    if let Some(data) = data {
+        for (key, val) in data {
+            if let Some(s) = val.as_str() {
+                let _ = std::fs::write(format!("{dir}/{key}"), s);
             }
-            hp.to_string()
-        } else {
-            // emptyDir (and, for now, configMap/secret/projected fallback):
-            // a per-pod scratch directory.
-            let dir = format!(
-                "/var/lib/kubelet/pods/{uid}/volumes/kubernetes.io~empty-dir/{name}"
-            );
-            let _ = std::fs::create_dir_all(&dir);
-            dir
-        };
-        map.insert(name, host_path);
+        }
     }
-    map
+}
+
+/// Write decoded Secret entries as files `<dir>/<key>` (0600 best-effort).
+fn materialize_secret_files(dir: &str, data: Option<&HashMap<String, String>>) {
+    let _ = std::fs::create_dir_all(dir);
+    if let Some(data) = data {
+        for (key, val) in data {
+            let path = format!("{dir}/{key}");
+            let _ = std::fs::write(&path, val);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+}
+
+/// Minimal standard base64 decode (Secret data is standard-alphabet base64).
+fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::new();
+    let mut buf = 0u32;
+    let mut bits = 0u8;
+    for &c in s.as_bytes() {
+        if c == b'=' || c == b'\n' || c == b'\r' {
+            continue;
+        }
+        let v = val(c).ok_or(())?;
+        buf = (buf << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// Resolve a container's `volumeMounts` to CRI mounts using the pod's resolved
+/// volumes. Mounts whose volume didn't resolve are dropped.
+fn resolve_mounts(spec: &Value, volumes: &HashMap<String, String>) -> Vec<Mount> {
+    spec["volumeMounts"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| {
+                    let vol_name = m["name"].as_str().unwrap_or("");
+                    let host_path = volumes.get(vol_name)?.clone();
+                    Some(Mount {
+                        container_path: m["mountPath"].as_str().unwrap_or("").to_string(),
+                        host_path,
+                        readonly: m["readOnly"].as_bool().unwrap_or(false),
+                        propagation: match m["mountPropagation"].as_str() {
+                            Some("Bidirectional") => MountPropagation::Bidirectional,
+                            Some("HostToContainer") => MountPropagation::HostToContainer,
+                            _ => MountPropagation::Private,
+                        },
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn probe_initial_delay(probe: &Value) -> u64 {
@@ -809,10 +1058,14 @@ fn extract_labels(pod: &Value) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
+/// Build the CRI container config from the spec, with env and mounts already
+/// resolved (env `valueFrom` + configMap/secret volumes need async apiserver
+/// reads, done by the caller).
 fn build_container_config(
     spec: &Value,
     image_ref: &str,
-    volumes: &HashMap<String, String>,
+    envs: Vec<(String, String)>,
+    mounts: Vec<Mount>,
 ) -> ContainerConfig {
     let name = spec["name"].as_str().unwrap_or("unnamed").to_string();
 
@@ -824,44 +1077,6 @@ fn build_container_config(
     let args: Vec<String> = spec["args"]
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-        .unwrap_or_default();
-
-    let envs: Vec<(String, String)> = spec["env"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .map(|e| {
-                    (
-                        e["name"].as_str().unwrap_or("").to_string(),
-                        e["value"].as_str().unwrap_or("").to_string(),
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let mounts: Vec<Mount> = spec["volumeMounts"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|m| {
-                    let vol_name = m["name"].as_str().unwrap_or("");
-                    // Skip mounts whose volume we couldn't resolve to a host
-                    // path rather than bind-mounting an empty string.
-                    let host_path = volumes.get(vol_name)?.clone();
-                    Some(Mount {
-                        container_path: m["mountPath"].as_str().unwrap_or("").to_string(),
-                        host_path,
-                        readonly: m["readOnly"].as_bool().unwrap_or(false),
-                        propagation: match m["mountPropagation"].as_str() {
-                            Some("Bidirectional") => MountPropagation::Bidirectional,
-                            Some("HostToContainer") => MountPropagation::HostToContainer,
-                            _ => MountPropagation::Private,
-                        },
-                    })
-                })
-                .collect()
-        })
         .unwrap_or_default();
 
     let sc = &spec["securityContext"];
@@ -1186,8 +1401,9 @@ mod tests {
         assert!(!sc.host_ipc);
     }
 
-    #[test]
-    fn resolve_volumes_maps_hostpath_and_emptydir() {
+    #[tokio::test]
+    async fn resolve_volumes_maps_hostpath_and_emptydir() {
+        let (_rt, mgr) = manager();
         let p = json!({
             "metadata": {"uid": "uid-9"},
             "spec": {"volumes": [
@@ -1195,7 +1411,7 @@ mod tests {
                 {"name": "scratch", "emptyDir": {}}
             ]}
         });
-        let v = resolve_volumes(&p);
+        let v = mgr.resolve_volumes(&p).await;
         assert_eq!(v.get("bpf").map(String::as_str), Some("/sys/fs/bpf"));
         assert_eq!(
             v.get("scratch").map(String::as_str),
@@ -1220,7 +1436,8 @@ mod tests {
                 {"name": "missing", "mountPath": "/nope"}
             ]
         });
-        let c = build_container_config(&spec, "cilium@sha", &volumes);
+        let mounts = resolve_mounts(&spec, &volumes);
+        let c = build_container_config(&spec, "cilium@sha", vec![], mounts);
         assert!(c.privileged);
         assert!(c.readonly_rootfs);
         assert_eq!(c.add_capabilities, vec!["NET_ADMIN", "SYS_MODULE"]);
@@ -1233,10 +1450,40 @@ mod tests {
 
     #[test]
     fn container_config_defaults_are_unprivileged() {
-        let c = build_container_config(&simple_container(), "img", &HashMap::new());
+        let c = build_container_config(&simple_container(), "img", vec![], vec![]);
         assert!(!c.privileged);
         assert!(c.add_capabilities.is_empty());
         assert!(c.mounts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_env_literal_and_downward_api() {
+        let (_rt, mgr) = manager(); // node_name = "test-node", no apiserver
+        let mut p = pod("uid-7", "web", "Always", simple_container());
+        p["metadata"]["labels"]["tier"] = json!("frontend");
+        let container = json!({
+            "name": "app",
+            "env": [
+                {"name": "LITERAL", "value": "hi"},
+                {"name": "NODE", "valueFrom": {"fieldRef": {"fieldPath": "spec.nodeName"}}},
+                {"name": "NS", "valueFrom": {"fieldRef": {"fieldPath": "metadata.namespace"}}},
+                {"name": "POD_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}}},
+                {"name": "TIER", "valueFrom": {"fieldRef": {"fieldPath": "metadata.labels['tier']"}}}
+            ]
+        });
+        let env = mgr.resolve_env(&p, &container, Some("10.1.2.3")).await;
+        let m: HashMap<_, _> = env.into_iter().collect();
+        assert_eq!(m.get("LITERAL").map(String::as_str), Some("hi"));
+        assert_eq!(m.get("NODE").map(String::as_str), Some(NODE));
+        assert_eq!(m.get("NS").map(String::as_str), Some("default"));
+        assert_eq!(m.get("POD_IP").map(String::as_str), Some("10.1.2.3"));
+        assert_eq!(m.get("TIER").map(String::as_str), Some("frontend"));
+    }
+
+    #[test]
+    fn base64_decode_roundtrip() {
+        // "hunter2" base64 == "aHVudGVyMg=="
+        assert_eq!(base64_decode("aHVudGVyMg==").unwrap(), b"hunter2");
     }
 
     #[tokio::test]
