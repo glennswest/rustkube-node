@@ -368,6 +368,49 @@ impl PodManager {
         v["status"]["token"].as_str().map(String::from)
     }
 
+    /// Standard in-cluster apiserver-discovery env vars. Points at the
+    /// apiserver the kubelet uses (there is no Service routing yet, so the
+    /// upstream 10.96.0.1 ClusterIP would be unreachable).
+    fn service_account_env(&self) -> Vec<(String, String)> {
+        let (host, port) = apiserver_host_port(&self.api_url);
+        vec![
+            ("KUBERNETES_SERVICE_HOST".into(), host),
+            ("KUBERNETES_SERVICE_PORT".into(), port.clone()),
+            ("KUBERNETES_SERVICE_PORT_HTTPS".into(), port),
+        ]
+    }
+
+    /// Default ServiceAccount credential mount at
+    /// `/var/run/secrets/kubernetes.io/serviceaccount` (token/ca.crt/namespace),
+    /// used when the apiserver's SA admission did NOT already inject a
+    /// projected `kube-api-access` volume and automount isn't disabled.
+    async fn service_account_mount(&self, pod: &Value) -> Option<Mount> {
+        if pod["spec"]["automountServiceAccountToken"].as_bool() == Some(false) {
+            return None;
+        }
+        if pod_mounts_sa_path(pod) {
+            return None; // SA admission already provided it — don't double-mount.
+        }
+        let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
+        let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default");
+        let sa = pod["spec"]["serviceAccountName"].as_str().unwrap_or("default");
+
+        let dir = pod_volume_dir(&self.state_root, uid, "secret", "kube-api-access");
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(format!("{dir}/namespace"), namespace);
+        if let Some(token) = self.request_sa_token(namespace, sa, None).await {
+            let _ = std::fs::write(format!("{dir}/token"), token);
+        }
+        // ca.crt: the cluster CA would go here once the apiserver serves TLS.
+
+        Some(Mount {
+            container_path: SA_MOUNT_PATH.to_string(),
+            host_path: dir,
+            readonly: true,
+            propagation: MountPropagation::Private,
+        })
+    }
+
     /// Sync desired pods (from API server) with actual running pods.
     ///
     /// Starts new pods, checks running ones (probes, restarts), and stops pods
@@ -486,6 +529,7 @@ impl PodManager {
     /// completion, before the app containers start. A non-zero exit or a
     /// runtime error aborts pod start (the caller reports Failed; the
     /// controller/next sync retries).
+    #[allow(clippy::too_many_arguments)]
     async fn run_init_containers(
         &self,
         pod: &Value,
@@ -493,6 +537,7 @@ impl PodManager {
         sandbox_config: &PodSandboxConfig,
         volumes: &HashMap<String, String>,
         pod_ip: Option<&str>,
+        sa_mount: &Option<Mount>,
     ) -> Result<(), CriError> {
         let inits = match pod["spec"]["initContainers"].as_array() {
             Some(a) if !a.is_empty() => a.clone(),
@@ -506,8 +551,10 @@ impl PodManager {
             let image = spec["image"].as_str().unwrap_or("");
             info!("Init container {ns}/{name}/{cname}: pulling {image}");
             let image_ref = self.images.pull_image(image).await?;
-            let envs = self.resolve_env(pod, spec, pod_ip).await;
-            let mounts = resolve_mounts(spec, volumes);
+            let mut envs = self.resolve_env(pod, spec, pod_ip).await;
+            merge_env(&mut envs, self.service_account_env());
+            let mut mounts = resolve_mounts(spec, volumes);
+            push_mount(&mut mounts, sa_mount.clone());
             let config = build_container_config(spec, &image_ref, envs, mounts);
             let cid = self
                 .runtime
@@ -572,10 +619,21 @@ impl PodManager {
             Some(sandbox_status.ip.clone())
         };
 
+        // Default ServiceAccount credential mount (token/ca/namespace),
+        // computed once per pod and injected into every container.
+        let sa_mount = self.service_account_mount(pod).await;
+
         // Run init containers to completion (in order) before the app
         // containers — each must exit 0. A failure aborts pod start.
-        self.run_init_containers(pod, &sandbox_id, &sandbox_config, &volumes, pod_ip.as_deref())
-            .await?;
+        self.run_init_containers(
+            pod,
+            &sandbox_id,
+            &sandbox_config,
+            &volumes,
+            pod_ip.as_deref(),
+            &sa_mount,
+        )
+        .await?;
 
         // Process containers
         let containers = pod["spec"]["containers"]
@@ -596,9 +654,12 @@ impl PodManager {
             info!("Pulling image {image} for {namespace}/{name}/{container_name}");
             let image_ref = self.images.pull_image(image).await?;
 
-            // Build container config (resolve env valueFrom + mounts first).
-            let envs = self.resolve_env(pod, container_spec, pod_ip.as_deref()).await;
-            let mounts = resolve_mounts(container_spec, &volumes);
+            // Build container config (resolve env valueFrom + mounts, then
+            // inject the SA credential mount + KUBERNETES_SERVICE_* env).
+            let mut envs = self.resolve_env(pod, container_spec, pod_ip.as_deref()).await;
+            merge_env(&mut envs, self.service_account_env());
+            let mut mounts = resolve_mounts(container_spec, &volumes);
+            push_mount(&mut mounts, sa_mount.clone());
             let container_config =
                 build_container_config(container_spec, &image_ref, envs, mounts);
 
@@ -934,10 +995,12 @@ impl PodManager {
 
         let image = spec["image"].as_str().unwrap_or("");
         let volumes = self.resolve_volumes(&state.pod).await;
-        let envs = self
+        let mut envs = self
             .resolve_env(&state.pod, spec, state.pod_ip.as_deref())
             .await;
-        let mounts = resolve_mounts(spec, &volumes);
+        merge_env(&mut envs, self.service_account_env());
+        let mut mounts = resolve_mounts(spec, &volumes);
+        push_mount(&mut mounts, self.service_account_mount(&state.pod).await);
         let result = async move {
             let image_ref = self.images.pull_image(image).await?;
             let mut config = build_container_config(spec, &image_ref, envs, mounts);
@@ -1111,6 +1174,60 @@ fn build_sandbox_config(pod: &Value) -> PodSandboxConfig {
 /// Per-pod volume directory: <state_root>/pods/<uid>/volumes/kubernetes.io~<kind>/<name>.
 fn pod_volume_dir(state_root: &str, uid: &str, kind: &str, name: &str) -> String {
     format!("{state_root}/pods/{uid}/volumes/kubernetes.io~{kind}/{name}")
+}
+
+/// Standard in-cluster ServiceAccount credential mount path.
+const SA_MOUNT_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
+
+/// Whether any container already mounts the SA credential path (i.e. the
+/// apiserver's SA admission injected a `kube-api-access` projected volume).
+fn pod_mounts_sa_path(pod: &Value) -> bool {
+    for key in ["containers", "initContainers"] {
+        if let Some(cs) = pod["spec"][key].as_array() {
+            for c in cs {
+                if let Some(vm) = c["volumeMounts"].as_array() {
+                    if vm
+                        .iter()
+                        .any(|m| m["mountPath"].as_str() == Some(SA_MOUNT_PATH))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Parse host + port from the apiserver URL (`http://host:port` → ("host","port")).
+fn apiserver_host_port(api_url: &str) -> (String, String) {
+    let rest = api_url
+        .strip_prefix("https://")
+        .or_else(|| api_url.strip_prefix("http://"))
+        .unwrap_or(api_url);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    match authority.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.to_string()),
+        None => (authority.to_string(), "6443".to_string()),
+    }
+}
+
+/// Append `additions` env pairs whose keys aren't already present in `envs`.
+fn merge_env(envs: &mut Vec<(String, String)>, additions: Vec<(String, String)>) {
+    for (k, v) in additions {
+        if !envs.iter().any(|(ek, _)| ek == &k) {
+            envs.push((k, v));
+        }
+    }
+}
+
+/// Append `mount` unless a mount for the same container_path already exists.
+fn push_mount(mounts: &mut Vec<Mount>, mount: Option<Mount>) {
+    if let Some(m) = mount {
+        if !mounts.iter().any(|x| x.container_path == m.container_path) {
+            mounts.push(m);
+        }
+    }
 }
 
 /// Write projected configMap/secret source data into `dir`. With `items`,
@@ -1371,6 +1488,8 @@ mod tests {
         exec_exit_code: Mutex<i32>,
         /// Container names that exit immediately on start (init containers) → code.
         exit_on_start: Mutex<HashMap<String, i32>>,
+        /// The most recent ContainerConfig passed to create_container.
+        last_container_config: Mutex<Option<ContainerConfig>>,
         removed_sandboxes: Mutex<Vec<String>>,
         removed_containers: Mutex<Vec<String>>,
     }
@@ -1406,6 +1525,10 @@ mod tests {
 
         fn container_ids(&self) -> Vec<String> {
             self.containers.lock().unwrap().keys().cloned().collect()
+        }
+
+        fn last_container_config(&self) -> Option<ContainerConfig> {
+            self.last_container_config.lock().unwrap().clone()
         }
 
         fn live_sandbox_count(&self) -> usize {
@@ -1474,6 +1597,7 @@ mod tests {
             config: &ContainerConfig,
             _sandbox_config: &PodSandboxConfig,
         ) -> Result<String, CriError> {
+            *self.last_container_config.lock().unwrap() = Some(config.clone());
             let id = format!("c-{}-{}", config.name, self.next_id.fetch_add(1, Ordering::SeqCst));
             self.containers.lock().unwrap().insert(
                 id.clone(),
@@ -1668,6 +1792,62 @@ mod tests {
         // The downward file was written with the namespace.
         let content = std::fs::read_to_string(format!("{dir}/namespace")).unwrap_or_default();
         assert_eq!(content, "default");
+    }
+
+    #[test]
+    fn apiserver_host_port_parsing() {
+        assert_eq!(
+            apiserver_host_port("http://192.168.8.98:6443"),
+            ("192.168.8.98".to_string(), "6443".to_string())
+        );
+        assert_eq!(
+            apiserver_host_port("https://api.example.com:443/foo"),
+            ("api.example.com".to_string(), "443".to_string())
+        );
+    }
+
+    #[test]
+    fn pod_mounts_sa_path_detects_projected_mount() {
+        let with = json!({"spec": {"containers": [
+            {"name": "c", "volumeMounts": [{"name": "kube-api-access", "mountPath": SA_MOUNT_PATH}]}
+        ]}});
+        let without = json!({"spec": {"containers": [
+            {"name": "c", "volumeMounts": [{"name": "data", "mountPath": "/data"}]}
+        ]}});
+        assert!(pod_mounts_sa_path(&with));
+        assert!(!pod_mounts_sa_path(&without));
+    }
+
+    #[tokio::test]
+    async fn service_account_mount_default_and_opt_out() {
+        let (_rt, mgr) = manager(); // no apiserver → token skipped, but ns written
+        // Default pod: gets an SA mount at the standard path.
+        let p = pod("uid-2", "web", "Always", simple_container());
+        let m = mgr.service_account_mount(&p).await.expect("sa mount");
+        assert_eq!(m.container_path, SA_MOUNT_PATH);
+        assert!(m.readonly);
+        assert_eq!(
+            std::fs::read_to_string(format!("{}/namespace", m.host_path)).unwrap_or_default(),
+            "default"
+        );
+        // automountServiceAccountToken: false → no mount.
+        let mut off = pod("uid-3", "web", "Always", simple_container());
+        off["spec"]["automountServiceAccountToken"] = json!(false);
+        assert!(mgr.service_account_mount(&off).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn service_account_env_injected_into_container() {
+        let (rt, mgr) = manager();
+        let p = pod("uid-4", "web", "Always", simple_container());
+        mgr.sync_pods(&[p]).await;
+        // The created app container has the KUBERNETES_SERVICE_* env + SA mount.
+        let cfg = rt.last_container_config().expect("a container was created");
+        assert!(cfg
+            .envs
+            .iter()
+            .any(|(k, _)| k == "KUBERNETES_SERVICE_HOST"));
+        assert!(cfg.mounts.iter().any(|m| m.container_path == SA_MOUNT_PATH));
     }
 
     #[test]
