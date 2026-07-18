@@ -12,6 +12,8 @@ pub struct NodeReporter {
     node_name: String,
     /// Pod CIDR assigned to this node, written to `spec.podCIDR` when set.
     pod_cidr: Option<String>,
+    /// Container runtime version string (e.g. `cri-o://1.32.0`) for nodeInfo.
+    runtime_version: String,
     client: reqwest::Client,
 }
 
@@ -25,8 +27,17 @@ impl NodeReporter {
             api_url: api_url.trim_end_matches('/').to_string(),
             node_name: node_name.to_string(),
             pod_cidr,
+            runtime_version: "cri-o://unknown".to_string(),
             client: reqwest::Client::new(),
         }
+    }
+
+    /// Set the container runtime version reported in nodeInfo.
+    pub fn with_runtime_version(mut self, v: String) -> Self {
+        if !v.is_empty() {
+            self.runtime_version = v;
+        }
+        self
     }
 
     /// The Node object metadata (name + labels) reported to the API server.
@@ -209,7 +220,7 @@ impl NodeReporter {
                 "bootID": "",
                 "kernelVersion": "",
                 "osImage": format!("rustkube ({} {})", std::env::consts::OS, std::env::consts::ARCH),
-                "containerRuntimeVersion": "containerd://unknown",
+                "containerRuntimeVersion": &self.runtime_version,
                 "kubeletVersion": format!("v1.32.0-rustkube+{}", apimachinery::VERSION),
                 "kubeProxyVersion": format!("v1.32.0-rustkube+{}", apimachinery::VERSION),
                 "operatingSystem": go_os(),

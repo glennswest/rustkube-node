@@ -38,7 +38,7 @@ pub struct Kubelet {
     config: KubeletConfig,
     pod_manager: Arc<PodManager>,
     migration: Arc<dyn MigrationService>,
-    reporter: NodeReporter,
+    runtime: Arc<dyn RuntimeService>,
     api_client: reqwest::Client,
     node_ip: String,
 }
@@ -50,17 +50,12 @@ impl Kubelet {
         images: Arc<dyn ImageService>,
         migration: Arc<dyn MigrationService>,
     ) -> Self {
-        let reporter = NodeReporter::with_pod_cidr(
-            &config.api_server_url,
-            &config.node_name,
-            config.pod_cidr.clone(),
-        );
         let node_ip = crate::node_status::detect_node_ip()
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "127.0.0.1".to_string());
 
         let pod_manager = Arc::new(PodManager::with_api(
-            runtime,
+            runtime.clone(),
             images,
             &config.node_name,
             &config.api_server_url,
@@ -71,7 +66,7 @@ impl Kubelet {
             config,
             pod_manager,
             migration,
-            reporter,
+            runtime,
             api_client: reqwest::Client::new(),
             node_ip,
         }
@@ -81,8 +76,23 @@ impl Kubelet {
     pub async fn run(&self) -> anyhow::Result<()> {
         info!("Kubelet starting for node {}", self.config.node_name);
 
+        // Query the container runtime version for nodeInfo (e.g. cri-o://1.32.0).
+        let runtime_version = match self.runtime.version().await {
+            Ok((name, version, _)) => format!("{name}://{version}"),
+            Err(e) => {
+                warn!("Could not get runtime version: {e}");
+                "cri-o://unknown".to_string()
+            }
+        };
+
         // Register node
-        self.reporter.register().await?;
+        let reporter = NodeReporter::with_pod_cidr(
+            &self.config.api_server_url,
+            &self.config.node_name,
+            self.config.pod_cidr.clone(),
+        )
+        .with_runtime_version(runtime_version.clone());
+        reporter.register().await?;
 
         // Spawn heartbeat task
         let reporter_url = self.config.api_server_url.clone();
@@ -90,7 +100,8 @@ impl Kubelet {
         let pod_cidr = self.config.pod_cidr.clone();
         let heartbeat_interval = self.config.heartbeat_interval;
         tokio::spawn(async move {
-            let reporter = NodeReporter::with_pod_cidr(&reporter_url, &node_name, pod_cidr);
+            let reporter = NodeReporter::with_pod_cidr(&reporter_url, &node_name, pod_cidr)
+                .with_runtime_version(runtime_version);
             let mut interval = time::interval(heartbeat_interval);
             loop {
                 interval.tick().await;

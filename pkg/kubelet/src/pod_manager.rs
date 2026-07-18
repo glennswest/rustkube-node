@@ -8,7 +8,7 @@
 //! drive container restarts and readiness.
 
 use crate::cri::{
-    ContainerConfig, ContainerState, CriError, ImageService, Mount, MountPropagation,
+    ContainerConfig, ContainerState, CriError, ImageInfo, ImageService, Mount, MountPropagation,
     PodSandboxConfig, RuntimeService,
 };
 use crate::health::{run_probe, ProbeResult};
@@ -549,8 +549,8 @@ impl PodManager {
         for spec in &inits {
             let cname = spec["name"].as_str().unwrap_or("init");
             let image = spec["image"].as_str().unwrap_or("");
-            info!("Init container {ns}/{name}/{cname}: pulling {image}");
-            let image_ref = self.images.pull_image(image).await?;
+            info!("Init container {ns}/{name}/{cname}: ensuring image {image}");
+            let image_ref = self.ensure_image(image, spec).await?;
             let mut envs = self.resolve_env(pod, spec, pod_ip).await;
             merge_env(&mut envs, self.service_account_env());
             let mut mounts = resolve_mounts(spec, volumes);
@@ -595,6 +595,24 @@ impl PodManager {
             }
         }
         Ok(())
+    }
+
+    /// Ensure a container image is available per its `imagePullPolicy`:
+    /// Always pulls; IfNotPresent pulls only if absent; Never fails if absent.
+    async fn ensure_image(&self, image: &str, spec: &Value) -> Result<String, CriError> {
+        match effective_pull_policy(spec, image) {
+            "Never" => match self.images.image_status(image).await? {
+                Some(info) => Ok(image_present_ref(&info, image)),
+                None => Err(CriError::ImagePull(format!(
+                    "image {image} not present and imagePullPolicy is Never"
+                ))),
+            },
+            "IfNotPresent" => match self.images.image_status(image).await {
+                Ok(Some(info)) => Ok(image_present_ref(&info, image)),
+                _ => self.images.pull_image(image).await,
+            },
+            _ => self.images.pull_image(image).await, // Always
+        }
     }
 
     async fn start_pod(&self, pod: &Value) -> Result<PodStatusUpdate, CriError> {
@@ -650,9 +668,9 @@ impl PodManager {
             let container_name = container_spec["name"].as_str().unwrap_or("unnamed");
             let image = container_spec["image"].as_str().unwrap_or("");
 
-            // Pull image
-            info!("Pulling image {image} for {namespace}/{name}/{container_name}");
-            let image_ref = self.images.pull_image(image).await?;
+            // Ensure image per imagePullPolicy
+            info!("Ensuring image {image} for {namespace}/{name}/{container_name}");
+            let image_ref = self.ensure_image(image, container_spec).await?;
 
             // Build container config (resolve env valueFrom + mounts, then
             // inject the SA credential mount + KUBERNETES_SERVICE_* env).
@@ -1002,7 +1020,7 @@ impl PodManager {
         let mut mounts = resolve_mounts(spec, &volumes);
         push_mount(&mut mounts, self.service_account_mount(&state.pod).await);
         let result = async move {
-            let image_ref = self.images.pull_image(image).await?;
+            let image_ref = self.ensure_image(image, spec).await?;
             let mut config = build_container_config(spec, &image_ref, envs, mounts);
             config.attempt = restart_count;
             let cid = self
@@ -1178,6 +1196,35 @@ fn pod_volume_dir(state_root: &str, uid: &str, kind: &str, name: &str) -> String
 
 /// Standard in-cluster ServiceAccount credential mount path.
 const SA_MOUNT_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
+
+/// Effective imagePullPolicy for a container: explicit value, else the K8s
+/// default (Always for an untagged or `:latest` image, IfNotPresent otherwise).
+fn effective_pull_policy(spec: &Value, image: &str) -> &'static str {
+    match spec["imagePullPolicy"].as_str() {
+        Some("Always") => "Always",
+        Some("Never") => "Never",
+        Some("IfNotPresent") => "IfNotPresent",
+        _ => {
+            let after_host = image.rsplit_once('/').map(|(_, r)| r).unwrap_or(image);
+            if !after_host.contains(':') || after_host.ends_with(":latest") {
+                "Always"
+            } else {
+                "IfNotPresent"
+            }
+        }
+    }
+}
+
+/// A reference for an already-present image: prefer a repo digest, then the
+/// image id, then the requested name.
+fn image_present_ref(info: &ImageInfo, image: &str) -> String {
+    info.repo_digests
+        .first()
+        .cloned()
+        .filter(|s| !s.is_empty())
+        .or_else(|| (!info.id.is_empty()).then(|| info.id.clone()))
+        .unwrap_or_else(|| image.to_string())
+}
 
 /// Whether any container already mounts the SA credential path (i.e. the
 /// apiserver's SA admission injected a `kube-api-access` projected volume).
@@ -1792,6 +1839,19 @@ mod tests {
         // The downward file was written with the namespace.
         let content = std::fs::read_to_string(format!("{dir}/namespace")).unwrap_or_default();
         assert_eq!(content, "default");
+    }
+
+    #[test]
+    fn pull_policy_defaults_and_explicit() {
+        // Explicit wins.
+        assert_eq!(effective_pull_policy(&json!({"imagePullPolicy": "Never"}), "x:1"), "Never");
+        // Default: :latest / untagged → Always; pinned tag → IfNotPresent.
+        assert_eq!(effective_pull_policy(&json!({}), "busybox:latest"), "Always");
+        assert_eq!(effective_pull_policy(&json!({}), "busybox"), "Always");
+        assert_eq!(effective_pull_policy(&json!({}), "busybox:1.36"), "IfNotPresent");
+        // A port in the registry host must not be mistaken for a tag.
+        assert_eq!(effective_pull_policy(&json!({}), "reg:5000/busybox:1.36"), "IfNotPresent");
+        assert_eq!(effective_pull_policy(&json!({}), "reg:5000/busybox"), "Always");
     }
 
     #[test]
