@@ -1505,12 +1505,11 @@ fn build_container_config(
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
 
-    let cpu_request = spec["resources"]["requests"]["cpu"]
-        .as_str()
-        .unwrap_or("0");
-    let mem_request = spec["resources"]["requests"]["memory"]
-        .as_str()
-        .unwrap_or("0");
+    // cgroup semantics: cpu.shares from the CPU *request* (relative weight);
+    // the cpu quota (hard cap) and memory limit from *limits* (0 = unlimited).
+    let cpu_request = spec["resources"]["requests"]["cpu"].as_str().unwrap_or("0");
+    let cpu_limit = spec["resources"]["limits"]["cpu"].as_str().unwrap_or("0");
+    let mem_limit = spec["resources"]["limits"]["memory"].as_str().unwrap_or("0");
 
     ContainerConfig {
         name,
@@ -1530,9 +1529,9 @@ fn build_container_config(
         stdin: spec["stdin"].as_bool().unwrap_or(false),
         tty: spec["tty"].as_bool().unwrap_or(false),
         cpu_period: 100_000,
-        cpu_quota: parse_cpu_quota(cpu_request),
+        cpu_quota: parse_cpu_quota(cpu_limit),
         cpu_shares: parse_cpu_shares(cpu_request),
-        memory_limit_bytes: parse_memory_bytes(mem_request),
+        memory_limit_bytes: parse_memory_bytes(mem_limit),
         privileged: sc["privileged"].as_bool().unwrap_or(false),
         readonly_rootfs: sc["readOnlyRootFilesystem"].as_bool().unwrap_or(false),
         add_capabilities,
@@ -2036,6 +2035,29 @@ mod tests {
         assert_eq!(c.mounts[0].host_path, "/sys/fs/bpf");
         assert_eq!(c.mounts[0].container_path, "/sys/fs/bpf");
         assert_eq!(c.mounts[0].propagation, MountPropagation::Bidirectional);
+    }
+
+    #[test]
+    fn resources_shares_from_request_quota_and_memory_from_limits() {
+        let spec = json!({
+            "name": "app", "image": "x",
+            "resources": {
+                "requests": {"cpu": "250m", "memory": "64Mi"},
+                "limits": {"cpu": "500m", "memory": "128Mi"}
+            }
+        });
+        let c = build_container_config(&spec, "x", vec![], vec![]);
+        // shares from request (250m → ~256), quota from limit (500m → 50000
+        // with 100000 period), memory limit from limit (128Mi).
+        assert_eq!(c.cpu_shares, 256);
+        assert_eq!(c.cpu_quota, 50_000);
+        assert_eq!(c.memory_limit_bytes, 128 * 1024 * 1024);
+        // No limits → unlimited (quota 0, memory 0), shares still from request.
+        let spec2 = json!({"name": "app", "image": "x",
+            "resources": {"requests": {"cpu": "100m"}}});
+        let c2 = build_container_config(&spec2, "x", vec![], vec![]);
+        assert_eq!(c2.cpu_quota, 0);
+        assert_eq!(c2.memory_limit_bytes, 0);
     }
 
     #[test]
