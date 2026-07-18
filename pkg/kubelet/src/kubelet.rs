@@ -96,7 +96,20 @@ impl Kubelet {
         )
         .with_runtime_version(runtime_version.clone())
         .with_kubelet_port(self.config.kubelet_port);
-        reporter.register().await?;
+        // Retry registration rather than exiting — the apiserver may be
+        // briefly unreachable or the node's RBAC not yet in place. The kubelet
+        // must not crash-loop out of the cluster over a transient failure.
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            match reporter.register().await {
+                Ok(()) => break,
+                Err(e) => {
+                    warn!("Node registration failed ({e}); retrying in {backoff:?}");
+                    time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                }
+            }
+        }
 
         // Adopt pods already running in the runtime (e.g. after a kubelet
         // restart) so we reconcile rather than double-create sandboxes.
