@@ -91,7 +91,7 @@ impl PodManager {
         images: Arc<dyn ImageService>,
         node_name: &str,
     ) -> Self {
-        Self::with_api(runtime, images, node_name, "", "127.0.0.1")
+        Self::with_api(runtime, images, node_name, "", "127.0.0.1", reqwest::Client::new())
     }
 
     pub fn with_api(
@@ -100,6 +100,7 @@ impl PodManager {
         node_name: &str,
         api_url: &str,
         node_ip: &str,
+        api_client: reqwest::Client,
     ) -> Self {
         Self {
             runtime,
@@ -107,7 +108,7 @@ impl PodManager {
             pods: RwLock::new(HashMap::new()),
             node_name: node_name.to_string(),
             api_url: api_url.trim_end_matches('/').to_string(),
-            api_client: reqwest::Client::new(),
+            api_client,
             node_ip: node_ip.to_string(),
             state_root: "/var/lib/kubelet".to_string(),
         }

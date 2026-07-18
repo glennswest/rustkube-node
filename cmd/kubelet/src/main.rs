@@ -55,6 +55,14 @@ struct Cli {
     /// Port for the kubelet's inbound HTTP server (/healthz, /metrics, /pods).
     #[arg(long, env = "KUBELET_PORT", default_value_t = 10250)]
     kubelet_port: u16,
+
+    /// Cluster CA cert (PEM) to trust for an HTTPS apiserver.
+    #[arg(long, env = "APISERVER_CA")]
+    apiserver_ca: Option<String>,
+
+    /// File containing a bearer token to authenticate to the apiserver.
+    #[arg(long, env = "KUBELET_TOKEN_FILE")]
+    token_file: Option<String>,
 }
 
 #[tokio::main]
@@ -140,11 +148,28 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    let apiserver_ca = cli.apiserver_ca.as_ref().and_then(|p| match std::fs::read(p) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            tracing::warn!("cannot read apiserver CA {p}: {e}");
+            None
+        }
+    });
+    let bearer_token = cli.token_file.as_ref().and_then(|p| match std::fs::read_to_string(p) {
+        Ok(s) => Some(s.trim().to_string()),
+        Err(e) => {
+            tracing::warn!("cannot read token file {p}: {e}");
+            None
+        }
+    });
+
     let config = KubeletConfig {
         node_name,
         api_server_url: cli.apiserver,
         pod_cidr: cli.pod_cidr,
         kubelet_port: cli.kubelet_port,
+        apiserver_ca,
+        bearer_token,
         ..Default::default()
     };
     let kubelet = Kubelet::new(config, runtime, images, migration);

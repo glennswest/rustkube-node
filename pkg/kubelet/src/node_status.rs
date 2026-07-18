@@ -49,6 +49,12 @@ impl NodeReporter {
         self
     }
 
+    /// Use a specific (e.g. authenticated HTTPS) client for apiserver calls.
+    pub fn with_client(mut self, client: reqwest::Client) -> Self {
+        self.client = client;
+        self
+    }
+
     /// The Node object metadata (name + labels) reported to the API server.
     fn node_metadata(&self) -> Value {
         json!({

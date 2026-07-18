@@ -5,6 +5,7 @@
 //! and reports node status via Lease heartbeats.
 
 pub mod checkpoint;
+pub mod client;
 pub mod cri;
 pub mod cri_client;
 pub mod cri_grpc;

@@ -21,6 +21,10 @@ pub struct KubeletConfig {
     pub sync_interval: Duration,
     /// Port for the kubelet's inbound HTTP server (upstream 10250).
     pub kubelet_port: u16,
+    /// Cluster CA (PEM) to trust for an HTTPS apiserver. None → no custom root.
+    pub apiserver_ca: Option<Vec<u8>>,
+    /// Bearer token for authenticating to the apiserver (SA/JWT). None → none.
+    pub bearer_token: Option<String>,
 }
 
 impl Default for KubeletConfig {
@@ -32,6 +36,8 @@ impl Default for KubeletConfig {
             heartbeat_interval: Duration::from_secs(10),
             sync_interval: Duration::from_secs(2),
             kubelet_port: 10250,
+            apiserver_ca: None,
+            bearer_token: None,
         }
     }
 }
@@ -57,12 +63,20 @@ impl Kubelet {
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "127.0.0.1".to_string());
 
+        // One authenticated apiserver client (HTTPS CA + bearer token when
+        // configured), shared by the pod manager, node reporter, and kubelet.
+        let api_client = crate::client::build_authed_client(
+            config.apiserver_ca.as_deref(),
+            config.bearer_token.as_deref(),
+        );
+
         let pod_manager = Arc::new(PodManager::with_api(
             runtime.clone(),
             images,
             &config.node_name,
             &config.api_server_url,
             &node_ip,
+            api_client.clone(),
         ));
 
         Self {
@@ -70,7 +84,7 @@ impl Kubelet {
             pod_manager,
             migration,
             runtime,
-            api_client: reqwest::Client::new(),
+            api_client,
             node_ip,
         }
     }
@@ -95,7 +109,8 @@ impl Kubelet {
             self.config.pod_cidr.clone(),
         )
         .with_runtime_version(runtime_version.clone())
-        .with_kubelet_port(self.config.kubelet_port);
+        .with_kubelet_port(self.config.kubelet_port)
+        .with_client(self.api_client.clone());
         // Retry registration rather than exiting — the apiserver may be
         // briefly unreachable or the node's RBAC not yet in place. The kubelet
         // must not crash-loop out of the cluster over a transient failure.
@@ -128,10 +143,12 @@ impl Kubelet {
         let pod_cidr = self.config.pod_cidr.clone();
         let heartbeat_interval = self.config.heartbeat_interval;
         let kubelet_port = self.config.kubelet_port;
+        let hb_client = self.api_client.clone();
         tokio::spawn(async move {
             let reporter = NodeReporter::with_pod_cidr(&reporter_url, &node_name, pod_cidr)
                 .with_runtime_version(runtime_version)
-                .with_kubelet_port(kubelet_port);
+                .with_kubelet_port(kubelet_port)
+                .with_client(hb_client);
             let mut interval = time::interval(heartbeat_interval);
             loop {
                 interval.tick().await;
