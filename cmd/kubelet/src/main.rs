@@ -51,6 +51,10 @@ struct Cli {
     /// Disable CNI networking (pods use host networking). For dev only.
     #[arg(long, default_value_t = false)]
     no_cni: bool,
+
+    /// Port for the kubelet's inbound HTTP server (/healthz, /metrics, /pods).
+    #[arg(long, env = "KUBELET_PORT", default_value_t = 10250)]
+    kubelet_port: u16,
 }
 
 #[tokio::main]
@@ -140,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
         node_name,
         api_server_url: cli.apiserver,
         pod_cidr: cli.pod_cidr,
+        kubelet_port: cli.kubelet_port,
         ..Default::default()
     };
     let kubelet = Kubelet::new(config, runtime, images, migration);

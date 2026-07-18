@@ -14,6 +14,7 @@ pub mod kubelet;
 pub mod node_status;
 pub mod pod_manager;
 pub mod runtime;
+pub mod server;
 pub mod vm_migrate;
 pub mod vm_runtime;
 

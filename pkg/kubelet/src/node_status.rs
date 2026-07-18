@@ -14,6 +14,8 @@ pub struct NodeReporter {
     pod_cidr: Option<String>,
     /// Container runtime version string (e.g. `cri-o://1.32.0`) for nodeInfo.
     runtime_version: String,
+    /// Kubelet server port, reported in daemonEndpoints.kubeletEndpoint.
+    kubelet_port: u16,
     client: reqwest::Client,
 }
 
@@ -28,6 +30,7 @@ impl NodeReporter {
             node_name: node_name.to_string(),
             pod_cidr,
             runtime_version: "cri-o://unknown".to_string(),
+            kubelet_port: 10250,
             client: reqwest::Client::new(),
         }
     }
@@ -37,6 +40,12 @@ impl NodeReporter {
         if !v.is_empty() {
             self.runtime_version = v;
         }
+        self
+    }
+
+    /// Set the kubelet server port reported in daemonEndpoints.
+    pub fn with_kubelet_port(mut self, port: u16) -> Self {
+        self.kubelet_port = port;
         self
     }
 
@@ -225,6 +234,9 @@ impl NodeReporter {
                 "kubeProxyVersion": format!("v1.32.0-rustkube+{}", apimachinery::VERSION),
                 "operatingSystem": go_os(),
                 "architecture": go_arch()
+            },
+            "daemonEndpoints": {
+                "kubeletEndpoint": { "Port": self.kubelet_port }
             },
             "addresses": build_addresses(&self.node_name)
         })

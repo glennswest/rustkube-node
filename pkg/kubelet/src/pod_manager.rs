@@ -1138,6 +1138,31 @@ impl PodManager {
     }
 
     /// Get the sandbox ID for a pod by UID.
+    /// (managed pod count, total container count) for the /metrics endpoint.
+    pub async fn metrics_snapshot(&self) -> (usize, usize) {
+        let pods = self.pods.read().await;
+        let containers = pods.values().map(|p| p.container_ids.len()).sum();
+        (pods.len(), containers)
+    }
+
+    /// A v1 PodList of the pods this kubelet manages (for the /pods endpoint).
+    pub async fn pods_json(&self) -> Value {
+        let pods = self.pods.read().await;
+        let items: Vec<Value> = pods
+            .values()
+            .map(|p| {
+                serde_json::json!({
+                    "metadata": {"name": p.name, "namespace": p.namespace, "uid": p.uid},
+                    "status": {
+                        "phase": p.phase,
+                        "podIP": p.pod_ip,
+                    }
+                })
+            })
+            .collect();
+        serde_json::json!({"kind": "PodList", "apiVersion": "v1", "items": items})
+    }
+
     pub async fn get_sandbox_id(&self, uid: &str) -> Option<String> {
         let pods = self.pods.read().await;
         pods.get(uid).and_then(|s| s.sandbox_id.clone())

@@ -19,6 +19,8 @@ pub struct KubeletConfig {
     pub pod_cidr: Option<String>,
     pub heartbeat_interval: Duration,
     pub sync_interval: Duration,
+    /// Port for the kubelet's inbound HTTP server (upstream 10250).
+    pub kubelet_port: u16,
 }
 
 impl Default for KubeletConfig {
@@ -29,6 +31,7 @@ impl Default for KubeletConfig {
             pod_cidr: None,
             heartbeat_interval: Duration::from_secs(10),
             sync_interval: Duration::from_secs(2),
+            kubelet_port: 10250,
         }
     }
 }
@@ -91,21 +94,31 @@ impl Kubelet {
             &self.config.node_name,
             self.config.pod_cidr.clone(),
         )
-        .with_runtime_version(runtime_version.clone());
+        .with_runtime_version(runtime_version.clone())
+        .with_kubelet_port(self.config.kubelet_port);
         reporter.register().await?;
 
         // Adopt pods already running in the runtime (e.g. after a kubelet
         // restart) so we reconcile rather than double-create sandboxes.
         self.pod_manager.recover_state().await;
 
+        // Inbound kubelet HTTP server (:10250) — /healthz, /metrics, /pods.
+        {
+            let pm = self.pod_manager.clone();
+            let port = self.config.kubelet_port;
+            tokio::spawn(async move { crate::server::serve(port, pm).await });
+        }
+
         // Spawn heartbeat task
         let reporter_url = self.config.api_server_url.clone();
         let node_name = self.config.node_name.clone();
         let pod_cidr = self.config.pod_cidr.clone();
         let heartbeat_interval = self.config.heartbeat_interval;
+        let kubelet_port = self.config.kubelet_port;
         tokio::spawn(async move {
             let reporter = NodeReporter::with_pod_cidr(&reporter_url, &node_name, pod_cidr)
-                .with_runtime_version(runtime_version);
+                .with_runtime_version(runtime_version)
+                .with_kubelet_port(kubelet_port);
             let mut interval = time::interval(heartbeat_interval);
             loop {
                 interval.tick().await;
