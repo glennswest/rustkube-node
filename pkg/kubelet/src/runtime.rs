@@ -407,11 +407,17 @@ mod linux {
             })
         }
 
-        async fn list_pod_sandbox(&self) -> Result<Vec<(String, PodSandboxState)>, CriError> {
+        async fn list_pod_sandbox(&self) -> Result<Vec<PodSandboxSummary>, CriError> {
             let sandboxes = self.sandboxes.read().await;
             Ok(sandboxes
                 .values()
-                .map(|s| (s.id.clone(), PodSandboxState::Ready))
+                .map(|s| PodSandboxSummary {
+                    id: s.id.clone(),
+                    state: PodSandboxState::Ready,
+                    uid: s.config.uid.clone(),
+                    name: s.config.name.clone(),
+                    namespace: s.config.namespace.clone(),
+                })
                 .collect())
         }
 
@@ -901,7 +907,7 @@ pub mod stub {
         async fn pod_sandbox_status(&self, id: &str) -> Result<PodSandboxStatusInfo, CriError> {
             Ok(PodSandboxStatusInfo { id: id.into(), state: PodSandboxState::Ready, created_at: 0, ip: "10.244.0.2".into(), additional_ips: vec![] })
         }
-        async fn list_pod_sandbox(&self) -> Result<Vec<(String, PodSandboxState)>, CriError> { Ok(vec![]) }
+        async fn list_pod_sandbox(&self) -> Result<Vec<PodSandboxSummary>, CriError> { Ok(vec![]) }
         async fn create_container(&self, _: &str, _: &ContainerConfig, _: &PodSandboxConfig) -> Result<String, CriError> {
             Ok("stub-container".into())
         }

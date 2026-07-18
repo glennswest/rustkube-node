@@ -577,7 +577,7 @@ mod linux {
             })
         }
 
-        async fn list_pod_sandbox(&self) -> Result<Vec<(String, PodSandboxState)>, CriError> {
+        async fn list_pod_sandbox(&self) -> Result<Vec<PodSandboxSummary>, CriError> {
             let vms = self.vms.read().await;
             Ok(vms.values().map(|vm| {
                 let state = if vm.pid.is_some() {
@@ -585,7 +585,13 @@ mod linux {
                 } else {
                     PodSandboxState::NotReady
                 };
-                (vm.id.clone(), state)
+                PodSandboxSummary {
+                    id: vm.id.clone(),
+                    state,
+                    uid: vm.config.uid.clone(),
+                    name: vm.config.name.clone(),
+                    namespace: vm.config.namespace.clone(),
+                }
             }).collect())
         }
 
@@ -1085,7 +1091,7 @@ pub mod stub {
         async fn pod_sandbox_status(&self, _: &str) -> Result<PodSandboxStatusInfo, CriError> {
             Err(CriError::Runtime("VM runtime not supported".into()))
         }
-        async fn list_pod_sandbox(&self) -> Result<Vec<(String, PodSandboxState)>, CriError> { Ok(vec![]) }
+        async fn list_pod_sandbox(&self) -> Result<Vec<PodSandboxSummary>, CriError> { Ok(vec![]) }
         async fn create_container(&self, _: &str, _: &ContainerConfig, _: &PodSandboxConfig) -> Result<String, CriError> {
             Err(CriError::Runtime("VM runtime not supported".into()))
         }

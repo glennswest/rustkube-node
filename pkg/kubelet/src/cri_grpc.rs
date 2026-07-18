@@ -9,7 +9,8 @@
 use crate::cri::{
     CheckpointRef, ContainerConfig, ContainerState, ContainerStatusInfo, CriError,
     ExecSyncResult, ImageInfo, ImageService, MigrationProgress, MigrationService,
-    MigrationStrategy, PodSandboxConfig, PodSandboxState, PodSandboxStatusInfo, RuntimeService,
+    MigrationStrategy, PodSandboxConfig, PodSandboxState, PodSandboxStatusInfo, PodSandboxSummary,
+    RuntimeService,
 };
 use async_trait::async_trait;
 use tonic::transport::{Channel, Endpoint, Uri};
@@ -326,7 +327,7 @@ impl RuntimeService for CriGrpcClient {
         })
     }
 
-    async fn list_pod_sandbox(&self) -> Result<Vec<(String, PodSandboxState)>, CriError> {
+    async fn list_pod_sandbox(&self) -> Result<Vec<PodSandboxSummary>, CriError> {
         let resp = self
             .runtime
             .clone()
@@ -344,7 +345,14 @@ impl RuntimeService for CriGrpcClient {
                 } else {
                     PodSandboxState::NotReady
                 };
-                (s.id, state)
+                let m = s.metadata.unwrap_or_default();
+                PodSandboxSummary {
+                    id: s.id,
+                    state,
+                    uid: m.uid,
+                    name: m.name,
+                    namespace: m.namespace,
+                }
             })
             .collect())
     }

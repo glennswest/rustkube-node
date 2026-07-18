@@ -411,6 +411,72 @@ impl PodManager {
         })
     }
 
+    /// Reconcile the in-memory pod map with sandboxes already running in the
+    /// container runtime. Called once at startup so a kubelet restart adopts
+    /// the pods it was already running instead of creating duplicate sandboxes.
+    pub async fn recover_state(&self) {
+        let sandboxes = match self.runtime.list_pod_sandbox().await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("state recovery: listing sandboxes failed: {e}");
+                return;
+            }
+        };
+        let mut recovered = 0;
+        for sb in sandboxes {
+            if sb.uid.is_empty() {
+                continue;
+            }
+            // Map container name → id for the containers in this sandbox.
+            let mut container_ids = HashMap::new();
+            if let Ok(cs) = self.runtime.list_containers(Some(&sb.id)).await {
+                for c in cs {
+                    if !c.name.is_empty() {
+                        container_ids.insert(c.name, c.id);
+                    }
+                }
+            }
+            let pod_ip = self
+                .runtime
+                .pod_sandbox_status(&sb.id)
+                .await
+                .ok()
+                .map(|s| s.ip)
+                .filter(|ip| !ip.is_empty());
+
+            let mut pods = self.pods.write().await;
+            if pods.contains_key(&sb.uid) {
+                continue;
+            }
+            pods.insert(
+                sb.uid.clone(),
+                PodState {
+                    namespace: sb.namespace.clone(),
+                    name: sb.name.clone(),
+                    uid: sb.uid.clone(),
+                    sandbox_id: Some(sb.id.clone()),
+                    container_ids,
+                    phase: "Running".to_string(),
+                    pod: Value::Null, // refreshed on the next sync
+                    pod_ip,
+                    restart_counts: HashMap::new(),
+                    ready: HashMap::new(),
+                    liveness_failures: HashMap::new(),
+                    started: HashMap::new(),
+                    terminated: HashMap::new(),
+                },
+            );
+            recovered += 1;
+            info!(
+                "state recovery: adopted running pod {}/{} (sandbox {})",
+                sb.namespace, sb.name, sb.id
+            );
+        }
+        if recovered > 0 {
+            info!("state recovery: adopted {recovered} running pod sandbox(es)");
+        }
+    }
+
     /// Sync desired pods (from API server) with actual running pods.
     ///
     /// Starts new pods, checks running ones (probes, restarts), and stops pods
@@ -1511,6 +1577,7 @@ mod tests {
     use super::*;
     use crate::cri::{
         ContainerStatusInfo, ExecSyncResult, ImageInfo, PodSandboxState, PodSandboxStatusInfo,
+        PodSandboxSummary,
     };
     use async_trait::async_trait;
     use serde_json::json;
@@ -1528,7 +1595,7 @@ mod tests {
     /// In-memory runtime for pod lifecycle tests.
     #[derive(Default)]
     struct FakeRuntime {
-        sandboxes: Mutex<HashMap<String, PodSandboxState>>,
+        sandboxes: Mutex<HashMap<String, (PodSandboxState, PodSandboxConfig)>>,
         containers: Mutex<HashMap<String, FakeContainer>>,
         next_id: AtomicU32,
         /// Exit code exec_sync returns (probes).
@@ -1594,15 +1661,14 @@ mod tests {
             self.sandboxes
                 .lock()
                 .unwrap()
-                .insert(id.clone(), PodSandboxState::Ready);
+                .insert(id.clone(), (PodSandboxState::Ready, config.clone()));
             Ok(id)
         }
 
         async fn stop_pod_sandbox(&self, sandbox_id: &str) -> Result<(), CriError> {
-            self.sandboxes
-                .lock()
-                .unwrap()
-                .insert(sandbox_id.to_string(), PodSandboxState::NotReady);
+            if let Some(entry) = self.sandboxes.lock().unwrap().get_mut(sandbox_id) {
+                entry.0 = PodSandboxState::NotReady;
+            }
             Ok(())
         }
 
@@ -1628,13 +1694,19 @@ mod tests {
             })
         }
 
-        async fn list_pod_sandbox(&self) -> Result<Vec<(String, PodSandboxState)>, CriError> {
+        async fn list_pod_sandbox(&self) -> Result<Vec<PodSandboxSummary>, CriError> {
             Ok(self
                 .sandboxes
                 .lock()
                 .unwrap()
                 .iter()
-                .map(|(k, v)| (k.clone(), *v))
+                .map(|(k, (state, cfg))| PodSandboxSummary {
+                    id: k.clone(),
+                    state: *state,
+                    uid: cfg.uid.clone(),
+                    name: cfg.name.clone(),
+                    namespace: cfg.namespace.clone(),
+                })
                 .collect())
         }
 
@@ -2019,6 +2091,24 @@ mod tests {
         assert!(u.container_statuses[0].ready);
         assert_eq!(rt.live_sandbox_count(), 1);
         assert_eq!(rt.container_ids().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recover_state_adopts_running_sandbox_no_double_create() {
+        let (rt, mgr) = manager();
+        let p = pod("uid-1", "web", "Always", simple_container());
+        // First "boot": start the pod — one sandbox created.
+        mgr.sync_pods(&[p.clone()]).await;
+        assert_eq!(rt.live_sandbox_count(), 1);
+
+        // Simulate a kubelet restart: fresh manager, same runtime with the
+        // sandbox still running.
+        let mgr2 = PodManager::new(rt.clone(), rt.clone(), NODE);
+        mgr2.recover_state().await;
+        // The running pod is adopted, so a re-sync does NOT create a 2nd sandbox.
+        let outcome = mgr2.sync_pods(&[p]).await;
+        assert_eq!(rt.live_sandbox_count(), 1, "must not double-create sandbox");
+        assert_eq!(outcome.updates[0].phase, "Running");
     }
 
     #[tokio::test]

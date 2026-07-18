@@ -17,10 +17,22 @@ pub enum ContainerState {
 }
 
 /// CRI pod sandbox state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PodSandboxState {
     Ready = 0,
+    #[default]
     NotReady = 1,
+}
+
+/// Summary of a pod sandbox from a list call, including the pod identity
+/// (metadata) needed to reconcile the kubelet's state with the runtime.
+#[derive(Debug, Clone, Default)]
+pub struct PodSandboxSummary {
+    pub id: String,
+    pub state: PodSandboxState,
+    pub uid: String,
+    pub name: String,
+    pub namespace: String,
 }
 
 /// Pod sandbox configuration.
@@ -168,7 +180,7 @@ pub trait RuntimeService: Send + Sync + 'static {
     ) -> Result<PodSandboxStatusInfo, CriError>;
 
     /// List pod sandboxes.
-    async fn list_pod_sandbox(&self) -> Result<Vec<(String, PodSandboxState)>, CriError>;
+    async fn list_pod_sandbox(&self) -> Result<Vec<PodSandboxSummary>, CriError>;
 
     /// Create a container in a sandbox. Returns container ID.
     async fn create_container(

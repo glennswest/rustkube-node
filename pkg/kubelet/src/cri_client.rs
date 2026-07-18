@@ -163,19 +163,25 @@ impl RuntimeService for CriClient {
         })
     }
 
-    async fn list_pod_sandbox(&self) -> Result<Vec<(String, PodSandboxState)>, CriError> {
+    async fn list_pod_sandbox(&self) -> Result<Vec<PodSandboxSummary>, CriError> {
         let json = self.crictl_json(&["pods"])?;
         let items = json["items"].as_array().cloned().unwrap_or_default();
 
         let mut result = Vec::new();
         for item in &items {
-            let id = item["id"].as_str().unwrap_or("").to_string();
             let state = if item["state"].as_str() == Some("SANDBOX_READY") {
                 PodSandboxState::Ready
             } else {
                 PodSandboxState::NotReady
             };
-            result.push((id, state));
+            let m = &item["metadata"];
+            result.push(PodSandboxSummary {
+                id: item["id"].as_str().unwrap_or("").to_string(),
+                state,
+                uid: m["uid"].as_str().unwrap_or("").to_string(),
+                name: m["name"].as_str().unwrap_or("").to_string(),
+                namespace: m["namespace"].as_str().unwrap_or("").to_string(),
+            });
         }
 
         Ok(result)

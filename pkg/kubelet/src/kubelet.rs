@@ -94,6 +94,10 @@ impl Kubelet {
         .with_runtime_version(runtime_version.clone());
         reporter.register().await?;
 
+        // Adopt pods already running in the runtime (e.g. after a kubelet
+        // restart) so we reconcile rather than double-create sandboxes.
+        self.pod_manager.recover_state().await;
+
         // Spawn heartbeat task
         let reporter_url = self.config.api_server_url.clone();
         let node_name = self.config.node_name.clone();
