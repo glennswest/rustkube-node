@@ -115,6 +115,19 @@ pub struct Mount {
     pub propagation: MountPropagation,
 }
 
+/// Container resource-usage stats (subset of CRI ContainerStats).
+#[derive(Debug, Clone, Default)]
+pub struct ContainerStatsInfo {
+    pub container_id: String,
+    pub name: String,
+    /// Pod name/namespace, from the sandbox labels (io.kubernetes.pod.*).
+    pub pod: String,
+    pub namespace: String,
+    /// Cumulative CPU usage in nanoseconds (for the cadvisor counter).
+    pub cpu_usage_core_nanos: u64,
+    pub memory_working_set_bytes: u64,
+}
+
 /// Container status information.
 #[derive(Debug, Clone)]
 pub struct ContainerStatusInfo {
@@ -181,6 +194,12 @@ pub trait RuntimeService: Send + Sync + 'static {
 
     /// List pod sandboxes.
     async fn list_pod_sandbox(&self) -> Result<Vec<PodSandboxSummary>, CriError>;
+
+    /// Resource-usage stats for all containers. Default: none (runtimes that
+    /// don't implement stats return an empty list).
+    async fn list_container_stats(&self) -> Result<Vec<ContainerStatsInfo>, CriError> {
+        Ok(vec![])
+    }
 
     /// Create a container in a sandbox. Returns container ID.
     async fn create_container(

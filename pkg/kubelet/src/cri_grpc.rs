@@ -7,7 +7,8 @@
 //! This supersedes the Phase-1 crictl bridge in `cri_client.rs`.
 
 use crate::cri::{
-    CheckpointRef, ContainerConfig, ContainerState, ContainerStatusInfo, CriError,
+    CheckpointRef, ContainerConfig, ContainerState, ContainerStatsInfo, ContainerStatusInfo,
+    CriError,
     ExecSyncResult, ImageInfo, ImageService, MigrationProgress, MigrationService,
     MigrationStrategy, PodSandboxConfig, PodSandboxState, PodSandboxStatusInfo, PodSandboxSummary,
     RuntimeService,
@@ -464,6 +465,48 @@ impl RuntimeService for CriGrpcClient {
                 image_ref: c.image_ref,
                 reason: String::new(),
                 message: String::new(),
+            })
+            .collect())
+    }
+
+    async fn list_container_stats(&self) -> Result<Vec<ContainerStatsInfo>, CriError> {
+        let resp = self
+            .runtime
+            .clone()
+            .list_container_stats(proto::ListContainerStatsRequest { filter: None })
+            .await
+            .map_err(rpc_err)?
+            .into_inner();
+
+        Ok(resp
+            .stats
+            .into_iter()
+            .map(|s| {
+                let attrs = s.attributes.unwrap_or_default();
+                let labels = attrs.labels;
+                ContainerStatsInfo {
+                    container_id: attrs.id,
+                    name: labels
+                        .get("io.kubernetes.container.name")
+                        .cloned()
+                        .or_else(|| attrs.metadata.map(|m| m.name))
+                        .unwrap_or_default(),
+                    pod: labels.get("io.kubernetes.pod.name").cloned().unwrap_or_default(),
+                    namespace: labels
+                        .get("io.kubernetes.pod.namespace")
+                        .cloned()
+                        .unwrap_or_default(),
+                    cpu_usage_core_nanos: s
+                        .cpu
+                        .and_then(|c| c.usage_core_nano_seconds)
+                        .map(|v| v.value)
+                        .unwrap_or(0),
+                    memory_working_set_bytes: s
+                        .memory
+                        .and_then(|m| m.working_set_bytes)
+                        .map(|v| v.value)
+                        .unwrap_or(0),
+                }
             })
             .collect())
     }

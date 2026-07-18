@@ -1138,6 +1138,12 @@ impl PodManager {
     }
 
     /// Get the sandbox ID for a pod by UID.
+    /// Per-container resource stats from the runtime (for /metrics/cadvisor
+    /// and /stats/summary).
+    pub async fn container_stats(&self) -> Vec<crate::cri::ContainerStatsInfo> {
+        self.runtime.list_container_stats().await.unwrap_or_default()
+    }
+
     /// (managed pod count, total container count) for the /metrics endpoint.
     pub async fn metrics_snapshot(&self) -> (usize, usize) {
         let pods = self.pods.read().await;

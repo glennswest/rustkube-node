@@ -17,6 +17,8 @@ pub fn router(pod_manager: Arc<PodManager>) -> Router {
         .route("/livez", get(healthz))
         .route("/readyz", get(healthz))
         .route("/metrics", get(metrics))
+        .route("/metrics/cadvisor", get(metrics_cadvisor))
+        .route("/stats/summary", get(stats_summary))
         .route("/pods", get(pods))
         .with_state(pod_manager)
 }
@@ -57,6 +59,74 @@ async fn metrics(State(pm): State<Arc<PodManager>>) -> impl IntoResponse {
 
 async fn pods(State(pm): State<Arc<PodManager>>) -> impl IntoResponse {
     Json(pm.pods_json().await)
+}
+
+/// cAdvisor-style container metrics scraped by Prometheus.
+async fn metrics_cadvisor(State(pm): State<Arc<PodManager>>) -> impl IntoResponse {
+    let stats = pm.container_stats().await;
+    let mut body = String::new();
+    body.push_str("# HELP container_cpu_usage_seconds_total Cumulative CPU time consumed (seconds).\n");
+    body.push_str("# TYPE container_cpu_usage_seconds_total counter\n");
+    for s in &stats {
+        let labels = format!(
+            "container=\"{}\",pod=\"{}\",namespace=\"{}\"",
+            s.name, s.pod, s.namespace
+        );
+        let secs = s.cpu_usage_core_nanos as f64 / 1e9;
+        body.push_str(&format!("container_cpu_usage_seconds_total{{{labels}}} {secs}\n"));
+    }
+    body.push_str("# HELP container_memory_working_set_bytes Current working set (bytes).\n");
+    body.push_str("# TYPE container_memory_working_set_bytes gauge\n");
+    for s in &stats {
+        let labels = format!(
+            "container=\"{}\",pod=\"{}\",namespace=\"{}\"",
+            s.name, s.pod, s.namespace
+        );
+        body.push_str(&format!(
+            "container_memory_working_set_bytes{{{labels}}} {}\n",
+            s.memory_working_set_bytes
+        ));
+    }
+    ([("content-type", "text/plain; version=0.0.4")], body)
+}
+
+/// Minimal Summary API (metrics-server / `kubectl top`) — node + per-pod
+/// container CPU/memory grouped from the CRI container stats.
+async fn stats_summary(State(pm): State<Arc<PodManager>>) -> impl IntoResponse {
+    use std::collections::BTreeMap;
+    let stats = pm.container_stats().await;
+    // Group containers by (namespace, pod).
+    let mut by_pod: BTreeMap<(String, String), Vec<serde_json::Value>> = BTreeMap::new();
+    let mut node_cpu = 0u64;
+    let mut node_mem = 0u64;
+    for s in &stats {
+        node_cpu += s.cpu_usage_core_nanos;
+        node_mem += s.memory_working_set_bytes;
+        by_pod
+            .entry((s.namespace.clone(), s.pod.clone()))
+            .or_default()
+            .push(serde_json::json!({
+                "name": s.name,
+                "cpu": {"usageCoreNanoSeconds": s.cpu_usage_core_nanos},
+                "memory": {"workingSetBytes": s.memory_working_set_bytes},
+            }));
+    }
+    let pods: Vec<serde_json::Value> = by_pod
+        .into_iter()
+        .map(|((ns, name), containers)| {
+            serde_json::json!({
+                "podRef": {"name": name, "namespace": ns},
+                "containers": containers,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "node": {
+            "cpu": {"usageCoreNanoSeconds": node_cpu},
+            "memory": {"workingSetBytes": node_mem},
+        },
+        "pods": pods,
+    }))
 }
 
 #[cfg(test)]
@@ -188,6 +258,17 @@ mod tests {
         let text = String::from_utf8_lossy(&body);
         assert!(text.contains("kubelet_running_pods 0"));
         assert!(text.contains("kubelet_running_containers 0"));
+    }
+
+    #[tokio::test]
+    async fn cadvisor_and_summary_ok() {
+        for uri in ["/metrics/cadvisor", "/stats/summary"] {
+            let resp = app()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        }
     }
 
     #[tokio::test]
