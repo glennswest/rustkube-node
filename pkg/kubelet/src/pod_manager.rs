@@ -885,7 +885,46 @@ impl PodManager {
 
             let status = match self.runtime.container_status(&cid).await {
                 Ok(s) => s,
+                Err(CriError::NotFound(_)) => {
+                    // The container record is gone from the runtime — CRI-O
+                    // pruned a crashed container, or the kubelet restarted after
+                    // the container died. Recreate it per restart policy instead
+                    // of reporting "waiting" forever (which would strand the pod;
+                    // e.g. an adopted cilium-operator whose container had exited).
+                    let should_recreate = matches!(restart_policy.as_str(), "Always" | "OnFailure");
+                    if should_recreate && !spec.is_null() {
+                        info!(
+                            "Container {}/{}/{name} missing from runtime — recreating per policy {restart_policy}",
+                            state.namespace, state.name
+                        );
+                        self.restart_container(
+                            &mut state,
+                            &name,
+                            &cid,
+                            &spec,
+                            &sandbox_config,
+                            &mut container_statuses,
+                        )
+                        .await;
+                    } else {
+                        state.terminated.insert(name.clone(), 0);
+                        state.ready.insert(name.clone(), false);
+                        container_statuses.push(ContainerStatusReport {
+                            name: name.clone(),
+                            container_id: cid.clone(),
+                            state: "terminated".to_string(),
+                            ready: false,
+                            restart_count,
+                            exit_code: 0,
+                            image: spec["image"].as_str().unwrap_or("").to_string(),
+                            image_ref: String::new(),
+                        });
+                    }
+                    continue;
+                }
                 Err(e) => {
+                    // Transient error (e.g. RPC timeout): keep waiting rather than
+                    // disturbing a container that may still be alive.
                     warn!(
                         "Failed to get status for container {name} in {}/{}: {e}",
                         state.namespace, state.name
@@ -1536,6 +1575,62 @@ fn extract_labels(pod: &Value) -> HashMap<String, String> {
 /// Build the CRI container config from the spec, with env and mounts already
 /// resolved (env `valueFrom` + configMap/secret volumes need async apiserver
 /// reads, done by the caller).
+/// Expand Kubernetes `$(VAR)` references in a command/arg string against the
+/// container's environment, mirroring upstream kubelet semantics:
+///   - `$(NAME)` → the value of `NAME` if present, else the literal `$(NAME)`
+///   - `$$`      → a literal `$`
+///   - `$(`      with no closing `)` → left verbatim
+///   - `$` followed by anything else → left verbatim (the `$` and next char)
+fn expand_env_refs(input: &str, vars: &HashMap<&str, &str>) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' && i + 1 < chars.len() {
+            let rest = &chars[i + 1..];
+            match rest[0] {
+                '$' => {
+                    // Escaped operator: `$$` → `$`.
+                    out.push('$');
+                    i += 2;
+                }
+                '(' => {
+                    if let Some(close) = rest.iter().position(|&c| c == ')') {
+                        // rest[0] is '(', so any ')' is at index >= 1.
+                        let name: String = rest[1..close].iter().collect();
+                        match vars.get(name.as_str()) {
+                            Some(v) => out.push_str(v),
+                            None => {
+                                // Unknown var: emit the reference verbatim.
+                                out.push('$');
+                                out.push('(');
+                                out.push_str(&name);
+                                out.push(')');
+                            }
+                        }
+                        i += 1 + close + 1; // consume `$` `(` .. `)`
+                    } else {
+                        // Incomplete reference `$(...` with no closer.
+                        out.push('$');
+                        out.push('(');
+                        i += 2;
+                    }
+                }
+                other => {
+                    // `$` not beginning an expression: emit both chars.
+                    out.push('$');
+                    out.push(other);
+                    i += 2;
+                }
+            }
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 fn build_container_config(
     spec: &Value,
     image_ref: &str,
@@ -1544,14 +1639,31 @@ fn build_container_config(
 ) -> ContainerConfig {
     let name = spec["name"].as_str().unwrap_or("unnamed").to_string();
 
+    // Kubernetes expands `$(VAR)` references in command/args from the
+    // container's resolved environment (`$$` escapes to a literal `$`;
+    // unknown names are left verbatim). Required by many workloads —
+    // e.g. cilium-operator passes `--debug=$(CILIUM_DEBUG)`.
+    let env_map: HashMap<&str, &str> =
+        envs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
     let command: Vec<String> = spec["command"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| expand_env_refs(s, &env_map))
+                .collect()
+        })
         .unwrap_or_default();
 
     let args: Vec<String> = spec["args"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| expand_env_refs(s, &env_map))
+                .collect()
+        })
         .unwrap_or_default();
 
     let sc = &spec["securityContext"];
@@ -2094,6 +2206,43 @@ mod tests {
         assert_eq!(c.mounts[0].host_path, "/sys/fs/bpf");
         assert_eq!(c.mounts[0].container_path, "/sys/fs/bpf");
         assert_eq!(c.mounts[0].propagation, MountPropagation::Bidirectional);
+    }
+
+    #[test]
+    fn expands_env_refs_in_command_and_args() {
+        // The exact cilium-operator case: `--debug=$(CILIUM_DEBUG)` must become
+        // `--debug=false` from the resolved env, or the container crash-loops.
+        let spec = json!({
+            "name": "cilium-operator", "image": "x",
+            "command": ["cilium-operator-generic"],
+            "args": ["--config-dir=/tmp/cilium/config-map", "--debug=$(CILIUM_DEBUG)"]
+        });
+        let envs = vec![("CILIUM_DEBUG".to_string(), "false".to_string())];
+        let c = build_container_config(&spec, "x", envs, vec![]);
+        assert_eq!(c.command, vec!["cilium-operator-generic"]);
+        assert_eq!(c.args, vec!["--config-dir=/tmp/cilium/config-map", "--debug=false"]);
+    }
+
+    #[test]
+    fn expand_env_refs_semantics() {
+        let mut m = HashMap::new();
+        m.insert("FOO", "bar");
+        m.insert("EMPTY", "");
+        // basic substitution + surrounding text
+        assert_eq!(expand_env_refs("x-$(FOO)-y", &m), "x-bar-y");
+        // known-empty var expands to empty
+        assert_eq!(expand_env_refs("[$(EMPTY)]", &m), "[]");
+        // unknown var left verbatim
+        assert_eq!(expand_env_refs("$(MISSING)", &m), "$(MISSING)");
+        // `$$` escapes to a single literal `$`
+        assert_eq!(expand_env_refs("cost is $$5", &m), "cost is $5");
+        // incomplete reference left verbatim
+        assert_eq!(expand_env_refs("$(FOO", &m), "$(FOO");
+        // lone `$` and `$`+non-paren left verbatim
+        assert_eq!(expand_env_refs("a$", &m), "a$");
+        assert_eq!(expand_env_refs("$x", &m), "$x");
+        // multiple refs in one string
+        assert_eq!(expand_env_refs("$(FOO)/$(FOO)", &m), "bar/bar");
     }
 
     #[test]

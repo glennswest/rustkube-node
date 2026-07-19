@@ -29,7 +29,19 @@ pub fn build_authed_client(ca_pem: Option<&[u8]>, token: Option<&str>) -> reqwes
         }
     }
 
-    builder.build().unwrap_or_default()
+    // Never fall back to a default client here. `unwrap_or_default()` would
+    // silently discard the root CA and bearer token and hand back a bare
+    // client, which then fails TLS against the cluster CA with an opaque
+    // "error sending request" — or worse, talks to an apiserver unauthenticated.
+    // A kubelet that cannot build its authenticated client must not continue.
+    match builder.build() {
+        Ok(client) => client,
+        Err(e) => panic!(
+            "failed to build the apiserver client (CA supplied: {}, token supplied: {}): {e}",
+            ca_pem.is_some(),
+            token.is_some_and(|t| !t.is_empty())
+        ),
+    }
 }
 
 #[cfg(test)]
