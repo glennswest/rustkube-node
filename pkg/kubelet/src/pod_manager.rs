@@ -83,6 +83,9 @@ pub struct PodManager {
     /// Kubelet state root; per-pod volume dirs live under `<state_root>/pods`.
     /// Overridable in tests. Default `/var/lib/kubelet`.
     state_root: String,
+    /// Cluster CA (PEM), written into ServiceAccount `ca.crt` so in-cluster
+    /// clients can verify a TLS apiserver.
+    ca_pem: Option<Vec<u8>>,
 }
 
 impl PodManager {
@@ -111,7 +114,14 @@ impl PodManager {
             api_client,
             node_ip: node_ip.to_string(),
             state_root: "/var/lib/kubelet".to_string(),
+            ca_pem: None,
         }
+    }
+
+    /// Cluster CA (PEM) to write into ServiceAccount `ca.crt` for pods.
+    pub fn with_ca_pem(mut self, ca: Option<Vec<u8>>) -> Self {
+        self.ca_pem = ca;
+        self
     }
 
     /// Fetch a ConfigMap's `data` map (namespaced). None on any failure.
@@ -282,6 +292,16 @@ impl PodManager {
                 let dir = pod_volume_dir(&self.state_root, uid, "projected", &name);
                 let _ = std::fs::create_dir_all(&dir);
                 self.materialize_projected(pod, namespace, &dir, sources).await;
+                // Ensure the SA volume has a usable ca.crt even if the cluster
+                // has no kube-root-ca.crt configMap to source it from.
+                if let Some(ca) = &self.ca_pem {
+                    let has_sat = sources
+                        .iter()
+                        .any(|s| !s["serviceAccountToken"].is_null());
+                    if has_sat {
+                        let _ = std::fs::write(format!("{dir}/ca.crt"), ca);
+                    }
+                }
                 dir
             } else {
                 // emptyDir (and other unhandled types): per-pod scratch dir.
@@ -402,7 +422,9 @@ impl PodManager {
         if let Some(token) = self.request_sa_token(namespace, sa, None).await {
             let _ = std::fs::write(format!("{dir}/token"), token);
         }
-        // ca.crt: the cluster CA would go here once the apiserver serves TLS.
+        if let Some(ca) = &self.ca_pem {
+            let _ = std::fs::write(format!("{dir}/ca.crt"), ca);
+        }
 
         Some(Mount {
             container_path: SA_MOUNT_PATH.to_string(),

@@ -70,14 +70,17 @@ impl Kubelet {
             config.bearer_token.as_deref(),
         );
 
-        let pod_manager = Arc::new(PodManager::with_api(
-            runtime.clone(),
-            images,
-            &config.node_name,
-            &config.api_server_url,
-            &node_ip,
-            api_client.clone(),
-        ));
+        let pod_manager = Arc::new(
+            PodManager::with_api(
+                runtime.clone(),
+                images,
+                &config.node_name,
+                &config.api_server_url,
+                &node_ip,
+                api_client.clone(),
+            )
+            .with_ca_pem(config.apiserver_ca.clone()),
+        );
 
         Self {
             config,
