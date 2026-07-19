@@ -25,6 +25,12 @@ pub struct KubeletConfig {
     pub apiserver_ca: Option<Vec<u8>>,
     /// Bearer token for authenticating to the apiserver (SA/JWT). None → none.
     pub bearer_token: Option<String>,
+    /// Client certificate chain (PEM) for mutual-TLS node auth. None → none.
+    pub client_cert: Option<Vec<u8>>,
+    /// Private key (PEM) for `client_cert`. None → none.
+    pub client_key: Option<Vec<u8>>,
+    /// Skip apiserver cert verification (dev only).
+    pub insecure_skip_tls_verify: bool,
 }
 
 impl Default for KubeletConfig {
@@ -38,6 +44,9 @@ impl Default for KubeletConfig {
             kubelet_port: 10250,
             apiserver_ca: None,
             bearer_token: None,
+            client_cert: None,
+            client_key: None,
+            insecure_skip_tls_verify: false,
         }
     }
 }
@@ -68,10 +77,13 @@ impl Kubelet {
         // A build failure is fatal — proceeding with a silently-degraded client
         // would fail every apiserver call with an opaque transport error
         // (rustkube-node#16).
-        let api_client = crate::client::build_authed_client(
-            config.apiserver_ca.as_deref(),
-            config.bearer_token.as_deref(),
-        )?;
+        let api_client = crate::client::build_authed_client(&crate::client::ClientAuth {
+            ca_pem: config.apiserver_ca.as_deref(),
+            token: config.bearer_token.as_deref(),
+            client_cert_pem: config.client_cert.as_deref(),
+            client_key_pem: config.client_key.as_deref(),
+            insecure_skip_tls_verify: config.insecure_skip_tls_verify,
+        })?;
 
         let pod_manager = Arc::new(
             PodManager::with_api(

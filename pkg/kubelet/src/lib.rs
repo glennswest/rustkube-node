@@ -11,6 +11,7 @@ pub mod cri_client;
 pub mod cri_grpc;
 pub mod csi;
 pub mod health;
+pub mod kubeconfig;
 pub mod kubelet;
 pub mod node_status;
 pub mod pod_manager;
