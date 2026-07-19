@@ -172,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
         bearer_token,
         ..Default::default()
     };
-    let kubelet = Kubelet::new(config, runtime, images, migration);
+    let kubelet = Kubelet::new(config, runtime, images, migration)?;
     if let Err(e) = kubelet.run().await {
         anyhow::bail!("kubelet failed: {e}");
     }

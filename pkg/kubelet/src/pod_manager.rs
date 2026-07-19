@@ -431,6 +431,7 @@ impl PodManager {
             host_path: dir,
             readonly: true,
             propagation: MountPropagation::Private,
+            selinux_relabel: true, // kubelet-materialized — must relabel for SELinux
         })
     }
 
@@ -645,6 +646,7 @@ impl PodManager {
             let mut mounts = resolve_mounts(spec, volumes);
             push_mount(&mut mounts, sa_mount.clone());
             let config = build_container_config(spec, &image_ref, envs, mounts);
+            ensure_container_log_dir(&sandbox_config.log_directory, &config.name);
             let cid = self
                 .runtime
                 .create_container(sandbox_id, &config, sandbox_config)
@@ -769,6 +771,7 @@ impl PodManager {
             push_mount(&mut mounts, sa_mount.clone());
             let container_config =
                 build_container_config(container_spec, &image_ref, envs, mounts);
+            ensure_container_log_dir(&sandbox_config.log_directory, &container_config.name);
 
             // Create container
             let container_id = self
@@ -1074,6 +1077,37 @@ impl PodManager {
             }
         }
 
+        // Reconcile: create any app container declared in the spec that has no
+        // live record and has not terminated for good. Covers an adopted pod
+        // whose container had already exited (its record pruned by the runtime)
+        // and partial starts. Initial creation is not gated by restartPolicy.
+        let missing: Vec<String> = container_specs
+            .keys()
+            .filter(|n| {
+                !state.container_ids.contains_key(*n) && !state.terminated.contains_key(*n)
+            })
+            .cloned()
+            .collect();
+        for name in missing {
+            let spec = match container_specs.get(&name) {
+                Some(s) if !s.is_null() => s.clone(),
+                _ => continue,
+            };
+            info!(
+                "Container {}/{}/{name} declared but not running — creating",
+                state.namespace, state.name
+            );
+            self.restart_container(
+                &mut state,
+                &name,
+                "", // no prior container record
+                &spec,
+                &sandbox_config,
+                &mut container_statuses,
+            )
+            .await;
+        }
+
         // Pod phase: Succeeded/Failed only when every container has terminated
         // for good; otherwise it is still Running.
         let total = state.container_ids.len();
@@ -1152,6 +1186,7 @@ impl PodManager {
             let mut config = build_container_config(spec, &image_ref, envs, mounts);
             config.attempt = restart_count;
             config.log_path = format!("{}/{restart_count}.log", config.name);
+            ensure_container_log_dir(&sandbox_config.log_directory, &config.name);
             let cid = self
                 .runtime
                 .create_container(&sandbox_id, &config, sandbox_config)
@@ -1537,6 +1572,11 @@ fn resolve_mounts(spec: &Value, volumes: &HashMap<String, String>) -> Vec<Mount>
                 .filter_map(|m| {
                     let vol_name = m["name"].as_str().unwrap_or("");
                     let host_path = volumes.get(vol_name)?.clone();
+                    // Relabel kubelet-materialized volumes (configMap/secret/
+                    // projected/emptyDir live under .../volumes/kubernetes.io~*)
+                    // so the container can read them under enforcing SELinux;
+                    // never relabel hostPath (arbitrary host system paths).
+                    let selinux_relabel = host_path.contains("/volumes/kubernetes.io~");
                     Some(Mount {
                         container_path: m["mountPath"].as_str().unwrap_or("").to_string(),
                         host_path,
@@ -1546,6 +1586,7 @@ fn resolve_mounts(spec: &Value, volumes: &HashMap<String, String>) -> Vec<Mount>
                             Some("HostToContainer") => MountPropagation::HostToContainer,
                             _ => MountPropagation::Private,
                         },
+                        selinux_relabel,
                     })
                 })
                 .collect()
@@ -1575,6 +1616,16 @@ fn extract_labels(pod: &Value) -> HashMap<String, String> {
 /// Build the CRI container config from the spec, with env and mounts already
 /// resolved (env `valueFrom` + configMap/secret volumes need async apiserver
 /// reads, done by the caller).
+/// conmon opens each container's log at `<sandbox log_directory>/<name>/<attempt>.log`
+/// but does not create the `<name>` subdirectory — so container creation fails
+/// with "conmon: Failed to open log file" unless the kubelet makes it first.
+fn ensure_container_log_dir(log_directory: &str, container_name: &str) {
+    let dir = format!("{log_directory}/{container_name}");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        warn!("could not create container log dir {dir}: {e}");
+    }
+}
+
 /// Expand Kubernetes `$(VAR)` references in a command/arg string against the
 /// container's environment, mirroring upstream kubelet semantics:
 ///   - `$(NAME)` → the value of `NAME` if present, else the literal `$(NAME)`

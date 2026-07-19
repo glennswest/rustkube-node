@@ -113,6 +113,12 @@ pub struct Mount {
     pub host_path: String,
     pub readonly: bool,
     pub propagation: MountPropagation,
+    /// Ask the runtime to relabel the host path for the container's SELinux
+    /// context. Required on enforcing SELinux hosts for kubelet-materialized
+    /// content (SA token, configMap/secret/projected/emptyDir); without it the
+    /// container is denied access even when DAC perms allow. Never set for
+    /// hostPath — relabeling host system paths (e.g. /sys, /proc) is harmful.
+    pub selinux_relabel: bool,
 }
 
 /// Container resource-usage stats (subset of CRI ContainerStats).

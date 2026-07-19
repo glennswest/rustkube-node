@@ -189,6 +189,7 @@ fn to_proto_container_config(config: &ContainerConfig) -> proto::ContainerConfig
                 host_path: m.host_path.clone(),
                 readonly: m.readonly,
                 propagation: to_proto_propagation(m.propagation),
+                selinux_relabel: m.selinux_relabel,
                 ..Default::default()
             })
             .collect(),

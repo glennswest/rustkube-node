@@ -58,17 +58,20 @@ impl Kubelet {
         runtime: Arc<dyn RuntimeService>,
         images: Arc<dyn ImageService>,
         migration: Arc<dyn MigrationService>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let node_ip = crate::node_status::detect_node_ip()
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "127.0.0.1".to_string());
 
         // One authenticated apiserver client (HTTPS CA + bearer token when
         // configured), shared by the pod manager, node reporter, and kubelet.
+        // A build failure is fatal — proceeding with a silently-degraded client
+        // would fail every apiserver call with an opaque transport error
+        // (rustkube-node#16).
         let api_client = crate::client::build_authed_client(
             config.apiserver_ca.as_deref(),
             config.bearer_token.as_deref(),
-        );
+        )?;
 
         let pod_manager = Arc::new(
             PodManager::with_api(
@@ -82,14 +85,14 @@ impl Kubelet {
             .with_ca_pem(config.apiserver_ca.clone()),
         );
 
-        Self {
+        Ok(Self {
             config,
             pod_manager,
             migration,
             runtime,
             api_client,
             node_ip,
-        }
+        })
     }
 
     /// Run the kubelet. Blocks forever.

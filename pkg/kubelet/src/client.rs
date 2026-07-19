@@ -10,26 +10,44 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 
 /// Build an apiserver client. `ca_pem` (PEM bytes) is added as a trusted root
 /// for HTTPS; `token` is sent as `Authorization: Bearer <token>` on every call.
-pub fn build_authed_client(ca_pem: Option<&[u8]>, token: Option<&str>) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder();
+///
+/// Returns an error instead of silently degrading: if a CA was supplied but is
+/// unusable, or the client fails to build, the caller must not proceed with a
+/// client that would fail every HTTPS request with an opaque transport error
+/// (rustkube-node#16 — the old `build().unwrap_or_default()` dropped the CA and
+/// token on any builder failure, so the node never registered).
+pub fn build_authed_client(
+    ca_pem: Option<&[u8]>,
+    token: Option<&str>,
+) -> anyhow::Result<reqwest::Client> {
+    // Bound every request: without a timeout a single unresponsive apiserver
+    // call (e.g. a TokenRequest that never returns) wedges the kubelet's sync
+    // loop indefinitely. Connect + overall timeouts keep the loop live.
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30));
 
     if let Some(pem) = ca_pem {
-        match reqwest::Certificate::from_pem(pem) {
-            Ok(cert) => builder = builder.add_root_certificate(cert),
-            Err(e) => tracing::warn!("apiserver CA cert not usable: {e}"),
-        }
+        // A supplied-but-unusable CA is fatal: continuing without it would
+        // leave the client unable to verify a privately-signed apiserver, which
+        // surfaces only later as a confusing "error sending request".
+        let cert = reqwest::Certificate::from_pem(pem)
+            .map_err(|e| anyhow::anyhow!("apiserver CA cert not usable: {e}"))?;
+        builder = builder.add_root_certificate(cert);
     }
 
     if let Some(tok) = token.filter(|t| !t.is_empty()) {
-        if let Ok(mut val) = HeaderValue::from_str(&format!("Bearer {tok}")) {
-            val.set_sensitive(true);
-            let mut headers = HeaderMap::new();
-            headers.insert(AUTHORIZATION, val);
-            builder = builder.default_headers(headers);
-        }
+        let mut val = HeaderValue::from_str(&format!("Bearer {tok}"))
+            .map_err(|e| anyhow::anyhow!("bearer token is not a valid header value: {e}"))?;
+        val.set_sensitive(true);
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, val);
+        builder = builder.default_headers(headers);
     }
 
-    builder.build().unwrap_or_default()
+    builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build apiserver HTTP client: {e}"))
 }
 
 #[cfg(test)]
@@ -39,11 +57,29 @@ mod tests {
     #[test]
     fn builds_without_ca_or_token() {
         // The plain/dev path must still yield a working client.
-        let _ = build_authed_client(None, None);
+        assert!(build_authed_client(None, None).is_ok());
     }
 
     #[test]
     fn builds_with_token() {
-        let _ = build_authed_client(None, Some("abc.def.ghi"));
+        assert!(build_authed_client(None, Some("abc.def.ghi")).is_ok());
+    }
+
+    #[test]
+    fn unusable_ca_is_an_error_not_a_silent_drop() {
+        // rustkube-node#16: a supplied-but-broken CA must surface as an error,
+        // never a client that silently omits the root and fails every request.
+        // reqwest validates the cert lazily, so this fails at build() rather
+        // than at from_pem() — either way it must be an error, not a fallback.
+        let err = build_authed_client(
+            Some(b"-----BEGIN CERTIFICATE-----\nnope\n-----END CERTIFICATE-----\n"),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("CA cert not usable") || err.contains("failed to build"),
+            "got: {err}"
+        );
     }
 }
