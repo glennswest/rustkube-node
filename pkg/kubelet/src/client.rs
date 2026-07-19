@@ -6,10 +6,16 @@
 //! (rustkube-node#11). With no CA/token it degrades to the previous plain
 //! client, preserving the dev/plaintext path.
 
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
 
 /// Build an apiserver client. `ca_pem` (PEM bytes) is added as a trusted root
 /// for HTTPS; `token` is sent as `Authorization: Bearer <token>` on every call.
+///
+/// Every request carries `Accept: application/json`. The kubelet's client is a
+/// hand-rolled JSON client that cannot decode `application/vnd.kubernetes.protobuf`;
+/// now that the apiserver can emit protobuf (rustkube#32), pinning Accept keeps
+/// content negotiation on JSON rather than relying on the server's default
+/// (rustkube-node#17).
 ///
 /// Returns an error instead of silently degrading: if a CA was supplied but is
 /// unusable, or the client fails to build, the caller must not proceed with a
@@ -36,14 +42,17 @@ pub fn build_authed_client(
         builder = builder.add_root_certificate(cert);
     }
 
+    // Default headers on every request: always ask for JSON; add the bearer
+    // token when configured.
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     if let Some(tok) = token.filter(|t| !t.is_empty()) {
         let mut val = HeaderValue::from_str(&format!("Bearer {tok}"))
             .map_err(|e| anyhow::anyhow!("bearer token is not a valid header value: {e}"))?;
         val.set_sensitive(true);
-        let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, val);
-        builder = builder.default_headers(headers);
     }
+    builder = builder.default_headers(headers);
 
     builder
         .build()
