@@ -73,17 +73,6 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // rustls 0.23 requires a process-level crypto provider before any TLS
-    // client is built. Without it, building the HTTPS apiserver client fails
-    // and the kubelet can never register (rustkube-node#16). Installing it
-    // explicitly makes the choice deterministic rather than dependent on which
-    // crate happens to enable which provider feature.
-    if rustls::crypto::CryptoProvider::get_default().is_none() {
-        if rustls::crypto::ring::default_provider().install_default().is_err() {
-            tracing::warn!("a rustls crypto provider was already installed");
-        }
-    }
-
     let cli = Cli::parse();
     let node_name = cli
         .node_name
