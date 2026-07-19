@@ -33,6 +33,7 @@ tracing-subscriber = { workspace = true }
 libcontainer = { workspace = true }
 oci-spec = { workspace = true }
 nix = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 tokio-stream = { workspace = true, features = ["net"] }

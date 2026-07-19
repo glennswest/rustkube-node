@@ -160,6 +160,32 @@ fn to_proto_propagation(p: crate::cri::MountPropagation) -> i32 {
     }
 }
 
+/// Extract the sandbox network-namespace path from a verbose
+/// `PodSandboxStatus.info` map. CRI-O puts a JSON blob under the `info` key that
+/// carries the sandbox `pid` and OCI `runtimeSpec`; prefer an explicit network
+/// namespace path, else fall back to `/proc/<pid>/ns/net`. Returns None for
+/// host-network sandboxes (pid 0 / no netns).
+fn netns_path_from_info(info: &std::collections::HashMap<String, String>) -> Option<String> {
+    let raw = info.get("info")?;
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if let Some(namespaces) = v["runtimeSpec"]["linux"]["namespaces"].as_array() {
+        for n in namespaces {
+            if n["type"] == "network" {
+                if let Some(p) = n["path"].as_str() {
+                    if !p.is_empty() {
+                        return Some(p.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let pid = v["pid"].as_u64()?;
+    if pid == 0 {
+        return None;
+    }
+    Some(format!("/proc/{pid}/ns/net"))
+}
+
 fn to_proto_container_config(config: &ContainerConfig) -> proto::ContainerConfig {
     proto::ContainerConfig {
         metadata: Some(proto::ContainerMetadata {
@@ -305,7 +331,9 @@ impl RuntimeService for CriGrpcClient {
             .clone()
             .pod_sandbox_status(proto::PodSandboxStatusRequest {
                 pod_sandbox_id: sandbox_id.to_string(),
-                verbose: false,
+                // Verbose so `info` carries the sandbox PID → netns path, used
+                // to run http/tcp probes inside the pod network namespace.
+                verbose: true,
             })
             .await
             .map_err(rpc_err)?
@@ -315,6 +343,7 @@ impl RuntimeService for CriGrpcClient {
             .status
             .ok_or_else(|| CriError::Runtime("empty sandbox status".into()))?;
         let network = status.network.unwrap_or_default();
+        let netns_path = netns_path_from_info(&resp.info);
 
         Ok(PodSandboxStatusInfo {
             id: status.id,
@@ -326,6 +355,7 @@ impl RuntimeService for CriGrpcClient {
             created_at: status.created_at,
             ip: network.ip,
             additional_ips: network.additional_ips.into_iter().map(|i| i.ip).collect(),
+            netns_path,
         })
     }
 

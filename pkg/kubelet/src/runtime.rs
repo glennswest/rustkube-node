@@ -404,6 +404,7 @@ mod linux {
                 created_at: 0,
                 ip: state.ip.clone(),
                 additional_ips: vec![],
+                netns_path: None,
             })
         }
 
@@ -905,7 +906,7 @@ pub mod stub {
         async fn stop_pod_sandbox(&self, _: &str) -> Result<(), CriError> { Ok(()) }
         async fn remove_pod_sandbox(&self, _: &str) -> Result<(), CriError> { Ok(()) }
         async fn pod_sandbox_status(&self, id: &str) -> Result<PodSandboxStatusInfo, CriError> {
-            Ok(PodSandboxStatusInfo { id: id.into(), state: PodSandboxState::Ready, created_at: 0, ip: "10.244.0.2".into(), additional_ips: vec![] })
+            Ok(PodSandboxStatusInfo { id: id.into(), state: PodSandboxState::Ready, created_at: 0, ip: "10.244.0.2".into(), additional_ips: vec![], netns_path: None })
         }
         async fn list_pod_sandbox(&self) -> Result<Vec<PodSandboxSummary>, CriError> { Ok(vec![]) }
         async fn create_container(&self, _: &str, _: &ContainerConfig, _: &PodSandboxConfig) -> Result<String, CriError> {

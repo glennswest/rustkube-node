@@ -158,6 +158,10 @@ pub struct PodSandboxStatusInfo {
     pub created_at: i64,
     pub ip: String,
     pub additional_ips: Vec<String>,
+    /// Path to the sandbox's network namespace (`/proc/<pid>/ns/net`), when the
+    /// runtime reports it. Used to run http/tcp health probes inside the pod's
+    /// netns so `127.0.0.1`/loopback-bound health servers are reachable.
+    pub netns_path: Option<String>,
 }
 
 /// Image information.

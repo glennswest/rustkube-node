@@ -858,6 +858,18 @@ impl PodManager {
             .unwrap_or_default();
         let sandbox_config = build_sandbox_config(&state.pod);
         let pod_ip = state.pod_ip.clone().unwrap_or_default();
+        // The pod's network namespace, so http/tcp probes run inside it and can
+        // reach loopback-bound health servers (e.g. cilium-operator on
+        // 127.0.0.1:9234). Best-effort — falls back to the host netns if unknown.
+        let pod_netns: Option<String> = match &state.sandbox_id {
+            Some(sid) => self
+                .runtime
+                .pod_sandbox_status(sid)
+                .await
+                .ok()
+                .and_then(|s| s.netns_path),
+            None => None,
+        };
 
         let mut container_statuses = Vec::new();
 
@@ -960,7 +972,7 @@ impl PodManager {
                     let liveness = &spec["livenessProbe"];
                     let mut restarted = false;
                     if !liveness.is_null() && elapsed >= probe_initial_delay(liveness) {
-                        match run_probe(liveness, &cid, &pod_ip, &self.runtime).await {
+                        match run_probe(liveness, &spec, &cid, &pod_ip, pod_netns.as_deref(), &self.runtime).await {
                             ProbeResult::Failure(reason) => {
                                 let failures =
                                     state.liveness_failures.entry(name.clone()).or_insert(0);
@@ -1004,7 +1016,7 @@ impl PodManager {
                         false
                     } else {
                         matches!(
-                            run_probe(readiness, &cid, &pod_ip, &self.runtime).await,
+                            run_probe(readiness, &spec, &cid, &pod_ip, pod_netns.as_deref(), &self.runtime).await,
                             ProbeResult::Success
                         )
                     };
@@ -1912,6 +1924,7 @@ mod tests {
                 created_at: 0,
                 ip: "10.88.0.5".to_string(),
                 additional_ips: vec![],
+                netns_path: None,
             })
         }
 
