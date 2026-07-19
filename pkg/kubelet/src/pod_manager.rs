@@ -1112,6 +1112,7 @@ impl PodManager {
             let image_ref = self.ensure_image(image, spec).await?;
             let mut config = build_container_config(spec, &image_ref, envs, mounts);
             config.attempt = restart_count;
+            config.log_path = format!("{}/{restart_count}.log", config.name);
             let cid = self
                 .runtime
                 .create_container(&sandbox_id, &config, sandbox_config)
@@ -1579,7 +1580,9 @@ fn build_container_config(
         mounts,
         labels: HashMap::new(),
         annotations: HashMap::new(),
-        log_path: String::new(),
+        // CRI log path, relative to the sandbox log_directory: <container>/<attempt>.log.
+        // Enables `crictl logs` / `kubectl logs`.
+        log_path: format!("{name}/0.log"),
         stdin: spec["stdin"].as_bool().unwrap_or(false),
         tty: spec["tty"].as_bool().unwrap_or(false),
         cpu_period: 100_000,
