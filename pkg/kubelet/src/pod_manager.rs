@@ -1566,6 +1566,10 @@ fn build_container_config(
     let cpu_limit = spec["resources"]["limits"]["cpu"].as_str().unwrap_or("0");
     let mem_limit = spec["resources"]["limits"]["memory"].as_str().unwrap_or("0");
 
+    // CRI log path, relative to the sandbox log_directory: <container>/<attempt>.log.
+    // Enables `crictl logs` / `kubectl logs`.
+    let log_path = format!("{name}/0.log");
+
     ContainerConfig {
         name,
         attempt: 0,
@@ -1580,9 +1584,7 @@ fn build_container_config(
         mounts,
         labels: HashMap::new(),
         annotations: HashMap::new(),
-        // CRI log path, relative to the sandbox log_directory: <container>/<attempt>.log.
-        // Enables `crictl logs` / `kubectl logs`.
-        log_path: format!("{name}/0.log"),
+        log_path,
         stdin: spec["stdin"].as_bool().unwrap_or(false),
         tty: spec["tty"].as_bool().unwrap_or(false),
         cpu_period: 100_000,
