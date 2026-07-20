@@ -55,6 +55,11 @@ pub struct PodSandboxConfig {
     pub host_pid: bool,
     /// Share the host IPC namespace (pod.spec.hostIPC).
     pub host_ipc: bool,
+    /// Allow privileged containers in this sandbox. Required when any container
+    /// in the pod sets `securityContext.privileged` — otherwise the runtime
+    /// rejects it with "no privileged container allowed in sandbox"
+    /// (e.g. Cilium's mount-bpf-fs init container). (rustkube-node#26)
+    pub privileged: bool,
 }
 
 /// Port mapping for a pod sandbox.
@@ -92,6 +97,20 @@ pub struct ContainerConfig {
     pub readonly_rootfs: bool,
     /// securityContext.capabilities.add (Linux capability names, e.g. NET_ADMIN).
     pub add_capabilities: Vec<String>,
+    /// securityContext.seLinuxOptions — the container's SELinux label. Cilium's
+    /// init containers request `type: spc_t` so they can write host paths under
+    /// enforcing SELinux; without passing this the runtime uses `container_t`
+    /// and those writes are denied (rustkube-node#26).
+    pub selinux_options: Option<SeLinuxOptions>,
+}
+
+/// SELinux label parts (user/role/type/level) for a container.
+#[derive(Debug, Clone, Default)]
+pub struct SeLinuxOptions {
+    pub user: String,
+    pub role: String,
+    pub type_: String,
+    pub level: String,
 }
 
 /// Mount propagation mode (matches CRI MountPropagation).

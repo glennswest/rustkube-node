@@ -125,6 +125,7 @@ fn to_proto_sandbox_config(config: &PodSandboxConfig) -> proto::PodSandboxConfig
                     config.host_pid,
                     config.host_ipc,
                 )),
+                privileged: config.privileged,
                 ..Default::default()
             }),
             ..Default::default()
@@ -238,6 +239,12 @@ fn to_proto_container_config(config: &ContainerConfig) -> proto::ContainerConfig
                 capabilities: Some(proto::Capability {
                     add_capabilities: config.add_capabilities.clone(),
                     ..Default::default()
+                }),
+                selinux_options: config.selinux_options.as_ref().map(|s| proto::SeLinuxOption {
+                    user: s.user.clone(),
+                    role: s.role.clone(),
+                    r#type: s.type_.clone(),
+                    level: s.level.clone(),
                 }),
                 ..Default::default()
             }),

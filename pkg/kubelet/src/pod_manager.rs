@@ -9,7 +9,7 @@
 
 use crate::cri::{
     ContainerConfig, ContainerState, CriError, ImageInfo, ImageService, Mount, MountPropagation,
-    PodSandboxConfig, RuntimeService,
+    PodSandboxConfig, RuntimeService, SeLinuxOptions,
 };
 use crate::health::{run_probe, ProbeResult};
 use serde_json::Value;
@@ -1371,6 +1371,15 @@ fn build_sandbox_config(pod: &Value) -> PodSandboxConfig {
     let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default");
     let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
 
+    // The sandbox must allow privileged containers if any container (init or
+    // app) requests it, else the runtime rejects the privileged container.
+    let any_privileged = ["containers", "initContainers"].iter().any(|k| {
+        pod["spec"][k]
+            .as_array()
+            .map(|a| a.iter().any(|c| c["securityContext"]["privileged"].as_bool() == Some(true)))
+            .unwrap_or(false)
+    });
+
     PodSandboxConfig {
         name: name.to_string(),
         uid: uid.to_string(),
@@ -1393,6 +1402,7 @@ fn build_sandbox_config(pod: &Value) -> PodSandboxConfig {
         host_network: pod["spec"]["hostNetwork"].as_bool().unwrap_or(false),
         host_pid: pod["spec"]["hostPID"].as_bool().unwrap_or(false),
         host_ipc: pod["spec"]["hostIPC"].as_bool().unwrap_or(false),
+        privileged: any_privileged,
     }
 }
 
@@ -1735,6 +1745,22 @@ fn build_container_config(
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
 
+    // securityContext.seLinuxOptions — pass the container's SELinux label to the
+    // runtime (e.g. cilium's init containers request `type: spc_t`). Pod-level
+    // seLinuxOptions falls back via the caller; container-level wins.
+    let se = &sc["seLinuxOptions"];
+    let selinux_options = if se.is_object() {
+        let field = |k: &str| se[k].as_str().unwrap_or("").to_string();
+        Some(SeLinuxOptions {
+            user: field("user"),
+            role: field("role"),
+            type_: field("type"),
+            level: field("level"),
+        })
+    } else {
+        None
+    };
+
     // cgroup semantics: cpu.shares from the CPU *request* (relative weight);
     // the cpu quota (hard cap) and memory limit from *limits* (0 = unlimited).
     let cpu_request = spec["resources"]["requests"]["cpu"].as_str().unwrap_or("0");
@@ -1769,6 +1795,7 @@ fn build_container_config(
         privileged: sc["privileged"].as_bool().unwrap_or(false),
         readonly_rootfs: sc["readOnlyRootFilesystem"].as_bool().unwrap_or(false),
         add_capabilities,
+        selinux_options,
     }
 }
 
@@ -2307,6 +2334,24 @@ mod tests {
         assert_eq!(expand_env_refs("$x", &m), "$x");
         // multiple refs in one string
         assert_eq!(expand_env_refs("$(FOO)/$(FOO)", &m), "bar/bar");
+    }
+
+    #[test]
+    fn passes_selinux_options_to_cri() {
+        // Cilium's init containers request `type: spc_t` so they can write host
+        // paths under enforcing SELinux (rustkube-node#26).
+        let spec = json!({
+            "name": "mount-cgroup", "image": "x",
+            "securityContext": {"seLinuxOptions": {"type": "spc_t", "level": "s0"}}
+        });
+        let c = build_container_config(&spec, "x", vec![], vec![]);
+        let se = c.selinux_options.expect("seLinuxOptions must pass through");
+        assert_eq!(se.type_, "spc_t");
+        assert_eq!(se.level, "s0");
+        assert_eq!(se.user, "");
+        // A container without seLinuxOptions gets None (default label).
+        let plain = build_container_config(&json!({"name": "a", "image": "x"}), "x", vec![], vec![]);
+        assert!(plain.selinux_options.is_none());
     }
 
     #[test]

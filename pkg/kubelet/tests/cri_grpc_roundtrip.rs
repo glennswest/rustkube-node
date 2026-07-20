@@ -333,6 +333,7 @@ fn sandbox_config() -> PodSandboxConfig {
         host_network: true,
         host_pid: false,
         host_ipc: false,
+        privileged: true,
     }
 }
 
@@ -398,6 +399,11 @@ async fn full_pod_flow_over_unix_socket() {
         privileged: true,
         readonly_rootfs: false,
         add_capabilities: vec!["NET_ADMIN".into()],
+        selinux_options: Some(kubelet::cri::SeLinuxOptions {
+            type_: "spc_t".into(),
+            level: "s0".into(),
+            ..Default::default()
+        }),
     };
     let container_id = client
         .create_container(&sandbox_id, &container, &config)
