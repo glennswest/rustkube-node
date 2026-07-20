@@ -9,7 +9,7 @@
 
 use crate::cri::{
     ContainerConfig, ContainerState, CriError, ImageInfo, ImageService, Mount, MountPropagation,
-    PodSandboxConfig, RuntimeService, SeLinuxOptions,
+    PodSandboxConfig, RuntimeService, SeLinuxOptions, SeccompProfile,
 };
 use crate::health::{run_probe, ProbeResult};
 use serde_json::Value;
@@ -1473,6 +1473,7 @@ fn build_sandbox_config(pod: &Value) -> PodSandboxConfig {
         host_pid: pod["spec"]["hostPID"].as_bool().unwrap_or(false),
         host_ipc: pod["spec"]["hostIPC"].as_bool().unwrap_or(false),
         privileged: any_privileged,
+        seccomp_profile: parse_seccomp(&pod["spec"]["securityContext"]),
     }
 }
 
@@ -1870,6 +1871,22 @@ fn build_container_config(
         host_pid: false,
         host_ipc: false,
         share_process_namespace: false,
+        // Container-level seccompProfile; a pod-level one is filled in later by
+        // apply_pod_namespaces when the container doesn't set its own.
+        seccomp_profile: parse_seccomp(sc),
+    }
+}
+
+/// Read a `securityContext.seccompProfile` (`{type, localhostProfile}`).
+fn parse_seccomp(sc: &Value) -> Option<SeccompProfile> {
+    let p = &sc["seccompProfile"];
+    match p["type"].as_str()? {
+        "Unconfined" => Some(SeccompProfile::Unconfined),
+        "RuntimeDefault" => Some(SeccompProfile::RuntimeDefault),
+        "Localhost" => Some(SeccompProfile::Localhost(
+            p["localhostProfile"].as_str().unwrap_or("").to_string(),
+        )),
+        _ => None,
     }
 }
 
@@ -1884,6 +1901,10 @@ fn apply_pod_namespaces(config: &mut ContainerConfig, pod: &Value) {
     config.host_ipc = spec["hostIPC"].as_bool().unwrap_or(false);
     config.share_process_namespace =
         spec["shareProcessNamespace"].as_bool().unwrap_or(false);
+    // A container without its own seccompProfile inherits the pod's.
+    if config.seccomp_profile.is_none() {
+        config.seccomp_profile = parse_seccomp(&spec["securityContext"]);
+    }
 }
 
 fn parse_cpu_quota(s: &str) -> i64 {
@@ -2406,6 +2427,37 @@ mod tests {
         let mut c2 = build_container_config(&simple_container(), "img", vec![], vec![]);
         apply_pod_namespaces(&mut c2, &json!({"spec": {}}));
         assert!(!c2.host_pid && !c2.host_network && !c2.host_ipc && !c2.share_process_namespace);
+    }
+
+    #[test]
+    fn seccomp_profile_parsed_and_inherited_from_pod() {
+        // parse_seccomp maps each K8s profile type.
+        assert_eq!(
+            parse_seccomp(&json!({"seccompProfile": {"type": "Unconfined"}})),
+            Some(SeccompProfile::Unconfined)
+        );
+        assert_eq!(
+            parse_seccomp(&json!({"seccompProfile": {"type": "RuntimeDefault"}})),
+            Some(SeccompProfile::RuntimeDefault)
+        );
+        assert_eq!(
+            parse_seccomp(&json!({"seccompProfile": {"type": "Localhost", "localhostProfile": "p.json"}})),
+            Some(SeccompProfile::Localhost("p.json".into()))
+        );
+        assert_eq!(parse_seccomp(&json!({})), None);
+
+        // The Cilium case: seccompProfile set only at the pod level must reach the
+        // container, or the runtime default profile fails its syscalls with EPERM.
+        let mut c = build_container_config(&simple_container(), "img", vec![], vec![]);
+        assert_eq!(c.seccomp_profile, None);
+        apply_pod_namespaces(&mut c, &json!({"spec": {"securityContext": {"seccompProfile": {"type": "Unconfined"}}}}));
+        assert_eq!(c.seccomp_profile, Some(SeccompProfile::Unconfined));
+
+        // A container's own profile wins over the pod's.
+        let own = json!({"name": "a", "image": "x", "securityContext": {"seccompProfile": {"type": "RuntimeDefault"}}});
+        let mut c2 = build_container_config(&own, "x", vec![], vec![]);
+        apply_pod_namespaces(&mut c2, &json!({"spec": {"securityContext": {"seccompProfile": {"type": "Unconfined"}}}}));
+        assert_eq!(c2.seccomp_profile, Some(SeccompProfile::RuntimeDefault));
     }
 
     #[test]

@@ -60,6 +60,8 @@ pub struct PodSandboxConfig {
     /// rejects it with "no privileged container allowed in sandbox"
     /// (e.g. Cilium's mount-bpf-fs init container). (rustkube-node#26)
     pub privileged: bool,
+    /// pod.spec.securityContext.seccompProfile — applied to the sandbox.
+    pub seccomp_profile: Option<SeccompProfile>,
 }
 
 /// Port mapping for a pod sandbox.
@@ -115,6 +117,10 @@ pub struct ContainerConfig {
     /// pod.spec.shareProcessNamespace — containers share the pod's PID namespace
     /// (pid=POD) instead of each getting their own (pid=CONTAINER).
     pub share_process_namespace: bool,
+    /// securityContext.seccompProfile (container-level, else the pod's). Cilium
+    /// needs `Unconfined`, or the runtime's default profile fails its syscalls
+    /// with EPERM — stalling even the `config` init container on an HTTPS call.
+    pub seccomp_profile: Option<SeccompProfile>,
 }
 
 /// SELinux label parts (user/role/type/level) for a container.
@@ -124,6 +130,20 @@ pub struct SeLinuxOptions {
     pub role: String,
     pub type_: String,
     pub level: String,
+}
+
+/// securityContext.seccompProfile — which seccomp profile the runtime applies.
+/// Unset means the runtime uses its default profile, which answers blocked
+/// syscalls with EPERM; workloads that program the datapath (Cilium) must run
+/// `Unconfined` or even a plain apiserver call inside an init container fails.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SeccompProfile {
+    /// No seccomp filtering.
+    Unconfined,
+    /// The runtime's default profile.
+    RuntimeDefault,
+    /// A profile file on the node (absolute path in the ref).
+    Localhost(String),
 }
 
 /// Mount propagation mode (matches CRI MountPropagation).

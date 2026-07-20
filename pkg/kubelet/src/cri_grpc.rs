@@ -126,6 +126,7 @@ fn to_proto_sandbox_config(config: &PodSandboxConfig) -> proto::PodSandboxConfig
                     config.host_ipc,
                 )),
                 privileged: config.privileged,
+                seccomp: config.seccomp_profile.as_ref().map(to_proto_seccomp),
                 ..Default::default()
             }),
             ..Default::default()
@@ -282,10 +283,28 @@ fn to_proto_container_config(config: &ContainerConfig) -> proto::ContainerConfig
                     r#type: s.type_.clone(),
                     level: s.level.clone(),
                 }),
+                seccomp: config.seccomp_profile.as_ref().map(to_proto_seccomp),
                 ..Default::default()
             }),
         }),
         ..Default::default()
+    }
+}
+
+/// Map a seccomp profile to the CRI `SecurityProfile`. `Unconfined` disables
+/// seccomp filtering — required by Cilium, whose containers would otherwise hit
+/// EPERM on blocked syscalls under the runtime default profile.
+fn to_proto_seccomp(p: &crate::cri::SeccompProfile) -> proto::SecurityProfile {
+    use crate::cri::SeccompProfile::*;
+    use proto::security_profile::ProfileType;
+    let (profile_type, localhost_ref) = match p {
+        Unconfined => (ProfileType::Unconfined, String::new()),
+        RuntimeDefault => (ProfileType::RuntimeDefault, String::new()),
+        Localhost(r) => (ProfileType::Localhost, r.clone()),
+    };
+    proto::SecurityProfile {
+        profile_type: profile_type as i32,
+        localhost_ref,
     }
 }
 
