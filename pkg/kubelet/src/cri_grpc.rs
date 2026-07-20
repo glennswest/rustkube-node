@@ -152,6 +152,37 @@ fn namespace_options(host_network: bool, host_pid: bool, host_ipc: bool) -> prot
     }
 }
 
+/// Container-level namespaces, which must be consistent with the sandbox:
+///   * network/ipc: NODE when the pod is hostNetwork/hostIPC, else POD (share
+///     the sandbox's).
+///   * pid: NODE for hostPID, POD when the pod opts into a shared process
+///     namespace, otherwise CONTAINER (each container its own PID namespace —
+///     the Kubernetes default). Leaving this unset defaulted to POD, which
+///     conflicts with a hostPID sandbox and blocks the Cilium agent.
+fn container_namespace_options(config: &ContainerConfig) -> proto::NamespaceOption {
+    let pid = if config.host_pid {
+        proto::NamespaceMode::Node
+    } else if config.share_process_namespace {
+        proto::NamespaceMode::Pod
+    } else {
+        proto::NamespaceMode::Container
+    };
+    proto::NamespaceOption {
+        network: if config.host_network {
+            proto::NamespaceMode::Node as i32
+        } else {
+            proto::NamespaceMode::Pod as i32
+        },
+        ipc: if config.host_ipc {
+            proto::NamespaceMode::Node as i32
+        } else {
+            proto::NamespaceMode::Pod as i32
+        },
+        pid: pid as i32,
+        ..Default::default()
+    }
+}
+
 fn to_proto_propagation(p: crate::cri::MountPropagation) -> i32 {
     use crate::cri::MountPropagation::*;
     match p {
@@ -236,6 +267,11 @@ fn to_proto_container_config(config: &ContainerConfig) -> proto::ContainerConfig
             security_context: Some(proto::LinuxContainerSecurityContext {
                 privileged: config.privileged,
                 readonly_rootfs: config.readonly_rootfs,
+                // The container's namespaces must be consistent with the
+                // sandbox's. If left unset they default to POD, which conflicts
+                // with a hostPID/hostNetwork sandbox (pid/net=NODE) and the
+                // runtime refuses to start the container. Mirror the pod here.
+                namespace_options: Some(container_namespace_options(config)),
                 capabilities: Some(proto::Capability {
                     add_capabilities: config.add_capabilities.clone(),
                     ..Default::default()

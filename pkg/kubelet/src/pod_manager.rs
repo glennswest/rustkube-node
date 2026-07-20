@@ -650,7 +650,8 @@ impl PodManager {
             merge_env(&mut envs, self.service_account_env());
             let mut mounts = resolve_mounts(spec, volumes);
             push_mount(&mut mounts, sa_mount.clone());
-            let config = build_container_config(spec, &image_ref, envs, mounts);
+            let mut config = build_container_config(spec, &image_ref, envs, mounts);
+            apply_pod_namespaces(&mut config, pod);
             ensure_container_log_dir(&sandbox_config.log_directory, &config.name);
             let cid = self
                 .runtime
@@ -774,8 +775,9 @@ impl PodManager {
             merge_env(&mut envs, self.service_account_env());
             let mut mounts = resolve_mounts(container_spec, &volumes);
             push_mount(&mut mounts, sa_mount.clone());
-            let container_config =
+            let mut container_config =
                 build_container_config(container_spec, &image_ref, envs, mounts);
+            apply_pod_namespaces(&mut container_config, pod);
             ensure_container_log_dir(&sandbox_config.log_directory, &container_config.name);
 
             // Create container
@@ -1256,9 +1258,13 @@ impl PodManager {
         merge_env(&mut envs, self.service_account_env());
         let mut mounts = resolve_mounts(spec, &volumes);
         push_mount(&mut mounts, self.service_account_mount(&state.pod).await);
+        // Capture the pod's namespace-sharing flags before `state` is borrowed
+        // by the async block below (which also mutably borrows `state` later).
+        let pod_for_ns = state.pod.clone();
         let result = async move {
             let image_ref = self.ensure_image(image, spec).await?;
             let mut config = build_container_config(spec, &image_ref, envs, mounts);
+            apply_pod_namespaces(&mut config, &pod_for_ns);
             config.attempt = restart_count;
             config.log_path = format!("{}/{restart_count}.log", config.name);
             ensure_container_log_dir(&sandbox_config.log_directory, &config.name);
@@ -1860,7 +1866,24 @@ fn build_container_config(
         readonly_rootfs: sc["readOnlyRootFilesystem"].as_bool().unwrap_or(false),
         add_capabilities,
         selinux_options,
+        host_network: false,
+        host_pid: false,
+        host_ipc: false,
+        share_process_namespace: false,
     }
+}
+
+/// Copy the pod-level namespace-sharing flags onto a container config. The
+/// container's CRI namespace_options must be consistent with the sandbox's
+/// (both derive from the pod), or the runtime refuses to start the container —
+/// e.g. a hostPID pod's sandbox is pid=NODE, so its containers must be too.
+fn apply_pod_namespaces(config: &mut ContainerConfig, pod: &Value) {
+    let spec = &pod["spec"];
+    config.host_network = spec["hostNetwork"].as_bool().unwrap_or(false);
+    config.host_pid = spec["hostPID"].as_bool().unwrap_or(false);
+    config.host_ipc = spec["hostIPC"].as_bool().unwrap_or(false);
+    config.share_process_namespace =
+        spec["shareProcessNamespace"].as_bool().unwrap_or(false);
 }
 
 fn parse_cpu_quota(s: &str) -> i64 {
@@ -2361,6 +2384,28 @@ mod tests {
         assert_eq!(c.mounts[0].host_path, "/sys/fs/bpf");
         assert_eq!(c.mounts[0].container_path, "/sys/fs/bpf");
         assert_eq!(c.mounts[0].propagation, MountPropagation::Bidirectional);
+    }
+
+    #[test]
+    fn apply_pod_namespaces_propagates_host_flags() {
+        // hostPID pod (the Cilium agent): the container must carry host_pid so
+        // its CRI pid namespace becomes NODE and matches the hostPID sandbox —
+        // otherwise the runtime rejects it with "pod level PID namespace
+        // requested for the container, but pod sandbox was not similarly
+        // configured".
+        let mut c = build_container_config(&simple_container(), "img", vec![], vec![]);
+        assert!(!c.host_pid && !c.host_network && !c.host_ipc);
+        let pod = json!({"spec": {"hostPID": true, "hostNetwork": true}});
+        apply_pod_namespaces(&mut c, &pod);
+        assert!(c.host_pid);
+        assert!(c.host_network);
+        assert!(!c.host_ipc);
+        assert!(!c.share_process_namespace);
+
+        // A plain pod leaves every namespace flag off (container gets its own).
+        let mut c2 = build_container_config(&simple_container(), "img", vec![], vec![]);
+        apply_pod_namespaces(&mut c2, &json!({"spec": {}}));
+        assert!(!c2.host_pid && !c2.host_network && !c2.host_ipc && !c2.share_process_namespace);
     }
 
     #[test]

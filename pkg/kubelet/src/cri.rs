@@ -102,6 +102,19 @@ pub struct ContainerConfig {
     /// enforcing SELinux; without passing this the runtime uses `container_t`
     /// and those writes are denied (rustkube-node#26).
     pub selinux_options: Option<SeLinuxOptions>,
+    /// pod.spec.hostNetwork — the container joins the host network namespace.
+    pub host_network: bool,
+    /// pod.spec.hostPID — the container joins the host PID namespace. Must match
+    /// the sandbox: a hostPID pod builds its sandbox with pid=NODE, so the
+    /// container's namespace_options.pid must also be NODE or the runtime rejects
+    /// it ("pod level PID namespace requested ... but pod sandbox was not
+    /// similarly configured") — this is what blocks the hostPID Cilium agent.
+    pub host_pid: bool,
+    /// pod.spec.hostIPC — the container joins the host IPC namespace.
+    pub host_ipc: bool,
+    /// pod.spec.shareProcessNamespace — containers share the pod's PID namespace
+    /// (pid=POD) instead of each getting their own (pid=CONTAINER).
+    pub share_process_namespace: bool,
 }
 
 /// SELinux label parts (user/role/type/level) for a container.
