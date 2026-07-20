@@ -31,6 +31,13 @@ pub struct KubeletConfig {
     pub client_key: Option<Vec<u8>>,
     /// Skip apiserver cert verification (dev only).
     pub insecure_skip_tls_verify: bool,
+    /// Inbound `:10250` serving cert + key (PEM). None → self-signed at startup.
+    pub serving_cert: Option<Vec<u8>>,
+    pub serving_key: Option<Vec<u8>>,
+    /// Static bearer token accepted by the inbound server (e.g. for monitoring).
+    pub server_auth_token: Option<String>,
+    /// Serve the inbound `:10250` endpoints unauthenticated (dev only).
+    pub anonymous_auth: bool,
 }
 
 impl Default for KubeletConfig {
@@ -47,6 +54,10 @@ impl Default for KubeletConfig {
             client_cert: None,
             client_key: None,
             insecure_skip_tls_verify: false,
+            serving_cert: None,
+            serving_key: None,
+            server_auth_token: None,
+            anonymous_auth: false,
         }
     }
 }
@@ -148,11 +159,21 @@ impl Kubelet {
         // restart) so we reconcile rather than double-create sandboxes.
         self.pod_manager.recover_state().await;
 
-        // Inbound kubelet HTTP server (:10250) — /healthz, /metrics, /pods.
+        // Inbound kubelet HTTPS server (:10250) — /healthz, /metrics, /pods.
         {
             let pm = self.pod_manager.clone();
             let port = self.config.kubelet_port;
-            tokio::spawn(async move { crate::server::serve(port, pm).await });
+            let server_config = crate::server::ServerConfig {
+                tls_cert: self.config.serving_cert.clone(),
+                tls_key: self.config.serving_key.clone(),
+                node_name: self.config.node_name.clone(),
+                node_ip: self.node_ip.clone(),
+                auth_token: self.config.server_auth_token.clone(),
+                api_client: self.api_client.clone(),
+                api_url: self.config.api_server_url.clone(),
+                anonymous: self.config.anonymous_auth,
+            };
+            tokio::spawn(async move { crate::server::serve(port, pm, server_config).await });
         }
 
         // Spawn heartbeat task

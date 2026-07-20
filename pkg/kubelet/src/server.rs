@@ -6,11 +6,42 @@
 //! TLS + bearer-token auth is the TLS phase (rustkube-node#9).
 
 use crate::pod_manager::PodManager;
-use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
+use axum::extract::{Request, State};
+use axum::http::{header::AUTHORIZATION, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::{routing::get, Json, Router};
 use std::sync::Arc;
 use tracing::{info, warn};
 
-/// Build the router (exposed for tests).
+/// TLS + auth configuration for the inbound `:10250` server (rustkube-node#9).
+#[derive(Clone)]
+pub struct ServerConfig {
+    /// PEM serving cert + key. When either is absent, a self-signed cert is
+    /// generated at startup (SANs = node name + node IP).
+    pub tls_cert: Option<Vec<u8>>,
+    pub tls_key: Option<Vec<u8>>,
+    pub node_name: String,
+    pub node_ip: String,
+    /// Static bearer token accepted for inbound auth (e.g. a monitoring scraper).
+    pub auth_token: Option<String>,
+    /// Authenticated apiserver client + URL, used to validate bearer tokens via
+    /// TokenReview.
+    pub api_client: reqwest::Client,
+    pub api_url: String,
+    /// Serve all routes unauthenticated (dev only).
+    pub anonymous: bool,
+}
+
+#[derive(Clone)]
+struct AuthState {
+    auth_token: Option<String>,
+    api_client: reqwest::Client,
+    api_url: String,
+    anonymous: bool,
+}
+
+/// Build the (unauthenticated) router — exposed for tests.
 pub fn router(pod_manager: Arc<PodManager>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
@@ -23,21 +54,127 @@ pub fn router(pod_manager: Arc<PodManager>) -> Router {
         .with_state(pod_manager)
 }
 
-/// Serve the kubelet API on `0.0.0.0:<port>`. Runs until the process exits.
-pub async fn serve(port: u16, pod_manager: Arc<PodManager>) {
-    let app = router(pod_manager);
-    let addr = format!("0.0.0.0:{port}");
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
-        Ok(l) => l,
+/// Serve the kubelet API over HTTPS on `0.0.0.0:<port>` with bearer-token auth
+/// on everything except the health endpoints. Runs until the process exits.
+pub async fn serve(port: u16, pod_manager: Arc<PodManager>, config: ServerConfig) {
+    // rustls needs a process-wide crypto provider; installing is idempotent.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    if config.anonymous {
+        warn!("kubelet server: anonymous auth enabled — :{port} endpoints are unauthenticated");
+    }
+    let auth = AuthState {
+        auth_token: config.auth_token.clone(),
+        api_client: config.api_client.clone(),
+        api_url: config.api_url.clone(),
+        anonymous: config.anonymous,
+    };
+    let app = router(pod_manager).layer(middleware::from_fn_with_state(auth, auth_mw));
+
+    // Serving cert: use the provided pair, else self-sign.
+    let (cert_pem, key_pem) = match (&config.tls_cert, &config.tls_key) {
+        (Some(c), Some(k)) => (c.clone(), k.clone()),
+        _ => match self_signed_cert(&config.node_name, &config.node_ip) {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!("kubelet server: self-signed cert generation failed: {e}");
+                return;
+            }
+        },
+    };
+    let tls = match axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem, key_pem).await {
+        Ok(t) => t,
         Err(e) => {
-            warn!("kubelet server: cannot bind {addr}: {e}");
+            warn!("kubelet server: TLS config failed: {e}");
             return;
         }
     };
-    info!("kubelet server listening on {addr}");
-    if let Err(e) = axum::serve(listener, app).await {
+
+    let addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();
+    info!(
+        "kubelet server listening on https://0.0.0.0:{port} (auth: {})",
+        if config.anonymous { "anonymous" } else { "bearer-token" }
+    );
+    if let Err(e) = axum_server::bind_rustls(addr, tls)
+        .serve(app.into_make_service())
+        .await
+    {
         warn!("kubelet server exited: {e}");
     }
+}
+
+/// Auth gate: health/liveness/readiness are always open; everything else needs a
+/// valid bearer token (a configured static token, or one the apiserver accepts
+/// via TokenReview).
+async fn auth_mw(State(auth): State<AuthState>, req: Request, next: Next) -> Response {
+    let path = req.uri().path();
+    let exempt = matches!(path, "/healthz" | "/livez" | "/readyz");
+    if exempt || auth.anonymous {
+        return next.run(req).await;
+    }
+    let token = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(str::to_string);
+    match token {
+        Some(t) if authorize(&auth, &t).await => next.run(req).await,
+        _ => (StatusCode::UNAUTHORIZED, "Unauthorized\n").into_response(),
+    }
+}
+
+async fn authorize(auth: &AuthState, token: &str) -> bool {
+    if let Some(expected) = &auth.auth_token {
+        if constant_time_eq(token.as_bytes(), expected.as_bytes()) {
+            return true;
+        }
+    }
+    token_review(auth, token).await
+}
+
+/// Validate a token via the apiserver's TokenReview API (best-effort — succeeds
+/// only if the apiserver implements it and the token authenticates).
+async fn token_review(auth: &AuthState, token: &str) -> bool {
+    let url = format!(
+        "{}/apis/authentication.k8s.io/v1/tokenreviews",
+        auth.api_url.trim_end_matches('/')
+    );
+    let body = serde_json::json!({
+        "apiVersion": "authentication.k8s.io/v1",
+        "kind": "TokenReview",
+        "spec": { "token": token }
+    });
+    match auth.api_client.post(&url).json(&body).send().await {
+        Ok(resp) => resp
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|v| v["status"]["authenticated"].as_bool())
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// Length-checked constant-time byte comparison (avoids token timing leaks).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Generate a self-signed serving cert (PEM cert, PEM key) for the node.
+fn self_signed_cert(node_name: &str, node_ip: &str) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let mut sans = vec![node_name.to_string(), "localhost".to_string()];
+    if !node_ip.is_empty() {
+        sans.push(node_ip.to_string());
+    }
+    let key = rcgen::generate_simple_self_signed(sans)?;
+    Ok((
+        key.cert.pem().into_bytes(),
+        key.key_pair.serialize_pem().into_bytes(),
+    ))
 }
 
 async fn healthz() -> impl IntoResponse {

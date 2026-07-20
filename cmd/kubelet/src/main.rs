@@ -80,6 +80,23 @@ struct Cli {
     /// Skip apiserver certificate verification (dev only — do not use in prod).
     #[arg(long, default_value_t = false)]
     insecure_skip_tls_verify: bool,
+
+    /// Serving certificate (PEM) for the inbound :10250 server. Self-signed if unset.
+    #[arg(long, env = "KUBELET_TLS_CERT_FILE")]
+    tls_cert_file: Option<String>,
+
+    /// Serving private key (PEM) for --tls-cert-file.
+    #[arg(long, env = "KUBELET_TLS_PRIVATE_KEY_FILE")]
+    tls_private_key_file: Option<String>,
+
+    /// File with a static bearer token accepted by the inbound :10250 server
+    /// (e.g. for a metrics scraper). Tokens are also validated via TokenReview.
+    #[arg(long, env = "KUBELET_SERVER_TOKEN_FILE")]
+    server_token_file: Option<String>,
+
+    /// Serve the inbound :10250 endpoints unauthenticated (dev only).
+    #[arg(long, default_value_t = false)]
+    anonymous_auth: bool,
 }
 
 /// Read a file to bytes, warning (not failing) if it can't be read — matches
@@ -234,6 +251,20 @@ async fn main() -> anyhow::Result<()> {
             .map(|k| k.insecure_skip_tls_verify)
             .unwrap_or(false);
 
+    // Inbound :10250 server TLS + auth (rustkube-node#9).
+    let serving_cert = cli.tls_cert_file.as_deref().and_then(read_file_bytes);
+    let serving_key = cli.tls_private_key_file.as_deref().and_then(read_file_bytes);
+    let server_auth_token = cli
+        .server_token_file
+        .as_ref()
+        .and_then(|p| match std::fs::read_to_string(p) {
+            Ok(s) => Some(s.trim().to_string()),
+            Err(e) => {
+                tracing::warn!("cannot read server token file {p}: {e}");
+                None
+            }
+        });
+
     let config = KubeletConfig {
         node_name,
         api_server_url,
@@ -244,6 +275,10 @@ async fn main() -> anyhow::Result<()> {
         client_cert,
         client_key,
         insecure_skip_tls_verify,
+        serving_cert,
+        serving_key,
+        server_auth_token,
+        anonymous_auth: cli.anonymous_auth,
         ..Default::default()
     };
     let kubelet = Kubelet::new(config, runtime, images, migration)?;
