@@ -182,21 +182,37 @@ impl NodeReporter {
     fn build_status(&self) -> Value {
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-        // Get system info
+        // Real system + filesystem stats (no longer faked).
         let (total_mem_ki, cpu_count) = get_system_resources();
+        let (fs_total, fs_avail) = ephemeral_fs_stats().unwrap_or((0, 0));
+        // Available memory drives MemoryPressure; fall back to "plenty" if unknown.
+        let avail_mem_ki = available_memory_ki().unwrap_or(total_mem_ki);
+
+        // Eviction-style pressure signals (kubelet defaults: memory.available<100Mi,
+        // nodefs.available<10%). PIDPressure only when very few PIDs remain.
+        let mem_pressure = avail_mem_ki < 100 * 1024;
+        let disk_pressure = fs_total > 0 && (fs_avail as f64 / fs_total as f64) < 0.10;
+        let pid_pressure = pid_stats()
+            .map(|(used, max)| max.saturating_sub(used) < 2000)
+            .unwrap_or(false);
+
+        // ephemeral-storage capacity from the container/pod-storage filesystem;
+        // allocatable reserves the 10% eviction headroom.
+        let eph_cap_ki = fs_total / 1024;
+        let eph_alloc_ki = (fs_total / 1024) * 9 / 10;
 
         json!({
             "capacity": {
                 "cpu": cpu_count.to_string(),
                 "memory": format!("{total_mem_ki}Ki"),
                 "pods": "110",
-                "ephemeral-storage": "50Gi"
+                "ephemeral-storage": format!("{eph_cap_ki}Ki")
             },
             "allocatable": {
                 "cpu": cpu_count.to_string(),
                 "memory": format!("{}Ki", total_mem_ki.saturating_sub(256 * 1024)),
                 "pods": "110",
-                "ephemeral-storage": "45Gi"
+                "ephemeral-storage": format!("{eph_alloc_ki}Ki")
             },
             "conditions": [
                 {
@@ -209,22 +225,22 @@ impl NodeReporter {
                 },
                 {
                     "type": "MemoryPressure",
-                    "status": "False",
-                    "reason": "KubeletHasSufficientMemory",
+                    "status": if mem_pressure { "True" } else { "False" },
+                    "reason": if mem_pressure { "KubeletHasInsufficientMemory" } else { "KubeletHasSufficientMemory" },
                     "lastHeartbeatTime": &now,
                     "lastTransitionTime": &now
                 },
                 {
                     "type": "DiskPressure",
-                    "status": "False",
-                    "reason": "KubeletHasNoDiskPressure",
+                    "status": if disk_pressure { "True" } else { "False" },
+                    "reason": if disk_pressure { "KubeletHasDiskPressure" } else { "KubeletHasNoDiskPressure" },
                     "lastHeartbeatTime": &now,
                     "lastTransitionTime": &now
                 },
                 {
                     "type": "PIDPressure",
-                    "status": "False",
-                    "reason": "KubeletHasSufficientPID",
+                    "status": if pid_pressure { "True" } else { "False" },
+                    "reason": if pid_pressure { "KubeletHasInsufficientPID" } else { "KubeletHasSufficientPID" },
                     "lastHeartbeatTime": &now,
                     "lastTransitionTime": &now
                 }
@@ -332,5 +348,81 @@ fn detect_total_memory_ki() -> Option<u64> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn detect_total_memory_ki() -> Option<u64> {
+    None
+}
+
+/// (total, available) bytes of the filesystem backing container/pod storage —
+/// used for `ephemeral-storage` capacity and DiskPressure. Tries the CRI-O /
+/// kubelet storage roots, then falls back to `/`.
+pub(crate) fn ephemeral_fs_stats() -> Option<(u64, u64)> {
+    for p in ["/var/lib/containers", "/var/lib/kubelet", "/var", "/"] {
+        if std::path::Path::new(p).exists() {
+            if let Some(s) = statvfs_bytes(p) {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+/// Currently-available memory in KiB (MemAvailable), for MemoryPressure.
+#[cfg(target_os = "linux")]
+fn available_memory_ki() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            return rest.trim().trim_end_matches(" kB").trim().parse().ok();
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn available_memory_ki() -> Option<u64> {
+    None
+}
+
+/// (used, max) process IDs, for PIDPressure.
+#[cfg(target_os = "linux")]
+fn pid_stats() -> Option<(u64, u64)> {
+    let max: u64 = std::fs::read_to_string("/proc/sys/kernel/pid_max")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let used = std::fs::read_dir("/proc")
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .map(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+                .unwrap_or(false)
+        })
+        .count() as u64;
+    Some((used, max))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pid_stats() -> Option<(u64, u64)> {
+    None
+}
+
+/// (total, available) bytes of the filesystem containing `path`, via statvfs(3).
+#[cfg(target_os = "linux")]
+fn statvfs_bytes(path: &str) -> Option<(u64, u64)> {
+    use std::ffi::CString;
+    let c = CString::new(path).ok()?;
+    // SAFETY: statvfs fills a zeroed buffer; the return code is checked.
+    let mut buf: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut buf) } != 0 {
+        return None;
+    }
+    let frsize = buf.f_frsize as u64;
+    Some((buf.f_blocks as u64 * frsize, buf.f_bavail as u64 * frsize))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn statvfs_bytes(_path: &str) -> Option<(u64, u64)> {
     None
 }

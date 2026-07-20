@@ -120,10 +120,19 @@ async fn stats_summary(State(pm): State<Arc<PodManager>>) -> impl IntoResponse {
             })
         })
         .collect();
+    // Real node filesystem stats (ephemeral storage) for eviction/monitoring.
+    let node_fs = crate::node_status::ephemeral_fs_stats().map(|(total, avail)| {
+        serde_json::json!({
+            "capacityBytes": total,
+            "availableBytes": avail,
+            "usedBytes": total.saturating_sub(avail),
+        })
+    });
     Json(serde_json::json!({
         "node": {
             "cpu": {"usageCoreNanoSeconds": node_cpu},
             "memory": {"workingSetBytes": node_mem},
+            "fs": node_fs,
         },
         "pods": pods,
     }))
