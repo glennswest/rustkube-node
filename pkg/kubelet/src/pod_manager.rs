@@ -37,6 +37,10 @@ pub struct PodState {
     pub ready: HashMap<String, bool>,
     /// Consecutive liveness probe failures per container name.
     pub liveness_failures: HashMap<String, u32>,
+    /// Per-container: has the startupProbe passed yet? Until it does (or when
+    /// there is no startupProbe), liveness/readiness are suppressed so a slow-
+    /// starting container (e.g. cilium-agent) isn't killed before it's up.
+    pub startup_passed: HashMap<String, bool>,
     /// When each container was last (re)started, for initialDelaySeconds.
     pub started: HashMap<String, Instant>,
     /// Containers that terminated for good (no restart) → exit code.
@@ -486,6 +490,7 @@ impl PodManager {
                     restart_counts: HashMap::new(),
                     ready: HashMap::new(),
                     liveness_failures: HashMap::new(),
+                    startup_passed: HashMap::new(),
                     started: HashMap::new(),
                     terminated: HashMap::new(),
                 },
@@ -819,6 +824,7 @@ impl PodManager {
                     restart_counts: HashMap::new(),
                     ready: ready_map,
                     liveness_failures: HashMap::new(),
+                    startup_passed: HashMap::new(),
                     started: started_map,
                     terminated: HashMap::new(),
                 },
@@ -966,6 +972,63 @@ impl PodManager {
                         .get(&name)
                         .map(|t| t.elapsed().as_secs())
                         .unwrap_or(u64::MAX);
+
+                    // Startup probe: until it passes, gate out liveness/readiness
+                    // so a slow-starting container (e.g. cilium-agent bringing up
+                    // its :9879 health server) isn't killed prematurely.
+                    let startup = &spec["startupProbe"];
+                    if !startup.is_null()
+                        && !state.startup_passed.get(&name).copied().unwrap_or(false)
+                    {
+                        let not_ready = |statuses: &mut Vec<ContainerStatusReport>| {
+                            statuses.push(ContainerStatusReport {
+                                name: name.clone(),
+                                container_id: cid.clone(),
+                                state: "running".to_string(),
+                                ready: false,
+                                restart_count,
+                                exit_code: 0,
+                                image: status.image.clone(),
+                                image_ref: status.image_ref.clone(),
+                            });
+                        };
+                        if elapsed < probe_initial_delay(startup) {
+                            state.ready.insert(name.clone(), false);
+                            not_ready(&mut container_statuses);
+                            continue;
+                        }
+                        match run_probe(startup, &spec, &cid, &pod_ip, pod_netns.as_deref(), &self.runtime).await {
+                            ProbeResult::Success => {
+                                info!("Startup probe passed for {}/{}/{name}", state.namespace, state.name);
+                                state.startup_passed.insert(name.clone(), true);
+                                state.liveness_failures.insert(name.clone(), 0);
+                                // fall through to liveness/readiness this cycle
+                            }
+                            ProbeResult::Failure(reason) => {
+                                let failures = state.liveness_failures.entry(name.clone()).or_insert(0);
+                                *failures += 1;
+                                let threshold = probe_failure_threshold(startup);
+                                warn!(
+                                    "Startup probe failed for {}/{}/{name} ({}/{threshold}): {reason}",
+                                    state.namespace, state.name, *failures
+                                );
+                                if *failures >= threshold {
+                                    info!("Startup threshold reached — restarting {}/{}/{name}", state.namespace, state.name);
+                                    if self.restart_container(&mut state, &name, &cid, &spec, &sandbox_config, &mut container_statuses).await {
+                                        continue;
+                                    }
+                                }
+                                state.ready.insert(name.clone(), false);
+                                not_ready(&mut container_statuses);
+                                continue;
+                            }
+                            ProbeResult::Unknown => {
+                                state.ready.insert(name.clone(), false);
+                                not_ready(&mut container_statuses);
+                                continue;
+                            }
+                        }
+                    }
 
                     // Liveness probe: consecutive failures past the threshold
                     // kill and restart the container.
@@ -1307,6 +1370,7 @@ impl PodManager {
                 restart_counts: HashMap::new(),
                 ready: HashMap::new(),
                 liveness_failures: HashMap::new(),
+                    startup_passed: HashMap::new(),
                 started: HashMap::new(),
                 terminated: HashMap::new(),
             },
