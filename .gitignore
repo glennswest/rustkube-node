@@ -3,3 +3,4 @@
 .env
 .env.*
 .terragrunt-cache/
+deploy/terragrunt/rknode/pki/
