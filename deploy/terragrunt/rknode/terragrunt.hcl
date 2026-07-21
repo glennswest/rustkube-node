@@ -36,7 +36,7 @@ locals {
   # Pinned released artifacts — the latest at rebuild time.
   fastetcd_rpm_url      = "https://github.com/glennswest/fastetcd/releases/download/v1.0.4/fastetcd-1.0.4-1.x86_64.rpm"
   rustkube_rpm_url      = "https://github.com/glennswest/rustkube/releases/download/v0.7.32/kubernetes-rs-0.7.32-1.x86_64.rpm"
-  rustkube_node_rpm_url = "https://github.com/glennswest/rustkube-node/releases/download/v0.2.2/rustkube-node-0.2.2-1.fc43.x86_64.rpm"
+  rustkube_node_rpm_url = "https://github.com/glennswest/rustkube-node/releases/download/v0.2.3/rustkube-node-0.2.3-1.fc43.x86_64.rpm"
 }
 
 inputs = {
