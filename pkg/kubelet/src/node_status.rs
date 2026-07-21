@@ -85,7 +85,8 @@ impl NodeReporter {
             "kind": "Node",
             "metadata": self.node_metadata(),
             "spec": self.node_spec(),
-            "status": self.build_status()
+            // Fresh node: no existing conditions to preserve.
+            "status": self.build_status(&[])
         });
 
         let resp = self
@@ -110,13 +111,31 @@ impl NodeReporter {
         }
     }
 
+    /// GET the node's current status conditions, so a heartbeat can merge its
+    /// own conditions in without wiping ones set by other components
+    /// (rustkube-node#29). Returns an empty list if the node/status can't be
+    /// read — a heartbeat then just re-asserts the kubelet-owned conditions.
+    async fn current_conditions(&self) -> Vec<Value> {
+        let url = format!("{}/api/v1/nodes/{}", self.api_url, self.node_name);
+        match self.client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => resp
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|node| node["status"]["conditions"].as_array().cloned())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
     /// PUT the node status via the `/status` subresource (preserves metadata/spec).
     async fn update_node_status(&self) -> anyhow::Result<()> {
+        let existing = self.current_conditions().await;
         let node_update = json!({
             "apiVersion": "v1",
             "kind": "Node",
             "metadata": { "name": &self.node_name },
-            "status": self.build_status()
+            "status": self.build_status(&existing)
         });
 
         let resp = self
@@ -179,7 +198,11 @@ impl NodeReporter {
         Ok(())
     }
 
-    fn build_status(&self) -> Value {
+    /// Build the node status, merging the kubelet-owned conditions into
+    /// `existing` (the conditions currently on the object) so third-party
+    /// conditions — Cilium's `NetworkUnavailable`, NPD/operator conditions — are
+    /// preserved rather than clobbered on every heartbeat (rustkube-node#29).
+    fn build_status(&self, existing: &[Value]) -> Value {
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
         // Real system + filesystem stats (no longer faked).
@@ -214,37 +237,9 @@ impl NodeReporter {
                 "pods": "110",
                 "ephemeral-storage": format!("{eph_alloc_ki}Ki")
             },
-            "conditions": [
-                {
-                    "type": "Ready",
-                    "status": "True",
-                    "reason": "KubeletReady",
-                    "message": "rustkube kubelet is ready",
-                    "lastHeartbeatTime": &now,
-                    "lastTransitionTime": &now
-                },
-                {
-                    "type": "MemoryPressure",
-                    "status": if mem_pressure { "True" } else { "False" },
-                    "reason": if mem_pressure { "KubeletHasInsufficientMemory" } else { "KubeletHasSufficientMemory" },
-                    "lastHeartbeatTime": &now,
-                    "lastTransitionTime": &now
-                },
-                {
-                    "type": "DiskPressure",
-                    "status": if disk_pressure { "True" } else { "False" },
-                    "reason": if disk_pressure { "KubeletHasDiskPressure" } else { "KubeletHasNoDiskPressure" },
-                    "lastHeartbeatTime": &now,
-                    "lastTransitionTime": &now
-                },
-                {
-                    "type": "PIDPressure",
-                    "status": if pid_pressure { "True" } else { "False" },
-                    "reason": if pid_pressure { "KubeletHasInsufficientPID" } else { "KubeletHasSufficientPID" },
-                    "lastHeartbeatTime": &now,
-                    "lastTransitionTime": &now
-                }
-            ],
+            "conditions": merge_owned_conditions(
+                existing, mem_pressure, disk_pressure, pid_pressure, &now,
+            ),
             "nodeInfo": {
                 "machineID": "",
                 "systemUUID": "",
@@ -263,6 +258,80 @@ impl NodeReporter {
             "addresses": build_addresses(&self.node_name)
         })
     }
+}
+
+/// The condition types the kubelet owns and refreshes each heartbeat. Every
+/// other condition on the node (e.g. Cilium's `NetworkUnavailable`, or custom
+/// operator/NPD conditions) is left untouched.
+const KUBELET_OWNED_CONDITIONS: [&str; 4] =
+    ["Ready", "MemoryPressure", "DiskPressure", "PIDPressure"];
+
+/// Merge the kubelet-owned conditions into `existing`, keyed by `type`
+/// (rustkube-node#29):
+///   * foreign conditions (not in `KUBELET_OWNED_CONDITIONS`) are carried
+///     through verbatim, so a heartbeat never clobbers them;
+///   * each owned condition's `lastTransitionTime` is carried forward from the
+///     previous value when its `status` is unchanged, and only stamped `now` on
+///     an actual flip — `lastHeartbeatTime` always advances.
+fn merge_owned_conditions(
+    existing: &[Value],
+    mem_pressure: bool,
+    disk_pressure: bool,
+    pid_pressure: bool,
+    now: &str,
+) -> Value {
+    // (type, status, reason, message) for the kubelet-owned conditions.
+    let owned = [
+        ("Ready", "True", "KubeletReady", "rustkube kubelet is ready"),
+        (
+            "MemoryPressure",
+            if mem_pressure { "True" } else { "False" },
+            if mem_pressure { "KubeletHasInsufficientMemory" } else { "KubeletHasSufficientMemory" },
+            "",
+        ),
+        (
+            "DiskPressure",
+            if disk_pressure { "True" } else { "False" },
+            if disk_pressure { "KubeletHasDiskPressure" } else { "KubeletHasNoDiskPressure" },
+            "",
+        ),
+        (
+            "PIDPressure",
+            if pid_pressure { "True" } else { "False" },
+            if pid_pressure { "KubeletHasInsufficientPID" } else { "KubeletHasSufficientPID" },
+            "",
+        ),
+    ];
+
+    // Preserve every condition the kubelet does not own.
+    let mut out: Vec<Value> = existing
+        .iter()
+        .filter(|c| !KUBELET_OWNED_CONDITIONS.contains(&c["type"].as_str().unwrap_or("")))
+        .cloned()
+        .collect();
+
+    for (typ, status, reason, message) in owned {
+        let prev = existing.iter().find(|c| c["type"] == typ);
+        // Keep the prior transition time unless the status actually changed.
+        let transition = match prev {
+            Some(p) if p["status"].as_str() == Some(status) => {
+                p["lastTransitionTime"].as_str().unwrap_or(now).to_string()
+            }
+            _ => now.to_string(),
+        };
+        let mut cond = json!({
+            "type": typ,
+            "status": status,
+            "reason": reason,
+            "lastHeartbeatTime": now,
+            "lastTransitionTime": transition,
+        });
+        if !message.is_empty() {
+            cond["message"] = json!(message);
+        }
+        out.push(cond);
+    }
+    Value::Array(out)
 }
 
 /// Map Rust's `std::env::consts::ARCH` to the Go `GOARCH` string Kubernetes uses.
@@ -425,4 +494,71 @@ fn statvfs_bytes(path: &str) -> Option<(u64, u64)> {
 #[cfg(not(target_os = "linux"))]
 fn statvfs_bytes(_path: &str) -> Option<(u64, u64)> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn types(v: &Value) -> Vec<String> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["type"].as_str().unwrap().to_string())
+            .collect()
+    }
+    fn cond<'a>(v: &'a Value, t: &str) -> &'a Value {
+        v.as_array().unwrap().iter().find(|c| c["type"] == t).unwrap()
+    }
+
+    #[test]
+    fn preserves_foreign_conditions() {
+        // The Cilium case: NetworkUnavailable must survive a heartbeat.
+        let existing = json!([
+            {"type": "NetworkUnavailable", "status": "False", "reason": "CiliumIsUp",
+             "lastHeartbeatTime": "t0", "lastTransitionTime": "t0"}
+        ]);
+        let merged = merge_owned_conditions(existing.as_array().unwrap(), false, false, false, "t1");
+        let ts = types(&merged);
+        assert!(ts.contains(&"NetworkUnavailable".to_string()));
+        for owned in ["Ready", "MemoryPressure", "DiskPressure", "PIDPressure"] {
+            assert!(ts.contains(&owned.to_string()), "missing {owned}");
+        }
+        // Foreign condition carried through untouched.
+        assert_eq!(cond(&merged, "NetworkUnavailable")["reason"], "CiliumIsUp");
+        assert_eq!(cond(&merged, "NetworkUnavailable")["lastTransitionTime"], "t0");
+        assert_eq!(cond(&merged, "Ready")["status"], "True");
+    }
+
+    #[test]
+    fn carries_transition_time_when_status_unchanged() {
+        // Ready was already True at t0; a heartbeat at t1 keeps the transition
+        // time but advances the heartbeat time.
+        let existing = json!([
+            {"type": "Ready", "status": "True", "lastHeartbeatTime": "t0", "lastTransitionTime": "t0"}
+        ]);
+        let merged = merge_owned_conditions(existing.as_array().unwrap(), false, false, false, "t1");
+        let ready = cond(&merged, "Ready");
+        assert_eq!(ready["lastTransitionTime"], "t0", "transition time must not churn");
+        assert_eq!(ready["lastHeartbeatTime"], "t1", "heartbeat time must advance");
+    }
+
+    #[test]
+    fn stamps_transition_time_on_flip() {
+        // DiskPressure flips False -> True: transition time updates to now.
+        let existing = json!([
+            {"type": "DiskPressure", "status": "False", "lastHeartbeatTime": "t0", "lastTransitionTime": "t0"}
+        ]);
+        let merged = merge_owned_conditions(existing.as_array().unwrap(), false, true, false, "t1");
+        let dp = cond(&merged, "DiskPressure");
+        assert_eq!(dp["status"], "True");
+        assert_eq!(dp["lastTransitionTime"], "t1", "flip must stamp now");
+    }
+
+    #[test]
+    fn fresh_node_gets_all_owned_conditions() {
+        let merged = merge_owned_conditions(&[], false, false, false, "t1");
+        assert_eq!(types(&merged).len(), 4);
+        assert_eq!(cond(&merged, "Ready")["lastTransitionTime"], "t1");
+    }
 }
