@@ -28,6 +28,11 @@ struct Cli {
     #[arg(long, env = "POD_CIDR")]
     pod_cidr: Option<String>,
 
+    /// Static-pod manifest directory. Pods here run locally (no apiserver) —
+    /// how the control plane bootstraps. Empty string disables static pods.
+    #[arg(long, env = "POD_MANIFEST_PATH", default_value = "/etc/kubernetes/manifests")]
+    pod_manifest_path: String,
+
     /// CRI socket path (only used with --runtime=cri).
     #[arg(long, env = "CRI_SOCKET")]
     cri_socket: Option<String>,
@@ -269,6 +274,11 @@ async fn main() -> anyhow::Result<()> {
         node_name,
         api_server_url,
         pod_cidr: cli.pod_cidr,
+        pod_manifest_path: if cli.pod_manifest_path.is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(&cli.pod_manifest_path))
+        },
         kubelet_port: cli.kubelet_port,
         apiserver_ca,
         bearer_token,

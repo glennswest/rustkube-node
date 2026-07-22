@@ -38,6 +38,10 @@ pub struct KubeletConfig {
     pub server_auth_token: Option<String>,
     /// Serve the inbound `:10250` endpoints unauthenticated (dev only).
     pub anonymous_auth: bool,
+    /// Directory of static-pod manifests (e.g. /etc/kubernetes/manifests). These
+    /// pods run locally, independent of the apiserver — this is how the control
+    /// plane (apiserver, etcd) bootstraps. `None` disables static pods.
+    pub pod_manifest_path: Option<std::path::PathBuf>,
 }
 
 impl Default for KubeletConfig {
@@ -58,6 +62,7 @@ impl Default for KubeletConfig {
             serving_key: None,
             server_auth_token: None,
             anonymous_auth: false,
+            pod_manifest_path: Some(std::path::PathBuf::from("/etc/kubernetes/manifests")),
         }
     }
 }
@@ -131,28 +136,57 @@ impl Kubelet {
             }
         };
 
-        // Register node
-        let reporter = NodeReporter::with_pod_cidr(
-            &self.config.api_server_url,
-            &self.config.node_name,
-            self.config.pod_cidr.clone(),
-        )
-        .with_runtime_version(runtime_version.clone())
-        .with_kubelet_port(self.config.kubelet_port)
-        .with_client(self.api_client.clone());
-        // Retry registration rather than exiting — the apiserver may be
-        // briefly unreachable or the node's RBAC not yet in place. The kubelet
-        // must not crash-loop out of the cluster over a transient failure.
-        let mut backoff = Duration::from_secs(1);
-        loop {
-            match reporter.register().await {
-                Ok(()) => break,
-                Err(e) => {
-                    warn!("Node registration failed ({e}); retrying in {backoff:?}");
-                    time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(30));
+        // Static pods first: the control plane (apiserver, etcd, controller,
+        // scheduler) ships as static-pod manifests and must run LOCALLY,
+        // independent of the apiserver — that is how the apiserver itself
+        // starts. Run them now (and continuously in the sync loop below) so we
+        // never deadlock waiting for a control plane that nothing brings up.
+        let static_pods = self.load_static_pods();
+        if !static_pods.is_empty() {
+            info!(
+                "running {} static pod(s) from {}",
+                static_pods.len(),
+                self.config
+                    .pod_manifest_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            );
+            self.pod_manager.sync_pods(&static_pods).await;
+        }
+
+        // Register the node in the BACKGROUND with backoff — never block the pod
+        // loops on it. Static pods keep running (and get retried in the sync
+        // loop) even while the apiserver is still coming up or RBAC isn't in
+        // place yet. The kubelet must not crash-loop out over a transient
+        // registration failure, nor stall the control-plane bootstrap on it.
+        {
+            let url = self.config.api_server_url.clone();
+            let node_name = self.config.node_name.clone();
+            let pod_cidr = self.config.pod_cidr.clone();
+            let rv = runtime_version.clone();
+            let port = self.config.kubelet_port;
+            let client = self.api_client.clone();
+            tokio::spawn(async move {
+                let reporter = NodeReporter::with_pod_cidr(&url, &node_name, pod_cidr)
+                    .with_runtime_version(rv)
+                    .with_kubelet_port(port)
+                    .with_client(client);
+                let mut backoff = Duration::from_secs(1);
+                loop {
+                    match reporter.register().await {
+                        Ok(()) => {
+                            info!("node registered");
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("Node registration failed ({e}); retrying in {backoff:?}");
+                            time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(Duration::from_secs(30));
+                        }
+                    }
                 }
-            }
+            });
         }
 
         // Adopt pods already running in the runtime (e.g. after a kubelet
@@ -207,26 +241,107 @@ impl Kubelet {
         }
     }
 
+    /// Load static-pod manifests from `pod_manifest_path` and normalize them for
+    /// local reconcile. Static pods run without the apiserver, keyed by a stable
+    /// uid derived from name+node so re-reads don't recreate them. Best-effort:
+    /// unreadable/invalid files are skipped with a warning.
+    fn load_static_pods(&self) -> Vec<Value> {
+        let mut pods = Vec::new();
+        let Some(dir) = self.config.pod_manifest_path.as_ref() else {
+            return pods;
+        };
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(e) => {
+                debug!("no static pod dir {}: {e}", dir.display());
+                return pods;
+            }
+        };
+        for ent in entries.flatten() {
+            let path = ent.path();
+            match path.extension().and_then(|s| s.to_str()) {
+                Some("yaml") | Some("yml") | Some("json") => {}
+                _ => continue,
+            }
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!("read static pod {}: {e}", path.display());
+                    continue;
+                }
+            };
+            let mut pod: Value = match serde_yaml::from_str(&text) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("parse static pod {}: {e}", path.display());
+                    continue;
+                }
+            };
+            if pod.get("kind").and_then(|k| k.as_str()) != Some("Pod") {
+                continue;
+            }
+            let name = pod["metadata"]["name"]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "static".into());
+            let ns = pod["metadata"]["namespace"]
+                .as_str()
+                .unwrap_or("kube-system")
+                .to_string();
+            // Stable, node-scoped identity so reconciles don't recreate the pod
+            // (matches Kubernetes' mirror-pod `<name>-<node>` convention).
+            let uid = format!("static-{name}-{}", self.config.node_name);
+            pod["metadata"]["name"] = Value::String(name);
+            pod["metadata"]["namespace"] = Value::String(ns);
+            pod["metadata"]["uid"] = Value::String(uid);
+            pod["spec"]["nodeName"] = Value::String(self.config.node_name.clone());
+            pods.push(pod);
+        }
+        pods
+    }
+
     /// Sync pods: fetch desired pods from API server, reconcile with actual.
     async fn sync(&self) -> anyhow::Result<()> {
-        // List all pods across all namespaces
-        let resp: Value = self
+        // Apiserver pods scheduled to this node — BEST-EFFORT: during bootstrap
+        // the apiserver may be down, but static pods must still run to bring it
+        // up, so a failed list must not abort the sync.
+        let mut my_pods: Vec<Value> = match self
             .api_client
             .get(format!("{}/api/v1/pods", self.config.api_server_url))
             .send()
-            .await?
-            .json()
-            .await?;
+            .await
+        {
+            Ok(resp) => resp
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|v| v["items"].as_array().cloned())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|p| p["spec"]["nodeName"].as_str() == Some(&self.config.node_name))
+                .collect(),
+            Err(e) => {
+                debug!("apiserver pod list unavailable ({e}); running static pods only");
+                Vec::new()
+            }
+        };
 
-        let pods = resp["items"].as_array().cloned().unwrap_or_default();
-
-        // Filter to pods scheduled to this node
-        let my_pods: Vec<Value> = pods
-            .into_iter()
-            .filter(|p| {
-                p["spec"]["nodeName"].as_str() == Some(&self.config.node_name)
-            })
-            .collect();
+        // Static pods always run, whether or not the apiserver knows them. This
+        // is what keeps the control plane up (and retries it) during bootstrap.
+        for sp in self.load_static_pods() {
+            let uid = sp["metadata"]["uid"].as_str().unwrap_or("").to_string();
+            if !my_pods
+                .iter()
+                .any(|p| p["metadata"]["uid"].as_str() == Some(uid.as_str()))
+            {
+                my_pods.push(sp);
+            }
+        }
 
         // Sync pod states
         let outcome = self.pod_manager.sync_pods(&my_pods).await;
