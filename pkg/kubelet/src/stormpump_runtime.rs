@@ -65,12 +65,21 @@ use crate::cri::{
 /// Where stormpump listens for clients on a stormcos node.
 pub const DEFAULT_SOCKET: &str = "/run/stormpump.sock";
 
-/// `sandbox::Profile::Routed` — a veth to the node bridge: east-west between
-/// pods and a default route out.
+/// `sandbox::Profile::Isolated` — a network namespace with nothing in it but
+/// loopback.
+///
+/// The right profile whenever a CNI owns pod networking, which is the case this
+/// is built for: the plugin creates the veth and anything the runtime plumbed
+/// first would have to be undone. It is also what makes a pod's containers
+/// share `localhost`, since loopback is there whether or not anything else is.
+///
+/// A node with no CNI installed gets pods that can reach each other inside a
+/// pod and nothing outside it — which is honest, and better than a pod that
+/// fails to start because the node has no bridge to wire to.
 ///
 /// Named here rather than imported so the number this puts on the wire is
-/// visible at the place it is chosen.
-const PROFILE_ROUTED: u8 = 0;
+/// visible where it is chosen.
+const PROFILE_ISOLATED: u8 = 4;
 
 /// One container the kubelet has asked for.
 struct Container {
@@ -374,14 +383,15 @@ impl RuntimeService for StormpumpRuntime {
         //
         // Not for host networking — there is no namespace to hold, because the
         // containers are already in the same one, which is the node's.
+        //
+        // Everything else gets an isolated namespace: a CNI fills it when one
+        // is installed, and until then its containers share loopback with each
+        // other and reach nothing outside, which is what a pod on a node with
+        // no pod network honestly is.
         let handle = if config.host_network {
             None
         } else {
-            // Routed: a veth to the node bridge, east-west plus a default
-            // route. When a CNI is installed this becomes an empty namespace
-            // for it to fill instead, which is a profile the engine does not
-            // have yet.
-            Some(self.on_ring(|r| r.sandbox_acquire(PROFILE_ROUTED)).await?)
+            Some(self.on_ring(|r| r.sandbox_acquire(PROFILE_ISOLATED)).await?)
         };
 
         let sb = Sandbox {
