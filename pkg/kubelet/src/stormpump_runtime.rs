@@ -278,9 +278,21 @@ fn spec_for(config: &ContainerConfig, sandbox: &PodSandboxConfig) -> stormpump::
         // image a container runs is a property of the spawn. `Chroot` is
         // "enter the volume's mount view", which is what a container root is.
         root: Root::Chroot,
-        // Its own file, so a crashed container's reason survives it and the
-        // node's console is not the only place it went.
-        logs: Logs::Combined,
+        // Inherited, for now, and this is a real gap rather than a choice.
+        //
+        // `Logs::Combined` writes `<id>.stdout`/`.stderr` into a *log volume*,
+        // whose handle the spawn carries in `inline_b` — and a spawn asking for
+        // it without one is refused with EINVAL, which is exactly what happened
+        // here. Supplying it means registering the pod's log directory
+        // (`/var/log/pods/<ns>_<pod>_<uid>/...`, which CRI hands us) as a
+        // volume, and that path has to exist in the *host's* mount namespace
+        // because that is where the engine opens it — this kubelet is in a
+        // container and its own /var/log is not the node's.
+        //
+        // Until that is bound through, output goes where the engine's goes: the
+        // node's log and the fleet's multicast group. Visible, but not where
+        // `kubectl logs` looks, so that is the next piece.
+        logs: Logs::Inherit,
         mounts: Vec::new(),
         // hostNetwork is the node's namespace; anything else is the pod's,
         // which the sandbox already holds. `Profile::Host` is "no namespace at
