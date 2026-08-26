@@ -190,14 +190,19 @@ impl RingClient {
 
     /// Take a sandbox from the warm pool, or build one.
     ///
-    /// This is the operation a CRI shim cannot express and the reason for going
-    /// direct: the namespaces already exist, so what a start costs is `setns`
-    /// rather than `unshare`.
-    pub fn sandbox_acquire(&self, spec: Handle) -> Result<Handle, RingError> {
+    /// The profile is a byte, not a spec: a sandbox is namespaces and nothing
+    /// else, so a spec for one would be a spec with nothing to run — which the
+    /// engine refuses.
+    ///
+    /// This is the operation a CRI shim cannot express and half the reason for
+    /// going direct: the namespaces already exist, so what a container start
+    /// costs is `setns` rather than `unshare`. The other half is that a pod's
+    /// containers can be put in the *same* one.
+    pub fn sandbox_acquire(&self, profile: u8) -> Result<Handle, RingError> {
         let cqe = self.submit(
             Sqe {
                 opcode: Op::SandboxAcquire as u8,
-                primary: spec,
+                inline_a: profile as u64,
                 ..Default::default()
             },
             None,
@@ -224,11 +229,15 @@ impl RingClient {
     /// with EINVAL, which is exactly the shape of bug that is hard to place
     /// from the outside — so it is a required argument here rather than
     /// something a caller can forget.
+    /// `sandbox` is the pod's, joined rather than taken — which is what puts a
+    /// pod's containers on one network instead of several. `Handle::NONE`
+    /// means "take your own", which is right for anything that is not a pod.
     pub fn spawn(
         &self,
         spec: Handle,
         root: Handle,
         logs: Handle,
+        sandbox: Handle,
         domain: u8,
     ) -> Result<Handle, RingError> {
         let cqe = self.submit(
@@ -237,6 +246,7 @@ impl RingClient {
                 domain,
                 primary: spec,
                 handle_a: root,
+                handle_b: sandbox,
                 inline_b: logs.0,
                 ..Default::default()
             },

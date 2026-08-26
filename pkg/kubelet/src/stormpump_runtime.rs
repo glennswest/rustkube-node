@@ -65,6 +65,13 @@ use crate::cri::{
 /// Where stormpump listens for clients on a stormcos node.
 pub const DEFAULT_SOCKET: &str = "/run/stormpump.sock";
 
+/// `sandbox::Profile::Routed` — a veth to the node bridge: east-west between
+/// pods and a default route out.
+///
+/// Named here rather than imported so the number this puts on the wire is
+/// visible at the place it is chosen.
+const PROFILE_ROUTED: u8 = 0;
+
 /// One container the kubelet has asked for.
 struct Container {
     id: String,
@@ -359,24 +366,27 @@ impl RuntimeService for StormpumpRuntime {
         // for hostPID in a sandbox that was not built for it is the mismatch
         // every runtime rejects, and the reason is that the sandbox's
         // namespaces already exist by the time the container is created.
-        // Recorded, not acquired.
+        // Acquired, so the pod's containers share it.
         //
-        // `SandboxAcquire` is reserved in stormpump's ABI and not implemented:
-        // the engine dispatches twelve ops and that is not one of them. A
-        // sandbox is not a thing a client asks for — `Spawn` builds the
-        // workload's namespaces itself, and the warm pool behind that is the
-        // engine's own business rather than something a caller reaches into.
+        // This is the difference between a pod and a bag of containers: they
+        // land in namespaces that already exist rather than each making its
+        // own, so they share a network and reach each other on localhost.
         //
-        // So a pod sandbox here is what the pod *wants*, held until its
-        // containers are spawned and folded into each of their specs. The
-        // consequence, stated plainly: containers of a pod get namespaces that
-        // match rather than namespaces they share, because nothing in the spec
-        // can yet say "join that one's". That is right for a single-container
-        // pod and wrong for a pod that expects a shared localhost — which is
-        // the next thing this needs from the engine.
+        // Not for host networking — there is no namespace to hold, because the
+        // containers are already in the same one, which is the node's.
+        let handle = if config.host_network {
+            None
+        } else {
+            // Routed: a veth to the node bridge, east-west plus a default
+            // route. When a CNI is installed this becomes an empty namespace
+            // for it to fill instead, which is a profile the engine does not
+            // have yet.
+            Some(self.on_ring(|r| r.sandbox_acquire(PROFILE_ROUTED)).await?)
+        };
+
         let sb = Sandbox {
             id: id.clone(),
-            handle: None,
+            handle,
             config: config.clone(),
             state: PodSandboxState::Ready,
             created_at: now_nanos(),
@@ -406,7 +416,9 @@ impl RuntimeService for StormpumpRuntime {
             .remove(sandbox_id)
             .and_then(|sb| sb.handle);
         if let Some(h) = handle {
-            // Back to the pool, which is what makes the next start cheap.
+            // Back to the pool, which is what makes the next start cheap. The
+            // engine defers it until the last container has left, so this may
+            // be called while they are still stopping.
             let _ = self.on_ring(move |r| r.sandbox_release(h)).await;
         }
         self.forget_containers_of(sandbox_id).await;
@@ -515,7 +527,7 @@ impl RuntimeService for StormpumpRuntime {
 
     async fn start_container(&self, container_id: &str) -> Result<(), CriError> {
         self.probe()?;
-        let (spec, path, log_dir) = {
+        let (spec, path, log_dir, sandbox_id) = {
             let containers = self.containers.lock().await;
             let c = containers
                 .get(container_id)
@@ -532,7 +544,14 @@ impl RuntimeService for StormpumpRuntime {
                     c.image
                 ))
             })?;
-            (spec, path, c.log_dir.clone())
+            (spec, path, c.log_dir.clone(), c.sandbox_id.clone())
+        };
+
+        // The pod's sandbox, if it has one. A host-network pod has none and
+        // each container is simply in the node's namespaces.
+        let sandbox = {
+            let sandboxes = self.sandboxes.lock().await;
+            sandboxes.get(&sandbox_id).and_then(|sb| sb.handle).unwrap_or(Handle::NONE)
         };
 
         // Registered now, not at create: a volume handle is a resource the
@@ -549,10 +568,10 @@ impl RuntimeService for StormpumpRuntime {
                 let root = r.volume_register(&path)?;
                 let logs = r.volume_register(&log_dir)?;
                 tracing::debug!(
-                    ?spec, ?root, ?logs, path = %path, logs_dir = %log_dir,
+                    ?spec, ?root, ?logs, ?sandbox, path = %path, logs_dir = %log_dir,
                     "stormpump: spawning"
                 );
-                r.spawn(spec, root, logs, Domain::Container as u8)
+                r.spawn(spec, root, logs, sandbox, Domain::Container as u8)
             })
             .await?;
 
