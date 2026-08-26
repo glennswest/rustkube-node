@@ -2546,7 +2546,7 @@ source = "git+https://github.com/glennswest/stormcast?branch=main#9244121e2f9c73
 [[package]]
 name = "stormpump"
 version = "0.1.0"
-source = "git+https://github.com/glennswest/stormpump?branch=main#3387b3cfc8cced2c0c54781cbfe0b8dea8ac4328"
+source = "git+https://github.com/glennswest/stormpump?branch=main#4ceaf07cbf27745406572347b37cedb6e1fa2d63"
 dependencies = [
  "libc",
  "stormcast",
@@ -2556,7 +2556,7 @@ dependencies = [
 [[package]]
 name = "stormpump-abi"
 version = "0.1.0"
-source = "git+https://github.com/glennswest/stormpump?branch=main#3387b3cfc8cced2c0c54781cbfe0b8dea8ac4328"
+source = "git+https://github.com/glennswest/stormpump?branch=main#4ceaf07cbf27745406572347b37cedb6e1fa2d63"
 
 [[package]]
 name = "strsim"
