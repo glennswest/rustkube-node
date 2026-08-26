@@ -75,8 +75,14 @@ struct Container {
     spec_handle: Option<Handle>,
     /// The handle for the running workload. `None` until started.
     workload_handle: Option<Handle>,
-    /// The image's volume, registered with the engine. `None` until pulled.
+    /// The image's volume, registered with the engine. `None` until started.
     root_handle: Option<Handle>,
+    /// Where the image's filesystem is mounted on this node.
+    ///
+    /// Registered with the engine at start rather than at create: a volume
+    /// handle is a resource the engine holds, and holding one for a container
+    /// that may never start is a leak for as long as the pod is pending.
+    root_path: Option<String>,
     state: ContainerState,
     created_at: i64,
     started_at: i64,
@@ -250,6 +256,10 @@ fn spec_for(config: &ContainerConfig, sandbox: &PodSandboxConfig) -> stormpump::
 
     let mut argv: Vec<String> = config.command.clone();
     argv.extend(config.args.iter().cloned());
+    // A spec with nothing to run is refused at define time (`EmptyArgv`), and
+    // an image's entrypoint is not something this side knows. Falling back to a
+    // shell would run the wrong thing silently; an empty argv fails loudly at
+    // the moment the spec is defined, naming the container.
 
     Spec {
         domain: Domain::Container,
@@ -320,32 +330,24 @@ impl RuntimeService for StormpumpRuntime {
         // for hostPID in a sandbox that was not built for it is the mismatch
         // every runtime rejects, and the reason is that the sandbox's
         // namespaces already exist by the time the container is created.
-        // The sandbox spec: what namespaces this pod gets. Defined and
-        // acquired now rather than at the first container, because the
-        // containers of a pod join namespaces that must already exist — and
-        // because acquiring is where the warm pool pays off.
-        use stormpump::spec::{Share, Spec};
-        let sandbox_spec = Spec {
-            domain: Domain::Container,
-            profile: if config.host_network { Profile::Host } else { Profile::Routed },
-            share: Share {
-                pid: config.host_pid,
-                ipc: config.host_ipc,
-                uts: false,
-            },
-            ..Spec::default()
-        };
-        let encoded = sandbox_spec.encode();
-        let handle = self
-            .on_ring(move |r| {
-                let spec = r.spec_define(encoded)?;
-                r.sandbox_acquire(spec)
-            })
-            .await?;
-
+        // Recorded, not acquired.
+        //
+        // `SandboxAcquire` is reserved in stormpump's ABI and not implemented:
+        // the engine dispatches twelve ops and that is not one of them. A
+        // sandbox is not a thing a client asks for — `Spawn` builds the
+        // workload's namespaces itself, and the warm pool behind that is the
+        // engine's own business rather than something a caller reaches into.
+        //
+        // So a pod sandbox here is what the pod *wants*, held until its
+        // containers are spawned and folded into each of their specs. The
+        // consequence, stated plainly: containers of a pod get namespaces that
+        // match rather than namespaces they share, because nothing in the spec
+        // can yet say "join that one's". That is right for a single-container
+        // pod and wrong for a pod that expects a shared localhost — which is
+        // the next thing this needs from the engine.
         let sb = Sandbox {
             id: id.clone(),
-            handle: Some(handle),
+            handle: None,
             config: config.clone(),
             state: PodSandboxState::Ready,
             created_at: now_nanos(),
@@ -444,6 +446,11 @@ impl RuntimeService for StormpumpRuntime {
             spec_handle: Some(spec),
             workload_handle: None,
             root_handle: None,
+            // The image ref is the mounted path, which is what pull_image
+            // returned. A pod whose image was never pulled has none, and
+            // start_container says so rather than spawning onto nothing.
+            root_path: StormpumpImages::local_path(&config.image)
+                .map(|p| p.to_string_lossy().into_owned()),
             state: ContainerState::Created,
             created_at: now_nanos(),
             started_at: 0,
@@ -471,19 +478,24 @@ impl RuntimeService for StormpumpRuntime {
             let spec = c.spec_handle.ok_or_else(|| {
                 CriError::Runtime(format!("container {container_id} has no spec"))
             })?;
-            // The root is the image's volume. Until pull_image mints one there
-            // is nothing to run, and saying so is better than spawning a
-            // container with no filesystem and reporting it started.
-            let root = c.root_handle.ok_or_else(|| {
+            // The root is the image's filesystem. Without one there is nothing
+            // to run, and saying so is better than spawning a container onto
+            // nothing and reporting that it started.
+            let path = c.root_path.clone().ok_or_else(|| {
                 CriError::Runtime(format!(
-                    "container {container_id} has no root volume — its image was never pulled"
+                    "container {container_id} has no root — image {} was never pulled",
+                    c.image
                 ))
             })?;
-            (spec, root)
+            (spec, path)
         };
 
+        // Registered now, not at create: a volume handle is a resource the
+        // engine holds, and holding one for a container that may never start
+        // is a leak for as long as its pod is pending.
         let workload = self
             .on_ring(move |r| {
+                let root = r.volume_register(&path)?;
                 r.spawn(spec, root, Domain::Container as u8)
             })
             .await?;
@@ -627,24 +639,85 @@ impl StormpumpImages {
     }
 }
 
+/// Where a node's own images live once the initramfs has mounted them.
+///
+/// A golden *is* an image: a sealed filesystem, cloned copy-on-write, mounted
+/// read-only. The ones a node ships with are already mounted here by the time
+/// anything runs, so an image named after one needs no pull at all — the
+/// filesystem is already on the node and the "pull" is a lookup.
+const PALLET_ROOT: &str = "/pallets";
+
+impl StormpumpImages {
+    /// The mounted path for an image, if this node ships it as a golden.
+    ///
+    /// `docker.io/library/busybox:latest` -> `busybox`, so a pod can name an
+    /// image the ordinary way and get the node's copy. A tag is ignored,
+    /// deliberately: a golden is one sealed filesystem and its version is the
+    /// pallet's, not a string in a pod spec.
+    fn local_path(image: &str) -> Option<std::path::PathBuf> {
+        let last = image.rsplit('/').next().unwrap_or(image);
+        let name = last.split(['@', ':']).next().unwrap_or(last);
+        if name.is_empty() {
+            return None;
+        }
+        let p = std::path::Path::new(PALLET_ROOT).join(name);
+        // A directory that exists but is not a mount is an empty mount point —
+        // the initramfs makes those for volumes it could not attach. Running a
+        // container on one gives an empty root and a confusing failure, so it
+        // is treated as absent.
+        let has_content = std::fs::read_dir(&p).map(|mut d| d.next().is_some()).unwrap_or(false);
+        has_content.then_some(p)
+    }
+}
+
 #[async_trait]
 impl ImageService for StormpumpImages {
     async fn pull_image(&self, image: &str) -> Result<String, CriError> {
-        Err(CriError::Runtime(format!(
-            "pulling {image} through the registry at {} is not wired yet",
+        if let Some(path) = Self::local_path(image) {
+            tracing::info!(image = %image, path = %path.display(), "image is a golden on this node");
+            return Ok(path.to_string_lossy().into_owned());
+        }
+        // Everything else needs the registry to mint a copy-on-write clone and
+        // the node to attach it, and the attach half does not exist yet: a
+        // clone is a volume, and nothing mounts a volume at runtime. Reported
+        // rather than faked, because a container started on the wrong
+        // filesystem is worse than one that does not start.
+        Err(CriError::ImagePull(format!(
+            "{image} is not a golden on this node, and pulling from the registry at {} \
+             needs runtime volume attach, which is not built",
             self.registry
         )))
     }
 
-    async fn image_status(&self, _image: &str) -> Result<Option<ImageInfo>, CriError> {
-        Ok(None)
+    async fn image_status(&self, image: &str) -> Result<Option<ImageInfo>, CriError> {
+        Ok(Self::local_path(image).map(|p| ImageInfo {
+            id: p.to_string_lossy().into_owned(),
+            repo_tags: vec![image.to_string()],
+            repo_digests: Vec::new(),
+            size: 0,
+        }))
     }
 
     async fn list_images(&self) -> Result<Vec<ImageInfo>, CriError> {
-        Ok(Vec::new())
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(PALLET_ROOT) else { return Ok(out) };
+        for e in entries.flatten() {
+            let Some(name) = e.file_name().to_str().map(str::to_owned) else { continue };
+            if Self::local_path(&name).is_some() {
+                out.push(ImageInfo {
+                    id: e.path().to_string_lossy().into_owned(),
+                    repo_tags: vec![name],
+                    repo_digests: Vec::new(),
+                    size: 0,
+                });
+            }
+        }
+        Ok(out)
     }
 
     async fn remove_image(&self, _image: &str) -> Result<(), CriError> {
+        // A golden is not this node's to delete: it is a pallet member, and
+        // what runs is a clone of it. Removing images is the pallet's business.
         Ok(())
     }
 }
