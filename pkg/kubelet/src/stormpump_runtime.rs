@@ -70,6 +70,15 @@ struct Container {
     id: String,
     sandbox_id: String,
     name: String,
+    /// The pod and namespace this container belongs to.
+    ///
+    /// A container's identity is `namespace/pod/container`, never the bare
+    /// name: two namespaces may each have an `app`, and they are different
+    /// containers. Kept here so a log line, a status and a workload name all
+    /// say which one — the bare name is ambiguous exactly when someone is
+    /// trying to tell two of them apart.
+    namespace: String,
+    pod: String,
     image: String,
     /// The handle stormpump returned for the spec. `None` until created.
     spec_handle: Option<Handle>,
@@ -215,8 +224,9 @@ impl StormpumpRuntime {
                         ((e.status >> 8) & 0xff) as i32
                     };
                     tracing::info!(
-                        container = %c.id, name = %c.name, code = c.exit_code,
-                        "stormpump: container exited"
+                        container = %c.id,
+                        name = %format!("{}/{}/{}", c.namespace, c.pod, c.name),
+                        code = c.exit_code, "stormpump: container exited"
                     );
                 }
             }
@@ -437,11 +447,21 @@ impl RuntimeService for StormpumpRuntime {
         let encoded = spec_for(config, _sandbox_config).encode();
         let spec = self.on_ring(move |r| r.spec_define(encoded)).await?;
 
+        let (namespace, pod) = {
+            let sandboxes = self.sandboxes.lock().await;
+            sandboxes
+                .get(sandbox_id)
+                .map(|sb| (sb.config.namespace.clone(), sb.config.name.clone()))
+                .unwrap_or_default()
+        };
+
         let id = self.mint_id("ct");
         let c = Container {
             id: id.clone(),
             sandbox_id: sandbox_id.to_string(),
             name: config.name.clone(),
+            namespace,
+            pod,
             image: config.image.clone(),
             spec_handle: Some(spec),
             workload_handle: None,
@@ -460,9 +480,10 @@ impl RuntimeService for StormpumpRuntime {
             host_network: config.host_network,
             host_pid: config.host_pid,
         };
+        let qualified = format!("{}/{}/{}", c.namespace, c.pod, c.name);
         self.containers.lock().await.insert(id.clone(), c);
         tracing::info!(
-            container = %id, name = %config.name, image = %config.image,
+            container = %id, name = %qualified, image = %config.image,
             "stormpump: container created"
         );
         Ok(id)
@@ -508,8 +529,8 @@ impl RuntimeService for StormpumpRuntime {
         c.state = ContainerState::Running;
         c.started_at = now_nanos();
         tracing::info!(
-            container = %c.id, name = %c.name, workload = ?workload,
-            "stormpump: container started"
+            container = %c.id, name = %format!("{}/{}/{}", c.namespace, c.pod, c.name),
+            workload = ?workload, "stormpump: container started"
         );
         Ok(())
     }
@@ -780,6 +801,8 @@ mod tests {
                     name: id.into(),
                     image: "i".into(),
                     spec_handle: None,
+                    namespace: "default".into(),
+                    pod: "p".into(),
                     workload_handle: None,
                     root_handle: None,
                     root_path: None,
@@ -856,6 +879,71 @@ mod tests {
 
         let cc = ContainerConfig { host_pid: true, ..Default::default() };
         assert!(spec_for(&cc, &PodSandboxConfig::default()).share.pid);
+    }
+
+    #[tokio::test]
+    async fn two_namespaces_may_each_have_a_container_called_app() {
+        // A container is namespace/pod/container, never the bare name. Two
+        // namespaces each having an `app` is ordinary, and they are different
+        // containers — anything that keys on the name alone merges them.
+        let r = StormpumpRuntime::new("/run/stormpump.sock");
+        for (id, ns) in [("sb-a", "alpha"), ("sb-b", "beta")] {
+            r.sandboxes.lock().await.insert(
+                id.into(),
+                Sandbox {
+                    id: id.into(),
+                    handle: None,
+                    config: PodSandboxConfig {
+                        name: "web".into(),
+                        namespace: ns.into(),
+                        ..Default::default()
+                    },
+                    state: PodSandboxState::Ready,
+                    created_at: 0,
+                },
+            );
+        }
+        // Both are called `app`; both must exist, distinctly.
+        let containers = r.containers.lock().await.len();
+        assert_eq!(containers, 0);
+        drop(containers);
+
+        let mut ids = Vec::new();
+        for sb in ["sb-a", "sb-b"] {
+            let mut c = r.containers.lock().await;
+            let id = r.mint_id("ct");
+            let ns = r.sandboxes.lock().await[sb].config.namespace.clone();
+            c.insert(
+                id.clone(),
+                Container {
+                    id: id.clone(),
+                    sandbox_id: sb.into(),
+                    name: "app".into(),
+                    namespace: ns,
+                    pod: "web".into(),
+                    image: "busybox".into(),
+                    spec_handle: None,
+                    workload_handle: None,
+                    root_handle: None,
+                    root_path: None,
+                    state: ContainerState::Created,
+                    created_at: 0,
+                    started_at: 0,
+                    finished_at: 0,
+                    exit_code: 0,
+                    privileged: false,
+                    host_network: false,
+                    host_pid: false,
+                },
+            );
+            ids.push(id);
+        }
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(r.list_containers(None).await.unwrap().len(), 2);
+        // And each is reachable in its own sandbox.
+        assert_eq!(r.list_containers(Some("sb-a")).await.unwrap().len(), 1);
+        assert_eq!(r.list_containers(Some("sb-b")).await.unwrap().len(), 1);
     }
 
     #[test]
