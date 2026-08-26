@@ -217,11 +217,18 @@ impl RingClient {
         Ok(())
     }
 
-    /// spec + root volume + sandbox -> a running workload.
+    /// spec + root volume -> a running workload.
+    ///
+    /// `logs` is the volume the workload's log file is opened in, carried in
+    /// `inline_b`. A spec asking for its own log file without one is refused
+    /// with EINVAL, which is exactly the shape of bug that is hard to place
+    /// from the outside — so it is a required argument here rather than
+    /// something a caller can forget.
     pub fn spawn(
         &self,
         spec: Handle,
         root: Handle,
+        logs: Handle,
         domain: u8,
     ) -> Result<Handle, RingError> {
         let cqe = self.submit(
@@ -230,6 +237,7 @@ impl RingClient {
                 domain,
                 primary: spec,
                 handle_a: root,
+                inline_b: logs.0,
                 ..Default::default()
             },
             None,

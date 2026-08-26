@@ -86,6 +86,10 @@ struct Container {
     workload_handle: Option<Handle>,
     /// The image's volume, registered with the engine. `None` until started.
     root_handle: Option<Handle>,
+    /// The directory this container's log file is opened in:
+    /// `<sandbox log_directory>/<container>`. Kubernetes reads
+    /// `<that>/<restart>.log` and nowhere else.
+    log_dir: String,
     /// Where the image's filesystem is mounted on this node.
     ///
     /// Registered with the engine at start rather than at create: a volume
@@ -278,21 +282,24 @@ fn spec_for(config: &ContainerConfig, sandbox: &PodSandboxConfig) -> stormpump::
         // image a container runs is a property of the spawn. `Chroot` is
         // "enter the volume's mount view", which is what a container root is.
         root: Root::Chroot,
-        // Inherited, for now, and this is a real gap rather than a choice.
+        // Its own file, in the directory Kubernetes will look in.
         //
-        // `Logs::Combined` writes `<id>.stdout`/`.stderr` into a *log volume*,
-        // whose handle the spawn carries in `inline_b` — and a spawn asking for
-        // it without one is refused with EINVAL, which is exactly what happened
-        // here. Supplying it means registering the pod's log directory
-        // (`/var/log/pods/<ns>_<pod>_<uid>/...`, which CRI hands us) as a
-        // volume, and that path has to exist in the *host's* mount namespace
-        // because that is where the engine opens it — this kubelet is in a
-        // container and its own /var/log is not the node's.
-        //
-        // Until that is bound through, output goes where the engine's goes: the
-        // node's log and the fleet's multicast group. Visible, but not where
-        // `kubectl logs` looks, so that is the next piece.
-        logs: Logs::Inherit,
+        // The spawn carries the log *volume* — the container's directory under
+        // `/var/log/pods/<ns>_<pod>_<uid>/<container>/` — and the spec carries
+        // the file's *name*, `<restart>.log`. Both are needed: the engine
+        // opens the name with `openat` against the volume, and would otherwise
+        // name the file after an id the client never sees, where nothing looks
+        // for it.
+        logs: Logs::Combined,
+        // `<name>/<restart>.log` is what CRI hands us; the directory half is
+        // the volume, so what is left is the file.
+        log_name: config
+            .log_path
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("0.log")
+            .to_string(),
         mounts: Vec::new(),
         // hostNetwork is the node's namespace; anything else is the pod's,
         // which the sandbox already holds. `Profile::Host` is "no namespace at
@@ -474,6 +481,11 @@ impl RuntimeService for StormpumpRuntime {
             name: config.name.clone(),
             namespace,
             pod,
+            log_dir: format!(
+                "{}/{}",
+                _sandbox_config.log_directory.trim_end_matches('/'),
+                config.name
+            ),
             image: config.image.clone(),
             spec_handle: Some(spec),
             workload_handle: None,
@@ -503,7 +515,7 @@ impl RuntimeService for StormpumpRuntime {
 
     async fn start_container(&self, container_id: &str) -> Result<(), CriError> {
         self.probe()?;
-        let (spec, path) = {
+        let (spec, path, log_dir) = {
             let containers = self.containers.lock().await;
             let c = containers
                 .get(container_id)
@@ -520,25 +532,27 @@ impl RuntimeService for StormpumpRuntime {
                     c.image
                 ))
             })?;
-            (spec, path)
+            (spec, path, c.log_dir.clone())
         };
 
         // Registered now, not at create: a volume handle is a resource the
         // engine holds, and holding one for a container that may never start
         // is a leak for as long as its pod is pending.
+        // The directory the engine opens the log file in. Created here as well
+        // as by the kubelet's own bookkeeping, because the engine resolves it
+        // in the *host's* mount namespace and a missing directory is an EINVAL
+        // at spawn rather than a missing log.
+        let _ = std::fs::create_dir_all(&log_dir);
+
         let workload = self
             .on_ring(move |r| {
                 let root = r.volume_register(&path)?;
-                // Both handles, before the spawn that uses them. A spawn
-                // refused with EINVAL says nothing about *which* argument was
-                // wrong, and the two candidates — a spec defined for another
-                // domain, and a root handle the engine does not recognise —
-                // are told apart by seeing them.
+                let logs = r.volume_register(&log_dir)?;
                 tracing::debug!(
-                    ?spec, ?root, path = %path, domain = Domain::Container as u8,
+                    ?spec, ?root, ?logs, path = %path, logs_dir = %log_dir,
                     "stormpump: spawning"
                 );
-                r.spawn(spec, root, Domain::Container as u8)
+                r.spawn(spec, root, logs, Domain::Container as u8)
             })
             .await?;
 
@@ -824,6 +838,7 @@ mod tests {
                     spec_handle: None,
                     namespace: "default".into(),
                     pod: "p".into(),
+                    log_dir: String::new(),
                     workload_handle: None,
                     root_handle: None,
                     root_path: None,
@@ -942,6 +957,7 @@ mod tests {
                     name: "app".into(),
                     namespace: ns,
                     pod: "web".into(),
+                    log_dir: String::new(),
                     image: "busybox".into(),
                     spec_handle: None,
                     workload_handle: None,
