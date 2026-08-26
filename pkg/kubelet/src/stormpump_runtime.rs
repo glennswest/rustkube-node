@@ -168,6 +168,19 @@ impl StormpumpRuntime {
             .map_err(|e| CriError::Runtime(e.to_string()))
     }
 
+    /// Everything else about a sandbox going away.
+    ///
+    /// Split out from the ring call so the invariant it carries can be tested
+    /// on a box with no engine: a container whose sandbox is gone has no
+    /// namespaces to live in, and leaving it listed has the kubelet trying to
+    /// reconcile something that cannot exist.
+    async fn forget_containers_of(&self, sandbox_id: &str) {
+        self.containers
+            .lock()
+            .await
+            .retain(|_, c| c.sandbox_id != sandbox_id);
+    }
+
     /// Take note of anything the engine says has ended.
     ///
     /// An exit arrives unsolicited, so this is how a crashed container stops
@@ -367,19 +380,6 @@ impl RuntimeService for StormpumpRuntime {
         }
         self.forget_containers_of(sandbox_id).await;
         Ok(())
-    }
-
-    /// Everything else about a sandbox going away.
-    ///
-    /// Split out from the ring call so the invariant it carries can be tested
-    /// on a box with no engine: a container whose sandbox is gone has no
-    /// namespaces to live in, and leaving it listed has the kubelet trying to
-    /// reconcile something that cannot exist.
-    async fn forget_containers_of(&self, sandbox_id: &str) {
-        self.containers
-            .lock()
-            .await
-            .retain(|_, c| c.sandbox_id != sandbox_id);
     }
 
 
