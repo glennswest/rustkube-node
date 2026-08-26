@@ -75,7 +75,12 @@ impl std::fmt::Display for RingError {
                     Some(o) => format!("{o:?}"),
                     None => format!("op {op}"),
                 };
-                write!(f, "stormpump refused {name}: errno {errno} (at step {step})")
+                // The step is named, not numbered. `errno 2 at step 4` and
+                // `ENOENT attaching mounts` are the same fact, and only one of
+                // them tells you which mount to go and look at.
+                let where_ = stormpump_abi::ExecStep::from_u32(*step).name();
+                let why = std::io::Error::from_raw_os_error(*errno);
+                write!(f, "stormpump refused {name}: {why} ({where_})")
             }
             RingError::Gone => write!(f, "the connection to stormpump is gone"),
         }
@@ -265,6 +270,14 @@ impl RingClient {
                 // something else.
                 inline_a: sandbox.0,
                 inline_b: logs.0,
+                // Wait for the child to reach `execve` before calling the start
+                // a success. Without this the fork returning is the answer, and
+                // a container whose setup fails — a missing root, a mount that
+                // will not bind, a cgroup that refuses — is reported as started
+                // and then found dead with exit 127 and an empty log, which
+                // says nothing about which of those it was. The cost is one
+                // pipe per start and a completion that arrives a moment later.
+                flags: stormpump_abi::flags::AWAIT_EXEC,
                 ..Default::default()
             },
             payload,
@@ -446,9 +459,12 @@ mod tests {
         // The opcode matters as much as the errno: a pod start makes several
         // calls in a row, and "errno 22" alone names neither the call nor the
         // argument. This cost an afternoon before the op was carried.
-        let e = RingError::Failed { op: Op::VolumeRegister as u8, errno: 22, step: 7 };
+        let e = RingError::Failed { op: Op::VolumeRegister as u8, errno: 22, step: 4 };
         let text = format!("{e}");
-        assert!(text.contains("22") && text.contains('7'), "{text}");
         assert!(text.contains("VolumeRegister"), "{text}");
+        // Both halves in words: the step named rather than numbered, and the
+        // errno spelled out. A reader should not need two lookup tables.
+        assert!(text.contains("mounts"), "{text}");
+        assert!(text.contains("Invalid argument"), "{text}");
     }
 }
