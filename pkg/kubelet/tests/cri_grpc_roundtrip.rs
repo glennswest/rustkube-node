@@ -334,6 +334,7 @@ fn sandbox_config() -> PodSandboxConfig {
         host_pid: false,
         host_ipc: false,
         privileged: true,
+        ..Default::default()
     }
 }
 
