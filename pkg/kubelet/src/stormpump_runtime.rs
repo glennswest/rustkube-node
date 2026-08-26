@@ -470,7 +470,7 @@ impl RuntimeService for StormpumpRuntime {
 
     async fn start_container(&self, container_id: &str) -> Result<(), CriError> {
         self.probe()?;
-        let (spec, root) = {
+        let (spec, path) = {
             let containers = self.containers.lock().await;
             let c = containers
                 .get(container_id)
@@ -782,6 +782,7 @@ mod tests {
                     spec_handle: None,
                     workload_handle: None,
                     root_handle: None,
+                    root_path: None,
                     state: ContainerState::Created,
                     created_at: 0,
                     started_at: 0,
