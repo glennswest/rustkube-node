@@ -405,6 +405,7 @@ async fn full_pod_flow_over_unix_socket() {
             level: "s0".into(),
             ..Default::default()
         }),
+        ..Default::default()
     };
     let container_id = client
         .create_container(&sandbox_id, &container, &config)
