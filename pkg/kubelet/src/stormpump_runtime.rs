@@ -53,6 +53,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::stormpump_ring::{RingClient, RingError};
+use stormpump::sandbox::Profile;
 use stormpump_abi::handle::Handle;
 use stormpump_abi::Domain;
 
@@ -71,11 +72,11 @@ struct Container {
     name: String,
     image: String,
     /// The handle stormpump returned for the spec. `None` until created.
-    spec_handle: Option<u32>,
+    spec_handle: Option<Handle>,
     /// The handle for the running workload. `None` until started.
-    workload_handle: Option<u32>,
+    workload_handle: Option<Handle>,
     /// The image's volume, registered with the engine. `None` until pulled.
-    root_handle: Option<u32>,
+    root_handle: Option<Handle>,
     state: ContainerState,
     created_at: i64,
     started_at: i64,
@@ -91,7 +92,7 @@ struct Container {
 /// One pod sandbox.
 struct Sandbox {
     id: String,
-    handle: Option<u32>,
+    handle: Option<Handle>,
     config: PodSandboxConfig,
     state: PodSandboxState,
     created_at: i64,
@@ -163,8 +164,8 @@ impl StormpumpRuntime {
         let ring = self.ring()?;
         tokio::task::spawn_blocking(move || f(&ring))
             .await
-            .map_err(|e| CriError::Other(format!("ring call did not run: {e}")))?
-            .map_err(|e| CriError::Other(e.to_string()))
+            .map_err(|e| CriError::Runtime(format!("ring call did not run: {e}")))?
+            .map_err(|e| CriError::Runtime(e.to_string()))
     }
 
     /// Take note of anything the engine says has ended.
@@ -232,7 +233,7 @@ impl StormpumpRuntime {
 /// The two models line up more than they differ, and where they differ the
 /// comment says which way it went and why.
 fn spec_for(config: &ContainerConfig, sandbox: &PodSandboxConfig) -> stormpump::spec::Spec {
-    use stormpump::spec::{Logs, Profile, Root, Share, Spec};
+    use stormpump::spec::{Logs, Root, Share, Spec};
 
     let mut argv: Vec<String> = config.command.clone();
     argv.extend(config.args.iter().cloned());
@@ -241,8 +242,9 @@ fn spec_for(config: &ContainerConfig, sandbox: &PodSandboxConfig) -> stormpump::
         domain: Domain::Container,
         // The root arrives as a registered volume handle at spawn, not here:
         // the spec is defined once and can be spawned many times, and the
-        // image a container runs is a property of the spawn.
-        root: Root::Volume,
+        // image a container runs is a property of the spawn. `Chroot` is
+        // "enter the volume's mount view", which is what a container root is.
+        root: Root::Chroot,
         // Its own file, so a crashed container's reason survives it and the
         // node's console is not the only place it went.
         logs: Logs::Combined,
@@ -309,7 +311,7 @@ impl RuntimeService for StormpumpRuntime {
         // acquired now rather than at the first container, because the
         // containers of a pod join namespaces that must already exist — and
         // because acquiring is where the warm pool pays off.
-        use stormpump::spec::{Profile, Share, Spec};
+        use stormpump::spec::{Share, Spec};
         let sandbox_spec = Spec {
             domain: Domain::Container,
             profile: if config.host_network { Profile::Host } else { Profile::Routed },
@@ -330,7 +332,7 @@ impl RuntimeService for StormpumpRuntime {
 
         let sb = Sandbox {
             id: id.clone(),
-            handle: Some(handle.raw()),
+            handle: Some(handle),
             config: config.clone(),
             state: PodSandboxState::Ready,
             created_at: now_nanos(),
@@ -362,7 +364,7 @@ impl RuntimeService for StormpumpRuntime {
         if let Some(h) = handle {
             // Back to the pool, which is what makes the next start cheap.
             let _ = self
-                .on_ring(move |r| r.sandbox_release(Handle::from_raw(h)))
+                .on_ring(move |r| r.sandbox_release(h))
                 .await;
         }
         // Its containers go with it. A container whose sandbox is gone has no
@@ -432,7 +434,7 @@ impl RuntimeService for StormpumpRuntime {
             sandbox_id: sandbox_id.to_string(),
             name: config.name.clone(),
             image: config.image.clone(),
-            spec_handle: Some(spec.raw()),
+            spec_handle: Some(spec),
             workload_handle: None,
             root_handle: None,
             state: ContainerState::Created,
@@ -460,13 +462,13 @@ impl RuntimeService for StormpumpRuntime {
                 .get(container_id)
                 .ok_or_else(|| CriError::NotFound(format!("container {container_id}")))?;
             let spec = c.spec_handle.ok_or_else(|| {
-                CriError::Other(format!("container {container_id} has no spec"))
+                CriError::Runtime(format!("container {container_id} has no spec"))
             })?;
             // The root is the image's volume. Until pull_image mints one there
             // is nothing to run, and saying so is better than spawning a
             // container with no filesystem and reporting it started.
             let root = c.root_handle.ok_or_else(|| {
-                CriError::Other(format!(
+                CriError::Runtime(format!(
                     "container {container_id} has no root volume — its image was never pulled"
                 ))
             })?;
@@ -475,7 +477,7 @@ impl RuntimeService for StormpumpRuntime {
 
         let workload = self
             .on_ring(move |r| {
-                r.spawn(Handle::from_raw(spec), Handle::from_raw(root), Domain::Container as u8)
+                r.spawn(spec, root, Domain::Container as u8)
             })
             .await?;
 
@@ -483,11 +485,11 @@ impl RuntimeService for StormpumpRuntime {
         let c = containers
             .get_mut(container_id)
             .ok_or_else(|| CriError::NotFound(format!("container {container_id}")))?;
-        c.workload_handle = Some(workload.raw());
+        c.workload_handle = Some(workload);
         c.state = ContainerState::Running;
         c.started_at = now_nanos();
         tracing::info!(
-            container = %c.id, name = %c.name, workload = workload.raw(),
+            container = %c.id, name = %c.name, workload = ?workload,
             "stormpump: container started"
         );
         Ok(())
@@ -505,7 +507,7 @@ impl RuntimeService for StormpumpRuntime {
             // Signal, grace, kill is one op: the policy timer lives in the
             // engine rather than in every client that wants to stop something.
             let grace = timeout.max(0) as u64;
-            self.on_ring(move |r| r.stop(Handle::from_raw(w), grace)).await?;
+            self.on_ring(move |r| r.stop(w, grace)).await?;
         }
         let mut containers = self.containers.lock().await;
         if let Some(c) = containers.get_mut(container_id) {
@@ -526,7 +528,7 @@ impl RuntimeService for StormpumpRuntime {
             // Frees the pidfd and the cgroup, which the process dying does not.
             // Refused while it is still running, so this follows a stop.
             let _ = self
-                .on_ring(move |r| r.workload_release(Handle::from_raw(w)))
+                .on_ring(move |r| r.workload_release(w))
                 .await;
         }
         Ok(())
@@ -591,7 +593,7 @@ impl RuntimeService for StormpumpRuntime {
         // ring already has the op. Not wired yet, and an empty success would be
         // worse than an error: a readiness probe that "succeeds" without
         // running anything reports every container healthy.
-        Err(CriError::Unsupported(
+        Err(CriError::Runtime(
             "exec_sync is not wired to the stormpump ring yet".to_string(),
         ))
     }
@@ -621,7 +623,7 @@ impl StormpumpImages {
 #[async_trait]
 impl ImageService for StormpumpImages {
     async fn pull_image(&self, image: &str) -> Result<String, CriError> {
-        Err(CriError::Unsupported(format!(
+        Err(CriError::Runtime(format!(
             "pulling {image} through the registry at {} is not wired yet",
             self.registry
         )))

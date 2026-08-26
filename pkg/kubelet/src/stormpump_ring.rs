@@ -78,7 +78,7 @@ impl std::error::Error for RingError {}
 /// An exit the engine reported without being asked.
 #[derive(Debug, Clone, Copy)]
 pub struct Exited {
-    pub handle: u32,
+    pub handle: Handle,
     /// The wait status, as `waitpid` reports it.
     pub status: u32,
 }
@@ -99,17 +99,27 @@ impl RingClient {
     pub fn attach(socket: &str) -> Result<RingClient, RingError> {
         let attached = stormpump::transport::attach(socket, TOKEN)
             .map_err(|e| RingError::Attach(format!("{socket}: {e}")))?;
-        let mapping = Mapping::from_fd(attached.ring)
-            .map_err(|e| RingError::Attach(format!("mapping the ring: {e}")))?;
 
         let (tx, rx) = mpsc::channel::<Request>();
         let (exit_tx, exits) = mpsc::channel::<Exited>();
         let submit = attached.submit;
         let complete = attached.complete;
+        let ring_fd = attached.ring;
 
         std::thread::Builder::new()
             .name("kubelet-stormpump-ring".into())
             .spawn(move || {
+                // The mapping is built *here*, not before the spawn: it holds
+                // a raw pointer into the shared region and is therefore not
+                // `Send`, which is correct — one thread owns the ring. A
+                // descriptor is just an integer and crosses freely.
+                let mapping = match Mapping::from_fd(ring_fd) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::error!("mapping the stormpump ring: {e}");
+                        return;
+                    }
+                };
                 // The stream is held for the life of the thread: dropping it
                 // closes the connection, and the engine takes that as the
                 // client having gone away.
@@ -321,10 +331,7 @@ fn run(
             if cqe.user_data == 0 {
                 // Unsolicited: a workload ended. Nothing asked, and something
                 // still has to hear it.
-                let _ = exits.send(Exited {
-                    handle: cqe.handle().raw(),
-                    status: cqe.aux,
-                });
+                let _ = exits.send(Exited { handle: cqe.handle(), status: cqe.aux });
                 continue;
             }
             if let Some(reply) = waiting.remove(&cqe.user_data) {
