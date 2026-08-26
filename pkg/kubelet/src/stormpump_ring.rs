@@ -246,7 +246,10 @@ impl RingClient {
                 domain,
                 primary: spec,
                 handle_a: root,
-                handle_b: sandbox,
+                // The sandbox and the log volume both travel as inline
+                // handles. `handle_b` is the parent workload and means
+                // something else.
+                inline_a: sandbox.0,
                 inline_b: logs.0,
                 ..Default::default()
             },
