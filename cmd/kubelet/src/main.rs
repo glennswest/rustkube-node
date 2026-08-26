@@ -33,12 +33,16 @@ struct Cli {
     #[arg(long, env = "POD_MANIFEST_PATH", default_value = "/etc/kubernetes/manifests")]
     pod_manifest_path: String,
 
+    /// Where the registry that mints image clones lives (--runtime=stormpump).
+    #[arg(long, default_value = "http://127.0.0.1:5100")]
+    registry: String,
+
     /// CRI socket path (only used with --runtime=cri).
     #[arg(long, env = "CRI_SOCKET")]
     cri_socket: Option<String>,
 
     /// Container runtime: native (libcontainer), vm (microVM), cri (external CRI).
-    #[arg(long, default_value = "native", value_parser = ["native", "vm", "cri"])]
+    #[arg(long, default_value = "native", value_parser = ["native", "vm", "cri", "stormpump"])]
     runtime: String,
 
     /// VMM backend for --runtime=vm.
@@ -183,6 +187,35 @@ async fn main() -> anyhow::Result<()> {
                 let img = Arc::new(NativeImageService::new());
                 let mig = rt.clone() as Arc<dyn kubelet::cri::MigrationService>;
                 (rt as _, img as _, mig)
+            }
+        }
+        "stormpump" => {
+            // The engine's ring, not a socket protocol. See
+            // kubelet::stormpump_runtime for why there is no shim.
+            let socket = cli
+                .cri_socket
+                .clone()
+                .unwrap_or_else(|| kubelet::stormpump_runtime::DEFAULT_SOCKET.to_string());
+            match kubelet::stormpump_runtime::StormpumpRuntime::connect(&socket) {
+                Ok(rt) => {
+                    tracing::info!("kubelet using stormpump runtime (ring at {socket})");
+                    let rt = Arc::new(rt);
+                    let img = Arc::new(
+                        kubelet::stormpump_runtime::StormpumpImages::new(
+                            cli.registry.clone(),
+                        ),
+                    );
+                    let mig = Arc::new(NativeRuntime::new())
+                        as Arc<dyn kubelet::cri::MigrationService>;
+                    (rt as _, img as _, mig)
+                }
+                Err(e) => {
+                    // Refused rather than fallen back from. A kubelet that
+                    // silently runs a different runtime than it was told to
+                    // is a node whose pods are not where anyone thinks.
+                    tracing::error!("cannot use the stormpump runtime: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         "cri" => {
