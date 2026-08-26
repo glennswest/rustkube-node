@@ -517,6 +517,15 @@ impl RuntimeService for StormpumpRuntime {
         let workload = self
             .on_ring(move |r| {
                 let root = r.volume_register(&path)?;
+                // Both handles, before the spawn that uses them. A spawn
+                // refused with EINVAL says nothing about *which* argument was
+                // wrong, and the two candidates — a spec defined for another
+                // domain, and a root handle the engine does not recognise —
+                // are told apart by seeing them.
+                tracing::debug!(
+                    ?spec, ?root, path = %path, domain = Domain::Container as u8,
+                    "stormpump: spawning"
+                );
                 r.spawn(spec, root, Domain::Container as u8)
             })
             .await?;
