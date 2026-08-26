@@ -54,7 +54,12 @@ pub enum RingError {
     /// The engine did not answer within the deadline.
     Timeout,
     /// The engine answered with a negative errno.
-    Failed { errno: i32, step: u32 },
+    ///
+    /// Carries the opcode, because "stormpump refused: errno 22" names neither
+    /// the call nor the argument, and a pod start makes several in a row. The
+    /// step is how far a spawn's child got before giving up — 0 for anything
+    /// refused before the fork.
+    Failed { op: u8, errno: i32, step: u32 },
     /// The ring thread is gone, which means the connection is.
     Gone,
 }
@@ -65,8 +70,12 @@ impl std::fmt::Display for RingError {
             RingError::Attach(w) => write!(f, "cannot attach to stormpump: {w}"),
             RingError::Full => write!(f, "stormpump submission queue is full"),
             RingError::Timeout => write!(f, "stormpump did not answer"),
-            RingError::Failed { errno, step } => {
-                write!(f, "stormpump refused: errno {errno} (at step {step})")
+            RingError::Failed { op, errno, step } => {
+                let name = match Op::from_u8(*op) {
+                    Some(o) => format!("{o:?}"),
+                    None => format!("op {op}"),
+                };
+                write!(f, "stormpump refused {name}: errno {errno} (at step {step})")
             }
             RingError::Gone => write!(f, "the connection to stormpump is gone"),
         }
@@ -301,6 +310,8 @@ fn run(
     // Requests submitted and not yet answered. More than one can be in flight
     // when a completion for an earlier request arrives out of order.
     let mut waiting: HashMap<u64, mpsc::Sender<Result<Cqe, RingError>>> = HashMap::new();
+    // Which op each outstanding request was, so a failure can name it.
+    let mut sent: HashMap<u64, u8> = HashMap::new();
 
     loop {
         // Take one request if there is one, without blocking so completions
@@ -325,6 +336,7 @@ fn run(
                     let _ = req.reply.send(Err(RingError::Full));
                     continue;
                 }
+                sent.insert(id, sqe.opcode);
                 waiting.insert(id, req.reply);
                 stormpump::transport::kick(submit);
             }
@@ -343,8 +355,15 @@ fn run(
                 continue;
             }
             if let Some(reply) = waiting.remove(&cqe.user_data) {
+                if !cqe.is_err() {
+                    sent.remove(&cqe.user_data);
+                }
                 let answer = if cqe.is_err() {
-                    Err(RingError::Failed { errno: -cqe.result as i32, step: cqe.aux })
+                    Err(RingError::Failed {
+                        op: sent.remove(&cqe.user_data).unwrap_or(0),
+                        errno: -cqe.result as i32,
+                        step: cqe.aux,
+                    })
                 } else {
                     Ok(cqe)
                 };
@@ -389,8 +408,12 @@ mod tests {
         // Spawn reports how far the child got before it gave up, and that is
         // most of the diagnosis — "failed at mount" and "failed at exec" are
         // different problems with the same errno.
-        let e = RingError::Failed { errno: 22, step: 7 };
+        // The opcode matters as much as the errno: a pod start makes several
+        // calls in a row, and "errno 22" alone names neither the call nor the
+        // argument. This cost an afternoon before the op was carried.
+        let e = RingError::Failed { op: Op::VolumeRegister as u8, errno: 22, step: 7 };
         let text = format!("{e}");
         assert!(text.contains("22") && text.contains('7'), "{text}");
+        assert!(text.contains("VolumeRegister"), "{text}");
     }
 }
