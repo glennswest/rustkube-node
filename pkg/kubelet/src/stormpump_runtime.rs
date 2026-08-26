@@ -363,19 +363,26 @@ impl RuntimeService for StormpumpRuntime {
             .and_then(|sb| sb.handle);
         if let Some(h) = handle {
             // Back to the pool, which is what makes the next start cheap.
-            let _ = self
-                .on_ring(move |r| r.sandbox_release(h))
-                .await;
+            let _ = self.on_ring(move |r| r.sandbox_release(h)).await;
         }
-        // Its containers go with it. A container whose sandbox is gone has no
-        // namespaces to live in, and leaving it listed would have the kubelet
-        // trying to reconcile something that cannot exist.
+        self.forget_containers_of(sandbox_id).await;
+        Ok(())
+    }
+
+    /// Everything else about a sandbox going away.
+    ///
+    /// Split out from the ring call so the invariant it carries can be tested
+    /// on a box with no engine: a container whose sandbox is gone has no
+    /// namespaces to live in, and leaving it listed has the kubelet trying to
+    /// reconcile something that cannot exist.
+    async fn forget_containers_of(&self, sandbox_id: &str) {
         self.containers
             .lock()
             .await
             .retain(|_, c| c.sandbox_id != sandbox_id);
-        Ok(())
     }
+
+
 
     async fn pod_sandbox_status(
         &self,
@@ -671,36 +678,123 @@ mod tests {
         assert!(a.starts_with("ct-") && b.starts_with("ct-"));
     }
 
+    /// Everything below runs without an engine. The lifecycle itself needs
+    /// one — a sandbox is acquired from stormpump's pool and a container is a
+    /// spawn — so what is tested here is the bookkeeping either side of the
+    /// ring, and the failures a node without stormpump should give.
+
     #[tokio::test]
     async fn removing_a_sandbox_takes_its_containers_with_it() {
-        let r = StormpumpRuntime::new("/dev/null"); // exists, so probe passes
-        let cfg = PodSandboxConfig { name: "p".into(), ..Default::default() };
-        let sb = r.run_pod_sandbox(&cfg).await.unwrap();
+        let r = StormpumpRuntime::new("/run/stormpump.sock");
+        // Placed directly: acquiring one needs the engine, and the invariant
+        // under test is about the maps rather than about the acquisition.
+        r.sandboxes.lock().await.insert(
+            "sb-1".into(),
+            Sandbox {
+                id: "sb-1".into(),
+                handle: None,
+                config: PodSandboxConfig::default(),
+                state: PodSandboxState::Ready,
+                created_at: 0,
+            },
+        );
+        for (id, sb) in [("ct-1", "sb-1"), ("ct-2", "sb-1"), ("ct-3", "sb-other")] {
+            r.containers.lock().await.insert(
+                id.into(),
+                Container {
+                    id: id.into(),
+                    sandbox_id: sb.into(),
+                    name: id.into(),
+                    image: "i".into(),
+                    spec_handle: None,
+                    workload_handle: None,
+                    root_handle: None,
+                    state: ContainerState::Created,
+                    created_at: 0,
+                    started_at: 0,
+                    finished_at: 0,
+                    exit_code: 0,
+                    privileged: false,
+                    host_network: false,
+                    host_pid: false,
+                },
+            );
+        }
 
-        let cc = ContainerConfig { name: "c".into(), ..Default::default() };
-        let ct = r.create_container(&sb, &cc, &cfg).await.unwrap();
-        assert_eq!(r.list_containers(None).await.unwrap().len(), 1);
+        r.forget_containers_of("sb-1").await;
 
-        r.remove_pod_sandbox(&sb).await.unwrap();
-        // A container whose sandbox is gone has no namespaces to live in;
-        // leaving it listed has the kubelet reconciling something that cannot
-        // exist.
-        assert!(r.list_containers(None).await.unwrap().is_empty());
-        assert!(r.container_status(&ct).await.is_err());
+        // The two in that sandbox are gone; the one in another is not.
+        let left = r.list_containers(None).await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, "ct-3");
     }
 
     #[tokio::test]
     async fn a_container_needs_a_sandbox_that_exists() {
-        let r = StormpumpRuntime::new("/dev/null");
+        let r = StormpumpRuntime::new("/run/stormpump.sock");
         let cfg = PodSandboxConfig::default();
         let cc = ContainerConfig { name: "c".into(), ..Default::default() };
-        assert!(r.create_container("sb-nope", &cc, &cfg).await.is_err());
+        let e = r.create_container("sb-nope", &cc, &cfg).await.unwrap_err();
+        // The sandbox is checked before the engine is reached, so this says
+        // "not found" rather than "no stormpump" even on a box without one.
+        assert!(matches!(e, CriError::NotFound(_)), "{e:?}");
+    }
+
+    #[tokio::test]
+    async fn a_node_without_stormpump_says_so() {
+        let r = StormpumpRuntime::new("/nonexistent/stormpump.sock");
+        let e = r.run_pod_sandbox(&PodSandboxConfig::default()).await.unwrap_err();
+        let text = format!("{e}");
+        assert!(text.contains("stormpump"), "{text}");
+        assert!(text.contains("/nonexistent/stormpump.sock"), "{text}");
     }
 
     #[tokio::test]
     async fn exec_sync_refuses_rather_than_reporting_a_success_it_did_not_have() {
-        let r = StormpumpRuntime::new("/dev/null");
+        let r = StormpumpRuntime::new("/run/stormpump.sock");
         let e = r.exec_sync("ct-1", &["true".into()], 1).await;
         assert!(e.is_err(), "an empty success would mark every probe healthy");
+    }
+
+    #[test]
+    fn a_host_network_container_gets_no_namespace_at_all() {
+        // `Profile::Host` is "no network namespace", which is exactly what
+        // hostNetwork means — and what Cilium's agent runs with.
+        let sandbox = PodSandboxConfig { host_network: true, ..Default::default() };
+        let cc = ContainerConfig { name: "cilium".into(), ..Default::default() };
+        let spec = spec_for(&cc, &sandbox);
+        assert_eq!(spec.profile, Profile::Host);
+
+        // And an ordinary pod is routed: east-west plus a default route.
+        let spec = spec_for(&cc, &PodSandboxConfig::default());
+        assert_eq!(spec.profile, Profile::Routed);
+    }
+
+    #[test]
+    fn the_sandbox_decides_the_namespaces() {
+        // A container asking for hostPID in a sandbox not built for it is the
+        // mismatch every runtime rejects, because the sandbox's namespaces
+        // already exist by the time the container is created. So the two are
+        // folded together rather than allowed to disagree.
+        let sandbox = PodSandboxConfig { host_pid: true, ..Default::default() };
+        let cc = ContainerConfig { name: "c".into(), ..Default::default() };
+        assert!(spec_for(&cc, &sandbox).share.pid);
+
+        let cc = ContainerConfig { host_pid: true, ..Default::default() };
+        assert!(spec_for(&cc, &PodSandboxConfig::default()).share.pid);
+    }
+
+    #[test]
+    fn command_and_args_become_one_argv() {
+        let cc = ContainerConfig {
+            command: vec!["/usr/bin/cilium-agent".into()],
+            args: vec!["--config-dir".into(), "/tmp/cilium".into()],
+            ..Default::default()
+        };
+        let spec = spec_for(&cc, &PodSandboxConfig::default());
+        assert_eq!(
+            spec.argv,
+            vec!["/usr/bin/cilium-agent", "--config-dir", "/tmp/cilium"]
+        );
     }
 }
