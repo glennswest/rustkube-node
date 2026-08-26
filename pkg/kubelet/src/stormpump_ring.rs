@@ -90,8 +90,16 @@ pub struct Exited {
 /// locks are held for a send and a try_recv — never across the wait, which
 /// happens on a channel private to the caller.
 pub struct RingClient {
+    /// Named rather than derived: a `Debug` that dumps channel internals says
+    /// nothing useful, and `unwrap_err()` in a test needs one.
     tx: std::sync::Mutex<mpsc::Sender<Request>>,
     exits: std::sync::Mutex<mpsc::Receiver<Exited>>,
+}
+
+impl std::fmt::Debug for RingClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RingClient(attached)")
+    }
 }
 
 impl RingClient {
