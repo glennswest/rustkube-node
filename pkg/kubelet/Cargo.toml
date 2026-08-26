@@ -7,6 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+# The node's execution engine. Depended on for its ring client and spec
+# encoding rather than for the engine itself — its whole dependency set is
+# libc plus two crates with none of their own, so this costs the kubelet
+# almost nothing.
+stormpump = { git = "https://github.com/glennswest/stormpump", branch = "main" }
+stormpump-abi = { git = "https://github.com/glennswest/stormpump", branch = "main" }
 apimachinery = { workspace = true }
 cni = { workspace = true }
 tonic = { workspace = true }

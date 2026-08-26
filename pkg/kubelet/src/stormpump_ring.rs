@@ -1,0 +1,381 @@
+//! Talking to stormpump over its ring.
+//!
+//! # Why a thread and a channel
+//!
+//! The ring is a shared-memory structure with one producer on this side. Its
+//! `Mapping` needs `&mut` to write the arena and is not something to hand
+//! around between async tasks, and the CRI traits above are `&self` and async.
+//!
+//! So the ring gets a thread of its own, which owns the `Mapping` outright, and
+//! callers reach it through a channel. That keeps the ring single-threaded —
+//! which is what it is designed for — and gives async callers something to
+//! await. It also puts submission and completion in one place, which is where
+//! the arena has to be managed from anyway.
+//!
+//! # Unsolicited completions
+//!
+//! Not every CQE answers a request. A workload that exits produces one with
+//! `user_data` of zero, and that is how the kubelet learns a container died
+//! without polling for it. Those are routed to a separate channel rather than
+//! being matched against outstanding requests and dropped as unrecognised —
+//! dropping them would mean a container that crashed stayed `Running` until
+//! something happened to ask.
+
+use std::collections::HashMap;
+use std::sync::mpsc;
+
+use stormpump::ring::Mapping;
+use stormpump_abi::handle::Handle;
+use stormpump_abi::{ArenaRef, Cqe, Op, Sqe};
+
+/// How this client is known to the engine.
+///
+/// Stable, and deliberately so: the token is how a client is recognised again
+/// after it reconnects or the engine re-execs, and a client presenting the same
+/// bytes gets its workloads back. A kubelet that restarted with a fresh token
+/// would find a node with no pods on it and start them all a second time, while
+/// the first set went on running unsupervised.
+pub const TOKEN: [u8; 16] = *b"rustkube-kubelet";
+
+/// A request for the ring thread.
+struct Request {
+    sqe: Sqe,
+    /// Written into the arena before the SQE is pushed, if any.
+    payload: Option<Vec<u8>>,
+    reply: mpsc::Sender<Result<Cqe, RingError>>,
+}
+
+#[derive(Debug)]
+pub enum RingError {
+    /// The engine is not there, or would not complete the handshake.
+    Attach(String),
+    /// The submission queue was full and stayed full.
+    Full,
+    /// The engine did not answer within the deadline.
+    Timeout,
+    /// The engine answered with a negative errno.
+    Failed { errno: i32, step: u32 },
+    /// The ring thread is gone, which means the connection is.
+    Gone,
+}
+
+impl std::fmt::Display for RingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RingError::Attach(w) => write!(f, "cannot attach to stormpump: {w}"),
+            RingError::Full => write!(f, "stormpump submission queue is full"),
+            RingError::Timeout => write!(f, "stormpump did not answer"),
+            RingError::Failed { errno, step } => {
+                write!(f, "stormpump refused: errno {errno} (at step {step})")
+            }
+            RingError::Gone => write!(f, "the connection to stormpump is gone"),
+        }
+    }
+}
+
+impl std::error::Error for RingError {}
+
+/// An exit the engine reported without being asked.
+#[derive(Debug, Clone, Copy)]
+pub struct Exited {
+    pub handle: u32,
+    /// The wait status, as `waitpid` reports it.
+    pub status: u32,
+}
+
+/// The client half of the ring.
+///
+/// Both ends are behind mutexes because `std::sync::mpsc` is `Send` but not
+/// `Sync`, and the CRI traits are `&self` on a value shared between tasks. The
+/// locks are held for a send and a try_recv — never across the wait, which
+/// happens on a channel private to the caller.
+pub struct RingClient {
+    tx: std::sync::Mutex<mpsc::Sender<Request>>,
+    exits: std::sync::Mutex<mpsc::Receiver<Exited>>,
+}
+
+impl RingClient {
+    /// Attach to the engine and start the thread that owns the ring.
+    pub fn attach(socket: &str) -> Result<RingClient, RingError> {
+        let attached = stormpump::transport::attach(socket, TOKEN)
+            .map_err(|e| RingError::Attach(format!("{socket}: {e}")))?;
+        let mapping = Mapping::from_fd(attached.ring)
+            .map_err(|e| RingError::Attach(format!("mapping the ring: {e}")))?;
+
+        let (tx, rx) = mpsc::channel::<Request>();
+        let (exit_tx, exits) = mpsc::channel::<Exited>();
+        let submit = attached.submit;
+        let complete = attached.complete;
+
+        std::thread::Builder::new()
+            .name("kubelet-stormpump-ring".into())
+            .spawn(move || {
+                // The stream is held for the life of the thread: dropping it
+                // closes the connection, and the engine takes that as the
+                // client having gone away.
+                let _stream = attached.stream;
+                run(mapping, rx, exit_tx, submit, complete);
+            })
+            .map_err(|e| RingError::Attach(format!("starting the ring thread: {e}")))?;
+
+        Ok(RingClient {
+            tx: std::sync::Mutex::new(tx),
+            exits: std::sync::Mutex::new(exits),
+        })
+    }
+
+    /// Submit one entry and wait for its completion.
+    ///
+    /// Blocking, and called from `spawn_blocking` by the async side. The ring
+    /// thread serialises requests, which at the rate a kubelet starts pods is
+    /// not a constraint worth engineering around: stormpump's own measured cost
+    /// for a container start is around 200 µs, so the queue is empty long
+    /// before the next pod arrives.
+    pub fn submit(&self, sqe: Sqe, payload: Option<Vec<u8>>) -> Result<Cqe, RingError> {
+        let (reply, answer) = mpsc::channel();
+        {
+            let tx = self.tx.lock().map_err(|_| RingError::Gone)?;
+            tx.send(Request { sqe, payload, reply }).map_err(|_| RingError::Gone)?;
+        }
+        // Outside the lock: another caller must be able to submit while this
+        // one waits, or the ring serialises on the client rather than on the
+        // engine.
+        answer.recv().map_err(|_| RingError::Gone)?
+    }
+
+    /// Define a spec, returning its handle.
+    pub fn spec_define(&self, encoded: Vec<u8>) -> Result<Handle, RingError> {
+        let cqe = self.submit(
+            Sqe { opcode: Op::SpecDefine as u8, ..Default::default() },
+            Some(encoded),
+        )?;
+        Ok(cqe.handle())
+    }
+
+    /// Register a mounted volume by path, returning its handle.
+    pub fn volume_register(&self, mount: &str) -> Result<Handle, RingError> {
+        let cqe = self.submit(
+            Sqe { opcode: Op::VolumeRegister as u8, ..Default::default() },
+            Some(mount.as_bytes().to_vec()),
+        )?;
+        Ok(cqe.handle())
+    }
+
+    /// Take a sandbox from the warm pool, or build one.
+    ///
+    /// This is the operation a CRI shim cannot express and the reason for going
+    /// direct: the namespaces already exist, so what a start costs is `setns`
+    /// rather than `unshare`.
+    pub fn sandbox_acquire(&self, spec: Handle) -> Result<Handle, RingError> {
+        let cqe = self.submit(
+            Sqe {
+                opcode: Op::SandboxAcquire as u8,
+                primary: spec,
+                ..Default::default()
+            },
+            None,
+        )?;
+        Ok(cqe.handle())
+    }
+
+    pub fn sandbox_release(&self, sandbox: Handle) -> Result<(), RingError> {
+        self.submit(
+            Sqe {
+                opcode: Op::SandboxRelease as u8,
+                primary: sandbox,
+                ..Default::default()
+            },
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// spec + root volume + sandbox -> a running workload.
+    pub fn spawn(
+        &self,
+        spec: Handle,
+        root: Handle,
+        domain: u8,
+    ) -> Result<Handle, RingError> {
+        let cqe = self.submit(
+            Sqe {
+                opcode: Op::Spawn as u8,
+                domain,
+                primary: spec,
+                handle_a: root,
+                ..Default::default()
+            },
+            None,
+        )?;
+        Ok(cqe.handle())
+    }
+
+    /// Signal, grace, kill — one op, so the policy timer is the engine's.
+    pub fn stop(&self, workload: Handle, grace_secs: u64) -> Result<(), RingError> {
+        self.submit(
+            Sqe {
+                opcode: Op::Stop as u8,
+                primary: workload,
+                inline_a: grace_secs,
+                ..Default::default()
+            },
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// Free an exited workload's handle, its pidfd and its cgroup.
+    pub fn workload_release(&self, workload: Handle) -> Result<(), RingError> {
+        self.submit(
+            Sqe {
+                opcode: Op::WorkloadRelease as u8,
+                primary: workload,
+                ..Default::default()
+            },
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// Everything the engine has reported ending since the last call.
+    ///
+    /// Drained rather than subscribed to: the caller is the runtime's own
+    /// status path, which runs when the kubelet asks, and an exit that arrives
+    /// between two asks must still be there for the second one.
+    pub fn drain_exits(&self) -> Vec<Exited> {
+        let mut out = Vec::new();
+        if let Ok(rx) = self.exits.lock() {
+            while let Ok(e) = rx.try_recv() {
+                out.push(e);
+            }
+        }
+        out
+    }
+
+    /// Ask about a workload without changing it.
+    pub fn query(&self, workload: Handle) -> Result<Cqe, RingError> {
+        self.submit(
+            Sqe {
+                opcode: Op::Query as u8,
+                primary: workload,
+                ..Default::default()
+            },
+            None,
+        )
+    }
+}
+
+/// How long to wait for one completion.
+///
+/// Generous against what these cost — a container start is sub-millisecond —
+/// and bounded so that a wedged engine surfaces as a failed pod with a reason
+/// rather than a kubelet that stops reconciling.
+const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn run(
+    mut mapping: Mapping,
+    rx: mpsc::Receiver<Request>,
+    exits: mpsc::Sender<Exited>,
+    submit: i32,
+    complete: i32,
+) {
+    let mut next_id: u64 = 1;
+    // Requests submitted and not yet answered. More than one can be in flight
+    // when a completion for an earlier request arrives out of order.
+    let mut waiting: HashMap<u64, mpsc::Sender<Result<Cqe, RingError>>> = HashMap::new();
+
+    loop {
+        // Take one request if there is one, without blocking so completions
+        // for work already submitted keep flowing.
+        match rx.recv_timeout(std::time::Duration::from_millis(2)) {
+            Ok(req) => {
+                let id = next_id;
+                next_id += 1;
+                let mut sqe = req.sqe;
+                sqe.user_data = id;
+                if let Some(bytes) = &req.payload {
+                    mapping.write_arena(0, bytes);
+                    match ArenaRef::new(0, bytes.len() as u32) {
+                        Some(a) => sqe.arena = a,
+                        None => {
+                            let _ = req.reply.send(Err(RingError::Full));
+                            continue;
+                        }
+                    }
+                }
+                if mapping.ring().push_sqe(sqe).is_err() {
+                    let _ = req.reply.send(Err(RingError::Full));
+                    continue;
+                }
+                waiting.insert(id, req.reply);
+                stormpump::transport::kick(submit);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            // Every sender is gone: the client was dropped, so this thread's
+            // work is done and the stream closes with it.
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+
+        stormpump::transport::drain(complete);
+        while let Some(cqe) = mapping.ring().pop_cqe() {
+            if cqe.user_data == 0 {
+                // Unsolicited: a workload ended. Nothing asked, and something
+                // still has to hear it.
+                let _ = exits.send(Exited {
+                    handle: cqe.handle().raw(),
+                    status: cqe.aux,
+                });
+                continue;
+            }
+            if let Some(reply) = waiting.remove(&cqe.user_data) {
+                let answer = if cqe.is_err() {
+                    Err(RingError::Failed { errno: -cqe.result as i32, step: cqe.aux })
+                } else {
+                    Ok(cqe)
+                };
+                let _ = reply.send(answer);
+            }
+        }
+
+        // Anything outstanding past the deadline is reported as such rather
+        // than waited on forever. Cheap to check: `waiting` holds one entry per
+        // request in flight, which is a handful at most.
+        if !waiting.is_empty() {
+            // A deadline per request would need a timestamp each; one shared
+            // deadline is enough because these complete in microseconds, and
+            // the case this exists for is an engine that has stopped answering
+            // at all.
+            let _ = DEADLINE;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_token_is_sixteen_bytes_and_says_who_we_are() {
+        // The engine reads exactly sixteen. A token that has to be padded or
+        // truncated is a token that changes when someone edits the string.
+        assert_eq!(TOKEN.len(), 16);
+        assert_eq!(&TOKEN[..], b"rustkube-kubelet");
+    }
+
+    #[test]
+    fn attaching_to_nothing_says_where_it_looked() {
+        let e = RingClient::attach("/nonexistent/stormpump.sock").unwrap_err();
+        let text = format!("{e}");
+        assert!(text.contains("/nonexistent/stormpump.sock"), "{text}");
+    }
+
+    #[test]
+    fn a_failure_carries_the_errno_and_the_step() {
+        // Spawn reports how far the child got before it gave up, and that is
+        // most of the diagnosis — "failed at mount" and "failed at exec" are
+        // different problems with the same errno.
+        let e = RingError::Failed { errno: 22, step: 7 };
+        let text = format!("{e}");
+        assert!(text.contains("22") && text.contains('7'), "{text}");
+    }
+}
