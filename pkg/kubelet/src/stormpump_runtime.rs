@@ -65,6 +65,9 @@ use crate::cri::{
 /// Where stormpump listens for clients on a stormcos node.
 pub const DEFAULT_SOCKET: &str = "/run/stormpump.sock";
 
+/// What one spec can carry, from `stormpump::spec::MAX_MOUNTS`.
+const MAX_MOUNTS: usize = 16;
+
 /// `sandbox::Profile::Isolated` — a network namespace with nothing in it but
 /// loopback.
 ///
@@ -106,6 +109,10 @@ struct Container {
     /// `<sandbox log_directory>/<container>`. Kubernetes reads
     /// `<that>/<restart>.log` and nowhere else.
     log_dir: String,
+    /// The host paths for this container's mounts, in the order the spec
+    /// declares their destinations. Registered as volumes at spawn and paired
+    /// with those destinations by position.
+    mount_sources: Vec<String>,
     /// Where the image's filesystem is mounted on this node.
     ///
     /// Registered with the engine at start rather than at create: a volume
@@ -316,7 +323,23 @@ fn spec_for(config: &ContainerConfig, sandbox: &PodSandboxConfig) -> stormpump::
             .filter(|s| !s.is_empty())
             .unwrap_or("0.log")
             .to_string(),
-        mounts: Vec::new(),
+        // What the pod asked for, in a fixed order. The volumes themselves are
+        // handles supplied at spawn, paired with these by position — so this
+        // order and that order are the same order, and the engine refuses a
+        // count that does not match.
+        //
+        // Capped at what a spec can carry. A pod past the cap is refused at
+        // define time with the count in the message, rather than starting with
+        // some of its volumes.
+        mounts: config
+            .mounts
+            .iter()
+            .take(MAX_MOUNTS)
+            .map(|m| stormpump::spec::Mount {
+                dst: m.container_path.clone(),
+                readonly: m.readonly,
+            })
+            .collect(),
         // hostNetwork is the node's namespace; anything else is the pod's,
         // which the sandbox already holds. `Profile::Host` is "no namespace at
         // all", which is exactly what hostNetwork means.
@@ -503,6 +526,12 @@ impl RuntimeService for StormpumpRuntime {
             name: config.name.clone(),
             namespace,
             pod,
+            mount_sources: config
+                .mounts
+                .iter()
+                .take(MAX_MOUNTS)
+                .map(|m| m.host_path.clone())
+                .collect(),
             log_dir: format!(
                 "{}/{}",
                 _sandbox_config.log_directory.trim_end_matches('/'),
@@ -537,7 +566,7 @@ impl RuntimeService for StormpumpRuntime {
 
     async fn start_container(&self, container_id: &str) -> Result<(), CriError> {
         self.probe()?;
-        let (spec, path, log_dir, sandbox_id) = {
+        let (spec, path, log_dir, sandbox_id, mount_sources) = {
             let containers = self.containers.lock().await;
             let c = containers
                 .get(container_id)
@@ -554,7 +583,7 @@ impl RuntimeService for StormpumpRuntime {
                     c.image
                 ))
             })?;
-            (spec, path, c.log_dir.clone(), c.sandbox_id.clone())
+            (spec, path, c.log_dir.clone(), c.sandbox_id.clone(), c.mount_sources.clone())
         };
 
         // The pod's sandbox, if it has one. A host-network pod has none and
@@ -577,11 +606,16 @@ impl RuntimeService for StormpumpRuntime {
             .on_ring(move |r| {
                 let root = r.volume_register(&path)?;
                 let logs = r.volume_register(&log_dir)?;
+                // One per mount point, in the spec's order.
+                let mut mounts = Vec::with_capacity(mount_sources.len());
+                for src in &mount_sources {
+                    mounts.push(r.volume_register(src)?);
+                }
                 tracing::debug!(
                     ?spec, ?root, ?logs, ?sandbox, path = %path, logs_dir = %log_dir,
                     "stormpump: spawning"
                 );
-                r.spawn(spec, root, logs, sandbox, Domain::Container as u8)
+                r.spawn(spec, root, logs, sandbox, &mounts, Domain::Container as u8)
             })
             .await?;
 
@@ -868,6 +902,7 @@ mod tests {
                     namespace: "default".into(),
                     pod: "p".into(),
                     log_dir: String::new(),
+                    mount_sources: Vec::new(),
                     workload_handle: None,
                     root_handle: None,
                     root_path: None,
@@ -987,6 +1022,7 @@ mod tests {
                     namespace: ns,
                     pod: "web".into(),
                     log_dir: String::new(),
+                    mount_sources: Vec::new(),
                     image: "busybox".into(),
                     spec_handle: None,
                     workload_handle: None,
@@ -1010,6 +1046,33 @@ mod tests {
         // And each is reachable in its own sandbox.
         assert_eq!(r.list_containers(Some("sb-a")).await.unwrap().len(), 1);
         assert_eq!(r.list_containers(Some("sb-b")).await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn mounts_keep_the_order_the_spec_declares() {
+        // The engine pairs the nth volume handle with the nth destination, so
+        // these two lists are the same list seen twice. A mismatch does not
+        // fail — it mounts the wrong volume at the right path, which is the
+        // kind of bug that is found much later and by something else.
+        use crate::cri::Mount;
+        let cc = ContainerConfig {
+            mounts: vec![
+                Mount { container_path: "/data".into(), host_path: "/host/a".into(), ..Default::default() },
+                Mount { container_path: "/cfg".into(), host_path: "/host/b".into(), readonly: true, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let spec = spec_for(&cc, &PodSandboxConfig::default());
+        assert_eq!(spec.mounts.len(), 2);
+        assert_eq!(spec.mounts[0].dst, "/data");
+        assert!(!spec.mounts[0].readonly);
+        assert_eq!(spec.mounts[1].dst, "/cfg");
+        assert!(spec.mounts[1].readonly, "a read-only mount stays read-only");
+
+        // And the sources this records are in that same order.
+        let sources: Vec<String> =
+            cc.mounts.iter().take(MAX_MOUNTS).map(|m| m.host_path.clone()).collect();
+        assert_eq!(sources, vec!["/host/a".to_string(), "/host/b".to_string()]);
     }
 
     #[test]

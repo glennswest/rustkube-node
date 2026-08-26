@@ -232,14 +232,28 @@ impl RingClient {
     /// `sandbox` is the pod's, joined rather than taken — which is what puts a
     /// pod's containers on one network instead of several. `Handle::NONE`
     /// means "take your own", which is right for anything that is not a pod.
+    /// `mounts` are the volumes for the spec's mount points, **in the order the
+    /// spec declares them** — the engine pairs the nth handle with the nth
+    /// destination and refuses a count that does not match, because a container
+    /// missing one of its volumes starts and then behaves inexplicably.
     pub fn spawn(
         &self,
         spec: Handle,
         root: Handle,
         logs: Handle,
         sandbox: Handle,
+        mounts: &[Handle],
         domain: u8,
     ) -> Result<Handle, RingError> {
+        let payload = if mounts.is_empty() {
+            None
+        } else {
+            let mut bytes = Vec::with_capacity(mounts.len() * 8);
+            for m in mounts {
+                bytes.extend_from_slice(&m.0.to_le_bytes());
+            }
+            Some(bytes)
+        };
         let cqe = self.submit(
             Sqe {
                 opcode: Op::Spawn as u8,
@@ -253,7 +267,7 @@ impl RingClient {
                 inline_b: logs.0,
                 ..Default::default()
             },
-            None,
+            payload,
         )?;
         Ok(cqe.handle())
     }
