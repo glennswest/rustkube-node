@@ -2441,7 +2441,7 @@ mod tests {
             ]}
         }]);
         let v = mgr.resolve_volumes(&p).await;
-        let dir = v.get("kube-api-access").expect("projected volume resolved");
+        let dir = &v.get("kube-api-access").expect("projected volume resolved").path;
         assert!(dir.contains("kubernetes.io~projected"));
         // The downward file was written with the namespace.
         let content = std::fs::read_to_string(format!("{dir}/namespace")).unwrap_or_default();
@@ -2537,17 +2537,23 @@ mod tests {
             ]}
         });
         let v = mgr.resolve_volumes(&p).await;
-        assert_eq!(v.get("bpf").map(String::as_str), Some("/sys/fs/bpf"));
+        assert_eq!(v.get("bpf").map(|r| r.path.as_str()), Some("/sys/fs/bpf"));
         assert!(v
             .get("scratch")
             .unwrap()
+            .path
             .ends_with("/pods/uid-9/volumes/kubernetes.io~empty-dir/scratch"));
+        // A directory to bind carries no filesystem — only a claim does.
+        assert!(v.get("bpf").unwrap().fstype.is_none());
     }
 
     #[test]
     fn container_config_resolves_mounts_and_security_context() {
         let mut volumes = HashMap::new();
-        volumes.insert("bpf".to_string(), "/sys/fs/bpf".to_string());
+        volumes.insert(
+            "bpf".to_string(),
+            ResolvedVolume { path: "/sys/fs/bpf".to_string(), fstype: None },
+        );
         let spec = json!({
             "name": "cilium-agent",
             "image": "cilium:latest",
