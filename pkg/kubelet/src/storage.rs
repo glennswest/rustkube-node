@@ -33,8 +33,15 @@ use serde_json::Value;
 /// Size classes a claim is rounded up to.
 ///
 /// Classes rather than exact sizes, so a claim for 100 MiB uses the 256 MiB
-/// template instead of minting a new one — minting per claim would put an
-/// `mkfs` back on the pod-start path, which is the whole thing being avoided.
+/// blank instead of minting a new one — minting per claim would put an `mkfs`
+/// back on the pod-start path, which is the whole thing being avoided.
+///
+/// **The class is also the quota.** A claim rounds up to one and that class is
+/// its ceiling, so the ladder is how a volume's size is limited without anyone
+/// writing a quota system — which is why it starts at 1 MiB rather than at a
+/// size that would be convenient to allocate. A volume holding one config file
+/// or one small state file is a real and common shape, and giving it 64 MiB
+/// would not waste space (a blank is sparse) but would waste the limit.
 /// A claim larger than the biggest is refused rather than rounded down.
 ///
 /// This list must match the blanks the image actually ships, because a class
@@ -43,6 +50,8 @@ use serde_json::Value;
 /// of it, so larger classes belong on a node whose data drive is sized for
 /// them rather than in a 32 GB test image.
 pub const SIZE_CLASSES: &[(&str, u64)] = &[
+    ("1M", 1024 * 1024),
+    ("16M", 16 * 1024 * 1024),
     ("64M", 64 * 1024 * 1024),
     ("256M", 256 * 1024 * 1024),
     ("1G", 1024 * 1024 * 1024),
@@ -128,7 +137,8 @@ mod tests {
 
     #[test]
     fn a_claim_rounds_up_to_a_class_never_down() {
-        assert_eq!(class_for(1).map(|c| c.0), Some("64M"));
+        assert_eq!(class_for(1).map(|c| c.0), Some("1M"));
+        assert_eq!(class_for(1024 * 1024 + 1).map(|c| c.0), Some("16M"));
         assert_eq!(class_for(64 * 1024 * 1024).map(|c| c.0), Some("64M"));
         assert_eq!(class_for(64 * 1024 * 1024 + 1).map(|c| c.0), Some("256M"));
         assert_eq!(class_for(1024 * 1024 * 1024).map(|c| c.0), Some("1G"));
@@ -142,7 +152,7 @@ mod tests {
 
     #[test]
     fn a_claim_with_no_request_gets_the_smallest_class() {
-        assert_eq!(claim_bytes(&json!({"spec":{}})), 64 * 1024 * 1024);
+        assert_eq!(claim_bytes(&json!({"spec":{}})), 1024 * 1024);
         assert_eq!(
             claim_bytes(&json!({"spec":{"resources":{"requests":{"storage":"1Gi"}}}})),
             1024 * 1024 * 1024
