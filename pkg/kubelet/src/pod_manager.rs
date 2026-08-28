@@ -472,11 +472,18 @@ impl PodManager {
         };
 
         // Attach it here, as a block device the container will mount.
-        let attach = serde_json::json!({ "node": self.node_name });
+        //
+        // On the volume, not on /v1 (stormblock#78, v12.1.0): a volume is the
+        // thing that has a device, and this one was cloned through /api/v1 so
+        // it has no /v1 record. `ublk` explicitly rather than by preference —
+        // asking for it where it cannot be offered is a 409 rather than a
+        // silent downgrade to nvme-tcp, and a downgrade is not something to
+        // discover from a mount that behaves oddly later.
+        let attach = serde_json::json!({ "node": self.node_name, "transport": "ublk" });
         let info: Value = self
-            .storage_post(&format!("/v1/volumes/{vol_id}/attach"), &attach)
+            .storage_post(&format!("/api/v1/volumes/{vol_id}/attach"), &attach)
             .await
-            .ok_or_else(|| format!("stormblock would not attach {name}"))?;
+            .ok_or_else(|| format!("stormblock would not attach {name} as a local device"))?;
         if let Some(dev) = info["device_hint"].as_str() {
             info!("PVC {namespace}/{claim} -> {name} ({class}) at {dev}");
             return Ok(dev.to_string());
