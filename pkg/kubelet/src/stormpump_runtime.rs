@@ -389,11 +389,7 @@ fn spec_for(config: &ContainerConfig, sandbox: &PodSandboxConfig) -> stormpump::
             Profile::Routed
         },
         argv,
-        env: config
-            .envs
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect(),
+        env: container_env(config),
         cwd: if config.working_dir.is_empty() {
             "/".to_string()
         } else {
@@ -813,6 +809,49 @@ pub struct StormpumpImages {
     /// registry round trip per container start, and `imagePullPolicy` is what
     /// exists to ask for it.
     pulled: Mutex<HashMap<String, String>>,
+}
+
+/// The container's environment: what the pod asked for, plus the defaults an
+/// OCI runtime would have taken from the image config.
+///
+/// **A golden has no image config**, so `HOME`, `PATH` and `HOSTNAME` — which
+/// every other runtime derives from the image or the pod — arrive unset unless
+/// something puts them there. Real programs assume them: Cilium's operator got
+/// as far as starting its hive and then died on
+/// `unable to get current user home directory: os/user lookup failed; $HOME is
+/// empty`, which is a missing environment variable wearing the costume of a
+/// user-lookup failure.
+///
+/// The pod always wins. These are defaults, not overrides: a spec that sets
+/// `HOME` means it, and this must never quietly replace it.
+fn container_env(config: &ContainerConfig) -> Vec<String> {
+    let mut env: Vec<String> = config
+        .envs
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+
+    let has = |env: &Vec<String>, key: &str| {
+        let prefix = format!("{key}=");
+        env.iter().any(|e| e.starts_with(&prefix))
+    };
+
+    // HOME=/root because a container without a user database runs as root,
+    // and that is the home an image would declare for it.
+    if !has(&env, "HOME") {
+        env.push("HOME=/root".to_string());
+    }
+    if !has(&env, "PATH") {
+        env.push(
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+        );
+    }
+    // Upstream's kubelet sets HOSTNAME to the pod name, and plenty of software
+    // reads it rather than calling uname.
+    if !has(&env, "HOSTNAME") && !config.name.is_empty() {
+        env.push(format!("HOSTNAME={}", config.name));
+    }
+    env
 }
 
 /// Find `argv0` on the standard PATH *inside* an image root.
@@ -1315,6 +1354,38 @@ mod tests {
     }
 
     #[test]
+    /// A golden carries no image config, so HOME and PATH arrive unset unless
+    /// the runtime supplies them. Cilium's operator died on an empty $HOME
+    /// after getting all the way to starting its hive.
+    #[test]
+    fn the_container_gets_the_environment_an_image_would_have_given_it() {
+        let cfg = ContainerConfig { name: "cilium-operator".into(), ..Default::default() };
+        let env = container_env(&cfg);
+        assert!(env.iter().any(|e| e == "HOME=/root"), "{env:?}");
+        assert!(env.iter().any(|e| e.starts_with("PATH=/usr/local/sbin:")), "{env:?}");
+        assert!(env.iter().any(|e| e == "HOSTNAME=cilium-operator"), "{env:?}");
+    }
+
+    /// Defaults, not overrides — a pod that sets HOME means it.
+    #[test]
+    fn the_pod_environment_wins_over_the_defaults() {
+        let cfg = ContainerConfig {
+            name: "c".into(),
+            envs: vec![
+                ("HOME".to_string(), "/home/app".to_string()),
+                ("PATH".to_string(), "/opt/bin".to_string()),
+            ],
+            ..Default::default()
+        };
+        let env = container_env(&cfg);
+        assert!(env.iter().any(|e| e == "HOME=/home/app"), "{env:?}");
+        assert!(env.iter().any(|e| e == "PATH=/opt/bin"), "{env:?}");
+        // And exactly once each — a duplicate would leave which one wins to
+        // whatever execve does with it.
+        assert_eq!(env.iter().filter(|e| e.starts_with("HOME=")).count(), 1);
+        assert_eq!(env.iter().filter(|e| e.starts_with("PATH=")).count(), 1);
+    }
+
     /// The engine refuses a relative argv[0], and every real manifest writes
     /// one — Cilium says `cilium-agent`, `cilium-dbg`, `sh`. Resolving it here
     /// is what lets those run.
