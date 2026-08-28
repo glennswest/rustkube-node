@@ -511,13 +511,18 @@ impl RuntimeService for StormpumpRuntime {
         config: &ContainerConfig,
         _sandbox_config: &PodSandboxConfig,
     ) -> Result<String, CriError> {
-        self.probe()?;
+        // The sandbox first, the engine second. A request naming a sandbox
+        // that does not exist is wrong whether or not stormpump is running,
+        // and answering it with "no stormpump on this node" sends the reader
+        // to the wrong component — the kubelet's own bookkeeping is what has
+        // the answer, and it needs nothing to give it.
         {
             let sandboxes = self.sandboxes.lock().await;
             if !sandboxes.contains_key(sandbox_id) {
                 return Err(CriError::NotFound(format!("sandbox {sandbox_id}")));
             }
         }
+        self.probe()?;
         let encoded = spec_for(config, _sandbox_config).encode();
         let spec = self.on_ring(move |r| r.spec_define(encoded)).await?;
 
