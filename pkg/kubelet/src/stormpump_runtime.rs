@@ -304,6 +304,36 @@ fn spec_for(config: &ContainerConfig, sandbox: &PodSandboxConfig) -> stormpump::
     // shell would run the wrong thing silently; an empty argv fails loudly at
     // the moment the spec is defined, naming the container.
 
+    // **argv[0] is resolved here, because the engine will not do it.**
+    //
+    // stormpump refuses a relative argv[0] on purpose — "resolving PATH is a
+    // lookup, and lookups do not belong on a start path" — and that is the
+    // right invariant for an engine. But Kubernetes says `command` is what the
+    // *runtime* execs, and every real manifest writes it the way a shell would:
+    // Cilium's containers say `cilium-agent`, `cilium-dbg`, `sh`. Passing those
+    // through unchanged made every Cilium pod fail at SpecDefine.
+    //
+    // So the lookup happens on this side, where the image root is known, and
+    // the engine still receives an absolute path.
+    if let Some(first) = argv.first().cloned() {
+        if !first.starts_with('/') {
+            match StormpumpImages::local_path(&config.image) {
+                Some(root) => match resolve_in_image(&root, &first) {
+                    Some(abs) => argv[0] = abs,
+                    None => tracing::warn!(
+                        image = %config.image, argv0 = %first,
+                        "argv[0] is not on PATH inside the image; the engine will \
+                         refuse the spec"
+                    ),
+                },
+                None => tracing::warn!(
+                    image = %config.image, argv0 = %first,
+                    "cannot resolve argv[0]: the image is not on this node yet"
+                ),
+            }
+        }
+    }
+
     Spec {
         domain: Domain::Container,
         // The root arrives as a registered volume handle at spawn, not here:
@@ -785,6 +815,41 @@ pub struct StormpumpImages {
     pulled: Mutex<HashMap<String, String>>,
 }
 
+/// Find `argv0` on the standard PATH *inside* an image root.
+///
+/// Returns the path as the container will see it (absolute, image-relative),
+/// not the host path — the container is chrooted into the image, so
+/// `/pallets/cilium/usr/bin/cilium-agent` on this side is `/usr/bin/cilium-agent`
+/// on that one.
+///
+/// The directory list is the conventional PATH, in the conventional order. An
+/// image that puts its binary somewhere else and relies on an `ENV PATH` is not
+/// handled: a golden is a filesystem and carries no image config, so there is
+/// no PATH to read. That case is a miss, and a miss is reported rather than
+/// guessed at.
+fn resolve_in_image(root: &std::path::Path, argv0: &str) -> Option<String> {
+    // A command with a slash in it is a path already, just not an absolute
+    // one — `./foo` or `bin/foo`. PATH is not consulted for those, the same as
+    // a shell.
+    if argv0.contains('/') {
+        return None;
+    }
+    for dir in [
+        "/usr/local/sbin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/usr/bin",
+        "/sbin",
+        "/bin",
+    ] {
+        let candidate = root.join(dir.trim_start_matches('/')).join(argv0);
+        if candidate.is_file() {
+            return Some(format!("{dir}/{argv0}"));
+        }
+    }
+    None
+}
+
 /// Where a pulled image is mounted. Under `/run` because it does not survive a
 /// reboot: the clone does, and is found again by name.
 const IMAGE_ROOT: &str = "/run/stormpump/images";
@@ -1250,6 +1315,44 @@ mod tests {
     }
 
     #[test]
+    /// The engine refuses a relative argv[0], and every real manifest writes
+    /// one — Cilium says `cilium-agent`, `cilium-dbg`, `sh`. Resolving it here
+    /// is what lets those run.
+    #[test]
+    fn argv0_resolves_against_the_image_path() {
+        let root = std::env::temp_dir().join(format!("rk-argv-{}", std::process::id()));
+        let bin = root.join("usr/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("cilium-agent"), b"#!/bin/true\n").unwrap();
+
+        // Found on PATH, and reported as the *container* sees it.
+        assert_eq!(
+            resolve_in_image(&root, "cilium-agent"),
+            Some("/usr/bin/cilium-agent".to_string())
+        );
+        // Not there at all.
+        assert_eq!(resolve_in_image(&root, "nonesuch"), None);
+        // A command containing a slash is a path, not a PATH lookup — same as
+        // a shell.
+        assert_eq!(resolve_in_image(&root, "./cilium-agent"), None);
+        assert_eq!(resolve_in_image(&root, "usr/bin/cilium-agent"), None);
+
+        // Order matters: /usr/local/bin wins over /usr/bin.
+        let local = root.join("usr/local/bin");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("cilium-agent"), b"x").unwrap();
+        assert_eq!(
+            resolve_in_image(&root, "cilium-agent"),
+            Some("/usr/local/bin/cilium-agent".to_string())
+        );
+
+        // A directory of the right name is not a command.
+        std::fs::create_dir_all(root.join("usr/bin/adir")).unwrap();
+        assert_eq!(resolve_in_image(&root, "adir"), None);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     fn command_and_args_become_one_argv() {
         let cc = ContainerConfig {
             command: vec!["/usr/bin/cilium-agent".into()],
