@@ -193,6 +193,30 @@ impl RingClient {
         Ok(cqe.handle())
     }
 
+    /// Register a volume that is a block device, mounting it at `mount`.
+    ///
+    /// **The engine does the mount, and that is the point.** A mount is only
+    /// visible in the mount namespace that made it, and the kubelet runs in a
+    /// container — so a device this process mounted would be a device only
+    /// this process could see, and the container started on it would find an
+    /// empty root. The engine is PID 1, so the mount it makes is the node's.
+    ///
+    /// Idempotent: registering a device already mounted at that path returns a
+    /// handle rather than an error, because two pods of one image both ask.
+    pub fn volume_register_device(
+        &self,
+        mount: &str,
+        device: &str,
+        fstype: &str,
+    ) -> Result<Handle, RingError> {
+        let payload = format!("{mount}\0{device}\0{fstype}").into_bytes();
+        let cqe = self.submit(
+            Sqe { opcode: Op::VolumeRegister as u8, ..Default::default() },
+            Some(payload),
+        )?;
+        Ok(cqe.handle())
+    }
+
     /// Take a sandbox from the warm pool, or build one.
     ///
     /// The profile is a byte, not a spec: a sandbox is namespaces and nothing
