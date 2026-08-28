@@ -105,6 +105,9 @@ impl NodeReporter {
             pod_cidr,
             runtime_version: "cri-o://unknown".to_string(),
             kubelet_port: 10250,
+            labels: Vec::new(),
+            annotations: Vec::new(),
+            taints: Vec::new(),
             client: reqwest::Client::new(),
         }
     }
