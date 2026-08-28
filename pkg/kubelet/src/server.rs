@@ -6,7 +6,7 @@
 //! TLS + bearer-token auth is the TLS phase (rustkube-node#9).
 
 use crate::pod_manager::PodManager;
-use axum::extract::{Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{header::AUTHORIZATION, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -51,6 +51,11 @@ pub fn router(pod_manager: Arc<PodManager>) -> Router {
         .route("/metrics/cadvisor", get(metrics_cadvisor))
         .route("/stats/summary", get(stats_summary))
         .route("/pods", get(pods))
+        // What `kubectl logs` reads, by way of the apiserver proxy.
+        .route(
+            "/containerLogs/{namespace}/{pod}/{container}",
+            get(container_logs),
+        )
         .with_state(pod_manager)
 }
 
@@ -429,4 +434,155 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["kind"], "PodList");
     }
+}
+
+/// `GET /containerLogs/{namespace}/{pod}/{container}` — what `kubectl logs`
+/// ultimately reads.
+///
+/// The apiserver proxies the user's request here; this is the only place that
+/// knows where a container's output actually is. The path is the CRI one the
+/// kubelet itself told the runtime to write:
+///
+///   /var/log/pods/<namespace>_<pod>_<uid>/<container>/<restart>.log
+///
+/// The pod's UID is not in the URL, so it is resolved from the kubelet's own
+/// view of its pods — which is also what makes a request for a pod this node
+/// does not have a 404 rather than an empty body.
+async fn container_logs(
+    State(pm): State<Arc<PodManager>>,
+    Path((namespace, pod, container)): Path<(String, String, String)>,
+    Query(opts): Query<LogOptions>,
+) -> impl IntoResponse {
+    let Some(uid) = pm.pod_uid(&namespace, &pod).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("pod {namespace}/{pod} not found on this node\n"),
+        );
+    };
+    let dir = format!("/var/log/pods/{namespace}_{pod}_{uid}/{container}");
+
+    // `previous` asks for the run before the current one. Restarts are numbered
+    // from 0, so the current file is the highest and "previous" is the one
+    // below it — absent for a container that has never restarted, which is a
+    // 400 upstream rather than an empty success.
+    let mut runs: Vec<u32> = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                e.file_name().to_str().and_then(|n| n.strip_suffix(".log")).and_then(|n| n.parse().ok())
+            })
+            .collect(),
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("no logs for container {container} in {namespace}/{pod}\n"),
+            )
+        }
+    };
+    runs.sort_unstable();
+    let want = if opts.previous.unwrap_or(false) {
+        match runs.len().checked_sub(2).and_then(|i| runs.get(i)) {
+            Some(r) => *r,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("container {container} has no previous run\n"),
+                )
+            }
+        }
+    } else {
+        match runs.last() {
+            Some(r) => *r,
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    format!("no logs for container {container} in {namespace}/{pod}\n"),
+                )
+            }
+        }
+    };
+
+    let path = format!("{dir}/{want}.log");
+    let body = match std::fs::read_to_string(&path) {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::NOT_FOUND, format!("cannot read {path}: {e}\n")),
+    };
+    (StatusCode::OK, filter_log(&body, &opts))
+}
+
+/// The query parameters `kubectl logs` sends.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LogOptions {
+    /// Only the last N lines.
+    tail_lines: Option<usize>,
+    /// Only entries newer than this many seconds.
+    since_seconds: Option<i64>,
+    /// Only entries at or after this RFC3339 time.
+    since_time: Option<String>,
+    /// Prefix each line with its timestamp.
+    timestamps: Option<bool>,
+    /// The run before the current one.
+    previous: Option<bool>,
+    /// Accepted and ignored: streaming is a separate change, and a client that
+    /// asks for it should get the log it asked for rather than an error.
+    #[allow(dead_code)]
+    follow: Option<bool>,
+    /// Accepted and ignored — a byte cap on the response.
+    #[allow(dead_code)]
+    limit_bytes: Option<usize>,
+}
+
+/// Apply the CRI log-format options to a file's contents.
+///
+/// The runtime writes CRI format: `<rfc3339nano> <stdout|stderr> <F|P> <line>`.
+/// `kubectl logs` shows only the message unless `timestamps` is set, so the
+/// prefix is stripped here rather than left for the client to be surprised by.
+fn filter_log(body: &str, opts: &LogOptions) -> String {
+    let cutoff: Option<chrono::DateTime<chrono::Utc>> = opts
+        .since_time
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .or_else(|| {
+            opts.since_seconds
+                .map(|s| chrono::Utc::now() - chrono::Duration::seconds(s))
+        });
+
+    let mut out: Vec<String> = Vec::new();
+    for line in body.lines() {
+        // `<ts> <stream> <tag> <message>` — split off exactly three fields, so
+        // a message containing spaces survives intact.
+        let mut it = line.splitn(4, ' ');
+        let (ts, _stream, _tag, msg) = match (it.next(), it.next(), it.next(), it.next()) {
+            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+            // Not CRI format: pass it through rather than drop it. A log the
+            // reader cannot see is worse than one with an odd prefix.
+            _ => {
+                out.push(line.to_string());
+                continue;
+            }
+        };
+        if let Some(cut) = cutoff {
+            match chrono::DateTime::parse_from_rfc3339(ts) {
+                Ok(t) if t.with_timezone(&chrono::Utc) < cut => continue,
+                _ => {}
+            }
+        }
+        if opts.timestamps.unwrap_or(false) {
+            out.push(format!("{ts} {msg}"));
+        } else {
+            out.push(msg.to_string());
+        }
+    }
+    if let Some(n) = opts.tail_lines {
+        if out.len() > n {
+            out.drain(..out.len() - n);
+        }
+    }
+    let mut s = out.join("\n");
+    if !s.is_empty() {
+        s.push('\n');
+    }
+    s
 }

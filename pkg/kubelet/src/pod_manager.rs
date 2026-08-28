@@ -1331,6 +1331,19 @@ impl PodManager {
     }
 
     /// A v1 PodList of the pods this kubelet manages (for the /pods endpoint).
+    /// The UID of a pod this node is running, by namespace and name.
+    ///
+    /// Needed because a container's log path contains the UID
+    /// (`/var/log/pods/<ns>_<pod>_<uid>/`) while the URL `kubectl logs` sends
+    /// does not — and because a pod this node has never heard of should be a
+    /// 404 rather than an empty log.
+    pub async fn pod_uid(&self, namespace: &str, name: &str) -> Option<String> {
+        let pods = self.pods.read().await;
+        pods.values()
+            .find(|p| p.namespace == namespace && p.name == name)
+            .map(|p| p.uid.clone())
+    }
+
     pub async fn pods_json(&self) -> Value {
         let pods = self.pods.read().await;
         let items: Vec<Value> = pods
