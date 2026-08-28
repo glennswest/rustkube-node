@@ -417,7 +417,8 @@ impl PodManager {
     async fn provision_claim(&self, namespace: &str, claim: &str) -> Result<String, String> {
         let name = crate::storage::volume_name(namespace, claim);
 
-        // What the claim asked for, rounded up to a size class.
+        // What the claim asked for, rounded up to a class. The class is also
+        // the ceiling: a claim gets the blank that holds it and no more.
         let pvc: Value = self
             .api_get(&format!(
                 "/api/v1/namespaces/{namespace}/persistentvolumeclaims/{claim}"
@@ -425,47 +426,74 @@ impl PodManager {
             .await
             .ok_or_else(|| format!("claim {claim} not found"))?;
         let want = crate::storage::claim_bytes(&pvc);
-        let (class, bytes) = crate::storage::class_for(want).ok_or_else(|| {
-            format!(
-                "claim asks for {want} bytes, larger than the largest size class — refused \
-                 rather than rounded down"
-            )
+        let (class, _bytes) = crate::storage::class_for(want).ok_or_else(|| {
+            format!("claim asks for {want} bytes, larger than the largest size class")
         })?;
 
-        // Create, or find the one already there. Cloned from the blank
-        // filesystem for this class, so no mkfs happens on this path.
-        let body = serde_json::json!({
-            "name": name,
-            "size_bytes": bytes,
-            "source": { "volume": crate::storage::template_name(class) },
-        });
-        let created: Value = self
-            .storage_post("/v1/volumes", &body)
-            .await
-            .ok_or_else(|| format!("stormblock would not create volume {name}"))?;
-        let id = created["id"]
-            .as_str()
-            .ok_or_else(|| format!("stormblock returned no id for {name}: {created}"))?
-            .to_string();
+        // Already provisioned? A claim is keyed on namespace and name, so a
+        // restarted pod is reunited with its data rather than given a fresh
+        // volume — which is the whole difference between a claim and a scratch
+        // directory.
+        let existing = self.storage_volume_id(&name).await;
+        let vol_id = match existing {
+            Some(id) => id,
+            None => {
+                // Clone the blank for this class. `clone` is the one door:
+                // it descends from a sealed volume, records lineage, and
+                // stamps the clone with its own filesystem UUID — two live
+                // filesystems must never claim one identity (stormblock#76).
+                let blank = crate::storage::template_name(class);
+                let src = self
+                    .storage_volume_id(&blank)
+                    .await
+                    .ok_or_else(|| format!("no blank volume {blank} on this node"))?;
+                let body = serde_json::json!({ "name": name, "verify": true });
+                let created: Value = self
+                    .storage_post(&format!("/api/v1/volumes/{src}/clone"), &body)
+                    .await
+                    .ok_or_else(|| format!("stormblock would not clone {blank} to {name}"))?;
+                created["id"]
+                    .as_str()
+                    .ok_or_else(|| format!("clone of {blank} returned no id: {created}"))?
+                    .to_string()
+            }
+        };
 
-        // Attach it here. The local fast path answers with a ublk device on
-        // this node; anything else means the volume is not local, and mounting
-        // a remote namespace is a separate piece of work rather than something
-        // to improvise here.
+        // Attach it here, as a block device the container will mount.
         let attach = serde_json::json!({ "node": self.node_name });
         let info: Value = self
-            .storage_post(&format!("/v1/volumes/{id}/attach"), &attach)
+            .storage_post(&format!("/v1/volumes/{vol_id}/attach"), &attach)
             .await
             .ok_or_else(|| format!("stormblock would not attach {name}"))?;
-
         if let Some(dev) = info["device_hint"].as_str() {
-            info!("PVC {namespace}/{claim} -> volume {name} ({class}) at {dev}");
+            info!("PVC {namespace}/{claim} -> {name} ({class}) at {dev}");
             return Ok(dev.to_string());
         }
         Err(format!(
             "volume {name} did not attach locally: {info} — an NVMe-oF attach needs a \
              connect this node does not do yet"
         ))
+    }
+
+    /// A volume's id by name, or `None` when this node has no such volume.
+    async fn storage_volume_id(&self, name: &str) -> Option<String> {
+        let list: Value = self.storage_get("/api/v1/volumes").await?;
+        list["items"]
+            .as_array()?
+            .iter()
+            .find(|v| v["name"].as_str() == Some(name))
+            .and_then(|v| v["id"].as_str())
+            .map(str::to_string)
+    }
+
+    /// GET from stormblock's management API on this node.
+    async fn storage_get(&self, path: &str) -> Option<Value> {
+        let resp =
+            self.api_client.get(format!("{}{path}", self.storage_url)).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.json::<Value>().await.ok()
     }
 
     /// Materialize a projected volume's sources into `dir`: serviceAccountToken
