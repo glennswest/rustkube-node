@@ -73,6 +73,21 @@ pub struct SyncOutcome {
 }
 
 /// Manages pod lifecycle on a single node.
+/// A pod volume, resolved to something the runtime can mount.
+///
+/// `fstype` is `None` for everything that is a directory to bind — hostPath,
+/// configMap, secret, projected, emptyDir. A PersistentVolumeClaim resolves to
+/// a **block device** and carries the filesystem on it, because the runtime
+/// mounts it inside the container rather than binding a path the host already
+/// has. Keeping that explicit rather than sniffing a `/dev/` prefix: the
+/// difference between a bind and a mount decides whether a wrong answer is a
+/// missing file or a corrupted one.
+#[derive(Debug, Clone)]
+pub struct ResolvedVolume {
+    pub path: String,
+    pub fstype: Option<String>,
+}
+
 pub struct PodManager {
     runtime: Arc<dyn RuntimeService>,
     images: Arc<dyn ImageService>,
@@ -84,6 +99,9 @@ pub struct PodManager {
     api_client: reqwest::Client,
     /// This node's IP, for the downward API `status.hostIP`.
     node_ip: String,
+    /// stormblock's management API on this node. Volumes for
+    /// PersistentVolumeClaims are created and attached through it.
+    storage_url: String,
     /// Kubelet state root; per-pod volume dirs live under `<state_root>/pods`.
     /// Overridable in tests. Default `/var/lib/kubelet`.
     state_root: String,
@@ -117,6 +135,7 @@ impl PodManager {
             api_url: api_url.trim_end_matches('/').to_string(),
             api_client,
             node_ip: node_ip.to_string(),
+            storage_url: "http://127.0.0.1:9090".to_string(),
             state_root: "/var/lib/kubelet".to_string(),
             ca_pem: None,
         }
@@ -129,6 +148,40 @@ impl PodManager {
     }
 
     /// Fetch a ConfigMap's `data` map (namespaced). None on any failure.
+    /// GET any object from the apiserver.
+    async fn api_get(&self, path: &str) -> Option<Value> {
+        if self.api_url.is_empty() {
+            return None;
+        }
+        let resp = self.api_client.get(format!("{}{path}", self.api_url)).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.json::<Value>().await.ok()
+    }
+
+    /// POST to stormblock's management API on this node.
+    ///
+    /// Loopback by default: the storage engine runs on the node whose volumes
+    /// it serves, and a kubelet asking another node's stormblock for a local
+    /// device would get an answer that is true somewhere else.
+    async fn storage_post(&self, path: &str, body: &Value) -> Option<Value> {
+        let resp = self
+            .api_client
+            .post(format!("{}{path}", self.storage_url))
+            .json(body)
+            .send()
+            .await
+            .ok()?;
+        let status = resp.status();
+        let text = resp.text().await.ok()?;
+        if !status.is_success() {
+            warn!("stormblock {path} -> {status}: {}", text.chars().take(200).collect::<String>());
+            return None;
+        }
+        serde_json::from_str(&text).ok()
+    }
+
     async fn fetch_configmap(&self, namespace: &str, name: &str) -> Option<Value> {
         if self.api_url.is_empty() {
             return None;
@@ -257,7 +310,7 @@ impl PodManager {
 
     /// Resolve `spec.volumes` to host paths, materializing configMap/secret
     /// volumes to files under the pod dir. hostPath/emptyDir handled inline.
-    async fn resolve_volumes(&self, pod: &Value) -> HashMap<String, String> {
+    async fn resolve_volumes(&self, pod: &Value) -> HashMap<String, ResolvedVolume> {
         let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
         let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default");
         let mut map = HashMap::new();
@@ -307,15 +360,112 @@ impl PodManager {
                     }
                 }
                 dir
+            } else if let Some(claim) = vol["persistentVolumeClaim"]["claimName"].as_str() {
+                // A real volume on stormblock, not a directory.
+                //
+                // The claim is cloned from a blank filesystem that was made
+                // once at image-build time, attached as a block device on this
+                // node, and mounted *by the container* — see storage.rs. A
+                // failure here falls back to a scratch directory rather than
+                // failing the pod, and says so: a pod that starts with its data
+                // in the wrong place is bad, but so is a pod that will not start
+                // on a node whose storage is briefly unreachable. The fallback
+                // is loud, and `kubectl describe` shows the reason.
+                match self.provision_claim(namespace, claim).await {
+                    Ok(device) => {
+                        map.insert(
+                            name,
+                            ResolvedVolume { path: device, fstype: Some("ext4".to_string()) },
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "PVC {namespace}/{claim}: {e} — falling back to a scratch \
+                             directory, THIS DATA WILL NOT PERSIST"
+                        );
+                        let dir = pod_volume_dir(&self.state_root, uid, "pvc-failed", &name);
+                        let _ = std::fs::create_dir_all(&dir);
+                        dir
+                    }
+                }
             } else {
                 // emptyDir (and other unhandled types): per-pod scratch dir.
                 let dir = pod_volume_dir(&self.state_root, uid, "empty-dir", &name);
                 let _ = std::fs::create_dir_all(&dir);
                 dir
             };
-            map.insert(name, host_path);
+            map.insert(name, ResolvedVolume { path: host_path, fstype: None });
         }
         map
+    }
+
+    /// Turn a PersistentVolumeClaim into a block device on this node.
+    ///
+    /// **Redundancy is not decided here.** stormblock and stormdrive are the
+    /// redundancy controller: stormdrive knows the drives and their failure
+    /// domains, stormblock places a volume's legs across them. The kubelet asks
+    /// for a volume of a size and is told a device; how many copies it has and
+    /// which drives they are on is not the kubelet's business and must not
+    /// become it — a scheduler or a node agent that starts making placement
+    /// decisions is how two components end up disagreeing about where data is.
+    ///
+    /// The volume name is derived from the namespace and claim, and creation is
+    /// name-idempotent, so a restarted pod is reunited with its data rather than
+    /// given a fresh volume. That is the whole difference between a claim and a
+    /// scratch directory, and it is why the name cannot include the pod UID.
+    async fn provision_claim(&self, namespace: &str, claim: &str) -> Result<String, String> {
+        let name = crate::storage::volume_name(namespace, claim);
+
+        // What the claim asked for, rounded up to a size class.
+        let pvc: Value = self
+            .api_get(&format!(
+                "/api/v1/namespaces/{namespace}/persistentvolumeclaims/{claim}"
+            ))
+            .await
+            .ok_or_else(|| format!("claim {claim} not found"))?;
+        let want = crate::storage::claim_bytes(&pvc);
+        let (class, bytes) = crate::storage::class_for(want).ok_or_else(|| {
+            format!(
+                "claim asks for {want} bytes, larger than the largest size class — refused \
+                 rather than rounded down"
+            )
+        })?;
+
+        // Create, or find the one already there. Cloned from the blank
+        // filesystem for this class, so no mkfs happens on this path.
+        let body = serde_json::json!({
+            "name": name,
+            "size_bytes": bytes,
+            "source": { "volume": crate::storage::template_name(class) },
+        });
+        let created: Value = self
+            .storage_post("/v1/volumes", &body)
+            .await
+            .ok_or_else(|| format!("stormblock would not create volume {name}"))?;
+        let id = created["id"]
+            .as_str()
+            .ok_or_else(|| format!("stormblock returned no id for {name}: {created}"))?
+            .to_string();
+
+        // Attach it here. The local fast path answers with a ublk device on
+        // this node; anything else means the volume is not local, and mounting
+        // a remote namespace is a separate piece of work rather than something
+        // to improvise here.
+        let attach = serde_json::json!({ "node": self.node_name });
+        let info: Value = self
+            .storage_post(&format!("/v1/volumes/{id}/attach"), &attach)
+            .await
+            .ok_or_else(|| format!("stormblock would not attach {name}"))?;
+
+        if let Some(dev) = info["device_hint"].as_str() {
+            info!("PVC {namespace}/{claim} -> volume {name} ({class}) at {dev}");
+            return Ok(dev.to_string());
+        }
+        Err(format!(
+            "volume {name} did not attach locally: {info} — an NVMe-oF attach needs a \
+             connect this node does not do yet"
+        ))
     }
 
     /// Materialize a projected volume's sources into `dir`: serviceAccountToken
@@ -436,6 +586,7 @@ impl PodManager {
             readonly: true,
             propagation: MountPropagation::Private,
             selinux_relabel: true, // kubelet-materialized — must relabel for SELinux
+            fstype: None,          // a directory to bind, not a device
         })
     }
 
@@ -1670,14 +1821,15 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
 
 /// Resolve a container's `volumeMounts` to CRI mounts using the pod's resolved
 /// volumes. Mounts whose volume didn't resolve are dropped.
-fn resolve_mounts(spec: &Value, volumes: &HashMap<String, String>) -> Vec<Mount> {
+fn resolve_mounts(spec: &Value, volumes: &HashMap<String, ResolvedVolume>) -> Vec<Mount> {
     spec["volumeMounts"]
         .as_array()
         .map(|a| {
             a.iter()
                 .filter_map(|m| {
                     let vol_name = m["name"].as_str().unwrap_or("");
-                    let host_path = volumes.get(vol_name)?.clone();
+                    let resolved = volumes.get(vol_name)?;
+                    let host_path = resolved.path.clone();
                     // Relabel kubelet-materialized volumes (configMap/secret/
                     // projected/emptyDir live under .../volumes/kubernetes.io~*)
                     // so the container can read them under enforcing SELinux;
@@ -1693,6 +1845,7 @@ fn resolve_mounts(spec: &Value, volumes: &HashMap<String, String>) -> Vec<Mount>
                             _ => MountPropagation::Private,
                         },
                         selinux_relabel,
+                        fstype: resolved.fstype.clone(),
                     })
                 })
                 .collect()

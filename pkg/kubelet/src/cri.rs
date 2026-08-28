@@ -171,6 +171,14 @@ pub struct Mount {
     /// container is denied access even when DAC perms allow. Never set for
     /// hostPath — relabeling host system paths (e.g. /sys, /proc) is harmful.
     pub selinux_relabel: bool,
+    /// A filesystem to mount, when `host_path` names a **block device** rather
+    /// than a directory to bind.
+    ///
+    /// `None` is every mount that existed before block-backed claims: bind the
+    /// directory. `Some("ext4")` is a PersistentVolumeClaim, whose backing is a
+    /// device the runtime mounts inside the container — which is what keeps the
+    /// mount out of the host's namespace and away from mount propagation.
+    pub fstype: Option<String>,
 }
 
 /// Container resource-usage stats (subset of CRI ContainerStats).
