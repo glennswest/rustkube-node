@@ -235,10 +235,14 @@ async fn main() -> anyhow::Result<()> {
                 Ok(rt) => {
                     tracing::info!("kubelet using stormpump runtime (ring at {socket})");
                     let rt = Arc::new(rt);
+                    // The ring goes to the image service too: a pull ends in
+                    // a mount, and only the engine can make one the rest of
+                    // the node can see.
                     let img = Arc::new(
                         kubelet::stormpump_runtime::StormpumpImages::new(
                             cli.registry.clone(),
-                        ),
+                        )
+                        .with_engine(rt.ring(), node_name.clone()),
                     );
                     let mig = Arc::new(NativeRuntime::new())
                         as Arc<dyn kubelet::cri::MigrationService>;

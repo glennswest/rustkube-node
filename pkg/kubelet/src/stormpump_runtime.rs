@@ -159,6 +159,12 @@ impl StormpumpRuntime {
     /// Attach to stormpump. Fails if the engine is not there, because a
     /// kubelet that starts without its runtime and discovers it pod by pod
     /// reports a dozen unrelated failures for one cause.
+    /// The ring, for the image service — which needs the engine for the one
+    /// thing only the engine can do: mount a volume in the node's namespace.
+    pub fn ring(&self) -> Option<Arc<RingClient>> {
+        self.ring.clone()
+    }
+
     pub fn connect(socket: impl Into<String>) -> Result<StormpumpRuntime, RingError> {
         let socket = socket.into();
         let ring = Arc::new(RingClient::attach(&socket)?);
