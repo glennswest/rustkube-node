@@ -781,7 +781,7 @@ impl PodManager {
         pod: &Value,
         sandbox_id: &str,
         sandbox_config: &PodSandboxConfig,
-        volumes: &HashMap<String, String>,
+        volumes: &HashMap<String, ResolvedVolume>,
         pod_ip: Option<&str>,
         sa_mount: &Option<Mount>,
     ) -> Result<(), CriError> {
