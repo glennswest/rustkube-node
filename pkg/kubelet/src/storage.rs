@@ -35,14 +35,17 @@ use serde_json::Value;
 /// Classes rather than exact sizes, so a claim for 100 MiB uses the 256 MiB
 /// template instead of minting a new one — minting per claim would put an
 /// `mkfs` back on the pod-start path, which is the whole thing being avoided.
-/// Five classes covers three orders of magnitude; a claim larger than the
-/// biggest is refused rather than rounded down.
+/// A claim larger than the biggest is refused rather than rounded down.
+///
+/// This list must match the blanks the image actually ships, because a class
+/// with no blank is a claim that cannot be satisfied. The image carries
+/// 64M/256M/1G — a blank is carried twice, as the golden and the slab's clone
+/// of it, so larger classes belong on a node whose data drive is sized for
+/// them rather than in a 32 GB test image.
 pub const SIZE_CLASSES: &[(&str, u64)] = &[
     ("64M", 64 * 1024 * 1024),
     ("256M", 256 * 1024 * 1024),
     ("1G", 1024 * 1024 * 1024),
-    ("5G", 5 * 1024 * 1024 * 1024),
-    ("10G", 10 * 1024 * 1024 * 1024),
 ];
 
 /// The template name for a size class — the key a claim looks up and, on a
@@ -128,12 +131,13 @@ mod tests {
         assert_eq!(class_for(1).map(|c| c.0), Some("64M"));
         assert_eq!(class_for(64 * 1024 * 1024).map(|c| c.0), Some("64M"));
         assert_eq!(class_for(64 * 1024 * 1024 + 1).map(|c| c.0), Some("256M"));
-        assert_eq!(class_for(3 * 1024 * 1024 * 1024).map(|c| c.0), Some("5G"));
+        assert_eq!(class_for(1024 * 1024 * 1024).map(|c| c.0), Some("1G"));
     }
 
     #[test]
     fn a_claim_larger_than_the_largest_class_is_refused() {
         assert_eq!(class_for(100 * 1024 * 1024 * 1024), None);
+        assert_eq!(class_for(2 * 1024 * 1024 * 1024), None, "no blank ships for 2 GiB yet");
     }
 
     #[test]
