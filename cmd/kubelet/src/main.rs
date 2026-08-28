@@ -242,7 +242,7 @@ async fn main() -> anyhow::Result<()> {
                         kubelet::stormpump_runtime::StormpumpImages::new(
                             cli.registry.clone(),
                         )
-                        .with_engine(rt.ring(), node_name.clone()),
+                        .with_engine(rt.ring_client(), node_name.clone()),
                     );
                     let mig = Arc::new(NativeRuntime::new())
                         as Arc<dyn kubelet::cri::MigrationService>;

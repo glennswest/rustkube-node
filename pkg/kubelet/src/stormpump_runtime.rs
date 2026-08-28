@@ -161,7 +161,7 @@ impl StormpumpRuntime {
     /// reports a dozen unrelated failures for one cause.
     /// The ring, for the image service — which needs the engine for the one
     /// thing only the engine can do: mount a volume in the node's namespace.
-    pub fn ring(&self) -> Option<Arc<RingClient>> {
+    pub fn ring_client(&self) -> Option<Arc<RingClient>> {
         self.ring.clone()
     }
 
