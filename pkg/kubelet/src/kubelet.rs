@@ -677,7 +677,13 @@ impl Kubelet {
             }),
         ];
 
-        let all_ready = update.container_statuses.iter().all(|cs| cs.ready);
+        // A pod with no containers running is **not** Ready. `.all()` on an
+        // empty list is true, so a pod that failed before any container
+        // started reported Ready=True with no containers — which is how a
+        // Failed pod came back looking healthy to everything that reads
+        // conditions.
+        let all_ready = !update.container_statuses.is_empty()
+            && update.container_statuses.iter().all(|cs| cs.ready);
         conditions.push(serde_json::json!({
             "type": "ContainersReady",
             "status": if all_ready { "True" } else { "False" }
@@ -695,6 +701,19 @@ impl Kubelet {
             "startTime": &now
         });
 
+        // **Publish why.** The kubelet already knows: `start_pod` returns the
+        // error and it is carried here in `update.message` — and it was
+        // dropped on the floor, so a pod that would not start reported
+        // `phase: Failed` and nothing else. On a node with no shell that is
+        // unrecoverable; the reason exists and nobody can read it.
+        if !update.message.is_empty() {
+            status["message"] = serde_json::json!(&update.message);
+            status["reason"] = serde_json::json!(match update.phase.as_str() {
+                "Failed" => "StartFailed",
+                _ => "Kubelet",
+            });
+        }
+
         if let Some(ref ip) = update.pod_ip {
             status["podIP"] = serde_json::json!(ip);
             status["podIPs"] = serde_json::json!([{"ip": ip}]);
@@ -706,14 +725,21 @@ impl Kubelet {
             self.config.api_server_url, update.namespace, update.name
         );
 
-        if let Ok(resp) = self.api_client.get(&path).send().await {
-            if resp.status().is_success() {
-                if let Ok(mut pod) = resp.json::<Value>().await {
-                    pod["status"] = status;
-                    let _ = self.api_client.put(&path).json(&pod).send().await;
-                }
-            }
-        }
+        // Through the /status subresource, not a whole-object PUT. A PUT sends
+        // back a spec read a moment ago, so a status write races every spec
+        // change — the same defect that made a Deployment's scale-up lose to a
+        // ReplicaSet's status write.
+        let _ = self
+            .api_client
+            .put(format!("{path}/status"))
+            .json(&serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": { "name": &update.name, "namespace": &update.namespace },
+                "status": status
+            }))
+            .send()
+            .await;
 
         Ok(())
     }
