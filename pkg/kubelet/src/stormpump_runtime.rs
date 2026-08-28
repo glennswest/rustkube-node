@@ -338,6 +338,10 @@ fn spec_for(config: &ContainerConfig, sandbox: &PodSandboxConfig) -> stormpump::
             .map(|m| stormpump::spec::Mount {
                 dst: m.container_path.clone(),
                 readonly: m.readonly,
+                // A PersistentVolumeClaim resolves to a block device, and the
+                // container's own child mounts it — which is why a real volume
+                // needs no mount propagation and no host-side mount at all.
+                fstype: m.fstype.clone(),
             })
             .collect(),
         // hostNetwork is the node's namespace; anything else is the pod's,
