@@ -75,6 +75,68 @@ pub struct SyncOutcome {
 /// Manages pod lifecycle on a single node.
 /// A pod volume, resolved to something the runtime can mount.
 ///
+/// Make a `hostPath` source exist, if its declared type says the kubelet
+/// should.
+///
+/// **`FileOrCreate` was not handled at all**, and that is what stopped
+/// Cilium's agent: `/run/xtables.lock` is declared `FileOrCreate`, was never
+/// created, and the spawn failed with `No such file or directory (attaching
+/// mounts)` — an ENOENT naming no path, for a file the kubelet was supposed to
+/// have made.
+///
+/// The types, as Kubernetes defines them:
+///
+/// | type | meaning |
+/// |---|---|
+/// | `DirectoryOrCreate` | create the directory if absent |
+/// | `FileOrCreate` | create an empty file if absent (and its parent) |
+/// | `Directory`, `File`, `Socket`, `CharDevice`, `BlockDevice` | **must already exist** |
+/// | unset | no checks; the mount simply uses the path |
+///
+/// The "must already exist" types are deliberately not created: `Directory`
+/// means "I expect this to be here", and silently creating an empty one turns
+/// a misconfiguration into a container that starts and behaves strangely. What
+/// this does instead is say so, because the alternative is the ENOENT above.
+fn ensure_host_path(path: &str, typ: &str) {
+    match typ {
+        "DirectoryOrCreate" => {
+            if let Err(e) = std::fs::create_dir_all(path) {
+                warn!("hostPath {path}: could not create directory: {e}");
+            }
+        }
+        "FileOrCreate" => {
+            if std::path::Path::new(path).exists() {
+                return;
+            }
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    warn!("hostPath {path}: could not create parent directory: {e}");
+                    return;
+                }
+            }
+            // create_new so a race with another pod does not truncate a file
+            // something is already holding — xtables.lock is a lock file, and
+            // truncating one under its holder is worse than losing the race.
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => warn!("hostPath {path}: could not create file: {e}"),
+            }
+        }
+        "" => {}
+        // Must already exist. Say so rather than leaving the spawn to fail
+        // with an errno and no path.
+        other => {
+            if !std::path::Path::new(path).exists() {
+                warn!(
+                    "hostPath {path} has type {other}, which requires it to exist \
+                     already, and it does not — the container will fail to start"
+                );
+            }
+        }
+    }
+}
+
 /// `fstype` is `None` for everything that is a directory to bind — hostPath,
 /// configMap, secret, projected, emptyDir. A PersistentVolumeClaim resolves to
 /// a **block device** and carries the filesystem on it, because the runtime
@@ -324,10 +386,7 @@ impl PodManager {
                 None => continue,
             };
             let host_path = if let Some(hp) = vol["hostPath"]["path"].as_str() {
-                let typ = vol["hostPath"]["type"].as_str().unwrap_or("");
-                if matches!(typ, "DirectoryOrCreate" | "Directory" | "") {
-                    let _ = std::fs::create_dir_all(hp);
-                }
+                ensure_host_path(hp, vol["hostPath"]["type"].as_str().unwrap_or(""));
                 hp.to_string()
             } else if !vol["configMap"].is_null() {
                 let cm = vol["configMap"]["name"].as_str().unwrap_or("");
@@ -2999,5 +3058,42 @@ mod tests {
         assert!(outcome.updates.is_empty());
         assert!(outcome.removed.is_empty());
         assert_eq!(rt.live_sandbox_count(), 0);
+    }
+
+    /// FileOrCreate was not handled at all, and that is what stopped Cilium's
+    /// agent: /run/xtables.lock is declared FileOrCreate, was never created,
+    /// and the spawn failed with ENOENT attaching mounts.
+    #[test]
+    fn host_path_types_create_only_what_they_should() {
+        let root = std::env::temp_dir().join(format!("rk-hp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // DirectoryOrCreate makes the directory, parents included.
+        let d = root.join("a/b/c");
+        ensure_host_path(d.to_str().unwrap(), "DirectoryOrCreate");
+        assert!(d.is_dir(), "DirectoryOrCreate should create the directory");
+
+        // FileOrCreate makes an empty file and its parent.
+        let f = root.join("run/xtables.lock");
+        ensure_host_path(f.to_str().unwrap(), "FileOrCreate");
+        assert!(f.is_file(), "FileOrCreate should create the file");
+
+        // And does not truncate one that exists — it may be held.
+        std::fs::write(&f, b"held").unwrap();
+        ensure_host_path(f.to_str().unwrap(), "FileOrCreate");
+        assert_eq!(std::fs::read(&f).unwrap(), b"held", "must not truncate");
+
+        // Directory means "must already exist": nothing is created.
+        let must = root.join("absent");
+        ensure_host_path(must.to_str().unwrap(), "Directory");
+        assert!(!must.exists(), "Directory must not be created");
+
+        // An unset type performs no checks and creates nothing.
+        let none = root.join("untyped");
+        ensure_host_path(none.to_str().unwrap(), "");
+        assert!(!none.exists(), "an unset type creates nothing");
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
