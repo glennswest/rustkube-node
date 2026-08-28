@@ -155,14 +155,31 @@ async fn main() -> anyhow::Result<()> {
     // `No such file or directory` — an ENOENT that points at the container
     // image, the volume, or the log path, none of which are the cause. That
     // cost a day here.
+    // A runtime that does its own networking is exempt — **unless a CNI
+    // network is actually configured**, because then someone has installed a
+    // plugin and means it.
+    //
+    // The first version of this exempted by runtime alone, which is wrong the
+    // moment Cilium is the plan: Cilium *is* a CNI plugin, something has to
+    // invoke it, and a blanket exemption means nothing ever does. The runtime
+    // owning networking is the *default*, not a veto over a network config
+    // that exists on disk.
     let runtime_owns_networking = matches!(cli.runtime.as_str(), "cri" | "stormpump");
+    let cni_configured = cni::CniInvoker::new(
+        cli.cni_conf_dir.clone(),
+        vec![std::path::PathBuf::from(&cli.cni_bin_dir)],
+    )
+    .network_ready()
+    .is_ok();
     let cni_invoker = if cli.no_cni {
         tracing::warn!("CNI disabled (--no-cni) — pods will use host networking");
         None
-    } else if runtime_owns_networking {
+    } else if runtime_owns_networking && !cni_configured {
         tracing::info!(
-            "CNI not used: the {} runtime provides pod networking itself",
-            cli.runtime
+            "CNI not used: the {} runtime provides pod networking itself, and no network \
+             config is present in {}",
+            cli.runtime,
+            cli.cni_conf_dir
         );
         None
     } else {
