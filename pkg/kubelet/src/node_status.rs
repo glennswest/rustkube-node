@@ -7,6 +7,62 @@ use serde_json::{json, Value};
 use tracing::info;
 
 /// API client for node status reporting.
+/// Parse `key=value,key=value` into pairs, the way `--node-labels` is spelled.
+///
+/// An entry with no `=` is skipped rather than treated as an empty value: a
+/// label with an empty value is a legitimate thing to want, and silently
+/// creating one from a typo is worse than ignoring the typo.
+pub fn parse_key_values(spec: &str) -> Vec<(String, String)> {
+    spec.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| p.split_once('='))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect()
+}
+
+/// Parse `--register-with-taints`: `key=value:Effect` or `key:Effect`.
+///
+/// A taint with no value is normal — `node.cilium.io/agent-not-ready:NoSchedule`
+/// carries meaning in the key alone — so the value half is optional and the
+/// effect is not.
+///
+/// An unparseable entry is **dropped with the reason logged**, not defaulted.
+/// A taint that silently becomes something else is worse than no taint: the
+/// point of registering tainted is to keep workloads off, and a wrong effect
+/// (`NoSchedule` where `NoExecute` was meant) fails in the direction of
+/// running things that should not run.
+pub fn parse_taints(spec: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let Some((lhs, effect)) = part.rsplit_once(':') else {
+            tracing::warn!("ignoring taint {part:?}: no :Effect");
+            continue;
+        };
+        if !matches!(effect, "NoSchedule" | "PreferNoSchedule" | "NoExecute") {
+            tracing::warn!(
+                "ignoring taint {part:?}: {effect:?} is not NoSchedule, \
+                 PreferNoSchedule or NoExecute"
+            );
+            continue;
+        }
+        let (key, value) = match lhs.split_once('=') {
+            Some((k, v)) => (k, Some(v)),
+            None => (lhs, None),
+        };
+        if key.is_empty() {
+            tracing::warn!("ignoring taint {part:?}: empty key");
+            continue;
+        }
+        let mut t = json!({ "key": key, "effect": effect });
+        if let Some(v) = value {
+            t["value"] = Value::String(v.to_string());
+        }
+        out.push(t);
+    }
+    out
+}
+
 pub struct NodeReporter {
     api_url: String,
     node_name: String,
@@ -16,6 +72,24 @@ pub struct NodeReporter {
     runtime_version: String,
     /// Kubelet server port, reported in daemonEndpoints.kubeletEndpoint.
     kubelet_port: u16,
+    /// Extra labels applied at registration (`--node-labels`).
+    labels: Vec<(String, String)>,
+    /// Annotations applied at registration (`--node-annotations`).
+    annotations: Vec<(String, String)>,
+    /// Taints applied at registration (`--register-with-taints`).
+    ///
+    /// **This is how a node keeps workloads off itself until it can carry
+    /// them.** A node with no pod network is Ready by every measure the
+    /// kubelet can take — the runtime answers, the disk is fine — and pods
+    /// scheduled onto it get no address. Registering tainted inverts that: the
+    /// node is unusable until something removes the taint, and the component
+    /// that removes it is the one that made the node usable. Cilium is built
+    /// around exactly this (`node.cilium.io/agent-not-ready`).
+    ///
+    /// Applied **only at creation**. A taint removed by an operator or by
+    /// Cilium must not come back on the next kubelet restart, or the node
+    /// oscillates and nothing can ever be scheduled.
+    taints: Vec<Value>,
     client: reqwest::Client,
 }
 
@@ -44,6 +118,19 @@ impl NodeReporter {
     }
 
     /// Set the kubelet server port reported in daemonEndpoints.
+    /// Labels, annotations and taints to register with.
+    pub fn with_registration(
+        mut self,
+        labels: Vec<(String, String)>,
+        annotations: Vec<(String, String)>,
+        taints: Vec<Value>,
+    ) -> Self {
+        self.labels = labels;
+        self.annotations = annotations;
+        self.taints = taints;
+        self
+    }
+
     pub fn with_kubelet_port(mut self, port: u16) -> Self {
         self.kubelet_port = port;
         self
@@ -57,23 +144,38 @@ impl NodeReporter {
 
     /// The Node object metadata (name + labels) reported to the API server.
     fn node_metadata(&self) -> Value {
-        json!({
-            "name": &self.node_name,
-            "labels": {
-                "kubernetes.io/hostname": &self.node_name,
-                "kubernetes.io/os": go_os(),
-                "kubernetes.io/arch": go_arch(),
-                "node.kubernetes.io/instance-type": "rustkube"
+        let mut labels = json!({
+            "kubernetes.io/hostname": &self.node_name,
+            "kubernetes.io/os": go_os(),
+            "kubernetes.io/arch": go_arch(),
+            "node.kubernetes.io/instance-type": "rustkube"
+        });
+        if let Some(m) = labels.as_object_mut() {
+            for (k, v) in &self.labels {
+                m.insert(k.clone(), Value::String(v.clone()));
             }
-        })
+        }
+        let mut meta = json!({ "name": &self.node_name, "labels": labels });
+        if !self.annotations.is_empty() {
+            let mut ann = serde_json::Map::new();
+            for (k, v) in &self.annotations {
+                ann.insert(k.clone(), Value::String(v.clone()));
+            }
+            meta["annotations"] = Value::Object(ann);
+        }
+        meta
     }
 
     /// The Node spec (podCIDR/podCIDRs when configured).
     fn node_spec(&self) -> Value {
-        match &self.pod_cidr {
+        let mut spec = match &self.pod_cidr {
             Some(cidr) => json!({ "podCIDR": cidr, "podCIDRs": [cidr] }),
             None => json!({}),
+        };
+        if !self.taints.is_empty() {
+            spec["taints"] = Value::Array(self.taints.clone());
         }
+        spec
     }
 
     /// Register this node with the API server. Creates the Node via POST; if it
@@ -560,5 +662,70 @@ mod tests {
         let merged = merge_owned_conditions(&[], false, false, false, "t1");
         assert_eq!(types(&merged).len(), 4);
         assert_eq!(cond(&merged, "Ready")["lastTransitionTime"], "t1");
+    }
+
+    #[test]
+    fn labels_parse_and_a_typo_is_skipped_not_invented() {
+        assert_eq!(
+            parse_key_values("a=1,b=2"),
+            vec![("a".into(), "1".into()), ("b".into(), "2".into())]
+        );
+        // No `=`: skipped, rather than becoming a label with an empty value.
+        assert_eq!(parse_key_values("oops"), Vec::<(String, String)>::new());
+        assert_eq!(parse_key_values(""), Vec::<(String, String)>::new());
+        // An intentionally empty value is kept.
+        assert_eq!(parse_key_values("k="), vec![("k".into(), String::new())]);
+    }
+
+    #[test]
+    fn taints_parse_with_and_without_a_value() {
+        let t = parse_taints("node.cilium.io/agent-not-ready:NoSchedule");
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0]["key"], "node.cilium.io/agent-not-ready");
+        assert_eq!(t[0]["effect"], "NoSchedule");
+        assert!(t[0].get("value").is_none(), "no value must mean no value key");
+
+        let t = parse_taints("dedicated=gpu:NoExecute,other:PreferNoSchedule");
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0]["value"], "gpu");
+        assert_eq!(t[1]["effect"], "PreferNoSchedule");
+    }
+
+    /// A malformed taint is dropped, never defaulted. Registering tainted
+    /// exists to keep workloads off; a wrong effect fails toward running
+    /// things that should not run.
+    #[test]
+    fn a_malformed_taint_is_dropped_not_defaulted() {
+        assert!(parse_taints("noeffect").is_empty());
+        assert!(parse_taints("key:Nonsense").is_empty());
+        assert!(parse_taints(":NoSchedule").is_empty());
+        // The good one in a list still survives.
+        assert_eq!(parse_taints("bad,good:NoSchedule").len(), 1);
+    }
+
+    #[test]
+    fn registration_metadata_carries_labels_annotations_and_taints() {
+        let r = NodeReporter::new("http://x", "n1").with_registration(
+            vec![("tier".into(), "edge".into())],
+            vec![("storm.io/rack".into(), "r7".into())],
+            parse_taints("node.cilium.io/agent-not-ready:NoSchedule"),
+        );
+        let meta = r.node_metadata();
+        assert_eq!(meta["labels"]["tier"], "edge");
+        // The built-ins are still there.
+        assert_eq!(meta["labels"]["kubernetes.io/hostname"], "n1");
+        assert_eq!(meta["annotations"]["storm.io/rack"], "r7");
+        let spec = r.node_spec();
+        assert_eq!(spec["taints"][0]["key"], "node.cilium.io/agent-not-ready");
+    }
+
+    /// No registration options means no empty annotations map and no taints
+    /// key — an empty `taints: []` on a Node is not the same as absent to
+    /// every controller that reads it.
+    #[test]
+    fn no_options_means_no_keys() {
+        let r = NodeReporter::new("http://x", "n1");
+        assert!(r.node_metadata().get("annotations").is_none());
+        assert!(r.node_spec().get("taints").is_none());
     }
 }

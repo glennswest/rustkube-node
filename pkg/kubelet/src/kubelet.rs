@@ -17,6 +17,14 @@ pub struct KubeletConfig {
     pub api_server_url: String,
     /// Pod CIDR for this node, written to `spec.podCIDR` when set.
     pub pod_cidr: Option<String>,
+    /// Extra node labels applied at registration (`--node-labels`).
+    pub node_labels: Vec<(String, String)>,
+    /// Node annotations applied at registration (`--node-annotations`).
+    pub node_annotations: Vec<(String, String)>,
+    /// Taints applied at registration (`--register-with-taints`), and **only**
+    /// at registration: a taint removed by an operator or by the component
+    /// that made the node usable must not come back on the next restart.
+    pub register_with_taints: Vec<serde_json::Value>,
     pub heartbeat_interval: Duration,
     pub sync_interval: Duration,
     /// Port for the kubelet's inbound HTTP server (upstream 10250).
@@ -167,10 +175,18 @@ impl Kubelet {
             let rv = runtime_version.clone();
             let port = self.config.kubelet_port;
             let client = self.api_client.clone();
+            let labels = self.config.node_labels.clone();
+            let annotations = self.config.node_annotations.clone();
+            let taints = self.config.register_with_taints.clone();
             tokio::spawn(async move {
                 let reporter = NodeReporter::with_pod_cidr(&url, &node_name, pod_cidr)
                     .with_runtime_version(rv)
                     .with_kubelet_port(port)
+                    // Registration only. The heartbeat reporter below is
+                    // deliberately built without these: it writes status
+                    // through the /status subresource, and re-asserting taints
+                    // every few seconds would undo every removal.
+                    .with_registration(labels, annotations, taints)
                     .with_client(client);
                 let mut backoff = Duration::from_secs(1);
                 loop {

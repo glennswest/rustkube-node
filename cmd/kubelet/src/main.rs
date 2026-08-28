@@ -28,6 +28,27 @@ struct Cli {
     #[arg(long, env = "POD_CIDR")]
     pod_cidr: Option<String>,
 
+    /// Extra labels to register this node with: `key=value,key=value`.
+    #[arg(long = "node-labels", env = "NODE_LABELS", default_value = "")]
+    node_labels: String,
+
+    /// Annotations to register this node with: `key=value,key=value`.
+    ///
+    /// Not an upstream kubelet flag. It is here because a node's placement
+    /// facts — rack, shelf, failure domain — have to reach the API from
+    /// somewhere, and the node is the only thing that knows them at boot.
+    #[arg(long = "node-annotations", env = "NODE_ANNOTATIONS", default_value = "")]
+    node_annotations: String,
+
+    /// Taints to register this node with: `key=value:Effect` or `key:Effect`.
+    ///
+    /// Applied only when the Node object is created. This is how a node keeps
+    /// workloads off itself until something makes it usable — a node with no
+    /// pod network is Ready by every measure the kubelet can take, and pods
+    /// scheduled onto it get no address.
+    #[arg(long = "register-with-taints", env = "REGISTER_WITH_TAINTS", default_value = "")]
+    register_with_taints: String,
+
     /// Static-pod manifest directory. Pods here run locally (no apiserver) —
     /// how the control plane bootstraps. Empty string disables static pods.
     #[arg(long, env = "POD_MANIFEST_PATH", default_value = "/etc/kubernetes/manifests")]
@@ -346,6 +367,9 @@ async fn main() -> anyhow::Result<()> {
         node_name,
         api_server_url,
         pod_cidr: cli.pod_cidr,
+        node_labels: kubelet::node_status::parse_key_values(&cli.node_labels),
+        node_annotations: kubelet::node_status::parse_key_values(&cli.node_annotations),
+        register_with_taints: kubelet::node_status::parse_taints(&cli.register_with_taints),
         pod_manifest_path: if cli.pod_manifest_path.is_empty() {
             None
         } else {
