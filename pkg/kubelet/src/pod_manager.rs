@@ -443,10 +443,22 @@ impl PodManager {
                 // stamps the clone with its own filesystem UUID — two live
                 // filesystems must never claim one identity (stormblock#76).
                 let blank = crate::storage::template_name(class);
-                let src = self
-                    .storage_volume_id(&blank)
+                let (src, sealed) = self
+                    .storage_volume(&blank)
                     .await
                     .ok_or_else(|| format!("no blank volume {blank} on this node"))?;
+
+                // A clone descends from a *sealed* volume, and the blanks
+                // arrive sealed as golden images — which is a different thing
+                // from stormblock's seal state. Sealing here is idempotent and
+                // self-healing; it belongs in the image build, and doing it
+                // here means a node with an older image still works.
+                if !sealed {
+                    info!("sealing blank {blank} so claims can be cloned from it");
+                    self.storage_post(&format!("/api/v1/volumes/{src}/seal"), &serde_json::json!({}))
+                        .await
+                        .ok_or_else(|| format!("could not seal blank {blank}"))?;
+                }
                 let body = serde_json::json!({ "name": name, "verify": true });
                 let created: Value = self
                     .storage_post(&format!("/api/v1/volumes/{src}/clone"), &body)
@@ -477,13 +489,17 @@ impl PodManager {
 
     /// A volume's id by name, or `None` when this node has no such volume.
     async fn storage_volume_id(&self, name: &str) -> Option<String> {
+        self.storage_volume(name).await.map(|(id, _)| id)
+    }
+
+    /// A volume's id and whether it is sealed.
+    async fn storage_volume(&self, name: &str) -> Option<(String, bool)> {
         let list: Value = self.storage_get("/api/v1/volumes").await?;
-        list["items"]
+        let v = list["items"]
             .as_array()?
             .iter()
-            .find(|v| v["name"].as_str() == Some(name))
-            .and_then(|v| v["id"].as_str())
-            .map(str::to_string)
+            .find(|v| v["name"].as_str() == Some(name))?;
+        Some((v["id"].as_str()?.to_string(), v["sealed"].as_bool().unwrap_or(false)))
     }
 
     /// GET from stormblock's management API on this node.
