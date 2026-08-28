@@ -4,6 +4,7 @@
 //! manages pod state machines, health probes, volumes, image pulls,
 //! and reports node status via Lease heartbeats.
 
+pub mod storage;
 pub mod stormpump_ring;
 pub mod stormpump_runtime;
 pub mod checkpoint;
