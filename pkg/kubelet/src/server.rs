@@ -537,9 +537,22 @@ struct LogOptions {
 
 /// Apply the CRI log-format options to a file's contents.
 ///
-/// The runtime writes CRI format: `<rfc3339nano> <stdout|stderr> <F|P> <line>`.
-/// `kubectl logs` shows only the message unless `timestamps` is set, so the
-/// prefix is stripped here rather than left for the client to be surprised by.
+/// The CRI format is `<rfc3339nano> <stdout|stderr> <F|P> <line>`, and where a
+/// runtime writes it this strips the prefix unless `timestamps` was asked for.
+///
+/// **stormpump does not write it.** The engine gives the container a descriptor
+/// pointing straight at the log file and never sees a log byte — that is what
+/// makes logging zero-copy, and it is deliberate. The consequence is that a
+/// stormpump container's log has no per-line metadata, so `timestamps`,
+/// `sinceSeconds` and `sinceTime` have nothing to work from and are inert.
+/// `tailLines` is line-based and works regardless.
+///
+/// Lines are passed through rather than dropped when they are not CRI format:
+/// a log the reader cannot see is worse than one without a timestamp. The
+/// alternative — refusing `--timestamps` outright — would break the common
+/// invocation to signal something the caller cannot act on anyway. If per-line
+/// timestamps become worth having, they cost the zero-copy property, and that
+/// is the trade to weigh rather than a bug to fix.
 fn filter_log(body: &str, opts: &LogOptions) -> String {
     let cutoff: Option<chrono::DateTime<chrono::Utc>> = opts
         .since_time
