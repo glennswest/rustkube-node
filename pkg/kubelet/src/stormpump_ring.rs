@@ -78,7 +78,16 @@ impl std::fmt::Display for RingError {
                 // The step is named, not numbered. `errno 2 at step 4` and
                 // `ENOENT attaching mounts` are the same fact, and only one of
                 // them tells you which mount to go and look at.
-                let where_ = stormpump_abi::ExecStep::from_u32(*step).name();
+                //
+                // SpecDefine's number is a *spec error*, not an exec step:
+                // nothing has forked yet, so the taxonomy is what was wrong
+                // with the spec. Reading it as a step printed a plausible and
+                // entirely unrelated stage name, which is worse than a number.
+                let where_ = if *op == Op::SpecDefine as u8 {
+                    stormpump::spec::SpecError::name_of(*step)
+                } else {
+                    stormpump_abi::ExecStep::from_u32(*step).name()
+                };
                 let why = std::io::Error::from_raw_os_error(*errno);
                 write!(f, "stormpump refused {name}: {why} ({where_})")
             }
