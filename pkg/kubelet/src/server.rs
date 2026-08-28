@@ -52,10 +52,12 @@ pub fn router(pod_manager: Arc<PodManager>) -> Router {
         .route("/stats/summary", get(stats_summary))
         .route("/pods", get(pods))
         // What `kubectl logs` reads, by way of the apiserver proxy.
-        .route(
-            "/containerLogs/{namespace}/{pod}/{container}",
-            get(container_logs),
-        )
+        // `:param`, not `{param}` — this crate is on axum 0.7, where braces are
+        // a *literal* segment. Written the 0.8 way the route matched nothing
+        // and axum answered its own empty 404, which reads as "no such pod"
+        // rather than "no such route". The apiserver is on 0.8 and its routes
+        // use braces, so the two spellings coexist and neither is a typo.
+        .route("/containerLogs/:namespace/:pod/:container", get(container_logs))
         .with_state(pod_manager)
 }
 
