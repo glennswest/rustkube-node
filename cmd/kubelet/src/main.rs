@@ -141,11 +141,29 @@ async fn main() -> anyhow::Result<()> {
         cli.apiserver
     );
 
-    // Standard CNI for the native/VM-fallback runtimes (with --runtime=cri
-    // the external runtime invokes CNI itself). Cilium is the expected
+    // Standard CNI for the native/VM-fallback runtimes. Cilium is the expected
     // default plugin; anything spec-compliant in the conf dir works.
+    //
+    // Runtimes that do their own networking are exempt, and that exemption has
+    // to be real rather than a comment. `cri` hands the job to the external
+    // runtime; `stormpump` does it in the engine, which owns the network
+    // namespace and attaches each workload by profile (routed, private,
+    // macvlan, host, isolated) with no plugin involved.
+    //
+    // Without this the kubelet gates sandbox creation on a CNI config it will
+    // never use, and an empty /etc/cni/net.d makes every pod fail as
+    // `No such file or directory` — an ENOENT that points at the container
+    // image, the volume, or the log path, none of which are the cause. That
+    // cost a day here.
+    let runtime_owns_networking = matches!(cli.runtime.as_str(), "cri" | "stormpump");
     let cni_invoker = if cli.no_cni {
         tracing::warn!("CNI disabled (--no-cni) — pods will use host networking");
+        None
+    } else if runtime_owns_networking {
+        tracing::info!(
+            "CNI not used: the {} runtime provides pod networking itself",
+            cli.runtime
+        );
         None
     } else {
         let invoker = cni::CniInvoker::new(
