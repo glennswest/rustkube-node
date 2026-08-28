@@ -611,8 +611,14 @@ impl RuntimeService for StormpumpRuntime {
                 for src in &mount_sources {
                     mounts.push(r.volume_register(src)?);
                 }
+                // The mount *sources* by name, not only their count. A start
+                // that fails at the mount step is otherwise a step with no
+                // subject: "attaching mounts, ENOENT" does not say which of
+                // them, and the destinations are inside the spec where this
+                // log cannot see them.
                 tracing::debug!(
                     ?spec, ?root, ?logs, ?sandbox, path = %path, logs_dir = %log_dir,
+                    mounts = %mount_sources.join(","),
                     "stormpump: spawning"
                 );
                 r.spawn(spec, root, logs, sandbox, &mounts, Domain::Container as u8)
