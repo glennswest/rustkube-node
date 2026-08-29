@@ -662,9 +662,31 @@ impl RuntimeService for StormpumpRuntime {
                     mounts = %mount_sources.join(","),
                     "stormpump: spawning"
                 );
+                // **Name the mount, here.** The engine reports which one
+                // failed as an index — it is the only side that can, doing the
+                // mount in the host's namespace while this process runs in a
+                // container — and the index only means something where the
+                // list that was sent still exists, which is inside this
+                // closure.
                 r.spawn(spec, root, logs, sandbox, &mounts, Domain::Container as u8)
+                    .map_err(|e| {
+                        let named = match &e {
+                            RingError::Failed { step, .. } => {
+                                crate::stormpump_ring::failed_mount_index(*step)
+                                    .and_then(|i| mount_sources.get(i).map(|s| (i, s.clone())))
+                            }
+                            _ => None,
+                        };
+                        match named {
+                            Some((i, src)) => {
+                                RingError::Detail(format!("{e}: mount {i} is {src}"))
+                            }
+                            None => e,
+                        }
+                    })
             })
             .await?;
+
 
         let mut containers = self.containers.lock().await;
         let c = containers

@@ -47,6 +47,10 @@ struct Request {
 
 #[derive(Debug)]
 pub enum RingError {
+    /// A failure that has already been described, with detail the caller had
+    /// and this crate does not — which mount, which path. Carried rather than
+    /// re-derived, because the context exists at exactly one place.
+    Detail(String),
     /// The engine is not there, or would not complete the handshake.
     Attach(String),
     /// The submission queue was full and stayed full.
@@ -93,6 +97,7 @@ impl std::fmt::Display for RingError {
                 let why = std::io::Error::from_raw_os_error(*errno);
                 write!(f, "stormpump refused {name}: {why} ({where_})")
             }
+            RingError::Detail(msg) => write!(f, "{msg}"),
             RingError::Gone => write!(f, "the connection to stormpump is gone"),
         }
     }
