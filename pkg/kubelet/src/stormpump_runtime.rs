@@ -138,6 +138,10 @@ struct Sandbox {
     config: PodSandboxConfig,
     state: PodSandboxState,
     created_at: i64,
+    /// `/proc/<holder>/ns/net`, the only name a CNI plugin understands.
+    netns: Option<String>,
+    /// What the CNI gave this pod, empty when none ran.
+    ip: String,
 }
 
 /// The kubelet's view of stormpump.
@@ -148,6 +152,13 @@ pub struct StormpumpRuntime {
     /// its bookkeeping can be tested, and every operation that needs the engine
     /// says so rather than pretending.
     ring: Option<Arc<RingClient>>,
+    /// The CNI, when one is installed.
+    ///
+    /// Held rather than resolved once at startup: Cilium writes its conflist
+    /// only after its agent is up, which is minutes after the kubelet decided
+    /// anything. `CniInvoker` reloads the config on every call for exactly
+    /// this reason, so the question "is there a network" is asked per pod.
+    cni: Option<cni::CniInvoker>,
     sandboxes: Mutex<HashMap<String, Sandbox>>,
     containers: Mutex<HashMap<String, Container>>,
     /// Monotonic, so two containers created in the same millisecond do not
@@ -172,16 +183,28 @@ impl StormpumpRuntime {
         Ok(StormpumpRuntime {
             socket,
             ring: Some(ring),
+            cni: None,
             sandboxes: Mutex::new(HashMap::new()),
             containers: Mutex::new(HashMap::new()),
             next_id: std::sync::atomic::AtomicU64::new(1),
         })
     }
 
+    /// Give this runtime a CNI to call.
+    ///
+    /// Optional because a node with no pod network is a real configuration —
+    /// containers then share loopback with the rest of their pod and reach
+    /// nothing else, which is what a pod on a network-less node honestly is.
+    pub fn with_cni(mut self, invoker: Option<cni::CniInvoker>) -> Self {
+        self.cni = invoker;
+        self
+    }
+
     pub fn new(socket: impl Into<String>) -> StormpumpRuntime {
         StormpumpRuntime {
             socket: socket.into(),
             ring: None,
+            cni: None,
             sandboxes: Mutex::new(HashMap::new()),
             containers: Mutex::new(HashMap::new()),
             next_id: std::sync::atomic::AtomicU64::new(1),
@@ -447,11 +470,65 @@ impl RuntimeService for StormpumpRuntime {
         // is installed, and until then its containers share loopback with each
         // other and reach nothing outside, which is what a pod on a node with
         // no pod network honestly is.
-        let handle = if config.host_network {
-            None
+        let (handle, netns) = if config.host_network {
+            (None, None)
         } else {
-            Some(self.on_ring(|r| r.sandbox_acquire(PROFILE_ISOLATED)).await?)
+            let (h, pid) = self.on_ring(|r| r.sandbox_acquire(PROFILE_ISOLATED)).await?;
+            // A pid of 0 means the engine reported no holder; `/proc/0/ns/net`
+            // is not a path and handing it to a plugin would fail a long way
+            // from here.
+            let netns = (pid > 0).then(|| format!("/proc/{pid}/ns/net"));
+            (Some(h), netns)
         };
+
+        // Pod networking.
+        //
+        // **Nothing invoked a CNI here before**, so an isolated namespace was
+        // created and then left empty: pods ran, reported no address, and had
+        // no interface but loopback. Cilium was running and healthy the whole
+        // time, because a plugin does nothing until something execs it.
+        //
+        // Asked per pod rather than at startup — the config appears when the
+        // agent that writes it comes up, which is after the kubelet decided
+        // anything it decided once.
+        let mut ip = String::new();
+        if let (Some(invoker), Some(ns)) = (&self.cni, &netns) {
+            match invoker.network_ready() {
+                Ok(_) => {
+                    let pod = cni::PodNetwork::new(
+                        &id,
+                        ns,
+                        &config.namespace,
+                        &config.name,
+                        &config.uid,
+                    );
+                    match invoker.add(&pod).await {
+                        Ok(result) => {
+                            ip = result
+                                .ips
+                                .first()
+                                .map(|i| i.address.split('/').next().unwrap_or("").to_string())
+                                .unwrap_or_default();
+                            tracing::info!(
+                                sandbox = %id, pod = %config.name, %ip,
+                                "CNI attached the pod network"
+                            );
+                        }
+                        // A pod with no network is worth reporting and is not
+                        // worth refusing to start: the containers still run,
+                        // and the address staying empty is what says so.
+                        Err(e) => tracing::warn!(
+                            sandbox = %id, pod = %config.name,
+                            "CNI ADD failed, pod has no network: {e}"
+                        ),
+                    }
+                }
+                Err(e) => tracing::debug!(
+                    sandbox = %id,
+                    "no CNI network configured yet ({e}); pod gets loopback only"
+                ),
+            }
+        }
 
         let sb = Sandbox {
             id: id.clone(),
@@ -459,6 +536,8 @@ impl RuntimeService for StormpumpRuntime {
             config: config.clone(),
             state: PodSandboxState::Ready,
             created_at: now_nanos(),
+            netns,
+            ip,
         };
         self.sandboxes.lock().await.insert(id.clone(), sb);
         tracing::info!(
@@ -478,12 +557,31 @@ impl RuntimeService for StormpumpRuntime {
     }
 
     async fn remove_pod_sandbox(&self, sandbox_id: &str) -> Result<(), CriError> {
-        let handle = self
-            .sandboxes
-            .lock()
-            .await
-            .remove(sandbox_id)
-            .and_then(|sb| sb.handle);
+        let removed = self.sandboxes.lock().await.remove(sandbox_id);
+
+        // Hand the address back before the namespace goes.
+        //
+        // CNI DEL is what returns the IP to the pool and tears down the host
+        // end of the veth. Skipping it leaks an address per pod — invisible
+        // until a node has churned through its /24 and pods stop getting
+        // addresses for no apparent reason. It must also happen while the
+        // holder is still alive, since the plugin is given its namespace path.
+        if let Some(sb) = &removed {
+            if let (Some(invoker), Some(ns)) = (&self.cni, &sb.netns) {
+                let pod = cni::PodNetwork::new(
+                    sandbox_id,
+                    ns,
+                    &sb.config.namespace,
+                    &sb.config.name,
+                    &sb.config.uid,
+                );
+                if let Err(e) = invoker.del(&pod).await {
+                    tracing::warn!(sandbox = %sandbox_id, "CNI DEL failed: {e}");
+                }
+            }
+        }
+
+        let handle = removed.and_then(|sb| sb.handle);
         if let Some(h) = handle {
             // Back to the pool, which is what makes the next start cheap. The
             // engine defers it until the last container has left, so this may
@@ -508,12 +606,13 @@ impl RuntimeService for StormpumpRuntime {
             id: sb.id.clone(),
             state: sb.state,
             created_at: sb.created_at,
-            // A host-network pod has the node's address; anything else needs
-            // the CNI to have run, and reporting an address we have not been
-            // given would make a pod look reachable when it is not.
-            ip: String::new(),
+            // A host-network pod has the node's address; anything else has
+            // whatever the CNI gave it, and an empty string where none ran —
+            // reporting an address we were not given would make a pod look
+            // reachable when it is not.
+            ip: sb.ip.clone(),
             additional_ips: Vec::new(),
-            netns_path: None,
+            netns_path: sb.netns.clone(),
         })
     }
 

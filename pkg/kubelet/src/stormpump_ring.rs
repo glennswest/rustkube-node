@@ -276,7 +276,14 @@ impl RingClient {
     /// going direct: the namespaces already exist, so what a container start
     /// costs is `setns` rather than `unshare`. The other half is that a pod's
     /// containers can be put in the *same* one.
-    pub fn sandbox_acquire(&self, profile: u8) -> Result<Handle, RingError> {
+    /// Acquire a sandbox, and learn the pid holding its namespaces.
+    ///
+    /// The pid is what makes the namespaces nameable from outside this ring:
+    /// a CNI plugin is handed `/proc/<pid>/ns/net`, never a handle. Zero means
+    /// the engine did not report one, which a caller must treat as "no path" —
+    /// `/proc/0/ns/net` is not a thing, and passing it to a plugin would fail
+    /// somewhere far from here.
+    pub fn sandbox_acquire(&self, profile: u8) -> Result<(Handle, u32), RingError> {
         let cqe = self.submit(
             Sqe {
                 opcode: Op::SandboxAcquire as u8,
@@ -285,7 +292,7 @@ impl RingClient {
             },
             None,
         )?;
-        Ok(cqe.handle())
+        Ok((cqe.handle(), cqe.aux))
     }
 
     pub fn sandbox_release(&self, sandbox: Handle) -> Result<(), RingError> {

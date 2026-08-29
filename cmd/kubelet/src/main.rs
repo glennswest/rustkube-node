@@ -192,17 +192,27 @@ async fn main() -> anyhow::Result<()> {
     )
     .network_ready()
     .is_ok();
+    // **A runtime that re-checks per pod must not be gated on a one-time
+    // look.** Cilium writes its conflist when its agent comes up, which is
+    // minutes after this line runs, and the answer here used to be permanent
+    // for the life of the process: the node logged "no network config is
+    // present", never looked again, and every pod got an empty namespace while
+    // a healthy Cilium sat beside it. `CniInvoker` reloads its config on every
+    // call precisely so this decision does not have to be final.
     let cni_invoker = if cli.no_cni {
         tracing::warn!("CNI disabled (--no-cni) — pods will use host networking");
         None
     } else if runtime_owns_networking && !cni_configured {
         tracing::info!(
-            "CNI not used: the {} runtime provides pod networking itself, and no network \
-             config is present in {}",
-            cli.runtime,
-            cli.cni_conf_dir
+            "no CNI network in {} yet; the {} runtime will use its own networking until \
+             one appears",
+            cli.cni_conf_dir,
+            cli.runtime
         );
-        None
+        Some(cni::CniInvoker::new(
+            cli.cni_conf_dir.clone(),
+            vec![std::path::PathBuf::from(&cli.cni_bin_dir)],
+        ))
     } else {
         let invoker = cni::CniInvoker::new(
             cli.cni_conf_dir.clone(),
@@ -255,7 +265,9 @@ async fn main() -> anyhow::Result<()> {
             match kubelet::stormpump_runtime::StormpumpRuntime::connect(&socket) {
                 Ok(rt) => {
                     tracing::info!("kubelet using stormpump runtime (ring at {socket})");
-                    let rt = Arc::new(rt);
+                    // The runtime asks per pod whether a network exists, so it
+                    // is given the invoker even when none is configured yet.
+                    let rt = Arc::new(rt.with_cni(cni_invoker));
                     // The ring goes to the image service too: a pull ends in
                     // a mount, and only the engine can make one the rest of
                     // the node can see.
