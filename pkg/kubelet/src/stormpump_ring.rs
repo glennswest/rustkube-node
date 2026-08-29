@@ -101,6 +101,19 @@ impl std::fmt::Display for RingError {
                 // as a sentence is worse than a number: it looks like a stage
                 // that exists. Printing the value turns "which step is setup"
                 // into a lookup rather than a guess — this cost a boot.
+                // SpecDefine never reaches a *step*: it fails while reading
+                // the spec, and what it puts in that field is a SpecError
+                // code. Decoding it as a step therefore printed
+                // "unrecognised step 14" for what is "argv is not absolute" —
+                // a number where a sentence was already available, and a
+                // lookup in the wrong table.
+                if name == "SpecDefine" {
+                    return write!(
+                        f,
+                        "stormpump refused SpecDefine: {why} ({})",
+                        stormpump::spec::SpecError::name_of(*step)
+                    );
+                }
                 match stormpump_abi::ExecStep::from_u32(*step & 0xFFFF) {
                     // Step 0 is "the child never reported one" — which is a
                     // fact about where the failure happened, not a stage. It
