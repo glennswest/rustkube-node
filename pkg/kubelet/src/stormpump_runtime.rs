@@ -641,7 +641,18 @@ impl RuntimeService for StormpumpRuntime {
         // as by the kubelet's own bookkeeping, because the engine resolves it
         // in the *host's* mount namespace and a missing directory is an EINVAL
         // at spawn rather than a missing log.
-        let _ = std::fs::create_dir_all(&log_dir);
+        //
+        // **Failing here beats failing at spawn.** This used to warn and carry
+        // on, and the engine then refused the spawn with `EINVAL (opening the
+        // log file)` — a message that names neither the directory nor the
+        // reason. When the node's root filesystem filled, every pod on the
+        // node reported that, and the cause was an ENOSPC discarded right
+        // here.
+        if let Err(e) = std::fs::create_dir_all(&log_dir) {
+            return Err(CriError::Runtime(format!(
+                "cannot create the container log directory {log_dir}: {e}"
+            )));
+        }
 
         let workload = self
             .on_ring(move |r| {
