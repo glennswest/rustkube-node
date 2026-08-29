@@ -159,6 +159,9 @@ pub struct PodManager {
     /// `valueFrom` and configMap/secret volumes. Empty → those reads are skipped.
     api_url: String,
     api_client: reqwest::Client,
+    /// Emits pod events, so a failure reaches `oc describe` rather than only a
+    /// log on a node with no shell.
+    events: Option<crate::events::EventRecorder>,
     /// This node's IP, for the downward API `status.hostIP`.
     node_ip: String,
     /// stormblock's management API on this node. Volumes for
@@ -194,6 +197,13 @@ impl PodManager {
             images,
             pods: RwLock::new(HashMap::new()),
             node_name: node_name.to_string(),
+            events: (!api_url.is_empty()).then(|| {
+                crate::events::EventRecorder::new(
+                    api_client.clone(),
+                    api_url,
+                    node_name,
+                )
+            }),
             api_url: api_url.trim_end_matches('/').to_string(),
             api_client,
             node_ip: node_ip.to_string(),
@@ -454,6 +464,21 @@ impl PodManager {
                 let _ = std::fs::create_dir_all(&dir);
                 dir
             };
+            // **Check it is there, and say which one is not.**
+            //
+            // The engine mounts by path and reports ENOENT with no path, so a
+            // single missing source presents as
+            // `Spawn: No such file or directory (attaching mounts)` for a pod
+            // with thirteen volumes — and finding which took reading the spec
+            // and reasoning about the node. The kubelet knows every path it is
+            // about to hand over; checking here costs a stat and turns
+            // deduction into a sentence.
+            if !std::path::Path::new(&host_path).exists() {
+                warn!(
+                    "volume {name}: {host_path} does not exist on this node — the \
+                     container will fail to start with ENOENT attaching mounts"
+                );
+            }
             map.insert(name, ResolvedVolume { path: host_path, fstype: None });
         }
         map
@@ -821,6 +846,24 @@ impl PodManager {
                 // New pod — start it
                 match self.start_pod(pod).await {
                     Ok(status) => outcome.updates.push(status),
+                    // A volume that is not there yet is **Pending**, not
+                    // Failed. Upstream retries a hostPath that does not exist
+                    // because it may appear — another component creates it, a
+                    // disk mounts — and marking the pod Failed ends it for a
+                    // condition that has not been established as permanent.
+                    Err(CriError::VolumeNotReady(what)) => {
+                        warn!("Pod {namespace}/{name} waiting on volumes: {what}");
+                        outcome.updates.push(PodStatusUpdate {
+                            namespace: namespace.to_string(),
+                            name: name.to_string(),
+                            phase: "Pending".to_string(),
+                            message: format!(
+                                "Unable to attach or mount volumes: unmounted volumes=[{what}]"
+                            ),
+                            container_statuses: vec![],
+                            pod_ip: None,
+                        });
+                    }
                     Err(e) => {
                         error!("Failed to start pod {namespace}/{name}: {e}");
                         outcome.updates.push(PodStatusUpdate {
@@ -982,6 +1025,54 @@ impl PodManager {
 
         let sandbox_config = build_sandbox_config(pod);
         let volumes = self.resolve_volumes(pod).await;
+
+        // **Refuse before spawning, naming the path.**
+        //
+        // The engine mounts by path and reports ENOENT with no path, so one
+        // missing source out of thirteen presents as `Spawn: No such file or
+        // directory (attaching mounts)` — and working out which one meant
+        // reading the pod spec and reasoning about what the node has. The
+        // kubelet already holds every path it is about to hand over, so it can
+        // say so, and the message reaches `oc describe` instead of a log
+        // nobody can reach.
+        let missing: Vec<(String, String)> = volumes
+            .iter()
+            .filter(|(_, v)| v.fstype.is_none())
+            .filter(|(_, v)| !std::path::Path::new(&v.path).exists())
+            .map(|(name, v)| (name.clone(), v.path.clone()))
+            .collect();
+        if !missing.is_empty() {
+            // Upstream's shape, deliberately: a `FailedMount` warning naming
+            // the volume and the path, and the pod stays **Pending** rather
+            // than Failed — the path may appear (another component creates it,
+            // a disk mounts), and upstream retries rather than giving up.
+            //
+            // The declared type is what says whether a file or a directory was
+            // expected, which is the difference between "you have not created
+            // it" and "you created the wrong kind of thing".
+            let declared = |vol: &str| -> String {
+                pod["spec"]["volumes"]
+                    .as_array()
+                    .and_then(|vs| vs.iter().find(|v| v["name"].as_str() == Some(vol)))
+                    .and_then(|v| v["hostPath"]["type"].as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            for (vol, path) in &missing {
+                let msg = crate::events::failed_mount_message(vol, path, &declared(vol));
+                warn!("{namespace}/{name}: {msg}");
+                if let Some(rec) = &self.events {
+                    rec.pod_event(pod, "Warning", "FailedMount", &msg).await;
+                }
+            }
+            return Err(CriError::VolumeNotReady(
+                missing
+                    .iter()
+                    .map(|(v, p)| format!("{v} ({p})"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
 
         // Create pod sandbox
         let sandbox_id = self.runtime.run_pod_sandbox(&sandbox_config).await?;

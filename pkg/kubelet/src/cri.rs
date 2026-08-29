@@ -405,6 +405,12 @@ pub enum CriError {
     #[error("image pull error: {0}")]
     ImagePull(String),
 
+    /// A volume is not ready yet — the pod stays Pending and is retried,
+    /// which is what upstream does for a hostPath that is not there. Failing
+    /// the pod would be wrong: the path may appear.
+    #[error("volume not ready: {0}")]
+    VolumeNotReady(String),
+
     #[error("timeout")]
     Timeout,
 
