@@ -97,18 +97,42 @@ pub struct SyncOutcome {
 /// means "I expect this to be here", and silently creating an empty one turns
 /// a misconfiguration into a container that starts and behaves strangely. What
 /// this does instead is say so, because the alternative is the ENOENT above.
+/// Where the host's filesystem is reachable from inside the kubelet.
+///
+/// **The kubelet runs in a container and the engine mounts in the host's
+/// namespace.** A `create_dir_all` on this side makes the directory here,
+/// where nothing will look for it; the mount then fails with an ENOENT naming
+/// no path. Cilium's `/opt/cni/bin` failed exactly that way.
+///
+/// Absent on a kubelet that is not containerised, in which case the paths are
+/// already the host's and no prefix is needed.
+const HOST_ROOT: &str = "/hostroot";
+
+/// The path as the *host* sees it, for creating something the engine will
+/// later mount.
+fn on_host(path: &str) -> std::path::PathBuf {
+    let root = std::path::Path::new(HOST_ROOT);
+    if root.is_dir() {
+        root.join(path.trim_start_matches('/'))
+    } else {
+        std::path::PathBuf::from(path)
+    }
+}
+
 fn ensure_host_path(path: &str, typ: &str) {
     match typ {
         "DirectoryOrCreate" => {
-            if let Err(e) = std::fs::create_dir_all(path) {
-                warn!("hostPath {path}: could not create directory: {e}");
+            let target = on_host(path);
+            if let Err(e) = std::fs::create_dir_all(&target) {
+                warn!("hostPath {path}: could not create {} : {e}", target.display());
             }
         }
         "FileOrCreate" => {
-            if std::path::Path::new(path).exists() {
+            let target = on_host(path);
+            if target.exists() {
                 return;
             }
-            if let Some(parent) = std::path::Path::new(path).parent() {
+            if let Some(parent) = target.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
                     warn!("hostPath {path}: could not create parent directory: {e}");
                     return;
@@ -117,7 +141,7 @@ fn ensure_host_path(path: &str, typ: &str) {
             // create_new so a race with another pod does not truncate a file
             // something is already holding — xtables.lock is a lock file, and
             // truncating one under its holder is worse than losing the race.
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&target) {
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(e) => warn!("hostPath {path}: could not create file: {e}"),
@@ -127,7 +151,7 @@ fn ensure_host_path(path: &str, typ: &str) {
         // Must already exist. Say so rather than leaving the spawn to fail
         // with an errno and no path.
         other => {
-            if !std::path::Path::new(path).exists() {
+            if !on_host(path).exists() {
                 warn!(
                     "hostPath {path} has type {other}, which requires it to exist \
                      already, and it does not — the container will fail to start"
