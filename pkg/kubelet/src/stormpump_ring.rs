@@ -95,7 +95,21 @@ impl std::fmt::Display for RingError {
                     stormpump_abi::ExecStep::from_u32(*step & 0xFFFF).name()
                 };
                 let why = std::io::Error::from_raw_os_error(*errno);
-                write!(f, "stormpump refused {name}: {why} ({where_})")
+                // The raw step too, when it is one nothing recognises.
+                //
+                // "setup" is the name for *unknown*, and an unknown step read
+                // as a sentence is worse than a number: it looks like a stage
+                // that exists. Printing the value turns "which step is setup"
+                // into a lookup rather than a guess — this cost a boot.
+                if matches!(
+                    stormpump_abi::ExecStep::from_u32(*step & 0xFFFF),
+                    stormpump_abi::ExecStep::Unknown
+                ) && *step != 0
+                {
+                    write!(f, "stormpump refused {name}: {why} (unrecognised step {step})")
+                } else {
+                    write!(f, "stormpump refused {name}: {why} ({where_})")
+                }
             }
             RingError::Detail(msg) => write!(f, "{msg}"),
             RingError::Gone => write!(f, "the connection to stormpump is gone"),
