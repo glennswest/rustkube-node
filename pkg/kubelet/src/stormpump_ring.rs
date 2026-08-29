@@ -127,6 +127,18 @@ impl std::fmt::Debug for RingClient {
     }
 }
 
+/// The mount a failure refers to, if it names one.
+///
+/// stormpump packs the index plus one into the high sixteen bits of the step
+/// word, so zero means "no mount named" — which is what every non-mount step
+/// reports.
+pub fn failed_mount_index(step: u32) -> Option<usize> {
+    match (step >> 16) as usize {
+        0 => None,
+        n => Some(n - 1),
+    }
+}
+
 impl RingClient {
     /// Attach to the engine and start the thread that owns the ring.
     pub fn attach(socket: &str) -> Result<RingClient, RingError> {
@@ -194,18 +206,6 @@ impl RingClient {
         )?;
         Ok(cqe.handle())
     }
-
-/// The mount a failure refers to, if it names one.
-///
-/// stormpump packs the index plus one into the high sixteen bits of the step
-/// word, so zero means "no mount named" — which is what every non-mount step
-/// reports.
-pub fn failed_mount_index(step: u32) -> Option<usize> {
-    match (step >> 16) as usize {
-        0 => None,
-        n => Some(n - 1),
-    }
-}
 
     /// Register a mounted volume by path, returning its handle.
     pub fn volume_register(&self, mount: &str) -> Result<Handle, RingError> {
