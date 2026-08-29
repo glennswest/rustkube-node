@@ -541,9 +541,8 @@ impl RuntimeService for StormpumpRuntime {
                         // come up looking healthy.
                         Err(e) => {
                             self.release_sandbox(&id, handle).await;
-                            return Err(CriError::Runtime(format!(
-                                "CNI ADD failed for {}/{}: {e}",
-                                config.namespace, config.name
+                            return Err(CriError::NetworkNotReady(format!(
+                                "CNI ADD failed: {e}"
                             )));
                         }
                     }
@@ -562,9 +561,8 @@ impl RuntimeService for StormpumpRuntime {
                     // retry succeeds as soon as the agent is up. The agent
                     // itself is hostNetwork, so it is not waiting on this.
                     self.release_sandbox(&id, handle).await;
-                    return Err(CriError::Runtime(format!(
-                        "no pod network yet ({e}); not starting {}/{} without one",
-                        config.namespace, config.name
+                    return Err(CriError::NetworkNotReady(format!(
+                        "no CNI network configured yet ({e})"
                     )));
                 }
             }

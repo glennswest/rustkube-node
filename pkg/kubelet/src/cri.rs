@@ -410,6 +410,14 @@ pub enum CriError {
     /// the pod would be wrong: the path may appear.
     #[error("volume not ready: {0}")]
     VolumeNotReady(String),
+    /// The pod network is not available yet.
+    ///
+    /// Retryable for the same reason as a missing volume: the CNI appears when
+    /// its agent comes up, and marking the pod Failed ends it for a condition
+    /// that has not been established as permanent. This is the ordinary state
+    /// of every pod scheduled in the window before the network agent is ready.
+    #[error("network not ready: {0}")]
+    NetworkNotReady(String),
 
     #[error("timeout")]
     Timeout,

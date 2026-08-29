@@ -875,6 +875,21 @@ impl PodManager {
                     // because it may appear — another component creates it, a
                     // disk mounts — and marking the pod Failed ends it for a
                     // condition that has not been established as permanent.
+                    // The same shape one layer over: a pod that cannot get
+                    // an address waits for one. Marking it Failed left CoreDNS
+                    // dead on a node whose network came up ten seconds later,
+                    // and nothing retried it.
+                    Err(CriError::NetworkNotReady(what)) => {
+                        warn!("Pod {namespace}/{name} waiting on the pod network: {what}");
+                        outcome.updates.push(PodStatusUpdate {
+                            namespace: namespace.to_string(),
+                            name: name.to_string(),
+                            phase: "Pending".to_string(),
+                            message: format!("network is not ready: {what}"),
+                            container_statuses: vec![],
+                            pod_ip: None,
+                        });
+                    }
                     Err(CriError::VolumeNotReady(what)) => {
                         warn!("Pod {namespace}/{name} waiting on volumes: {what}");
                         outcome.updates.push(PodStatusUpdate {
