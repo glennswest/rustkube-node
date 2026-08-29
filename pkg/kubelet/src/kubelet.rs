@@ -810,10 +810,24 @@ fn system_hostname() -> Option<String> {
 /// a convenience.
 async fn mirror_node_services(client: &reqwest::Client, api_url: &str, node: &str) {
     const ASSET_STATUS: &str = "/run/stormpump/assets.json";
-    let Ok(text) = std::fs::read_to_string(ASSET_STATUS) else {
-        // No file: this node is not run by stormpump, or PID 1 has not written
-        // one yet. Neither is an error.
-        return;
+    let text = match std::fs::read_to_string(ASSET_STATUS) {
+        Ok(t) => t,
+        Err(e) => {
+            // Not an error — a node not run by stormpump has no such file, and
+            // neither does one whose PID 1 has not written it yet.
+            //
+            // **But say so once.** This returned in silence, so when the node's
+            // services stopped appearing as pods there was no line anywhere
+            // saying why, and nothing distinguished "no file" from "cannot
+            // read it" from "the loop is not running". Once, at debug, is
+            // enough to answer that without a line every fifteen seconds
+            // forever on a node that will never have one.
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                debug!("not mirroring node services: cannot read {ASSET_STATUS}: {e}");
+            });
+            return;
+        }
     };
     let assets = crate::mirror::parse_assets(&text);
     if assets.is_empty() {
