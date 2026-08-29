@@ -5,6 +5,7 @@
 //! and reports node status via Lease heartbeats.
 
 pub mod events;
+pub mod mirror;
 pub mod storage;
 pub mod stormpump_ring;
 pub mod stormpump_runtime;
