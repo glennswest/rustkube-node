@@ -361,6 +361,23 @@ impl Kubelet {
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|p| p["spec"]["nodeName"].as_str() == Some(&self.config.node_name))
+                // A mirror pod describes something PID 1 is already running.
+                //
+                // **It is a record, not an instruction.** This kubelet writes
+                // one per node service and then saw it come back as a pod
+                // assigned to this node, so it tried to *start* it — spawning
+                // `stormpump://stormblock` as though it were an image, failing,
+                // and overwriting the true status with StartFailed. The node's
+                // own services then appeared permanently broken while every one
+                // of them was serving.
+                //
+                // Upstream has the same annotation for the same reason: a
+                // kubelet must not act on the objects it publishes about work
+                // it did not schedule.
+                .filter(|p| {
+                    p["metadata"]["annotations"]["kubernetes.io/config.source"].as_str()
+                        != Some("stormpump")
+                })
                 .collect(),
             Err(e) => {
                 debug!("apiserver pod list unavailable ({e}); running static pods only");
