@@ -190,6 +190,18 @@ impl StormpumpRuntime {
         })
     }
 
+    /// Hand a sandbox back after a failed start.
+    ///
+    /// Without this every retry of a pod that cannot get a network leaks a
+    /// namespace holder, and a pod retrying on a backoff would exhaust the
+    /// node while looking like it was merely waiting.
+    async fn release_sandbox(&self, id: &str, handle: Option<Handle>) {
+        self.sandboxes.lock().await.remove(id);
+        if let Some(h) = handle {
+            let _ = self.on_ring(move |r| r.sandbox_release(h)).await;
+        }
+    }
+
     /// Give this runtime a CNI to call.
     ///
     /// Optional because a node with no pod network is a real configuration —
@@ -524,19 +536,37 @@ impl RuntimeService for StormpumpRuntime {
                                 "CNI attached the pod network"
                             );
                         }
-                        // A pod with no network is worth reporting and is not
-                        // worth refusing to start: the containers still run,
-                        // and the address staying empty is what says so.
-                        Err(e) => tracing::warn!(
-                            sandbox = %id, pod = %config.name,
-                            "CNI ADD failed, pod has no network: {e}"
-                        ),
+                        // Same reasoning as a missing config: a pod that
+                        // asked for a network and did not get one must not
+                        // come up looking healthy.
+                        Err(e) => {
+                            self.release_sandbox(&id, handle).await;
+                            return Err(CriError::Runtime(format!(
+                                "CNI ADD failed for {}/{}: {e}",
+                                config.namespace, config.name
+                            )));
+                        }
                     }
                 }
-                Err(e) => tracing::debug!(
-                    sandbox = %id,
-                    "no CNI network configured yet ({e}); pod gets loopback only"
-                ),
+                Err(e) => {
+                    // **Wait, rather than run without a network.**
+                    //
+                    // This used to warn and carry on, so a pod created in the
+                    // window before Cilium writes its conflist got loopback
+                    // and nothing ever re-attached it: CoreDNS came up
+                    // Running, with no address, and its Service had no
+                    // endpoints. Running-but-unreachable is the worst of the
+                    // three outcomes — it looks healthy.
+                    //
+                    // Failing here leaves the pod to be retried, and the
+                    // retry succeeds as soon as the agent is up. The agent
+                    // itself is hostNetwork, so it is not waiting on this.
+                    self.release_sandbox(&id, handle).await;
+                    return Err(CriError::Runtime(format!(
+                        "no pod network yet ({e}); not starting {}/{} without one",
+                        config.namespace, config.name
+                    )));
+                }
             }
         }
 
