@@ -491,6 +491,16 @@ impl RuntimeService for StormpumpRuntime {
         // Asked per pod rather than at startup — the config appears when the
         // agent that writes it comes up, which is after the kubelet decided
         // anything it decided once.
+        // One line saying what the two inputs actually are.
+        //
+        // Both have to be present for a plugin to run, and when nothing
+        // happened there was no way to tell which was missing: a silent `if
+        // let` on two options looks identical whichever half is None, and two
+        // build-and-boot cycles went into guessing.
+        tracing::info!(
+            sandbox = %id, cni = self.cni.is_some(), netns = ?netns,
+            "pod networking inputs"
+        );
         let mut ip = String::new();
         if let (Some(invoker), Some(ns)) = (&self.cni, &netns) {
             match invoker.network_ready() {
