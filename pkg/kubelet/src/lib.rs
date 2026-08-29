@@ -4,6 +4,7 @@
 //! manages pod state machines, health probes, volumes, image pulls,
 //! and reports node status via Lease heartbeats.
 
+pub mod dns;
 pub mod events;
 pub mod mirror;
 pub mod storage;

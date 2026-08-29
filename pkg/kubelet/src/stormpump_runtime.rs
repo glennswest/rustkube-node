@@ -1336,6 +1336,8 @@ mod tests {
                 config: PodSandboxConfig::default(),
                 state: PodSandboxState::Ready,
                 created_at: 0,
+                netns: None,
+                ip: String::new(),
             },
         );
         for (id, sb) in [("ct-1", "sb-1"), ("ct-2", "sb-1"), ("ct-3", "sb-other")] {
@@ -1448,6 +1450,8 @@ mod tests {
                     },
                     state: PodSandboxState::Ready,
                     created_at: 0,
+                    netns: None,
+                    ip: String::new(),
                 },
             );
         }

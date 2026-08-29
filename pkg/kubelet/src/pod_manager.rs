@@ -194,6 +194,10 @@ pub struct PodManager {
     /// Kubelet state root; per-pod volume dirs live under `<state_root>/pods`.
     /// Overridable in tests. Default `/var/lib/kubelet`.
     state_root: String,
+    /// The cluster DNS service address(es) a pod's resolv.conf points at.
+    cluster_dns: Vec<String>,
+    /// The cluster domain the search path is built from.
+    cluster_domain: String,
     /// Cluster CA (PEM), written into ServiceAccount `ca.crt` so in-cluster
     /// clients can verify a TLS apiserver.
     ca_pem: Option<Vec<u8>>,
@@ -233,6 +237,8 @@ impl PodManager {
             node_ip: node_ip.to_string(),
             storage_url: "http://127.0.0.1:9090".to_string(),
             state_root: "/var/lib/kubelet".to_string(),
+            cluster_dns: vec!["10.96.0.10".to_string()],
+            cluster_domain: "cluster.local".to_string(),
             ca_pem: None,
         }
     }
@@ -718,6 +724,79 @@ impl PodManager {
     /// `/var/run/secrets/kubernetes.io/serviceaccount` (token/ca.crt/namespace),
     /// used when the apiserver's SA admission did NOT already inject a
     /// projected `kube-api-access` volume and automount isn't disabled.
+    /// The pod's `/etc/resolv.conf`.
+    ///
+    /// **No pod had one at all** — not empty, absent — so every lookup inside
+    /// every container fell through to 127.0.0.1 and reported "no servers
+    /// could be reached", while cluster DNS was up and reachable the whole
+    /// time. Nothing ever told a pod where the resolver was.
+    ///
+    /// Written under the pod's own directory and bind-mounted, the same shape
+    /// as the ServiceAccount token: one path, visible to the kubelet that
+    /// writes it and to the engine that mounts it.
+    fn resolv_conf_mount(&self, pod: &Value) -> Option<Mount> {
+        // A pod that mounts its own resolv.conf means it.
+        if pod["spec"]["containers"].as_array().is_some_and(|cs| {
+            cs.iter().any(|c| {
+                c["volumeMounts"].as_array().is_some_and(|ms| {
+                    ms.iter().any(|m| m["mountPath"].as_str() == Some("/etc/resolv.conf"))
+                })
+            })
+        }) {
+            return None;
+        }
+
+        let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
+        let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default");
+        let host_network = pod["spec"]["hostNetwork"].as_bool().unwrap_or(false);
+        let policy = crate::dns::DnsPolicy::parse(
+            pod["spec"]["dnsPolicy"].as_str(),
+            host_network,
+        );
+        let node_resolv = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+        let content = crate::dns::resolv_conf(
+            policy,
+            namespace,
+            &self.cluster_dns,
+            &self.cluster_domain,
+            pod["spec"].get("dnsConfig"),
+            &node_resolv,
+        );
+        if content.is_empty() {
+            return None;
+        }
+
+        let dir = format!("{}/pods/{uid}/etc", self.state_root);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            warn!("could not create {dir} for resolv.conf: {e}");
+            return None;
+        }
+        let path = format!("{dir}/resolv.conf");
+        if let Err(e) = std::fs::write(&path, &content) {
+            warn!("could not write {path}: {e}");
+            return None;
+        }
+        Some(Mount {
+            container_path: "/etc/resolv.conf".to_string(),
+            host_path: path,
+            readonly: true,
+            propagation: MountPropagation::Private,
+            selinux_relabel: true,
+            fstype: None,
+        })
+    }
+
+    /// Point pods at a different cluster DNS, or a different domain.
+    pub fn with_cluster_dns(mut self, servers: Vec<String>, domain: String) -> Self {
+        if !servers.is_empty() {
+            self.cluster_dns = servers;
+        }
+        if !domain.is_empty() {
+            self.cluster_domain = domain;
+        }
+        self
+    }
+
     async fn service_account_mount(&self, pod: &Value) -> Option<Mount> {
         if pod["spec"]["automountServiceAccountToken"].as_bool() == Some(false) {
             return None;
@@ -976,6 +1055,7 @@ impl PodManager {
         volumes: &HashMap<String, ResolvedVolume>,
         pod_ip: Option<&str>,
         sa_mount: &Option<Mount>,
+        dns_mount: &Option<Mount>,
     ) -> Result<(), CriError> {
         let inits = match pod["spec"]["initContainers"].as_array() {
             Some(a) if !a.is_empty() => a.clone(),
@@ -993,6 +1073,7 @@ impl PodManager {
             merge_env(&mut envs, self.service_account_env());
             let mut mounts = resolve_mounts(spec, volumes);
             push_mount(&mut mounts, sa_mount.clone());
+            push_mount(&mut mounts, dns_mount.clone());
             let mut config = build_container_config(spec, &image_ref, envs, mounts);
             apply_pod_namespaces(&mut config, pod);
             ensure_container_log_dir(&sandbox_config.log_directory, &config.name);
@@ -1092,6 +1173,7 @@ impl PodManager {
         // Default ServiceAccount credential mount (token/ca/namespace),
         // computed once per pod and injected into every container.
         let sa_mount = self.service_account_mount(pod).await;
+        let dns_mount = self.resolv_conf_mount(pod);
 
         // Run init containers to completion (in order) before the app
         // containers — each must exit 0. A failure aborts pod start.
@@ -1102,6 +1184,7 @@ impl PodManager {
             &volumes,
             pod_ip.as_deref(),
             &sa_mount,
+            &dns_mount,
         )
         .await?;
 
@@ -1130,6 +1213,7 @@ impl PodManager {
             merge_env(&mut envs, self.service_account_env());
             let mut mounts = resolve_mounts(container_spec, &volumes);
             push_mount(&mut mounts, sa_mount.clone());
+            push_mount(&mut mounts, dns_mount.clone());
             let mut container_config =
                 build_container_config(container_spec, &image_ref, envs, mounts);
             apply_pod_namespaces(&mut container_config, pod);
