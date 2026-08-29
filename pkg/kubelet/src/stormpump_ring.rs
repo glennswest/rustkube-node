@@ -86,7 +86,9 @@ impl std::fmt::Display for RingError {
                 let where_ = if *op == Op::SpecDefine as u8 {
                     stormpump::spec::SpecError::name_of(*step)
                 } else {
-                    stormpump_abi::ExecStep::from_u32(*step).name()
+                    // A mount failure packs the mount's index in the high
+                    // sixteen bits; the step itself is the low half.
+                    stormpump_abi::ExecStep::from_u32(*step & 0xFFFF).name()
                 };
                 let why = std::io::Error::from_raw_os_error(*errno);
                 write!(f, "stormpump refused {name}: {why} ({where_})")
@@ -192,6 +194,18 @@ impl RingClient {
         )?;
         Ok(cqe.handle())
     }
+
+/// The mount a failure refers to, if it names one.
+///
+/// stormpump packs the index plus one into the high sixteen bits of the step
+/// word, so zero means "no mount named" — which is what every non-mount step
+/// reports.
+pub fn failed_mount_index(step: u32) -> Option<usize> {
+    match (step >> 16) as usize {
+        0 => None,
+        n => Some(n - 1),
+    }
+}
 
     /// Register a mounted volume by path, returning its handle.
     pub fn volume_register(&self, mount: &str) -> Result<Handle, RingError> {
@@ -499,5 +513,21 @@ mod tests {
         // errno spelled out. A reader should not need two lookup tables.
         assert!(text.contains("mounts"), "{text}");
         assert!(text.contains("Invalid argument"), "{text}");
+    }
+
+    /// A mount failure names which mount. Zero keeps meaning "no index", so a
+    /// failure from any other step still decodes as it always did.
+    #[test]
+    fn a_mount_failure_carries_its_index() {
+        let pack = |step: u32, idx: usize| (step & 0xFFFF) | (((idx as u32) + 1) << 16);
+        let mounts = stormpump_abi::ExecStep::Mounts as u32;
+
+        assert_eq!(failed_mount_index(pack(mounts, 0)), Some(0));
+        assert_eq!(failed_mount_index(pack(mounts, 12)), Some(12));
+        // The step survives the packing.
+        assert_eq!(pack(mounts, 12) & 0xFFFF, mounts);
+        // A plain step names no mount.
+        assert_eq!(failed_mount_index(mounts), None);
+        assert_eq!(failed_mount_index(0), None);
     }
 }

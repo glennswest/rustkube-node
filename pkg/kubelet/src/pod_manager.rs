@@ -1026,53 +1026,17 @@ impl PodManager {
         let sandbox_config = build_sandbox_config(pod);
         let volumes = self.resolve_volumes(pod).await;
 
-        // **Refuse before spawning, naming the path.**
+
+        // **The kubelet cannot check host paths from here.** It runs in a
+        // container; the mounts happen in the engine's namespace, which is the
+        // host's. A `Path::exists()` on this side asks the kubelet's own
+        // filesystem and answers about the wrong machine — an earlier version
+        // did exactly that and refused pods whose hostPaths were present on
+        // the host and absent in this container.
         //
-        // The engine mounts by path and reports ENOENT with no path, so one
-        // missing source out of thirteen presents as `Spawn: No such file or
-        // directory (attaching mounts)` — and working out which one meant
-        // reading the pod spec and reasoning about what the node has. The
-        // kubelet already holds every path it is about to hand over, so it can
-        // say so, and the message reaches `oc describe` instead of a log
-        // nobody can reach.
-        let missing: Vec<(String, String)> = volumes
-            .iter()
-            .filter(|(_, v)| v.fstype.is_none())
-            .filter(|(_, v)| !std::path::Path::new(&v.path).exists())
-            .map(|(name, v)| (name.clone(), v.path.clone()))
-            .collect();
-        if !missing.is_empty() {
-            // Upstream's shape, deliberately: a `FailedMount` warning naming
-            // the volume and the path, and the pod stays **Pending** rather
-            // than Failed — the path may appear (another component creates it,
-            // a disk mounts), and upstream retries rather than giving up.
-            //
-            // The declared type is what says whether a file or a directory was
-            // expected, which is the difference between "you have not created
-            // it" and "you created the wrong kind of thing".
-            let declared = |vol: &str| -> String {
-                pod["spec"]["volumes"]
-                    .as_array()
-                    .and_then(|vs| vs.iter().find(|v| v["name"].as_str() == Some(vol)))
-                    .and_then(|v| v["hostPath"]["type"].as_str())
-                    .unwrap_or("")
-                    .to_string()
-            };
-            for (vol, path) in &missing {
-                let msg = crate::events::failed_mount_message(vol, path, &declared(vol));
-                warn!("{namespace}/{name}: {msg}");
-                if let Some(rec) = &self.events {
-                    rec.pod_event(pod, "Warning", "FailedMount", &msg).await;
-                }
-            }
-            return Err(CriError::VolumeNotReady(
-                missing
-                    .iter()
-                    .map(|(v, p)| format!("{v} ({p})"))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            ));
-        }
+        // The engine does the mount and knows which one failed, so naming it
+        // is the engine's job. See `ExecStep::Mounts` and the mount index it
+        // carries.
 
         // Create pod sandbox
         let sandbox_id = self.runtime.run_pod_sandbox(&sandbox_config).await?;
