@@ -250,6 +250,24 @@ impl Kubelet {
             }
         });
 
+        // Mirror the node's own services into the API.
+        //
+        // Its own task on a slow interval: these change when PID 1 restarts
+        // something, which is rare, and a mirror that costs a write every two
+        // seconds would be worse than the invisibility it fixes.
+        {
+            let url = self.config.api_server_url.clone();
+            let node = self.config.node_name.clone();
+            let client = self.api_client.clone();
+            tokio::spawn(async move {
+                let mut interval = time::interval(Duration::from_secs(15));
+                loop {
+                    interval.tick().await;
+                    mirror_node_services(&client, &url, &node).await;
+                }
+            });
+        }
+
         // Main sync loop
         let mut interval = time::interval(self.config.sync_interval);
         loop {
@@ -777,5 +795,66 @@ fn system_hostname() -> Option<String> {
         None
     } else {
         Some(h)
+    }
+}
+
+/// Publish a mirror pod for each service PID 1 supervises.
+///
+/// Reads what stormpump wrote and reflects it. **Nothing is invented**: an
+/// asset absent from the file is not mirrored, and a mirror whose asset has
+/// gone is deleted — the file is the truth, and a stale pod claiming a service
+/// is running is worse than no pod at all.
+///
+/// Best effort throughout. A node whose services cannot be *seen* still works;
+/// failing the kubelet over a cosmetic write would trade a real capability for
+/// a convenience.
+async fn mirror_node_services(client: &reqwest::Client, api_url: &str, node: &str) {
+    const ASSET_STATUS: &str = "/run/stormpump/assets.json";
+    let Ok(text) = std::fs::read_to_string(ASSET_STATUS) else {
+        // No file: this node is not run by stormpump, or PID 1 has not written
+        // one yet. Neither is an error.
+        return;
+    };
+    let assets = crate::mirror::parse_assets(&text);
+    if assets.is_empty() {
+        return;
+    }
+
+    // The node's uid, so the mirrors are owned by it and collected with it.
+    let node_uid = match client.get(format!("{api_url}/api/v1/nodes/{node}")).send().await {
+        Ok(r) if r.status().is_success() => r
+            .json::<Value>()
+            .await
+            .ok()
+            .and_then(|n| n["metadata"]["uid"].as_str().map(str::to_owned))
+            .unwrap_or_default(),
+        _ => return,
+    };
+    if node_uid.is_empty() {
+        return;
+    }
+
+    let now = chrono::Utc::now();
+    for a in &assets {
+        // startTime from the age PID 1 reported: the two ends share no clock,
+        // so an age is portable where an instant is not.
+        let started = (now - chrono::Duration::seconds(a.age_secs as i64))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let pod = crate::mirror::mirror_pod(a, node, &node_uid, &started);
+        let name = crate::mirror::mirror_name(&a.name, node);
+        let base = format!("{api_url}/api/v1/namespaces/kube-system/pods");
+
+        // Create, then fall back to updating status — the object is long-lived
+        // and only its status moves.
+        let created = client.post(&base).json(&pod).send().await;
+        let exists = matches!(created, Ok(ref r) if r.status() == 409);
+        if exists {
+            let _ = client
+                .put(format!("{base}/{name}/status"))
+                .json(&pod)
+                .send()
+                .await;
+        }
     }
 }
