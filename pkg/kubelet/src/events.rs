@@ -71,7 +71,16 @@ impl EventRecorder {
         if name.is_empty() {
             return;
         }
+        // Two clocks, deliberately.
+        //
+        // `firstTimestamp` and `lastTimestamp` are `metav1.Time` — RFC3339 to
+        // the second. `eventTime` is `metav1.MicroTime` and **requires
+        // microseconds**: a plain RFC3339 there fails to unmarshal, and the
+        // client discards the whole EventList rather than one field. That is
+        // why `oc describe` printed `Events: <none>` while the API was
+        // returning twenty-five of them and `oc get events` listed them fine.
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let now_micro = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
         let key = format!("{namespace}/{name}/{uid}/{etype}/{reason}/{message}");
 
         let mut seen = self.seen.lock().await;
@@ -89,7 +98,7 @@ impl EventRecorder {
                 "count": prev.count,
                 "firstTimestamp": prev.first,
                 "lastTimestamp": now,
-                "eventTime": now,
+                "eventTime": now_micro,
             });
             let _ = self
                 .client
@@ -135,7 +144,7 @@ impl EventRecorder {
             "reportingInstance": self.node_name,
             "firstTimestamp": now,
             "lastTimestamp": now,
-            "eventTime": now,
+            "eventTime": now_micro,
             "count": 1,
         });
 
