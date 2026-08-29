@@ -101,14 +101,21 @@ impl std::fmt::Display for RingError {
                 // as a sentence is worse than a number: it looks like a stage
                 // that exists. Printing the value turns "which step is setup"
                 // into a lookup rather than a guess — this cost a boot.
-                if matches!(
-                    stormpump_abi::ExecStep::from_u32(*step & 0xFFFF),
-                    stormpump_abi::ExecStep::Unknown
-                ) && *step != 0
-                {
-                    write!(f, "stormpump refused {name}: {why} (unrecognised step {step})")
-                } else {
-                    write!(f, "stormpump refused {name}: {why} ({where_})")
+                match stormpump_abi::ExecStep::from_u32(*step & 0xFFFF) {
+                    // Step 0 is "the child never reported one" — which is a
+                    // fact about where the failure happened, not a stage. It
+                    // read as "setup", a plausible-looking name for a phase
+                    // that does not exist, and cost several boots.
+                    stormpump_abi::ExecStep::Unknown if *step == 0 => write!(
+                        f,
+                        "stormpump refused {name}: {why} (no step reported — the failure \
+                         was before the child could describe it)"
+                    ),
+                    stormpump_abi::ExecStep::Unknown => write!(
+                        f,
+                        "stormpump refused {name}: {why} (unrecognised step {step})"
+                    ),
+                    _ => write!(f, "stormpump refused {name}: {why} ({where_})"),
                 }
             }
             RingError::Detail(msg) => write!(f, "{msg}"),
