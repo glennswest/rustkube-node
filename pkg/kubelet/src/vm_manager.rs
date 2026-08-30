@@ -319,7 +319,14 @@ impl VmManager {
                     return Err(format!("disk {}: cloud-init disks are not generated yet", d.name));
                 }
             };
-            let body = json!({ "node": self.node_name, "transport": "ublk" });
+            // No node in the request. This kubelet is asking the stormblock
+            // *on this node* to attach a volume *here*; naming the node adds a
+            // way for the two to disagree and no information — and they did
+            // disagree, because a stormblock started by an init system has no
+            // HOSTNAME in its environment and called itself "localhost" while
+            // the attach named the node. The storage knows which machine it
+            // is running on.
+            let body = json!({ "transport": "ublk" });
             let info = match self
                 .post(&format!("{}/api/v1/volumes/{volume_id}/attach", self.storage), &body)
                 .await
