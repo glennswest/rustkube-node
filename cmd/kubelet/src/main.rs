@@ -58,6 +58,11 @@ struct Cli {
     #[arg(long, default_value = "http://127.0.0.1:5100")]
     registry: String,
 
+    /// This node's stormblock, which clones a golden and attaches it as a
+    /// block device. Used for virtual machines (--runtime=stormpump).
+    #[arg(long, env = "STORMBLOCK_URL", default_value = "http://127.0.0.1:9090")]
+    stormblock: String,
+
     /// CRI socket path (only used with --runtime=cri).
     #[arg(long, env = "CRI_SOCKET")]
     cri_socket: Option<String>,
@@ -229,6 +234,11 @@ async fn main() -> anyhow::Result<()> {
         Some(invoker)
     };
 
+    // The ring, when there is one. A VM is a workload in a machine domain and
+    // only the engine starts one, so every other runtime leaves this None and
+    // the kubelet simply does not reconcile VMs.
+    let mut engine_ring: Option<std::sync::Arc<kubelet::stormpump_ring::RingClient>> = None;
+
     let (runtime, images, migration): (
         Arc<dyn kubelet::cri::RuntimeService>,
         Arc<dyn kubelet::cri::ImageService>,
@@ -268,6 +278,7 @@ async fn main() -> anyhow::Result<()> {
                     // The runtime asks per pod whether a network exists, so it
                     // is given the invoker even when none is configured yet.
                     let rt = Arc::new(rt.with_cni(cni_invoker));
+                    engine_ring = rt.ring_client();
                     // The ring goes to the image service too: a pull ends in
                     // a mount, and only the engine can make one the rest of
                     // the node can see.
@@ -399,7 +410,13 @@ async fn main() -> anyhow::Result<()> {
         anonymous_auth: cli.anonymous_auth,
         ..Default::default()
     };
-    let kubelet = Kubelet::new(config, runtime, images, migration)?;
+    let mut kubelet = Kubelet::new(config, runtime, images, migration)?;
+    if let Some(ring) = engine_ring {
+        // The same connection the containers are started on, deliberately: a
+        // workload belongs to the client that started it, so a second ring
+        // would mean a second thing whose death is a VM's death.
+        kubelet = kubelet.with_engine(ring, &cli.stormblock);
+    }
     if let Err(e) = kubelet.run().await {
         anyhow::bail!("kubelet failed: {e}");
     }

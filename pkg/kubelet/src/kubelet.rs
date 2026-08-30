@@ -82,6 +82,13 @@ impl Default for KubeletConfig {
 pub struct Kubelet {
     config: KubeletConfig,
     pod_manager: Arc<PodManager>,
+    /// Virtual machines, when this node has an engine to start them with.
+    ///
+    /// `None` on any runtime but stormpump: a VM here is a workload in a
+    /// machine domain, and nothing else on this node can start one. A kubelet
+    /// without it simply does not list VMIs — it does not fail, and it does not
+    /// pretend.
+    vms: Option<Arc<crate::vm_manager::VmManager>>,
     migration: Arc<dyn MigrationService>,
     runtime: Arc<dyn RuntimeService>,
     api_client: reqwest::Client,
@@ -127,11 +134,36 @@ impl Kubelet {
         Ok(Self {
             config,
             pod_manager,
+            vms: None,
             migration,
             runtime,
             api_client,
             node_ip,
         })
+    }
+
+    /// Reconcile virtual machines too, on the ring the containers use.
+    ///
+    /// A builder rather than a constructor argument because every runtime but
+    /// stormpump would pass nothing. It takes the ring rather than a built
+    /// manager so the manager gets *this* kubelet's authenticated apiserver
+    /// client — a status written with an unauthenticated one is a status
+    /// nobody ever sees.
+    pub fn with_engine(
+        mut self,
+        ring: Arc<crate::stormpump_ring::RingClient>,
+        stormblock: &str,
+    ) -> Self {
+        self.vms = Some(Arc::new(
+            crate::vm_manager::VmManager::new(
+                Some(ring),
+                &self.config.node_name,
+                self.api_client.clone(),
+                &self.config.api_server_url,
+            )
+            .with_storage(stormblock),
+        ));
+        self
     }
 
     /// Run the kubelet. Blocks forever.
@@ -395,6 +427,20 @@ impl Kubelet {
             {
                 my_pods.push(sp);
             }
+        }
+
+        // Machines assigned here, reconciled on the same tick and through the
+        // same ring. Best-effort like the pod list: a cluster with no VM CRD is
+        // the ordinary case on a node that runs none, and it must not stop pods
+        // from being synced.
+        if let Some(vms) = &self.vms {
+            let want = crate::vm_manager::list_for_node(
+                &self.api_client,
+                &self.config.api_server_url,
+                &self.config.node_name,
+            )
+            .await;
+            vms.sync(&want).await;
         }
 
         // Sync pod states

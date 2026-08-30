@@ -974,7 +974,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots",
+ "webpki-roots 1.0.8",
 ]
 
 [[package]]
@@ -1305,6 +1305,8 @@ dependencies = [
  "serde_yaml",
  "stormpump",
  "stormpump-abi",
+ "stormvm-node",
+ "stormvm-spec",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -2218,7 +2220,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "webpki-roots",
+ "webpki-roots 1.0.8",
 ]
 
 [[package]]
@@ -2427,6 +2429,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_spanned"
+version = "0.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "serde_urlencoded"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2546,7 +2557,7 @@ source = "git+https://github.com/glennswest/stormcast?branch=main#9244121e2f9c73
 [[package]]
 name = "stormpump"
 version = "0.1.0"
-source = "git+https://github.com/glennswest/stormpump?branch=main#08f8e605a35054d9d818ac9bd3e86976f037ed37"
+source = "git+https://github.com/glennswest/stormpump?branch=main#eb33f1978ee0ae738dfc8e76e84d964ea4b8f4ac"
 dependencies = [
  "libc",
  "stormcast",
@@ -2556,7 +2567,65 @@ dependencies = [
 [[package]]
 name = "stormpump-abi"
 version = "0.1.0"
-source = "git+https://github.com/glennswest/stormpump?branch=main#08f8e605a35054d9d818ac9bd3e86976f037ed37"
+source = "git+https://github.com/glennswest/stormpump?branch=main#eb33f1978ee0ae738dfc8e76e84d964ea4b8f4ac"
+
+[[package]]
+name = "stormvm-block"
+version = "0.1.0"
+source = "git+https://github.com/glennswest/stormvm?branch=main#35888e93f0624b523d24906ef0fe35db414409b1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "ureq",
+]
+
+[[package]]
+name = "stormvm-node"
+version = "0.1.0"
+source = "git+https://github.com/glennswest/stormvm?branch=main#35888e93f0624b523d24906ef0fe35db414409b1"
+dependencies = [
+ "anyhow",
+ "libc",
+ "stormpump",
+ "stormpump-abi",
+ "stormvm-block",
+ "stormvm-ring",
+ "stormvm-spec",
+ "stormvm-vmm",
+ "tracing",
+]
+
+[[package]]
+name = "stormvm-ring"
+version = "0.1.0"
+source = "git+https://github.com/glennswest/stormvm?branch=main#35888e93f0624b523d24906ef0fe35db414409b1"
+dependencies = [
+ "stormpump",
+ "stormpump-abi",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "stormvm-spec"
+version = "0.1.0"
+source = "git+https://github.com/glennswest/stormvm?branch=main#35888e93f0624b523d24906ef0fe35db414409b1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "toml",
+]
+
+[[package]]
+name = "stormvm-vmm"
+version = "0.1.0"
+source = "git+https://github.com/glennswest/stormvm?branch=main#35888e93f0624b523d24906ef0fe35db414409b1"
+dependencies = [
+ "serde",
+ "stormvm-spec",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "strsim"
@@ -2800,6 +2869,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml"
+version = "0.8.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc1beb996b9d83529a9e75c17a1686767d148d70663143c7854d8b4a09ced362"
+dependencies = [
+ "serde",
+ "serde_spanned",
+ "toml_datetime",
+ "toml_edit",
+]
+
+[[package]]
+name = "toml_datetime"
+version = "0.6.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22cddaf88f4fbc13c51aebbf5f8eceb5c7c5a9da2ac40a13519eb5b0a0e8f11c"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "toml_edit"
+version = "0.22.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41fe8c660ae4257887cf66394862d21dbca4a6ddd26f04a3560410406a2f819a"
+dependencies = [
+ "indexmap 2.14.0",
+ "serde",
+ "serde_spanned",
+ "toml_datetime",
+ "toml_write",
+ "winnow",
+]
+
+[[package]]
+name = "toml_write"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
+
+[[package]]
 name = "tonic"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3017,6 +3127,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "ureq"
+version = "2.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
+dependencies = [
+ "base64",
+ "flate2",
+ "log",
+ "once_cell",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "url",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3146,6 +3274,15 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.8",
 ]
 
 [[package]]
@@ -3318,6 +3455,15 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "winnow"
+version = "0.7.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "writeable"

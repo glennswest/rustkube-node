@@ -13,6 +13,10 @@ license.workspace = true
 # almost nothing.
 stormpump = { git = "https://github.com/glennswest/stormpump", branch = "main" }
 stormpump-abi = { git = "https://github.com/glennswest/stormpump", branch = "main" }
+# The VM object, its conversion from a Kubernetes object, and the plan that
+# turns it into a stormpump spec. Libraries: the loop is this kubelet's.
+stormvm-spec = { git = "https://github.com/glennswest/stormvm", branch = "main" }
+stormvm-node = { git = "https://github.com/glennswest/stormvm", branch = "main" }
 apimachinery = { workspace = true }
 cni = { workspace = true }
 tonic = { workspace = true }
