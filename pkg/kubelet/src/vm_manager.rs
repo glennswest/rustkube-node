@@ -44,6 +44,8 @@ pub struct Vm {
     pub namespace: String,
     pub name: String,
     pub uid: String,
+    /// Where this machine's output goes, so a failure can be quoted back.
+    pub log_dir: String,
     pub handle: Handle,
     /// What was cloned or attached for it, so it can be given back.
     pub disks: Vec<ResolvedDisk>,
@@ -226,6 +228,7 @@ impl VmManager {
             namespace: ns,
             name: vm.name.clone(),
             uid: uid.to_string(),
+            log_dir: dir.clone(),
             handle,
             disks,
             phase: Phase::Running,
@@ -265,7 +268,14 @@ impl VmManager {
             let mut done = vm.clone();
             done.phase = if code == 0 { Phase::Succeeded } else { Phase::Failed };
             done.exit_code = code;
-            done.message = format!("the hypervisor exited with {code}");
+            done.message = match (code, hypervisor_said(&vm.log_dir)) {
+                // **What it said, not that it failed.** "the hypervisor exited
+                // with 1" is true and useless: the reason is in a file on a
+                // node with no shell, and reading it has cost this stack whole
+                // rebuild-and-boot cycles more than once.
+                (c, Some(said)) if c != 0 => format!("the hypervisor exited with {c}: {said}"),
+                (c, _) => format!("the hypervisor exited with {c}"),
+            };
             info!(vm = %done.name, code, "vm ended");
             self.release(&done.disks).await;
             if let Some(r) = self.ring.clone() {
@@ -453,6 +463,7 @@ impl VmManager {
             namespace: obj["metadata"]["namespace"].as_str().unwrap_or("default").into(),
             name: obj["metadata"]["name"].as_str().unwrap_or_default().into(),
             uid: uid.to_string(),
+            log_dir: String::new(),
             handle: Handle::NONE,
             disks: Vec::new(),
             phase: Phase::Failed,
@@ -509,6 +520,34 @@ impl VmManager {
         }
         serde_json::from_str(&text).map_err(|e| format!("{e}: {text}"))
     }
+}
+
+/// The last thing the hypervisor printed before it went.
+///
+/// Bounded and best-effort: a log that cannot be read is not a reason to lose
+/// the exit code as well, and a status message is not the place for a
+/// megabyte. The tail rather than the head — a hypervisor that refuses
+/// something says so last, after whatever it managed first.
+fn hypervisor_said(log_dir: &str) -> Option<String> {
+    const KEEP: usize = 400;
+    if log_dir.is_empty() {
+        return None;
+    }
+    let text = std::fs::read_to_string(format!("{log_dir}/hypervisor.log")).ok()?;
+    let tail: String = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("; ");
+    if tail.is_empty() {
+        return None;
+    }
+    Some(tail.chars().take(KEEP).collect())
 }
 
 /// The VMIs the apiserver says belong on this node.
@@ -595,6 +634,33 @@ mod tests {
         assert_eq!(decode(2 | ((3 << 8) << 8)), Some(3));
         // SIGKILL is 9 in the low seven bits.
         assert_eq!(decode(2 | (9 << 8)), Some(137));
+    }
+
+    /// The reason a hypervisor gave, quoted back — the whole point being that
+    /// "exited with 1" is true and useless when the explanation is in a file
+    /// on a node with no shell.
+    #[test]
+    fn what_the_hypervisor_said_reaches_the_status() {
+        let dir = std::env::temp_dir().join(format!("vmtest-log-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hypervisor.log");
+        std::fs::write(
+            &path,
+            "qemu-system-x86_64: warning: something\n\n             qemu-system-x86_64: -blockdev: could not open '/dev/ublkb9': No such file\n",
+        )
+        .unwrap();
+        let said = hypervisor_said(dir.to_str().unwrap()).unwrap();
+        assert!(said.contains("could not open"), "{said}");
+        assert!(!said.contains("\n\n"), "blank lines are not information: {said}");
+
+        // A log that cannot be read must not cost the exit code as well.
+        assert_eq!(hypervisor_said("/nonexistent/dir"), None);
+        assert_eq!(hypervisor_said(""), None);
+
+        // An empty log says nothing rather than an empty quote.
+        std::fs::write(&path, "\n\n").unwrap();
+        assert_eq!(hypervisor_said(dir.to_str().unwrap()), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A VM with no uid cannot be told apart from the next one of the same
