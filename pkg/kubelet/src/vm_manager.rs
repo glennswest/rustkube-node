@@ -314,10 +314,13 @@ impl VmManager {
                     }
                 }
                 DiskSource::Volume(v) => v.clone(),
-                DiskSource::CloudInit => {
-                    self.release(&done).await;
-                    return Err(format!("disk {}: cloud-init disks are not generated yet", d.name));
-                }
+                DiskSource::CloudInit => match self.seed_volume(vm).await {
+                    Ok(id) => id,
+                    Err(e) => {
+                        self.release(&done).await;
+                        return Err(format!("disk {}: {e}", d.name));
+                    }
+                },
             };
             // No node in the request. This kubelet is asking the stormblock
             // *on this node* to attach a volume *here*; naming the node adds a
@@ -354,6 +357,83 @@ impl VmManager {
             });
         }
         Ok(done)
+    }
+
+    /// Build this VM's cloud-init seed.
+    ///
+    /// **A cloud image has no password and no keys**, by design: it becomes
+    /// *this* machine by reading a seed. The seed is a small filesystem
+    /// labelled `cidata` holding `meta-data`, `user-data` and (when the
+    /// network is not DHCP) `network-config` — cloud-init finds it by that
+    /// label and by nothing else.
+    ///
+    /// It is built the way everything else here is: a template formatted once
+    /// per node, a copy-on-write clone per VM, and the files written through
+    /// stormblock, which writes into an ext4 image directly with no mount and
+    /// no loop device. Writing an ISO 9660 here would mean a filesystem writer
+    /// in the kubelet, which is the thing this ecosystem has learned not to
+    /// duplicate.
+    ///
+    /// The hostname comes from the **definition** — the VM's `hostname` or its
+    /// name — never from a lease. A guest that takes its name from DHCP is a
+    /// guest whose identity changes when the network does, and its
+    /// certificates and logs change with it.
+    async fn seed_volume(&self, vm: &VmSpec) -> Result<String, String> {
+        let seed = stormvm_cloudinit::Seed::for_vm(vm);
+        let template = self.ensure_seed_template().await?;
+
+        // A clone per VM, named after it, so a start that is retried finds its
+        // own seed rather than making a second.
+        let body = json!({ "name": format!("{}-seed", vm.name), "verify": true });
+        let clone = self
+            .post(&format!("{}/api/v1/volumes/{template}/clone", self.storage), &body)
+            .await
+            .map_err(|e| format!("cloning the cidata template: {e}"))?;
+        let id = clone["id"]
+            .as_str()
+            .ok_or_else(|| format!("stormblock returned no volume for the seed: {clone}"))?
+            .to_string();
+
+        let files: Vec<Value> = seed
+            .files()
+            .into_iter()
+            .map(|(name, content)| json!({ "path": format!("/{name}"), "content": content }))
+            .collect();
+        self.post(
+            &format!("{}/api/v1/volumes/{id}/files", self.storage),
+            &json!({ "files": files }),
+        )
+        .await
+        .map_err(|e| format!("writing the seed: {e}"))?;
+        Ok(id)
+    }
+
+    /// The template every seed is cloned from, made once per node.
+    ///
+    /// Idempotent by name: two VMs starting at once both ask, and the second
+    /// must find the first's rather than build a second template.
+    async fn ensure_seed_template(&self) -> Result<String, String> {
+        let url = format!("{}/api/v1/fstemplates", self.storage);
+        if let Ok(r) = self.http.get(&format!("{url}/cidata")).send().await {
+            if r.status().is_success() {
+                if let Ok(v) = r.json::<Value>().await {
+                    if let Some(id) = v["id"].as_str() {
+                        return Ok(id.to_string());
+                    }
+                }
+            }
+        }
+        // 8 MiB: the three files are a few hundred bytes and the smallest ext4
+        // mke2fs will make is already larger than they need.
+        let body = json!({ "name": "cidata", "size": "8M", "label": "cidata" });
+        let v = self
+            .post(&url, &body)
+            .await
+            .map_err(|e| format!("creating the cidata template: {e}"))?;
+        v["id"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| format!("stormblock returned no template: {v}"))
     }
 
     /// Best effort: a start that has already gone wrong must not be made worse
