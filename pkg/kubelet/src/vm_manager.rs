@@ -37,6 +37,12 @@ use stormvm_spec::{DiskSource, VmSpec};
 const LOG_ROOT: &str = "/var/log/pods";
 /// Per-VM sockets: the serial console and the hypervisor's control socket.
 const RUN_ROOT: &str = "/run/stormvm";
+/// The bridge a VM lands on when its network does not name one.
+///
+/// A bridge of the node's own rather than the node's uplink: attaching taps
+/// directly to the interface carrying the node's address would put the node's
+/// own connectivity in the blast radius of a VM start.
+const DEFAULT_BRIDGE: &str = "stormbr0";
 
 /// One VM this node is running, or has run.
 #[derive(Debug, Clone)]
@@ -186,8 +192,19 @@ impl VmManager {
         let run = format!("{RUN_ROOT}/{}", vm.name);
         let _ = std::fs::create_dir_all(&run);
 
+        // NICs, before the plan: the tap has to exist so its descriptor can
+        // be named, and it has to be deposited so the engine can find it by
+        // that name.
+        let nics = match self.resolve_nics(&vm, &ring).await {
+            Ok(n) => n,
+            Err(e) => {
+                self.release(&disks).await;
+                return Err(e);
+            }
+        };
+
         let logging = Logging::pod(&dir, 0);
-        let built = match plan::build(&vm, &disks, &logging, RUN_ROOT) {
+        let built = match plan::build_with_nics(&vm, &disks, &nics, &logging, RUN_ROOT) {
             Ok(p) => p,
             Err(e) => {
                 self.release(&disks).await;
@@ -367,6 +384,69 @@ impl VmManager {
             });
         }
         Ok(done)
+    }
+
+    /// Make this VM's NICs and hand their descriptors to the engine.
+    ///
+    /// **The node makes the tap; the hypervisor inherits it.** Creating one
+    /// needs CAP_NET_ADMIN, and a VMM that could do it would hold that
+    /// capability for the whole life of a guest running a foreign operating
+    /// system.
+    ///
+    /// One tap per declared interface, in order — a VM with three NICs gets
+    /// three, each on the bridge its network names, which is what makes a
+    /// machine on the storage network and a machine on the pod network differ
+    /// only in a bridge name.
+    async fn resolve_nics(
+        &self,
+        vm: &VmSpec,
+        ring: &Arc<RingClient>,
+    ) -> Result<Vec<plan::ResolvedNic>, String> {
+        use stormvm_spec::NetworkAttachment;
+
+        let mut out = Vec::new();
+        for i in &vm.interfaces {
+            let bridge = match &i.network {
+                NetworkAttachment::Bridged(b) => b.clone(),
+                // The node's own network, which needs a bridge carrying the
+                // uplink. Named rather than guessed: attaching a tap to the
+                // wrong interface takes the node off the network.
+                NetworkAttachment::Host => DEFAULT_BRIDGE.to_string(),
+                // Not yet: a VM on the pod network wants a sandbox's namespace
+                // and a tap bridged to the veth in it — the same tap, made
+                // somewhere else. Refused by name rather than silently given a
+                // different network.
+                other => {
+                    return Err(format!(
+                        "interface {}: network {other} is not wired yet on this node",
+                        i.name
+                    ))
+                }
+            };
+            let name = crate::vm_net::tap_name(&vm.name, &i.name);
+            let mac = i
+                .mac
+                .clone()
+                .filter(|m| m != "auto")
+                .unwrap_or_else(|| crate::vm_net::mac_for(&vm.name, &i.name));
+
+            let fd = crate::vm_net::tap_on_bridge(&name, &bridge)
+                .map_err(|e| format!("interface {}: {e}", i.name))?;
+            let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
+            // The name the spec claims it under. `tap-<nic>` is what the
+            // driver puts in `Render.fds`, and the two have to agree or the
+            // engine looks up a name nobody deposited.
+            let slot = format!("tap-{}", i.name);
+            let r = ring.clone();
+            let deposit_name = slot.clone();
+            tokio::task::spawn_blocking(move || r.deposit_fd(&deposit_name, fd))
+                .await
+                .map_err(|e| format!("deposit task: {e}"))?
+                .map_err(|e| format!("interface {}: {e:?}", i.name))?;
+
+            out.push(plan::ResolvedNic { name: i.name.clone(), tap_fd: raw, mac });
+        }
+        Ok(out)
     }
 
     /// Build this VM's cloud-init seed.
