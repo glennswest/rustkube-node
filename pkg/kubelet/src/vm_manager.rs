@@ -427,8 +427,8 @@ impl VmManager {
         if let Ok(r) = self.http.get(&format!("{url}/cidata")).send().await {
             if r.status().is_success() {
                 if let Ok(v) = r.json::<Value>().await {
-                    if let Some(id) = v["id"].as_str() {
-                        return Ok(id.to_string());
+                    if let Some(id) = sealed_volume_of(&v) {
+                        return Ok(id);
                     }
                 }
             }
@@ -440,10 +440,8 @@ impl VmManager {
             .post(&url, &body)
             .await
             .map_err(|e| format!("creating the cidata template: {e}"))?;
-        v["id"]
-            .as_str()
-            .map(String::from)
-            .ok_or_else(|| format!("stormblock returned no template: {v}"))
+        sealed_volume_of(&v)
+            .ok_or_else(|| format!("stormblock returned no template volume: {v}"))
     }
 
     /// Best effort: a start that has already gone wrong must not be made worse
@@ -520,6 +518,20 @@ impl VmManager {
         }
         serde_json::from_str(&text).map_err(|e| format!("{e}: {text}"))
     }
+}
+
+/// The **volume** behind an fstemplate, which is what a clone is taken from.
+///
+/// Two things were wrong the first time: the response wraps the template in a
+/// `template` object, and a template's own `id` is not a volume — the thing to
+/// clone is its sealed volume. Cloning the template id came back as "no
+/// volume", which is true and reads as though the template were missing.
+fn sealed_volume_of(v: &Value) -> Option<String> {
+    let t = if v["template"].is_object() { &v["template"] } else { v };
+    t["sealed_volume_id"]
+        .as_str()
+        .or_else(|| t["raw_volume_id"].as_str())
+        .map(String::from)
 }
 
 /// The last thing the hypervisor printed before it went.
@@ -634,6 +646,28 @@ mod tests {
         assert_eq!(decode(2 | ((3 << 8) << 8)), Some(3));
         // SIGKILL is 9 in the low seven bits.
         assert_eq!(decode(2 | (9 << 8)), Some(137));
+    }
+
+    /// A template's own id is not a volume, and the response wraps it — both
+    /// of which made a working template read as a missing one.
+    #[test]
+    fn the_seed_template_resolves_to_its_sealed_volume() {
+        let wrapped = json!({ "template": {
+            "id": "9b91e307-cd65-483b-b90b-ffd389e8b24b",
+            "name": "cidata",
+            "sealed_volume_id": "6f7228ca-7e6a-4a54-93e3-82f3b0bb4fe9",
+            "raw_volume_id": null,
+            "state": "ready"
+        }});
+        assert_eq!(
+            sealed_volume_of(&wrapped).as_deref(),
+            Some("6f7228ca-7e6a-4a54-93e3-82f3b0bb4fe9"),
+            "the sealed volume is what a clone comes from, not the template id"
+        );
+        // Unwrapped, and a template that has only a raw volume yet.
+        let raw = json!({ "id": "t", "raw_volume_id": "r", "sealed_volume_id": null });
+        assert_eq!(sealed_volume_of(&raw).as_deref(), Some("r"));
+        assert_eq!(sealed_volume_of(&json!({ "id": "t" })), None);
     }
 
     /// The reason a hypervisor gave, quoted back — the whole point being that
