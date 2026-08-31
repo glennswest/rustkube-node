@@ -142,6 +142,20 @@ impl VmManager {
             want.push((uid, obj.clone()));
         }
 
+        // Stops before starts. A deleted VMI's replacement derives the same
+        // tap name, and a tap exists while any process holds its descriptor —
+        // so starting first raced the old hypervisor's exit and failed with
+        // EBUSY on a tap that was already dying.
+        let keep: Vec<String> = want.iter().map(|(u, _)| u.clone()).collect();
+        let gone: Vec<Vm> = {
+            let vms = self.vms.lock().await;
+            vms.values().filter(|v| !keep.contains(&v.uid)).cloned().collect()
+        };
+        for vm in gone {
+            self.stop(&vm).await;
+            self.vms.lock().await.remove(&vm.uid);
+        }
+
         for (uid, obj) in &want {
             if self.vms.lock().await.contains_key(uid) {
                 continue;
@@ -152,16 +166,6 @@ impl VmManager {
                 warn!("{ns}/{name}: {e}");
                 self.record_failure(uid, obj, &e).await;
             }
-        }
-
-        let keep: Vec<String> = want.iter().map(|(u, _)| u.clone()).collect();
-        let gone: Vec<Vm> = {
-            let vms = self.vms.lock().await;
-            vms.values().filter(|v| !keep.contains(&v.uid)).cloned().collect()
-        };
-        for vm in gone {
-            self.stop(&vm).await;
-            self.vms.lock().await.remove(&vm.uid);
         }
     }
 
@@ -310,7 +314,31 @@ impl VmManager {
             // A machine gets a real grace period: ACPI shutdown, then a kill.
             // Thirty seconds is what a guest needs to flush and unmount, and
             // the timer is the engine's so it survives this process.
-            let _ = tokio::task::spawn_blocking(move || ring.stop(handle, 30)).await;
+            let r0 = ring.clone();
+            let _ = tokio::task::spawn_blocking(move || r0.stop(handle, 30)).await;
+            // And the stop is not over until the machine is gone. Removing
+            // the record is what lets a same-name VM start, and its tap
+            // exists while the hypervisor holds the descriptor — returning
+            // early hands the successor EBUSY on a dying tap. The deadline
+            // sits past the engine's own grace, so its kill has fired
+            // before this gives up; exit itself frees the tap, so a reaped
+            // status is not waited for beyond that.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
+            loop {
+                let r = ring.clone();
+                let answer = tokio::task::spawn_blocking(move || r.query(handle)).await;
+                match answer {
+                    Ok(Ok(cqe)) if cqe.aux & 0xff != 2 => {}
+                    // Exited, or the engine no longer knows the handle —
+                    // either way the machine is gone.
+                    _ => break,
+                }
+                if std::time::Instant::now() >= deadline {
+                    warn!(vm = %vm.name, "still running past its grace period; moving on");
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
         }
         self.release(&vm.disks).await;
         info!(vm = %vm.name, "vm stopped");
