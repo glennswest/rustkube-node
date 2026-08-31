@@ -372,17 +372,19 @@ impl VmManager {
     /// Build this VM's cloud-init seed.
     ///
     /// **A cloud image has no password and no keys**, by design: it becomes
-    /// *this* machine by reading a seed. The seed is a small filesystem
-    /// labelled `cidata` holding `meta-data`, `user-data` and (when the
-    /// network is not DHCP) `network-config` — cloud-init finds it by that
-    /// label and by nothing else.
+    /// *this* machine by reading a seed. The seed is a small **vfat** volume
+    /// labelled `CIDATA` holding `meta-data`, `user-data` and (when the
+    /// network is not DHCP) `network-config`.
     ///
-    /// It is built the way everything else here is: a template formatted once
-    /// per node, a copy-on-write clone per VM, and the files written through
-    /// stormblock, which writes into an ext4 image directly with no mount and
-    /// no loop device. Writing an ISO 9660 here would mean a filesystem writer
-    /// in the kubelet, which is the thing this ecosystem has learned not to
-    /// duplicate.
+    /// vfat, not ext4. NoCloud is documented as vfat or ISO 9660 and in
+    /// practice honours only those: an ext4 volume carrying the same label and
+    /// the same files produced `Did not find any data source, searched
+    /// classes: ()` inside an Alpine guest with the disk visible as `vdb`. The
+    /// label was genuinely on the disk — `blkid` said so — and it still was
+    /// not read.
+    ///
+    /// stormblock makes it in one call, so there is no template, no clone and
+    /// no filesystem writer here.
     ///
     /// The hostname comes from the **definition** — the VM's `hostname` or its
     /// name — never from a lease. A guest that takes its name from DHCP is a
@@ -390,61 +392,35 @@ impl VmManager {
     /// certificates and logs change with it.
     async fn seed_volume(&self, vm: &VmSpec) -> Result<String, String> {
         let seed = stormvm_cloudinit::Seed::for_vm(vm);
-        let template = self.ensure_seed_template().await?;
 
-        // A clone per VM, named after it, so a start that is retried finds its
-        // own seed rather than making a second.
-        let body = json!({ "name": format!("{}-seed", vm.name), "verify": true });
-        let clone = self
-            .post(&format!("{}/api/v1/volumes/{template}/clone", self.storage), &body)
+        // 16 MiB: the files are a few hundred bytes, and FAT16 needs enough
+        // clusters to be FAT16 at all. Thin, so it costs what it holds.
+        let body = json!({
+            "name": format!("{}-seed", vm.name),
+            "size": "16M",
+            "redundancy": "none",
+        });
+        let v = self
+            .post(&format!("{}/api/v1/volumes", self.storage), &body)
             .await
-            .map_err(|e| format!("cloning the cidata template: {e}"))?;
-        let id = clone["id"]
+            .map_err(|e| format!("creating the seed volume: {e}"))?;
+        let id = v["id"]
             .as_str()
-            .ok_or_else(|| format!("stormblock returned no volume for the seed: {clone}"))?
+            .ok_or_else(|| format!("stormblock returned no volume: {v}"))?
             .to_string();
 
         let files: Vec<Value> = seed
             .files()
             .into_iter()
-            // `contents`, not `content`: the field serde is looking for. The
-            // wrong name is ignored rather than rejected, so it wrote three
-            // files of zero bytes and the guest booted with an empty seed.
-            .map(|(name, content)| json!({ "path": format!("/{name}"), "contents": content }))
+            .map(|(name, contents)| json!({ "path": name, "contents": contents }))
             .collect();
         self.post(
-            &format!("{}/api/v1/volumes/{id}/files", self.storage),
-            &json!({ "files": files }),
+            &format!("{}/api/v1/volumes/{id}/cidata", self.storage),
+            &json!({ "files": files, "label": "CIDATA" }),
         )
         .await
         .map_err(|e| format!("writing the seed: {e}"))?;
         Ok(id)
-    }
-
-    /// The template every seed is cloned from, made once per node.
-    ///
-    /// Idempotent by name: two VMs starting at once both ask, and the second
-    /// must find the first's rather than build a second template.
-    async fn ensure_seed_template(&self) -> Result<String, String> {
-        let url = format!("{}/api/v1/fstemplates", self.storage);
-        if let Ok(r) = self.http.get(&format!("{url}/cidata")).send().await {
-            if r.status().is_success() {
-                if let Ok(v) = r.json::<Value>().await {
-                    if let Some(id) = sealed_volume_of(&v) {
-                        return Ok(id);
-                    }
-                }
-            }
-        }
-        // 8 MiB: the three files are a few hundred bytes and the smallest ext4
-        // mke2fs will make is already larger than they need.
-        let body = json!({ "name": "cidata", "size": "8M", "label": "cidata" });
-        let v = self
-            .post(&url, &body)
-            .await
-            .map_err(|e| format!("creating the cidata template: {e}"))?;
-        sealed_volume_of(&v)
-            .ok_or_else(|| format!("stormblock returned no template volume: {v}"))
     }
 
     /// Best effort: a start that has already gone wrong must not be made worse
@@ -521,20 +497,6 @@ impl VmManager {
         }
         serde_json::from_str(&text).map_err(|e| format!("{e}: {text}"))
     }
-}
-
-/// The **volume** behind an fstemplate, which is what a clone is taken from.
-///
-/// Two things were wrong the first time: the response wraps the template in a
-/// `template` object, and a template's own `id` is not a volume — the thing to
-/// clone is its sealed volume. Cloning the template id came back as "no
-/// volume", which is true and reads as though the template were missing.
-fn sealed_volume_of(v: &Value) -> Option<String> {
-    let t = if v["template"].is_object() { &v["template"] } else { v };
-    t["sealed_volume_id"]
-        .as_str()
-        .or_else(|| t["raw_volume_id"].as_str())
-        .map(String::from)
 }
 
 /// The last thing the hypervisor printed before it went.
@@ -649,28 +611,6 @@ mod tests {
         assert_eq!(decode(2 | ((3 << 8) << 8)), Some(3));
         // SIGKILL is 9 in the low seven bits.
         assert_eq!(decode(2 | (9 << 8)), Some(137));
-    }
-
-    /// A template's own id is not a volume, and the response wraps it — both
-    /// of which made a working template read as a missing one.
-    #[test]
-    fn the_seed_template_resolves_to_its_sealed_volume() {
-        let wrapped = json!({ "template": {
-            "id": "9b91e307-cd65-483b-b90b-ffd389e8b24b",
-            "name": "cidata",
-            "sealed_volume_id": "6f7228ca-7e6a-4a54-93e3-82f3b0bb4fe9",
-            "raw_volume_id": null,
-            "state": "ready"
-        }});
-        assert_eq!(
-            sealed_volume_of(&wrapped).as_deref(),
-            Some("6f7228ca-7e6a-4a54-93e3-82f3b0bb4fe9"),
-            "the sealed volume is what a clone comes from, not the template id"
-        );
-        // Unwrapped, and a template that has only a raw volume yet.
-        let raw = json!({ "id": "t", "raw_volume_id": "r", "sealed_volume_id": null });
-        assert_eq!(sealed_volume_of(&raw).as_deref(), Some("r"));
-        assert_eq!(sealed_volume_of(&json!({ "id": "t" })), None);
     }
 
     /// The reason a hypervisor gave, quoted back — the whole point being that
