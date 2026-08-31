@@ -407,7 +407,10 @@ impl VmManager {
         let files: Vec<Value> = seed
             .files()
             .into_iter()
-            .map(|(name, content)| json!({ "path": format!("/{name}"), "content": content }))
+            // `contents`, not `content`: the field serde is looking for. The
+            // wrong name is ignored rather than rejected, so it wrote three
+            // files of zero bytes and the guest booted with an empty seed.
+            .map(|(name, content)| json!({ "path": format!("/{name}"), "contents": content }))
             .collect();
         self.post(
             &format!("{}/api/v1/volumes/{id}/files", self.storage),
