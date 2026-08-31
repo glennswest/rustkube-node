@@ -45,6 +45,19 @@ struct Request {
     reply: mpsc::Sender<Result<Cqe, RingError>>,
 }
 
+/// A descriptor to hand the engine, under a name.
+///
+/// A separate message rather than part of `Request` because it does not go
+/// through the ring at all: a descriptor cannot travel through shared memory,
+/// so it goes over the attach socket with `SCM_RIGHTS` — and that socket is
+/// owned by the ring thread, which is the only reason this is a message
+/// instead of a method call.
+struct Deposit {
+    name: String,
+    fd: std::os::fd::OwnedFd,
+    reply: mpsc::Sender<Result<(), RingError>>,
+}
+
 #[derive(Debug)]
 pub enum RingError {
     /// A failure that has already been described, with detail the caller had
@@ -185,6 +198,7 @@ impl RingClient {
             .map_err(|e| RingError::Attach(format!("{socket}: {e}")))?;
 
         let (tx, rx) = mpsc::channel::<Request>();
+        let (dep_tx, dep_rx) = mpsc::channel::<Deposit>();
         let (exit_tx, exits) = mpsc::channel::<Exited>();
         let submit = attached.submit;
         let complete = attached.complete;
@@ -207,13 +221,14 @@ impl RingClient {
                 // The stream is held for the life of the thread: dropping it
                 // closes the connection, and the engine takes that as the
                 // client having gone away.
-                let _stream = attached.stream;
-                run(mapping, rx, exit_tx, submit, complete);
+                let stream = attached.stream;
+                run(mapping, rx, dep_rx, &stream, exit_tx, submit, complete);
             })
             .map_err(|e| RingError::Attach(format!("starting the ring thread: {e}")))?;
 
         Ok(RingClient {
             tx: std::sync::Mutex::new(tx),
+            deposits: std::sync::Mutex::new(dep_tx),
             exits: std::sync::Mutex::new(exits),
         })
     }
@@ -234,6 +249,26 @@ impl RingClient {
         // Outside the lock: another caller must be able to submit while this
         // one waits, or the ring serialises on the client rather than on the
         // engine.
+        answer.recv().map_err(|_| RingError::Gone)?
+    }
+
+    /// Hand the engine a descriptor, under a name a spec can claim.
+    ///
+    /// **This is how a workload gets something it could not open itself** — a
+    /// tap, a vhost descriptor, a socket the client already holds. Making a
+    /// tap needs CAP_NET_ADMIN; a hypervisor that could make its own would
+    /// hold that capability for the life of the guest, so the node makes it
+    /// and passes the descriptor instead.
+    ///
+    /// The name is the whole binding: the spec says "the tap for eth0 arrives
+    /// on fd 9", and this says which descriptor that name means.
+    pub fn deposit_fd(&self, name: &str, fd: std::os::fd::OwnedFd) -> Result<(), RingError> {
+        let (reply, answer) = mpsc::channel();
+        {
+            let tx = self.deposits.lock().map_err(|_| RingError::Gone)?;
+            tx.send(Deposit { name: name.to_string(), fd, reply })
+                .map_err(|_| RingError::Gone)?;
+        }
         answer.recv().map_err(|_| RingError::Gone)?
     }
 
@@ -443,6 +478,8 @@ const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 fn run(
     mut mapping: Mapping,
     rx: mpsc::Receiver<Request>,
+    deposits: mpsc::Receiver<Deposit>,
+    stream: &std::os::unix::net::UnixStream,
     exits: mpsc::Sender<Exited>,
     submit: i32,
     complete: i32,
@@ -457,6 +494,23 @@ fn run(
     loop {
         // Take one request if there is one, without blocking so completions
         // for work already submitted keep flowing.
+        // Descriptors first, and out of band: they do not go through the ring
+        // at all, and a spawn that names one must not be submitted before the
+        // engine has it.
+        while let Ok(dep) = deposits.try_recv() {
+            let result = stormpump::transport::deposit_fd(
+                stream,
+                &dep.name,
+                std::os::fd::AsRawFd::as_raw_fd(&dep.fd),
+            )
+            .map_err(|e| RingError::Detail(format!("depositing {}: {e}", dep.name)));
+            // The descriptor is dropped here, after the send: the engine has
+            // its own copy from SCM_RIGHTS, and holding ours would leak one
+            // per NIC per VM.
+            drop(dep.fd);
+            let _ = dep.reply.send(result);
+        }
+
         match rx.recv_timeout(std::time::Duration::from_millis(2)) {
             Ok(req) => {
                 let id = next_id;
