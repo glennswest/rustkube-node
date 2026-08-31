@@ -170,6 +170,10 @@ pub struct RingClient {
     /// Named rather than derived: a `Debug` that dumps channel internals says
     /// nothing useful, and `unwrap_err()` in a test needs one.
     tx: std::sync::Mutex<mpsc::Sender<Request>>,
+    /// Descriptors to hand over. Its own channel because a descriptor does not
+    /// travel through the ring — `SCM_RIGHTS` on the attach socket is the only
+    /// way, and that socket belongs to the ring thread.
+    deposits: std::sync::Mutex<mpsc::Sender<Deposit>>,
     exits: std::sync::Mutex<mpsc::Receiver<Exited>>,
 }
 
