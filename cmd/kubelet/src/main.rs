@@ -136,6 +136,46 @@ struct Cli {
 
 /// Read a file to bytes, warning (not failing) if it can't be read — matches
 /// the best-effort handling of the other credential files.
+/// Read a CA that the boot may not have written yet.
+///
+/// Bounded, because a wait that never ends is a node that never says why it is
+/// not up; and fatal at the end of it, because a trust anchor that was named
+/// on the command line and is not on disk is a misconfiguration this process
+/// cannot work around.
+async fn wait_for_ca(path: &str) -> anyhow::Result<Vec<u8>> {
+    const LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+    let started = std::time::Instant::now();
+    let mut said = false;
+    loop {
+        match std::fs::read(path) {
+            // An empty file is a write in progress, not an anchor.
+            Ok(b) if !b.is_empty() => {
+                if said {
+                    tracing::info!(
+                        "apiserver CA {path} appeared after {:.1}s",
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+                return Ok(b);
+            }
+            _ => {}
+        }
+        if started.elapsed() >= LIMIT {
+            anyhow::bail!(
+                "--apiserver-ca {path} was named but is still not readable after {}s. \
+                 Without it this kubelet cannot verify the apiserver and would retry \
+                 forever without saying why",
+                LIMIT.as_secs()
+            );
+        }
+        if !said {
+            tracing::warn!("apiserver CA {path} is not there yet — waiting for it");
+            said = true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
 fn read_file_bytes(path: &str) -> Option<Vec<u8>> {
     match std::fs::read(path) {
         Ok(b) => Some(b),
@@ -330,11 +370,37 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
-    let apiserver_ca = cli
-        .apiserver_ca
-        .as_deref()
-        .and_then(read_file_bytes)
-        .or_else(|| kubeconfig.as_ref().and_then(|k| k.ca_pem.clone()));
+    // A trust anchor that was asked for and is not there **yet**.
+    //
+    // `read_file_bytes` answers `None` for a missing file, and `None` here
+    // means "no CA", so an explicitly configured anchor that had not been
+    // written yet turned into a client that trusts only the public roots and
+    // can therefore never verify this cluster's apiserver. Nothing rebuilds
+    // that client, so the node retried registration every thirty seconds for
+    // the life of the boot:
+    //
+    //   WARN kubelet: Node registration failed (error sending request for url
+    //        (https://192.168.30.2:6443/api/v1/nodes)); retrying in 30s
+    //
+    // and nothing ever scheduled, because the apiserver had no node. On the
+    // machine this was found on the margin was two seconds — the kubelet
+    // started at 20:25:01.81 and `stormcert-init` wrote `ca.crt` at 20:25:03 —
+    // and both are started by the same boot, so the order is not something
+    // either one controls.
+    //
+    // The message made it worse: `reqwest` reports a TLS trust failure as
+    // "error sending request for url", naming neither TLS nor the
+    // certificate, so it reads exactly like the network being down. `curl`
+    // with the same CA, the same URL and the same network namespace answered
+    // HTTP 200 the whole time.
+    //
+    // So an anchor that was named is waited for, briefly, and its continued
+    // absence is fatal rather than silent. A path that was given and cannot
+    // be read is a misconfiguration; only the delay is transient.
+    let apiserver_ca = match cli.apiserver_ca.as_deref() {
+        Some(path) => Some(wait_for_ca(path).await?),
+        None => kubeconfig.as_ref().and_then(|k| k.ca_pem.clone()),
+    };
     let client_cert = cli
         .client_certificate
         .as_deref()
