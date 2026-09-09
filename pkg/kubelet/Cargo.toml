@@ -29,6 +29,8 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = { workspace = true }
 rcgen = "0.13"
 tokio = { workspace = true }
+# ReceiverStream, so a followed log can be handed to axum as a body stream.
+tokio-stream = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

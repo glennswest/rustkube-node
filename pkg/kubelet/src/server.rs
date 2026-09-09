@@ -1,9 +1,10 @@
 //! The kubelet's inbound HTTP server (upstream `:10250`).
 //!
-//! Minimal today: liveness, a Prometheus `/metrics` endpoint, and `/pods`
-//! (the pods this kubelet manages). Exec/attach/portforward and
-//! `/stats/summary` are follow-ups (rustkube-node#7). Plain HTTP for now;
-//! TLS + bearer-token auth is the TLS phase (rustkube-node#9).
+//! Liveness, a Prometheus `/metrics` endpoint, `/stats/summary`, `/pods` (the
+//! pods this kubelet manages) and `/containerLogs` — the endpoint the
+//! apiserver proxies `kubectl logs` to (rustkube-node#34). Exec, attach and
+//! portforward are follow-ups (rustkube-node#7). Served over HTTPS with
+//! bearer-token auth (rustkube-node#9).
 
 use crate::pod_manager::PodManager;
 use axum::extract::{Path, Query, Request, State};
@@ -438,6 +439,7 @@ mod tests {
     }
 }
 
+
 /// `GET /containerLogs/{namespace}/{pod}/{container}` — what `kubectl logs`
 /// ultimately reads.
 ///
@@ -450,70 +452,201 @@ mod tests {
 /// The pod's UID is not in the URL, so it is resolved from the kubelet's own
 /// view of its pods — which is also what makes a request for a pod this node
 /// does not have a 404 rather than an empty body.
+///
+/// `follow=true` streams: the file as it stands is sent first, then whatever is
+/// appended to it, until the container is gone from this node or the client
+/// hangs up. That is the half of `kubectl logs -f` that lives here — the
+/// apiserver already passes the body through chunk by chunk (rustkube#55), so
+/// buffering on this side was what made `-f` print once and stop.
 async fn container_logs(
     State(pm): State<Arc<PodManager>>,
     Path((namespace, pod, container)): Path<(String, String, String)>,
     Query(opts): Query<LogOptions>,
-) -> impl IntoResponse {
-    let Some(uid) = pm.pod_uid(&namespace, &pod).await else {
-        return (
+) -> Response {
+    let path = match log_file(&pm, &namespace, &pod, &container, &opts).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+
+    // Read what is there now. Only up to the last newline: the runtime may be
+    // mid-line, and half a line followed by the rest of it arriving as a
+    // separate chunk would be indistinguishable from two lines.
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            return (StatusCode::NOT_FOUND, format!("cannot read {path}: {e}\n")).into_response()
+        }
+    };
+    let consumed = raw.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let mut budget = opts.limit_bytes;
+    let head = cap(filter_log(&raw[..consumed], &opts), &mut budget);
+
+    if !opts.follow.unwrap_or(false) {
+        return (StatusCode::OK, head).into_response();
+    }
+    if budget == Some(0) {
+        return (StatusCode::OK, head).into_response();
+    }
+
+    // Follow. A channel rather than a self-referential stream: the reader is a
+    // blocking file poll, and pushing into a bounded channel gives it
+    // backpressure from the client for free — a slow reader stalls the poll
+    // instead of growing a buffer.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(16);
+    if !head.is_empty() && tx.send(Ok(head.into_bytes())).await.is_err() {
+        return (StatusCode::OK, String::new()).into_response();
+    }
+    // `tailLines` applies to the log as it stood, not to each new line.
+    let opts = LogOptions { tail_lines: None, ..opts };
+    tokio::spawn(async move {
+        let mut offset = consumed as u64;
+        loop {
+            // The container going away is what ends `-f` upstream; without
+            // this the stream would hold open forever on a finished pod.
+            if pm.pod_uid(&namespace, &pod).await.is_none() {
+                return;
+            }
+            match tail_from(&path, &mut offset) {
+                Ok(chunk) if !chunk.is_empty() => {
+                    let out = cap(filter_log(&chunk, &opts), &mut budget);
+                    if !out.is_empty() && tx.send(Ok(out.into_bytes())).await.is_err() {
+                        return; // client hung up
+                    }
+                    if budget == Some(0) {
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                // A read error mid-follow (the file rotated out from under us,
+                // the mount went away) ends the stream rather than spinning.
+                Err(_) => return,
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(axum::body::Body::from_stream(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
+        .unwrap_or_else(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response()
+        })
+}
+
+/// Which file holds the run the caller asked for.
+///
+/// Restarts are numbered from 0, so the current run is the highest-numbered
+/// file and `previous` is the one below it — absent for a container that has
+/// never restarted, which is a 400 upstream rather than an empty success.
+async fn log_file(
+    pm: &PodManager,
+    namespace: &str,
+    pod: &str,
+    container: &str,
+    opts: &LogOptions,
+) -> Result<String, Response> {
+    let Some(uid) = pm.pod_uid(namespace, pod).await else {
+        return Err((
             StatusCode::NOT_FOUND,
             format!("pod {namespace}/{pod} not found on this node\n"),
-        );
+        )
+            .into_response());
     };
     let dir = format!("/var/log/pods/{namespace}_{pod}_{uid}/{container}");
+    let none = || {
+        (
+            StatusCode::NOT_FOUND,
+            format!("no logs for container {container} in {namespace}/{pod}\n"),
+        )
+            .into_response()
+    };
 
-    // `previous` asks for the run before the current one. Restarts are numbered
-    // from 0, so the current file is the highest and "previous" is the one
-    // below it — absent for a container that has never restarted, which is a
-    // 400 upstream rather than an empty success.
     let mut runs: Vec<u32> = match std::fs::read_dir(&dir) {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
             .filter_map(|e| {
-                e.file_name().to_str().and_then(|n| n.strip_suffix(".log")).and_then(|n| n.parse().ok())
+                e.file_name()
+                    .to_str()
+                    .and_then(|n| n.strip_suffix(".log"))
+                    .and_then(|n| n.parse().ok())
             })
             .collect(),
-        Err(_) => {
-            return (
-                StatusCode::NOT_FOUND,
-                format!("no logs for container {container} in {namespace}/{pod}\n"),
-            )
-        }
+        Err(_) => return Err(none()),
     };
     runs.sort_unstable();
     let want = if opts.previous.unwrap_or(false) {
         match runs.len().checked_sub(2).and_then(|i| runs.get(i)) {
             Some(r) => *r,
             None => {
-                return (
+                return Err((
                     StatusCode::BAD_REQUEST,
                     format!("container {container} has no previous run\n"),
                 )
+                    .into_response())
             }
         }
     } else {
         match runs.last() {
             Some(r) => *r,
-            None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    format!("no logs for container {container} in {namespace}/{pod}\n"),
-                )
-            }
+            None => return Err(none()),
         }
     };
+    Ok(format!("{dir}/{want}.log"))
+}
 
-    let path = format!("{dir}/{want}.log");
-    let body = match std::fs::read_to_string(&path) {
-        Ok(b) => b,
-        Err(e) => return (StatusCode::NOT_FOUND, format!("cannot read {path}: {e}\n")),
+/// Whole lines appended to `path` since `offset`, advancing `offset` past them.
+///
+/// A file shorter than the offset was truncated or replaced, so reading resumes
+/// at the start rather than returning nothing forever.
+fn tail_from(path: &str, offset: &mut u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    if len < *offset {
+        *offset = 0;
+    }
+    if len == *offset {
+        return Ok(String::new());
+    }
+    f.seek(SeekFrom::Start(*offset))?;
+    let mut buf = Vec::with_capacity((len - *offset) as usize);
+    f.take(len - *offset).read_to_end(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    // Stop at the last newline; a partial line stays for the next poll.
+    let whole = match text.rfind('\n') {
+        Some(i) => i + 1,
+        None => return Ok(String::new()),
     };
-    (StatusCode::OK, filter_log(&body, &opts))
+    *offset += whole as u64;
+    Ok(text[..whole].to_string())
+}
+
+/// Trim `s` to what is left of the `limitBytes` budget, spending it.
+///
+/// `None` is no limit. The cut is at a character boundary because the response
+/// is UTF-8 text and half a codepoint is not; upstream cuts at a byte and lets
+/// the client cope, which is worse for no gain.
+fn cap(s: String, budget: &mut Option<usize>) -> String {
+    let Some(left) = budget.as_mut() else {
+        return s;
+    };
+    if s.len() <= *left {
+        *left -= s.len();
+        return s;
+    }
+    let mut end = *left;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    *left = 0;
+    s[..end].to_string()
 }
 
 /// The query parameters `kubectl logs` sends.
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LogOptions {
     /// Only the last N lines.
@@ -526,16 +659,13 @@ struct LogOptions {
     timestamps: Option<bool>,
     /// The run before the current one.
     previous: Option<bool>,
-    /// Accepted and ignored: streaming is a separate change, and a client that
-    /// asks for it should get the log it asked for rather than an error.
-    #[allow(dead_code)]
+    /// Keep the response open and send what is appended.
     follow: Option<bool>,
-    /// Accepted and ignored — a byte cap on the response.
-    #[allow(dead_code)]
+    /// A byte cap on the response, counted after filtering.
     limit_bytes: Option<usize>,
 }
 
-/// Apply the CRI log-format options to a file's contents.
+/// Apply the CRI log-format options to a chunk of a log file.
 ///
 /// The CRI format is `<rfc3339nano> <stdout|stderr> <F|P> <line>`, and where a
 /// runtime writes it this strips the prefix unless `timestamps` was asked for.
@@ -600,4 +730,98 @@ fn filter_log(body: &str, opts: &LogOptions) -> String {
         s.push('\n');
     }
     s
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+
+    fn cri(lines: &[(&str, &str)]) -> String {
+        lines
+            .iter()
+            .map(|(ts, msg)| format!("{ts} stdout F {msg}\n"))
+            .collect()
+    }
+
+    #[test]
+    fn strips_the_cri_prefix_unless_timestamps_asked() {
+        let body = cri(&[("2026-09-09T00:00:01Z", "one"), ("2026-09-09T00:00:02Z", "two")]);
+        assert_eq!(filter_log(&body, &LogOptions::default()), "one\ntwo\n");
+        let with_ts = LogOptions { timestamps: Some(true), ..Default::default() };
+        assert_eq!(
+            filter_log(&body, &with_ts),
+            "2026-09-09T00:00:01Z one\n2026-09-09T00:00:02Z two\n"
+        );
+    }
+
+    #[test]
+    fn non_cri_lines_pass_through() {
+        // stormpump writes the container's bytes verbatim; dropping them
+        // because they have no timestamp would empty the log.
+        let opts = LogOptions { timestamps: Some(true), ..Default::default() };
+        assert_eq!(filter_log("raw line\n", &opts), "raw line\n");
+    }
+
+    #[test]
+    fn tail_lines_keeps_the_last_n() {
+        let body = "a\nb\nc\nd\n";
+        let opts = LogOptions { tail_lines: Some(2), ..Default::default() };
+        assert_eq!(filter_log(body, &opts), "c\nd\n");
+    }
+
+    #[test]
+    fn limit_bytes_spends_a_budget_across_chunks() {
+        let mut budget = Some(5);
+        assert_eq!(cap("abc".to_string(), &mut budget), "abc");
+        assert_eq!(budget, Some(2));
+        // The second chunk is cut short and the budget is now spent, which is
+        // what stops the follow loop.
+        assert_eq!(cap("defgh".to_string(), &mut budget), "de");
+        assert_eq!(budget, Some(0));
+    }
+
+    #[test]
+    fn limit_bytes_cuts_on_a_char_boundary() {
+        let mut budget = Some(2);
+        // "é" is two bytes: a one-byte budget must yield nothing, not half of it.
+        let mut one = Some(1);
+        assert_eq!(cap("é".to_string(), &mut one), "");
+        assert_eq!(cap("é".to_string(), &mut budget), "é");
+    }
+
+    #[test]
+    fn no_limit_passes_everything() {
+        let mut budget = None;
+        assert_eq!(cap("anything at all".to_string(), &mut budget), "anything at all");
+    }
+
+    #[test]
+    fn tail_from_returns_only_whole_lines_and_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("0.log");
+        let p = path.to_str().unwrap().to_string();
+        std::fs::write(&path, "one\ntwo\npart").unwrap();
+
+        let mut offset = 0u64;
+        assert_eq!(tail_from(&p, &mut offset).unwrap(), "one\ntwo\n");
+        assert_eq!(offset, 8);
+        // The partial line is not emitted until its newline arrives.
+        assert_eq!(tail_from(&p, &mut offset).unwrap(), "");
+        std::fs::write(&path, "one\ntwo\npartial\n").unwrap();
+        assert_eq!(tail_from(&p, &mut offset).unwrap(), "partial\n");
+    }
+
+    #[test]
+    fn tail_from_restarts_when_the_file_is_truncated() {
+        // A rotated or recreated log is shorter than where we were reading;
+        // holding the old offset would go silent for the life of the stream.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("0.log");
+        let p = path.to_str().unwrap().to_string();
+        std::fs::write(&path, "long first line\n").unwrap();
+        let mut offset = 0u64;
+        assert_eq!(tail_from(&p, &mut offset).unwrap(), "long first line\n");
+        std::fs::write(&path, "new\n").unwrap();
+        assert_eq!(tail_from(&p, &mut offset).unwrap(), "new\n");
+    }
 }
