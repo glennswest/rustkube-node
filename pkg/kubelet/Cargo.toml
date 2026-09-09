@@ -17,6 +17,10 @@ stormpump-abi = { git = "https://github.com/glennswest/stormpump", branch = "mai
 # turns it into a stormpump spec. Libraries: the loop is this kubelet's.
 stormvm-spec = { git = "https://github.com/glennswest/stormvm", branch = "main" }
 stormvm-node = { git = "https://github.com/glennswest/stormvm", branch = "main" }
+# Tap naming, MAC derivation and the ioctls that make one. Shared with the
+# standalone `stormvm start` path deliberately: the two must not derive
+# different names for one VM (rustkube-node#39).
+stormvm-net = { git = "https://github.com/glennswest/stormvm", branch = "main" }
 stormvm-cloudinit = { git = "https://github.com/glennswest/stormvm", branch = "main" }
 apimachinery = { workspace = true }
 cni = { workspace = true }

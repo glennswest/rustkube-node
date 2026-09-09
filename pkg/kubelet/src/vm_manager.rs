@@ -37,6 +37,16 @@ use stormvm_spec::{DiskSource, VmSpec};
 const LOG_ROOT: &str = "/var/log/pods";
 /// Per-VM sockets: the serial console and the hypervisor's control socket.
 const RUN_ROOT: &str = "/run/stormvm";
+
+/// Drop a machine's console registration.
+///
+/// Absent is success in `console::remove`, so a stop racing a failed start is
+/// not an error and this needs no "was it written?" bookkeeping.
+fn deregister(name: &str) {
+    if let Err(e) = stormvm_node::console::remove(RUN_ROOT, name) {
+        warn!(vm = %name, "could not drop the console registration: {e}");
+    }
+}
 /// The bridge a VM lands on when its network does not name one.
 ///
 /// A bridge of the node's own rather than the node's uplink: attaching taps
@@ -199,7 +209,7 @@ impl VmManager {
         // NICs, before the plan: the tap has to exist so its descriptor can
         // be named, and it has to be deposited so the engine can find it by
         // that name.
-        let nics = match self.resolve_nics(&vm, &ring).await {
+        let nics = match self.resolve_nics(&ns, &vm, &ring).await {
             Ok(n) => n,
             Err(e) => {
                 self.release(&disks).await;
@@ -208,9 +218,37 @@ impl VmManager {
         };
 
         let logging = Logging::pod(&dir, 0);
+
+        // Register the machine for the console doors, before the spawn
+        // (rustkube-node#38).
+        //
+        // stormvm's console daemon resolves a VM out of the run directory
+        // rather than out of an apiserver — it is a different process from
+        // whatever started the machine and has to answer "where is
+        // default/web-1's serial socket" across its own restart, with no
+        // cluster to ask. `stormvm start` writes this file; the kubelet did
+        // not, so a VM the kubelet started was invisible: `/api/v1/vms` empty
+        // and every attach a 404.
+        //
+        // Before the spawn, and from the same `logging` and run dir the plan
+        // is built from, so it describes *this* machine rather than a second
+        // reading of the spec. The console reports a door open only when the
+        // socket is actually there, so a registration that precedes the
+        // hypervisor is right: it says what was asked for, and the socket says
+        // whether the machine got that far.
+        let registration = stormvm_node::console::Registration::of(&vm, &ns, uid, &logging, RUN_ROOT);
+        if let Err(e) = stormvm_node::console::write(RUN_ROOT, &registration) {
+            // Not fatal: a machine that runs without a console door is worse
+            // than one that does not run at all only to whoever wanted the
+            // door. Warned rather than swallowed, because the symptom at the
+            // console end is a 404 with nothing to say why.
+            warn!(vm = %vm.name, "could not register for the console doors: {e}");
+        }
+
         let built = match plan::build_with_nics(&vm, &disks, &nics, &logging, RUN_ROOT) {
             Ok(p) => p,
             Err(e) => {
+                deregister(&vm.name);
                 self.release(&disks).await;
                 return Err(format!("{e:#}"));
             }
@@ -239,6 +277,7 @@ impl VmManager {
         let handle = match started {
             Ok(h) => h,
             Err(e) => {
+                deregister(&vm.name);
                 self.release(&disks).await;
                 return Err(format!("stormpump refused: {e:?}"));
             }
@@ -340,6 +379,11 @@ impl VmManager {
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             }
         }
+        // The door closes with the machine. A registration that outlives its
+        // VM is a console door onto a socket nothing is bound to, which reads
+        // as "the guest is quiet" rather than "there is no guest" — so this
+        // matters as much as the write (rustkube-node#38).
+        deregister(&vm.name);
         self.release(&vm.disks).await;
         info!(vm = %vm.name, "vm stopped");
     }
@@ -425,57 +469,67 @@ impl VmManager {
     /// three, each on the bridge its network names, which is what makes a
     /// machine on the storage network and a machine on the pod network differ
     /// only in a bridge name.
+    /// Make every NIC the spec asks for, and deposit its descriptor.
+    ///
+    /// The naming and the ioctls are `stormvm-net`'s, not this file's
+    /// (rustkube-node#39). Two reasons, and the second is the one that
+    /// matters: the standalone `stormvm start` path and the kubelet must not
+    /// derive *different* names for one VM, and the derivation this file used
+    /// to carry ignored the namespace — so `default/web-1` and
+    /// `staging/web-1` got the same tap name and, worse, the same MAC. Two
+    /// guests with one address on a shared segment presents as intermittent
+    /// connectivity for both, with the ARP table the only place it is visible.
+    ///
+    /// The local ioctl helpers went with it. They read `ifr_ifindex` through
+    /// the `flags` arm of `ifreq` — an `int` read as a `short`, which is the
+    /// whole value below 32767 and a truncation above it. Interface indices
+    /// are monotonic and never reused, and every container veth consumes one,
+    /// so a node that has churned enough pods enslaves the wrong interface or
+    /// none, silently: the tap exists, the guest has a NIC, and no frame ever
+    /// reaches the bridge.
     async fn resolve_nics(
         &self,
+        namespace: &str,
         vm: &VmSpec,
         ring: &Arc<RingClient>,
     ) -> Result<Vec<plan::ResolvedNic>, String> {
-        use stormvm_spec::NetworkAttachment;
+        let defaults = stormvm_net::Defaults { uplink_bridge: DEFAULT_BRIDGE.to_string() };
+        // Pure: every decision that could be wrong is made here, with no
+        // privilege and nothing created yet.
+        let plans = stormvm_net::plan(namespace, &vm.name, &vm.interfaces, &defaults)?;
 
-        let mut out = Vec::new();
-        for i in &vm.interfaces {
-            let bridge = match &i.network {
-                NetworkAttachment::Bridged(b) => b.clone(),
-                // The node's own network, which needs a bridge carrying the
-                // uplink. Named rather than guessed: attaching a tap to the
-                // wrong interface takes the node off the network.
-                NetworkAttachment::Host => DEFAULT_BRIDGE.to_string(),
-                // Not yet: a VM on the pod network wants a sandbox's namespace
-                // and a tap bridged to the veth in it — the same tap, made
-                // somewhere else. Refused by name rather than silently given a
-                // different network.
-                other => {
-                    return Err(format!(
-                        "interface {}: network {other} is not wired yet on this node",
-                        i.name
-                    ))
-                }
-            };
-            let name = crate::vm_net::tap_name(&vm.name, &i.name);
-            let mac = i
-                .mac
-                .clone()
-                .filter(|m| m != "auto")
-                .unwrap_or_else(|| crate::vm_net::mac_for(&vm.name, &i.name));
-
-            let fd = crate::vm_net::tap_on_bridge(&name, &bridge)
-                .map_err(|e| format!("interface {}: {e}", i.name))?;
-            let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
-            // The name the spec claims it under. `tap-<nic>` is what the
-            // driver puts in `Render.fds`, and the two have to agree or the
-            // engine looks up a name nobody deposited.
-            let slot = format!("tap-{}", i.name);
-            let r = ring.clone();
-            let deposit_name = slot.clone();
-            tokio::task::spawn_blocking(move || r.deposit_fd(&deposit_name, fd))
-                .await
-                .map_err(|e| format!("deposit task: {e}"))?
-                .map_err(|e| format!("interface {}: {e:?}", i.name))?;
-
-            out.push(plan::ResolvedNic { name: i.name.clone(), tap_fd: raw, mac });
+        let mut out = Vec::with_capacity(plans.len());
+        for p in &plans {
+            // No sandbox: a VM on the pod network wants a namespace this
+            // kubelet does not pop here yet, and `realise` refuses that
+            // binding by name rather than landing the guest on the node's own
+            // network.
+            let made = stormvm_net::realise(p, None, RUN_ROOT)?;
+            if let Some(fd) = made.fd {
+                // Before the spawn: the engine resolves `Spec.fds` against
+                // what was already deposited, so a descriptor that arrives
+                // later is a name nobody deposited and the guest starts with
+                // no NIC — which it reports as a network that is simply down.
+                // The ring takes ownership and holds the tap up for the run.
+                let r = ring.clone();
+                let slot = p.slot();
+                let nic = p.nic.clone();
+                tokio::task::spawn_blocking(move || r.deposit_fd(&slot, fd))
+                    .await
+                    .map_err(|e| format!("deposit task: {e}"))?
+                    .map_err(|e| format!("interface {nic}: {e:?}"))?;
+            }
+            out.push(plan::ResolvedNic {
+                name: p.nic.clone(),
+                // Where a binding produced an address, the MAC is that
+                // address's; otherwise the derived one.
+                mac: made.address.as_ref().map(|a| a.mac.clone()).unwrap_or_else(|| p.mac.clone()),
+                transport: made.transport,
+            });
         }
         Ok(out)
     }
+
 
     /// Build this VM's cloud-init seed.
     ///
@@ -682,6 +736,57 @@ mod tests {
             "metadata": { "name": "web-1", "namespace": "default", "uid": "u-1" },
             "spec": { "nodeName": node, "domain": { "memory": { "guest": "1Gi" } } }
         })
+    }
+
+    /// The console doors resolve a VM out of the run directory, so a machine
+    /// this kubelet started has to leave a registration there — and take it
+    /// away again (rustkube-node#38).
+    #[test]
+    fn a_machine_is_registered_for_the_console_and_deregistered_with_it() {
+        let run = tempfile::tempdir().unwrap();
+        let root = run.path().to_str().unwrap();
+        let vm: VmSpec = stormvm_spec::kube::from_kube(&vmi("n1")).unwrap();
+        let logging = Logging::pod("/var/log/pods/default_web-1_u-1/web-1", 0);
+
+        let reg = stormvm_node::console::Registration::of(&vm, "default", "u-1", &logging, root);
+        stormvm_node::console::write(root, &reg).unwrap();
+
+        // Found by namespace *and* name: the run directory is named by the VM
+        // alone, so two `web-1`s in two namespaces would otherwise put a
+        // terminal on the wrong guest.
+        let found = stormvm_node::console::find(root, "default", "web-1");
+        assert!(found.is_some(), "the door should be registered");
+        assert_eq!(found.unwrap().uid, "u-1");
+        assert!(stormvm_node::console::find(root, "staging", "web-1").is_none());
+
+        stormvm_node::console::remove(root, "web-1").unwrap();
+        assert!(
+            stormvm_node::console::find(root, "default", "web-1").is_none(),
+            "a registration that outlives its machine is a door onto a socket \
+             nothing is bound to"
+        );
+        // Absent is success, so a stop racing a failed start is not an error.
+        assert!(stormvm_node::console::remove(root, "web-1").is_ok());
+    }
+
+    /// The namespace is part of what a NIC is named after (rustkube-node#39).
+    ///
+    /// Asserted here, not only in `stormvm-net`, because the bug this replaced
+    /// lived in this crate: two VMs of one name in two namespaces derived the
+    /// same tap name and the same MAC, which presents as intermittent
+    /// connectivity for both with the ARP table the only evidence.
+    #[test]
+    fn two_namespaces_do_not_share_a_tap_or_a_mac() {
+        let a_tap = stormvm_net::tap_name("default", "web-1", "net0");
+        let b_tap = stormvm_net::tap_name("staging", "web-1", "net0");
+        assert_ne!(a_tap, b_tap);
+        assert_ne!(
+            stormvm_net::mac_for("default", "web-1", "net0"),
+            stormvm_net::mac_for("staging", "web-1", "net0")
+        );
+        // Still inside the kernel's 15-byte interface-name limit, which is
+        // what the hash is for.
+        assert!(a_tap.len() <= 15, "{a_tap}");
     }
 
     /// A kubelet that started unscheduled work would start it on every node at
