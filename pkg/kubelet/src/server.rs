@@ -59,6 +59,9 @@ pub fn router(pod_manager: Arc<PodManager>) -> Router {
         // rather than "no such route". The apiserver is on 0.8 and its routes
         // use braces, so the two spellings coexist and neither is a typo.
         .route("/containerLogs/:namespace/:pod/:container", get(container_logs))
+        // A VM's console, spliced through to stormvm on loopback — what the
+        // apiserver's subresources.kubevirt.io handler proxies to (rustkube#61).
+        .route("/vmConsole/:namespace/:name/:door", get(vm_console))
         .with_state(pod_manager)
 }
 
@@ -387,7 +390,7 @@ mod tests {
         }
     }
 
-    fn app() -> Router {
+    pub(super) fn app() -> Router {
         let rt = Arc::new(NoopRt);
         let pm = Arc::new(PodManager::new(rt.clone(), rt, "test-node"));
         router(pm)
@@ -823,5 +826,303 @@ mod log_tests {
         assert_eq!(tail_from(&p, &mut offset).unwrap(), "long first line\n");
         std::fs::write(&path, "new\n").unwrap();
         assert_eq!(tail_from(&p, &mut offset).unwrap(), "new\n");
+    }
+}
+
+/// `GET /vmConsole/{namespace}/{name}/{door}` — a VM's console, spliced
+/// through to stormvm.
+///
+/// The apiserver serves `subresources.kubevirt.io` so `virtctl console` has
+/// something to resolve (rustkube#61), and it cannot reach stormvm itself:
+/// stormvm is loopback-bound, and its rule is *loopback, or a token* with
+/// **minting deliberately loopback-only** — so an off-node caller can neither
+/// connect nor mint itself a credential. This kubelet is on the node and is
+/// already an authenticated hop (the apiserver's bearer token, validated by
+/// TokenReview), so the console takes the route that already exists rather
+/// than a second auth scheme: apiserver → kubelet → stormvm on loopback.
+///
+/// Transparent, like the apiserver's half: nothing here parses a WebSocket
+/// frame. The client's handshake headers go up verbatim — `Sec-WebSocket-Key`
+/// included, so the accept value stormvm computes is the one the client is
+/// waiting for — stormvm's `101` comes back verbatim, and after that it is
+/// bytes in both directions.
+async fn vm_console(
+    Path((namespace, name, door)): Path<(String, String, String)>,
+    req: Request,
+) -> Response {
+    // stormvm's own spelling: `serial` and `vnc` are the doors it serves.
+    // Anything else is refused here rather than forwarded, so a typo reads as
+    // a bad request instead of a 404 from a service the caller cannot see.
+    if door != "serial" && door != "vnc" {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("no console door {door}: expected serial or vnc\n"),
+        )
+            .into_response();
+    }
+    let path = format!("/api/v1/vms/{namespace}/{name}/console/{door}");
+
+    let addr = stormvm_addr();
+    let upstream = match tokio::net::TcpStream::connect(&addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            // stormvm not running is the common case on a node with no VMs,
+            // and it is worth saying so plainly: the alternative is a bare 502
+            // that reads as the VM being broken.
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("no stormvm on {addr}: {e}\n"),
+            )
+                .into_response();
+        }
+    };
+    let _ = upstream.set_nodelay(true);
+    proxy_upgrade(upstream, &addr, &path, req).await
+}
+
+/// stormvm's console service, loopback by default.
+const STORMVM_ADDR: &str = "127.0.0.1:9095";
+
+/// Where stormvm is listening.
+///
+/// `STORMVM_CONSOLE_ADDR` overrides the default, for a node that binds it
+/// elsewhere — and so a test can point this at a listener of its own instead
+/// of racing whatever holds :9095 on the build box.
+fn stormvm_addr() -> String {
+    std::env::var("STORMVM_CONSOLE_ADDR").unwrap_or_else(|_| STORMVM_ADDR.to_string())
+}
+
+/// Forward the handshake, hand back the answer, then splice.
+async fn proxy_upgrade(
+    mut upstream: tokio::net::TcpStream,
+    addr: &str,
+    path: &str,
+    req: Request,
+) -> Response {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut head = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n");
+    for (k, v) in req.headers().iter() {
+        // `host` is ours; the rest — Connection, Upgrade, the websocket key
+        // and version — is the negotiation and must survive untouched.
+        if k.as_str() == "host" {
+            continue;
+        }
+        if let Ok(value) = v.to_str() {
+            head.push_str(&format!("{k}: {value}\r\n"));
+        }
+    }
+    head.push_str("\r\n");
+    if let Err(e) = upstream.write_all(head.as_bytes()).await {
+        return (StatusCode::BAD_GATEWAY, format!("stormvm handshake: {e}\n")).into_response();
+    }
+
+    // Read to the end of stormvm's response head.
+    let mut buf: Vec<u8> = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 2048];
+    let head_end = loop {
+        if let Some(pos) = find_head_end(&buf) {
+            break pos;
+        }
+        if buf.len() > 64 * 1024 {
+            return (StatusCode::BAD_GATEWAY, "stormvm sent an oversized head\n").into_response();
+        }
+        match upstream.read(&mut chunk).await {
+            Ok(0) => {
+                return (StatusCode::BAD_GATEWAY, "stormvm closed without answering\n")
+                    .into_response()
+            }
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) => {
+                return (StatusCode::BAD_GATEWAY, format!("stormvm read: {e}\n")).into_response()
+            }
+        }
+    };
+    let (status, headers) = match parse_head(&buf[..head_end]) {
+        Ok(v) => v,
+        Err(e) => {
+            return (StatusCode::BAD_GATEWAY, format!("stormvm head: {e}\n")).into_response()
+        }
+    };
+    let leftover = buf[head_end..].to_vec();
+
+    // Not an upgrade: stormvm's own answer is the useful one — "no such VM",
+    // "that door is not open" — so it is passed through rather than replaced.
+    if status != 101 {
+        let body = String::from_utf8_lossy(&leftover).to_string();
+        return (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            body,
+        )
+            .into_response();
+    }
+
+    let mut response = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+    for (k, v) in headers.iter() {
+        if k == "content-length" || k == "transfer-encoding" {
+            continue;
+        }
+        response = response.header(k, v);
+    }
+    let response = match response.body(axum::body::Body::empty()) {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("upgrade: {e}\n")).into_response()
+        }
+    };
+
+    tokio::spawn(async move {
+        match hyper::upgrade::on(req).await {
+            Ok(upgraded) => {
+                let mut client = hyper_util::rt::TokioIo::new(upgraded);
+                // Anything stormvm sent after its headers is already the first
+                // frame; losing it hangs the session.
+                if !leftover.is_empty() {
+                    if let Err(e) = client.write_all(&leftover).await {
+                        warn!("vm console: first write to client failed: {e}");
+                        return;
+                    }
+                }
+                if let Err(e) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
+                    tracing::debug!("vm console session ended: {e}");
+                }
+            }
+            Err(e) => warn!("vm console: client never upgraded: {e}"),
+        }
+    });
+    response
+}
+
+/// End of the response head, or None if it is not all here yet.
+fn find_head_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
+/// Status and headers from a response head.
+fn parse_head(head: &[u8]) -> Result<(u16, axum::http::HeaderMap), String> {
+    let text = String::from_utf8_lossy(head);
+    let mut lines = text.split("\r\n");
+    let status: u16 = lines
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .ok_or_else(|| "no status line".to_string())?;
+    let mut headers = axum::http::HeaderMap::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((k, v)) = line.split_once(':') else { continue };
+        if let (Ok(name), Ok(value)) = (
+            k.trim().parse::<axum::http::HeaderName>(),
+            axum::http::HeaderValue::from_str(v.trim()),
+        ) {
+            headers.insert(name, value);
+        }
+    }
+    Ok((status, headers))
+}
+
+#[cfg(test)]
+mod console_tests {
+    use super::tests::app;
+    use super::*;
+
+    /// The whole node-side hop, against a stand-in for stormvm: the client's
+    /// handshake reaches it verbatim and its `101` comes back verbatim.
+    ///
+    /// Verbatim is the property that matters. The client checks the accept
+    /// value against the key it sent, so a hop that recomputed either would
+    /// fail the handshake — and nothing here may parse a frame.
+    #[tokio::test]
+    async fn a_handshake_reaches_stormvm_and_its_answer_comes_back() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tower::ServiceExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::env::set_var("STORMVM_CONSOLE_ADDR", addr.to_string());
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let recorded = seen.clone();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 2048];
+            let n = sock.read(&mut buf).await.unwrap();
+            *recorded.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).to_string();
+            sock.write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                  Connection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        });
+
+        let req = HttpRequest::builder()
+            .uri("/vmConsole/default/web-1/serial")
+            .header("connection", "Upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("sec-websocket-version", "13")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app().oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(
+            resp.headers().get("sec-websocket-accept").unwrap(),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
+            "stormvm's accept value must reach the client untouched"
+        );
+
+        let sent = seen.lock().unwrap().clone();
+        assert!(sent.starts_with("GET /api/v1/vms/default/web-1/console/serial HTTP/1.1"), "{sent}");
+        assert!(sent.contains("dGhlIHNhbXBsZSBub25jZQ=="), "the key must be forwarded: {sent}");
+        std::env::remove_var("STORMVM_CONSOLE_ADDR");
+    }
+
+    /// A door stormvm does not serve is refused here, so a typo reads as a bad
+    /// request rather than a 404 from a service the caller cannot see.
+    #[tokio::test]
+    async fn an_unknown_door_is_refused_before_the_hop() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use tower::ServiceExt;
+
+        let req = HttpRequest::builder()
+            .uri("/vmConsole/default/web-1/nonsense")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn a_response_head_is_found_and_parsed() {
+        let head = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                     Sec-WebSocket-Accept: abc=\r\n\r\nfirst-frame";
+        let end = find_head_end(head).unwrap();
+        let (status, headers) = parse_head(&head[..end]).unwrap();
+        assert_eq!(status, 101);
+        // The accept value has to survive verbatim: the client checks it, and
+        // a proxy that recomputed one would fail the handshake.
+        assert_eq!(headers.get("sec-websocket-accept").unwrap(), "abc=");
+        assert_eq!(&head[end..], b"first-frame");
+    }
+
+    #[test]
+    fn a_refusal_is_passed_through_by_its_status() {
+        // stormvm's own answer — "no such VM" — is the useful one.
+        let head = b"HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\n\r\nno\n";
+        let end = find_head_end(head).unwrap();
+        let (status, _) = parse_head(&head[..end]).unwrap();
+        assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn an_incomplete_head_is_not_parsed_early() {
+        assert!(find_head_end(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: web").is_none());
     }
 }

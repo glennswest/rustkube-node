@@ -28,6 +28,9 @@ tonic = { workspace = true }
 prost = { workspace = true }
 tower = { version = "0.5" }
 hyper-util = { version = "0.1" }
+# `hyper::upgrade::on`, to splice a console WebSocket through to stormvm
+# (rustkube#61). axum's own ws extractor parses frames; this hop must not.
+hyper = { version = "1", features = ["client", "http1"] }
 axum = { version = "0.7" }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = { workspace = true }

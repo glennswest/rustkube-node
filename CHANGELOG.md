@@ -4,6 +4,24 @@
 
 <!-- New unreleased changes go here -->
 
+## [v0.6.0] — 2026-09-09
+
+### Added
+- **feat(kubelet):** `GET /vmConsole/{ns}/{name}/{door}` on :10250 — a VM's
+  serial or VNC console, spliced through to stormvm on loopback. This is the
+  node half of rustkube#61: the apiserver serves
+  `subresources.kubevirt.io/v1` so `virtctl console` has something to resolve,
+  and it cannot reach stormvm itself, because stormvm is loopback-bound and
+  mints its one-attach tokens only from loopback. The kubelet is on the node
+  and is already an authenticated hop, so the console takes the route that
+  already exists rather than a second auth scheme.
+- The hop is transparent: nothing parses a WebSocket frame. The client's
+  handshake headers go up verbatim (`Sec-WebSocket-Key` included, so the
+  accept value stormvm computes is the one the client checks), stormvm's `101`
+  comes back verbatim, and a refusal is passed through with its own status so
+  "no such VM" reads as itself. `STORMVM_CONSOLE_ADDR` overrides the default
+  `127.0.0.1:9095`.
+
 ## [v0.5.0] — 2026-09-09
 
 ### Fixed
