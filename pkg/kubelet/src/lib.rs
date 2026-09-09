@@ -12,6 +12,7 @@ pub mod stormpump_ring;
 pub mod stormpump_runtime;
 pub mod checkpoint;
 pub mod client;
+pub mod crashloop;
 pub mod cri;
 pub mod cri_client;
 pub mod cri_grpc;

@@ -730,9 +730,23 @@ impl Kubelet {
                     "terminated" => serde_json::json!({
                         "terminated": {"exitCode": cs.exit_code, "finishedAt": &now}
                     }),
-                    _ => serde_json::json!({
-                        "waiting": {"reason": "ContainerCreating"}
-                    }),
+                    // The reason is what `kubectl get pod` prints in the
+                    // STATUS column, so "CrashLoopBackOff" here is the
+                    // difference between a reader seeing a container that is
+                    // starting and one that has been failing for ten minutes.
+                    // Empty still means ContainerCreating — the ordinary case.
+                    _ => {
+                        let reason = if cs.reason.is_empty() {
+                            "ContainerCreating"
+                        } else {
+                            cs.reason.as_str()
+                        };
+                        let mut waiting = serde_json::json!({"reason": reason});
+                        if !cs.message.is_empty() {
+                            waiting["message"] = serde_json::json!(cs.message);
+                        }
+                        serde_json::json!({"waiting": waiting})
+                    }
                 };
 
                 serde_json::json!({

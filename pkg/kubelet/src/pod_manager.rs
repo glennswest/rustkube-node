@@ -201,6 +201,9 @@ pub struct PodManager {
     /// Cluster CA (PEM), written into ServiceAccount `ca.crt` so in-cluster
     /// clients can verify a TLS apiserver.
     ca_pem: Option<Vec<u8>>,
+    /// Per-container restart backoff, so a container that keeps dying is not
+    /// recreated on every sync tick (#25).
+    backoff: crate::crashloop::CrashLoopBackoff,
 }
 
 impl PodManager {
@@ -240,6 +243,7 @@ impl PodManager {
             cluster_dns: vec!["10.96.0.10".to_string()],
             cluster_domain: "cluster.local".to_string(),
             ca_pem: None,
+            backoff: crate::crashloop::CrashLoopBackoff::new(),
         }
     }
 
@@ -935,8 +939,16 @@ impl PodManager {
 
             let phase = pod["status"]["phase"].as_str().unwrap_or("Pending");
 
-            // Skip terminated pods
-            if phase == "Succeeded" || phase == "Failed" {
+            // Skip pods that are terminal *and meant to be*.
+            //
+            // An `Always` pod is never terminal, so a stored Succeeded or
+            // Failed on one is a phase this kubelet should not have written
+            // (or an older one did) — and skipping it here is what turned that
+            // mistake into a pod nothing would ever restart. Reconciling it
+            // is the recovery: the pod is started or re-checked like any
+            // other, and its phase is corrected on the next status write.
+            let restart_policy = pod["spec"]["restartPolicy"].as_str().unwrap_or("Always");
+            if (phase == "Succeeded" || phase == "Failed") && restart_policy != "Always" {
                 continue;
             }
 
@@ -1245,6 +1257,8 @@ impl PodManager {
                 exit_code: 0,
                 image: image.to_string(),
                 image_ref: image_ref.to_string(),
+                reason: String::new(),
+                message: String::new(),
             });
         }
 
@@ -1341,6 +1355,8 @@ impl PodManager {
                     exit_code: *exit_code,
                     image: spec["image"].as_str().unwrap_or("").to_string(),
                     image_ref: String::new(),
+                    reason: String::new(),
+                    message: String::new(),
                 });
                 continue;
             }
@@ -1354,7 +1370,9 @@ impl PodManager {
                     // of reporting "waiting" forever (which would strand the pod;
                     // e.g. an adopted cilium-operator whose container had exited).
                     let should_recreate = matches!(restart_policy.as_str(), "Always" | "OnFailure");
-                    if should_recreate && !spec.is_null() {
+                    let key = crate::crashloop::CrashLoopBackoff::key(uid, &name);
+                    let backing_off = self.backoff.wait(&key);
+                    if should_recreate && !spec.is_null() && backing_off.is_none() {
                         info!(
                             "Container {}/{}/{name} missing from runtime — recreating per policy {restart_policy}",
                             state.namespace, state.name
@@ -1368,6 +1386,28 @@ impl PodManager {
                             &mut container_statuses,
                         )
                         .await;
+                        self.backoff.restarted(&key);
+                    } else if let Some(left) = backing_off.filter(|_| should_recreate) {
+                        // A pruned record is the commonest way a crash loop
+                        // looks from here, so this path needs the same gate as
+                        // a plain exit — it is the one the cilium-operator
+                        // runaway came through.
+                        state.ready.insert(name.clone(), false);
+                        container_statuses.push(ContainerStatusReport {
+                            name: name.clone(),
+                            container_id: cid.clone(),
+                            state: "waiting".to_string(),
+                            ready: false,
+                            restart_count,
+                            exit_code: 0,
+                            image: spec["image"].as_str().unwrap_or("").to_string(),
+                            image_ref: String::new(),
+                            reason: "CrashLoopBackOff".to_string(),
+                            message: format!(
+                                "back-off {}s restarting failed container {name}",
+                                left.as_secs()
+                            ),
+                        });
                     } else {
                         state.terminated.insert(name.clone(), 0);
                         state.ready.insert(name.clone(), false);
@@ -1380,6 +1420,8 @@ impl PodManager {
                             exit_code: 0,
                             image: spec["image"].as_str().unwrap_or("").to_string(),
                             image_ref: String::new(),
+                            reason: String::new(),
+                            message: String::new(),
                         });
                     }
                     continue;
@@ -1401,6 +1443,8 @@ impl PodManager {
                         exit_code: 0,
                         image: spec["image"].as_str().unwrap_or("").to_string(),
                         image_ref: String::new(),
+                        reason: String::new(),
+                        message: String::new(),
                     });
                     continue;
                 }
@@ -1431,6 +1475,8 @@ impl PodManager {
                                 exit_code: 0,
                                 image: status.image.clone(),
                                 image_ref: status.image_ref.clone(),
+                                reason: String::new(),
+                                message: String::new(),
                             });
                         };
                         if elapsed < probe_initial_delay(startup) {
@@ -1525,6 +1571,9 @@ impl PodManager {
                         )
                     };
                     state.ready.insert(name.clone(), ready);
+                    // Up, and forgiven once it has been up long enough.
+                    self.backoff
+                        .running(&crate::crashloop::CrashLoopBackoff::key(uid, &name));
 
                     container_statuses.push(ContainerStatusReport {
                         name: name.clone(),
@@ -1535,6 +1584,8 @@ impl PodManager {
                         exit_code: 0,
                         image: status.image.clone(),
                         image_ref: status.image_ref,
+                        reason: String::new(),
+                        message: String::new(),
                     });
                 }
                 ContainerState::Exited => {
@@ -1545,19 +1596,45 @@ impl PodManager {
                     };
 
                     if should_restart {
-                        info!(
-                            "Container {}/{}/{name} exited (code {}) — restarting per policy {restart_policy}",
-                            state.namespace, state.name, status.exit_code
-                        );
-                        self.restart_container(
-                            &mut state,
-                            &name,
-                            &cid,
-                            &spec,
-                            &sandbox_config,
-                            &mut container_statuses,
-                        )
-                        .await;
+                        let key = crate::crashloop::CrashLoopBackoff::key(uid, &name);
+                        if let Some(left) = self.backoff.wait(&key) {
+                            // Backing off. Reported as waiting with the reason
+                            // a reader expects, rather than recreated now: a
+                            // container recreated every sync tick is a crash
+                            // loop at thirty restarts a minute, and the first
+                            // failure — the one that says why — scrolls away.
+                            state.ready.insert(name.clone(), false);
+                            container_statuses.push(ContainerStatusReport {
+                                name: name.clone(),
+                                container_id: cid.clone(),
+                                state: "waiting".to_string(),
+                                ready: false,
+                                restart_count,
+                                exit_code: status.exit_code,
+                                image: status.image.clone(),
+                                image_ref: status.image_ref,
+                                reason: "CrashLoopBackOff".to_string(),
+                                message: format!(
+                                    "back-off {}s restarting failed container {name}",
+                                    left.as_secs()
+                                ),
+                            });
+                        } else {
+                            info!(
+                                "Container {}/{}/{name} exited (code {}) — restarting per policy {restart_policy}",
+                                state.namespace, state.name, status.exit_code
+                            );
+                            self.restart_container(
+                                &mut state,
+                                &name,
+                                &cid,
+                                &spec,
+                                &sandbox_config,
+                                &mut container_statuses,
+                            )
+                            .await;
+                            self.backoff.restarted(&key);
+                        }
                     } else {
                         info!(
                             "Container {}/{}/{name} exited (code {}) — not restarting (policy {restart_policy})",
@@ -1574,6 +1651,8 @@ impl PodManager {
                             exit_code: status.exit_code,
                             image: status.image.clone(),
                             image_ref: status.image_ref,
+                            reason: String::new(),
+                            message: String::new(),
                         });
                     }
                 }
@@ -1588,6 +1667,8 @@ impl PodManager {
                         exit_code: 0,
                         image: status.image.clone(),
                         image_ref: status.image_ref,
+                        reason: String::new(),
+                        message: String::new(),
                     });
                 }
             }
@@ -1609,6 +1690,29 @@ impl PodManager {
                 Some(s) if !s.is_null() => s.clone(),
                 _ => continue,
             };
+            // Gated like the other two recreate paths: this is where a
+            // container whose record the runtime pruned comes back round, and
+            // an ungated reconcile recreates it every sync tick.
+            let key = crate::crashloop::CrashLoopBackoff::key(uid, &name);
+            if let Some(left) = self.backoff.wait(&key) {
+                state.ready.insert(name.clone(), false);
+                container_statuses.push(ContainerStatusReport {
+                    name: name.clone(),
+                    container_id: String::new(),
+                    state: "waiting".to_string(),
+                    ready: false,
+                    restart_count: 0,
+                    exit_code: 0,
+                    image: spec["image"].as_str().unwrap_or("").to_string(),
+                    image_ref: String::new(),
+                    reason: "CrashLoopBackOff".to_string(),
+                    message: format!(
+                        "back-off {}s restarting failed container {name}",
+                        left.as_secs()
+                    ),
+                });
+                continue;
+            }
             info!(
                 "Container {}/{}/{name} declared but not running — creating",
                 state.namespace, state.name
@@ -1622,12 +1726,26 @@ impl PodManager {
                 &mut container_statuses,
             )
             .await;
+            self.backoff.restarted(&key);
         }
 
-        // Pod phase: Succeeded/Failed only when every container has terminated
-        // for good; otherwise it is still Running.
+        // Pod phase.
+        //
+        // A `restartPolicy: Always` pod is **never** terminal from a container
+        // exiting: the contract of Always is that the container comes back, so
+        // the pod stays Running and the container sits in waiting /
+        // CrashLoopBackOff. Only Never and OnFailure reach Succeeded or Failed
+        // this way (#25).
+        //
+        // Marking an Always pod Failed was not a cosmetic error. The sync loop
+        // skips terminated pods, so the pod was never looked at again — the
+        // cilium-agent DaemonSet pod sat Failed for hours and deleting it was
+        // the only way out. A node that strands a recoverable pod has failed
+        // at the one thing the kubelet is for.
         let total = state.container_ids.len();
-        let phase = if total > 0 && state.terminated.len() == total {
+        let phase = if restart_policy == "Always" {
+            "Running"
+        } else if total > 0 && state.terminated.len() == total {
             if state.terminated.values().all(|&code| code == 0) {
                 "Succeeded"
             } else {
@@ -1731,6 +1849,8 @@ impl PodManager {
                     exit_code: 0,
                     image: image.to_string(),
                     image_ref,
+                    reason: String::new(),
+                    message: String::new(),
                 });
                 true
             }
@@ -1749,6 +1869,8 @@ impl PodManager {
                     exit_code: 0,
                     image: image.to_string(),
                     image_ref: String::new(),
+                    reason: String::new(),
+                    message: String::new(),
                 });
                 false
             }
@@ -1838,6 +1960,9 @@ impl PodManager {
 
     /// Stop and remove a pod.
     pub async fn stop_pod(&self, uid: &str) -> Result<(), CriError> {
+        // The pod is going; its backoff goes with it, or a node that churns
+        // pods keeps an entry per container for as long as it runs.
+        self.backoff.forget_pod(uid);
         let state = {
             let mut pods = self.pods.write().await;
             pods.remove(uid)
@@ -1885,6 +2010,15 @@ pub struct ContainerStatusReport {
     pub exit_code: i32,
     pub image: String,
     pub image_ref: String,
+    /// The `waiting` reason, when the state is `waiting`. Empty means
+    /// `ContainerCreating` — the ordinary case of a container on its way up.
+    ///
+    /// `CrashLoopBackOff` is the one that matters: it is how a person reading
+    /// `kubectl get pod` learns the difference between a container that is
+    /// starting and one that has been failing for ten minutes.
+    pub reason: String,
+    /// Free text under the reason — for a backoff, how much of it is left.
+    pub message: String,
 }
 
 /// Build the sandbox config for a pod object.
@@ -3138,6 +3272,79 @@ mod tests {
         assert_eq!(u.container_statuses[0].exit_code, 0);
         // No restart happened.
         assert_eq!(u.container_statuses[0].restart_count, 0);
+    }
+
+    /// The reported failure: a `restartPolicy: Always` pod whose container
+    /// crashed went `phase=Failed`, and the sync loop skips Failed pods, so
+    /// nothing ever restarted it. The cilium-agent DaemonSet pod sat like that
+    /// for hours and deleting it was the only way out (#25).
+    #[tokio::test]
+    async fn an_always_pod_is_not_failed_by_a_crashing_container() {
+        let (rt, mgr) = manager();
+        let p = pod("uid-1", "agent", "Always", simple_container());
+        mgr.sync_pods(&[p.clone()]).await;
+
+        let cid = rt.container_ids().pop().unwrap();
+        rt.set_container_state(&cid, ContainerState::Exited, 1);
+
+        let outcome = mgr.sync_pods(&[p]).await;
+        let u = &outcome.updates[0];
+        assert_eq!(
+            u.phase, "Running",
+            "an Always pod stays Running: the contract of Always is that the container comes back"
+        );
+    }
+
+    /// The other half of the strand: a pod already carrying a stored `Failed`
+    /// — written by an older kubelet, or by a start that failed — must be
+    /// picked up again rather than skipped forever.
+    #[tokio::test]
+    async fn a_failed_always_pod_is_reconciled_not_skipped() {
+        let (rt, mgr) = manager();
+        let mut p = pod("uid-1", "agent", "Always", simple_container());
+        p["status"] = json!({"phase": "Failed"});
+
+        let outcome = mgr.sync_pods(&[p]).await;
+        assert!(
+            !rt.container_ids().is_empty(),
+            "the pod should have been started, not skipped"
+        );
+        assert_eq!(outcome.updates[0].phase, "Running");
+
+        // A Never pod that has genuinely finished is still left alone.
+        let (rt2, mgr2) = manager();
+        let mut done = pod("uid-2", "job", "Never", simple_container());
+        done["status"] = json!({"phase": "Succeeded"});
+        let outcome = mgr2.sync_pods(&[done]).await;
+        assert!(rt2.container_ids().is_empty(), "a finished job is not restarted");
+        assert!(outcome.updates.is_empty());
+    }
+
+    /// The second crash backs off instead of being recreated on the next tick,
+    /// and says so in the words `kubectl get pod` prints.
+    #[tokio::test]
+    async fn a_second_crash_backs_off_rather_than_restarting_now() {
+        let (rt, mgr) = manager();
+        let p = pod("uid-1", "agent", "Always", simple_container());
+        mgr.sync_pods(&[p.clone()]).await;
+
+        // First crash: restarted immediately — most exits are not a loop.
+        let cid = rt.container_ids().pop().unwrap();
+        rt.set_container_state(&cid, ContainerState::Exited, 1);
+        let u = &mgr.sync_pods(&[p.clone()]).await.updates[0];
+        assert_eq!(u.container_statuses[0].restart_count, 1, "the first restart is immediate");
+
+        // Second crash, straight away: held, not recreated.
+        let cid = rt.container_ids().pop().unwrap();
+        rt.set_container_state(&cid, ContainerState::Exited, 1);
+        let outcome = mgr.sync_pods(&[p]).await;
+        let cs = &outcome.updates[0].container_statuses[0];
+        assert_eq!(cs.state, "waiting");
+        assert_eq!(cs.reason, "CrashLoopBackOff");
+        assert!(cs.message.contains("back-off"), "{}", cs.message);
+        assert!(!cs.ready);
+        // And the pod is still Running, not Failed.
+        assert_eq!(outcome.updates[0].phase, "Running");
     }
 
     #[tokio::test]
