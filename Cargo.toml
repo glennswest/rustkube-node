@@ -8,6 +8,34 @@ members = [
     "cmd/kube-proxy",
 ]
 
+# Release profile — the node's binaries land in a read-only erofs root, so
+# whatever ships is what every node carries for the life of the image; there is
+# no package manager to slim it down later (#30).
+#
+# `strip = "debuginfo"` rather than `strip = true`: the DWARF goes, the symbol
+# table stays, so a panic on a node names the functions in its backtrace
+# instead of printing addresses. Measured on the kubelet: 16.6 MiB as built,
+# 14.0 MiB if the symbols went too — 2.6 MiB for a readable backtrace on a
+# machine that cannot run a debugger against the binary anyway.
+#
+# `debug = "line-tables-only"` is carried for the same reason rustkube carries
+# it, but be clear about what it does here: `strip = "debuginfo"` removes the
+# line tables again, so backtraces resolve to functions, not to file and line.
+# Dropping the strip is what would buy file:line, at the cost of the DWARF.
+#
+# Thin LTO and one codegen unit are the part that might actually matter — the
+# kubelet and kube-proxy are on the node's hot path — rather than the size,
+# which is under 0.3% of the image and compressed besides.
+#
+# Matches rustkube's profile deliberately: the two halves of one control plane
+# should not be built to different settings.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+debug = "line-tables-only"
+
 [workspace.package]
 version = "0.4.0"
 edition = "2021"

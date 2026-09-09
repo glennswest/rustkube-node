@@ -2,7 +2,16 @@
 
 ## [Unreleased]
 
-<!-- New unreleased changes go here -->
+### 2026-09-09
+- **build:** add `[profile.release]` — opt-level 3, thin LTO, one codegen unit,
+  `strip = "debuginfo"` (#30). The workspace had no release profile at all, so
+  binaries shipped into the read-only erofs root with Cargo's defaults and full
+  debuginfo, and there is no package manager on an immutable node to slim them
+  down later. Matches rustkube's profile: the two halves of one control plane
+  should not be built to different settings. Measured on the kubelet: 16.6 MiB,
+  against 14.0 MiB if the symbol table went too — the 2.6 MiB buys backtraces
+  that name functions. LTO and codegen-units are the part likely to matter, not
+  the size: kubelet and kube-proxy are on the node's hot path.
 
 ## [v0.4.0] — 2026-09-09
 
