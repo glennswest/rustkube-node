@@ -2,13 +2,19 @@
 
 ## [Unreleased]
 
-### 2026-09-09
+<!-- New unreleased changes go here -->
+
+## [v0.5.0] — 2026-09-09
+
+### Fixed
 - **fix(kubelet):** **self-healing** — a `restartPolicy: Always` pod is no
   longer marked `Failed` when a container exits (#25). It stays `Running` with
   the container in `waiting`, which is the contract of `Always`. The old
   behavior stranded pods: the sync loop skips terminated pods, so a
   cilium-agent DaemonSet pod that crashed sat `Failed` for hours and deleting
   it was the only way out.
+
+### Added
 - **feat(kubelet):** CrashLoopBackOff — a per-container exponential restart
   backoff, 10s doubling to a 300s cap, reset once a container has stayed up
   for ten minutes (#25). The first restart is still immediate; every recreate
@@ -17,10 +23,14 @@
   cilium-operator runaway that recreated on every 2s sync tick. The reason and
   the remaining wait reach the apiserver, so `kubectl get pod` prints
   `CrashLoopBackOff` rather than `ContainerCreating`.
+
+### Fixed (cont.)
 - **fix(kubelet):** the sync loop no longer skips a `Failed` pod whose
   `restartPolicy` is `Always` — such a phase should not exist, and skipping it
   is what turned the mistake into a pod nothing would ever restart. A
   genuinely finished `Never`/`OnFailure` pod is still left alone.
+
+### Changed
 - **build:** add `[profile.release]` — opt-level 3, thin LTO, one codegen unit,
   `strip = "debuginfo"` (#30). The workspace had no release profile at all, so
   binaries shipped into the read-only erofs root with Cargo's defaults and full
