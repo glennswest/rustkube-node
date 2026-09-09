@@ -84,7 +84,7 @@ checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "apimachinery"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -512,7 +512,7 @@ dependencies = [
 
 [[package]]
 name = "cni"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "apimachinery",
@@ -1432,7 +1432,7 @@ checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 
 [[package]]
 name = "kube-proxy"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1444,7 +1444,7 @@ dependencies = [
 
 [[package]]
 name = "kubelet"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "apimachinery",
@@ -1486,7 +1486,7 @@ dependencies = [
 
 [[package]]
 name = "kubelet-cmd"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2193,7 +2193,7 @@ dependencies = [
 
 [[package]]
 name = "proxy"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "apimachinery",
