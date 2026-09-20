@@ -2,7 +2,19 @@
 
 ## [Unreleased]
 
-<!-- New unreleased changes go here -->
+### 2026-09-20
+- **fix(kubelet):** build against stormvm main again, and stop deriving two of
+  a VM's names without its namespace (#41). `Registration::of` takes the
+  namespace from the spec now and `console::remove` needs it, which were the
+  two compile errors; the two that compiled and were wrong mattered more. The
+  run directory is `<RUN_ROOT>/<ns>/<name>`, taken from `MachinePlan::run_dir`
+  rather than rebuilt — a second `format!` that disagreed left qemu binding
+  sockets into a directory nobody made, with nothing in the failure naming the
+  path. And volume names now come from `stormvm_node::start::volume_name`
+  (`<ns>.<name>-<disk>`) with the label from `vm.id()`: stormblock's namespace
+  is flat and `clone_volume` does not check uniqueness, so `default/web-1` and
+  `staging/web-1` both asked for `web-1-root` and `volume_by_name` returned
+  whichever the map iterated first.
 
 ## [v0.6.0] — 2026-09-09
 

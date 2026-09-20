@@ -42,9 +42,9 @@ const RUN_ROOT: &str = "/run/stormvm";
 ///
 /// Absent is success in `console::remove`, so a stop racing a failed start is
 /// not an error and this needs no "was it written?" bookkeeping.
-fn deregister(name: &str) {
-    if let Err(e) = stormvm_node::console::remove(RUN_ROOT, name) {
-        warn!(vm = %name, "could not drop the console registration: {e}");
+fn deregister(namespace: &str, name: &str) {
+    if let Err(e) = stormvm_node::console::remove(RUN_ROOT, namespace, name) {
+        warn!(vm = %name, namespace = %namespace, "could not drop the console registration: {e}");
     }
 }
 /// The bridge a VM lands on when its network does not name one.
@@ -203,9 +203,6 @@ impl VmManager {
             self.release(&disks).await;
             return Err(format!("could not make {dir}: {e}"));
         }
-        let run = format!("{RUN_ROOT}/{}", vm.name);
-        let _ = std::fs::create_dir_all(&run);
-
         // NICs, before the plan: the tap has to exist so its descriptor can
         // be named, and it has to be deposited so the engine can find it by
         // that name.
@@ -236,7 +233,7 @@ impl VmManager {
         // socket is actually there, so a registration that precedes the
         // hypervisor is right: it says what was asked for, and the socket says
         // whether the machine got that far.
-        let registration = stormvm_node::console::Registration::of(&vm, &ns, uid, &logging, RUN_ROOT);
+        let registration = stormvm_node::console::Registration::of(&vm, uid, &logging, RUN_ROOT);
         if let Err(e) = stormvm_node::console::write(RUN_ROOT, &registration) {
             // Not fatal: a machine that runs without a console door is worse
             // than one that does not run at all only to whoever wanted the
@@ -248,11 +245,27 @@ impl VmManager {
         let built = match plan::build_with_nics(&vm, &disks, &nics, &logging, RUN_ROOT) {
             Ok(p) => p,
             Err(e) => {
-                deregister(&vm.name);
+                deregister(&vm.namespace, &vm.name);
                 self.release(&disks).await;
                 return Err(format!("{e:#}"));
             }
         };
+
+        // The run directory, from the plan rather than rebuilt here.
+        //
+        // It is `<RUN_ROOT>/<ns>/<name>` now that a VM is qualified by its
+        // namespace (stormvm#6), and the plan has already told the hypervisor
+        // to bind its sockets there. A second `format!` that disagreed would
+        // leave qemu binding into a directory nobody made, and the failure
+        // names neither the path nor the reason — which is why the plan
+        // carries it out rather than expecting it to be derived twice.
+        //
+        // After the plan, therefore, not before.
+        if let Err(e) = std::fs::create_dir_all(&built.run_dir) {
+            deregister(&vm.namespace, &vm.name);
+            self.release(&disks).await;
+            return Err(format!("could not make {}: {e}", built.run_dir));
+        }
 
         // The ring is blocking and owns its own thread; the async side reaches
         // it through `spawn_blocking`, as the container path does.
@@ -277,7 +290,7 @@ impl VmManager {
         let handle = match started {
             Ok(h) => h,
             Err(e) => {
-                deregister(&vm.name);
+                deregister(&vm.namespace, &vm.name);
                 self.release(&disks).await;
                 return Err(format!("stormpump refused: {e:?}"));
             }
@@ -383,7 +396,7 @@ impl VmManager {
         // VM is a console door onto a socket nothing is bound to, which reads
         // as "the guest is quiet" rather than "there is no guest" — so this
         // matters as much as the write (rustkube-node#38).
-        deregister(&vm.name);
+        deregister(&vm.namespace, &vm.name);
         self.release(&vm.disks).await;
         info!(vm = %vm.name, "vm stopped");
     }
@@ -395,10 +408,19 @@ impl VmManager {
         for d in &vm.disks {
             let volume_id = match &d.from {
                 DiskSource::Golden(g) => {
+                    // Both qualified by namespace, through stormvm's own
+                    // definitions so the standalone and cluster paths cannot
+                    // disagree. stormblock's namespace is flat and a VM's is
+                    // not: `default/web-1` and `staging/web-1` both used to
+                    // ask for a volume called `web-1-root`, and
+                    // `clone_volume` does not check uniqueness — so there
+                    // were two distinct volumes under one name and
+                    // `volume_by_name` returned whichever the map iterated
+                    // first.
                     let body = json!({
-                        "name": format!("{}-{}", vm.name, d.name),
+                        "name": stormvm_node::start::volume_name(vm, &d.name),
                         "size": d.size,
-                        "label": format!("storm.io/vm={}", vm.name),
+                        "label": format!("storm.io/vm={}", vm.id()),
                         "verify": true,
                     });
                     match self
@@ -748,25 +770,49 @@ mod tests {
         let vm: VmSpec = stormvm_spec::kube::from_kube(&vmi("n1")).unwrap();
         let logging = Logging::pod("/var/log/pods/default_web-1_u-1/web-1", 0);
 
-        let reg = stormvm_node::console::Registration::of(&vm, "default", "u-1", &logging, root);
+        // The namespace comes from the spec now, not from a separate
+        // argument — a VM is qualified by it everywhere (stormvm#6).
+        let reg = stormvm_node::console::Registration::of(&vm, "u-1", &logging, root);
         stormvm_node::console::write(root, &reg).unwrap();
 
-        // Found by namespace *and* name: the run directory is named by the VM
-        // alone, so two `web-1`s in two namespaces would otherwise put a
-        // terminal on the wrong guest.
+        // Found by namespace *and* name: two `web-1`s in two namespaces must
+        // not put a terminal on the wrong guest.
         let found = stormvm_node::console::find(root, "default", "web-1");
         assert!(found.is_some(), "the door should be registered");
         assert_eq!(found.unwrap().uid, "u-1");
         assert!(stormvm_node::console::find(root, "staging", "web-1").is_none());
 
-        stormvm_node::console::remove(root, "web-1").unwrap();
+        stormvm_node::console::remove(root, "default", "web-1").unwrap();
         assert!(
             stormvm_node::console::find(root, "default", "web-1").is_none(),
             "a registration that outlives its machine is a door onto a socket \
              nothing is bound to"
         );
         // Absent is success, so a stop racing a failed start is not an error.
-        assert!(stormvm_node::console::remove(root, "web-1").is_ok());
+        assert!(stormvm_node::console::remove(root, "default", "web-1").is_ok());
+    }
+
+    /// Volume names carry the namespace, or two VMs share one volume.
+    ///
+    /// The silent half of #41: stormblock's namespace is flat and a VM's is
+    /// not, and `clone_volume` does not check uniqueness — so `default/web-1`
+    /// and `staging/web-1` both asked for `web-1-root`, and `volume_by_name`
+    /// returned whichever the map happened to iterate first.
+    #[test]
+    fn two_namespaces_do_not_share_a_volume_name() {
+        let a: VmSpec = stormvm_spec::kube::from_kube(&vmi("n1")).unwrap();
+        let mut other = vmi("n1");
+        other["metadata"]["namespace"] = json!("staging");
+        let b: VmSpec = stormvm_spec::kube::from_kube(&other).unwrap();
+
+        let an = stormvm_node::start::volume_name(&a, "root");
+        let bn = stormvm_node::start::volume_name(&b, "root");
+        assert_ne!(an, bn, "two namespaces, one volume name");
+        assert!(an.starts_with("default."), "{an}");
+        assert!(bn.starts_with("staging."), "{bn}");
+        // And the label that groups a VM's volumes is qualified too.
+        assert_eq!(a.id(), "default/web-1");
+        assert_ne!(a.id(), b.id());
     }
 
     /// The namespace is part of what a NIC is named after (rustkube-node#39).
