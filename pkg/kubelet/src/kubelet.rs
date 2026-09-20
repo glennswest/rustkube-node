@@ -4,7 +4,7 @@
 
 use crate::cri::{ImageService, MigrationService, RuntimeService};
 use crate::node_status::NodeReporter;
-use crate::pod_manager::{PodManager, RemovalReason};
+use crate::pod_manager::{InitContainerStatusReport, PodManager, RemovalReason};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::time::{self, Duration};
@@ -810,10 +810,10 @@ impl Kubelet {
         // Driven by the pod's *spec* rather than by the report being
         // non-empty: a pod with no init containers is initialized, and so is
         // one whose inits all succeeded. Anything else is not.
-        let declared_inits = update.declared_init_containers;
-        let initialized = declared_inits == 0
-            || (update.init_container_statuses.len() == declared_inits
-                && update.init_container_statuses.iter().all(|cs| cs.succeeded()));
+        let initialized = pod_initialized(
+            update.declared_init_containers,
+            &update.init_container_statuses,
+        );
 
         let mut conditions = vec![
             serde_json::json!({
@@ -1021,5 +1021,87 @@ fn nanos_to_rfc3339(nanos: i64) -> serde_json::Value {
                                            (nanos % 1_000_000_000) as u32) {
         Some(t) => serde_json::json!(t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
         None => serde_json::Value::Null,
+    }
+}
+
+/// Is the pod past its init containers?
+///
+/// Computed against the *declared* count, not against the reports being
+/// non-empty, because those two differ exactly where it matters: a pod that
+/// has not reached its init containers yet reports none, and "none reported"
+/// must not read the same as "none declared".
+fn pod_initialized(declared: usize, reports: &[InitContainerStatusReport]) -> bool {
+    if declared == 0 {
+        return true;
+    }
+    reports.len() == declared && reports.iter().all(|cs| cs.succeeded())
+}
+
+#[cfg(test)]
+mod init_condition_tests {
+    use super::*;
+
+    fn report(name: &str, exit: i32) -> InitContainerStatusReport {
+        InitContainerStatusReport {
+            name: name.into(),
+            container_id: "abc".into(),
+            state: "terminated".into(),
+            exit_code: exit,
+            reason: if exit == 0 { "Completed".into() } else { "Error".into() },
+            message: String::new(),
+            image: "busybox".into(),
+            image_ref: "sha256:x".into(),
+            started_at: 1,
+            finished_at: 2,
+        }
+    }
+
+    #[test]
+    fn a_pod_with_no_init_containers_is_initialized() {
+        assert!(pod_initialized(0, &[]));
+    }
+
+    #[test]
+    fn a_pod_that_has_not_reached_its_inits_is_not_initialized() {
+        // The bug this replaces: Initialized was hardcoded True, so a pod
+        // wedged here reported True with no containers running.
+        assert!(!pod_initialized(6, &[]));
+    }
+
+    #[test]
+    fn a_pod_part_way_through_is_not_initialized() {
+        assert!(!pod_initialized(6, &[report("config", 0), report("mount-cgroup", 0)]));
+    }
+
+    #[test]
+    fn all_succeeded_is_initialized() {
+        let all: Vec<_> = ["config", "mount-cgroup", "apply-sysctl-overwrites",
+                           "mount-bpf-fs", "clean-cilium-state", "install-cni-binaries"]
+            .iter().map(|n| report(n, 0)).collect();
+        assert!(pod_initialized(6, &all));
+    }
+
+    #[test]
+    fn one_failure_means_not_initialized() {
+        let mut all: Vec<_> = (0..6).map(|i| report(&format!("i{i}"), 0)).collect();
+        all[3] = report("i3", 1);
+        assert!(!pod_initialized(6, &all));
+    }
+
+    #[test]
+    fn a_running_init_has_not_succeeded() {
+        let mut r = report("config", 0);
+        r.state = "running".into();
+        assert!(!r.succeeded());
+        assert!(!pod_initialized(1, &[r]));
+    }
+
+    #[test]
+    fn an_epoch_timestamp_is_null_rather_than_1970() {
+        // A finish time asked for before there was one sorts first and looks
+        // like a fact if it renders as 1970.
+        assert_eq!(nanos_to_rfc3339(0), serde_json::Value::Null);
+        assert_eq!(nanos_to_rfc3339(-1), serde_json::Value::Null);
+        assert!(nanos_to_rfc3339(1_789_000_000_000_000_000).is_string());
     }
 }
