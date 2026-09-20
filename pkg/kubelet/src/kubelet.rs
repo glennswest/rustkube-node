@@ -723,12 +723,25 @@ impl Kubelet {
             .container_statuses
             .iter()
             .map(|cs| {
+                // The container's own times, not this moment.
+                //
+                // These were stamped with `now()` — the instant the status was
+                // *reported*. Every container therefore claimed to have
+                // started seconds ago, on every poll, so one that had been up
+                // for an hour looked exactly like one that had just come back;
+                // reading a restart into that is the natural mistake, and
+                // somebody did. A time the runtime did not give renders as
+                // null rather than as a plausible wrong answer.
                 let state_obj = match cs.state.as_str() {
                     "running" => serde_json::json!({
-                        "running": {"startedAt": &now}
+                        "running": {"startedAt": nanos_to_rfc3339(cs.started_at)}
                     }),
                     "terminated" => serde_json::json!({
-                        "terminated": {"exitCode": cs.exit_code, "finishedAt": &now}
+                        "terminated": {
+                            "exitCode": cs.exit_code,
+                            "startedAt": nanos_to_rfc3339(cs.started_at),
+                            "finishedAt": nanos_to_rfc3339(cs.finished_at)
+                        }
                     }),
                     // The reason is what `kubectl get pod` prints in the
                     // STATUS column, so "CrashLoopBackOff" here is the

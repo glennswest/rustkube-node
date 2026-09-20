@@ -1894,8 +1894,8 @@ impl PodManager {
                     {
                         let not_ready = |statuses: &mut Vec<ContainerStatusReport>| {
                             statuses.push(ContainerStatusReport {
-                                started_at: 0,
-                                finished_at: 0,
+                                started_at: status.started_at,
+                                finished_at: status.finished_at,
                                 name: name.clone(),
                                 container_id: cid.clone(),
                                 state: "running".to_string(),
@@ -2005,8 +2005,8 @@ impl PodManager {
                         .running(&crate::crashloop::CrashLoopBackoff::key(uid, &name));
 
                     container_statuses.push(ContainerStatusReport {
-                        started_at: 0,
-                        finished_at: 0,
+                        started_at: status.started_at,
+                        finished_at: status.finished_at,
                         name: name.clone(),
                         container_id: cid.clone(),
                         state: "running".to_string(),
@@ -2036,8 +2036,8 @@ impl PodManager {
                             // failure — the one that says why — scrolls away.
                             state.ready.insert(name.clone(), false);
                             container_statuses.push(ContainerStatusReport {
-                                started_at: 0,
-                                finished_at: 0,
+                                started_at: status.started_at,
+                                finished_at: status.finished_at,
                                 name: name.clone(),
                                 container_id: cid.clone(),
                                 state: "waiting".to_string(),
@@ -2076,8 +2076,8 @@ impl PodManager {
                         state.terminated.insert(name.clone(), status.exit_code);
                         state.ready.insert(name.clone(), false);
                         container_statuses.push(ContainerStatusReport {
-                            started_at: 0,
-                            finished_at: 0,
+                            started_at: status.started_at,
+                            finished_at: status.finished_at,
                             name: name.clone(),
                             container_id: cid.clone(),
                             state: "terminated".to_string(),
@@ -2094,8 +2094,8 @@ impl PodManager {
                 ContainerState::Created | ContainerState::Unknown => {
                     state.ready.insert(name.clone(), false);
                     container_statuses.push(ContainerStatusReport {
-                        started_at: 0,
-                        finished_at: 0,
+                        started_at: status.started_at,
+                        finished_at: status.finished_at,
                         name: name.clone(),
                         container_id: cid.clone(),
                         state: "waiting".to_string(),
@@ -2134,8 +2134,8 @@ impl PodManager {
             if let Some(left) = self.backoff.wait(&key) {
                 state.ready.insert(name.clone(), false);
                 container_statuses.push(ContainerStatusReport {
-                    started_at: 0,
-                    finished_at: 0,
+                    started_at: status.started_at,
+                    finished_at: status.finished_at,
                     name: name.clone(),
                     container_id: String::new(),
                     state: "waiting".to_string(),
