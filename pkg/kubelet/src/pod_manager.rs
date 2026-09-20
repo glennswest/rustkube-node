@@ -2178,6 +2178,12 @@ fn build_sandbox_config(pod: &Value) -> PodSandboxConfig {
         host_ipc: pod["spec"]["hostIPC"].as_bool().unwrap_or(false),
         privileged: any_privileged,
         seccomp_profile: parse_seccomp(&pod["spec"]["securityContext"]),
+        // Pod-level seLinuxOptions labels the sandbox as well as the
+        // containers. The sandbox owns the namespaces the containers join, so
+        // leaving it at the default type while the containers run as another
+        // is the inconsistency that shows up as a denial on the shared
+        // resource rather than on the container that was actually relabelled.
+        selinux_options: parse_selinux_options(&pod["spec"]["securityContext"]),
     }
 }
 
@@ -2523,20 +2529,10 @@ fn build_container_config(
         .unwrap_or_default();
 
     // securityContext.seLinuxOptions — pass the container's SELinux label to the
-    // runtime (e.g. cilium's init containers request `type: spc_t`). Pod-level
-    // seLinuxOptions falls back via the caller; container-level wins.
-    let se = &sc["seLinuxOptions"];
-    let selinux_options = if se.is_object() {
-        let field = |k: &str| se[k].as_str().unwrap_or("").to_string();
-        Some(SeLinuxOptions {
-            user: field("user"),
-            role: field("role"),
-            type_: field("type"),
-            level: field("level"),
-        })
-    } else {
-        None
-    };
+    // runtime (e.g. cilium's init containers request `type: spc_t`). A
+    // container that sets none inherits the pod's; that fallback is applied by
+    // `apply_pod_namespaces`, which is the only place holding the pod.
+    let selinux_options = parse_selinux_options(sc);
 
     // cgroup semantics: cpu.shares from the CPU *request* (relative weight);
     // the cpu quota (hard cap) and memory limit from *limits* (0 = unlimited).
@@ -2596,6 +2592,27 @@ fn parse_seccomp(sc: &Value) -> Option<SeccompProfile> {
     }
 }
 
+/// securityContext.seLinuxOptions → the CRI SELinux label.
+///
+/// Absent means "no opinion", and the runtime picks the default type
+/// (`container_t`). That is the right default and the wrong answer for a
+/// container that asked to be super-privileged: Cilium's init containers set
+/// `type: spc_t` precisely because they write host paths, and under enforcing
+/// SELinux `container_t` is denied those writes (rustkube-node#26).
+fn parse_selinux_options(security_context: &Value) -> Option<SeLinuxOptions> {
+    let se = &security_context["seLinuxOptions"];
+    if !se.is_object() {
+        return None;
+    }
+    let field = |k: &str| se[k].as_str().unwrap_or("").to_string();
+    Some(SeLinuxOptions {
+        user: field("user"),
+        role: field("role"),
+        type_: field("type"),
+        level: field("level"),
+    })
+}
+
 /// Copy the pod-level namespace-sharing flags onto a container config. The
 /// container's CRI namespace_options must be consistent with the sandbox's
 /// (both derive from the pod), or the runtime refuses to start the container —
@@ -2610,6 +2627,11 @@ fn apply_pod_namespaces(config: &mut ContainerConfig, pod: &Value) {
     // A container without its own seccompProfile inherits the pod's.
     if config.seccomp_profile.is_none() {
         config.seccomp_profile = parse_seccomp(&spec["securityContext"]);
+    }
+    // Likewise seLinuxOptions: pod-level applies to every container, and a
+    // container that sets its own overrides it (rustkube-node#26).
+    if config.selinux_options.is_none() {
+        config.selinux_options = parse_selinux_options(&spec["securityContext"]);
     }
 }
 
@@ -3225,6 +3247,54 @@ mod tests {
         // A container without seLinuxOptions gets None (default label).
         let plain = build_container_config(&json!({"name": "a", "image": "x"}), "x", vec![], vec![]);
         assert!(plain.selinux_options.is_none());
+    }
+
+    #[test]
+    fn selinux_options_inherited_from_pod_and_overridden_by_container() {
+        // Pod-level seLinuxOptions applies to a container that sets none.
+        let pod = json!({
+            "spec": {"securityContext": {"seLinuxOptions": {"type": "spc_t", "level": "s0"}}}
+        });
+        let mut c = build_container_config(&simple_container(), "img", vec![], vec![]);
+        assert!(c.selinux_options.is_none());
+        apply_pod_namespaces(&mut c, &pod);
+        assert_eq!(c.selinux_options.as_ref().unwrap().type_, "spc_t");
+
+        // The container's own label wins over the pod's.
+        let own = json!({
+            "name": "app", "image": "x",
+            "securityContext": {"seLinuxOptions": {"type": "container_t"}}
+        });
+        let mut c2 = build_container_config(&own, "x", vec![], vec![]);
+        apply_pod_namespaces(&mut c2, &pod);
+        assert_eq!(c2.selinux_options.as_ref().unwrap().type_, "container_t");
+
+        // A pod with no label leaves the container unlabelled.
+        let mut c3 = build_container_config(&simple_container(), "img", vec![], vec![]);
+        apply_pod_namespaces(&mut c3, &json!({"spec": {}}));
+        assert!(c3.selinux_options.is_none());
+    }
+
+    #[test]
+    fn sandbox_carries_the_pod_level_selinux_label() {
+        // The sandbox owns the namespaces its containers join, so a pod-level
+        // label has to reach it too (rustkube-node#26).
+        let pod = json!({
+            "metadata": {"name": "cilium", "namespace": "kube-system", "uid": "u1"},
+            "spec": {"securityContext": {"seLinuxOptions": {"type": "spc_t", "level": "s0"}}}
+        });
+        let sb = build_sandbox_config(&pod);
+        assert_eq!(sb.selinux_options.as_ref().unwrap().type_, "spc_t");
+
+        // A container-level label alone does not relabel the sandbox.
+        let pod2 = json!({
+            "metadata": {"name": "web", "namespace": "default", "uid": "u2"},
+            "spec": {"containers": [{
+                "name": "app", "image": "x",
+                "securityContext": {"seLinuxOptions": {"type": "spc_t"}}
+            }]}
+        });
+        assert!(build_sandbox_config(&pod2).selinux_options.is_none());
     }
 
     #[test]

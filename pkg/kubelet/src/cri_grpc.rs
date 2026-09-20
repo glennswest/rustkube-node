@@ -126,6 +126,7 @@ fn to_proto_sandbox_config(config: &PodSandboxConfig) -> proto::PodSandboxConfig
                     config.host_ipc,
                 )),
                 privileged: config.privileged,
+                selinux_options: config.selinux_options.as_ref().map(to_proto_selinux),
                 seccomp: config.seccomp_profile.as_ref().map(to_proto_seccomp),
                 ..Default::default()
             }),
@@ -277,17 +278,23 @@ fn to_proto_container_config(config: &ContainerConfig) -> proto::ContainerConfig
                     add_capabilities: config.add_capabilities.clone(),
                     ..Default::default()
                 }),
-                selinux_options: config.selinux_options.as_ref().map(|s| proto::SeLinuxOption {
-                    user: s.user.clone(),
-                    role: s.role.clone(),
-                    r#type: s.type_.clone(),
-                    level: s.level.clone(),
-                }),
+                selinux_options: config.selinux_options.as_ref().map(to_proto_selinux),
                 seccomp: config.seccomp_profile.as_ref().map(to_proto_seccomp),
                 ..Default::default()
             }),
         }),
         ..Default::default()
+    }
+}
+
+/// Map SELinux label parts to the CRI `SeLinuxOption`. Shared by the sandbox
+/// and its containers so the two cannot be labelled by different code.
+fn to_proto_selinux(s: &crate::cri::SeLinuxOptions) -> proto::SeLinuxOption {
+    proto::SeLinuxOption {
+        user: s.user.clone(),
+        role: s.role.clone(),
+        r#type: s.type_.clone(),
+        level: s.level.clone(),
     }
 }
 

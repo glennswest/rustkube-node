@@ -62,6 +62,10 @@ pub struct PodSandboxConfig {
     pub privileged: bool,
     /// pod.spec.securityContext.seccompProfile — applied to the sandbox.
     pub seccomp_profile: Option<SeccompProfile>,
+    /// pod.spec.securityContext.seLinuxOptions — the sandbox's SELinux label.
+    /// The sandbox holds the namespaces its containers join, so a pod-level
+    /// label has to reach it as well as them (rustkube-node#26).
+    pub selinux_options: Option<SeLinuxOptions>,
 }
 
 /// Port mapping for a pod sandbox.

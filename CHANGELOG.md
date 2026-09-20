@@ -3,6 +3,16 @@
 ## [Unreleased]
 
 ### 2026-09-20
+- **fix(kubelet):** honour *pod-level* `securityContext.seLinuxOptions`, and
+  label the sandbox with it (#26). The container-level passthrough landed
+  already, with a comment saying the pod-level fallback was applied "via the
+  caller" — no caller did: `apply_pod_namespaces` inherited the pod's seccomp
+  profile and not its SELinux label, so a pod that set the label once for all
+  its containers, rather than on each, got `container_t` and the denials the
+  passthrough existed to prevent. The parse is now one shared helper used by
+  the container, the pod fallback and the sandbox, so the three cannot
+  disagree, and the sandbox — which owns the namespaces its containers join —
+  carries the pod's label instead of being left at the default type.
 - **fix(kubelet):** put the Node object back when it disappears underneath a
   running kubelet (#31). The heartbeat's status PUT 404s once the object is
   gone — an admin `kubectl delete node`, node GC, an etcd restore that rolled
