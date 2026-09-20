@@ -273,3 +273,12 @@
   vanish. A failing init container is now reported rather than only becoming
   an error string — which one failed is the whole answer to why the pod will
   not start.
+- **fix:** `startedAt` and `finishedAt` were stamped with `now()` — the instant
+  the status was *reported*, not the instant anything happened. Every
+  container claimed to have started seconds ago on every poll, so one that had
+  been up for an hour was indistinguishable from one that had just been
+  restarted; an apiserver running since boot was read as having restarted. The
+  CRI status already carried the real times and they were being discarded. A
+  terminated container now also reports `startedAt`, which is what makes a
+  duration computable. A time the runtime did not give renders as `null`
+  rather than 1970, which sorts first and looks like a fact.
