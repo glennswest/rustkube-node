@@ -761,6 +761,60 @@ impl Kubelet {
             })
             .collect();
 
+        // Init containers, reported as Kubernetes reports them.
+        //
+        // These were invisible: the kubelet ran them, failed the pod if one
+        // exited non-zero, and then said nothing — so cilium's six showed in a
+        // console as six components of unknown health, with no way to tell
+        // "ran and succeeded" from "never ran" (#47).
+        let init_container_statuses: Vec<serde_json::Value> = update
+            .init_container_statuses
+            .iter()
+            .map(|cs| {
+                let state = if cs.state == "terminated" {
+                    serde_json::json!({"terminated": {
+                        "exitCode": cs.exit_code,
+                        "reason": cs.reason,
+                        "message": cs.message,
+                        "startedAt": nanos_to_rfc3339(cs.started_at),
+                        "finishedAt": nanos_to_rfc3339(cs.finished_at),
+                        "containerID": format!("containerd://{}", cs.container_id),
+                    }})
+                } else {
+                    serde_json::json!({"running": {
+                        "startedAt": nanos_to_rfc3339(cs.started_at)
+                    }})
+                };
+                serde_json::json!({
+                    "name": cs.name,
+                    "state": state,
+                    // An init container is never "ready" — it is finished or
+                    // it is not. Kubernetes reports ready=true for a
+                    // successfully completed one, which is what lets a reader
+                    // tell it apart from one still going.
+                    "ready": cs.succeeded(),
+                    "restartCount": 0,
+                    "image": cs.image,
+                    "imageID": cs.image_ref,
+                    "containerID": format!("containerd://{}", cs.container_id)
+                })
+            })
+            .collect();
+
+        // `Initialized` was hardcoded True — before the init containers ran,
+        // while they were running, and after one had failed. A pod wedged in
+        // init reported Initialized=True with no containers, which is worse
+        // than Unknown because it is confidently wrong, and it is the
+        // condition anything waiting on init progress would read.
+        //
+        // Driven by the pod's *spec* rather than by the report being
+        // non-empty: a pod with no init containers is initialized, and so is
+        // one whose inits all succeeded. Anything else is not.
+        let declared_inits = update.declared_init_containers;
+        let initialized = declared_inits == 0
+            || (update.init_container_statuses.len() == declared_inits
+                && update.init_container_statuses.iter().all(|cs| cs.succeeded()));
+
         let mut conditions = vec![
             serde_json::json!({
                 "type": "PodScheduled",
@@ -768,7 +822,9 @@ impl Kubelet {
             }),
             serde_json::json!({
                 "type": "Initialized",
-                "status": "True"
+                "status": if initialized { "True" } else { "False" },
+                "reason": if initialized { serde_json::Value::Null }
+                          else { serde_json::json!("ContainersNotInitialized") }
             }),
         ];
 
@@ -792,6 +848,7 @@ impl Kubelet {
             "phase": &update.phase,
             "conditions": conditions,
             "containerStatuses": container_statuses,
+            "initContainerStatuses": init_container_statuses,
             "hostIP": &self.node_ip,
             "startTime": &now
         });
@@ -947,5 +1004,22 @@ async fn mirror_node_services(client: &reqwest::Client, api_url: &str, node: &st
                 .send()
                 .await;
         }
+    }
+}
+
+/// Epoch nanoseconds, as CRI reports them, to the RFC 3339 the API expects.
+///
+/// Zero means the runtime did not say — a container that never started, or a
+/// finish time asked for before there was one. That becomes `null` rather
+/// than 1970, because a timestamp at the epoch sorts first and looks like a
+/// fact.
+fn nanos_to_rfc3339(nanos: i64) -> serde_json::Value {
+    if nanos <= 0 {
+        return serde_json::Value::Null;
+    }
+    match chrono::DateTime::from_timestamp(nanos / 1_000_000_000,
+                                           (nanos % 1_000_000_000) as u32) {
+        Some(t) => serde_json::json!(t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        None => serde_json::Value::Null,
     }
 }

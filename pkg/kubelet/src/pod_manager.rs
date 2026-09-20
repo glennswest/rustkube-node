@@ -45,6 +45,45 @@ pub struct PodState {
     pub started: HashMap<String, Instant>,
     /// Containers that terminated for good (no restart) → exit code.
     pub terminated: HashMap<String, i32>,
+    /// What each init container did, kept for the life of the pod.
+    ///
+    /// Held here rather than recomputed because init containers are removed
+    /// once they exit: the runtime cannot be asked afterwards, so if this is
+    /// not recorded at the moment it happens it is gone. It also has to
+    /// survive every later sync — `check_pod_status` builds a fresh status
+    /// each cycle, and an init report that existed only at start would appear
+    /// once and then vanish, which is worse than never reporting it.
+    pub init_statuses: Vec<InitContainerStatusReport>,
+}
+
+/// What one init container did.
+///
+/// Separate from [`ContainerStatusReport`] because the questions are not the
+/// same. An app container is asked whether it is ready and how often it has
+/// restarted; an init container runs once, and what is wanted is whether it
+/// finished, with what code, and when.
+#[derive(Debug, Clone)]
+pub struct InitContainerStatusReport {
+    pub name: String,
+    pub container_id: String,
+    /// `terminated`, `running` or `waiting`.
+    pub state: String,
+    pub exit_code: i32,
+    /// `Completed`, `Error`, or empty while it is still going.
+    pub reason: String,
+    pub message: String,
+    pub image: String,
+    pub image_ref: String,
+    /// Epoch nanoseconds, as the runtime reports them. Zero when unknown.
+    pub started_at: i64,
+    pub finished_at: i64,
+}
+
+impl InitContainerStatusReport {
+    /// Did this one finish successfully?
+    pub fn succeeded(&self) -> bool {
+        self.state == "terminated" && self.exit_code == 0
+    }
 }
 
 /// What [`PodManager::release_claim_volume`] did.
@@ -1189,6 +1228,7 @@ impl PodManager {
                     startup_passed: HashMap::new(),
                     started: HashMap::new(),
                     terminated: HashMap::new(),
+                    init_statuses: Vec::new(),
                 },
             );
             recovered += 1;
@@ -1281,6 +1321,8 @@ impl PodManager {
                             phase: "Pending".to_string(),
                             message: format!("network is not ready: {what}"),
                             container_statuses: vec![],
+                            init_container_statuses: vec![],
+                            declared_init_containers: declared_init_containers(pod),
                             pod_ip: None,
                         });
                     }
@@ -1294,6 +1336,8 @@ impl PodManager {
                                 "Unable to attach or mount volumes: unmounted volumes=[{what}]"
                             ),
                             container_statuses: vec![],
+                            init_container_statuses: vec![],
+                            declared_init_containers: declared_init_containers(pod),
                             pod_ip: None,
                         });
                     }
@@ -1305,6 +1349,8 @@ impl PodManager {
                             phase: "Failed".to_string(),
                             message: e.to_string(),
                             container_statuses: vec![],
+                            init_container_statuses: vec![],
+                            declared_init_containers: declared_init_containers(pod),
                             pod_ip: None,
                         });
                     }
@@ -1371,6 +1417,7 @@ impl PodManager {
         pod_ip: Option<&str>,
         sa_mount: &Option<Mount>,
         dns_mount: &Option<Mount>,
+        out: &mut Vec<InitContainerStatusReport>,
     ) -> Result<(), CriError> {
         let inits = match pod["spec"]["initContainers"].as_array() {
             Some(a) if !a.is_empty() => a.clone(),
@@ -1408,6 +1455,21 @@ impl PodManager {
                 match status.state {
                     ContainerState::Exited => {
                         if status.exit_code != 0 {
+                            // The failing one is the whole answer to "why is
+                            // this pod not starting", so it is reported rather
+                            // than only being turned into an error string.
+                            out.push(InitContainerStatusReport {
+                                name: cname.to_string(),
+                                container_id: cid.clone(),
+                                state: "terminated".into(),
+                                exit_code: status.exit_code,
+                                reason: "Error".into(),
+                                message: status.message.clone(),
+                                image: image.to_string(),
+                                image_ref: image_ref.clone(),
+                                started_at: status.started_at,
+                                finished_at: status.finished_at,
+                            });
                             let _ = self.runtime.remove_container(&cid).await;
                             return Err(CriError::Runtime(format!(
                                 "init container {cname} exited with code {}",
@@ -1415,11 +1477,43 @@ impl PodManager {
                             )));
                         }
                         info!("Init container {ns}/{name}/{cname} completed");
+                        // Recorded *before* the removal below, which is the
+                        // only chance: once the container is gone the runtime
+                        // cannot be asked what it did, and this is what a pod
+                        // reports as initContainerStatuses for the rest of its
+                        // life.
+                        out.push(InitContainerStatusReport {
+                            name: cname.to_string(),
+                            container_id: cid.clone(),
+                            state: "terminated".into(),
+                            exit_code: 0,
+                            reason: "Completed".into(),
+                            message: String::new(),
+                            image: image.to_string(),
+                            image_ref: image_ref.clone(),
+                            started_at: status.started_at,
+                            finished_at: status.finished_at,
+                        });
                         let _ = self.runtime.remove_container(&cid).await;
                         break;
                     }
                     _ => {
                         if waited >= MAX_WAIT_MS {
+                            out.push(InitContainerStatusReport {
+                                name: cname.to_string(),
+                                container_id: cid.clone(),
+                                state: "terminated".into(),
+                                exit_code: -1,
+                                reason: "DeadlineExceeded".into(),
+                                message: format!(
+                                    "init container did not exit within {}s",
+                                    MAX_WAIT_MS / 1000
+                                ),
+                                image: image.to_string(),
+                                image_ref: image_ref.clone(),
+                                started_at: status.started_at,
+                                finished_at: 0,
+                            });
                             let _ = self.runtime.stop_container(&cid, 5).await;
                             let _ = self.runtime.remove_container(&cid).await;
                             return Err(CriError::Timeout);
@@ -1492,16 +1586,33 @@ impl PodManager {
 
         // Run init containers to completion (in order) before the app
         // containers — each must exit 0. A failure aborts pod start.
-        self.run_init_containers(
-            pod,
-            &sandbox_id,
-            &sandbox_config,
-            &volumes,
-            pod_ip.as_deref(),
-            &sa_mount,
-            &dns_mount,
-        )
-        .await?;
+        // The out-param is why this is not a plain `?` on a returned Vec: when
+        // an init container fails, the reports gathered so far are exactly
+        // what says *which* one failed and how far the pod got, and a Result
+        // that carried only the error would throw that away at the moment it
+        // became useful.
+        let mut init_statuses: Vec<InitContainerStatusReport> = Vec::new();
+        let init_outcome = self
+            .run_init_containers(
+                pod,
+                &sandbox_id,
+                &sandbox_config,
+                &volumes,
+                pod_ip.as_deref(),
+                &sa_mount,
+                &dns_mount,
+                &mut init_statuses,
+            )
+            .await;
+        if let Err(e) = init_outcome {
+            if let Some(failed) = init_statuses.iter().find(|s| !s.succeeded()) {
+                warn!(
+                    "Pod {namespace}/{name}: init container {} {} (exit {})",
+                    failed.name, failed.reason, failed.exit_code
+                );
+            }
+            return Err(e);
+        }
 
         // Process containers
         let containers = pod["spec"]["containers"]
@@ -1585,6 +1696,7 @@ impl PodManager {
                     startup_passed: HashMap::new(),
                     started: started_map,
                     terminated: HashMap::new(),
+                    init_statuses: init_statuses.clone(),
                 },
             );
         }
@@ -1595,6 +1707,8 @@ impl PodManager {
             phase: "Running".to_string(),
             message: String::new(),
             container_statuses,
+            init_container_statuses: init_statuses,
+            declared_init_containers: declared_init_containers(pod),
             pod_ip,
         })
     }
@@ -2065,6 +2179,12 @@ impl PodManager {
             phase: phase.to_string(),
             message: String::new(),
             container_statuses,
+            // From the recorded state, not from the runtime: the init
+            // containers were removed when they exited, so this is the only
+            // surviving account of them. Without it every sync after the
+            // first would report a pod with no init containers at all.
+            init_container_statuses: state.init_statuses.clone(),
+            declared_init_containers: declared_init_containers(&state.pod),
             pod_ip: state.pod_ip.clone(),
         };
 
@@ -2268,6 +2388,7 @@ impl PodManager {
                     startup_passed: HashMap::new(),
                 started: HashMap::new(),
                 terminated: HashMap::new(),
+                init_statuses: Vec::new(),
             },
         );
         info!("Registered restored pod {namespace}/{name} with sandbox {sandbox_id}");
@@ -2343,6 +2464,19 @@ pub struct PodStatusUpdate {
     pub phase: String,
     pub message: String,
     pub container_statuses: Vec<ContainerStatusReport>,
+    /// What the pod's init containers did. Empty for a pod that has none —
+    /// which the emitter distinguishes from a pod whose inits are unreported,
+    /// because `Initialized` is computed from the pod spec, not from this.
+    pub init_container_statuses: Vec<InitContainerStatusReport>,
+    /// How many init containers the pod *declares*.
+    ///
+    /// The `Initialized` condition is computed against this rather than
+    /// against the reports being non-empty, because the two differ exactly
+    /// when it matters: a pod that has not reached its init containers yet
+    /// reports none, and "none reported" must not read the same as "none
+    /// declared". A pod with no init containers is initialized; a pod with
+    /// three and no reports is not.
+    pub declared_init_containers: usize,
     pub pod_ip: Option<String>,
 }
 
@@ -2366,6 +2500,14 @@ pub struct ContainerStatusReport {
     pub reason: String,
     /// Free text under the reason — for a backoff, how much of it is left.
     pub message: String,
+}
+
+/// How many init containers a pod declares.
+pub fn declared_init_containers(pod: &Value) -> usize {
+    pod["spec"]["initContainers"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0)
 }
 
 /// Build the sandbox config for a pod object.
@@ -3209,6 +3351,7 @@ mod tests {
             startup_passed: HashMap::new(),
             started: HashMap::new(),
             terminated: HashMap::new(),
+            init_statuses: Vec::new(),
         }
     }
 
