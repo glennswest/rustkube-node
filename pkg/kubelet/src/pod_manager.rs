@@ -2134,8 +2134,8 @@ impl PodManager {
             if let Some(left) = self.backoff.wait(&key) {
                 state.ready.insert(name.clone(), false);
                 container_statuses.push(ContainerStatusReport {
-                    started_at: status.started_at,
-                    finished_at: status.finished_at,
+                    started_at: 0,
+                    finished_at: 0,
                     name: name.clone(),
                     container_id: String::new(),
                     state: "waiting".to_string(),
