@@ -20,11 +20,12 @@
 //! process that never needed to exist.
 
 use crate::pod_manager::{PodManager, VolumeRelease};
-use axum::extract::{FromRef, Path, Query, Request, State};
+use axum::extract::{ConnectInfo, FromRef, Path, Query, Request, State};
 use axum::http::{header::AUTHORIZATION, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::{routing::{delete, get}, Json, Router};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -156,7 +157,7 @@ pub async fn serve(port: u16, pod_manager: Arc<PodManager>, config: ServerConfig
         }
     };
 
-    let addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();
+    let addr: SocketAddr = ([0, 0, 0, 0], port).into();
     info!(
         "kubelet server listening on https://0.0.0.0:{port} (auth: {})",
         if config.anonymous { "anonymous" } else { "bearer-token" }
@@ -977,7 +978,41 @@ async fn vm_console(
             return (StatusCode::BAD_REQUEST, format!("bad console path: {e}\n")).into_response();
         }
     };
+    // The rewrite drops the query with the path, which is deliberate: the
+    // only console query parameter is `token`, and see below for why a token
+    // must not reach the doors from here. (`to` belongs to the migrate and
+    // receive verbs, which are not mounted.)
     *req.uri_mut() = uri;
+
+    // **Two things the doors expect from their own listener, which this
+    // server is not.** Both are consequences of mounting rather than dialling,
+    // and getting either wrong is a runtime failure no type catches.
+    //
+    // `ConnectInfo`: the door handlers extract it, and axum only inserts it
+    // for a server started with `into_make_service_with_connect_info`. This
+    // one is not, so without the line below every console request fails as a
+    // missing request extension — a 500 that says nothing about consoles.
+    //
+    // Loopback specifically, and the honest reading is that it is not a
+    // fiction: `is_local` asks whether the caller is already inside the
+    // node's boundary, and mounted here the caller *is* this process, on the
+    // node. The request also reached this handler through `auth_mw`, which is
+    // strictly stronger than what the door would have applied — TLS and a
+    // TokenReview-validated bearer token, against stormvm's
+    // "loopback, or a token" rule for an unauthenticated node-local port.
+    // That is the trade rustkube-node#43 describes: mounted behind this
+    // server's auth, the console's own token path becomes a fallback for
+    // nothing.
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
+
+    // The `Authorization` header must not travel. It is the apiserver's
+    // bearer token, already spent by `auth_mw`, and it is not a console
+    // token — but the door checks a presented token *first* and refuses when
+    // it does not redeem, so forwarding it turns every authenticated console
+    // request into a 403. Worse than useless: it also fails from loopback,
+    // where the request would otherwise have been admitted outright.
+    req.headers_mut().remove(AUTHORIZATION);
 
     match console.oneshot(req).await {
         Ok(resp) => resp,
@@ -1066,28 +1101,72 @@ mod console_tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// `/vmConsole/{ns}/{name}/{door}` reaches the mounted console router,
-    /// which answers for itself. With an empty run directory there is no such
-    /// VM, and *that* is the assertion: the request was routed and answered
-    /// in-process — not refused by this handler, and not a 502 from a socket
-    /// that nothing is listening on, which is what the old splice returned
-    /// whenever stormvm was not running.
+    /// An unregistered VM gets the console's own "no vm here" answer — 404
+    /// with its message, not a 502 from a socket nothing is listening on,
+    /// which is what the old splice returned whenever stormvm was not running.
     #[tokio::test]
-    async fn the_console_router_answers_for_a_vm_that_is_not_there() {
+    async fn an_unregistered_vm_gets_the_consoles_own_answer() {
         let dir = tempfile::tempdir().unwrap();
         let resp = get(
             app_with_console(dir.path().to_str().unwrap()),
             "/vmConsole/default/web-1/serial",
         )
         .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("no vm default/web-1"), "{text}");
+    }
+
+    /// **The test that proves the mount.** A registered VM must get *past*
+    /// admission, and the two ways it would not are both invisible to the
+    /// type system:
+    ///
+    /// - the door extracts `ConnectInfo`, which axum inserts only for a
+    ///   server built with `into_make_service_with_connect_info` — this one
+    ///   is not, so a missing injection is a 500;
+    /// - the door checks a presented bearer token before it considers
+    ///   loopback, and the apiserver's token does not redeem — so a
+    ///   forwarded `Authorization` header is a 403.
+    ///
+    /// Sent without the WebSocket handshake headers, an admitted request
+    /// reaches `WebSocketUpgrade` and is rejected there — 426, or 400. That
+    /// is the pass: it means the request got all the way to the upgrade.
+    #[tokio::test]
+    async fn a_registered_vm_is_admitted_through_the_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().to_str().unwrap();
+        let reg = stormvm_node::console::Registration {
+            namespace: "default".into(),
+            name: "web-1".into(),
+            serial_socket: Some(format!("{run_dir}/default/web-1/serial.sock")),
+            ..Default::default()
+        };
+        stormvm_node::console::write(run_dir, &reg).unwrap();
+
+        // With the apiserver's credential attached, exactly as auth_mw saw it.
+        let req = HttpRequest::builder()
+            .uri("/vmConsole/default/web-1/serial")
+            .header("authorization", "Bearer an-apiserver-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app_with_console(run_dir).oneshot(req).await.unwrap();
+
         assert_ne!(
             resp.status(),
-            StatusCode::BAD_GATEWAY,
-            "a missing VM must not read as an unreachable console service"
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ConnectInfo was not injected — the door could not read its peer"
         );
+        assert_ne!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "the apiserver's bearer token reached the door and was refused as a console token"
+        );
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND, "the registration was not found");
         assert!(
-            resp.status().is_client_error() || resp.status().is_server_error(),
-            "an absent VM is not a successful console: got {}",
+            resp.status() == StatusCode::UPGRADE_REQUIRED
+                || resp.status() == StatusCode::BAD_REQUEST,
+            "an admitted request should reach the WebSocket upgrade: got {}",
             resp.status()
         );
     }
