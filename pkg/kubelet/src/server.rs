@@ -5,13 +5,19 @@
 //! apiserver proxies `kubectl logs` to (rustkube-node#34). Exec, attach and
 //! portforward are follow-ups (rustkube-node#7). Served over HTTPS with
 //! bearer-token auth (rustkube-node#9).
+//!
+//! Two routes are here because the thing they reach is on loopback and the
+//! control plane cannot: `/vmConsole` (stormvm) and `DELETE /volumes`
+//! (stormblock). Both keep the blast radius at one node and reuse a hop the
+//! apiserver already authenticates, rather than giving a controller
+//! credentials to every node's engine.
 
-use crate::pod_manager::PodManager;
+use crate::pod_manager::{PodManager, VolumeRelease};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{header::AUTHORIZATION, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::{routing::get, Json, Router};
+use axum::{routing::{delete, get}, Json, Router};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -62,6 +68,12 @@ pub fn router(pod_manager: Arc<PodManager>) -> Router {
         // A VM's console, spliced through to stormvm on loopback — what the
         // apiserver's subresources.kubevirt.io handler proxies to (rustkube#61).
         .route("/vmConsole/:namespace/:name/:door", get(vm_console))
+        // Release the stormblock clone behind a claim, so a `Delete` reclaim
+        // policy finishes (rustkube-node#46). Same shape as the VM console:
+        // control plane → kubelet → a loopback service the control plane
+        // cannot reach. `DELETE` rather than a verb under some other path
+        // because it destroys data, and should read that way in an audit log.
+        .route("/volumes/:namespace/:claim", delete(release_volume))
         .with_state(pod_manager)
 }
 
@@ -284,6 +296,48 @@ async fn stats_summary(State(pm): State<Arc<PodManager>>) -> impl IntoResponse {
         },
         "pods": pods,
     }))
+}
+
+/// `DELETE /volumes/{namespace}/{claim}` — delete the stormblock clone behind
+/// a released claim (rustkube-node#46).
+///
+/// The control plane's provisioner creates and binds the PV but cannot honour
+/// `reclaimPolicy: Delete`, because stormblock's management API is loopback
+/// and only the node can reach it. Leaving the PV `Released` was the
+/// deliberate stand-in: deleting the object without deleting the clone turns
+/// a visible leak into an invisible one, and because the volume name is
+/// derived from the claim's, a later unrelated claim of that name in that
+/// namespace would silently adopt the previous tenant's data.
+///
+/// - `204` — the clone is gone, or there was none (a retry is not an error).
+/// - `409` — a pod on this node still has it. Refused, not queued: a delete
+///   that races a running pod pulls a filesystem away mid-write.
+/// - `503` — the node could not establish that it is unused, or stormblock
+///   refused. Fails closed, because "I could not check" is not "nothing is
+///   using it" when the answer destroys data.
+async fn release_volume(
+    State(pod_manager): State<Arc<PodManager>>,
+    Path((namespace, claim)): Path<(String, String)>,
+) -> Response {
+    match pod_manager.release_claim_volume(&namespace, &claim).await {
+        Ok(VolumeRelease::Released) => {
+            info!("released the volume for claim {namespace}/{claim}");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(VolumeRelease::Absent) => StatusCode::NO_CONTENT.into_response(),
+        Ok(VolumeRelease::InUse(holder)) => (
+            StatusCode::CONFLICT,
+            format!(
+                "claim {namespace}/{claim} is still mounted by pod {namespace}/{holder} \
+                 on this node\n"
+            ),
+        )
+            .into_response(),
+        Err(why) => {
+            warn!("release of {namespace}/{claim} refused: {why}");
+            (StatusCode::SERVICE_UNAVAILABLE, format!("{why}\n")).into_response()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1021,6 +1075,45 @@ fn parse_head(head: &[u8]) -> Result<(u16, axum::http::HeaderMap), String> {
         }
     }
     Ok((status, headers))
+}
+
+#[cfg(test)]
+mod volume_release_tests {
+    use super::tests::app;
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use tower::ServiceExt;
+
+    async fn release(uri: &str) -> StatusCode {
+        let req = HttpRequest::builder()
+            .method("DELETE")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        app().oneshot(req).await.unwrap().status()
+    }
+
+    /// The route exists and is a DELETE. `app()`'s PodManager points at the
+    /// default loopback stormblock, which nothing is serving in a test, so
+    /// the answer is the fail-closed one — which is the assertion worth
+    /// making: an unreachable engine must not read as "released".
+    #[tokio::test]
+    async fn an_unreachable_engine_answers_503_not_204() {
+        assert_eq!(release("/volumes/default/data").await, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A GET on the release path is not a release. Destroying data through a
+    /// safe method is the mistake this asserts against.
+    #[tokio::test]
+    async fn only_delete_releases() {
+        let req = HttpRequest::builder()
+            .uri("/volumes/default/data")
+            .body(Body::empty())
+            .unwrap();
+        let status = app().oneshot(req).await.unwrap().status();
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    }
 }
 
 #[cfg(test)]

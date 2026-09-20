@@ -3,6 +3,25 @@
 ## [Unreleased]
 
 ### 2026-09-20
+- **feat(kubelet):** `DELETE /volumes/{namespace}/{claim}` on `:10250`, so a
+  `Delete` reclaim policy stops leaking (#46, filed from rustkube#71). The
+  control plane provisions and binds the PV but cannot delete the clone:
+  stormblock's management API is loopback, so only the node can reach the
+  engine holding the volume. The controller was leaving the PV `Released` and
+  emitting `VolumeNotDeleted` on every pass — deliberately, because deleting
+  the object without the clone turns a visible leak into an invisible one,
+  and the volume name is derived from the claim's, so a later unrelated claim
+  of that name in that namespace would adopt the previous tenant's data. Same
+  shape as the VM console (rustkube#61): no new auth and no new reachability
+  assumption. The name is resolved through `storage::volume_name`, the same
+  function that created it. It detaches before deleting, because the attach
+  outlives the pod and stormblock refuses to delete a volume it still serves.
+  A pod on this node still holding the claim is a `409`, refused rather than
+  queued. Absent is `204`, so a retrying controller settles. An engine that
+  cannot be reached, or an apiserver that cannot confirm the claim is unused,
+  is a `503` — "I could not check" is not "nothing is using it" when the
+  answer destroys data, and answering `204` there would delete the PV over a
+  volume that is still allocated.
 - **feat(kubelet):** enforce `ReadWriteOncePod` at the mount (#42). The
   scheduler filter is what keeps a second pod Pending with a readable reason,
   and it cannot see the two ways around it: a static pod, or one written

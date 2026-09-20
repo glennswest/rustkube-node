@@ -47,6 +47,18 @@ pub struct PodState {
     pub terminated: HashMap<String, i32>,
 }
 
+/// What [`PodManager::release_claim_volume`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VolumeRelease {
+    /// The clone was deleted.
+    Released,
+    /// There was no such volume on this node — already released, or never
+    /// provisioned here. Success, so a retrying controller settles.
+    Absent,
+    /// Refused: the named pod on this node still has the claim.
+    InUse(String),
+}
+
 /// Why a pod was removed from this node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemovalReason {
@@ -569,6 +581,103 @@ impl PodManager {
             .map(|st| st.name.clone())
     }
 
+    /// Delete the stormblock clone behind a claim, so a `Delete` reclaim
+    /// policy finishes instead of leaking (rustkube-node#46).
+    ///
+    /// **Why the node does this and not a controller.** stormblock's
+    /// management API is loopback: the engine that holds the volume is on the
+    /// node, and only the node can reach it. The alternative — an off-node
+    /// path to every node's engine — is a credential that can destroy any
+    /// volume in the cluster, reachable from wherever the controller runs.
+    /// This route keeps the blast radius at one node and reuses a hop the
+    /// apiserver already authenticates.
+    ///
+    /// The name comes from [`crate::storage::volume_name`], the same function
+    /// that created it, so the two cannot disagree about which volume this is.
+    pub async fn release_claim_volume(
+        &self,
+        namespace: &str,
+        claim: &str,
+    ) -> Result<VolumeRelease, String> {
+        // Refuse while a pod here still has it. A delete that races a running
+        // pod pulls a filesystem out from under a process mid-write, and the
+        // pod finds out as EIO on a device that no longer exists.
+        if let Some(holder) = self.claim_holder_here(namespace, claim).await? {
+            return Ok(VolumeRelease::InUse(holder));
+        }
+
+        // Absent is success: a controller retrying a delete it already
+        // completed is not an error, and answering 404 would make it one.
+        //
+        // This asks through `storage_volume_checked`, not the `Option`-shaped
+        // lookup the provisioning path uses, and the difference is the whole
+        // point: that one answers `None` both for "there is no such volume"
+        // and for "stormblock did not answer", and here those are opposite
+        // answers. Reporting the second as Absent would tell the controller
+        // the clone was deleted when the node could not even ask — which
+        // deletes the PV and turns the leak this endpoint exists to stop into
+        // the invisible kind.
+        let name = crate::storage::volume_name(namespace, claim);
+        let Some((vol_id, _sealed)) = self.storage_volume_checked(&name).await? else {
+            return Ok(VolumeRelease::Absent);
+        };
+
+        // Detach before deleting. The attach outlives the pod that needed it,
+        // and stormblock refuses to delete a volume it is still serving — so
+        // without this the delete comes back 409 for every volume that was
+        // ever mounted, which is all of them.
+        self.storage_delete(&format!("/api/v1/volumes/{vol_id}/attach")).await?;
+        self.storage_delete(&format!("/api/v1/volumes/{vol_id}")).await?;
+        info!("released volume {name} ({vol_id}) for claim {namespace}/{claim}");
+        Ok(VolumeRelease::Released)
+    }
+
+    /// The name of a pod on this node that still uses `claim`, if there is one.
+    ///
+    /// Asks twice, because neither source is sufficient alone. Local state
+    /// knows about static pods, which the apiserver has never heard of, and
+    /// is stale for a pod adopted after a kubelet restart — state recovery
+    /// enters those with a null spec and the claim list is only filled in on
+    /// the next sync. The apiserver knows the specs but not the static pods.
+    ///
+    /// `Err` when the apiserver cannot be asked at all, and the caller must
+    /// treat that as a refusal: this is a data-destroying operation, and "I
+    /// could not check" is not "nothing is using it".
+    async fn claim_holder_here(
+        &self,
+        namespace: &str,
+        claim: &str,
+    ) -> Result<Option<String>, String> {
+        // The uid filter excludes nothing here: every pod is somebody else.
+        if let Some(holder) = self.other_pod_holding(namespace, claim, "").await {
+            return Ok(Some(holder));
+        }
+        if self.api_url.is_empty() {
+            return Ok(None);
+        }
+        let pods = self
+            .api_get("/api/v1/pods")
+            .await
+            .ok_or_else(|| {
+                "cannot confirm the volume is unused: the apiserver pod list is unavailable"
+                    .to_string()
+            })?;
+        let holder = pods["items"]
+            .as_array()
+            .map(|a| a.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .find(|p| {
+                p["spec"]["nodeName"].as_str() == Some(&self.node_name)
+                    && p["metadata"]["namespace"].as_str() == Some(namespace)
+                    && !matches!(p["status"]["phase"].as_str(), Some("Succeeded") | Some("Failed"))
+                    && pod_claims(p).any(|c| c == claim)
+            })
+            .and_then(|p| p["metadata"]["name"].as_str())
+            .map(String::from);
+        Ok(holder)
+    }
+
     /// Turn a PersistentVolumeClaim into a block device on this node.
     ///
     /// **Redundancy is not decided here.** stormblock and stormdrive are the
@@ -734,6 +843,37 @@ impl PodManager {
         Some((v["id"].as_str()?.to_string(), v["sealed"].as_bool().unwrap_or(false)))
     }
 
+    /// A volume's id and seal state by name, telling "no such volume" apart
+    /// from "stormblock did not answer".
+    ///
+    /// [`Self::storage_volume`] collapses the two into `None`, which is right
+    /// for provisioning — either way there is nothing to clone from and the
+    /// next step handles it — and wrong for anything that destroys data.
+    async fn storage_volume_checked(&self, name: &str) -> Result<Option<(String, bool)>, String> {
+        let resp = self
+            .api_client
+            .get(format!("{}/api/v1/volumes", self.storage_url))
+            .send()
+            .await
+            .map_err(|e| format!("stormblock is not answering on this node: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("stormblock volume list -> {}", resp.status()));
+        }
+        let list: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("stormblock volume list is not JSON: {e}"))?;
+        let items = list["items"]
+            .as_array()
+            .ok_or_else(|| "stormblock volume list has no items".to_string())?;
+        Ok(items
+            .iter()
+            .find(|v| v["name"].as_str() == Some(name))
+            .and_then(|v| {
+                Some((v["id"].as_str()?.to_string(), v["sealed"].as_bool().unwrap_or(false)))
+            }))
+    }
+
     /// Lay down a blank filesystem for a size class, once.
     ///
     /// Returns what `storage_volume` would have: the id, and whether it is
@@ -763,6 +903,31 @@ impl PodManager {
             .as_str()
             .ok_or_else(|| ClaimError::Failed(format!("minting {blank} returned no id: {made}")))?;
         Ok((id.to_string(), made["sealed"].as_bool().unwrap_or(false)))
+    }
+
+    /// DELETE on stormblock's management API on this node.
+    ///
+    /// Unlike the GET and POST helpers this reports *why* it failed rather
+    /// than answering `None`. It is only used on the release path, where the
+    /// reason travels back to the control plane and is the whole content of
+    /// the answer: "it is still served by ublk" and "there is no such volume"
+    /// are different facts and a controller does different things with them.
+    async fn storage_delete(&self, path: &str) -> Result<(), String> {
+        let resp = self
+            .api_client
+            .delete(format!("{}{path}", self.storage_url))
+            .send()
+            .await
+            .map_err(|e| format!("stormblock is not answering on this node: {e}"))?;
+        let status = resp.status();
+        if status.is_success() || status.as_u16() == 404 {
+            return Ok(());
+        }
+        let body = resp.text().await.unwrap_or_default();
+        Err(format!(
+            "stormblock DELETE {path} -> {status}: {}",
+            body.chars().take(200).collect::<String>()
+        ))
     }
 
     /// GET from stormblock's management API on this node.
@@ -2751,7 +2916,7 @@ mod tests {
     };
     use async_trait::async_trait;
     use serde_json::json;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::Mutex;
 
     #[derive(Debug, Clone)]
@@ -3079,6 +3244,122 @@ mod tests {
             pods.get_mut("uid-1").unwrap().phase = "Succeeded".into();
         }
         assert!(mgr.other_pod_holding("default", "data", "uid-2").await.is_none());
+    }
+
+    /// A stand-in for stormblock's management API on loopback: it holds at
+    /// most one volume and records what was done to it.
+    struct FakeStormblock {
+        detached: Arc<AtomicBool>,
+        deleted: Arc<AtomicBool>,
+        url: String,
+    }
+
+    /// Serve the three calls a release makes: list the volumes, detach one,
+    /// delete one. A deleted volume drops out of the listing, so a second
+    /// release of the same claim sees what a real one would.
+    async fn fake_stormblock(volume: Option<&str>) -> FakeStormblock {
+        use axum::routing::{delete as http_delete, get as http_get};
+
+        let detached = Arc::new(AtomicBool::new(false));
+        let deleted = Arc::new(AtomicBool::new(false));
+        let name = volume.map(String::from);
+
+        let (for_list, for_detach, for_delete) =
+            (deleted.clone(), detached.clone(), deleted.clone());
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/volumes",
+                http_get(move || {
+                    let (name, deleted) = (name.clone(), for_list.clone());
+                    async move {
+                        let items = match (&name, deleted.load(Ordering::SeqCst)) {
+                            (Some(n), false) => json!([{"id": "vol-1", "name": n}]),
+                            _ => json!([]),
+                        };
+                        axum::Json(json!({ "items": items }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/volumes/:id/attach",
+                http_delete(move || {
+                    let d = for_detach.clone();
+                    async move {
+                        d.store(true, Ordering::SeqCst);
+                        axum::http::StatusCode::NO_CONTENT
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/volumes/:id",
+                http_delete(move || {
+                    let d = for_delete.clone();
+                    async move {
+                        d.store(true, Ordering::SeqCst);
+                        axum::http::StatusCode::NO_CONTENT
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        FakeStormblock { detached, deleted, url: format!("http://{addr}") }
+    }
+
+    #[tokio::test]
+    async fn releasing_a_claim_detaches_then_deletes_the_clone() {
+        let sb = fake_stormblock(Some("pvc-default-data")).await;
+        let (_rt, mut mgr) = manager();
+        mgr.storage_url = sb.url.clone();
+
+        assert_eq!(
+            mgr.release_claim_volume("default", "data").await.unwrap(),
+            VolumeRelease::Released
+        );
+        // Detach first: the attach outlives the pod, and stormblock refuses to
+        // delete a volume it is still serving.
+        assert!(sb.detached.load(Ordering::SeqCst));
+        assert!(sb.deleted.load(Ordering::SeqCst));
+
+        // Releasing again is success, not a 404: a controller retrying a
+        // delete it already completed must be able to settle.
+        assert_eq!(
+            mgr.release_claim_volume("default", "data").await.unwrap(),
+            VolumeRelease::Absent
+        );
+    }
+
+    #[tokio::test]
+    async fn a_claim_a_pod_still_holds_is_refused_not_deleted() {
+        let sb = fake_stormblock(Some("pvc-default-data")).await;
+        let (_rt, mut mgr) = manager();
+        mgr.storage_url = sb.url.clone();
+        {
+            let mut pods = mgr.pods.write().await;
+            pods.insert("uid-1".into(), state_holding("uid-1", "db", "data", "Running"));
+        }
+
+        assert_eq!(
+            mgr.release_claim_volume("default", "data").await.unwrap(),
+            VolumeRelease::InUse("db".into())
+        );
+        // Refused, not queued, and above all nothing was touched: a delete
+        // that races a running pod pulls a filesystem away mid-write.
+        assert!(!sb.detached.load(Ordering::SeqCst));
+        assert!(!sb.deleted.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_engine_is_an_error_not_a_silent_success() {
+        // Nothing listening: reporting Absent here would tell the controller
+        // the clone is gone when the node could not even ask, and the PV
+        // would be deleted over a volume that is still allocated.
+        let (_rt, mut mgr) = manager();
+        mgr.storage_url = "http://127.0.0.1:1".to_string();
+        assert!(mgr.release_claim_volume("default", "data").await.is_err());
     }
 
     #[test]
