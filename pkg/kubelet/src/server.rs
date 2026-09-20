@@ -1136,12 +1136,15 @@ mod console_tests {
     async fn a_registered_vm_is_admitted_through_the_mount() {
         let dir = tempfile::tempdir().unwrap();
         let run_dir = dir.path().to_str().unwrap();
-        let reg = stormvm_node::console::Registration {
-            namespace: "default".into(),
-            name: "web-1".into(),
-            serial_socket: Some(format!("{run_dir}/default/web-1/serial.sock")),
-            ..Default::default()
-        };
+        // Built through serde rather than as a literal: `Registration` has no
+        // `Default` and gains fields, and a test that named them all would
+        // break on every one. Only namespace and name are required.
+        let reg: stormvm_node::console::Registration = serde_json::from_value(serde_json::json!({
+            "namespace": "default",
+            "name": "web-1",
+            "serial_socket": format!("{run_dir}/default/web-1/serial.sock"),
+        }))
+        .unwrap();
         stormvm_node::console::write(run_dir, &reg).unwrap();
 
         // With the apiserver's credential attached, exactly as auth_mw saw it.
