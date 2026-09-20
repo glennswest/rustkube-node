@@ -3,6 +3,20 @@
 ## [Unreleased]
 
 ### 2026-09-20
+- **fix(kubelet):** provision only claims that belong to this node's
+  StorageClass (#44). Every PVC a pod mounted became a stormblock clone
+  regardless of who else owned it — harmless while this is the only
+  provisioner, and silent the moment it is not: a CSI driver binds the claim
+  to its own PV while this node clones a second volume and the pod runs on
+  that one, leaving a real, allocated volume mounted by nobody and a claim
+  that looks healthy pointing at no data. `storageClassName: ""` is an
+  explicit opt-out rather than "no opinion", matching the binder's
+  `claim_class`, so a static PV is no longer provisioned over.
+- **fix(kubelet):** a claim belonging to another provisioner no longer falls
+  back to scratch. The fallback's rationale is about storage that is
+  *briefly* unreachable; a class mismatch is permanent, so the same path gave
+  a pod scratch storage forever. It now waits with the reason in
+  `kubectl describe`, which is what upstream does and what can be diagnosed.
 - **fix(kubelet):** build against stormvm main again, and stop deriving two of
   a VM's names without its namespace (#41). `Registration::of` takes the
   namespace from the spec now and `console::remove` needs it, which were the

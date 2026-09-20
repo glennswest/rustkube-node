@@ -111,6 +111,45 @@ pub fn claim_bytes(pvc: &Value) -> u64 {
         .unwrap_or(SIZE_CLASSES[0].1)
 }
 
+/// The StorageClass this node provisions for itself.
+pub const STORAGE_CLASS: &str = "stormblock";
+
+/// Does this node provision this claim, or does it belong to someone else?
+///
+/// Every claim on the node used to become a stormblock clone regardless of
+/// who else thought they owned it (#44). That is harmless while this is the
+/// only provisioner and fails *silently* the moment it is not: with a CSI
+/// driver deployed, one claim is provisioned twice — the driver writes a PV
+/// and binds the claim, this node independently clones its own volume, and
+/// the pod runs on the node's. The CSI volume is real, allocated and mounted
+/// by nobody, so `kubectl` shows a healthy bound claim pointing at a volume
+/// holding no data. It surfaces as "my data vanished" after a reschedule.
+///
+/// The three cases are not symmetrical:
+///
+/// - **named** — ours, or another provisioner's. Only ours is provisioned here.
+/// - **`""`** — an *explicit opt-out* from dynamic provisioning: the claim is
+///   asking to be bound to a PV an administrator created, so provisioning one
+///   does the opposite of what it asked. rustkube's binder draws the same
+///   distinction in `claim_class`, and a kubelet that missed it would
+///   provision over static PVs.
+/// - **unset** — the control plane stamps the default class onto a claim that
+///   has none, so this is the window before that write lands rather than a
+///   claim with no class.
+///
+/// The unset case is right while stormblock is the default class and wrong the
+/// day it is not: a claim that would have been stamped with another class gets
+/// a stormblock volume if a pod races the binder to it. Closing that needs the
+/// StorageClass object and a match on its `provisioner` rather than its name,
+/// which is worth doing when the provisioning controller defines the class.
+pub fn provisioned_here(pvc: &Value) -> bool {
+    match pvc["spec"]["storageClassName"].as_str() {
+        Some("") => false,
+        Some(class) => class == STORAGE_CLASS,
+        None => true,
+    }
+}
+
 /// The volume name for a claim — stable, so a restarted pod finds its data.
 ///
 /// Keyed on namespace and claim name rather than the pod's UID: a pod is
@@ -124,6 +163,21 @@ pub fn volume_name(namespace: &str, claim: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn only_our_own_class_is_provisioned_here() {
+        // Ours, by name.
+        assert!(provisioned_here(&json!({"spec": {"storageClassName": "stormblock"}})));
+        // Somebody else's driver. Provisioning it is the double-provision that
+        // leaves a real, allocated, mounted-by-nobody volume behind.
+        assert!(!provisioned_here(&json!({"spec": {"storageClassName": "ebs-gp3"}})));
+        // An empty string is an explicit opt-out, not "no opinion": the claim
+        // wants an administrator's PV, and provisioning one does the opposite.
+        assert!(!provisioned_here(&json!({"spec": {"storageClassName": ""}})));
+        // Unset is the window before the control plane stamps the default.
+        assert!(provisioned_here(&json!({"spec": {}})));
+        assert!(provisioned_here(&json!({})));
+    }
 
     #[test]
     fn binary_and_decimal_suffixes_are_different_numbers() {

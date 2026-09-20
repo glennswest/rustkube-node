@@ -416,13 +416,19 @@ impl PodManager {
 
     /// Resolve `spec.volumes` to host paths, materializing configMap/secret
     /// volumes to files under the pod dir. hostPath/emptyDir handled inline.
-    async fn resolve_volumes(&self, pod: &Value) -> HashMap<String, ResolvedVolume> {
+    ///
+    /// `Err` only for a claim this node must not provision: everything else
+    /// degrades to scratch, loudly. See [`ClaimError`].
+    async fn resolve_volumes(
+        &self,
+        pod: &Value,
+    ) -> Result<HashMap<String, ResolvedVolume>, CriError> {
         let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
         let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default");
         let mut map = HashMap::new();
         let volumes = match pod["spec"]["volumes"].as_array() {
             Some(v) => v,
-            None => return map,
+            None => return Ok(map),
         };
         for vol in volumes {
             let name = match vol["name"].as_str() {
@@ -482,7 +488,17 @@ impl PodManager {
                         );
                         continue;
                     }
-                    Err(e) => {
+                    // Someone else's class. Permanent and deterministic, so
+                    // the scratch fallback is exactly wrong here: its
+                    // rationale is about a node whose storage is *briefly*
+                    // unreachable, and silently giving a pod scratch storage
+                    // forever because its claim belongs to another driver is
+                    // the bad half of that trade with none of the good half.
+                    // The pod waits instead, with the reason in `describe`.
+                    Err(ClaimError::NotOurs(why)) => {
+                        return Err(CriError::VolumeNotReady(why));
+                    }
+                    Err(ClaimError::Failed(e)) => {
                         warn!(
                             "PVC {namespace}/{claim}: {e} — falling back to a scratch \
                              directory, THIS DATA WILL NOT PERSIST"
@@ -515,7 +531,7 @@ impl PodManager {
             }
             map.insert(name, ResolvedVolume { path: host_path, fstype: None });
         }
-        map
+        Ok(map)
     }
 
     /// Turn a PersistentVolumeClaim into a block device on this node.
@@ -532,7 +548,7 @@ impl PodManager {
     /// name-idempotent, so a restarted pod is reunited with its data rather than
     /// given a fresh volume. That is the whole difference between a claim and a
     /// scratch directory, and it is why the name cannot include the pod UID.
-    async fn provision_claim(&self, namespace: &str, claim: &str) -> Result<String, String> {
+    async fn provision_claim(&self, namespace: &str, claim: &str) -> Result<String, ClaimError> {
         let name = crate::storage::volume_name(namespace, claim);
 
         // What the claim asked for, rounded up to a class. The class is also
@@ -542,10 +558,30 @@ impl PodManager {
                 "/api/v1/namespaces/{namespace}/persistentvolumeclaims/{claim}"
             ))
             .await
-            .ok_or_else(|| format!("claim {claim} not found"))?;
+            .ok_or_else(|| ClaimError::Failed(format!("claim {claim} not found")))?;
+
+        // Whose claim is this? Someone else's class is not ours to clone, and
+        // getting that wrong provisions a second volume for a claim that is
+        // already bound to somebody's PV (#44).
+        if !crate::storage::provisioned_here(&pvc) {
+            let class = pvc["spec"]["storageClassName"].as_str().unwrap_or("");
+            return Err(ClaimError::NotOurs(if class.is_empty() {
+                format!(
+                    "claim {namespace}/{claim} sets storageClassName: \"\", which asks to bind \
+                     an existing volume rather than provision one"
+                )
+            } else {
+                format!(
+                    "claim {namespace}/{claim} belongs to StorageClass {class}, not {}",
+                    crate::storage::STORAGE_CLASS
+                )
+            }));
+        }
         let want = crate::storage::claim_bytes(&pvc);
         let (class, _bytes) = crate::storage::class_for(want).ok_or_else(|| {
-            format!("claim asks for {want} bytes, larger than the largest size class")
+            ClaimError::Failed(format!(
+                "claim asks for {want} bytes, larger than the largest size class"
+            ))
         })?;
 
         // Already provisioned? A claim is keyed on namespace and name, so a
@@ -564,7 +600,7 @@ impl PodManager {
                 let (src, sealed) = self
                     .storage_volume(&blank)
                     .await
-                    .ok_or_else(|| format!("no blank volume {blank} on this node"))?;
+                    .ok_or_else(|| ClaimError::Failed(format!("no blank volume {blank} on this node")))?;
 
                 // A clone descends from a *sealed* volume, and the blanks
                 // arrive sealed as golden images — which is a different thing
@@ -575,16 +611,16 @@ impl PodManager {
                     info!("sealing blank {blank} so claims can be cloned from it");
                     self.storage_post(&format!("/api/v1/volumes/{src}/seal"), &serde_json::json!({}))
                         .await
-                        .ok_or_else(|| format!("could not seal blank {blank}"))?;
+                        .ok_or_else(|| ClaimError::Failed(format!("could not seal blank {blank}")))?;
                 }
                 let body = serde_json::json!({ "name": name, "verify": true });
                 let created: Value = self
                     .storage_post(&format!("/api/v1/volumes/{src}/clone"), &body)
                     .await
-                    .ok_or_else(|| format!("stormblock would not clone {blank} to {name}"))?;
+                    .ok_or_else(|| ClaimError::Failed(format!("stormblock would not clone {blank} to {name}")))?;
                 created["id"]
                     .as_str()
-                    .ok_or_else(|| format!("clone of {blank} returned no id: {created}"))?
+                    .ok_or_else(|| ClaimError::Failed(format!("clone of {blank} returned no id: {created}")))?
                     .to_string()
             }
         };
@@ -601,15 +637,15 @@ impl PodManager {
         let info: Value = self
             .storage_post(&format!("/api/v1/volumes/{vol_id}/attach"), &attach)
             .await
-            .ok_or_else(|| format!("stormblock would not attach {name} as a local device"))?;
+            .ok_or_else(|| ClaimError::Failed(format!("stormblock would not attach {name} as a local device")))?;
         if let Some(dev) = info["device_hint"].as_str() {
             info!("PVC {namespace}/{claim} -> {name} ({class}) at {dev}");
             return Ok(dev.to_string());
         }
-        Err(format!(
+        Err(ClaimError::Failed(format!(
             "volume {name} did not attach locally: {info} — an NVMe-oF attach needs a \
              connect this node does not do yet"
-        ))
+        )))
     }
 
     /// A volume's id by name, or `None` when this node has no such volume.
@@ -1156,7 +1192,7 @@ impl PodManager {
         info!("Starting pod {namespace}/{name}");
 
         let sandbox_config = build_sandbox_config(pod);
-        let volumes = self.resolve_volumes(pod).await;
+        let volumes = self.resolve_volumes(pod).await?;
 
 
         // **The kubelet cannot check host paths from here.** It runs in a
@@ -1808,7 +1844,19 @@ impl PodManager {
         };
 
         let image = spec["image"].as_str().unwrap_or("");
-        let volumes = self.resolve_volumes(&state.pod).await;
+        // A volume this node must not provision stops the restart: the same
+        // reason is on the pod's status from the start path, and retrying
+        // every tick would not change it.
+        let volumes = match self.resolve_volumes(&state.pod).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "Container {}/{}/{name}: {e}",
+                    state.namespace, state.name
+                );
+                return false;
+            }
+        };
         let mut envs = self
             .resolve_env(&state.pod, spec, state.pod_ip.as_deref())
             .await;
@@ -1985,6 +2033,32 @@ impl PodManager {
         }
 
         Ok(())
+    }
+}
+
+/// Why a claim could not be turned into a device.
+///
+/// Split because the two halves deserve opposite treatment, and conflating
+/// them is what made the scratch fallback dangerous (#44). `Failed` is
+/// transient — the engine is unreachable, a clone failed, an attach 409'd —
+/// and a pod that will not start on a node whose storage is briefly
+/// unreachable is worse than one that starts with scratch and says so loudly.
+/// `NotOurs` is permanent and deterministic, so the same fallback would give
+/// a pod scratch storage *forever* because its claim belongs to another
+/// driver, which is that trade's cost without its benefit.
+#[derive(Debug)]
+enum ClaimError {
+    /// Another provisioner's claim. Never falls back.
+    NotOurs(String),
+    /// Something went wrong that may not be wrong next time.
+    Failed(String),
+}
+
+impl std::fmt::Display for ClaimError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClaimError::NotOurs(m) | ClaimError::Failed(m) => f.write_str(m),
+        }
     }
 }
 
@@ -2862,7 +2936,7 @@ mod tests {
                 ]}}
             ]}
         }]);
-        let v = mgr.resolve_volumes(&p).await;
+        let v = mgr.resolve_volumes(&p).await.unwrap();
         let dir = &v.get("kube-api-access").expect("projected volume resolved").path;
         assert!(dir.contains("kubernetes.io~projected"));
         // The downward file was written with the namespace.
@@ -2958,7 +3032,7 @@ mod tests {
                 {"name": "scratch", "emptyDir": {}}
             ]}
         });
-        let v = mgr.resolve_volumes(&p).await;
+        let v = mgr.resolve_volumes(&p).await.unwrap();
         assert_eq!(v.get("bpf").map(|r| r.path.as_str()), Some("/sys/fs/bpf"));
         assert!(v
             .get("scratch")
