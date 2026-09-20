@@ -480,7 +480,7 @@ impl PodManager {
                 // in the wrong place is bad, but so is a pod that will not start
                 // on a node whose storage is briefly unreachable. The fallback
                 // is loud, and `kubectl describe` shows the reason.
-                match self.provision_claim(namespace, claim).await {
+                match self.provision_claim(namespace, claim, uid).await {
                     Ok(device) => {
                         map.insert(
                             name,
@@ -496,6 +496,15 @@ impl PodManager {
                     // the bad half of that trade with none of the good half.
                     // The pod waits instead, with the reason in `describe`.
                     Err(ClaimError::NotOurs(why)) => {
+                        return Err(CriError::VolumeNotReady(why));
+                    }
+                    // ReadWriteOncePod, already held here. Also permanent as
+                    // far as this pod is concerned until the holder goes
+                    // away, and the scratch fallback would be worse than
+                    // wrong: a pod that asked for an exclusive volume and
+                    // silently got an empty directory has been told its
+                    // guarantee held when it did not.
+                    Err(ClaimError::InUse(why)) => {
                         return Err(CriError::VolumeNotReady(why));
                     }
                     Err(ClaimError::Failed(e)) => {
@@ -534,6 +543,32 @@ impl PodManager {
         Ok(map)
     }
 
+    /// The name of another pod on this node that already has `claim` mounted,
+    /// if there is one.
+    ///
+    /// "Already has it mounted" is read from the pods this manager is running:
+    /// a pod is a holder while it is non-terminal, because a Succeeded or
+    /// Failed pod's containers are gone and nothing of it is writing. The
+    /// pod's own UID is excluded so a restart, which re-resolves its volumes,
+    /// does not find itself and refuse to come back up.
+    async fn other_pod_holding(
+        &self,
+        namespace: &str,
+        claim: &str,
+        pod_uid: &str,
+    ) -> Option<String> {
+        let pods = self.pods.read().await;
+        pods.values()
+            .find(|st| {
+                st.uid != pod_uid
+                    && st.namespace == namespace
+                    && st.phase != "Succeeded"
+                    && st.phase != "Failed"
+                    && pod_claims(&st.pod).any(|c| c == claim)
+            })
+            .map(|st| st.name.clone())
+    }
+
     /// Turn a PersistentVolumeClaim into a block device on this node.
     ///
     /// **Redundancy is not decided here.** stormblock and stormdrive are the
@@ -548,7 +583,12 @@ impl PodManager {
     /// name-idempotent, so a restarted pod is reunited with its data rather than
     /// given a fresh volume. That is the whole difference between a claim and a
     /// scratch directory, and it is why the name cannot include the pod UID.
-    async fn provision_claim(&self, namespace: &str, claim: &str) -> Result<String, ClaimError> {
+    async fn provision_claim(
+        &self,
+        namespace: &str,
+        claim: &str,
+        pod_uid: &str,
+    ) -> Result<String, ClaimError> {
         let name = crate::storage::volume_name(namespace, claim);
 
         // What the claim asked for, rounded up to a class. The class is also
@@ -577,6 +617,24 @@ impl PodManager {
                 )
             }));
         }
+        // `ReadWriteOncePod` means one *pod*, where `ReadWriteOnce` means one
+        // *node* and lets every pod on that node share the volume. The
+        // scheduler filter (rustkube#65) is what keeps a second pod Pending
+        // with a readable reason, and it is not enough on its own: a static
+        // pod, or one written straight onto `spec.nodeName`, never passes a
+        // scheduler filter at all. Upstream refuses the mount for exactly
+        // that reason, and so does this — a guarantee that holds for
+        // scheduled pods and quietly does not for the two ways around the
+        // scheduler is worse than not offering the mode (rustkube-node#42).
+        if crate::storage::is_rwop(&pvc) {
+            if let Some(holder) = self.other_pod_holding(namespace, claim, pod_uid).await {
+                return Err(ClaimError::InUse(format!(
+                    "claim {namespace}/{claim} is ReadWriteOncePod and is already mounted by \
+                     pod {namespace}/{holder} on this node"
+                )));
+            }
+        }
+
         let want = crate::storage::claim_bytes(&pvc);
         let (class, _bytes) = crate::storage::class_for(want).ok_or_else(|| {
             ClaimError::Failed(format!(
@@ -2094,6 +2152,10 @@ impl PodManager {
 enum ClaimError {
     /// Another provisioner's claim. Never falls back.
     NotOurs(String),
+    /// A `ReadWriteOncePod` claim another pod on this node already holds.
+    /// Never falls back either: the point of the mode is that the second
+    /// mount does not happen.
+    InUse(String),
     /// Something went wrong that may not be wrong next time.
     Failed(String),
 }
@@ -2101,7 +2163,9 @@ enum ClaimError {
 impl std::fmt::Display for ClaimError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ClaimError::NotOurs(m) | ClaimError::Failed(m) => f.write_str(m),
+            ClaimError::NotOurs(m) | ClaimError::InUse(m) | ClaimError::Failed(m) => {
+                f.write_str(m)
+            }
         }
     }
 }
@@ -2185,6 +2249,16 @@ fn build_sandbox_config(pod: &Value) -> PodSandboxConfig {
         // resource rather than on the container that was actually relabelled.
         selinux_options: parse_selinux_options(&pod["spec"]["securityContext"]),
     }
+}
+
+/// The PVC names a pod mounts, in spec order.
+fn pod_claims(pod: &Value) -> impl Iterator<Item = &str> {
+    pod["spec"]["volumes"]
+        .as_array()
+        .map(|v| v.as_slice())
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|vol| vol["persistentVolumeClaim"]["claimName"].as_str())
 }
 
 /// Per-pod volume directory: <state_root>/pods/<uid>/volumes/kubernetes.io~<kind>/<name>.
@@ -2947,6 +3021,77 @@ mod tests {
 
     fn simple_container() -> Value {
         json!({"name": "app", "image": "busybox:latest"})
+    }
+
+    /// A pod state holding one claim, in the given phase.
+    fn state_holding(uid: &str, name: &str, claim: &str, phase: &str) -> PodState {
+        PodState {
+            namespace: "default".to_string(),
+            name: name.to_string(),
+            uid: uid.to_string(),
+            sandbox_id: None,
+            container_ids: HashMap::new(),
+            phase: phase.to_string(),
+            pod: json!({
+                "metadata": {"name": name, "namespace": "default", "uid": uid},
+                "spec": {"volumes": [{"name": "data",
+                    "persistentVolumeClaim": {"claimName": claim}}]}
+            }),
+            pod_ip: None,
+            restart_counts: HashMap::new(),
+            ready: HashMap::new(),
+            liveness_failures: HashMap::new(),
+            startup_passed: HashMap::new(),
+            started: HashMap::new(),
+            terminated: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn rwop_holder_is_found_only_among_live_pods_elsewhere() {
+        let (_rt, mgr) = manager();
+        {
+            let mut pods = mgr.pods.write().await;
+            pods.insert("uid-1".into(), state_holding("uid-1", "db", "data", "Running"));
+        }
+
+        // A second pod on this node wanting the same claim finds the holder —
+        // this is the case the scheduler cannot catch, because a static pod or
+        // one written straight onto spec.nodeName never passes a filter.
+        assert_eq!(
+            mgr.other_pod_holding("default", "data", "uid-2").await.as_deref(),
+            Some("db")
+        );
+
+        // The holder does not find itself: a restart re-resolves its own
+        // volumes and must not refuse to come back up.
+        assert!(mgr.other_pod_holding("default", "data", "uid-1").await.is_none());
+
+        // A different claim, and the same claim in another namespace, are
+        // different volumes.
+        assert!(mgr.other_pod_holding("default", "other", "uid-2").await.is_none());
+        assert!(mgr.other_pod_holding("prod", "data", "uid-2").await.is_none());
+
+        // A terminal pod holds nothing — its containers are gone, so nothing
+        // of it is writing and the claim is free.
+        {
+            let mut pods = mgr.pods.write().await;
+            pods.get_mut("uid-1").unwrap().phase = "Succeeded".into();
+        }
+        assert!(mgr.other_pod_holding("default", "data", "uid-2").await.is_none());
+    }
+
+    #[test]
+    fn pod_claims_lists_only_pvc_volumes() {
+        let pod = json!({"spec": {"volumes": [
+            {"name": "cfg", "configMap": {"name": "c"}},
+            {"name": "data", "persistentVolumeClaim": {"claimName": "pgdata"}},
+            {"name": "tmp", "emptyDir": {}},
+            {"name": "more", "persistentVolumeClaim": {"claimName": "wal"}}
+        ]}});
+        assert_eq!(pod_claims(&pod).collect::<Vec<_>>(), vec!["pgdata", "wal"]);
+        // A pod with no volumes at all is not a special case.
+        assert_eq!(pod_claims(&json!({"spec": {}})).count(), 0);
     }
 
     #[test]

@@ -150,6 +150,20 @@ pub fn provisioned_here(pvc: &Value) -> bool {
     }
 }
 
+/// Does this claim ask for `ReadWriteOncePod`?
+///
+/// The mode that `ReadWriteOnce` is routinely mistaken for: RWO is one *node*
+/// and lets any number of pods on that node share the volume, RWOP is one
+/// *pod* and is the only mode that says so. A claim listing several modes
+/// containing RWOP is treated as RWOP, because the strictest mode a claim
+/// asks for is the one that has to hold.
+pub fn is_rwop(pvc: &Value) -> bool {
+    pvc["spec"]["accessModes"]
+        .as_array()
+        .map(|modes| modes.iter().any(|m| m.as_str() == Some("ReadWriteOncePod")))
+        .unwrap_or(false)
+}
+
 /// The volume name for a claim — stable, so a restarted pod finds its data.
 ///
 /// Keyed on namespace and claim name rather than the pod's UID: a pod is
@@ -163,6 +177,20 @@ pub fn volume_name(namespace: &str, claim: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn rwop_is_recognised_and_not_confused_with_rwo() {
+        assert!(is_rwop(&json!({"spec": {"accessModes": ["ReadWriteOncePod"]}})));
+        // The strictest mode a claim lists is the one that has to hold.
+        assert!(is_rwop(
+            &json!({"spec": {"accessModes": ["ReadWriteOnce", "ReadWriteOncePod"]}})
+        ));
+        // RWO is one node, not one pod — several pods on this node may share it.
+        assert!(!is_rwop(&json!({"spec": {"accessModes": ["ReadWriteOnce"]}})));
+        assert!(!is_rwop(&json!({"spec": {"accessModes": ["ReadWriteMany"]}})));
+        // No accessModes at all is not an exclusivity request.
+        assert!(!is_rwop(&json!({"spec": {}})));
+    }
 
     #[test]
     fn the_size_class_is_the_name_stormblock_is_asked_for() {

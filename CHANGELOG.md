@@ -3,6 +3,19 @@
 ## [Unreleased]
 
 ### 2026-09-20
+- **feat(kubelet):** enforce `ReadWriteOncePod` at the mount (#42). The
+  scheduler filter is what keeps a second pod Pending with a readable reason,
+  and it cannot see the two ways around it: a static pod, or one written
+  straight onto `spec.nodeName`, never passes a scheduler filter at all. The
+  kubelet now refuses the second mount of an RWOP claim while another
+  non-terminal pod on this node holds it, as upstream does — a guarantee that
+  holds for scheduled pods and quietly does not for unscheduled ones is worse
+  than not offering the mode, because a database that asked for exclusivity
+  gets a volume that only says it has it. The refusal leaves the pod Pending
+  with the holder named, and deliberately does not take the scratch-directory
+  fallback: handing a pod an empty directory here would report the guarantee
+  as kept. The claim's own pod re-resolving its volumes on restart does not
+  count as a second holder, nor does a Succeeded or Failed one.
 - **fix(kubelet):** honour *pod-level* `securityContext.seLinuxOptions`, and
   label the sandbox with it (#26). The container-level passthrough landed
   already, with a comment saying the pod-level fallback was applied "via the
