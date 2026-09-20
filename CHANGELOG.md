@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [v0.8.0] — 2026-09-20
+
 ### 2026-09-20
 - **feat(kubelet):** `DELETE /volumes/{namespace}/{claim}` on `:10250`, so a
   `Delete` reclaim policy stops leaking (#46, filed from rustkube#71). The
