@@ -3,6 +3,17 @@
 ## [Unreleased]
 
 ### 2026-09-20
+- **fix(kubelet):** put the Node object back when it disappears underneath a
+  running kubelet (#31). The heartbeat's status PUT 404s once the object is
+  gone — an admin `kubectl delete node`, node GC, an etcd restore that rolled
+  it back — and the old code logged a warning and retried the identical PUT
+  every 10 s forever, so the node stayed absent until someone restarted the
+  kubelet. That is not a transient failure with a retry: the object the PUT
+  addresses does not exist, and only a POST can bring it back. A 404 is now
+  told apart from every other status failure and answered with `register()`,
+  as upstream's status manager does; other failures still just retry, and the
+  409 path inside registration deliberately does not re-register, so the two
+  cannot chase each other.
 - **feat(kubelet):** mint a blank filesystem template on first use instead of
   requiring the image to carry one (#45). `storage.rs`'s module doc has always
   said the template is minted the first time a size class is asked for; the

@@ -63,6 +63,17 @@ pub fn parse_taints(spec: &str) -> Vec<Value> {
     out
 }
 
+/// What a status PUT did, for the one case the caller must tell apart.
+///
+/// `NodeGone` is a 404 from the `/status` subresource: the Node object this
+/// kubelet is reporting for is not there. It is separated from the error path
+/// because it is repairable — see `heartbeat()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusUpdate {
+    Updated,
+    NodeGone,
+}
+
 pub struct NodeReporter {
     api_url: String,
     node_name: String,
@@ -234,7 +245,13 @@ impl NodeReporter {
     }
 
     /// PUT the node status via the `/status` subresource (preserves metadata/spec).
-    async fn update_node_status(&self) -> anyhow::Result<()> {
+    ///
+    /// A 404 comes back as [`StatusUpdate::NodeGone`] rather than as an error,
+    /// because it is the one status failure with a repair: the object the PUT
+    /// addresses does not exist, and re-creating it is what fixes that. Every
+    /// other failure is an error, since retrying the same PUT is the right
+    /// response to a busy or unreachable apiserver.
+    async fn put_node_status(&self) -> anyhow::Result<StatusUpdate> {
         let existing = self.current_conditions().await;
         let node_update = json!({
             "apiVersion": "v1",
@@ -250,11 +267,28 @@ impl NodeReporter {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to update node status: {body}");
+        if resp.status().is_success() {
+            return Ok(StatusUpdate::Updated);
         }
-        Ok(())
+        if resp.status().as_u16() == 404 {
+            return Ok(StatusUpdate::NodeGone);
+        }
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Failed to update node status: {body}");
+    }
+
+    /// PUT the node status, treating a missing Node as an error.
+    ///
+    /// The registration path uses this: it has just been told by a 409 that the
+    /// object exists, so a 404 from the very next call is a genuine failure and
+    /// not something to re-register around (that would loop).
+    async fn update_node_status(&self) -> anyhow::Result<()> {
+        match self.put_node_status().await? {
+            StatusUpdate::Updated => Ok(()),
+            StatusUpdate::NodeGone => {
+                anyhow::bail!("Failed to update node status: node {} not found", self.node_name)
+            }
+        }
     }
 
     /// Send a heartbeat via Lease object.
@@ -296,8 +330,27 @@ impl NodeReporter {
 
         // Refresh node status conditions via the /status subresource so that
         // metadata (labels) and spec (podCIDR) are preserved across heartbeats.
-        if let Err(e) = self.update_node_status().await {
-            tracing::warn!("Heartbeat: node status update failed: {e}");
+        //
+        // A 404 here means the Node object is gone out from under a running
+        // kubelet — an admin `kubectl delete node`, node GC, an etcd restore
+        // that rolled the object back. Retrying the same PUT can never succeed,
+        // so without the re-register below the node stays absent until someone
+        // restarts the kubelet (rustkube-node#31). Re-registering is what
+        // upstream does, and it is the only step needed: `register()` POSTs the
+        // Node with metadata, spec and a fresh status, so the next heartbeat
+        // finds an object to update again.
+        match self.put_node_status().await {
+            Ok(StatusUpdate::Updated) => {}
+            Ok(StatusUpdate::NodeGone) => {
+                tracing::warn!(
+                    "Heartbeat: node {} no longer exists in the API — re-registering",
+                    self.node_name
+                );
+                if let Err(e) = self.register().await {
+                    tracing::warn!("Heartbeat: re-registration failed: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("Heartbeat: node status update failed: {e}"),
         }
 
         Ok(())
