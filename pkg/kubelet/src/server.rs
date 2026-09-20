@@ -1127,75 +1127,104 @@ mod console_tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// An unregistered VM gets the console's own "no vm here" answer — 404
-    /// with its message, not a 502 from a socket nothing is listening on,
-    /// which is what the old splice returned whenever stormvm was not running.
+    /// Write a console registration into `run_dir`, the way `vm_manager`
+    /// does when it starts a machine.
+    ///
+    /// Built through serde rather than as a struct literal: `Registration`
+    /// has no `Default` and gains fields, and a test that named them all
+    /// would break on every one. Only namespace and name are required.
+    fn register(run_dir: &str, namespace: &str, name: &str) {
+        let reg: stormvm_node::console::Registration = serde_json::from_value(serde_json::json!({
+            "namespace": namespace,
+            "name": name,
+            "serial_socket": format!("{run_dir}/{namespace}/{name}/serial.sock"),
+        }))
+        .unwrap();
+        stormvm_node::console::write(run_dir, &reg).unwrap();
+    }
+
+    /// Serve the kubelet's router on a real socket and return its address.
+    ///
+    /// A real connection, not `oneshot`, because the doors cannot be reached
+    /// any other way: `WebSocketUpgrade` is an *extractor*, so it runs before
+    /// the handler body and rejects anything that is not a handshake — which
+    /// means a request built in memory never reaches the VM lookup or the
+    /// admission check at all. Only a real one carries the upgrade handle
+    /// hyper puts in the extensions.
+    async fn serve_console(run_dir: &str) -> SocketAddr {
+        let app = app_with_console(run_dir);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
+    /// Open a console with a real WebSocket handshake, carrying the
+    /// apiserver's bearer token exactly as `auth_mw` would have seen it.
+    /// Returns the status line and the rest of the response.
+    async fn handshake(addr: SocketAddr, path: &str) -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: Upgrade\r\n\
+             Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Authorization: Bearer an-apiserver-token\r\n\r\n"
+        );
+        sock.write_all(req.as_bytes()).await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = sock.read(&mut buf).await.unwrap();
+        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+        let status: u16 = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        (status, text)
+    }
+
+    /// An unregistered VM gets the console's own answer — "no vm here" —
+    /// and not a 502 from a socket nothing is listening on, which is what
+    /// the old splice returned whenever stormvm was not running.
     #[tokio::test]
     async fn an_unregistered_vm_gets_the_consoles_own_answer() {
         let dir = tempfile::tempdir().unwrap();
-        let resp = get(
-            app_with_console(dir.path().to_str().unwrap()),
-            "/vmConsole/default/web-1/serial",
-        )
-        .await;
-        let (status, body) = status_and_body(resp).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        let addr = serve_console(dir.path().to_str().unwrap()).await;
+        let (status, body) = handshake(addr, "/vmConsole/default/web-1/serial").await;
+        assert_eq!(status, 404, "{body}");
         assert!(body.contains("no vm default/web-1"), "{body}");
     }
 
-    /// **The test that proves the mount.** A registered VM must get *past*
-    /// admission, and the two ways it would not are both invisible to the
-    /// type system:
+    /// **The test that proves the mount.** A registered VM is admitted and
+    /// the console answers `101`, which means the request reached the door,
+    /// resolved the VM out of the run directory, and passed admission.
+    ///
+    /// Two failures this rules out, both invisible to the type system and
+    /// both real before they were fixed:
     ///
     /// - the door extracts `ConnectInfo`, which axum inserts only for a
     ///   server built with `into_make_service_with_connect_info` — this one
     ///   is not, so a missing injection is a 500;
     /// - the door checks a presented bearer token before it considers
-    ///   loopback, and the apiserver's token does not redeem — so a
-    ///   forwarded `Authorization` header is a 403.
-    ///
-    /// Sent without the WebSocket handshake headers, an admitted request
-    /// reaches `WebSocketUpgrade` and is rejected there — 426, or 400. That
-    /// is the pass: it means the request got all the way to the upgrade.
+    ///   loopback, and the apiserver's token does not redeem — so the
+    ///   `Authorization` header this handshake carries would be a 403 if it
+    ///   were forwarded rather than stripped.
     #[tokio::test]
-    async fn a_registered_vm_is_admitted_through_the_mount() {
+    async fn a_registered_vm_is_admitted_and_upgraded() {
         let dir = tempfile::tempdir().unwrap();
         let run_dir = dir.path().to_str().unwrap();
-        // Built through serde rather than as a literal: `Registration` has no
-        // `Default` and gains fields, and a test that named them all would
-        // break on every one. Only namespace and name are required.
-        let reg: stormvm_node::console::Registration = serde_json::from_value(serde_json::json!({
-            "namespace": "default",
-            "name": "web-1",
-            "serial_socket": format!("{run_dir}/default/web-1/serial.sock"),
-        }))
-        .unwrap();
-        stormvm_node::console::write(run_dir, &reg).unwrap();
+        register(run_dir, "default", "web-1");
+        let addr = serve_console(run_dir).await;
 
-        // With the apiserver's credential attached, exactly as auth_mw saw it.
-        let req = HttpRequest::builder()
-            .uri("/vmConsole/default/web-1/serial")
-            .header("authorization", "Bearer an-apiserver-token")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app_with_console(run_dir).oneshot(req).await.unwrap();
-        let (status, body) = status_and_body(resp).await;
-
-        assert_ne!(
-            status,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "ConnectInfo was not injected — the door could not read its peer: {body}"
-        );
-        assert_ne!(
-            status,
-            StatusCode::FORBIDDEN,
-            "the apiserver's bearer token reached the door and was refused: {body}"
-        );
-        assert_ne!(status, StatusCode::NOT_FOUND, "the registration was not found: {body}");
-        assert!(
-            status == StatusCode::UPGRADE_REQUIRED || status == StatusCode::BAD_REQUEST,
-            "an admitted request should reach the WebSocket upgrade: got {status} — {body}"
-        );
+        let (status, body) = handshake(addr, "/vmConsole/default/web-1/serial").await;
+        assert_ne!(status, 500, "ConnectInfo was not injected: {body}");
+        assert_ne!(status, 403, "the apiserver's token reached the door: {body}");
+        assert_ne!(status, 404, "the registration was not found: {body}");
+        assert_eq!(status, 101, "an admitted console must upgrade: {body}");
     }
 
     /// The kubelet's own `/healthz` still answers. The console router serves
