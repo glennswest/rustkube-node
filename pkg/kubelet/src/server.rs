@@ -978,41 +978,59 @@ async fn vm_console(
             return (StatusCode::BAD_REQUEST, format!("bad console path: {e}\n")).into_response();
         }
     };
-    // The rewrite drops the query with the path, which is deliberate: the
-    // only console query parameter is `token`, and see below for why a token
-    // must not reach the doors from here. (`to` belongs to the migrate and
-    // receive verbs, which are not mounted.)
-    *req.uri_mut() = uri;
 
-    // **Two things the doors expect from their own listener, which this
-    // server is not.** Both are consequences of mounting rather than dialling,
-    // and getting either wrong is a runtime failure no type catches.
+    // **Hand the console the request its own listener would have built, not
+    // this one with the URI swapped.** Three things have to be right, and
+    // every one of them is a runtime failure that no type catches:
     //
-    // `ConnectInfo`: the door handlers extract it, and axum only inserts it
-    // for a server started with `into_make_service_with_connect_info`. This
-    // one is not, so without the line below every console request fails as a
-    // missing request extension — a 500 that says nothing about consoles.
+    // 1. *The path parameters must not travel.* axum keeps the segments it
+    //    captured in a request extension, and a router called with that
+    //    extension still set appends its own to them. This route captures
+    //    three and the console's captures two, so the door's `Path<(ns,
+    //    name)>` was handed five and every console request failed as
+    //    `Wrong number of path arguments`. Clearing the extensions is what
+    //    makes this a handover rather than a nesting.
     //
-    // Loopback specifically, and the honest reading is that it is not a
-    // fiction: `is_local` asks whether the caller is already inside the
-    // node's boundary, and mounted here the caller *is* this process, on the
-    // node. The request also reached this handler through `auth_mw`, which is
-    // strictly stronger than what the door would have applied — TLS and a
-    // TokenReview-validated bearer token, against stormvm's
-    // "loopback, or a token" rule for an unauthenticated node-local port.
-    // That is the trade rustkube-node#43 describes: mounted behind this
-    // server's auth, the console's own token path becomes a fallback for
-    // nothing.
-    req.extensions_mut()
+    // 2. *`ConnectInfo` must be there.* The doors extract it, and axum
+    //    inserts it only for a server built with
+    //    `into_make_service_with_connect_info`. This one is not.
+    //
+    //    Loopback, and that is not a fiction: `is_local` asks whether the
+    //    caller is already inside the node's boundary, and mounted here the
+    //    caller *is* this process, on the node. The request also came through
+    //    `auth_mw`, which is strictly stronger than the door's own rule —
+    //    TLS and a TokenReview-validated bearer token, against
+    //    "loopback, or a token" for an unauthenticated node-local port. That
+    //    is the trade rustkube-node#43 describes: behind this server's auth,
+    //    the console's token path is a fallback for nothing.
+    //
+    // 3. *The upgrade handle must survive the clear*, or the WebSocket the
+    //    whole route exists for cannot be completed.
+    //
+    // The query goes with the path, which is also deliberate: the only
+    // console query parameter is `token`, and a token must not reach the
+    // doors from here for the same reason the `Authorization` header must
+    // not — see below. (`to` belongs to the migrate and receive verbs, which
+    // are not mounted.)
+    let (mut parts, body) = req.into_parts();
+    parts.uri = uri;
+
+    // The apiserver's bearer token is already spent by `auth_mw` and is not a
+    // console token. The door checks a presented token *before* it considers
+    // loopback and refuses when it does not redeem, so forwarding this would
+    // turn every authenticated console request into a 403 — including from
+    // loopback, where it would otherwise be admitted outright.
+    parts.headers.remove(AUTHORIZATION);
+
+    let upgrade = parts.extensions.remove::<hyper::upgrade::OnUpgrade>();
+    parts.extensions.clear();
+    parts
+        .extensions
         .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
-
-    // The `Authorization` header must not travel. It is the apiserver's
-    // bearer token, already spent by `auth_mw`, and it is not a console
-    // token — but the door checks a presented token *first* and refuses when
-    // it does not redeem, so forwarding it turns every authenticated console
-    // request into a 403. Worse than useless: it also fails from loopback,
-    // where the request would otherwise have been admitted outright.
-    req.headers_mut().remove(AUTHORIZATION);
+    if let Some(upgrade) = upgrade {
+        parts.extensions.insert(upgrade);
+    }
+    let req = Request::from_parts(parts, body);
 
     match console.oneshot(req).await {
         Ok(resp) => resp,

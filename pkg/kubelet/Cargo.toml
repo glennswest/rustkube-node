@@ -35,6 +35,11 @@ hyper-util = { version = "0.1" }
 # needs to exist. Mounted here the doors also inherit this server's TLS and
 # bearer auth instead of stormvm's weaker "loopback, or a token" rule.
 stormvm-console = { git = "https://github.com/glennswest/stormvm", branch = "main" }
+# `hyper::upgrade::OnUpgrade`, by name. Handing a request to the console's
+# router means rebuilding it without this server's path captures, and the
+# upgrade handle is the one extension that has to survive that — without it
+# the WebSocket the route exists for cannot be completed.
+hyper = { version = "1" }
 # axum 0.8, matching stormvm-console and the apiserver. A 0.8 `Router` cannot
 # nest in a 0.7 one, which is the whole reason the console used to be reached
 # over a socket. Note the path syntax: 0.8 spells a parameter `{p}`, where 0.7
