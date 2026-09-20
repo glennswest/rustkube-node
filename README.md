@@ -100,12 +100,30 @@ data.
 
 ## Build
 
+What ships is a **golden** — a sealed filesystem on the forge that a stormcos
+release composes over. A node installs nothing, so there is no package to
+build and no image file to copy:
+
+```bash
+scripts/build-golden.sh          # on the build box, as root
+```
+
+It builds the static binaries, attaches a volume from the forge over NVMe/TCP,
+makes a filesystem on it, copies the binaries in with `install`, and seals it.
+No tar, no loop device, no second copy of anything. See [docs/BUILD.md](docs/BUILD.md).
+
+To compile without touching the forge:
+
 ```bash
 # requires ../rustkube checked out as a sibling, and `protoc` on the build
 # host (CRI gRPC codegen)
 cargo build --release            # produces target/release/{kubelet,kube-proxy}
 cargo build --release --target x86_64-unknown-linux-musl   # static
 ```
+
+`packaging/build-packages.sh` still makes an rpm and a deb. They are kept for
+hosts that are not stormcos nodes, and they are **not** what a node runs — note
+that they package a glibc build, which a node cannot exec.
 
 ## The work (greenfield)
 

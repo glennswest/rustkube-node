@@ -3,6 +3,26 @@
 ## [Unreleased]
 
 ### 2026-09-20
+- **feat(build):** `scripts/build-golden.sh` — what this repository ships is a
+  golden, not a package. It builds the static musl binaries, asks the forge for
+  a volume, attaches it over NVMe/TCP, makes a read-only filesystem on it,
+  copies the binaries in with `install`, and seals it. No tar and no image
+  file: a golden **is** a filesystem, and the forge can hand the build box the
+  namespace it will live in, so it is written where it belongs with ordinary
+  `cp` rather than serialised into an archive and read back out. The result is
+  a named, sealed volume with a content digest, which a release composes over
+  by mapping rather than copying.
+- **docs:** `docs/BUILD.md` — the new build, and why. Includes why the rpm and
+  deb are the wrong shape for a node that installs nothing, and why they could
+  never have worked anyway: `build-packages.sh` runs `cargo build --release`
+  without `--target`, so it packages glibc binaries a node cannot exec.
+- **feat(build):** the golden records what produced it —
+  `rustkube-node@<commit> kubelet:<digest> kube-proxy:<digest>` — at
+  `/etc/rustkube-node.provenance`, with `+dirty` when the tree is not clean. A
+  digest says the bytes are these bytes; it does not say what made them, and
+  that is the question asked when something is wrong.
+
+### 2026-09-20
 - **fix(test-cluster):** stop keeping a second, wrong copy of the fixture's
   artifact pins in `config.sh` (#27). `terragrunt.hcl` is what cloud-init
   templates from, so it is the only thing that decides what a VM installs;
