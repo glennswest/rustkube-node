@@ -2,6 +2,39 @@
 
 ## [Unreleased]
 
+### 2026-09-20
+- **feat(kubelet):** mount stormvm's console router instead of splicing to a
+  second process (#43). `/vmConsole/{ns}/{name}/{door}` is now answered by
+  `stormvm-console`'s own `axum::Router`, running in this process. There is
+  no standalone node — every node runs rustkube, so every node with a VM on
+  it already has a kubelet, and a long-lived daemon whose only job was to
+  serve consoles was one that never needed to exist. What goes with it: a TCP
+  connect per session, ~200 lines that re-implemented an HTTP client by hand
+  (parsing a response head, carrying the bytes that arrived after it), the
+  `STORMVM_CONSOLE_ADDR` escape hatch, and stormvm's weaker
+  "loopback, or a token" auth rule — the doors inherit this server's TLS and
+  TokenReview-validated bearer auth instead. Closes stormcos#39 and makes
+  rustkube-node#38 non-load-bearing.
+- **BREAKING:** `pkg/kubelet` is on **axum 0.8**, matching stormvm-console
+  and the apiserver — a 0.8 `Router` cannot nest in a 0.7 one, which is why
+  the console was reached over a socket in the first place. All route
+  patterns move from `:param` to `{param}`; the two spellings were previously
+  a standing source of 404s that read as "no such pod" rather than "no such
+  route". `axum-server` 0.7 serves an 0.8 router unchanged. `hyper` stays a
+  direct dependency for `hyper::upgrade::OnUpgrade`.
+- **fix(kubelet):** three things the mounted console needs that its own
+  listener used to provide, each a runtime failure no type catches. The
+  request is rebuilt rather than re-addressed, because axum keeps a route's
+  captured segments in an extension and the inner router appends its own —
+  three plus two meant every door saw `Wrong number of path arguments`.
+  `ConnectInfo` is injected as loopback, since axum only inserts it for a
+  server built with `into_make_service_with_connect_info` and, mounted, the
+  caller genuinely is this process on the node. The `Authorization` header is
+  stripped: it is the apiserver's token, already spent, and the door checks a
+  presented token before it considers loopback, so forwarding it would refuse
+  every authenticated console request. The upgrade handle is carried across
+  the rebuild, or the WebSocket cannot complete.
+
 ## [v0.8.0] — 2026-09-20
 
 ### 2026-09-20

@@ -48,15 +48,29 @@ TokenReview); `/healthz`, `/livez` and `/readyz` are open.
 | `GET /metrics`, `/metrics/cadvisor`, `/stats/summary` | Node and pod metrics |
 | `GET /pods` | The pods this kubelet manages |
 | `GET /containerLogs/{ns}/{pod}/{container}` | What `kubectl logs` reads, by way of the apiserver proxy |
-| `GET /vmConsole/{ns}/{name}/{door}` | A VM's `serial` or `vnc` console, spliced through to stormvm |
+| `GET /vmConsole/{ns}/{name}/{door}` | A VM's `serial` or `vnc` console, answered by stormvm's console router mounted here |
 | `DELETE /volumes/{ns}/{claim}` | Delete the stormblock clone behind a released claim |
 
-The last two exist here because what they reach is on **loopback** and the
-control plane cannot get to it: stormvm and stormblock both serve their
-management APIs on `127.0.0.1` only. Routing through the kubelet keeps the
-blast radius at one node and reuses a hop the apiserver already
-authenticates, rather than handing a controller credentials to every node's
-engine.
+The last two exist here because what they reach is on the node and the
+control plane cannot get to it. Routing through the kubelet keeps the blast
+radius at one node and reuses a hop the apiserver already authenticates,
+rather than handing a controller credentials to every node's engine.
+
+They reach it two different ways, and the difference is worth knowing.
+`DELETE /volumes` **dials** stormblock, which serves its management API on
+`127.0.0.1:9090` and is a separate engine with its own lifecycle. The console
+is **mounted**: `stormvm-console` is a library that hands back an
+`axum::Router`, so the doors run inside this process and the last hop is a
+function call. There is no standalone node — every node runs rustkube, so
+every node with a VM on it already has a kubelet, and a second long-lived
+process whose only job was to serve consoles was one that never needed to
+exist. Mounted here the doors also inherit this server's TLS and bearer auth
+instead of stormvm's weaker "loopback, or a token" rule for an
+unauthenticated node-local port.
+
+`stormvm serve` still mounts the same router on `:9095` for a developer at a
+terminal. That is a convenience for debugging a guest that will not boot, not
+a deployment shape, and nothing in a cluster depends on it.
 
 `DELETE /volumes` is what makes `reclaimPolicy: Delete` finish instead of
 leaking: `204` when the clone is gone or was never there, `409` while a pod
