@@ -252,3 +252,24 @@
 - **perf:** a followed log streams through a bounded channel instead of being
   read whole into a `String`, so a large or open-ended log does not sit on the
   kubelet's heap.
+
+### 2026-09-20
+- **fix:** `initContainerStatuses` is reported (#47). The kubelet ran init
+  containers and said nothing about them, so cilium's six appeared in a
+  console as six components of unknown health with no way to distinguish
+  "ran and succeeded" from "never ran". Each report carries
+  `state.terminated` with the exit code, reason and start/finish times.
+- **fix:** the `Initialized` condition is computed rather than hardcoded
+  `True`. It was True before the init containers ran, while they were
+  running, and after one had failed — a pod wedged in init reported
+  `Initialized=True` with no containers, which is worse than Unknown because
+  it is confidently wrong. It is driven by the declared count, because "none
+  reported" and "none declared" are exactly the two cases that must not read
+  the same.
+- The report is taken at the moment each init container exits, before the
+  `remove_container` that follows, and kept in `PodState`: once removed the
+  runtime cannot be asked what it did, and `check_pod_status` rebuilds the
+  status every cycle, so a report held anywhere else would appear once and
+  vanish. A failing init container is now reported rather than only becoming
+  an error string — which one failed is the whole answer to why the pod will
+  not start.
