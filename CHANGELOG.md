@@ -3,6 +3,14 @@
 ## [Unreleased]
 
 ### 2026-09-20
+- **feat(kubelet):** mint a blank filesystem template on first use instead of
+  requiring the image to carry one (#45). `storage.rs`'s module doc has always
+  said the template is minted the first time a size class is asked for; the
+  code looked it up and gave up, and a second doc comment then documented the
+  workaround — so two comments in one file contradicted each other and the
+  class ladder was capped at whatever the image happened to ship. A claim
+  above the largest shipped class was refused outright and adding a class
+  meant rebuilding an image. One `mkfs` ever, per class, per node.
 - **fix(kubelet):** provision only claims that belong to this node's
   StorageClass (#44). Every PVC a pod mounted became a stormblock clone
   regardless of who else owned it — harmless while this is the only

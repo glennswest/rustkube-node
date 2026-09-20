@@ -44,11 +44,11 @@ use serde_json::Value;
 /// would not waste space (a blank is sparse) but would waste the limit.
 /// A claim larger than the biggest is refused rather than rounded down.
 ///
-/// This list must match the blanks the image actually ships, because a class
-/// with no blank is a claim that cannot be satisfied. The image carries
-/// 64M/256M/1G — a blank is carried twice, as the golden and the slab's clone
-/// of it, so larger classes belong on a node whose data drive is sized for
-/// them rather than in a 32 GB test image.
+/// The list does **not** have to match what the image ships. A class with no
+/// blank is minted on first use (#45), so this is the ladder the node offers
+/// rather than an inventory of what was baked in. An image that carries the
+/// common classes saves the first claim one `mkfs`; one that carries none
+/// still works.
 pub const SIZE_CLASSES: &[(&str, u64)] = &[
     ("1M", 1024 * 1024),
     ("16M", 16 * 1024 * 1024),
@@ -163,6 +163,24 @@ pub fn volume_name(namespace: &str, claim: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_size_class_is_the_name_stormblock_is_asked_for() {
+        // Minting and lookup must agree on the name. stormcos once had the
+        // registry looking a blank up as `pvc-ext4j-<mib>m` while the image
+        // called it `pvc-1M`, and neither side could see the other's name —
+        // so both sides going through this one function is the fix, and this
+        // asserts the shape the minting body sends as `size`.
+        for (class, _) in SIZE_CLASSES {
+            assert_eq!(template_name(class), format!("pvc-{class}"));
+        }
+        // The class string is also what stormblock parses as a size, so it
+        // has to stay in the form its `resolve_size` reads.
+        assert_eq!(class_for(1024 * 1024).unwrap().0, "1M");
+        assert_eq!(class_for(100 * 1024 * 1024).unwrap().0, "256M");
+        // A claim above the ladder is refused rather than rounded down.
+        assert!(class_for(2 * 1024 * 1024 * 1024).is_none());
+    }
 
     #[test]
     fn only_our_own_class_is_provisioned_here() {

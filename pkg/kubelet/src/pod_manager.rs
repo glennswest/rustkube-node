@@ -597,10 +597,23 @@ impl PodManager {
                 // stamps the clone with its own filesystem UUID — two live
                 // filesystems must never claim one identity (stormblock#76).
                 let blank = crate::storage::template_name(class);
-                let (src, sealed) = self
-                    .storage_volume(&blank)
-                    .await
-                    .ok_or_else(|| ClaimError::Failed(format!("no blank volume {blank} on this node")))?;
+                let (src, sealed) = match self.storage_volume(&blank).await {
+                    Some(found) => found,
+                    // Mint it, rather than refusing the claim (#45).
+                    //
+                    // The alternative — which this replaces — capped the class
+                    // ladder at whatever the image happened to carry: a claim
+                    // above the largest shipped blank was refused outright,
+                    // and adding a class meant rebuilding an image. Baking
+                    // them in also decides at build time a question only run
+                    // time can answer, which is which sizes are actually
+                    // claimed, and spends image space on classes a node may
+                    // never use.
+                    //
+                    // One `mkfs` ever, per class, per node: the first claim of
+                    // a class pays for it and every claim after is a clone.
+                    None => self.mint_template(&blank, class).await?,
+                };
 
                 // A clone descends from a *sealed* volume, and the blanks
                 // arrive sealed as golden images — which is a different thing
@@ -661,6 +674,37 @@ impl PodManager {
             .iter()
             .find(|v| v["name"].as_str() == Some(name))?;
         Some((v["id"].as_str()?.to_string(), v["sealed"].as_bool().unwrap_or(false)))
+    }
+
+    /// Lay down a blank filesystem for a size class, once.
+    ///
+    /// Returns what `storage_volume` would have: the id, and whether it is
+    /// sealed. The caller seals if it is not, so this does not have to.
+    ///
+    /// The name is `template_name`'s, and that matters more than it looks:
+    /// stormcos once had the registry looking a blank up as `pvc-ext4j-<mib>m`
+    /// while the image called it `pvc-1M`, and neither side could see the
+    /// other's name. Minting through the same function the lookup uses is what
+    /// keeps that from coming back from this side.
+    async fn mint_template(&self, blank: &str, class: &str) -> Result<(String, bool), ClaimError> {
+        info!("no blank {blank} on this node — minting it (one mkfs, ever, for class {class})");
+        let body = serde_json::json!({ "name": blank, "size": class, "fs": "ext4" });
+        let made: Value = self
+            .storage_post("/api/v1/fstemplates", &body)
+            .await
+            .ok_or_else(|| {
+                ClaimError::Failed(format!("stormblock would not mint the blank {blank}"))
+            })?;
+        // A racing pod on the same node mints the same class; whoever lost
+        // still needs the id, and looking it up is both the answer and the
+        // check that it is really there.
+        if let Some(found) = self.storage_volume(blank).await {
+            return Ok(found);
+        }
+        let id = made["id"]
+            .as_str()
+            .ok_or_else(|| ClaimError::Failed(format!("minting {blank} returned no id: {made}")))?;
+        Ok((id.to_string(), made["sealed"].as_bool().unwrap_or(false)))
     }
 
     /// GET from stormblock's management API on this node.
