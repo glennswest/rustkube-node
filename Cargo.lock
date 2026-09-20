@@ -239,8 +239,6 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
- "hyper",
- "hyper-util",
  "itoa",
  "matchit 0.7.3",
  "memchr",
@@ -249,15 +247,10 @@ dependencies = [
  "pin-project-lite",
  "rustversion",
  "serde",
- "serde_json",
- "serde_path_to_error",
- "serde_urlencoded",
  "sync_wrapper",
- "tokio",
  "tower 0.5.3",
  "tower-layer",
  "tower-service",
- "tracing",
 ]
 
 [[package]]
@@ -315,7 +308,6 @@ dependencies = [
  "sync_wrapper",
  "tower-layer",
  "tower-service",
- "tracing",
 ]
 
 [[package]]
@@ -512,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "cni"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "apimachinery",
@@ -1432,7 +1424,7 @@ checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 
 [[package]]
 name = "kube-proxy"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1444,12 +1436,12 @@ dependencies = [
 
 [[package]]
 name = "kubelet"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "apimachinery",
  "async-trait",
- "axum 0.7.9",
+ "axum 0.8.9",
  "axum-server",
  "base64",
  "chrono",
@@ -1471,6 +1463,7 @@ dependencies = [
  "stormpump",
  "stormpump-abi",
  "stormvm-cloudinit",
+ "stormvm-console",
  "stormvm-net",
  "stormvm-node",
  "stormvm-spec",
@@ -1488,7 +1481,7 @@ dependencies = [
 
 [[package]]
 name = "kubelet-cmd"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2195,7 +2188,7 @@ dependencies = [
 
 [[package]]
 name = "proxy"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "apimachinery",
@@ -2934,6 +2927,35 @@ dependencies = [
  "serde_json",
  "stormvm-spec",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "stormvm-console"
+version = "0.9.0"
+source = "git+https://github.com/glennswest/stormvm?branch=main#7307ee4f41a882400fdaf6dcc9f87d2a0446519c"
+dependencies = [
+ "anyhow",
+ "axum 0.8.9",
+ "futures-util",
+ "getrandom 0.2.17",
+ "serde",
+ "serde_json",
+ "stormvm-control",
+ "stormvm-node",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "stormvm-control"
+version = "0.9.0"
+source = "git+https://github.com/glennswest/stormvm?branch=main#7307ee4f41a882400fdaf6dcc9f87d2a0446519c"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
