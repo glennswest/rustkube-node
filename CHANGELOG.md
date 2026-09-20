@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [v0.9.0] — 2026-09-20
+
 ### 2026-09-20
 - **feat(kubelet):** mount stormvm's console router instead of splicing to a
   second process (#43). `/vmConsole/{ns}/{name}/{door}` is now answered by
