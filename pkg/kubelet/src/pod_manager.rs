@@ -2509,8 +2509,6 @@ pub struct PodStatusUpdate {
 /// Container status for API server reporting.
 #[derive(Debug)]
 pub struct ContainerStatusReport {
-    started_at: 0,
-    finished_at: 0,
     pub name: String,
     pub container_id: String,
     pub state: String,
