@@ -28,10 +28,18 @@ tonic = { workspace = true }
 prost = { workspace = true }
 tower = { version = "0.5" }
 hyper-util = { version = "0.1" }
-# `hyper::upgrade::on`, to splice a console WebSocket through to stormvm
-# (rustkube#61). axum's own ws extractor parses frames; this hop must not.
-hyper = { version = "1", features = ["client", "http1"] }
-axum = { version = "0.7" }
+# The console doors themselves — serial and VNC — mounted in this server
+# rather than dialled over loopback (rustkube-node#43). There is no standalone
+# node: every node runs rustkube, so every node that runs a VM has a kubelet
+# on it, and a second long-lived process to serve consoles is one that never
+# needs to exist. Mounted here the doors also inherit this server's TLS and
+# bearer auth instead of stormvm's weaker "loopback, or a token" rule.
+stormvm-console = { git = "https://github.com/glennswest/stormvm", branch = "main" }
+# axum 0.8, matching stormvm-console and the apiserver. A 0.8 `Router` cannot
+# nest in a 0.7 one, which is the whole reason the console used to be reached
+# over a socket. Note the path syntax: 0.8 spells a parameter `{p}`, where 0.7
+# spelled it `:p` and read braces as a literal segment.
+axum = { version = "0.8" }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = { workspace = true }
 rcgen = "0.13"

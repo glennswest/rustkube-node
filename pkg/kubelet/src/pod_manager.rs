@@ -3281,7 +3281,7 @@ mod tests {
                 }),
             )
             .route(
-                "/api/v1/volumes/:id/attach",
+                "/api/v1/volumes/{id}/attach",
                 http_delete(move || {
                     let d = for_detach.clone();
                     async move {
@@ -3291,7 +3291,7 @@ mod tests {
                 }),
             )
             .route(
-                "/api/v1/volumes/:id",
+                "/api/v1/volumes/{id}",
                 http_delete(move || {
                     let d = for_delete.clone();
                     async move {

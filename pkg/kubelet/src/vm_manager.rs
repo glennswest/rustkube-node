@@ -36,7 +36,12 @@ use stormvm_spec::{DiskSource, VmSpec};
 /// `kubectl logs` to find it.
 const LOG_ROOT: &str = "/var/log/pods";
 /// Per-VM sockets: the serial console and the hypervisor's control socket.
-const RUN_ROOT: &str = "/run/stormvm";
+///
+/// Public because the console doors mounted in `server.rs` read the same
+/// directory this writes (rustkube-node#43). One constant, so the side that
+/// registers a VM and the side that opens its console cannot look in two
+/// different places.
+pub const RUN_ROOT: &str = "/run/stormvm";
 
 /// Drop a machine's console registration.
 ///

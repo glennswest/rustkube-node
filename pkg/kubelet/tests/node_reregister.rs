@@ -62,14 +62,14 @@ async fn lease() -> StatusCode {
 async fn serve(api: Arc<Apiserver>) -> String {
     let app = Router::new()
         .route("/api/v1/nodes", post(create_node))
-        .route("/api/v1/nodes/:name", get(get_node))
-        .route("/api/v1/nodes/:name/status", put(put_status))
+        .route("/api/v1/nodes/{name}", get(get_node))
+        .route("/api/v1/nodes/{name}/status", put(put_status))
         .route(
             "/apis/coordination.k8s.io/v1/namespaces/kube-node-lease/leases",
             post(lease),
         )
         .route(
-            "/apis/coordination.k8s.io/v1/namespaces/kube-node-lease/leases/:name",
+            "/apis/coordination.k8s.io/v1/namespaces/kube-node-lease/leases/{name}",
             put(lease),
         )
         .with_state(api);
