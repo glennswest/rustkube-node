@@ -38,6 +38,34 @@ Binaries and systemd units use **exact upstream names** (`kubelet`,
   containerd) and **VM runtime** (`--runtime=vm`) are experimental paths.
 - Test target: **x86_64 Linux**.
 
+## The kubelet API (`:10250`)
+
+HTTPS, bearer-token auth (a static token, or one the apiserver accepts via
+TokenReview); `/healthz`, `/livez` and `/readyz` are open.
+
+| Route | What it is |
+|---|---|
+| `GET /metrics`, `/metrics/cadvisor`, `/stats/summary` | Node and pod metrics |
+| `GET /pods` | The pods this kubelet manages |
+| `GET /containerLogs/{ns}/{pod}/{container}` | What `kubectl logs` reads, by way of the apiserver proxy |
+| `GET /vmConsole/{ns}/{name}/{door}` | A VM's `serial` or `vnc` console, spliced through to stormvm |
+| `DELETE /volumes/{ns}/{claim}` | Delete the stormblock clone behind a released claim |
+
+The last two exist here because what they reach is on **loopback** and the
+control plane cannot get to it: stormvm and stormblock both serve their
+management APIs on `127.0.0.1` only. Routing through the kubelet keeps the
+blast radius at one node and reuses a hop the apiserver already
+authenticates, rather than handing a controller credentials to every node's
+engine.
+
+`DELETE /volumes` is what makes `reclaimPolicy: Delete` finish instead of
+leaking: `204` when the clone is gone or was never there, `409` while a pod
+on this node still has the claim, `503` when the node cannot establish that
+it is unused. It never answers `204` on a guess — the volume name is derived
+from the claim's, so a PV deleted over a surviving clone would let a later
+claim of the same name in the same namespace adopt the previous tenant's
+data.
+
 ## Relationship to rustkube
 
 - **Control plane** (kube-apiserver, controller-manager, scheduler, fastetcd)
