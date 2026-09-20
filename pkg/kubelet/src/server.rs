@@ -1088,6 +1088,14 @@ mod console_tests {
         app.oneshot(req).await.unwrap()
     }
 
+    /// Status and body together — a console failure is only diagnosable from
+    /// the body, and an assertion on the status alone prints neither.
+    async fn status_and_body(resp: axum::http::Response<Body>) -> (StatusCode, String) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
     /// A door stormvm does not serve is refused here, so a typo reads as a
     /// bad request rather than as a 404 that could equally mean "no such VM".
     #[tokio::test]
@@ -1112,10 +1120,9 @@ mod console_tests {
             "/vmConsole/default/web-1/serial",
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
-        let text = String::from_utf8_lossy(&body);
-        assert!(text.contains("no vm default/web-1"), "{text}");
+        let (status, body) = status_and_body(resp).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(body.contains("no vm default/web-1"), "{body}");
     }
 
     /// **The test that proves the mount.** A registered VM must get *past*
@@ -1154,23 +1161,22 @@ mod console_tests {
             .body(Body::empty())
             .unwrap();
         let resp = app_with_console(run_dir).oneshot(req).await.unwrap();
+        let (status, body) = status_and_body(resp).await;
 
         assert_ne!(
-            resp.status(),
+            status,
             StatusCode::INTERNAL_SERVER_ERROR,
-            "ConnectInfo was not injected — the door could not read its peer"
+            "ConnectInfo was not injected — the door could not read its peer: {body}"
         );
         assert_ne!(
-            resp.status(),
+            status,
             StatusCode::FORBIDDEN,
-            "the apiserver's bearer token reached the door and was refused as a console token"
+            "the apiserver's bearer token reached the door and was refused: {body}"
         );
-        assert_ne!(resp.status(), StatusCode::NOT_FOUND, "the registration was not found");
+        assert_ne!(status, StatusCode::NOT_FOUND, "the registration was not found: {body}");
         assert!(
-            resp.status() == StatusCode::UPGRADE_REQUIRED
-                || resp.status() == StatusCode::BAD_REQUEST,
-            "an admitted request should reach the WebSocket upgrade: got {}",
-            resp.status()
+            status == StatusCode::UPGRADE_REQUIRED || status == StatusCode::BAD_REQUEST,
+            "an admitted request should reach the WebSocket upgrade: got {status} — {body}"
         );
     }
 
