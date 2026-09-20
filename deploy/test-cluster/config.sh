@@ -14,15 +14,20 @@ export RK_NODE_IP="192.168.8.99"
 export RK_NODE_FQDN="rknode1.g8.lo"
 export CI_USER="fedora"
 
-# --- pinned released artifacts (reproducible; no build on the VMs) ---
-# rustkube control plane (kube-apiserver/controller/scheduler) — matches the
-# version rustkube's own masters run. Install happens in cloud-init; this is
-# kept for reference/verify scripts.
-export RUSTKUBE_RPM="https://github.com/glennswest/rustkube/releases/download/v0.7.1/kubernetes-rs-0.7.1-1.x86_64.rpm"
-# fastetcd datastore (etcd v3 wire protocol).
-export FASTETCD_RPM="https://github.com/glennswest/fastetcd/releases/download/v0.8.1/fastetcd-0.8.1-1.x86_64.rpm"
-# rustkube-node (kubelet/kube-proxy) — the thing under test.
-export RUSTKUBE_NODE_RPM="https://github.com/glennswest/rustkube-node/releases/download/v0.1.0/rustkube-node-0.1.0-1.fc43.x86_64.rpm"
+# --- pinned released artifacts ---
+#
+# **They are in `deploy/terragrunt/rknode/terragrunt.hcl`, not here.** That is
+# the file cloud-init templates from, so it is the only one that decides what
+# a VM installs.
+#
+# This file used to carry a second copy "for reference", and the copy drifted:
+# it named rustkube-node v0.1.0 and rustkube v0.7.1 long after the rig had
+# moved to v0.2.3 and v0.7.33, and nothing read it, so nothing caught it. A
+# pin that is documentation of another pin is a pin that will be wrong —
+# anyone reading here to find out what the fixture runs was told the wrong
+# answer. Read `terragrunt.hcl`:
+#
+#   grep _rpm_url deploy/terragrunt/rknode/terragrunt.hcl
 
 # Plaintext HTTP control plane for this phase (the kubelet is HTTP-only today).
 export APISERVER_URL="http://${RK_MASTER_IP}:6443"

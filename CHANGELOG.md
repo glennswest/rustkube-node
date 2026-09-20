@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### 2026-09-20
+- **fix(test-cluster):** stop keeping a second, wrong copy of the fixture's
+  artifact pins in `config.sh` (#27). `terragrunt.hcl` is what cloud-init
+  templates from, so it is the only thing that decides what a VM installs;
+  the copy in `config.sh` was documentation of that and had drifted to name
+  rustkube-node v0.1.0 and rustkube v0.7.1 while the rig actually installed
+  v0.2.3 and v0.7.33. Nothing read it, so nothing caught it, and anyone
+  reading it to find out what the fixture runs — which is the first thing
+  #27 asks — was told the wrong answer.
+
 ## [v0.9.0] — 2026-09-20
 
 ### 2026-09-20
