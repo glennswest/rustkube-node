@@ -715,7 +715,17 @@ impl PodManager {
             // and reasoning about the node. The kubelet knows every path it is
             // about to hand over; checking here costs a stat and turns
             // deduction into a sentence.
-            let p = std::path::Path::new(&host_path);
+            // Checked where the *host* sees it, not where this process does.
+            //
+            // The kubelet runs in a container, so `/lib/modules` here is its
+            // own golden's — which has none — while the engine mounts the
+            // node's, where it is a symlink into the modules volume and
+            // resolves perfectly. So this reported FailedMount on every boot
+            // for a container that then ran fine, on a node that was 19/19
+            // healthy. `on_host` is the mapping the rest of this file already
+            // uses for exactly this reason; the check simply did not.
+            let checked = on_host(&host_path);
+            let p = checked.as_path();
             if !p.exists() {
                 // A dangling symlink is not a missing path, and saying so
                 // matters.
