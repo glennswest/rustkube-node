@@ -701,11 +701,42 @@ impl PodManager {
             // and reasoning about the node. The kubelet knows every path it is
             // about to hand over; checking here costs a stat and turns
             // deduction into a sentence.
-            if !std::path::Path::new(&host_path).exists() {
-                warn!(
-                    "volume {name}: {host_path} does not exist on this node — the \
-                     container will fail to start with ENOENT attaching mounts"
-                );
+            let p = std::path::Path::new(&host_path);
+            if !p.exists() {
+                // A dangling symlink is not a missing path, and saying so
+                // matters.
+                //
+                // `exists()` follows symlinks, so a link whose target has not
+                // been mounted *yet* reads as absent. On this node /lib/modules
+                // is exactly that — a symlink into the modules volume — and
+                // every boot produced
+                //
+                // ```text
+                // volume lib-modules: /lib/modules does not exist on this node
+                //   — the container will fail to start with ENOENT
+                // ```
+                //
+                // for a container that then started perfectly, because the
+                // volume was mounted by the time it did. A warning that
+                // predicts a failure which does not happen is worse than no
+                // warning: it is read once, disbelieved, and then the real
+                // ones are disbelieved too.
+                match std::fs::symlink_metadata(p) {
+                    Ok(_) => {
+                        let target = std::fs::read_link(p)
+                            .map(|t| t.display().to_string())
+                            .unwrap_or_else(|_| "?".into());
+                        warn!(
+                            "volume {name}: {host_path} is a symlink to {target}, which is not \
+                             there yet — if that is a volume still being mounted this resolves \
+                             itself; if not, the container will fail with ENOENT"
+                        );
+                    }
+                    Err(_) => warn!(
+                        "volume {name}: {host_path} does not exist on this node — the \
+                         container will fail to start with ENOENT attaching mounts"
+                    ),
+                }
             }
             map.insert(name, ResolvedVolume { path: host_path, fstype: None });
         }
