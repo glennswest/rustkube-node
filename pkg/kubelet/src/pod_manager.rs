@@ -1815,11 +1815,32 @@ impl PodManager {
 
             // Ensure image per imagePullPolicy
             info!("Ensuring image {image} for {namespace}/{name}/{container_name}");
-            self.event(pod, "Normal", "Pulling", &format!("Pulling image \"{image}\"")).await;
+            // **Say what happened, not what upstream would have done.**
+            //
+            // This emitted `Pulling` before asking and `Successfully pulled`
+            // after, unconditionally — so a container that resolved a local
+            // golden in microseconds reported pulling from quay.io. On a node
+            // whose entire design is that nothing is fetched at boot, that is
+            // not a cosmetic inaccuracy: it is evidence of a fault that does
+            // not exist, and it sent somebody looking for one.
+            //
+            // The image is checked first, so the event says which of the two
+            // actually happened.
+            let present = self.images.image_status(image).await.ok().flatten().is_some();
+            if !present {
+                self.event(pod, "Normal", "Pulling", &format!("Pulling image \"{image}\"")).await;
+            }
             let image_ref = match self.ensure_image(image, container_spec).await {
                 Ok(r) => {
-                    self.event(pod, "Normal", "Pulled",
-                               &format!("Successfully pulled image \"{image}\"")).await;
+                    if present {
+                        // Upstream's word for an image that was already
+                        // there, and the one `describe` readers expect.
+                        self.event(pod, "Normal", "Pulled",
+                                   &format!("Container image \"{image}\" already present on machine")).await;
+                    } else {
+                        self.event(pod, "Normal", "Pulled",
+                                   &format!("Successfully pulled image \"{image}\"")).await;
+                    }
                     r
                 }
                 Err(e) => {
