@@ -93,6 +93,14 @@ pub struct Kubelet {
     runtime: Arc<dyn RuntimeService>,
     api_client: reqwest::Client,
     node_ip: String,
+    /// Whether the missing static-pod directory has already been mentioned.
+    ///
+    /// It is read once per sync, so on any node that does not use static pods
+    /// — every stormcos node, where `stormpump`'s boot.d units are the
+    /// mechanism — the same line was emitted every few seconds forever. A
+    /// directory that is not there is a fact about the configuration, not an
+    /// event, and repeating it only buries the lines that are events.
+    said_no_static_dir: std::sync::atomic::AtomicBool,
 }
 
 impl Kubelet {
@@ -139,6 +147,7 @@ impl Kubelet {
             runtime,
             api_client,
             node_ip,
+            said_no_static_dir: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -321,8 +330,19 @@ impl Kubelet {
         };
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Once. A node that does not use static pods reads this
+                // directory on every sync, and saying so every time is how a
+                // debug log stops being readable.
+                if !self.said_no_static_dir.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    debug!("no static pod dir {} — none will be loaded", dir.display());
+                }
+                return pods;
+            }
             Err(e) => {
-                debug!("no static pod dir {}: {e}", dir.display());
+                // Anything else is actionable — a permission problem, a path
+                // that is not a directory — so it keeps saying so.
+                warn!("static pod dir {}: {e}", dir.display());
                 return pods;
             }
         };

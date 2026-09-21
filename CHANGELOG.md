@@ -282,3 +282,10 @@
   terminated container now also reports `startedAt`, which is what makes a
   duration computable. A time the runtime did not give renders as `null`
   rather than 1970, which sorts first and looks like a fact.
+- **fix:** the kubelet said `no static pod dir /etc/kubernetes/manifests` on
+  every sync forever. Static pods are read once per sync interval, and no
+  stormcos node has that directory — `stormpump`'s boot.d units are the
+  mechanism — so the line repeated every few seconds on every node. A missing
+  directory is a fact about the configuration, not an event: it is now said
+  once. A directory that exists but cannot be read is the opposite — that is
+  actionable, so it became a warning that keeps repeating.
