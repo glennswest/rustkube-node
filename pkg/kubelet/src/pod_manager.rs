@@ -317,6 +317,124 @@ impl PodManager {
         resp.json::<Value>().await.ok()
     }
 
+    /// POST an object to the apiserver. `None` on any failure, including a
+    /// 409 — an object that already exists is not a failure to the callers
+    /// here, which are all idempotent.
+    async fn api_post(&self, path: &str, body: &Value) -> Option<Value> {
+        if self.api_url.is_empty() {
+            return None;
+        }
+        let resp = self
+            .api_client
+            .post(format!("{}{path}", self.api_url))
+            .json(body)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.json::<Value>().await.ok()
+    }
+
+    /// PUT an object back to the apiserver.
+    async fn api_put(&self, path: &str, body: &Value) -> Option<Value> {
+        if self.api_url.is_empty() {
+            return None;
+        }
+        let resp = self
+            .api_client
+            .put(format!("{}{path}", self.api_url))
+            .json(body)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.json::<Value>().await.ok()
+    }
+
+    /// Publish the PersistentVolume behind a provisioned claim, and bind it.
+    ///
+    /// **Without this a claim works and reads Pending for ever.** The clone
+    /// is made, attached and mounted, the pod runs on it and keeps its data
+    /// across restarts — and the PVC object is never touched, so `kubectl get
+    /// pvc` says Pending and a console renders that as degraded. Somebody
+    /// looking at the cluster sees broken storage that is in fact working,
+    /// which is the worst of both: nothing to fix, and no way to tell.
+    ///
+    /// Written after the clone exists rather than before, so the object never
+    /// claims a volume that was not made.
+    ///
+    /// Best effort throughout. The pod has its storage either way, and
+    /// failing a running workload because a status write did not land would
+    /// be the reporting path breaking the thing it reports on.
+    async fn bind_claim(&self, namespace: &str, claim: &str, volume: &str, bytes: u64) {
+        let pv_name = format!("pvc-{}", volume);
+        let capacity = serde_json::json!({ "storage": format!("{bytes}") });
+        let pv = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolume",
+            "metadata": {
+                "name": pv_name,
+                "annotations": {
+                    // Which node holds it. A stormblock clone is local to the
+                    // node that made it, and that is the whole reason the
+                    // class binds on first consumer.
+                    "storm.io/node": self.node_name,
+                    "storm.io/volume": volume,
+                },
+            },
+            "spec": {
+                "capacity": capacity,
+                "accessModes": ["ReadWriteOnce"],
+                "persistentVolumeReclaimPolicy": "Delete",
+                "storageClassName": crate::storage::STORAGE_CLASS,
+                "volumeMode": "Filesystem",
+                "claimRef": {
+                    "kind": "PersistentVolumeClaim",
+                    "namespace": namespace,
+                    "name": claim,
+                },
+                // Not a real CSI volume: this node attached it directly. The
+                // handle is recorded so the volume behind a PV is findable
+                // without asking stormblock to match on name.
+                "csi": {
+                    "driver": "stormblock.storm.io",
+                    "volumeHandle": volume,
+                },
+            },
+            "status": { "phase": "Bound" },
+        });
+        if self.api_post("/api/v1/persistentvolumes", &pv).await.is_none() {
+            debug!("PV {pv_name} not created (it may already exist)");
+        }
+
+        // Bind the claim to it. Read-modify-write rather than a patch,
+        // because the claim carries a resourceVersion and losing a concurrent
+        // edit here would be a claim pointing at the wrong volume.
+        let path = format!("/api/v1/namespaces/{namespace}/persistentvolumeclaims/{claim}");
+        let Some(mut pvc) = self.api_get(&path).await else { return };
+        if pvc["status"]["phase"].as_str() == Some("Bound")
+            && pvc["spec"]["volumeName"].as_str() == Some(pv_name.as_str())
+        {
+            return;
+        }
+        pvc["spec"]["volumeName"] = serde_json::json!(pv_name);
+        if pvc["spec"]["storageClassName"].as_str().is_none() {
+            pvc["spec"]["storageClassName"] = serde_json::json!(crate::storage::STORAGE_CLASS);
+        }
+        pvc["status"] = serde_json::json!({
+            "phase": "Bound",
+            "accessModes": ["ReadWriteOnce"],
+            "capacity": capacity,
+        });
+        if self.api_put(&path, &pvc).await.is_some() {
+            info!("PVC {namespace}/{claim} bound to {pv_name}");
+        }
+    }
+
     /// POST to stormblock's management API on this node.
     ///
     /// Loopback by default: the storage engine runs on the node whose volumes
@@ -784,7 +902,7 @@ impl PodManager {
         }
 
         let want = crate::storage::claim_bytes(&pvc);
-        let (class, _bytes) = crate::storage::class_for(want).ok_or_else(|| {
+        let (class, class_bytes) = crate::storage::class_for(want).ok_or_else(|| {
             ClaimError::Failed(format!(
                 "claim asks for {want} bytes, larger than the largest size class"
             ))
@@ -859,6 +977,12 @@ impl PodManager {
             .ok_or_else(|| ClaimError::Failed(format!("stormblock would not attach {name} as a local device")))?;
         if let Some(dev) = info["device_hint"].as_str() {
             info!("PVC {namespace}/{claim} -> {name} ({class}) at {dev}");
+            // Say so on the claim, now that there is something to point at.
+            //
+            // Here rather than earlier so the object never names a volume
+            // that was not made, and after the attach so a bound claim means
+            // storage a pod can actually use.
+            self.bind_claim(namespace, claim, &name, class_bytes).await;
             return Ok(dev.to_string());
         }
         Err(ClaimError::Failed(format!(
