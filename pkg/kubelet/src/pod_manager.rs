@@ -317,6 +317,20 @@ impl PodManager {
         resp.json::<Value>().await.ok()
     }
 
+
+    /// Emit a pod event, if there is a recorder.
+    ///
+    /// The recorder was built, stored, and never called: `pod_event` had zero
+    /// call sites, so `describe pod` showed `Events: <none>` for exactly the
+    /// failures somebody opens it for. A helper rather than `if let` at every
+    /// site, because the sites are what was missing and they should be one
+    /// line each.
+    async fn event(&self, pod: &Value, etype: &str, reason: &str, message: &str) {
+        if let Some(r) = &self.events {
+            r.pod_event(pod, etype, reason, message).await;
+        }
+    }
+
     /// POST an object to the apiserver. `None` on any failure, including a
     /// 409 — an object that already exists is not a failure to the callers
     /// here, which are all idempotent.
@@ -732,10 +746,25 @@ impl PodManager {
                              itself; if not, the container will fail with ENOENT"
                         );
                     }
-                    Err(_) => warn!(
-                        "volume {name}: {host_path} does not exist on this node — the \
-                         container will fail to start with ENOENT attaching mounts"
-                    ),
+                    Err(_) => {
+                        warn!(
+                            "volume {name}: {host_path} does not exist on this node — the \
+                             container will fail to start with ENOENT attaching mounts"
+                        );
+                        // FailedMount, which is where somebody looks first.
+                        //
+                        // Not emitted for the dangling-symlink case above: a
+                        // volume that is about to be mounted is not a failure,
+                        // and an event saying it is would be read as one long
+                        // after it resolved.
+                        self.event(
+                            pod,
+                            "Warning",
+                            "FailedMount",
+                            &crate::events::failed_mount_message(&name, &host_path, ""),
+                        )
+                        .await;
+                    }
                 }
             }
             map.insert(name, ResolvedVolume { path: host_path, fstype: None });
@@ -1786,7 +1815,22 @@ impl PodManager {
 
             // Ensure image per imagePullPolicy
             info!("Ensuring image {image} for {namespace}/{name}/{container_name}");
-            let image_ref = self.ensure_image(image, container_spec).await?;
+            self.event(pod, "Normal", "Pulling", &format!("Pulling image \"{image}\"")).await;
+            let image_ref = match self.ensure_image(image, container_spec).await {
+                Ok(r) => {
+                    self.event(pod, "Normal", "Pulled",
+                               &format!("Successfully pulled image \"{image}\"")).await;
+                    r
+                }
+                Err(e) => {
+                    // The reason an image did not resolve is the whole
+                    // diagnosis, and it lived only in a log on a node with no
+                    // shell.
+                    self.event(pod, "Warning", "Failed",
+                               &format!("Failed to pull image \"{image}\": {e}")).await;
+                    return Err(e);
+                }
+            };
 
             // Build container config (resolve env valueFrom + mounts, then
             // inject the SA credential mount + KUBERNETES_SERVICE_* env).
@@ -1801,13 +1845,31 @@ impl PodManager {
             ensure_container_log_dir(&sandbox_config.log_directory, &container_config.name);
 
             // Create container
-            let container_id = self
+            let container_id = match self
                 .runtime
                 .create_container(&sandbox_id, &container_config, &sandbox_config)
-                .await?;
+                .await
+            {
+                Ok(id) => {
+                    self.event(pod, "Normal", "Created",
+                               &format!("Created container {container_name}")).await;
+                    id
+                }
+                Err(e) => {
+                    self.event(pod, "Warning", "Failed",
+                               &format!("Error creating container {container_name}: {e}")).await;
+                    return Err(e);
+                }
+            };
 
             // Start container
-            self.runtime.start_container(&container_id).await?;
+            if let Err(e) = self.runtime.start_container(&container_id).await {
+                self.event(pod, "Warning", "Failed",
+                           &format!("Error starting container {container_name}: {e}")).await;
+                return Err(e);
+            }
+            self.event(pod, "Normal", "Started",
+                       &format!("Started container {container_name}")).await;
             info!("Started container {container_name} ({container_id}) in {namespace}/{name}");
 
             // A container with a readiness probe starts not-ready until the
