@@ -107,6 +107,13 @@ pub struct VmManager {
     api: reqwest::Client,
     api_url: String,
     http: reqwest::Client,
+    /// Events about virtual machines.
+    ///
+    /// A VM that will not start failed in this file, and the reason — a
+    /// golden that is not on this node, a disk that would not attach —
+    /// reached a log on a node with no shell and nowhere else. `describe vmi`
+    /// showed nothing, which is the surface built for exactly this.
+    events: Option<crate::events::EventRecorder>,
     /// Keyed by uid: a VM deleted and recreated under one name is two
     /// different machines, and treating them as one is how the second finds
     /// the first's disks.
@@ -120,15 +127,44 @@ impl VmManager {
         api: reqwest::Client,
         api_url: impl Into<String>,
     ) -> VmManager {
+        let node_name = node_name.into();
+        let api_url = api_url.into().trim_end_matches('/').to_string();
+        let events = (!api_url.is_empty())
+            .then(|| crate::events::EventRecorder::new(api.clone(), &api_url, &node_name));
         VmManager {
             ring,
             storage: "http://127.0.0.1:9090".into(),
-            node_name: node_name.into(),
+            node_name,
             api,
-            api_url: api_url.into().trim_end_matches('/').to_string(),
+            api_url,
             http: reqwest::Client::new(),
+            events,
             vms: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Emit an event about a machine, if there is a recorder.
+    async fn event(&self, obj: &Value, etype: &str, reason: &str, message: &str) {
+        if let Some(r) = &self.events {
+            r.pod_event(obj, etype, reason, message).await;
+        }
+    }
+
+    /// The same, for a machine known only by its record.
+    ///
+    /// The end-of-life path holds a `Vm` rather than the object it came from,
+    /// and that is the event most worth having: a machine that exits is the
+    /// one somebody is asking about. The recorder needs namespace, name and
+    /// uid, which the record has.
+    async fn event_of(&self, vm: &Vm, etype: &str, reason: &str, message: &str) {
+        let obj = serde_json::json!({
+            "metadata": {
+                "namespace": vm.namespace,
+                "name": vm.name,
+                "uid": vm.uid,
+            }
+        });
+        self.event(&obj, etype, reason, message).await;
     }
 
     pub fn with_storage(mut self, storage: impl Into<String>) -> VmManager {
@@ -179,6 +215,12 @@ impl VmManager {
                 let ns = obj["metadata"]["namespace"].as_str().unwrap_or("default");
                 let name = obj["metadata"]["name"].as_str().unwrap_or("");
                 warn!("{ns}/{name}: {e}");
+                // The reason, where somebody will look for it.
+                //
+                // This is the message that said `cloning golden
+                // fedora-43-x86_64 for disk root: 404 no volume` and went
+                // only to a log on a node with no shell.
+                self.event(obj, "Warning", "FailedStart", &e).await;
                 self.record_failure(uid, obj, &e).await;
             }
         }
@@ -302,6 +344,8 @@ impl VmManager {
         };
 
         info!(vm = %vm.name, namespace = %ns, ?handle, "vm started");
+        self.event(obj, "Normal", "Started",
+                   &format!("Started virtual machine {}", vm.name)).await;
         let rec = Vm {
             namespace: ns,
             name: vm.name.clone(),
@@ -355,6 +399,13 @@ impl VmManager {
                 (c, _) => format!("the hypervisor exited with {c}"),
             };
             info!(vm = %done.name, code, "vm ended");
+            // A machine that exits 0 asked to; anything else did not.
+            if code == 0 {
+                self.event_of(&done, "Normal", "Stopped",
+                              &format!("Virtual machine {} stopped", done.name)).await;
+            } else {
+                self.event_of(&done, "Warning", "Failed", &done.message).await;
+            }
             self.release(&done.disks).await;
             if let Some(r) = self.ring.clone() {
                 let h = done.handle;
