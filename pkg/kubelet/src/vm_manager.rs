@@ -451,7 +451,87 @@ impl VmManager {
         self.vms.lock().await.values().cloned().collect()
     }
 
+
+    /// A copy of the machine with any `userDataSecretRef` turned into inline
+    /// `userData`.
+    ///
+    /// Returns the object unchanged when there is no reference, when the
+    /// secret cannot be read, or when it holds nothing usable -- a machine
+    /// that starts without its seed is bad, and a machine that does not start
+    /// at all because a secret was briefly unavailable is worse. The failure
+    /// is logged rather than swallowed, because "no login" needs a reason
+    /// somewhere.
+    ///
+    /// `stringData` as well as `data`: the apiserver is supposed to fold the
+    /// first into the second on write, and rustkube does not, so a secret
+    /// created the way Kubernetes documents comes back as it was written.
+    async fn with_seed(&self, obj: &Value) -> Value {
+        let ns = obj["metadata"]["namespace"].as_str().unwrap_or("default");
+        let Some(vols) = obj.pointer("/spec/volumes").and_then(Value::as_array) else {
+            return obj.clone();
+        };
+        let refs: Vec<(usize, String)> = vols
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| {
+                v.pointer("/cloudInitNoCloud/userDataSecretRef/name")
+                    .and_then(Value::as_str)
+                    .map(|n| (i, n.to_string()))
+            })
+            .collect();
+        if refs.is_empty() || self.api_url.is_empty() {
+            return obj.clone();
+        }
+        let mut out = obj.clone();
+        for (i, name) in refs {
+            let url = format!(
+                "{}/api/v1/namespaces/{ns}/secrets/{name}",
+                self.api_url.trim_end_matches('/')
+            );
+            let secret = match self.api.get(&url).send().await {
+                Ok(r) => match r.json::<Value>().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(secret = %name, error = %e, "cloud-init seed: unreadable secret");
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    warn!(secret = %name, error = %e, "cloud-init seed: secret not fetched");
+                    continue;
+                }
+            };
+            let Some(text) = seed_text(&secret) else {
+                warn!(secret = %name, "cloud-init seed: secret has no userdata");
+                continue;
+            };
+            out["spec"]["volumes"][i]["cloudInitNoCloud"]["userData"] = Value::String(text);
+            // The reference has been honoured; leaving it would let a later
+            // reader resolve it a second time.
+            if let Some(m) = out["spec"]["volumes"][i]["cloudInitNoCloud"].as_object_mut() {
+                m.remove("userDataSecretRef");
+            }
+        }
+        out
+    }
+
     async fn start(&self, uid: &str, obj: &Value) -> Result<(), StartFail> {
+        // Resolve the cloud-init secret before anything reads the spec.
+        //
+        // A seed may be referenced rather than inlined -- `userDataSecretRef`
+        // -- because the payload is where SSH keys and passwords live and a
+        // VMI spec is readable by anyone with get on virtualmachineinstances.
+        // Nothing resolved it: stormvm reads `cloudInitNoCloud.userData` and
+        // only that, so a machine whose seed was a reference booted with **no
+        // cloud-init at all** -- no key, no user, no hostname -- and the only
+        // symptom was a guest nobody could log into, which reads as a broken
+        // image rather than a missing indirection.
+        //
+        // Resolved here because this is the last place that has both an
+        // apiserver client and the object: the secret is fetched by the
+        // kubelet and inlined into the spec it hands to the engine, so the
+        // payload still never travels in the VMI.
+        let obj = &self.with_seed(obj).await;
         let vm: VmSpec = stormvm_spec::kube::from_kube(obj).map_err(|e| e.to_string())?;
         let ns = obj["metadata"]["namespace"].as_str().unwrap_or("default").to_string();
         let ring = self.ring.clone().ok_or_else(|| {
@@ -1660,5 +1740,87 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].phase, Phase::Failed);
         assert!(all[0].message.contains("no ring"), "{}", all[0].message);
+    }
+}
+
+/// The cloud-init document inside a Secret, from `data` or `stringData`.
+///
+/// `data` is base64 and `stringData` is not. Both are checked because the
+/// apiserver is supposed to fold the second into the first on write and
+/// rustkube does not, so a secret written the documented way stays in
+/// `stringData` and a reader that only knows `data` finds nothing.
+///
+/// The key is `userdata` by convention, but any single entry is taken when
+/// that name is absent: a seed with one field and the wrong name is obviously
+/// the seed, and failing there would mean a guest with no login over a
+/// spelling.
+fn seed_text(secret: &Value) -> Option<String> {
+    use base64::Engine as _;
+    let pick = |m: &Value| -> Option<(String, String)> {
+        let obj = m.as_object()?;
+        let (k, v) = obj
+            .get_key_value("userdata")
+            .or_else(|| obj.get_key_value("userData"))
+            .or_else(|| if obj.len() == 1 { obj.iter().next() } else { None })?;
+        Some((k.clone(), v.as_str()?.to_string()))
+    };
+    if let Some((_, raw)) = secret.get("stringData").and_then(|m| pick(m)) {
+        if !raw.trim().is_empty() {
+            return Some(raw);
+        }
+    }
+    if let Some((_, b64)) = secret.get("data").and_then(|m| pick(m)) {
+        let bytes = base64::engine::general_purpose::STANDARD.decode(b64.trim()).ok()?;
+        let text = String::from_utf8(bytes).ok()?;
+        if !text.trim().is_empty() {
+            return Some(text);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+
+    /// A seed written as `stringData` is still a seed.
+    ///
+    /// The apiserver is supposed to fold `stringData` into `data` on write.
+    /// rustkube does not, so a secret created the documented way comes back
+    /// exactly as written -- and a reader that only knows `data` finds
+    /// nothing, which presents as a guest with no login and no reason.
+    #[test]
+    fn a_seed_is_read_from_string_data() {
+        let s = serde_json::json!({
+            "stringData": {"userdata": "#cloud-config\nhostname: web-1\n"}
+        });
+        assert!(seed_text(&s).unwrap().contains("hostname: web-1"));
+    }
+
+    /// And from `data`, which is base64.
+    #[test]
+    fn a_seed_is_read_from_base64_data() {
+        use base64::Engine as _;
+        let b = base64::engine::general_purpose::STANDARD.encode("#cloud-config\nssh_authorized_keys:\n");
+        let s = serde_json::json!({"data": {"userdata": b}});
+        assert!(seed_text(&s).unwrap().contains("ssh_authorized_keys"));
+    }
+
+    /// One field under another name is obviously the seed.
+    ///
+    /// Failing over a spelling would mean a guest nobody can log into.
+    #[test]
+    fn a_single_oddly_named_field_is_taken_as_the_seed() {
+        let s = serde_json::json!({"stringData": {"user-data": "#cloud-config\n"}});
+        assert_eq!(seed_text(&s).as_deref(), Some("#cloud-config\n"));
+    }
+
+    /// Nothing usable is None, not an empty document.
+    #[test]
+    fn an_empty_secret_is_no_seed_at_all() {
+        assert!(seed_text(&serde_json::json!({})).is_none());
+        assert!(seed_text(&serde_json::json!({"stringData": {"userdata": "  "}})).is_none());
+        // Two fields, neither named: ambiguous, so not guessed.
+        assert!(seed_text(&serde_json::json!({"stringData": {"a": "x", "b": "y"}})).is_none());
     }
 }
