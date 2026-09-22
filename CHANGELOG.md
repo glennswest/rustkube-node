@@ -308,3 +308,13 @@
   `volume:<id>` it was handed belongs to whoever made it and is meant to
   outlive it. stormvm's own `delete` already states this rule; the kubelet did
   not implement it.
+- **feat(vm):** the kubelet registers each machine with the node's metadata
+  service at start, and forgets it at stop. A guest asks `169.254.169.254` who
+  it is, and the node running it is the only thing that can answer — it knows
+  the VMI, the MAC it generated and the addresses the guest was given.
+  Registered by the kubelet rather than by a watch on the apiserver, so a
+  guest's identity does not wait on a control plane that may be starting,
+  elsewhere or down: a node boots useful alone, and so do its guests.
+  Deregistration matters as much — an address is handed to the next guest, and
+  a metadata service answering for the previous occupant of an IP is worse
+  than one that does not answer.
