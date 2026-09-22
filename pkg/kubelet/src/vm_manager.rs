@@ -82,6 +82,12 @@ pub struct Vm {
     /// one that takes four are different machines, and nothing recorded it.
     pub started_unix: u64,
     pub ready_unix: Option<u64>,
+    /// Volumes this machine created and therefore owns.
+    ///
+    /// Its root clone and its cloud-init seed. A `volume:<id>` it was handed
+    /// is not here, because that one belongs to whoever made it and outlives
+    /// the machine on purpose.
+    pub owned_volumes: Vec<String>,
     /// The interfaces this machine was actually given.
     ///
     /// Resolved at start — name, MAC, and the binding that produced it — and
@@ -362,7 +368,7 @@ impl VmManager {
 
         // Storage first. Nothing has been asked of the engine yet, so a golden
         // that does not exist costs a failed status and no cleanup.
-        let disks = self.resolve_disks(&vm).await?;
+        let (disks, owned_volumes) = self.resolve_disks(&vm).await?;
 
         // The pod log directory, because that is where `kubectl logs` looks.
         // The container name is the VM's, so the path is the one the kubelet's
@@ -479,6 +485,7 @@ impl VmManager {
             exit_code: 0,
             started_unix: now_unix(),
             ready_unix: None,
+            owned_volumes,
             nics: nic_reports,
             message: String::new(),
         };
@@ -605,13 +612,15 @@ impl VmManager {
         // matters as much as the write (rustkube-node#38).
         deregister(&vm.namespace, &vm.name);
         self.release(&vm.disks).await;
+        self.destroy_owned(vm).await;
         info!(vm = %vm.name, "vm stopped");
     }
 
     /// Clone or attach every disk. Failure gives back what it already took —
     /// an attachment left behind is a device nobody will ever release.
-    async fn resolve_disks(&self, vm: &VmSpec) -> Result<Vec<ResolvedDisk>, String> {
+    async fn resolve_disks(&self, vm: &VmSpec) -> Result<(Vec<ResolvedDisk>, Vec<String>), String> {
         let mut done: Vec<ResolvedDisk> = Vec::new();
+        let mut owned: Vec<String> = Vec::new();
         for d in &vm.disks {
             let volume_id = match &d.from {
                 DiskSource::Golden(g) => {
@@ -676,6 +685,17 @@ impl VmManager {
                     d.name
                 ));
             };
+            // Whose disk is this?
+            //
+            // A clone of a golden and a cloud-init seed were made *for* this
+            // machine and go with it. A `volume:<id>` was handed to it and is
+            // somebody else's — deleting that is deleting data the machine
+            // was only borrowing. stormvm's own `delete` states the rule; the
+            // kubelet did not implement it.
+            let ours = !matches!(d.from, DiskSource::Volume(_));
+            if ours {
+                owned.push(volume_id.clone());
+            }
             done.push(ResolvedDisk {
                 name: d.name.clone(),
                 device: device.to_string(),
@@ -684,7 +704,7 @@ impl VmManager {
                 bus: d.bus,
             });
         }
-        Ok(done)
+        Ok((done, owned))
     }
 
     /// Make this VM's NICs and hand their descriptors to the engine.
@@ -835,6 +855,41 @@ impl VmManager {
         }
     }
 
+    /// Delete the volumes this machine made for itself.
+    ///
+    /// `release` only *detached* them, so a VM's root clone and its seed
+    /// outlived it for ever. One machine leaves two orphans; a build fleet
+    /// creating and destroying a hundred a day leaves two hundred, and
+    /// nothing can tell them from volumes something still needs — which is
+    /// the orphan problem stormblock#115 exists for, manufactured daily.
+    ///
+    /// Only what this machine created. A `volume:<id>` it was handed belongs
+    /// to whoever made it and is meant to outlive the machine; deleting that
+    /// is deleting somebody's data because a VM that borrowed it went away.
+    /// stormvm's own `delete` states this rule and the kubelet did not
+    /// implement it.
+    ///
+    /// After the detach, and best-effort: a volume that will not delete is
+    /// worth a line, not a failed teardown. The machine is already gone, and
+    /// refusing to finish would leave the *registration* behind too.
+    async fn destroy_owned(&self, vm: &Vm) {
+        for id in &vm.owned_volumes {
+            let url = format!("{}/api/v1/volumes/{id}", self.storage);
+            match self.http.delete(&url).send().await {
+                Ok(r) if r.status().is_success() => {
+                    info!(vm = %vm.name, volume = %id, "deleted the machine's own volume");
+                }
+                Ok(r) => {
+                    let code = r.status();
+                    let body = r.text().await.unwrap_or_default();
+                    warn!(vm = %vm.name, volume = %id,
+                          "could not delete: {code} {}", body.trim());
+                }
+                Err(e) => warn!(vm = %vm.name, volume = %id, "could not delete: {e}"),
+            }
+        }
+    }
+
     async fn record_failure(&self, uid: &str, obj: &Value, why: &str) {
         let rec = Vm {
             namespace: obj["metadata"]["namespace"].as_str().unwrap_or("default").into(),
@@ -848,6 +903,7 @@ impl VmManager {
             started_unix: now_unix(),
             // It never became ready, and that is the point of recording it.
             ready_unix: None,
+            owned_volumes: Vec::new(),
             // A machine that never started has no interfaces to report, and
             // saying so is different from not knowing.
             nics: Vec::new(),

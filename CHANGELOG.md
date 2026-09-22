@@ -300,3 +300,11 @@
   three commits old and a fix made in stormvm did not reach a stormcos node —
   the release recorded `rustkube-node@<commit>` accurately while the
   stormvm commit inside it was invisible and stale.
+- **fix:** a deleted VM takes its own volumes with it. `release` only
+  *detached* them, so every machine's root clone and cloud-init seed outlived
+  it for ever — one VM leaves two orphans, and a build fleet creating and
+  destroying a hundred a day leaves two hundred that nothing can tell from
+  volumes something still needs. Only what the machine created: a
+  `volume:<id>` it was handed belongs to whoever made it and is meant to
+  outlive it. stormvm's own `delete` already states this rule; the kubelet did
+  not implement it.
