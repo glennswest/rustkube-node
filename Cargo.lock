@@ -766,7 +766,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1163,7 +1163,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -1467,6 +1467,7 @@ dependencies = [
  "stormvm-net",
  "stormvm-node",
  "stormvm-spec",
+ "stormvm-vmm",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -1793,7 +1794,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2234,7 +2235,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2272,9 +2273,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2564,7 +2565,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2890,12 +2891,12 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "stormcast"
 version = "0.1.1"
-source = "git+https://github.com/glennswest/stormcast?branch=main#6cef6610f22c05f1ac42af251ddb0efdcd4d515b"
+source = "git+https://github.com/glennswest/stormcast?branch=main#172b79019eb1f6f47d088f9be7b74364fed27e9e"
 
 [[package]]
 name = "stormpump"
 version = "0.1.0"
-source = "git+https://github.com/glennswest/stormpump?branch=main#d3c346d614aad716c4bfcc629e739093590122d6"
+source = "git+https://github.com/glennswest/stormpump?branch=main#cb6a9725ebdeacfa9186fab7785999b7142a96c9"
 dependencies = [
  "libc",
  "stormcast",
@@ -2905,12 +2906,12 @@ dependencies = [
 [[package]]
 name = "stormpump-abi"
 version = "0.1.0"
-source = "git+https://github.com/glennswest/stormpump?branch=main#d3c346d614aad716c4bfcc629e739093590122d6"
+source = "git+https://github.com/glennswest/stormpump?branch=main#cb6a9725ebdeacfa9186fab7785999b7142a96c9"
 
 [[package]]
 name = "stormvm-block"
 version = "0.9.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#7307ee4f41a882400fdaf6dcc9f87d2a0446519c"
+source = "git+https://github.com/glennswest/stormvm?branch=main#abfaf73b1c3ce44a7d047519a8879ee9538ed6ab"
 dependencies = [
  "serde",
  "serde_json",
@@ -2921,7 +2922,7 @@ dependencies = [
 [[package]]
 name = "stormvm-cloudinit"
 version = "0.9.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#7307ee4f41a882400fdaf6dcc9f87d2a0446519c"
+source = "git+https://github.com/glennswest/stormvm?branch=main#abfaf73b1c3ce44a7d047519a8879ee9538ed6ab"
 dependencies = [
  "serde",
  "serde_json",
@@ -2932,7 +2933,7 @@ dependencies = [
 [[package]]
 name = "stormvm-console"
 version = "0.9.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#7307ee4f41a882400fdaf6dcc9f87d2a0446519c"
+source = "git+https://github.com/glennswest/stormvm?branch=main#abfaf73b1c3ce44a7d047519a8879ee9538ed6ab"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
@@ -2949,7 +2950,7 @@ dependencies = [
 [[package]]
 name = "stormvm-control"
 version = "0.9.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#7307ee4f41a882400fdaf6dcc9f87d2a0446519c"
+source = "git+https://github.com/glennswest/stormvm?branch=main#abfaf73b1c3ce44a7d047519a8879ee9538ed6ab"
 dependencies = [
  "serde",
  "serde_json",
@@ -2961,7 +2962,7 @@ dependencies = [
 [[package]]
 name = "stormvm-net"
 version = "0.9.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#7307ee4f41a882400fdaf6dcc9f87d2a0446519c"
+source = "git+https://github.com/glennswest/stormvm?branch=main#abfaf73b1c3ce44a7d047519a8879ee9538ed6ab"
 dependencies = [
  "libc",
  "stormvm-spec",
@@ -2972,7 +2973,7 @@ dependencies = [
 [[package]]
 name = "stormvm-node"
 version = "0.9.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#7307ee4f41a882400fdaf6dcc9f87d2a0446519c"
+source = "git+https://github.com/glennswest/stormvm?branch=main#abfaf73b1c3ce44a7d047519a8879ee9538ed6ab"
 dependencies = [
  "anyhow",
  "libc",
@@ -2992,7 +2993,7 @@ dependencies = [
 [[package]]
 name = "stormvm-ring"
 version = "0.9.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#7307ee4f41a882400fdaf6dcc9f87d2a0446519c"
+source = "git+https://github.com/glennswest/stormvm?branch=main#abfaf73b1c3ce44a7d047519a8879ee9538ed6ab"
 dependencies = [
  "stormpump",
  "stormpump-abi",
@@ -3002,7 +3003,7 @@ dependencies = [
 [[package]]
 name = "stormvm-spec"
 version = "0.9.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#7307ee4f41a882400fdaf6dcc9f87d2a0446519c"
+source = "git+https://github.com/glennswest/stormvm?branch=main#abfaf73b1c3ce44a7d047519a8879ee9538ed6ab"
 dependencies = [
  "serde",
  "serde_json",
@@ -3013,7 +3014,7 @@ dependencies = [
 [[package]]
 name = "stormvm-vmm"
 version = "0.9.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#7307ee4f41a882400fdaf6dcc9f87d2a0446519c"
+source = "git+https://github.com/glennswest/stormvm?branch=main#abfaf73b1c3ce44a7d047519a8879ee9538ed6ab"
 dependencies = [
  "serde",
  "stormvm-cloudinit",
@@ -3089,10 +3090,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

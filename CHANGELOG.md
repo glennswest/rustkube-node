@@ -295,3 +295,8 @@
   nothing. "No events at all" then looks identical to a kubelet that never
   tried, which is the one explanation the logs could not distinguish it from.
   A rejected event is now a warning naming the status and the body.
+- **chore:** update the pinned `stormvm-*` git dependencies to `abfaf73`. The
+  lock pinned `7307ee4`, so the kubelet was built against a `stormvm-spec`
+  three commits old and a fix made in stormvm did not reach a stormcos node —
+  the release recorded `rustkube-node@<commit>` accurately while the
+  stormvm commit inside it was invisible and stale.
