@@ -83,6 +83,57 @@ pub struct Vm {
     pub nics: Vec<NicReport>,
 }
 
+/// The addresses the guest holds, per interface, from the QEMU guest agent.
+///
+/// `guest-network-get-interfaces` is the only thing that knows: with a bridge
+/// the address comes from a DHCP server the node does not run, and with
+/// masquerade it is inside the hypervisor's own stack. The socket has been
+/// wired at `/run/stormvm/<ns>/<name>/agent.sock` since machines started and
+/// nothing has ever read it.
+///
+/// `None` when there is no agent, no answer, or the guest has not got that
+/// far — all of which are ordinary and none of which are worth logging on
+/// every sync of every machine.
+async fn guest_addresses(vm: &Vm) -> Option<Vec<Vec<String>>> {
+    let sock = format!("{RUN_ROOT}/{}/{}/agent.sock", vm.namespace, vm.name);
+    if !std::path::Path::new(&sock).exists() {
+        return None;
+    }
+    let v = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        stormvm_control::qga::execute(&sock, "guest-network-get-interfaces"),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    // One entry per interface the *guest* sees, which is not the order the
+    // spec lists them in — so loopback is dropped and the rest are taken in
+    // the order they come, which for a single-NIC machine is the only one
+    // that matters. Matching by MAC is the right answer for several NICs and
+    // is left until there is a machine here with more than one.
+    let mut out: Vec<Vec<String>> = Vec::new();
+    for iface in v.get("return")?.as_array()? {
+        let name = iface.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        if name == "lo" {
+            continue;
+        }
+        let addrs = iface
+            .get("ip-addresses")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.get("ip-address").and_then(|s| s.as_str()))
+                    // Link-local tells nobody anything they can reach.
+                    .filter(|s| !s.starts_with("fe80:") && !s.starts_with("169.254."))
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        out.push(addrs);
+    }
+    Some(out)
+}
+
 /// How the address reaches the guest, in one word.
 ///
 /// The difference that matters to somebody who cannot reach their VM:
@@ -103,6 +154,14 @@ fn binding_of(t: &stormvm_vmm::NicTransport) -> String {
 pub struct NicReport {
     pub name: String,
     pub mac: String,
+    /// What the guest actually holds, asked of the guest agent.
+    ///
+    /// Not derivable from anything the node knows: with a bridge the address
+    /// comes from a DHCP server the node does not run, and with masquerade
+    /// it is inside the hypervisor's own stack. The agent is the only thing
+    /// that can answer, and its socket has been wired since the machine
+    /// started — nothing read it.
+    pub addresses: Vec<String>,
     /// `bridge`, `user`, `passt`, … — how the address reaches the guest,
     /// which is the difference between a VM the cluster can route to and one
     /// only its own hypervisor can see.
@@ -410,6 +469,24 @@ impl VmManager {
             vms.values().filter(|v| !v.phase.terminal()).cloned().collect()
         };
         for vm in live {
+            // Ask the guest what address it has, and report it when it
+            // changes.
+            //
+            // Best-effort on purpose: a guest with no agent, or one still
+            // booting, simply has no answer, and that is not a fault to
+            // report. A short timeout because this runs on every sync and a
+            // hung agent must not hold the loop.
+            if let Some(addrs) = guest_addresses(&vm).await {
+                let changed = vm.nics.iter().map(|n| &n.addresses).ne(addrs.iter());
+                if changed {
+                    let mut with = vm.clone();
+                    for (n, a) in with.nics.iter_mut().zip(addrs.into_iter()) {
+                        n.addresses = a;
+                    }
+                    self.vms.lock().await.insert(with.uid.clone(), with.clone());
+                    self.patch_status(&with).await;
+                }
+            }
             let r = ring.clone();
             let handle = vm.handle;
             let answer = tokio::task::spawn_blocking(move || r.query(handle)).await;
@@ -637,6 +714,8 @@ impl VmManager {
                 name: p.nic.clone(),
                 mac: mac.clone(),
                 binding: binding_of(&made.transport),
+                // Empty until the guest has booted far enough to have one.
+                addresses: vec![],
             });
             out.push(plan::ResolvedNic {
                 name: p.nic.clone(),
@@ -765,6 +844,11 @@ impl VmManager {
                 .map(|n| json!({
                     "name": n.name,
                     "mac": n.mac,
+                    // Upstream's field, singular, plus every address when
+                    // there is more than one — a guest with v4 and v6 has
+                    // two and neither is "the" address.
+                    "ipAddress": n.addresses.first().cloned().unwrap_or_default(),
+                    "ipAddresses": n.addresses,
                     // Not upstream's, and named so it cannot be mistaken for
                     // one: `user` means the guest is behind a NAT inside the
                     // hypervisor process, which is a very different thing

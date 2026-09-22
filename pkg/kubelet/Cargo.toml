@@ -26,6 +26,12 @@ stormvm-net = { git = "https://github.com/glennswest/stormvm", branch = "main" }
 # difference between a VM the cluster can route to and one only its own
 # hypervisor can see.
 stormvm-vmm = { git = "https://github.com/glennswest/stormvm", branch = "main" }
+# The QEMU guest agent client, for the one question only the guest can
+# answer: what address does it actually hold. With a bridge that comes from
+# a DHCP server the node does not run; with masquerade it is inside the
+# hypervisor's own stack. The socket has been wired since machines started
+# and nothing read it.
+stormvm-control = { git = "https://github.com/glennswest/stormvm", branch = "main" }
 stormvm-cloudinit = { git = "https://github.com/glennswest/stormvm", branch = "main" }
 apimachinery = { workspace = true }
 cni = { workspace = true }
