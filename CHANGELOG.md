@@ -327,3 +327,13 @@
   apiserver that does not implement the selector answers with everything
   rather than an error, and silently running every machine in the cluster on
   one node is a worse failure than a slow list.
+- **feat:** the kubelet **watches** its machines rather than polling for them.
+  A poll asks "what is it now" every two seconds whether or not anything
+  changed; a watch is told. That matters most for the case hardest to reason
+  about — a machine that moves: with a poll the old node keeps answering for
+  it for up to a tick after it is gone and the new one stays silent for up to
+  a tick after it arrives. LIST for the current state and its
+  `resourceVersion`, WATCH from there, re-LIST on `410 Gone`, reconnect on any
+  disconnect. The reconcile loop still runs on its interval, because a watch
+  says what changed and reconciliation is what makes the node match it —
+  including when nothing changed and something drifted.

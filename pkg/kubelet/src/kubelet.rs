@@ -310,6 +310,25 @@ impl Kubelet {
             });
         }
 
+        // Follow this node's machines rather than asking every tick.
+        //
+        // The reconcile loop still runs on its interval — a watch says what
+        // changed, and reconciliation is what makes the node match it, which
+        // is also needed when nothing changed and something drifted.
+        if let Some(vms) = self.vms.clone() {
+            let api = self.api_client.clone();
+            let url = self.config.api_server_url.clone();
+            let node = self.config.node_name.clone();
+            let sink = vms.clone();
+            tokio::spawn(async move {
+                crate::vm_manager::watch_for_node(api, url, node, move |objs| {
+                    let s = sink.clone();
+                    tokio::spawn(async move { s.set_watched(objs).await });
+                })
+                .await;
+            });
+        }
+
         // Main sync loop
         let mut interval = time::interval(self.config.sync_interval);
         loop {
@@ -455,12 +474,22 @@ impl Kubelet {
         // the ordinary case on a node that runs none, and it must not stop pods
         // from being synced.
         if let Some(vms) = &self.vms {
-            let want = crate::vm_manager::list_for_node(
-                &self.api_client,
-                &self.config.api_server_url,
-                &self.config.node_name,
-            )
-            .await;
+            // What the watch has, or a list while it is still starting.
+            //
+            // A fresh kubelet cannot wait for an event: a watch only fires
+            // when something *changes*, and a node whose machines are all
+            // steady would sit idle forever having started none of them.
+            let want = match vms.watched().await {
+                Some(w) => w,
+                None => {
+                    crate::vm_manager::list_for_node(
+                        &self.api_client,
+                        &self.config.api_server_url,
+                        &self.config.node_name,
+                    )
+                    .await
+                }
+            };
             vms.sync(&want).await;
         }
 

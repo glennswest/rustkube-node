@@ -291,6 +291,13 @@ pub struct VmManager {
     /// partition, where one maintained by events is correct only if every
     /// event landed.
     desired: Mutex<HashMap<String, Value>>,
+    /// What the watch last saw, when there is one.
+    ///
+    /// The watch maintains this and the reconcile loop reads it, so the two
+    /// stay decoupled: a watch that reconnects does not disturb a
+    /// reconciliation in flight, and a reconcile that takes a moment does not
+    /// hold up an event.
+    watched: Mutex<Option<Vec<Value>>>,
     /// Whether a sync has ever completed.
     ///
     /// A cold cache must say so. "I have not synced" and "no such machine"
@@ -320,6 +327,7 @@ impl VmManager {
             events,
             vms: Mutex::new(HashMap::new()),
             desired: Mutex::new(HashMap::new()),
+            watched: Mutex::new(None),
             synced: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -361,6 +369,20 @@ impl VmManager {
     /// phase and its disks given back once — not restarted, because a
     /// `restartPolicy` for VMs is the controller's decision and this node does
     /// not have one yet.
+    /// What the watch has, if a watch is running.
+    ///
+    /// `None` means no watch has delivered anything yet and the caller should
+    /// list instead — a fresh kubelet must not sit idle waiting for an event
+    /// that only fires when something *changes*.
+    pub async fn watched(&self) -> Option<Vec<Value>> {
+        self.watched.lock().await.clone()
+    }
+
+    /// The watch's view, from the watch task.
+    pub async fn set_watched(&self, objs: Vec<Value>) {
+        *self.watched.lock().await = Some(objs);
+    }
+
     pub async fn sync(&self, desired: &[Value]) {
         self.absorb_ends().await;
 
@@ -1265,6 +1287,150 @@ fn hypervisor_said(log_dir: &str) -> Option<String> {
 ///
 /// Best-effort, like the pod list: a cluster with no such CRD is the ordinary
 /// case on a node that runs no VMs, and it must not abort a sync.
+/// Follow this node's machines, and keep following them.
+///
+/// A poll asks "what is it now" every two seconds whether or not anything
+/// changed; a watch is told. That matters most for the case it was hardest to
+/// reason about: a machine that moves. With a poll the old node keeps
+/// answering for it for up to a tick after it is gone, and the new one does
+/// not answer for up to a tick after it arrives. With a watch both learn at
+/// the moment the object changes.
+///
+/// The shape is the one every Kubernetes client uses, and each part of it is
+/// there for a failure that happens:
+///
+/// 1. **LIST** for the current state and the `resourceVersion` it is current
+///    as of. Starting a watch without one asks for "everything from now",
+///    which silently misses whatever exists already.
+/// 2. **WATCH** from that version. The body never ends; events arrive as
+///    newline-delimited JSON.
+/// 3. **410 Gone** means the server has discarded the history this version
+///    needed — ordinary after a compaction or a long disconnect, and the only
+///    correct response is to LIST again rather than to retry the watch.
+/// 4. **Any disconnect** is normal. An apiserver rotating, a load balancer
+///    idling out, a network blink: reconnect from the last version seen.
+///
+/// `on_set` is called with the full set after each change, so the caller sees
+/// the same shape a poll gave it and nothing downstream has to understand
+/// events.
+pub async fn watch_for_node<F>(
+    api: reqwest::Client,
+    api_url: String,
+    node: String,
+    on_set: F,
+) where
+    F: Fn(Vec<Value>) + Send + Sync + 'static,
+{
+    use futures::StreamExt;
+    let base = api_url.trim_end_matches('/').to_string();
+    let selector = format!("fieldSelector=status.nodeName%3D{node}");
+    // What this node believes it should be running, by uid — the set the
+    // watch maintains and hands back whole.
+    let mut have: HashMap<String, Value> = HashMap::new();
+
+    loop {
+        // 1. LIST.
+        let list_url =
+            format!("{base}/apis/kubevirt.io/v1/virtualmachineinstances?{selector}");
+        let Ok(resp) = api.get(&list_url).send().await else {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        };
+        let Ok(v) = resp.json::<Value>().await else {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        };
+        have.clear();
+        for o in v["items"].as_array().unwrap_or(&Vec::new()) {
+            // The same local check the poll kept, for the same reason: an
+            // apiserver that does not implement the selector answers with
+            // everything, and running the cluster's machines on one node is
+            // worse than a slow list.
+            if !assigned_to(o, &node) {
+                continue;
+            }
+            if let Some(uid) = o["metadata"]["uid"].as_str() {
+                have.insert(uid.to_string(), o.clone());
+            }
+        }
+        let mut version = v["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        on_set(have.values().cloned().collect());
+
+        // 2. WATCH.
+        loop {
+            let watch_url = format!(
+                "{base}/apis/kubevirt.io/v1/virtualmachineinstances                 ?watch=true&{selector}&resourceVersion={version}&timeoutSeconds=300"
+            );
+            let Ok(resp) = api.get(&watch_url).send().await else {
+                break;
+            };
+            if resp.status().as_u16() == 410 {
+                // Too old. Re-list; do not retry this version.
+                break;
+            }
+            if !resp.status().is_success() {
+                break;
+            }
+            let mut stream = resp.bytes_stream();
+            // Events are newline-delimited and a chunk is not a line: one
+            // chunk can hold several events or half of one.
+            let mut buf = Vec::new();
+            let mut gone = false;
+            while let Some(Ok(chunk)) = stream.next().await {
+                buf.extend_from_slice(&chunk);
+                while let Some(nl) = buf.iter().position(|b| *b == b'\n') {
+                    let line: Vec<u8> = buf.drain(..=nl).collect();
+                    let Ok(ev) = serde_json::from_slice::<Value>(&line[..line.len() - 1]) else {
+                        continue;
+                    };
+                    let kind = ev["type"].as_str().unwrap_or("");
+                    let obj = &ev["object"];
+                    if kind == "ERROR" {
+                        gone = true;
+                        break;
+                    }
+                    if let Some(rv) = obj["metadata"]["resourceVersion"].as_str() {
+                        version = rv.to_string();
+                    }
+                    let Some(uid) = obj["metadata"]["uid"].as_str() else { continue };
+                    match kind {
+                        "ADDED" | "MODIFIED" => {
+                            if assigned_to(obj, &node) {
+                                have.insert(uid.to_string(), obj.clone());
+                            } else {
+                                // Reassigned away from here — which is a
+                                // machine that moved, and the moment this
+                                // node must stop answering for it.
+                                have.remove(uid);
+                            }
+                        }
+                        "DELETED" => {
+                            have.remove(uid);
+                        }
+                        _ => continue,
+                    }
+                    on_set(have.values().cloned().collect());
+                }
+                if gone {
+                    break;
+                }
+            }
+            if gone {
+                break;
+            }
+            // The body ended: a timeout, a rotation, a blink. Reconnect from
+            // where we are rather than re-listing, which is the whole point
+            // of keeping the version.
+        }
+        // Fell out to re-list. A moment's pause so a persistently broken
+        // apiserver is not hammered.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 pub async fn list_for_node(api: &reqwest::Client, api_url: &str, node: &str) -> Vec<Value> {
     // Ask for this node's machines, not the cluster's.
     //

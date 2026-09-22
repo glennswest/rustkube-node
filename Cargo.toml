@@ -109,7 +109,10 @@ libcontainer = { version = "0.6", default-features = false, features = ["v2"] }
 oci-spec = { version = "0.9" }
 
 # HTTP client
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# `stream` for the watch: a Kubernetes watch is a response body that never
+# ends, delivered as newline-delimited JSON, so it has to be read as it
+# arrives rather than awaited to completion.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 
 # TLS (rustls only — no OpenSSL)
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "tls12"] }
