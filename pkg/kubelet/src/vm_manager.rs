@@ -104,6 +104,42 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+
+/// Addresses the node has seen each of a machine's NICs use, by MAC.
+///
+/// Read from `/proc/net/arp`, which is the node's IPv4 neighbour table. This
+/// is deliberately a weaker source than the guest agent: it only knows what
+/// has been seen from this node, it is IPv4 only, and an entry can be stale.
+/// It exists because the alternative for an agentless guest was showing
+/// nothing, and "no address" reads as a machine with no network rather than
+/// as a machine nobody has asked.
+///
+/// `None` when the table says nothing about any of them, so the caller can
+/// fall back rather than overwrite a good answer with an empty one.
+fn neighbour_addresses(vm: &Vm) -> Option<Vec<Vec<String>>> {
+    let table = std::fs::read_to_string("/proc/net/arp").ok()?;
+    // IP address, HW type, flags, HW address, mask, device
+    let mut by_mac: std::collections::HashMap<String, Vec<String>> = Default::default();
+    for line in table.lines().skip(1) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 4 {
+            continue;
+        }
+        // Flags 0x0 is an incomplete entry: the kernel asked and nobody
+        // answered, so the address it names is a guess.
+        if f[2] == "0x0" {
+            continue;
+        }
+        by_mac.entry(f[3].to_ascii_lowercase()).or_default().push(f[0].to_string());
+    }
+    let out: Vec<Vec<String>> = vm
+        .nics
+        .iter()
+        .map(|n| by_mac.get(&n.mac.to_ascii_lowercase()).cloned().unwrap_or_default())
+        .collect();
+    out.iter().any(|v| !v.is_empty()).then_some(out)
+}
+
 /// The addresses the guest holds, per interface, from the QEMU guest agent.
 ///
 /// `guest-network-get-interfaces` is the only thing that knows: with a bridge
@@ -687,7 +723,24 @@ impl VmManager {
             // booting, simply has no answer, and that is not a fault to
             // report. A short timeout because this runs on every sync and a
             // hung agent must not hold the loop.
-            if let Some(addrs) = guest_addresses(&vm).await {
+            // The guest agent first, the node's own neighbour table second.
+            //
+            // A guest with no agent has no answer about itself, and for a
+            // bridged machine that left the row with no address at all -- the
+            // one field somebody actually wants, missing on every guest
+            // without qemu-guest-agent, which includes anything mid-install
+            // and most images that are not cloud images.
+            //
+            // The node can answer instead: the machine is on a bridge it
+            // owns, so once the guest has spoken to anything its MAC is in
+            // the neighbour table with the address it took. Second, not
+            // first: the agent knows every address on every interface, and
+            // the neighbour table knows only what has been seen from here.
+            let addrs = match guest_addresses(&vm).await {
+                Some(a) if a.iter().any(|v| !v.is_empty()) => Some(a),
+                other => neighbour_addresses(&vm).or(other),
+            };
+            if let Some(addrs) = addrs {
                 let changed = vm.nics.iter().map(|n| &n.addresses).ne(addrs.iter());
                 // The agent answering *is* the readiness signal: it runs in
                 // the guest, so a reply means the guest booted far enough to

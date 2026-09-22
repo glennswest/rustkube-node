@@ -347,3 +347,15 @@
   that is where Kubernetes already answers it, so one query returns the
   release, the kernel and the kubelet together and every existing reader gets
   it free. Falls back to naming the runtime outside a stormcos image.
+- **fix(kubelet):** `userDataSecretRef` is resolved before the spec reaches
+  the engine. A seed may be referenced rather than inlined, because the
+  payload is where SSH keys live and a VMI spec is readable by anyone with
+  `get` on virtualmachineinstances — but nothing resolved the reference, so a
+  machine whose seed was a reference booted with **no cloud-init at all**: no
+  key, no user, no hostname, and a guest nobody could log into. `stringData`
+  is read as well as `data`, because the apiserver is supposed to fold the
+  first into the second and rustkube does not.
+- **feat(kubelet):** a machine with no guest agent still reports an address,
+  read from the node's neighbour table by MAC. Agentless guests — anything
+  mid-install, anything that is not a cloud image — showed no address at all,
+  which reads as a machine with no network rather than one nobody has asked.
