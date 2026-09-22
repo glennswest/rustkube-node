@@ -121,18 +121,27 @@ async fn guest_addresses(vm: &Vm) -> Option<Vec<Vec<String>>> {
     .await
     .ok()?
     .ok()?;
-    // One entry per interface the *guest* sees, which is not the order the
-    // spec lists them in — so loopback is dropped and the rest are taken in
-    // the order they come, which for a single-NIC machine is the only one
-    // that matters. Matching by MAC is the right answer for several NICs and
-    // is left until there is a machine here with more than one.
-    let mut out: Vec<Vec<String>> = Vec::new();
+    // Matched on MAC, not on position.
+    //
+    // The guest lists its interfaces in its own order, which is the kernel's
+    // enumeration and not the order the spec declares them. With one NIC
+    // those always agree; with two they agree until they do not, and the
+    // failure is an address attributed to the wrong interface — which is
+    // worse than no address, because it looks like an answer.
+    //
+    // Both sides have the MAC: the node generated it, the guest reports it.
+    // That is an identity, so it is what is used.
+    let mut by_mac: std::collections::HashMap<String, Vec<String>> = Default::default();
     for iface in v.get("return")?.as_array()? {
-        let name = iface.get("name").and_then(|n| n.as_str()).unwrap_or("");
-        if name == "lo" {
+        let mac = iface
+            .get("hardware-address")
+            .and_then(|m| m.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if mac.is_empty() || mac == "00:00:00:00:00:00" {
             continue;
         }
-        let addrs = iface
+        let addrs: Vec<String> = iface
             .get("ip-addresses")
             .and_then(|a| a.as_array())
             .map(|a| {
@@ -141,12 +150,18 @@ async fn guest_addresses(vm: &Vm) -> Option<Vec<Vec<String>>> {
                     // Link-local tells nobody anything they can reach.
                     .filter(|s| !s.starts_with("fe80:") && !s.starts_with("169.254."))
                     .map(str::to_string)
-                    .collect::<Vec<_>>()
+                    .collect()
             })
             .unwrap_or_default();
-        out.push(addrs);
+        by_mac.insert(mac, addrs);
     }
-    Some(out)
+    // In the spec's order, so the result lines up with `vm.nics`.
+    Some(
+        vm.nics
+            .iter()
+            .map(|n| by_mac.get(&n.mac.to_ascii_lowercase()).cloned().unwrap_or_default())
+            .collect(),
+    )
 }
 
 /// How the address reaches the guest, in one word.
