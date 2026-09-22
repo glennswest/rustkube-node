@@ -263,7 +263,6 @@ pub struct VmManager {
     ring: Option<Arc<RingClient>>,
     /// stormblock's management API on this node.
     storage: String,
-    imds: String,
     node_name: String,
     api: reqwest::Client,
     api_url: String,
@@ -295,10 +294,6 @@ impl VmManager {
         VmManager {
             ring,
             storage: "http://127.0.0.1:9090".into(),
-            // This node's own metadata service. Loopback because that is
-            // what per-node means: a guest's identity is answered by the
-            // machine hosting it and by nothing else.
-            imds: "http://127.0.0.1:8169".into(),
             node_name,
             api,
             api_url,
@@ -538,7 +533,6 @@ impl VmManager {
             message: String::new(),
         };
         self.vms.lock().await.insert(uid.to_string(), rec.clone());
-        self.register_instance(&rec, &vm, obj).await;
         self.patch_status(&rec).await;
         Ok(())
     }
@@ -660,7 +654,6 @@ impl VmManager {
         // as "the guest is quiet" rather than "there is no guest" — so this
         // matters as much as the write (rustkube-node#38).
         deregister(&vm.namespace, &vm.name);
-        self.deregister_instance(vm).await;
         self.release(&vm.disks).await;
         self.destroy_owned(vm).await;
         info!(vm = %vm.name, "vm stopped");
@@ -926,26 +919,29 @@ impl VmManager {
         }
     }
 
-    /// Tell this node's metadata service who the machine is.
+    /// Who is at this address, as instance metadata.
     ///
-    /// A guest asks `169.254.169.254` who it is, and the node it is running
-    /// on is the only thing that can answer: it knows the VMI, the MAC it
-    /// generated and the addresses the guest was given. Nothing else does,
-    /// and nothing else needs to — which is why the address is link-local
-    /// and the service is per-node rather than a cluster-wide one every
-    /// guest would have to find.
+    /// **The kubelet is the source of truth and this is how it is asked.**
     ///
-    /// Registered *here* rather than by a watch on the apiserver, on purpose.
-    /// The kubelet already has every fact at the moment the machine starts,
-    /// and doing it locally means a guest's identity does not wait on a
-    /// control plane that may be starting, elsewhere, or down. A node boots
-    /// useful alone; so do its guests.
+    /// The first version of this pushed a copy into the metadata service at
+    /// start and deleted it at stop, which is two records of one fact kept in
+    /// step by hand. Every way that goes wrong is a guest being told
+    /// something false: a machine that moved, a registration that failed
+    /// while the machine started anyway, an address handed to its next
+    /// occupant before the delete landed. The deregistration existed
+    /// precisely to paper over that, which is the sign it was the wrong
+    /// shape.
     ///
-    /// Best-effort: a node with no metadata service still runs machines, and
-    /// they fall back to the cloud-init seed exactly as before. Warned about
-    /// once per machine rather than per sync, because a service that is not
-    /// there is a fact about the node and not an event.
-    async fn register_instance(&self, vm: &Vm, spec: &VmSpec, obj: &Value) {
+    /// So nothing is stored twice. The kubelet already holds every fact —
+    /// the VMI, the MAC it generated, the addresses the guest was given, and
+    /// the machine's whole lifecycle — and answers from that. A record it
+    /// does not have is a machine that is not running here, which is exactly
+    /// the answer a metadata service should give.
+    pub async fn instance_at(&self, ip: &str) -> Option<Value> {
+        let vms = self.vms.lock().await;
+        let vm = vms.values().find(|v| {
+            !v.phase.terminal() && v.nics.iter().any(|n| n.addresses.iter().any(|a| a == ip))
+        })?;
         let interfaces: Vec<Value> = vm
             .nics
             .iter()
@@ -959,54 +955,17 @@ impl VmManager {
                 })
             })
             .collect();
-        // The address the guest will reach us from, which is how it is
-        // identified on every later request.
-        let local_ipv4 = vm
-            .nics
-            .iter()
-            .flat_map(|n| n.addresses.iter())
-            .find(|a| a.contains('.'))
-            .cloned()
-            .unwrap_or_default();
-        let body = json!({
+        Some(json!({
             "instance_id": vm.uid,
-            // The hostname a guest asks DHCP for and the one it reads here
-            // must agree, or the machine has two names and neither resolves.
-            "hostname": obj
-                .pointer("/metadata/annotations/storm.io~1hostname")
-                .and_then(Value::as_str)
-                .unwrap_or(&vm.name),
-            "local_ipv4": local_ipv4,
-            // The shape a guest reports, in the place a cloud puts it. Not a
-            // real instance type -- there is no catalogue of them here -- so
-            // it says what the machine is rather than inventing a name.
-            "instance_type": format!("{}vcpu-{}", spec.cpu.cores, spec.memory.size),
+            "hostname": vm.name,
+            "local_ipv4": ip,
             "region": "storm",
+            // The node, because that is the failure domain a guest is in.
             "zone": self.node_name,
             "tags": { "namespace": vm.namespace, "name": vm.name },
             "network": { "interfaces": interfaces },
-            "launched_at": chrono::Utc::now().to_rfc3339(),
-        });
-        let url = format!("{}/admin/instances", self.imds);
-        match self.http.post(&url).json(&body).send().await {
-            Ok(r) if r.status().is_success() => {
-                info!(vm = %vm.name, "registered with the metadata service");
-            }
-            Ok(r) => warn!(vm = %vm.name, "metadata service refused: {}", r.status()),
-            Err(e) => warn!(vm = %vm.name, "no metadata service at {}: {e}", self.imds),
-        }
-    }
-
-    /// Forget a machine that is gone.
-    ///
-    /// Its address will be handed to another guest, and a metadata service
-    /// that answers for the previous occupant of an IP is worse than one that
-    /// does not answer at all.
-    async fn deregister_instance(&self, vm: &Vm) {
-        let url = format!("{}/admin/instances/{}", self.imds, vm.uid);
-        if let Err(e) = self.http.delete(&url).send().await {
-            warn!(vm = %vm.name, "could not deregister from the metadata service: {e}");
-        }
+            "launched_at": vm.started_unix,
+        }))
     }
 
     /// Delete the volumes this machine made for itself.

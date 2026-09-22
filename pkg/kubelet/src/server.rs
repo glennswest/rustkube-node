@@ -65,6 +65,12 @@ struct AuthState {
 #[derive(Clone)]
 struct AppState {
     pods: Arc<PodManager>,
+    /// Virtual machines, when this node has an engine to run them.
+    ///
+    /// Held so the kubelet can answer "who is at this address" from the one
+    /// place that knows — rather than pushing a copy into a metadata service
+    /// and keeping two records of one fact in step by hand.
+    vms: Option<Arc<crate::vm_manager::VmManager>>,
     /// stormvm's console router, held so `/vmConsole` can hand a request
     /// straight to it. Cloning shares its sessions and tokens — they live
     /// behind an `Arc` inside — so a clone per request is not a second
@@ -78,6 +84,12 @@ impl FromRef<AppState> for Arc<PodManager> {
     }
 }
 
+impl FromRef<AppState> for Option<Arc<crate::vm_manager::VmManager>> {
+    fn from_ref(state: &AppState) -> Option<Arc<crate::vm_manager::VmManager>> {
+        state.vms.clone()
+    }
+}
+
 impl FromRef<AppState> for Router {
     fn from_ref(state: &AppState) -> Router {
         state.console.clone()
@@ -88,6 +100,7 @@ impl FromRef<AppState> for Router {
 pub fn router(pod_manager: Arc<PodManager>) -> Router {
     router_with_console(
         pod_manager,
+        None,
         stormvm_console::router(stormvm_console::Config {
             run_dir: crate::vm_manager::RUN_ROOT.into(),
             ..Default::default()
@@ -97,7 +110,11 @@ pub fn router(pod_manager: Arc<PodManager>) -> Router {
 
 /// The router, over a given console. Tests build one against a run directory
 /// of their own; nothing else needs this.
-fn router_with_console(pod_manager: Arc<PodManager>, console: Router) -> Router {
+fn router_with_console(
+    pod_manager: Arc<PodManager>,
+    vms: Option<Arc<crate::vm_manager::VmManager>>,
+    console: Router,
+) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/livez", get(healthz))
@@ -112,18 +129,32 @@ fn router_with_console(pod_manager: Arc<PodManager>, console: Router) -> Router 
         // handler proxies to (rustkube#61), answered by stormvm's own router
         // mounted below (rustkube-node#43).
         .route("/vmConsole/{namespace}/{name}/{door}", get(vm_console))
+        // Who is at this address.
+        //
+        // The metadata service asks this; it does not keep a registry of its
+        // own. The kubelet already holds the VMI, the MAC it generated, the
+        // addresses the guest was given and the whole lifecycle, so a second
+        // copy anywhere else is a copy that can be wrong — and the ways it
+        // goes wrong all end with a guest being told something false about
+        // itself.
+        .route("/vmInstance/{address}", get(vm_instance))
         // Release the stormblock clone behind a claim, so a `Delete` reclaim
         // policy finishes (rustkube-node#46). Same shape as the VM console:
         // control plane → kubelet → a service the control plane cannot reach.
         // `DELETE` rather than a verb under some other path because it
         // destroys data, and should read that way in an audit log.
         .route("/volumes/{namespace}/{claim}", delete(release_volume))
-        .with_state(AppState { pods: pod_manager, console })
+        .with_state(AppState { pods: pod_manager, console, vms })
 }
 
 /// Serve the kubelet API over HTTPS on `0.0.0.0:<port>` with bearer-token auth
 /// on everything except the health endpoints. Runs until the process exits.
-pub async fn serve(port: u16, pod_manager: Arc<PodManager>, config: ServerConfig) {
+pub async fn serve(
+    port: u16,
+    pod_manager: Arc<PodManager>,
+    vms: Option<Arc<crate::vm_manager::VmManager>>,
+    config: ServerConfig,
+) {
     // rustls needs a process-wide crypto provider; installing is idempotent.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -136,7 +167,15 @@ pub async fn serve(port: u16, pod_manager: Arc<PodManager>, config: ServerConfig
         api_url: config.api_url.clone(),
         anonymous: config.anonymous,
     };
-    let app = router(pod_manager).layer(middleware::from_fn_with_state(auth, auth_mw));
+    let app = router_with_console(
+        pod_manager,
+        vms,
+        stormvm_console::router(stormvm_console::Config {
+            run_dir: crate::vm_manager::RUN_ROOT.into(),
+            ..Default::default()
+        }),
+    )
+    .layer(middleware::from_fn_with_state(auth, auth_mw));
 
     // Serving cert: use the provided pair, else self-sign.
     let (cert_pem, key_pem) = match (&config.tls_cert, &config.tls_key) {
@@ -259,6 +298,29 @@ async fn metrics(State(pm): State<Arc<PodManager>>) -> impl IntoResponse {
          kubelet_running_containers {containers}\n"
     );
     ([("content-type", "text/plain; version=0.0.4")], body)
+}
+
+/// `GET /vmInstance/{address}` — the instance metadata for whoever holds it.
+///
+/// 404 for an address this node is not running a machine for, which is the
+/// honest answer and the one a metadata service should pass on: a guest that
+/// is not here is not this node's to describe.
+async fn vm_instance(
+    State(vms): State<Option<Arc<crate::vm_manager::VmManager>>>,
+    Path(address): Path<String>,
+) -> Response {
+    let Some(vms) = vms else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "this node runs no machines"})))
+            .into_response();
+    };
+    match vms.instance_at(&address).await {
+        Some(v) => Json(v).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("no machine at {address} on this node")})),
+        )
+            .into_response(),
+    }
 }
 
 async fn pods(State(pm): State<Arc<PodManager>>) -> impl IntoResponse {
@@ -1094,6 +1156,7 @@ mod console_tests {
         let pm = Arc::new(PodManager::new(rt.clone(), rt, "test-node"));
         router_with_console(
             pm,
+            None,
             stormvm_console::router(stormvm_console::Config {
                 run_dir: run_dir.to_string(),
                 ..Default::default()

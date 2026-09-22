@@ -267,7 +267,8 @@ impl Kubelet {
                 api_url: self.config.api_server_url.clone(),
                 anonymous: self.config.anonymous_auth,
             };
-            tokio::spawn(async move { crate::server::serve(port, pm, server_config).await });
+            let vms = self.vms.clone();
+            tokio::spawn(async move { crate::server::serve(port, pm, vms, server_config).await });
         }
 
         // Spawn heartbeat task
