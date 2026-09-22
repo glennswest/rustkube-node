@@ -766,7 +766,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1163,7 +1163,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tokio",
  "tower-service",
  "tracing",
@@ -1447,6 +1447,7 @@ dependencies = [
  "chrono",
  "clap",
  "cni",
+ "futures",
  "hyper",
  "hyper-util",
  "libc",
@@ -1795,7 +1796,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2236,7 +2237,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2274,9 +2275,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2473,6 +2474,7 @@ dependencies = [
  "base64",
  "bytes",
  "futures-core",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",
@@ -2492,12 +2494,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower 0.5.3",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "webpki-roots 1.0.8",
 ]
@@ -2566,7 +2570,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2897,7 +2901,7 @@ source = "git+https://github.com/glennswest/stormcast?branch=main#172b79019eb1f6
 [[package]]
 name = "stormpump"
 version = "0.1.0"
-source = "git+https://github.com/glennswest/stormpump?branch=main#bcf451bbcdf8c54d609cb3597115d7669e12bc1b"
+source = "git+https://github.com/glennswest/stormpump?branch=main#e2f260a1c80ea0af6d261d1870a4e8fc19bd59ac"
 dependencies = [
  "libc",
  "stormcast",
@@ -2907,12 +2911,12 @@ dependencies = [
 [[package]]
 name = "stormpump-abi"
 version = "0.1.0"
-source = "git+https://github.com/glennswest/stormpump?branch=main#bcf451bbcdf8c54d609cb3597115d7669e12bc1b"
+source = "git+https://github.com/glennswest/stormpump?branch=main#e2f260a1c80ea0af6d261d1870a4e8fc19bd59ac"
 
 [[package]]
 name = "stormvm-block"
 version = "0.9.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#16791e0e9cbe0ad2ee66dc0800640c6f80bd95d0"
+source = "git+https://github.com/glennswest/stormvm?branch=main#af360e6f9771b325d163f633e2f203280bfd54be"
 dependencies = [
  "serde",
  "serde_json",
@@ -2923,7 +2927,7 @@ dependencies = [
 [[package]]
 name = "stormvm-cloudinit"
 version = "0.9.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#16791e0e9cbe0ad2ee66dc0800640c6f80bd95d0"
+source = "git+https://github.com/glennswest/stormvm?branch=main#af360e6f9771b325d163f633e2f203280bfd54be"
 dependencies = [
  "serde",
  "serde_json",
@@ -2934,7 +2938,7 @@ dependencies = [
 [[package]]
 name = "stormvm-console"
 version = "0.9.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#16791e0e9cbe0ad2ee66dc0800640c6f80bd95d0"
+source = "git+https://github.com/glennswest/stormvm?branch=main#af360e6f9771b325d163f633e2f203280bfd54be"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
@@ -2951,7 +2955,7 @@ dependencies = [
 [[package]]
 name = "stormvm-control"
 version = "0.9.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#16791e0e9cbe0ad2ee66dc0800640c6f80bd95d0"
+source = "git+https://github.com/glennswest/stormvm?branch=main#af360e6f9771b325d163f633e2f203280bfd54be"
 dependencies = [
  "serde",
  "serde_json",
@@ -2963,7 +2967,7 @@ dependencies = [
 [[package]]
 name = "stormvm-net"
 version = "0.9.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#16791e0e9cbe0ad2ee66dc0800640c6f80bd95d0"
+source = "git+https://github.com/glennswest/stormvm?branch=main#af360e6f9771b325d163f633e2f203280bfd54be"
 dependencies = [
  "libc",
  "stormvm-spec",
@@ -2974,7 +2978,7 @@ dependencies = [
 [[package]]
 name = "stormvm-node"
 version = "0.9.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#16791e0e9cbe0ad2ee66dc0800640c6f80bd95d0"
+source = "git+https://github.com/glennswest/stormvm?branch=main#af360e6f9771b325d163f633e2f203280bfd54be"
 dependencies = [
  "anyhow",
  "libc",
@@ -2994,7 +2998,7 @@ dependencies = [
 [[package]]
 name = "stormvm-ring"
 version = "0.9.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#16791e0e9cbe0ad2ee66dc0800640c6f80bd95d0"
+source = "git+https://github.com/glennswest/stormvm?branch=main#af360e6f9771b325d163f633e2f203280bfd54be"
 dependencies = [
  "stormpump",
  "stormpump-abi",
@@ -3004,7 +3008,7 @@ dependencies = [
 [[package]]
 name = "stormvm-spec"
 version = "0.9.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#16791e0e9cbe0ad2ee66dc0800640c6f80bd95d0"
+source = "git+https://github.com/glennswest/stormvm?branch=main#af360e6f9771b325d163f633e2f203280bfd54be"
 dependencies = [
  "serde",
  "serde_json",
@@ -3015,7 +3019,7 @@ dependencies = [
 [[package]]
 name = "stormvm-vmm"
 version = "0.9.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#16791e0e9cbe0ad2ee66dc0800640c6f80bd95d0"
+source = "git+https://github.com/glennswest/stormvm?branch=main#af360e6f9771b325d163f633e2f203280bfd54be"
 dependencies = [
  "serde",
  "stormvm-cloudinit",
@@ -3094,7 +3098,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3699,6 +3703,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc1b4cb0cc549fcf58d7dfc081778139b3d283a081644e833e84682ad71cea24"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
