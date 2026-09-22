@@ -1333,11 +1333,11 @@ pub async fn watch_for_node<F>(
         let list_url =
             format!("{base}/apis/kubevirt.io/v1/virtualmachineinstances?{selector}");
         let Ok(resp) = api.get(&list_url).send().await else {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             continue;
         };
         let Ok(v) = resp.json::<Value>().await else {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             continue;
         };
         have.clear();
@@ -1427,7 +1427,7 @@ pub async fn watch_for_node<F>(
         }
         // Fell out to re-list. A moment's pause so a persistently broken
         // apiserver is not hammered.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
 
