@@ -74,6 +74,14 @@ pub struct Vm {
     /// Filled in when it ends.
     pub exit_code: i32,
     pub message: String,
+    /// When the hypervisor was started, and when the guest first answered.
+    ///
+    /// The difference is the number people actually want — not "how long
+    /// since the object was created" but "how long until this machine was
+    /// usable". A VM that takes forty seconds to reach a login prompt and
+    /// one that takes four are different machines, and nothing recorded it.
+    pub started_unix: u64,
+    pub ready_unix: Option<u64>,
     /// The interfaces this machine was actually given.
     ///
     /// Resolved at start — name, MAC, and the binding that produced it — and
@@ -81,6 +89,13 @@ pub struct Vm {
     /// nothing else. A console could not show what network a guest was on,
     /// and neither could anyone debugging why it could not be reached.
     pub nics: Vec<NicReport>,
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// The addresses the guest holds, per interface, from the QEMU guest agent.
@@ -447,6 +462,8 @@ impl VmManager {
             disks,
             phase: Phase::Running,
             exit_code: 0,
+            started_unix: now_unix(),
+            ready_unix: None,
             nics: nic_reports,
             message: String::new(),
         };
@@ -478,8 +495,16 @@ impl VmManager {
             // hung agent must not hold the loop.
             if let Some(addrs) = guest_addresses(&vm).await {
                 let changed = vm.nics.iter().map(|n| &n.addresses).ne(addrs.iter());
-                if changed {
+                // The agent answering *is* the readiness signal: it runs in
+                // the guest, so a reply means the guest booted far enough to
+                // start it. Recorded once — the first answer is the boot, and
+                // every one after it is just the machine still running.
+                let first_answer = vm.ready_unix.is_none();
+                if changed || first_answer {
                     let mut with = vm.clone();
+                    if first_answer {
+                        with.ready_unix = Some(now_unix());
+                    }
                     for (n, a) in with.nics.iter_mut().zip(addrs.into_iter()) {
                         n.addresses = a;
                     }
@@ -805,6 +830,9 @@ impl VmManager {
             disks: Vec::new(),
             phase: Phase::Failed,
             exit_code: 0,
+            started_unix: now_unix(),
+            // It never became ready, and that is the point of recording it.
+            ready_unix: None,
             // A machine that never started has no interfaces to report, and
             // saying so is different from not knowing.
             nics: Vec::new(),
@@ -837,6 +865,15 @@ impl VmManager {
         // an address is routable at all — was never written down anywhere.
         //
         // Upstream's field, so a console that knows KubeVirt knows this.
+        if vm.started_unix > 0 {
+            status["storm.io/startedUnix"] = json!(vm.started_unix);
+        }
+        if let Some(r) = vm.ready_unix {
+            status["storm.io/readyUnix"] = json!(r);
+            // Precomputed, because every consumer would otherwise subtract
+            // two numbers and one of them would get it wrong.
+            status["storm.io/bootSeconds"] = json!(r.saturating_sub(vm.started_unix));
+        }
         if !vm.nics.is_empty() {
             status["interfaces"] = json!(vm
                 .nics
