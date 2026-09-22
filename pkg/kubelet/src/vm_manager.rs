@@ -185,6 +185,38 @@ fn binding_of(t: &stormvm_vmm::NicTransport) -> String {
     }
 }
 
+/// Why a machine did not start, and whether asking again would help.
+///
+/// The distinction the kubelet did not have: a spec that cannot work and a
+/// resource that has not arrived look identical at the call site and are not
+/// remotely the same thing. One is over; the other is a pod waiting for an
+/// image pull.
+#[derive(Debug)]
+pub enum StartFail {
+    /// Something is missing that is expected to arrive. The machine stays
+    /// Pending and the next sync tries again.
+    Waiting(String),
+    /// It will not work. The machine is Failed and nothing retries it.
+    Failed(String),
+}
+
+impl StartFail {
+    fn message(&self) -> &str {
+        match self {
+            StartFail::Waiting(m) | StartFail::Failed(m) => m,
+        }
+    }
+}
+
+impl From<String> for StartFail {
+    /// Everything that has not been classified is a failure, which is the
+    /// safe direction: a real fault retried for ever is a machine that never
+    /// reports what is wrong with it.
+    fn from(s: String) -> Self {
+        StartFail::Failed(s)
+    }
+}
+
 /// One interface, as the object should describe it.
 #[derive(Debug, Clone)]
 pub struct NicReport {
@@ -342,6 +374,17 @@ impl VmManager {
             if let Err(e) = self.start(uid, obj).await {
                 let ns = obj["metadata"]["namespace"].as_str().unwrap_or("default");
                 let name = obj["metadata"]["name"].as_str().unwrap_or("");
+                if let StartFail::Waiting(why) = &e {
+                    // Pending, and nothing is recorded in `vms` — which is
+                    // what lets the next sync try again. Recording it is what
+                    // made a missing golden permanent: sync saw the uid and
+                    // skipped it for ever.
+                    info!("{ns}/{name}: {why}");
+                    self.event(obj, "Normal", "Waiting", why).await;
+                    self.patch_pending(ns, name, why).await;
+                    continue;
+                }
+                let e = e.message().to_string();
                 warn!("{ns}/{name}: {e}");
                 // The reason, where somebody will look for it.
                 //
@@ -359,7 +402,7 @@ impl VmManager {
         self.vms.lock().await.values().cloned().collect()
     }
 
-    async fn start(&self, uid: &str, obj: &Value) -> Result<(), String> {
+    async fn start(&self, uid: &str, obj: &Value) -> Result<(), StartFail> {
         let vm: VmSpec = stormvm_spec::kube::from_kube(obj).map_err(|e| e.to_string())?;
         let ns = obj["metadata"]["namespace"].as_str().unwrap_or("default").to_string();
         let ring = self.ring.clone().ok_or_else(|| {
@@ -618,7 +661,7 @@ impl VmManager {
 
     /// Clone or attach every disk. Failure gives back what it already took —
     /// an attachment left behind is a device nobody will ever release.
-    async fn resolve_disks(&self, vm: &VmSpec) -> Result<(Vec<ResolvedDisk>, Vec<String>), String> {
+    async fn resolve_disks(&self, vm: &VmSpec) -> Result<(Vec<ResolvedDisk>, Vec<String>), StartFail> {
         let mut done: Vec<ResolvedDisk> = Vec::new();
         let mut owned: Vec<String> = Vec::new();
         for d in &vm.disks {
@@ -646,7 +689,28 @@ impl VmManager {
                         Ok(v) => v["id"].as_str().unwrap_or_default().to_string(),
                         Err(e) => {
                             self.release(&done).await;
-                            return Err(format!("cloning golden {g} for disk {}: {e}", d.name));
+                            // A golden that is not here *yet* is not a
+                            // failure.
+                            //
+                            // Goldening a cloud image is minutes of
+                            // downloading and sealing, and a machine asked
+                            // for before that finishes used to fail
+                            // permanently: the record went Failed, sync saw
+                            // it in `vms` and skipped it for ever, and the
+                            // only recovery was deleting the VM and creating
+                            // it again once the image had landed.
+                            //
+                            // A pod scheduled before its image is pulled
+                            // waits. So does this.
+                            if e.starts_with("404") {
+                                return Err(StartFail::Waiting(format!(
+                                    "waiting for golden {g}"
+                                )));
+                            }
+                            return Err(StartFail::Failed(format!(
+                                "cloning golden {g} for disk {}: {e}",
+                                d.name
+                            )));
                         }
                     }
                 }
@@ -911,6 +975,34 @@ impl VmManager {
         };
         self.vms.lock().await.insert(uid.to_string(), rec.clone());
         self.patch_status(&rec).await;
+    }
+
+    /// A machine that is waiting for something, said on the object.
+    ///
+    /// Pending rather than Failed, with the reason — so a console shows
+    /// "waiting for golden fedora-43" instead of a machine that looks broken
+    /// and a person who deletes it and tries again.
+    async fn patch_pending(&self, ns: &str, name: &str, why: &str) {
+        let url = format!(
+            "{}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{name}/status",
+            self.api_url
+        );
+        let body = json!({ "status": {
+            "phase": "Pending",
+            "reason": "Waiting",
+            "message": why,
+            "nodeName": self.node_name,
+        }});
+        if let Err(e) = self
+            .api
+            .patch(&url)
+            .header("content-type", "application/merge-patch+json")
+            .json(&body)
+            .send()
+            .await
+        {
+            warn!("could not report {ns}/{name} as pending: {e}");
+        }
     }
 
     /// Say what happened, in the object.
