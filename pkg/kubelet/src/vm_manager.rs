@@ -977,7 +977,10 @@ impl VmManager {
                 .and_then(Value::as_str)
                 .unwrap_or(&vm.name),
             "local_ipv4": local_ipv4,
-            "instance_type": format!("{}vcpu-{}", spec.cpu.cores, spec.memory.guest),
+            // The shape a guest reports, in the place a cloud puts it. Not a
+            // real instance type -- there is no catalogue of them here -- so
+            // it says what the machine is rather than inventing a name.
+            "instance_type": format!("{}vcpu-{}", spec.cpu.cores, spec.memory.size),
             "region": "storm",
             "zone": self.node_name,
             "tags": { "namespace": vm.namespace, "name": vm.name },
