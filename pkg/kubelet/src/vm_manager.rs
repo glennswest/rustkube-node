@@ -278,6 +278,25 @@ pub struct VmManager {
     /// different machines, and treating them as one is how the second finds
     /// the first's disks.
     vms: Mutex<HashMap<String, Vm>>,
+    /// The VMIs the apiserver last gave this node, by uid.
+    ///
+    /// **The object is the truth; this is a cache of it.** Metadata is
+    /// answered from here rather than from the local `Vm` record, because the
+    /// two can diverge and the local one has no claim to be right when they
+    /// do: it is derived from an object that may since have changed, on a
+    /// node that may since have stopped running the machine.
+    ///
+    /// Replaced wholesale on every sync rather than updated by events — a
+    /// cache rebuilt from the object is correct after any restart, move or
+    /// partition, where one maintained by events is correct only if every
+    /// event landed.
+    desired: Mutex<HashMap<String, Value>>,
+    /// Whether a sync has ever completed.
+    ///
+    /// A cold cache must say so. "I have not synced" and "no such machine"
+    /// are different answers and only one of them is safe to act on: a guest
+    /// told the second at boot configures itself as nobody.
+    synced: std::sync::atomic::AtomicBool,
 }
 
 impl VmManager {
@@ -300,6 +319,8 @@ impl VmManager {
             http: reqwest::Client::new(),
             events,
             vms: Mutex::new(HashMap::new()),
+            desired: Mutex::new(HashMap::new()),
+            synced: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -352,6 +373,12 @@ impl VmManager {
             }
             want.push((uid, obj.clone()));
         }
+        // The cache of record, replaced rather than merged.
+        {
+            let mut d = self.desired.lock().await;
+            *d = want.iter().map(|(u, o)| (u.clone(), o.clone())).collect();
+        }
+        self.synced.store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Stops before starts. A deleted VMI's replacement derives the same
         // tap name, and a tap exists while any process holds its descriptor —
@@ -973,12 +1000,22 @@ impl VmManager {
         if self.node_ip_holds(ip).await {
             return None;
         }
+        if !self.synced.load(std::sync::atomic::Ordering::Relaxed) {
+            // Cold. Saying "no such machine" here would have a guest
+            // configure itself as nobody on a kubelet that simply has not
+            // caught up yet; the caller turns this into "ask again".
+            return Some(json!({ "storm.io/cold": true }));
+        }
         let vms = self.vms.lock().await;
         // Several machines can share a pod, so this matches the *machine* by
         // its own address rather than resolving a pod and assuming one.
         let vm = vms.values().find(|v| {
             !v.phase.terminal() && v.nics.iter().any(|n| n.addresses.iter().any(|a| a == ip))
         })?;
+        // The object, which is the truth. The local record only said which
+        // machine holds this address; everything a guest is told about itself
+        // comes from what the apiserver says it should be.
+        let obj = self.desired.lock().await.get(&vm.uid).cloned();
         let interfaces: Vec<Value> = vm
             .nics
             .iter()
@@ -992,14 +1029,33 @@ impl VmManager {
                 })
             })
             .collect();
+        let ann = |k: &str| -> Option<String> {
+            obj.as_ref()?
+                .pointer(&format!("/metadata/annotations/{}", k.replace('/', "~1")))?
+                .as_str()
+                .map(str::to_string)
+        };
         Some(json!({
             "instance_id": vm.uid,
-            "hostname": vm.name,
+            // The name the object gives it, falling back to the machine's
+            // own — an annotation somebody set is a deliberate answer and
+            // beats one derived from the object's name.
+            "hostname": ann("storm.io/hostname").unwrap_or_else(|| vm.name.clone()),
             "local_ipv4": ip,
             "region": "storm",
             // The node, because that is the failure domain a guest is in.
             "zone": self.node_name,
             "tags": { "namespace": vm.namespace, "name": vm.name },
+            // Labels from the object, so a guest can see what it was
+            // deployed as. Only labels: annotations carry the SSH key and
+            // the bridge and are not a guest's business.
+            "labels": obj
+                .as_ref()
+                .and_then(|o| o.pointer("/metadata/labels").cloned())
+                .unwrap_or_else(|| json!({})),
+            // What the node gave it, which the object cannot know: the
+            // addresses came from a DHCP server the node does not run, and
+            // the MAC was generated here.
             "network": { "interfaces": interfaces },
             "launched_at": vm.started_unix,
         }))

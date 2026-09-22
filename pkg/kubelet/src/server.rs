@@ -314,6 +314,18 @@ async fn vm_instance(
             .into_response();
     };
     match vms.instance_at(&address).await {
+        // A cold cache is 503, not 404.
+        //
+        // "I have not synced" and "no such machine" are different answers and
+        // only one is safe to act on: a guest told the second at boot
+        // configures itself as nobody and does not ask again. 503 with
+        // Retry-After is what a client already knows to wait on.
+        Some(v) if v.get("storm.io/cold").is_some() => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("retry-after", "2")],
+            Json(serde_json::json!({"error": "this node has not synced yet"})),
+        )
+            .into_response(),
         Some(v) => Json(v).into_response(),
         None => (
             StatusCode::NOT_FOUND,
