@@ -1005,7 +1005,21 @@ fn system_hostname() -> Option<String> {
 /// Best effort throughout. A node whose services cannot be *seen* still works;
 /// failing the kubelet over a cosmetic write would trade a real capability for
 /// a convenience.
+/// What each node service looked like last time, so a change can be reported.
+///
+/// A crash-looping service produced nothing in Kubernetes: `stormlb` restarted
+/// eight times in four minutes and the console showed a pod that was simply
+/// not Running, with no event saying why or that anything had happened. Every
+/// other pod on the node has a lifecycle; these had a state that silently
+/// differed from the last time you looked.
+static LAST_SEEN: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (bool, u32)>>> =
+    std::sync::OnceLock::new();
+
 async fn mirror_node_services(client: &reqwest::Client, api_url: &str, node: &str) {
+    // Its own recorder: this runs on a timer of its own, not through the pod
+    // manager, and building one per pass is a struct with a cloned client.
+    let events = (!api_url.is_empty())
+        .then(|| crate::events::EventRecorder::new(client.clone(), api_url, node));
     const ASSET_STATUS: &str = "/run/stormpump/assets.json";
     let text = match std::fs::read_to_string(ASSET_STATUS) {
         Ok(t) => t,
@@ -1043,6 +1057,58 @@ async fn mirror_node_services(client: &reqwest::Client, api_url: &str, node: &st
     };
     if node_uid.is_empty() {
         return;
+    }
+
+    // What changed since the last pass, as events.
+    //
+    // The mirror sees every transition — it reads the same table every
+    // fifteen seconds — and reported none of them. A service that stopped, or
+    // started, or has been restarting for four minutes is exactly what an
+    // event is for, and rustkube-node#50 is this.
+    {
+        let seen = LAST_SEEN.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+        let mut changes: Vec<(String, &'static str, String)> = Vec::new();
+        {
+            let mut last = match seen.lock() {
+                Ok(l) => l,
+                Err(e) => e.into_inner(),
+            };
+            for a in &assets {
+                match last.get(&a.name).copied() {
+                    None => {
+                        // First sight is not an event: every service would
+                        // announce itself on every kubelet restart.
+                    }
+                    Some((was_running, was_restarts)) => {
+                        if a.restarts > was_restarts {
+                            changes.push((
+                                a.name.clone(),
+                                "BackOff",
+                                format!(
+                                    "restarted {} time(s); PID 1 has restarted it {} times",
+                                    a.restarts - was_restarts,
+                                    a.restarts
+                                ),
+                            ));
+                        } else if was_running && !a.running {
+                            changes.push((a.name.clone(), "Stopped", "the service is no longer running".into()));
+                        } else if !was_running && a.running {
+                            changes.push((a.name.clone(), "Started", "the service is running".into()));
+                        }
+                    }
+                }
+                last.insert(a.name.clone(), (a.running, a.restarts));
+            }
+        }
+        for (name, reason, message) in changes {
+            let etype = if reason == "Started" { "Normal" } else { "Warning" };
+            let pod = json!({
+                "metadata": { "name": format!("{name}-{node}"), "namespace": "kube-system", "uid": "" }
+            });
+            if let Some(r) = &events {
+                r.pod_event(&pod, etype, reason, &message).await;
+            }
+        }
     }
 
     let now = chrono::Utc::now();
