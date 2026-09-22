@@ -451,12 +451,28 @@ const KUBELET_OWNED_CONDITIONS: [&str; 4] =
 /// Falls back to naming the runtime when the file is absent, which is the
 /// honest answer for a kubelet running outside a stormcos image.
 fn os_image() -> String {
-    match std::fs::read_to_string("/etc/stormcos/release/version") {
-        Ok(v) if !v.trim().is_empty() => {
-            format!("StormCOS {} ({} {})", v.trim(), std::env::consts::OS, std::env::consts::ARCH)
+    // Both paths, because the kubelet runs in a domain of its own.
+    //
+    // The release volume is mounted on the *node* at /etc/stormcos/release.
+    // The kubelet does not see the node's filesystem at its own root -- it
+    // gets it at /hostroot, which is why every other node-level file it reads
+    // is reached that way. Reading only the first path found nothing and
+    // fell back to naming the runtime, which is indistinguishable from a
+    // kubelet running outside a stormcos image and was reported as such for
+    // a whole release.
+    for p in ["/etc/stormcos/release/version", "/hostroot/etc/stormcos/release/version"] {
+        if let Ok(v) = std::fs::read_to_string(p) {
+            if !v.trim().is_empty() {
+                return format!(
+                    "StormCOS {} ({} {})",
+                    v.trim(),
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                );
+            }
         }
-        _ => format!("rustkube ({} {})", std::env::consts::OS, std::env::consts::ARCH),
     }
+    format!("rustkube ({} {})", std::env::consts::OS, std::env::consts::ARCH)
 }
 
 
