@@ -289,3 +289,9 @@
   directory is a fact about the configuration, not an event: it is now said
   once. A directory that exists but cannot be read is the opposite — that is
   actionable, so it became a warning that keeps repeating.
+- **fix:** the event POST checked only for a transport error, so an apiserver
+  that accepted the connection and rejected the object — a 422 on a field it
+  did not like, a 403, a 404 on a namespace — recorded nothing and said
+  nothing. "No events at all" then looks identical to a kubelet that never
+  tried, which is the one explanation the logs could not distinguish it from.
+  A rejected event is now a warning naming the status and the body.

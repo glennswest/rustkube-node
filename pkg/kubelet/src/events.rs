@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::warn;
 
 /// How often a repeating event is written back.
 ///
@@ -149,8 +149,32 @@ impl EventRecorder {
         });
 
         let url = format!("{}/api/v1/namespaces/{namespace}/events", self.api_url);
-        if let Err(e) = self.client.post(&url).json(&event).send().await {
-            debug!("could not record event {reason} for {namespace}/{name}: {e}");
+        // The *status*, not just the transport.
+        //
+        // This checked only for a send error, so an apiserver that accepted
+        // the connection and rejected the object — a 422 on a field it did
+        // not like, a 403, a 404 on a namespace — recorded nothing and said
+        // nothing. "No events at all" then looks like a kubelet that never
+        // tried, which is the one explanation the logs could not distinguish
+        // it from. A rejected event is a bug in what is being sent, and it
+        // has to be visible to be fixed.
+        //
+        // `warn`, not `debug`: events are how a node explains itself, and a
+        // node that cannot explain itself has a problem worth a line at the
+        // level somebody reads.
+        match self.client.post(&url).json(&event).send().await {
+            Err(e) => {
+                warn!("could not record event {reason} for {namespace}/{name}: {e}");
+            }
+            Ok(r) if !r.status().is_success() => {
+                let code = r.status();
+                let body = r.text().await.unwrap_or_default();
+                warn!(
+                    "apiserver rejected event {reason} for {namespace}/{name}: {code} {}",
+                    body.trim()
+                );
+            }
+            Ok(_) => {}
         }
     }
 }
