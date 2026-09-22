@@ -403,7 +403,7 @@ impl NodeReporter {
                 "systemUUID": "",
                 "bootID": "",
                 "kernelVersion": "",
-                "osImage": format!("rustkube ({} {})", std::env::consts::OS, std::env::consts::ARCH),
+                "osImage": os_image(),
                 "containerRuntimeVersion": &self.runtime_version,
                 "kubeletVersion": format!("v1.32.0-rustkube+{}", apimachinery::VERSION),
                 "kubeProxyVersion": format!("v1.32.0-rustkube+{}", apimachinery::VERSION),
@@ -431,6 +431,35 @@ const KUBELET_OWNED_CONDITIONS: [&str; 4] =
 ///   * each owned condition's `lastTransitionTime` is carried forward from the
 ///     previous value when its `status` is unchanged, and only stamped `now` on
 ///     an actual flip — `lastHeartbeatTime` always advances.
+
+/// What operating system this node is running, for `nodeInfo.osImage`.
+///
+/// The release is on the node, in the manifest volume the image carries at
+/// `/etc/stormcos/release/version`, and until now nothing surfaced it: a node
+/// could not say which release it was running, and neither could anything
+/// asking it. Finding out meant querying the registry for which release a
+/// boothost synonym pointed at, which is the build's record of what was
+/// *published*, not the node's record of what it *booted* — those differ for
+/// exactly as long as a node has not rebooted, which is when the question
+/// matters most.
+///
+/// `nodeInfo` is where Kubernetes already answers this, so it is answered
+/// there rather than somewhere new: one query for a node tells you the
+/// release, the kernel and the kubelet together, and everything that can
+/// already read a node object gets it for free.
+///
+/// Falls back to naming the runtime when the file is absent, which is the
+/// honest answer for a kubelet running outside a stormcos image.
+fn os_image() -> String {
+    match std::fs::read_to_string("/etc/stormcos/release/version") {
+        Ok(v) if !v.trim().is_empty() => {
+            format!("StormCOS {} ({} {})", v.trim(), std::env::consts::OS, std::env::consts::ARCH)
+        }
+        _ => format!("rustkube ({} {})", std::env::consts::OS, std::env::consts::ARCH),
+    }
+}
+
+
 fn merge_owned_conditions(
     existing: &[Value],
     mem_pressure: bool,

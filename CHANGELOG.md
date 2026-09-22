@@ -337,3 +337,13 @@
   disconnect. The reconcile loop still runs on its interval, because a watch
   says what changed and reconciliation is what makes the node match it —
   including when nothing changed and something drifted.
+- **feat(kubelet):** `nodeInfo.osImage` names the StormCOS release the node
+  booted, read from the manifest volume the image carries at
+  `/etc/stormcos/release/version`. Nothing surfaced it before: a node could not
+  say which release it was running, and finding out meant asking the registry
+  which release a boothost synonym pointed at — the build's record of what was
+  *published*, not the node's record of what it *booted*, which differ for
+  exactly as long as a node has not rebooted. Answered in `nodeInfo` because
+  that is where Kubernetes already answers it, so one query returns the
+  release, the kernel and the kubelet together and every existing reader gets
+  it free. Falls back to naming the runtime outside a stormcos image.
