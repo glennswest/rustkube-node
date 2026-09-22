@@ -74,6 +74,39 @@ pub struct Vm {
     /// Filled in when it ends.
     pub exit_code: i32,
     pub message: String,
+    /// The interfaces this machine was actually given.
+    ///
+    /// Resolved at start — name, MAC, and the binding that produced it — and
+    /// then thrown away, so a running VM reported `phase` and `nodeName` and
+    /// nothing else. A console could not show what network a guest was on,
+    /// and neither could anyone debugging why it could not be reached.
+    pub nics: Vec<NicReport>,
+}
+
+/// How the address reaches the guest, in one word.
+///
+/// The difference that matters to somebody who cannot reach their VM:
+/// `bridge` puts the guest on a real network, `user` is a NAT inside the
+/// hypervisor process that nothing outside it can route to, and `passt` is
+/// the same shape in a userspace device. A VMI that reported only `Running`
+/// gave no way to tell those apart.
+fn binding_of(t: &stormvm_vmm::NicTransport) -> String {
+    match t {
+        stormvm_vmm::NicTransport::Tap(_) => "bridge".into(),
+        stormvm_vmm::NicTransport::User { .. } => "user".into(),
+        stormvm_vmm::NicTransport::Stream(_) => "passt".into(),
+    }
+}
+
+/// One interface, as the object should describe it.
+#[derive(Debug, Clone)]
+pub struct NicReport {
+    pub name: String,
+    pub mac: String,
+    /// `bridge`, `user`, `passt`, … — how the address reaches the guest,
+    /// which is the difference between a VM the cluster can route to and one
+    /// only its own hypervisor can see.
+    pub binding: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,7 +286,7 @@ impl VmManager {
         // NICs, before the plan: the tap has to exist so its descriptor can
         // be named, and it has to be deposited so the engine can find it by
         // that name.
-        let nics = match self.resolve_nics(&ns, &vm, &ring).await {
+        let (nics, nic_reports) = match self.resolve_nics(&ns, &vm, &ring).await {
             Ok(n) => n,
             Err(e) => {
                 self.release(&disks).await;
@@ -355,6 +388,7 @@ impl VmManager {
             disks,
             phase: Phase::Running,
             exit_code: 0,
+            nics: nic_reports,
             message: String::new(),
         };
         self.vms.lock().await.insert(uid.to_string(), rec.clone());
@@ -570,13 +604,14 @@ impl VmManager {
         namespace: &str,
         vm: &VmSpec,
         ring: &Arc<RingClient>,
-    ) -> Result<Vec<plan::ResolvedNic>, String> {
+    ) -> Result<(Vec<plan::ResolvedNic>, Vec<NicReport>), String> {
         let defaults = stormvm_net::Defaults { uplink_bridge: DEFAULT_BRIDGE.to_string() };
         // Pure: every decision that could be wrong is made here, with no
         // privilege and nothing created yet.
         let plans = stormvm_net::plan(namespace, &vm.name, &vm.interfaces, &defaults)?;
 
         let mut out = Vec::with_capacity(plans.len());
+        let mut reports = Vec::with_capacity(plans.len());
         for p in &plans {
             // No sandbox: a VM on the pod network wants a namespace this
             // kubelet does not pop here yet, and `realise` refuses that
@@ -597,15 +632,21 @@ impl VmManager {
                     .map_err(|e| format!("deposit task: {e}"))?
                     .map_err(|e| format!("interface {nic}: {e:?}"))?;
             }
+            let mac = made.address.as_ref().map(|a| a.mac.clone()).unwrap_or_else(|| p.mac.clone());
+            reports.push(NicReport {
+                name: p.nic.clone(),
+                mac: mac.clone(),
+                binding: binding_of(&made.transport),
+            });
             out.push(plan::ResolvedNic {
                 name: p.nic.clone(),
                 // Where a binding produced an address, the MAC is that
                 // address's; otherwise the derived one.
-                mac: made.address.as_ref().map(|a| a.mac.clone()).unwrap_or_else(|| p.mac.clone()),
+                mac,
                 transport: made.transport,
             });
         }
-        Ok(out)
+        Ok((out, reports))
     }
 
 
@@ -685,6 +726,9 @@ impl VmManager {
             disks: Vec::new(),
             phase: Phase::Failed,
             exit_code: 0,
+            // A machine that never started has no interfaces to report, and
+            // saying so is different from not knowing.
+            nics: Vec::new(),
             message: why.to_string(),
         };
         self.vms.lock().await.insert(uid.to_string(), rec.clone());
@@ -705,6 +749,30 @@ impl VmManager {
             "phase": vm.phase.as_str(),
             "nodeName": self.node_name,
         });
+        // What the machine was actually given.
+        //
+        // A running VMI reported `phase` and `nodeName` and nothing else, so
+        // a console had nothing to show and anyone asking "why can I not
+        // reach this guest" had nowhere to look. The MAC was generated at
+        // start and discarded; the binding — the thing that decides whether
+        // an address is routable at all — was never written down anywhere.
+        //
+        // Upstream's field, so a console that knows KubeVirt knows this.
+        if !vm.nics.is_empty() {
+            status["interfaces"] = json!(vm
+                .nics
+                .iter()
+                .map(|n| json!({
+                    "name": n.name,
+                    "mac": n.mac,
+                    // Not upstream's, and named so it cannot be mistaken for
+                    // one: `user` means the guest is behind a NAT inside the
+                    // hypervisor process, which is a very different thing
+                    // from an address the cluster routes to.
+                    "storm.io/binding": n.binding,
+                }))
+                .collect::<Vec<_>>());
+        }
         if !vm.message.is_empty() {
             status["reason"] = json!(if vm.phase == Phase::Failed { "Failed" } else { "Ended" });
             status["message"] = json!(vm.message);

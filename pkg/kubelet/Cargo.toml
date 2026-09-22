@@ -21,6 +21,11 @@ stormvm-node = { git = "https://github.com/glennswest/stormvm", branch = "main" 
 # standalone `stormvm start` path deliberately: the two must not derive
 # different names for one VM (rustkube-node#39).
 stormvm-net = { git = "https://github.com/glennswest/stormvm", branch = "main" }
+# For NicTransport, so a VMI can say *how* its address reaches the guest —
+# bridge, user or passt. Reported rather than inferred: the three are the
+# difference between a VM the cluster can route to and one only its own
+# hypervisor can see.
+stormvm-vmm = { git = "https://github.com/glennswest/stormvm", branch = "main" }
 stormvm-cloudinit = { git = "https://github.com/glennswest/stormvm", branch = "main" }
 apimachinery = { workspace = true }
 cni = { workspace = true }
