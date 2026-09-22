@@ -1266,7 +1266,25 @@ fn hypervisor_said(log_dir: &str) -> Option<String> {
 /// Best-effort, like the pod list: a cluster with no such CRD is the ordinary
 /// case on a node that runs no VMs, and it must not abort a sync.
 pub async fn list_for_node(api: &reqwest::Client, api_url: &str, node: &str) -> Vec<Value> {
-    let url = format!("{}/apis/kubevirt.io/v1/virtualmachineinstances", api_url.trim_end_matches('/'));
+    // Ask for this node's machines, not the cluster's.
+    //
+    // This listed **every VMI in the cluster** and filtered locally, every
+    // two seconds, on every node. On a small cluster that is invisible. At a
+    // thousand nodes running a thousand machines each it is a million objects
+    // fetched five hundred times a second, and the apiserver spends its life
+    // serializing a list that each caller throws away 99.9% of.
+    //
+    // The field selector is the same one upstream's kubelet uses, and the
+    // reason it does: a node's business is its own machines.
+    //
+    // Still a poll. A watch is the right answer and a larger change — it
+    // needs resourceVersion tracking and re-establishment on disconnect —
+    // but a filtered poll is correct now and is the difference between
+    // O(cluster) and O(node) per tick.
+    let url = format!(
+        "{}/apis/kubevirt.io/v1/virtualmachineinstances?fieldSelector=status.nodeName%3D{node}",
+        api_url.trim_end_matches('/')
+    );
     let Ok(resp) = api.get(&url).send().await else {
         return Vec::new();
     };
@@ -1276,6 +1294,12 @@ pub async fn list_for_node(api: &reqwest::Client, api_url: &str, node: &str) -> 
     let Ok(v) = resp.json::<Value>().await else {
         return Vec::new();
     };
+    // Filtered again locally, deliberately.
+    //
+    // An apiserver that does not implement this field selector answers with
+    // everything rather than an error, and silently running every machine in
+    // the cluster on one node is a worse failure than a slow list. The check
+    // is cheap and it is the one that decides.
     v["items"]
         .as_array()
         .map(|items| {

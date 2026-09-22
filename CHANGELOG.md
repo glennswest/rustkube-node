@@ -318,3 +318,12 @@
   Deregistration matters as much — an address is handed to the next guest, and
   a metadata service answering for the previous occupant of an IP is worse
   than one that does not answer.
+- **fix:** the kubelet asks for **its own** machines, not the cluster's. It
+  listed every VMI cluster-wide every two seconds and filtered locally — on a
+  small cluster invisible, at a thousand nodes running a thousand machines
+  each it is a million objects fetched five hundred times a second, with the
+  apiserver serializing a list each caller throws away 99.9% of. The field
+  selector is the one upstream's kubelet uses. The local filter stays: an
+  apiserver that does not implement the selector answers with everything
+  rather than an error, and silently running every machine in the cluster on
+  one node is a worse failure than a slow list.
