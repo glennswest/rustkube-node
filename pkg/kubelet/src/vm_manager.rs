@@ -919,6 +919,27 @@ impl VmManager {
         }
     }
 
+    /// Is this one of the node's own addresses?
+    ///
+    /// Read from the interfaces rather than compared against a configured
+    /// node IP: a node has several, and the one a host-network container
+    /// happens to source from is whichever the route chose.
+    async fn node_ip_holds(&self, ip: &str) -> bool {
+        let Ok(out) = tokio::process::Command::new("ip")
+            .args(["-o", "addr", "show"])
+            .output()
+            .await
+        else {
+            // Cannot tell, so do not guess. Refusing costs a guest its
+            // metadata; guessing gives it somebody else's.
+            return true;
+        };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.split_whitespace().nth(3))
+            .any(|cidr| cidr.split('/').next() == Some(ip))
+    }
+
     /// Who is at this address, as instance metadata.
     ///
     /// **The kubelet is the source of truth and this is how it is asked.**
@@ -938,7 +959,23 @@ impl VmManager {
     /// does not have is a machine that is not running here, which is exactly
     /// the answer a metadata service should give.
     pub async fn instance_at(&self, ip: &str) -> Option<Value> {
+        // An address the node itself holds identifies nobody.
+        //
+        // A container on the host network shares the node's address, and so
+        // does every other one — and so does the node. Source IP cannot tell
+        // them apart, so there is no "the instance at this address" to
+        // return, and answering with *a* machine would hand one workload
+        // another's identity, keys and userdata.
+        //
+        // Refusing is the only correct answer. A host-network workload that
+        // needs an identity needs a different mechanism than an address, and
+        // inventing one here quietly would be the worst version of that.
+        if self.node_ip_holds(ip).await {
+            return None;
+        }
         let vms = self.vms.lock().await;
+        // Several machines can share a pod, so this matches the *machine* by
+        // its own address rather than resolving a pod and assuming one.
         let vm = vms.values().find(|v| {
             !v.phase.terminal() && v.nics.iter().any(|n| n.addresses.iter().any(|a| a == ip))
         })?;
