@@ -1012,7 +1012,9 @@ fn system_hostname() -> Option<String> {
 /// not Running, with no event saying why or that anything had happened. Every
 /// other pod on the node has a lifecycle; these had a state that silently
 /// differed from the last time you looked.
-static LAST_SEEN: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (bool, u32)>>> =
+static LAST_SEEN: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, (bool, u32)>>,
+> =
     std::sync::OnceLock::new();
 
 async fn mirror_node_services(client: &reqwest::Client, api_url: &str, node: &str) {
@@ -1066,7 +1068,8 @@ async fn mirror_node_services(client: &reqwest::Client, api_url: &str, node: &st
     // started, or has been restarting for four minutes is exactly what an
     // event is for, and rustkube-node#50 is this.
     {
-        let seen = LAST_SEEN.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+        let seen =
+            LAST_SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
         let mut changes: Vec<(String, &'static str, String)> = Vec::new();
         {
             let mut last = match seen.lock() {
@@ -1102,7 +1105,7 @@ async fn mirror_node_services(client: &reqwest::Client, api_url: &str, node: &st
         }
         for (name, reason, message) in changes {
             let etype = if reason == "Started" { "Normal" } else { "Warning" };
-            let pod = json!({
+            let pod = serde_json::json!({
                 "metadata": { "name": format!("{name}-{node}"), "namespace": "kube-system", "uid": "" }
             });
             if let Some(r) = &events {
