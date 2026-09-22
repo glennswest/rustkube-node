@@ -424,7 +424,7 @@ impl VmManager {
         let dir = format!("{LOG_ROOT}/{ns}_{}_{uid}/{}", vm.name, vm.name);
         if let Err(e) = std::fs::create_dir_all(&dir) {
             self.release(&disks).await;
-            return Err(format!("could not make {dir}: {e}"));
+            return Err(StartFail::Failed(format!("could not make {dir}: {e}")));
         }
         // NICs, before the plan: the tap has to exist so its descriptor can
         // be named, and it has to be deposited so the engine can find it by
@@ -433,7 +433,7 @@ impl VmManager {
             Ok(n) => n,
             Err(e) => {
                 self.release(&disks).await;
-                return Err(e);
+                return Err(StartFail::Failed(e));
             }
         };
 
@@ -470,7 +470,7 @@ impl VmManager {
             Err(e) => {
                 deregister(&vm.namespace, &vm.name);
                 self.release(&disks).await;
-                return Err(format!("{e:#}"));
+                return Err(StartFail::Failed(format!("{e:#}")));
             }
         };
 
@@ -487,7 +487,7 @@ impl VmManager {
         if let Err(e) = std::fs::create_dir_all(&built.run_dir) {
             deregister(&vm.namespace, &vm.name);
             self.release(&disks).await;
-            return Err(format!("could not make {}: {e}", built.run_dir));
+            return Err(StartFail::Failed(format!("could not make {}: {e}", built.run_dir)));
         }
 
         // The ring is blocking and owns its own thread; the async side reaches
@@ -515,7 +515,7 @@ impl VmManager {
             Err(e) => {
                 deregister(&vm.namespace, &vm.name);
                 self.release(&disks).await;
-                return Err(format!("stormpump refused: {e:?}"));
+                return Err(StartFail::Failed(format!("stormpump refused: {e:?}")));
             }
         };
 
@@ -726,7 +726,7 @@ impl VmManager {
                     Ok(id) => id,
                     Err(e) => {
                         self.release(&done).await;
-                        return Err(format!("disk {}: {e}", d.name));
+                        return Err(StartFail::Failed(format!("disk {}: {e}", d.name)));
                     }
                 },
             };
@@ -745,16 +745,16 @@ impl VmManager {
                 Ok(v) => v,
                 Err(e) => {
                     self.release(&done).await;
-                    return Err(format!("attaching {volume_id} for disk {}: {e}", d.name));
+                    return Err(StartFail::Failed(format!("attaching {volume_id} for disk {}: {e}", d.name)));
                 }
             };
             let Some(device) = info["device_hint"].as_str() else {
                 self.release(&done).await;
-                return Err(format!(
+                return Err(StartFail::Failed(format!(
                     "disk {} did not attach locally: {info} — an NVMe-oF attach needs a connect \
                      this node does not do yet",
                     d.name
-                ));
+                )));
             };
             // Whose disk is this?
             //
