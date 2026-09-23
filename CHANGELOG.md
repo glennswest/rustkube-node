@@ -27,6 +27,12 @@
   pinned here that the binder has moved to Released with policy Delete has its
   clone deleted (refused while a pod here still has it) and then the PV. They
   sat Released for ever before (rustkube#71). System volumes are Retain.
+- **fix(storage):** a claim's block device is mounted by the engine at
+  registration (`/run/stormpump/pvc/<dev>`) and bound into the container, the
+  same path an image pull takes. Registering the device node itself as a
+  directory to bind failed every claim with `ENOTDIR (attaching mounts)`.
+- **fix(storage):** blanks minted on demand ask stormblock for `role: data`, so
+  claims live in the half no install formats.
 
 ### 2026-09-20
 - **feat(build):** `scripts/build-golden.sh` — what this repository ships is a

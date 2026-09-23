@@ -110,9 +110,10 @@ struct Container {
     /// `<that>/<restart>.log` and nowhere else.
     log_dir: String,
     /// The host paths for this container's mounts, in the order the spec
-    /// declares their destinations. Registered as volumes at spawn and paired
-    /// with those destinations by position.
-    mount_sources: Vec<String>,
+    /// declares their destinations, with the filesystem when the source is a
+    /// block device (a PersistentVolumeClaim). Registered as volumes at spawn
+    /// and paired with those destinations by position.
+    mount_sources: Vec<(String, Option<String>)>,
     /// Where the image's filesystem is mounted on this node.
     ///
     /// Registered with the engine at start rather than at create: a volume
@@ -409,10 +410,12 @@ fn spec_for(config: &ContainerConfig, sandbox: &PodSandboxConfig) -> stormpump::
             .map(|m| stormpump::spec::Mount {
                 dst: m.container_path.clone(),
                 readonly: m.readonly,
-                // A PersistentVolumeClaim resolves to a block device, and the
-                // container's own child mounts it — which is why a real volume
-                // needs no mount propagation and no host-side mount at all.
-                fstype: m.fstype.clone(),
+                // Always a bind. A PersistentVolumeClaim resolves to a block
+                // device, and the *engine* mounts it at registration (see the
+                // spawn below) — the same path an image pull takes. Registering
+                // the device node itself as a directory to bind failed every
+                // claim with `ENOTDIR (attaching mounts)`.
+                fstype: None,
             })
             .collect(),
         // hostNetwork is the node's namespace; anything else is the pod's,
@@ -708,7 +711,7 @@ impl RuntimeService for StormpumpRuntime {
                 .mounts
                 .iter()
                 .take(MAX_MOUNTS)
-                .map(|m| m.host_path.clone())
+                .map(|m| (m.host_path.clone(), m.fstype.clone()))
                 .collect(),
             log_dir: format!(
                 "{}/{}",
@@ -797,8 +800,19 @@ impl RuntimeService for StormpumpRuntime {
                 let logs = r.volume_register(&log_dir)?;
                 // One per mount point, in the spec's order.
                 let mut mounts = Vec::with_capacity(mount_sources.len());
-                for src in &mount_sources {
-                    mounts.push(r.volume_register(src)?);
+                for (src, fstype) in &mount_sources {
+                    match fstype {
+                        // A block device: PID 1 mounts it on the node, and the
+                        // container binds that directory. Idempotent, so two
+                        // pods sharing a ReadWriteOnce claim on this node get
+                        // the one mount.
+                        Some(fs) => {
+                            let dev = src.rsplit('/').next().unwrap_or(src);
+                            let host = format!("{PVC_ROOT}/{dev}");
+                            mounts.push(r.volume_register_device(&host, src, fs)?);
+                        }
+                        None => mounts.push(r.volume_register(src)?),
+                    }
                 }
                 // The mount *sources* by name, not only their count. A start
                 // that fails at the mount step is otherwise a step with no
@@ -807,7 +821,7 @@ impl RuntimeService for StormpumpRuntime {
                 // log cannot see them.
                 tracing::debug!(
                     ?spec, ?root, ?logs, ?sandbox, path = %path, logs_dir = %log_dir,
-                    mounts = %mount_sources.join(","),
+                    mounts = %mount_sources.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join(","),
                     "stormpump: spawning"
                 );
                 // **Name the mount, here.** The engine reports which one
@@ -821,7 +835,7 @@ impl RuntimeService for StormpumpRuntime {
                         let named = match &e {
                             RingError::Failed { step, .. } => {
                                 crate::stormpump_ring::failed_mount_index(*step)
-                                    .and_then(|i| mount_sources.get(i).map(|s| (i, s.clone())))
+                                    .and_then(|i| mount_sources.get(i).map(|s| (i, s.0.clone())))
                             }
                             _ => None,
                         };
@@ -1062,6 +1076,8 @@ fn resolve_in_image(root: &std::path::Path, argv0: &str) -> Option<String> {
 /// Where a pulled image is mounted. Under `/run` because it does not survive a
 /// reboot: the clone does, and is found again by name.
 const IMAGE_ROOT: &str = "/run/stormpump/images";
+/// Where the engine mounts a claim's block device for its pods to bind.
+const PVC_ROOT: &str = "/run/stormpump/pvc";
 
 impl StormpumpImages {
     pub fn new(registry: impl Into<String>) -> StormpumpImages {

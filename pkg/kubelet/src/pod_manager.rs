@@ -1212,7 +1212,10 @@ impl PodManager {
     /// keeps that from coming back from this side.
     async fn mint_template(&self, blank: &str, class: &str) -> Result<String, ClaimError> {
         info!("no blank {blank} on this node — minting it (one mkfs, ever, for class {class})");
-        let body = serde_json::json!({ "name": blank, "size": class, "fs": "ext4" });
+        // `role: data`: the blank, and so every claim cloned from it, lives in
+        // the half no install formats — a claim shares its blank's unwritten
+        // extents, and the system half is replaced by every install.
+        let body = serde_json::json!({ "name": blank, "size": class, "fs": "ext4", "role": "data" });
         // stormblock formats and seals it, and answers `{"template": {...}}`.
         // A racing pod on the same node mints the same class and gets 409, so
         // the answer is looked up either way: that is both the id and the
