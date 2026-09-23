@@ -202,7 +202,7 @@ pub fn volume_name(namespace: &str, claim: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimSource {
     /// Another claim: its namespace when `dataSourceRef` names one (the
-    /// cross-namespace form, e.g. cloning `storm-system/fastetcd-data`), and
+    /// cross-namespace form, e.g. cloning `kube-system/fastetcd-data`), and
     /// its name.
     Claim(Option<String>, String),
     /// A golden, by name (`apiGroup: storm.io, kind: Golden`).
@@ -337,8 +337,8 @@ mod tests {
         // Across namespaces, the way a service's data is cloned.
         assert_eq!(
             claim_source(&json!({"spec": {"dataSourceRef":
-                {"kind": "PersistentVolumeClaim", "name": "fastetcd-data", "namespace": "storm-system"}}})),
-            Some(ClaimSource::Claim(Some("storm-system".into()), "fastetcd-data".into()))
+                {"kind": "PersistentVolumeClaim", "name": "fastetcd-data", "namespace": "kube-system"}}})),
+            Some(ClaimSource::Claim(Some("kube-system".into()), "fastetcd-data".into()))
         );
         assert_eq!(
             claim_source(&pvc(json!({"apiGroup": "storm.io", "kind": "Golden", "name": "fedora"}))),

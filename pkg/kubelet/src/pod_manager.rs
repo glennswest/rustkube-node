@@ -1174,7 +1174,7 @@ impl PodManager {
     ///
     /// - `PersistentVolumeClaim` (same namespace): the volume behind that
     ///   claim's bound PV, which is how the system's own data containers in
-    ///   `storm-system` are cloned too. A claim not bound yet falls back to the
+    ///   `kube-system` are cloned too. A claim not bound yet falls back to the
     ///   name this node would have given it.
     /// - `Golden` in `storm.io`: a golden by name, `<name>.golden` first.
     ///
