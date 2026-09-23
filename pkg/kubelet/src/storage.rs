@@ -49,18 +49,43 @@ use serde_json::Value;
 /// rather than an inventory of what was baked in. An image that carries the
 /// common classes saves the first claim one `mkfs`; one that carries none
 /// still works.
+///
+/// **Up to a terabyte.** The ladder stopped at 1 GiB, so a database asking for
+/// 20Gi was refused and an ordinary application could not get a volume at all.
+/// A blank is sparse and stormblock's mkfs does not write out inode tables, so
+/// a large class costs its metadata and nothing else until a claim writes.
+/// The steps are x4: a claim never gets more than four times what it asked for.
 pub const SIZE_CLASSES: &[(&str, u64)] = &[
-    ("1M", 1024 * 1024),
-    ("16M", 16 * 1024 * 1024),
-    ("64M", 64 * 1024 * 1024),
-    ("256M", 256 * 1024 * 1024),
-    ("1G", 1024 * 1024 * 1024),
+    ("1M", MIB),
+    ("16M", 16 * MIB),
+    ("64M", 64 * MIB),
+    ("256M", 256 * MIB),
+    ("1G", 1024 * MIB),
+    ("4G", 4 * 1024 * MIB),
+    ("16G", 16 * 1024 * MIB),
+    ("64G", 64 * 1024 * MIB),
+    ("256G", 256 * 1024 * MIB),
+    ("1T", 1024 * 1024 * MIB),
 ];
 
+const MIB: u64 = 1024 * 1024;
+
 /// The template name for a size class — the key a claim looks up and, on a
-/// miss, mints.
+/// miss, mints: `pvc-ext4j-<MiB>m`.
+///
+/// **The image's name, and sbregistry's.** The image ships its blanks as
+/// `pvc-ext4j-1m` … `pvc-ext4j-1024m` (stormcos `deploy/image.toml`), named by
+/// sbregistry's rule (`stormblock-registry/src/goldenbuild.rs`), and stormblock
+/// adopts them as fstemplates under those names. This looked for `pvc-1M`, so
+/// every claim missed the shipped blank, failed to mint its own, and fell back
+/// to a scratch directory that does not survive the pod.
 pub fn template_name(class: &str) -> String {
-    format!("pvc-{class}")
+    let bytes = SIZE_CLASSES
+        .iter()
+        .find(|(c, _)| *c == class)
+        .map(|(_, b)| *b)
+        .unwrap_or(MIB);
+    format!("pvc-ext4j-{}m", bytes / MIB)
 }
 
 /// The smallest class that holds `want` bytes.
@@ -173,6 +198,39 @@ pub fn volume_name(namespace: &str, claim: &str) -> String {
     format!("pvc-{namespace}-{claim}")
 }
 
+/// What a claim is cloned from, when it names a source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimSource {
+    /// Another claim: its namespace when `dataSourceRef` names one (the
+    /// cross-namespace form, e.g. cloning `storm-system/fastetcd-data`), and
+    /// its name.
+    Claim(Option<String>, String),
+    /// A golden, by name (`apiGroup: storm.io, kind: Golden`).
+    Golden(String),
+}
+
+/// The source a claim asks to be cloned from, if any.
+///
+/// `dataSourceRef` wins over `dataSource`, as upstream defines it. A source
+/// this node cannot clone (a VolumeSnapshot, some other API group) is `None`,
+/// so the claim gets a blank rather than a failure; snapshots are
+/// stormblock#111.
+pub fn claim_source(pvc: &Value) -> Option<ClaimSource> {
+    let r = if pvc["spec"]["dataSourceRef"].is_object() {
+        &pvc["spec"]["dataSourceRef"]
+    } else {
+        &pvc["spec"]["dataSource"]
+    };
+    let name = r["name"].as_str().filter(|n| !n.is_empty())?.to_string();
+    let group = r["apiGroup"].as_str().unwrap_or("");
+    let ns = r["namespace"].as_str().filter(|n| !n.is_empty()).map(String::from);
+    match (group, r["kind"].as_str()?) {
+        ("", "PersistentVolumeClaim") => Some(ClaimSource::Claim(ns, name)),
+        ("storm.io", "Golden") => Some(ClaimSource::Golden(name)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,15 +257,18 @@ mod tests {
         // called it `pvc-1M`, and neither side could see the other's name —
         // so both sides going through this one function is the fix, and this
         // asserts the shape the minting body sends as `size`.
-        for (class, _) in SIZE_CLASSES {
-            assert_eq!(template_name(class), format!("pvc-{class}"));
+        for (class, bytes) in SIZE_CLASSES {
+            assert_eq!(template_name(class), format!("pvc-ext4j-{}m", bytes / MIB));
         }
+        // The names the image ships, exactly.
+        assert_eq!(template_name("1M"), "pvc-ext4j-1m");
+        assert_eq!(template_name("1G"), "pvc-ext4j-1024m");
         // The class string is also what stormblock parses as a size, so it
         // has to stay in the form its `resolve_size` reads.
         assert_eq!(class_for(1024 * 1024).unwrap().0, "1M");
         assert_eq!(class_for(100 * 1024 * 1024).unwrap().0, "256M");
         // A claim above the ladder is refused rather than rounded down.
-        assert!(class_for(2 * 1024 * 1024 * 1024).is_none());
+        assert!(class_for(2 * 1024 * 1024 * MIB).is_none());
     }
 
     #[test]
@@ -246,8 +307,15 @@ mod tests {
 
     #[test]
     fn a_claim_larger_than_the_largest_class_is_refused() {
-        assert_eq!(class_for(100 * 1024 * 1024 * 1024), None);
-        assert_eq!(class_for(2 * 1024 * 1024 * 1024), None, "no blank ships for 2 GiB yet");
+        assert_eq!(class_for(1024 * 1024 * MIB + 1), None);
+    }
+
+    #[test]
+    fn an_ordinary_application_gets_a_volume() {
+        // A database asking for 20Gi was refused when the ladder stopped at 1G.
+        assert_eq!(class_for(parse_quantity("20Gi").unwrap()).map(|c| c.0), Some("64G"));
+        assert_eq!(class_for(parse_quantity("2Gi").unwrap()).map(|c| c.0), Some("4G"));
+        assert_eq!(class_for(parse_quantity("500Gi").unwrap()).map(|c| c.0), Some("1T"));
     }
 
     #[test]
@@ -260,10 +328,43 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_names_what_it_is_cloned_from() {
+        let pvc = |ds: Value| json!({"spec": {"dataSource": ds}});
+        assert_eq!(
+            claim_source(&pvc(json!({"kind": "PersistentVolumeClaim", "name": "db"}))),
+            Some(ClaimSource::Claim(None, "db".into()))
+        );
+        // Across namespaces, the way a service's data is cloned.
+        assert_eq!(
+            claim_source(&json!({"spec": {"dataSourceRef":
+                {"kind": "PersistentVolumeClaim", "name": "fastetcd-data", "namespace": "storm-system"}}})),
+            Some(ClaimSource::Claim(Some("storm-system".into()), "fastetcd-data".into()))
+        );
+        assert_eq!(
+            claim_source(&pvc(json!({"apiGroup": "storm.io", "kind": "Golden", "name": "fedora"}))),
+            Some(ClaimSource::Golden("fedora".into()))
+        );
+        // Not ours to clone: a blank instead.
+        assert_eq!(
+            claim_source(&pvc(json!({"apiGroup": "snapshot.storage.k8s.io", "kind": "VolumeSnapshot", "name": "s"}))),
+            None
+        );
+        assert_eq!(claim_source(&json!({"spec": {}})), None);
+        // dataSourceRef wins.
+        assert_eq!(
+            claim_source(&json!({"spec": {
+                "dataSource": {"kind": "PersistentVolumeClaim", "name": "a"},
+                "dataSourceRef": {"kind": "PersistentVolumeClaim", "name": "b"},
+            }})),
+            Some(ClaimSource::Claim(None, "b".into()))
+        );
+    }
+
+    #[test]
     fn a_volume_name_survives_the_pod_it_was_made_for() {
         // Keyed on the claim, not the pod: a recreated pod has a new UID and
         // must find the same data, which is what makes the claim persistent.
         assert_eq!(volume_name("app-one", "data"), "pvc-app-one-data");
-        assert_eq!(template_name("256M"), "pvc-256M");
+        assert_eq!(template_name("256M"), "pvc-ext4j-256m");
     }
 }

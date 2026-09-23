@@ -8,6 +8,7 @@ pub mod dns;
 pub mod events;
 pub mod mirror;
 pub mod storage;
+pub mod system_claims;
 pub mod stormpump_ring;
 pub mod stormpump_runtime;
 pub mod checkpoint;

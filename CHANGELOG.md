@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### 2026-09-23 (PVCs)
+- **fix(storage):** claims find the blanks the image ships. The kubelet looked
+  for `pvc-1M`; the image and sbregistry name them `pvc-ext4j-<MiB>m`. Minting
+  read a field stormblock does not return. So every claim fell back to a
+  scratch directory that does not survive the pod. Templates are now found,
+  minted and cloned through `/api/v1/fstemplates`, whose clone gives each
+  claim its own filesystem UUID.
+- **feat(storage):** the size ladder runs to 1 TiB in x4 steps (1M … 1T). It
+  stopped at 1 GiB, so an ordinary application asking for 20Gi was refused.
+- **feat(storage):** a claim with `dataSource`/`dataSourceRef` is a CoW clone
+  of it: another claim (across namespaces with `dataSourceRef.namespace`), or
+  a golden (`apiGroup: storm.io, kind: Golden`). Cloning data volumes is the
+  built-in storage class.
+- **fix(storage):** the PV a node publishes is named `pvc-<ns>-<claim>`, the
+  contract with the control plane, not `pvc-pvc-<ns>-<claim>`, which gave
+  every claim two PVs. It carries node affinity.
+- **feat(storage):** a claim bound to a stormblock PV mounts that PV's volume.
+- **feat(storage):** the node's own data containers (`*-data`, `*-state`) are
+  listed as bound PVCs in `storm-system`, with PVs `storm-<volume>` (reclaim
+  Retain) and their golden as `dataSourceRef` (#49). They can be cloned; a pod
+  mounting one directly is refused, because the service has it mounted.
+
 ### 2026-09-20
 - **feat(build):** `scripts/build-golden.sh` — what this repository ships is a
   golden, not a package. It builds the static musl binaries, asks the forge for

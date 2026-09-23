@@ -310,6 +310,21 @@ impl Kubelet {
             });
         }
 
+        // List the node's own data containers as PVCs (rustkube-node#49): the
+        // same slow cadence as the services mirror, for the same reason.
+        {
+            let url = self.config.api_server_url.clone();
+            let node = self.config.node_name.clone();
+            let client = self.api_client.clone();
+            tokio::spawn(async move {
+                let mut interval = time::interval(Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    crate::system_claims::mirror(&client, &url, "http://127.0.0.1:9090", &node).await;
+                }
+            });
+        }
+
         // Follow this node's machines rather than asking every tick.
         //
         // The reconcile loop still runs on its interval — a watch says what

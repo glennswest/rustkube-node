@@ -385,7 +385,12 @@ impl PodManager {
     /// failing a running workload because a status write did not land would
     /// be the reporting path breaking the thing it reports on.
     async fn bind_claim(&self, namespace: &str, claim: &str, volume: &str, bytes: u64) {
-        let pv_name = format!("pvc-{}", volume);
+        // **The PV is named after the volume**, which is the contract with the
+        // control plane's provisioner (rustkube `stormblock.rs`): both derive
+        // `pvc-<ns>-<claim>`. This wrote `pvc-` + that, so every claim got two
+        // PVs, one from each side, and the claim was repointed away from the
+        // one the binder had matched.
+        let pv_name = volume.to_string();
         let capacity = serde_json::json!({ "storage": format!("{bytes}") });
         let pv = serde_json::json!({
             "apiVersion": "v1",
@@ -418,6 +423,15 @@ impl PodManager {
                     "driver": "stormblock.storm.io",
                     "volumeHandle": volume,
                 },
+                // A clone lives on the node that made it; the scheduler must
+                // bring a pod here to use it.
+                "nodeAffinity": { "required": { "nodeSelectorTerms": [{
+                    "matchExpressions": [{
+                        "key": "kubernetes.io/hostname",
+                        "operator": "In",
+                        "values": [self.node_name],
+                    }],
+                }]}},
             },
             "status": { "phase": "Bound" },
         });
@@ -982,17 +996,43 @@ impl PodManager {
         // restarted pod is reunited with its data rather than given a fresh
         // volume — which is the whole difference between a claim and a scratch
         // directory.
-        let existing = self.storage_volume_id(&name).await;
+        // The node's own data containers are listed as claims, and they are
+        // mounted by the services that own them. A second mount of the same
+        // ext4 from a pod would corrupt it, so they are cloned, never mounted:
+        // a claim with `dataSource: {kind: PersistentVolumeClaim, name: <it>}`
+        // in this namespace gets a copy-on-write copy.
+        if namespace == crate::system_claims::NAMESPACE {
+            return Err(ClaimError::InUse(format!(
+                "{namespace}/{claim} is a node service's live data volume; mount a clone of it \
+                 (a claim with dataSource naming it) rather than the volume itself"
+            )));
+        }
+
+        // A claim already bound to a stormblock PV mounts *that* volume. The
+        // node's own data containers are claims like this (system_claims.rs),
+        // and so is any volume an administrator publishes by hand: deriving a
+        // name here instead would clone a new, empty volume beside the real one.
+        let bound = self.bound_volume(&pvc).await;
+        let existing = match bound {
+            Some(id) => Some(id),
+            None => self.storage_volume_id(&name).await,
+        };
         let vol_id = match existing {
             Some(id) => id,
+            // **A claim with a source is a clone of it.** Cloning data volumes
+            // is what a claim *is* on this platform; a blank is only the case
+            // where the source is an empty filesystem.
+            None if crate::storage::claim_source(&pvc).is_some() => {
+                self.clone_claim_source(namespace, &pvc, &name).await?
+            }
             None => {
                 // Clone the blank for this class. `clone` is the one door:
                 // it descends from a sealed volume, records lineage, and
                 // stamps the clone with its own filesystem UUID — two live
                 // filesystems must never claim one identity (stormblock#76).
                 let blank = crate::storage::template_name(class);
-                let (src, sealed) = match self.storage_volume(&blank).await {
-                    Some(found) => found,
+                let template = match self.storage_template(&blank).await {
+                    Some(id) => id,
                     // Mint it, rather than refusing the claim (#45).
                     //
                     // The alternative — which this replaces — capped the class
@@ -1009,25 +1049,17 @@ impl PodManager {
                     None => self.mint_template(&blank, class).await?,
                 };
 
-                // A clone descends from a *sealed* volume, and the blanks
-                // arrive sealed as golden images — which is a different thing
-                // from stormblock's seal state. Sealing here is idempotent and
-                // self-healing; it belongs in the image build, and doing it
-                // here means a node with an older image still works.
-                if !sealed {
-                    info!("sealing blank {blank} so claims can be cloned from it");
-                    self.storage_post(&format!("/api/v1/volumes/{src}/seal"), &serde_json::json!({}))
-                        .await
-                        .ok_or_else(|| ClaimError::Failed(format!("could not seal blank {blank}")))?;
-                }
+                // Through the template, not the volume: `fstemplates/{id}/clone`
+                // gives the clone its own filesystem UUID and verifies it, so
+                // two claims never present one identity (stormblock#76).
                 let body = serde_json::json!({ "name": name, "verify": true });
                 let created: Value = self
-                    .storage_post(&format!("/api/v1/volumes/{src}/clone"), &body)
+                    .storage_post(&format!("/api/v1/fstemplates/{template}/clone"), &body)
                     .await
                     .ok_or_else(|| ClaimError::Failed(format!("stormblock would not clone {blank} to {name}")))?;
-                created["id"]
+                created["volume_id"]
                     .as_str()
-                    .ok_or_else(|| ClaimError::Failed(format!("clone of {blank} returned no id: {created}")))?
+                    .ok_or_else(|| ClaimError::Failed(format!("clone of {blank} returned no volume: {created}")))?
                     .to_string()
             }
         };
@@ -1117,25 +1149,101 @@ impl PodManager {
     /// while the image called it `pvc-1M`, and neither side could see the
     /// other's name. Minting through the same function the lookup uses is what
     /// keeps that from coming back from this side.
-    async fn mint_template(&self, blank: &str, class: &str) -> Result<(String, bool), ClaimError> {
+    async fn mint_template(&self, blank: &str, class: &str) -> Result<String, ClaimError> {
         info!("no blank {blank} on this node — minting it (one mkfs, ever, for class {class})");
         let body = serde_json::json!({ "name": blank, "size": class, "fs": "ext4" });
-        let made: Value = self
-            .storage_post("/api/v1/fstemplates", &body)
-            .await
-            .ok_or_else(|| {
-                ClaimError::Failed(format!("stormblock would not mint the blank {blank}"))
-            })?;
-        // A racing pod on the same node mints the same class; whoever lost
-        // still needs the id, and looking it up is both the answer and the
-        // check that it is really there.
-        if let Some(found) = self.storage_volume(blank).await {
-            return Ok(found);
+        // stormblock formats and seals it, and answers `{"template": {...}}`.
+        // A racing pod on the same node mints the same class and gets 409, so
+        // the answer is looked up either way: that is both the id and the
+        // check that the template is really there.
+        let made = self.storage_post("/api/v1/fstemplates", &body).await;
+        if let Some(id) = self.storage_template(blank).await {
+            return Ok(id);
         }
-        let id = made["id"]
+        Err(ClaimError::Failed(format!(
+            "stormblock would not mint the blank {blank}: {}",
+            made.map(|m| m.to_string()).unwrap_or_else(|| "no answer".into())
+        )))
+    }
+
+    /// Clone what a claim's `dataSource` names into the claim's own volume.
+    ///
+    /// - `PersistentVolumeClaim` (same namespace): the volume behind that
+    ///   claim's bound PV, which is how the system's own data containers in
+    ///   `storm-system` are cloned too. A claim not bound yet falls back to the
+    ///   name this node would have given it.
+    /// - `Golden` in `storm.io`: a golden by name, `<name>.golden` first.
+    ///
+    /// Through `volumes/snapshots`, which takes a live source — a claim that is
+    /// mounted and being written is not sealed, and the clone route refuses
+    /// anything that is not. The copy is copy-on-write and gets its own
+    /// filesystem UUID.
+    async fn clone_claim_source(
+        &self,
+        namespace: &str,
+        pvc: &Value,
+        name: &str,
+    ) -> Result<String, ClaimError> {
+        let source = crate::storage::claim_source(pvc).expect("checked by the caller");
+        let candidates: Vec<String> = match &source {
+            crate::storage::ClaimSource::Claim(src_ns, src) => {
+                let src_ns = src_ns.as_deref().unwrap_or(namespace);
+                let mut c = Vec::new();
+                let path = format!("/api/v1/namespaces/{src_ns}/persistentvolumeclaims/{src}");
+                if let Some(src_pvc) = self.api_get(&path).await {
+                    if let Some(pv) = src_pvc["spec"]["volumeName"].as_str().filter(|v| !v.is_empty()) {
+                        if let Some(pv) = self.api_get(&format!("/api/v1/persistentvolumes/{pv}")).await {
+                            if let Some(h) = pv["spec"]["csi"]["volumeHandle"].as_str() {
+                                c.push(h.to_string());
+                            }
+                        }
+                    }
+                }
+                c.push(crate::storage::volume_name(src_ns, src));
+                c
+            }
+            crate::storage::ClaimSource::Golden(g) => vec![format!("{g}.golden"), g.clone()],
+        };
+        let mut src_id = None;
+        for cand in &candidates {
+            if let Some(id) = self.storage_volume_id(cand).await {
+                src_id = Some((cand.clone(), id));
+                break;
+            }
+        }
+        let Some((src_name, src_id)) = src_id else {
+            return Err(ClaimError::Failed(format!(
+                "the claim's source {source:?} has no volume on this node (looked for {})",
+                candidates.join(", ")
+            )));
+        };
+        let body = serde_json::json!({ "name": name, "source_volume_id": src_id });
+        let made: Value = self
+            .storage_post("/api/v1/volumes/snapshots", &body)
+            .await
+            .ok_or_else(|| ClaimError::Failed(format!("stormblock would not clone {src_name} to {name}")))?;
+        info!("claim {namespace}/{name}: cloned from {src_name}");
+        made["id"]
             .as_str()
-            .ok_or_else(|| ClaimError::Failed(format!("minting {blank} returned no id: {made}")))?;
-        Ok((id.to_string(), made["sealed"].as_bool().unwrap_or(false)))
+            .map(String::from)
+            .ok_or_else(|| ClaimError::Failed(format!("clone of {src_name} returned no id: {made}")))
+    }
+
+    /// The stormblock volume behind a claim's bound PV, when it is ours.
+    async fn bound_volume(&self, pvc: &Value) -> Option<String> {
+        let pv_name = pvc["spec"]["volumeName"].as_str().filter(|v| !v.is_empty())?;
+        let pv = self.api_get(&format!("/api/v1/persistentvolumes/{pv_name}")).await?;
+        if pv["spec"]["csi"]["driver"].as_str() != Some("stormblock.storm.io") {
+            return None;
+        }
+        let handle = pv["spec"]["csi"]["volumeHandle"].as_str()?;
+        self.storage_volume_id(handle).await
+    }
+
+    /// A filesystem template's id, by name.
+    async fn storage_template(&self, name: &str) -> Option<String> {
+        let t: Value = self.storage_get(&format!("/api/v1/fstemplates/{name}")).await?;
+        t["id"].as_str().map(String::from)
     }
 
     /// DELETE on stormblock's management API on this node.
