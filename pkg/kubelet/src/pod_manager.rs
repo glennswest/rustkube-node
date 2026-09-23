@@ -704,21 +704,37 @@ impl PodManager {
                     Err(ClaimError::InUse(why)) => {
                         return Err(CriError::VolumeNotReady(why));
                     }
+                    // **Never scratch for a claim.** This fell back to a
+                    // per-pod directory and started the pod — a database on a
+                    // claim ran happily and lost everything at its next
+                    // restart, with a warning in a log nobody reads as the
+                    // only trace. A claim that cannot be provisioned yet is a
+                    // pod that waits, retried on every sync, with the reason
+                    // in `describe`.
                     Err(ClaimError::Failed(e)) => {
-                        warn!(
-                            "PVC {namespace}/{claim}: {e} — falling back to a scratch \
-                             directory, THIS DATA WILL NOT PERSIST"
-                        );
-                        let dir = pod_volume_dir(&self.state_root, uid, "pvc-failed", &name);
-                        let _ = std::fs::create_dir_all(&dir);
-                        dir
+                        return Err(CriError::VolumeNotReady(format!(
+                            "PVC {namespace}/{claim}: {e}"
+                        )));
                     }
                 }
-            } else {
-                // emptyDir (and other unhandled types): per-pod scratch dir.
+            } else if vol.get("emptyDir").is_some() {
+                // What emptyDir means: per-pod scratch.
                 let dir = pod_volume_dir(&self.state_root, uid, "empty-dir", &name);
                 let _ = std::fs::create_dir_all(&dir);
                 dir
+            } else {
+                // Any other volume type — inline csi, ephemeral, nfs, iscsi —
+                // is one this node cannot provide yet. Turning it into an empty
+                // directory gave the pod a volume that looked right and held
+                // nothing; waiting says what is missing.
+                let kind = vol
+                    .as_object()
+                    .and_then(|o| o.keys().find(|k| k.as_str() != "name").cloned())
+                    .unwrap_or_else(|| "unknown".into());
+                return Err(CriError::VolumeNotReady(format!(
+                    "volume {name} is of type {kind}, which this node does not provide \
+                     (external CSI drivers: see stormcos issue)"
+                )));
             };
             // **Check it is there, and say which one is not.**
             //
