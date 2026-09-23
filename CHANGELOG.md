@@ -20,7 +20,7 @@
   every claim two PVs. It carries node affinity.
 - **feat(storage):** a claim bound to a stormblock PV mounts that PV's volume.
 - **feat(storage):** the node's own data containers (`*-data`, `*-state`) are
-  listed as bound PVCs in `storm-system`, with PVs `storm-<volume>` (reclaim
+  listed as bound PVCs in `kube-system`, beside the services' own pods, with PVs `storm-<volume>` (reclaim
   Retain) and their golden as `dataSourceRef` (#49). They can be cloned; a pod
   mounting one directly is refused, because the service has it mounted.
 

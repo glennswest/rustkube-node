@@ -10,7 +10,9 @@
 //!
 //! This mirrors them, the way `mirror_node_services` mirrors the services:
 //!
-//! - namespace `storm-system`
+//! - namespace `kube-system`, beside the service's own pod: the node's services
+//!   are mirrored there (`mirror.rs`), and a service's data belongs with it —
+//!   `kube-system/fastetcd-data` next to `kube-system/fastetcd-<node>`
 //! - a `PersistentVolume` named `storm-<volume>`, class `stormblock`, the
 //!   stormblock volume as its CSI handle, pinned to this node, reclaim
 //!   **Retain**: deleting the object must never delete a service's data.
@@ -29,11 +31,12 @@
 use serde_json::{json, Value};
 use tracing::{debug, info};
 
-/// Where the node's own claims live.
-pub const NAMESPACE: &str = "storm-system";
+/// Where the node's own claims live: with the node's services.
+pub const NAMESPACE: &str = "kube-system";
 
-/// Marks the objects this mirror owns.
-const LABEL: &str = "storm.io/system-volume";
+/// Marks the objects this mirror owns — and marks a volume a node service has
+/// mounted, which a pod may clone but must not mount.
+pub const LABEL: &str = "storm.io/system-volume";
 
 /// Is this stormblock volume one of the node's data containers?
 ///

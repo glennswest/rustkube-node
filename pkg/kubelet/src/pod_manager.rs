@@ -1001,11 +1001,15 @@ impl PodManager {
         // ext4 from a pod would corrupt it, so they are cloned, never mounted:
         // a claim with `dataSource: {kind: PersistentVolumeClaim, name: <it>}`
         // in this namespace gets a copy-on-write copy.
-        if namespace == crate::system_claims::NAMESPACE {
-            return Err(ClaimError::InUse(format!(
-                "{namespace}/{claim} is a node service's live data volume; mount a clone of it \
-                 (a claim with dataSource naming it) rather than the volume itself"
-            )));
+        if let Some(pv) = pvc["spec"]["volumeName"].as_str().filter(|v| !v.is_empty()) {
+            if let Some(pv) = self.api_get(&format!("/api/v1/persistentvolumes/{pv}")).await {
+                if pv["metadata"]["labels"][crate::system_claims::LABEL].as_str() == Some("true") {
+                    return Err(ClaimError::InUse(format!(
+                        "{namespace}/{claim} is a node service's live data volume; mount a clone \
+                         of it (a claim with dataSource naming it) rather than the volume itself"
+                    )));
+                }
+            }
         }
 
         // A claim already bound to a stormblock PV mounts *that* volume. The
