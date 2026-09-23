@@ -33,6 +33,9 @@
   directory to bind failed every claim with `ENOTDIR (attaching mounts)`.
 - **fix(storage):** blanks minted on demand ask stormblock for `role: data`, so
   claims live in the half no install formats.
+- **fix(storage):** cloning a claim flushes first (`sync(2)`). The clone is a
+  block snapshot, and a file written a moment before was still in the page
+  cache and missing from the clone; verified on the R230.
 
 ### 2026-09-20
 - **feat(build):** `scripts/build-golden.sh` — what this repository ships is a

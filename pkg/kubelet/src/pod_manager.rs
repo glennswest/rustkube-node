@@ -1281,6 +1281,20 @@ impl PodManager {
                 candidates.join(", ")
             )));
         };
+        // **Flush first.** The snapshot is block-level, and a claim being
+        // written has its newest data in the page cache of whichever mount
+        // holds it — here, or a service's mount in PID 1's namespace. Tested:
+        // a file written a moment before the clone was missing from it, and
+        // present in a clone taken after writeback. `sync(2)` writes back every
+        // filesystem's dirty data and journal, whichever namespace mounted it,
+        // so the clone holds what the writer had written. (Consistency a
+        // running application needs — a freeze — is the snapshot work,
+        // stormvm#28.)
+        let _ = tokio::task::spawn_blocking(|| {
+            // SAFETY: sync(2) takes no arguments and cannot fail.
+            unsafe { libc::sync() }
+        })
+        .await;
         let body = serde_json::json!({ "name": name, "source_volume_id": src_id });
         let made: Value = self
             .storage_post("/api/v1/volumes/snapshots", &body)
