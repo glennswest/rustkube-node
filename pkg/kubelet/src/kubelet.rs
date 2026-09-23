@@ -325,6 +325,18 @@ impl Kubelet {
             });
         }
 
+        // Reclaim this node's released claims (reclaimPolicy: Delete).
+        {
+            let pm = self.pod_manager.clone();
+            tokio::spawn(async move {
+                let mut interval = time::interval(Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    pm.reclaim_released().await;
+                }
+            });
+        }
+
         // Follow this node's machines rather than asking every tick.
         //
         // The reconcile loop still runs on its interval — a watch says what

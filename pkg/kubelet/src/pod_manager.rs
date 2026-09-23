@@ -822,6 +822,63 @@ impl PodManager {
             .map(|st| st.name.clone())
     }
 
+    /// Honour `reclaimPolicy: Delete` for the volumes this node holds.
+    ///
+    /// **The node reclaims its own.** A stormblock clone can only be deleted by
+    /// the node that holds it — stormblock's API is loopback — so this pass
+    /// finds this node's stormblock PVs that the binder has moved to
+    /// `Released` with policy `Delete`, releases the clone through
+    /// [`Self::release_claim_volume`] (which refuses while a pod here still has
+    /// it), and then deletes the PV. The control plane's provisioner used to
+    /// leave them `Released` with a warning for ever (rustkube#71).
+    ///
+    /// Never a system volume: those are Retain, and carry the system label.
+    pub async fn reclaim_released(&self) {
+        let Some(pvs) = self.api_get("/api/v1/persistentvolumes").await else { return };
+        for pv in pvs["items"].as_array().cloned().unwrap_or_default() {
+            if pv["spec"]["csi"]["driver"].as_str() != Some("stormblock.storm.io")
+                || pv["status"]["phase"].as_str() != Some("Released")
+                || pv["spec"]["persistentVolumeReclaimPolicy"].as_str() != Some("Delete")
+                || pv["metadata"]["labels"][crate::system_claims::LABEL].as_str() == Some("true")
+            {
+                continue;
+            }
+            let here = pv["metadata"]["annotations"]["storm.io/node"].as_str() == Some(&self.node_name)
+                || pv["spec"]["nodeAffinity"]["required"]["nodeSelectorTerms"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|t| t["matchExpressions"].as_array().cloned().unwrap_or_default())
+                    .any(|e| {
+                        e["values"].as_array().is_some_and(|v| v.iter().any(|n| n.as_str() == Some(&self.node_name)))
+                    });
+            if !here {
+                continue;
+            }
+            let (Some(ns), Some(claim), Some(pv_name)) = (
+                pv["spec"]["claimRef"]["namespace"].as_str(),
+                pv["spec"]["claimRef"]["name"].as_str(),
+                pv["metadata"]["name"].as_str(),
+            ) else {
+                continue;
+            };
+            match self.release_claim_volume(ns, claim).await {
+                Ok(VolumeRelease::Released) | Ok(VolumeRelease::Absent) => {
+                    let url = format!("{}/api/v1/persistentvolumes/{pv_name}", self.api_url);
+                    match self.api_client.delete(url).send().await {
+                        Ok(r) if r.status().is_success() || r.status().as_u16() == 404 => {
+                            info!("reclaimed {pv_name}: the volume for {ns}/{claim} is deleted")
+                        }
+                        Ok(r) => debug!("PV {pv_name} not deleted: {}", r.status()),
+                        Err(e) => debug!("PV {pv_name} not deleted: {e}"),
+                    }
+                }
+                Ok(other) => debug!("PV {pv_name} not reclaimed yet: {other:?}"),
+                Err(e) => debug!("PV {pv_name} not reclaimed: {e}"),
+            }
+        }
+    }
+
     /// Delete the stormblock clone behind a claim, so a `Delete` reclaim
     /// policy finishes instead of leaking (rustkube-node#46).
     ///

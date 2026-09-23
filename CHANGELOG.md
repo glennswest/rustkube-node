@@ -23,6 +23,10 @@
   listed as bound PVCs in `kube-system`, beside the services' own pods, with PVs `storm-<volume>` (reclaim
   Retain) and their golden as `dataSourceRef` (#49). They can be cloned; a pod
   mounting one directly is refused, because the service has it mounted.
+- **feat(storage):** the node reclaims its own released claims. A stormblock PV
+  pinned here that the binder has moved to Released with policy Delete has its
+  clone deleted (refused while a pod here still has it) and then the PV. They
+  sat Released for ever before (rustkube#71). System volumes are Retain.
 
 ### 2026-09-20
 - **feat(build):** `scripts/build-golden.sh` — what this repository ships is a
