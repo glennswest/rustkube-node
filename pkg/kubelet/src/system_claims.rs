@@ -53,6 +53,18 @@ pub fn is_data_container(v: &Value) -> bool {
         && (name.ends_with("-data") || name.ends_with("-state"))
 }
 
+/// Bytes as a Kubernetes quantity: `1Gi` rather than `1073741824`.
+pub fn quantity(bytes: u64) -> String {
+    const UNITS: [(&str, u64); 4] =
+        [("Ti", 1 << 40), ("Gi", 1 << 30), ("Mi", 1 << 20), ("Ki", 1 << 10)];
+    for (u, n) in UNITS {
+        if bytes >= n && bytes % n == 0 {
+            return format!("{}{u}", bytes / n);
+        }
+    }
+    bytes.to_string()
+}
+
 /// The PV name for a data container.
 pub fn pv_name(volume: &str) -> String {
     format!("storm-{volume}")
@@ -62,7 +74,7 @@ pub fn pv_name(volume: &str) -> String {
 pub fn objects(v: &Value, node: &str, golden: Option<&str>) -> (Value, Value) {
     let name = v["name"].as_str().unwrap_or("");
     let bytes = v["virtual_size_bytes"].as_u64().unwrap_or(0);
-    let capacity = json!({ "storage": format!("{bytes}") });
+    let capacity = json!({ "storage": quantity(bytes) });
     let labels = json!({ LABEL: "true" });
     let pv = json!({
         "apiVersion": "v1",
@@ -170,7 +182,21 @@ pub async fn mirror(client: &reqwest::Client, api_url: &str, storage_url: &str, 
         if !matches!(client.get(&pvc_path).send().await, Ok(r) if r.status().is_success()) {
             let url = format!("{api_url}/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims");
             match client.post(url).json(&pvc).send().await {
-                Ok(r) if r.status().is_success() => info!("listed data container {name} as PVC {NAMESPACE}/{name}"),
+                Ok(r) if r.status().is_success() => {
+                    info!("listed data container {name} as PVC {NAMESPACE}/{name}");
+                    // Bound from the first moment it is visible: a claim with
+                    // no status reads as Unknown until the binder's next pass,
+                    // and a console shows every service's data as unhealthy
+                    // for that window.
+                    if let Ok(mut made) = r.json::<Value>().await {
+                        made["status"] = json!({
+                            "phase": "Bound",
+                            "accessModes": ["ReadWriteOnce"],
+                            "capacity": pvc["spec"]["resources"]["requests"].clone(),
+                        });
+                        let _ = client.put(&pvc_path).json(&made).send().await;
+                    }
+                }
                 Ok(r) => debug!("PVC {NAMESPACE}/{name} not created: {}", r.status()),
                 Err(e) => debug!("PVC {NAMESPACE}/{name} not created: {e}"),
             }
@@ -211,6 +237,14 @@ mod tests {
         assert_eq!(pvc["spec"]["volumeName"], "storm-fastetcd-data");
         assert_eq!(pvc["spec"]["storageClassName"], "stormblock");
         assert_eq!(pvc["spec"]["dataSourceRef"]["kind"], "Golden");
-        assert_eq!(pvc["spec"]["resources"]["requests"]["storage"], "1073741824");
+        assert_eq!(pvc["spec"]["resources"]["requests"]["storage"], "1Gi");
+    }
+
+    #[test]
+    fn sizes_read_as_quantities() {
+        assert_eq!(quantity(1 << 30), "1Gi");
+        assert_eq!(quantity(64 << 20), "64Mi");
+        assert_eq!(quantity(3 << 40), "3Ti");
+        assert_eq!(quantity(1000), "1000");
     }
 }
