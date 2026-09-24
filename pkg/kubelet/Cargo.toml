@@ -37,6 +37,12 @@ apimachinery = { workspace = true }
 cni = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
+# google.protobuf.Timestamp and the wrappers, which csi.proto uses.
+prost-types = { workspace = true }
+# The names upstream derives by hashing: a VolumeAttachment is
+# `csi-<sha256(handle+driver+node)>` and a staging directory is
+# `<sha256(handle)>`. The attacher computes the first too, so both sides must agree.
+sha2 = "0.10"
 tower = { version = "0.5" }
 hyper-util = { version = "0.1" }
 # The console doors themselves — serial and VNC — mounted in this server

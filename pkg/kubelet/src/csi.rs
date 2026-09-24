@@ -1,853 +1,456 @@
-//! CSI (Container Storage Interface) client for volume management.
+//! The CSI node client: how the kubelet talks to another driver's node plugin.
 //!
-//! Provides trait-based abstractions for CSI Identity, Node, and Controller
-//! services. The kubelet primarily uses the Node service for staging and
-//! publishing volumes to pods.
+//! **This was a stub** that logged each call and created the directories, and
+//! it never spoke to a driver. A claim of another StorageClass therefore could
+//! not mount, and the module read as though it could (#52). It is now the real
+//! thing: gRPC over the driver's Unix socket, speaking the vendored CSI v1.9
+//! protocol (`proto/csi/csi.proto`).
 //!
-//! # Architecture
+//! Only the Identity and Node services are here. The Controller service
+//! (CreateVolume, ControllerPublish) is not the kubelet's to call. A driver's
+//! external-provisioner and external-attacher sidecars call it, prompted by
+//! the PVC and by the `VolumeAttachment` that rustkube's attach/detach
+//! controller writes.
 //!
-//! CSI drivers expose three gRPC services:
+//! # The node side of a volume
 //!
-//! - **Identity**: Plugin metadata and health checks
-//! - **Node**: Volume staging and publishing (kubelet side)
-//! - **Controller**: Volume creation, deletion, and attachment (control plane side)
+//! 1. **NodeStageVolume**, once per volume per node, when the driver advertises
+//!    `STAGE_UNSTAGE_VOLUME`: the driver mounts the device at a global staging
+//!    path, `<root>/plugins/kubernetes.io/csi/<driver>/<sha256(handle)>/globalmount`.
+//! 2. **NodePublishVolume**, once per pod: the driver makes the volume appear at
+//!    `<root>/pods/<uid>/volumes/kubernetes.io~csi/<volume>/mount`.
+//! 3. NodeUnpublishVolume when the pod goes, and NodeUnstageVolume when the
+//!    last pod on the node lets go.
 //!
-//! # Volume Lifecycle
-//!
-//! When a pod needs a volume:
-//!
-//! 1. **CreateVolume** (Controller) — Provision storage on backend
-//! 2. **ControllerPublishVolume** (Controller) — Attach volume to node
-//! 3. **NodeStageVolume** (Node) — Mount volume to global staging directory
-//! 4. **NodePublishVolume** (Node) — Bind mount to pod directory
-//!
-//! Teardown is the reverse:
-//!
-//! 1. **NodeUnpublishVolume** (Node) — Unmount from pod directory
-//! 2. **NodeUnstageVolume** (Node) — Unmount from global staging directory
-//! 3. **ControllerUnpublishVolume** (Controller) — Detach from node
-//! 4. **DeleteVolume** (Controller) — Delete storage
-//!
-//! # Example Usage
-//!
-//! ```no_run
-//! use kubelet::csi::{UnixCsiClient, setup_volume, teardown_volume};
-//! use std::path::PathBuf;
-//!
-//! # async fn example() -> anyhow::Result<()> {
-//! // Connect to CSI driver socket
-//! let client = UnixCsiClient::new(
-//!     PathBuf::from("/var/lib/kubelet/plugins/csi-driver/csi.sock"),
-//!     "driver.example.com".to_string(),
-//!     "node-1".to_string(),
-//! );
-//!
-//! // Setup volume for pod
-//! setup_volume(
-//!     &client,
-//!     "vol-12345",
-//!     "/var/lib/kubelet/plugins/kubernetes.io/csi/vol-12345/globalmount",
-//!     "/var/lib/kubelet/pods/abc-123/volumes/csi/vol-12345",
-//!     "ext4",
-//!     false,
-//! )
-//! .await?;
-//!
-//! // Pod uses volume...
-//!
-//! // Teardown when pod terminates
-//! teardown_volume(
-//!     &client,
-//!     "vol-12345",
-//!     "/var/lib/kubelet/plugins/kubernetes.io/csi/vol-12345/globalmount",
-//!     "/var/lib/kubelet/pods/abc-123/volumes/csi/vol-12345",
-//! )
-//! .await?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! # Current Implementation
-//!
-//! This module provides trait-based abstractions and a **stub implementation**
-//! (`UnixCsiClient`) that logs operations but does not communicate with real
-//! CSI drivers. A production implementation would:
-//!
-//! - Use tonic/gRPC to communicate over the Unix domain socket
-//! - Parse CSI protobuf messages (from csi.proto)
-//! - Handle CSI error codes and retries
-//! - Implement actual mount/unmount operations
-//!
-//! The stub is sufficient for testing and development of the kubelet's volume
-//! management logic.
-//!
-//! # References
-//!
-//! - CSI specification: https://github.com/container-storage-interface/spec
-//! - Kubernetes CSI documentation: https://kubernetes-csi.github.io/docs/
+//! Where the driver's mounts land (its namespace or the node's) is the part
+//! that decides whether this works at all. See `docs/csi.md`.
 
-use anyhow::{Context, Result};
-use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use anyhow::{anyhow, Context, Result};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::PathBuf;
-use tracing::{info, warn};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tonic::transport::{Channel, Endpoint, Uri};
 
-// ============================================================================
-// Identity Service
-// ============================================================================
+/// The generated CSI v1 messages and services.
+pub mod proto {
+    tonic::include_proto!("csi.v1");
+}
 
-/// CSI plugin metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CsiPluginInfo {
+use proto::identity_client::IdentityClient;
+use proto::node_client::NodeClient;
+use proto::node_service_capability::rpc::Type as NodeRpc;
+use proto::volume_capability::access_mode::Mode;
+
+/// How long one call to a driver may take.
+///
+/// NodeStage of a network volume can legitimately take a while: a connect
+/// and a filesystem check. A call that never returns would stall the pod
+/// sync loop that made it. Two minutes matches upstream's `csiTimeout`.
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A gRPC channel over a Unix socket.
+///
+/// Lazy, so a driver that is restarting is an error on the call that needs it,
+/// not at construction. tonic wants a URI, and the connector ignores it.
+pub fn unix_channel(path: &Path, timeout: Duration) -> Channel {
+    let path = path.to_path_buf();
+    Endpoint::from_static("http://[::1]:50051")
+        .timeout(timeout)
+        .connect_timeout(Duration::from_secs(5))
+        .connect_with_connector_lazy(tower::service_fn(move |_: Uri| {
+            let path = path.clone();
+            async move {
+                let stream = tokio::net::UnixStream::connect(path).await?;
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+            }
+        }))
+}
+
+/// What a driver says about itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginInfo {
     pub name: String,
     pub vendor_version: String,
-    pub manifest: HashMap<String, String>,
 }
 
-/// CSI plugin capability.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum CsiCapability {
-    ControllerService,
-    VolumeAccessibilityConstraints,
-    OnlineExpansion,
-    OfflineExpansion,
-}
-
-/// CSI Identity service — plugin metadata and health.
-#[async_trait]
-pub trait CsiIdentity: Send + Sync {
-    /// Get plugin name and version.
-    async fn get_plugin_info(&self) -> Result<CsiPluginInfo>;
-
-    /// Get plugin capabilities.
-    async fn get_plugin_capabilities(&self) -> Result<Vec<CsiCapability>>;
-
-    /// Health check — returns true if plugin is ready.
-    async fn probe(&self) -> Result<bool>;
-}
-
-// ============================================================================
-// Node Service
-// ============================================================================
-
-/// Request to stage a volume on the node (first mount step).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeStageVolumeRequest {
-    pub volume_id: String,
-    pub publish_context: HashMap<String, String>,
-    pub staging_target_path: String,
-    pub volume_capability: VolumeCapability,
-    pub secrets: HashMap<String, String>,
-    pub volume_context: HashMap<String, String>,
-}
-
-/// Request to unstage a volume from the node.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeUnstageVolumeRequest {
-    pub volume_id: String,
-    pub staging_target_path: String,
-}
-
-/// Request to publish a volume to a pod (second mount step).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodePublishVolumeRequest {
-    pub volume_id: String,
-    pub publish_context: HashMap<String, String>,
-    pub staging_target_path: String,
-    pub target_path: String,
-    pub volume_capability: VolumeCapability,
-    pub readonly: bool,
-    pub secrets: HashMap<String, String>,
-    pub volume_context: HashMap<String, String>,
-}
-
-/// Request to unpublish a volume from a pod.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeUnpublishVolumeRequest {
-    pub volume_id: String,
-    pub target_path: String,
-}
-
-/// Volume access capability.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VolumeCapability {
-    pub access_type: AccessType,
-    pub access_mode: AccessMode,
-}
-
-/// How the volume is accessed (block vs filesystem).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum AccessType {
-    Block,
-    Mount { fs_type: String, mount_flags: Vec<String> },
-}
-
-/// Volume access mode (RWO, ROX, RWX, etc.).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum AccessMode {
-    SingleNodeWriter,
-    SingleNodeReaderOnly,
-    MultiNodeReaderOnly,
-    MultiNodeSingleWriter,
-    MultiNodeMultiWriter,
-}
-
-/// Node service capability.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum NodeCapability {
-    StageUnstageVolume,
-    GetVolumeStats,
-    VolumeCondition,
-    SingleNodeMultiWriter,
-}
-
-/// Node topology and resource info.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// What the node plugin says about this node.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NodeInfo {
+    /// The driver's own name for this node. This is what the attacher passes to
+    /// ControllerPublishVolume, via `CSINode`, and it is often not the
+    /// Kubernetes node name.
     pub node_id: String,
-    pub max_volumes_per_node: u64,
-    pub accessible_topology: HashMap<String, String>,
+    /// 0 means the driver sets no limit.
+    pub max_volumes_per_node: i64,
+    /// Topology segments (e.g. `topology.hostpath.csi/node: n1`). They become
+    /// node labels, and their keys go in `CSINode`, so a topology-aware
+    /// provisioner can place a volume where this node can reach it.
+    pub topology: HashMap<String, String>,
 }
 
-/// CSI Node service — volume staging and publishing.
-#[async_trait]
-pub trait CsiNode: Send + Sync {
-    /// Stage a volume to a global staging directory on the node.
-    /// Called once per volume, before any pod mounts.
-    async fn node_stage_volume(&self, req: NodeStageVolumeRequest) -> Result<()>;
-
-    /// Unstage a volume from the global staging directory.
-    /// Called after all pods have unmounted the volume.
-    async fn node_unstage_volume(&self, req: NodeUnstageVolumeRequest) -> Result<()>;
-
-    /// Publish (mount) a volume into a pod's directory.
-    /// Called once per pod using the volume.
-    async fn node_publish_volume(&self, req: NodePublishVolumeRequest) -> Result<()>;
-
-    /// Unpublish (unmount) a volume from a pod's directory.
-    async fn node_unpublish_volume(&self, req: NodeUnpublishVolumeRequest) -> Result<()>;
-
-    /// Get node service capabilities.
-    async fn node_get_capabilities(&self) -> Result<Vec<NodeCapability>>;
-
-    /// Get node ID and topology info.
-    async fn node_get_info(&self) -> Result<NodeInfo>;
+/// The node capabilities the kubelet acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NodeCapabilities {
+    /// NodeStage/NodeUnstage are implemented, so a volume is staged once per
+    /// node before it is published per pod. Without it, publish is the only
+    /// step.
+    pub stage_unstage: bool,
+    /// The driver understands SINGLE_NODE_SINGLE_WRITER and
+    /// SINGLE_NODE_MULTI_WRITER, so ReadWriteOncePod can be said precisely.
+    pub single_node_multi_writer: bool,
 }
 
-// ============================================================================
-// Controller Service
-// ============================================================================
-
-/// Request to create a volume.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateVolumeRequest {
-    pub name: String,
-    pub capacity_bytes: u64,
-    pub volume_capabilities: Vec<VolumeCapability>,
-    pub parameters: HashMap<String, String>,
-    pub secrets: HashMap<String, String>,
-    pub volume_content_source: Option<VolumeContentSource>,
-    pub accessibility_requirements: Option<TopologyRequirement>,
+/// A PersistentVolume access mode, in CSI terms.
+///
+/// Upstream maps the PV's *first* access mode and so does this, because a
+/// driver given a mode its volume was not provisioned for may refuse the
+/// publish.
+pub fn access_mode(pv_mode: &str, caps: NodeCapabilities) -> Mode {
+    match pv_mode {
+        "ReadOnlyMany" => Mode::MultiNodeReaderOnly,
+        "ReadWriteMany" => Mode::MultiNodeMultiWriter,
+        "ReadWriteOncePod" if caps.single_node_multi_writer => Mode::SingleNodeSingleWriter,
+        "ReadWriteOnce" if caps.single_node_multi_writer => Mode::SingleNodeMultiWriter,
+        _ => Mode::SingleNodeWriter,
+    }
 }
 
-/// Volume metadata returned by CreateVolume.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Volume {
+/// Everything the node plugin needs to know about one volume.
+#[derive(Debug, Clone, Default)]
+pub struct VolumeSpec {
     pub volume_id: String,
-    pub capacity_bytes: u64,
-    pub volume_context: HashMap<String, String>,
-    pub content_source: Option<VolumeContentSource>,
-    pub accessible_topology: Vec<HashMap<String, String>>,
-}
-
-/// Source for volume content (snapshot, clone, etc.).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum VolumeContentSource {
-    Snapshot { snapshot_id: String },
-    Volume { volume_id: String },
-}
-
-/// Topology requirement for volume placement.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TopologyRequirement {
-    pub requisite: Vec<HashMap<String, String>>,
-    pub preferred: Vec<HashMap<String, String>>,
-}
-
-/// Request to publish a volume to a node (attach).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ControllerPublishRequest {
-    pub volume_id: String,
-    pub node_id: String,
-    pub volume_capability: VolumeCapability,
+    /// `""` lets the driver choose.
+    pub fs_type: String,
+    pub mount_flags: Vec<String>,
+    pub access_mode: i32,
     pub readonly: bool,
-    pub secrets: HashMap<String, String>,
+    /// `PV.spec.csi.volumeAttributes`, plus the pod's identity when the
+    /// CSIDriver asks for it (`podInfoOnMount`).
     pub volume_context: HashMap<String, String>,
-}
-
-/// Publish context returned by ControllerPublishVolume.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PublishInfo {
+    /// `VolumeAttachment.status.attachmentMetadata`: whatever the
+    /// controller's publish told the node (a device path or a LUN).
     pub publish_context: HashMap<String, String>,
+    pub stage_secrets: HashMap<String, String>,
+    pub publish_secrets: HashMap<String, String>,
 }
 
-/// Request to unpublish a volume from a node (detach).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ControllerUnpublishRequest {
-    pub volume_id: String,
-    pub node_id: String,
-    pub secrets: HashMap<String, String>,
-}
-
-/// Request to validate volume capabilities.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ValidateCapabilitiesRequest {
-    pub volume_id: String,
-    pub volume_context: HashMap<String, String>,
-    pub volume_capabilities: Vec<VolumeCapability>,
-    pub parameters: HashMap<String, String>,
-    pub secrets: HashMap<String, String>,
-}
-
-/// CSI Controller service — volume lifecycle and attachment.
-#[async_trait]
-pub trait CsiController: Send + Sync {
-    /// Create a new volume.
-    async fn create_volume(&self, req: CreateVolumeRequest) -> Result<Volume>;
-
-    /// Delete a volume.
-    async fn delete_volume(&self, volume_id: &str) -> Result<()>;
-
-    /// Publish (attach) a volume to a node.
-    async fn controller_publish_volume(&self, req: ControllerPublishRequest) -> Result<PublishInfo>;
-
-    /// Unpublish (detach) a volume from a node.
-    async fn controller_unpublish_volume(&self, req: ControllerUnpublishRequest) -> Result<()>;
-
-    /// Validate that a volume supports the requested capabilities.
-    async fn validate_volume_capabilities(&self, req: ValidateCapabilitiesRequest) -> Result<bool>;
-}
-
-// ============================================================================
-// Unix Domain Socket Client (Stub Implementation)
-// ============================================================================
-
-/// CSI client that connects to a driver via Unix domain socket.
-///
-/// This is a stub implementation that logs operations. In a production
-/// implementation, this would use gRPC to communicate with the CSI driver
-/// over the socket (typically /var/lib/kubelet/plugins/<driver>/csi.sock).
-pub struct UnixCsiClient {
-    socket_path: PathBuf,
-    plugin_name: String,
-    node_id: String,
-}
-
-impl UnixCsiClient {
-    /// Create a new CSI client connected to the given Unix socket.
-    pub fn new(socket_path: PathBuf, plugin_name: String, node_id: String) -> Self {
-        Self {
-            socket_path,
-            plugin_name,
-            node_id,
+impl VolumeSpec {
+    fn capability(&self) -> proto::VolumeCapability {
+        proto::VolumeCapability {
+            access_type: Some(proto::volume_capability::AccessType::Mount(
+                proto::volume_capability::MountVolume {
+                    fs_type: self.fs_type.clone(),
+                    mount_flags: self.mount_flags.clone(),
+                    volume_mount_group: String::new(),
+                },
+            )),
+            access_mode: Some(proto::volume_capability::AccessMode { mode: self.access_mode }),
         }
     }
-
-    /// Get the socket path.
-    pub fn socket_path(&self) -> &PathBuf {
-        &self.socket_path
-    }
 }
 
-#[async_trait]
-impl CsiIdentity for UnixCsiClient {
-    async fn get_plugin_info(&self) -> Result<CsiPluginInfo> {
-        info!("CSI GetPluginInfo: socket={}", self.socket_path.display());
-
-        // Stub: return synthetic plugin info
-        Ok(CsiPluginInfo {
-            name: self.plugin_name.clone(),
-            vendor_version: "0.1.0".to_string(),
-            manifest: HashMap::new(),
-        })
-    }
-
-    async fn get_plugin_capabilities(&self) -> Result<Vec<CsiCapability>> {
-        info!("CSI GetPluginCapabilities: socket={}", self.socket_path.display());
-
-        // Stub: assume controller service is available
-        Ok(vec![CsiCapability::ControllerService])
-    }
-
-    async fn probe(&self) -> Result<bool> {
-        info!("CSI Probe: socket={}", self.socket_path.display());
-
-        // Stub: assume plugin is ready if socket exists
-        Ok(self.socket_path.exists())
-    }
+/// A connection to one driver's node plugin.
+#[derive(Clone)]
+pub struct CsiDriverClient {
+    socket: PathBuf,
+    channel: Channel,
 }
 
-#[async_trait]
-impl CsiNode for UnixCsiClient {
-    async fn node_stage_volume(&self, req: NodeStageVolumeRequest) -> Result<()> {
-        info!(
-            volume_id = %req.volume_id,
-            staging_path = %req.staging_target_path,
-            "CSI NodeStageVolume"
-        );
+impl CsiDriverClient {
+    pub fn new(socket: &Path) -> Self {
+        Self { socket: socket.to_path_buf(), channel: unix_channel(socket, CALL_TIMEOUT) }
+    }
 
-        // Stub: In production, this would:
-        // 1. Call the CSI driver via gRPC
-        // 2. The driver would attach the volume to the node
-        // 3. Mount it to the staging path
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
 
-        // For now, just ensure the staging directory exists
-        let staging_path = PathBuf::from(&req.staging_target_path);
-        if !staging_path.exists() {
-            std::fs::create_dir_all(&staging_path)
-                .with_context(|| format!("Failed to create staging path: {}", req.staging_target_path))?;
+    fn identity(&self) -> IdentityClient<Channel> {
+        IdentityClient::new(self.channel.clone())
+    }
+
+    fn node(&self) -> NodeClient<Channel> {
+        NodeClient::new(self.channel.clone())
+    }
+
+    fn at(&self) -> String {
+        self.socket.display().to_string()
+    }
+
+    pub async fn plugin_info(&self) -> Result<PluginInfo> {
+        let r = self
+            .identity()
+            .get_plugin_info(proto::GetPluginInfoRequest {})
+            .await
+            .with_context(|| format!("GetPluginInfo on {}", self.at()))?
+            .into_inner();
+        Ok(PluginInfo { name: r.name, vendor_version: r.vendor_version })
+    }
+
+    /// Whether the plugin says it is ready. An unset `ready` means ready,
+    /// per the spec.
+    pub async fn probe(&self) -> Result<bool> {
+        let r = self
+            .identity()
+            .probe(proto::ProbeRequest {})
+            .await
+            .with_context(|| format!("Probe on {}", self.at()))?
+            .into_inner();
+        Ok(r.ready.unwrap_or(true))
+    }
+
+    pub async fn node_info(&self) -> Result<NodeInfo> {
+        let r = self
+            .node()
+            .node_get_info(proto::NodeGetInfoRequest {})
+            .await
+            .with_context(|| format!("NodeGetInfo on {}", self.at()))?
+            .into_inner();
+        if r.node_id.is_empty() {
+            return Err(anyhow!("NodeGetInfo on {} returned an empty node_id", self.at()));
         }
-
-        info!(
-            volume_id = %req.volume_id,
-            staging_path = %req.staging_target_path,
-            "CSI NodeStageVolume: staged (stub)"
-        );
-
-        Ok(())
-    }
-
-    async fn node_unstage_volume(&self, req: NodeUnstageVolumeRequest) -> Result<()> {
-        info!(
-            volume_id = %req.volume_id,
-            staging_path = %req.staging_target_path,
-            "CSI NodeUnstageVolume"
-        );
-
-        // Stub: In production, this would:
-        // 1. Unmount the volume from the staging path
-        // 2. Call the CSI driver to detach/cleanup
-
-        warn!(
-            volume_id = %req.volume_id,
-            "CSI NodeUnstageVolume: unstaged (stub)"
-        );
-
-        Ok(())
-    }
-
-    async fn node_publish_volume(&self, req: NodePublishVolumeRequest) -> Result<()> {
-        info!(
-            volume_id = %req.volume_id,
-            target_path = %req.target_path,
-            readonly = req.readonly,
-            "CSI NodePublishVolume"
-        );
-
-        // Stub: In production, this would:
-        // 1. Bind-mount from staging_target_path to target_path
-        // 2. Apply readonly flag if needed
-
-        let target_path = PathBuf::from(&req.target_path);
-        if !target_path.exists() {
-            std::fs::create_dir_all(&target_path)
-                .with_context(|| format!("Failed to create target path: {}", req.target_path))?;
-        }
-
-        info!(
-            volume_id = %req.volume_id,
-            target_path = %req.target_path,
-            "CSI NodePublishVolume: published (stub)"
-        );
-
-        Ok(())
-    }
-
-    async fn node_unpublish_volume(&self, req: NodeUnpublishVolumeRequest) -> Result<()> {
-        info!(
-            volume_id = %req.volume_id,
-            target_path = %req.target_path,
-            "CSI NodeUnpublishVolume"
-        );
-
-        // Stub: In production, this would unmount the bind mount
-
-        warn!(
-            volume_id = %req.volume_id,
-            "CSI NodeUnpublishVolume: unpublished (stub)"
-        );
-
-        Ok(())
-    }
-
-    async fn node_get_capabilities(&self) -> Result<Vec<NodeCapability>> {
-        info!("CSI NodeGetCapabilities");
-
-        // Stub: advertise staging support
-        Ok(vec![NodeCapability::StageUnstageVolume])
-    }
-
-    async fn node_get_info(&self) -> Result<NodeInfo> {
-        info!("CSI NodeGetInfo");
-
         Ok(NodeInfo {
-            node_id: self.node_id.clone(),
-            max_volumes_per_node: 256,
-            accessible_topology: HashMap::new(),
-        })
-    }
-}
-
-#[async_trait]
-impl CsiController for UnixCsiClient {
-    async fn create_volume(&self, req: CreateVolumeRequest) -> Result<Volume> {
-        info!(
-            name = %req.name,
-            capacity_bytes = req.capacity_bytes,
-            "CSI CreateVolume"
-        );
-
-        // Stub: return a synthetic volume ID
-        let volume_id = format!("vol-{}", uuid::Uuid::new_v4());
-
-        warn!(
-            volume_id = %volume_id,
-            name = %req.name,
-            "CSI CreateVolume: created (stub)"
-        );
-
-        Ok(Volume {
-            volume_id,
-            capacity_bytes: req.capacity_bytes,
-            volume_context: req.parameters,
-            content_source: req.volume_content_source,
-            accessible_topology: vec![],
+            node_id: r.node_id,
+            max_volumes_per_node: r.max_volumes_per_node,
+            topology: r.accessible_topology.map(|t| t.segments).unwrap_or_default(),
         })
     }
 
-    async fn delete_volume(&self, volume_id: &str) -> Result<()> {
-        info!(volume_id = %volume_id, "CSI DeleteVolume");
+    pub async fn node_capabilities(&self) -> Result<NodeCapabilities> {
+        let r = self
+            .node()
+            .node_get_capabilities(proto::NodeGetCapabilitiesRequest {})
+            .await
+            .with_context(|| format!("NodeGetCapabilities on {}", self.at()))?
+            .into_inner();
+        let mut caps = NodeCapabilities::default();
+        for c in r.capabilities {
+            if let Some(proto::node_service_capability::Type::Rpc(rpc)) = c.r#type {
+                match NodeRpc::try_from(rpc.r#type) {
+                    Ok(NodeRpc::StageUnstageVolume) => caps.stage_unstage = true,
+                    Ok(NodeRpc::SingleNodeMultiWriter) => caps.single_node_multi_writer = true,
+                    _ => {}
+                }
+            }
+        }
+        Ok(caps)
+    }
 
-        warn!(volume_id = %volume_id, "CSI DeleteVolume: deleted (stub)");
-
+    pub async fn stage(&self, v: &VolumeSpec, staging: &str) -> Result<()> {
+        self.node()
+            .node_stage_volume(proto::NodeStageVolumeRequest {
+                volume_id: v.volume_id.clone(),
+                publish_context: v.publish_context.clone(),
+                staging_target_path: staging.to_string(),
+                volume_capability: Some(v.capability()),
+                secrets: v.stage_secrets.clone(),
+                volume_context: v.volume_context.clone(),
+            })
+            .await
+            .map_err(|s| status_error("NodeStageVolume", &v.volume_id, s))?;
         Ok(())
     }
 
-    async fn controller_publish_volume(&self, req: ControllerPublishRequest) -> Result<PublishInfo> {
-        info!(
-            volume_id = %req.volume_id,
-            node_id = %req.node_id,
-            readonly = req.readonly,
-            "CSI ControllerPublishVolume"
-        );
-
-        // Stub: return empty publish context
-        warn!(
-            volume_id = %req.volume_id,
-            node_id = %req.node_id,
-            "CSI ControllerPublishVolume: published (stub)"
-        );
-
-        Ok(PublishInfo {
-            publish_context: HashMap::new(),
-        })
-    }
-
-    async fn controller_unpublish_volume(&self, req: ControllerUnpublishRequest) -> Result<()> {
-        info!(
-            volume_id = %req.volume_id,
-            node_id = %req.node_id,
-            "CSI ControllerUnpublishVolume"
-        );
-
-        warn!(
-            volume_id = %req.volume_id,
-            "CSI ControllerUnpublishVolume: unpublished (stub)"
-        );
-
+    pub async fn unstage(&self, volume_id: &str, staging: &str) -> Result<()> {
+        self.node()
+            .node_unstage_volume(proto::NodeUnstageVolumeRequest {
+                volume_id: volume_id.to_string(),
+                staging_target_path: staging.to_string(),
+            })
+            .await
+            .map_err(|s| status_error("NodeUnstageVolume", volume_id, s))?;
         Ok(())
     }
 
-    async fn validate_volume_capabilities(&self, req: ValidateCapabilitiesRequest) -> Result<bool> {
-        info!(
-            volume_id = %req.volume_id,
-            num_capabilities = req.volume_capabilities.len(),
-            "CSI ValidateVolumeCapabilities"
-        );
+    /// `staging` is `None` for a driver without STAGE_UNSTAGE_VOLUME.
+    pub async fn publish(&self, v: &VolumeSpec, staging: Option<&str>, target: &str) -> Result<()> {
+        self.node()
+            .node_publish_volume(proto::NodePublishVolumeRequest {
+                volume_id: v.volume_id.clone(),
+                publish_context: v.publish_context.clone(),
+                staging_target_path: staging.unwrap_or("").to_string(),
+                target_path: target.to_string(),
+                volume_capability: Some(v.capability()),
+                readonly: v.readonly,
+                secrets: v.publish_secrets.clone(),
+                volume_context: v.volume_context.clone(),
+            })
+            .await
+            .map_err(|s| status_error("NodePublishVolume", &v.volume_id, s))?;
+        Ok(())
+    }
 
-        // Stub: assume all capabilities are valid
-        Ok(true)
+    pub async fn unpublish(&self, volume_id: &str, target: &str) -> Result<()> {
+        self.node()
+            .node_unpublish_volume(proto::NodeUnpublishVolumeRequest {
+                volume_id: volume_id.to_string(),
+                target_path: target.to_string(),
+            })
+            .await
+            .map_err(|s| status_error("NodeUnpublishVolume", volume_id, s))?;
+        Ok(())
     }
 }
 
-// ============================================================================
-// Volume Lifecycle Helpers
-// ============================================================================
+/// A driver's refusal, readable in `describe`: the call, the volume, the
+/// gRPC code and the driver's own message. A raw `Status` debug-prints its
+/// metadata and buries the one sentence that matters.
+fn status_error(call: &str, volume_id: &str, s: tonic::Status) -> anyhow::Error {
+    anyhow!("{call} {volume_id}: {:?}: {}", s.code(), s.message())
+}
 
-/// Setup a volume for use by a pod.
+/// Stage (when the driver stages) and then publish.
 ///
-/// This performs the full CSI node workflow:
-/// 1. NodeStageVolume (global mount)
-/// 2. NodePublishVolume (bind mount to pod)
+/// Both calls are idempotent by the CSI contract, so this is safe to repeat.
+/// A pod that retries its start after one volume failed calls it again for
+/// the ones that succeeded.
 pub async fn setup_volume(
-    csi: &dyn CsiNode,
-    volume_id: &str,
-    staging_path: &str,
-    target_path: &str,
-    fs_type: &str,
-    readonly: bool,
+    client: &CsiDriverClient,
+    v: &VolumeSpec,
+    staging: Option<&str>,
+    target: &str,
 ) -> Result<()> {
-    info!(
-        volume_id = %volume_id,
-        staging_path = %staging_path,
-        target_path = %target_path,
-        fs_type = %fs_type,
-        readonly = readonly,
-        "Setting up CSI volume"
-    );
-
-    // Stage the volume (global mount)
-    csi.node_stage_volume(NodeStageVolumeRequest {
-        volume_id: volume_id.to_string(),
-        publish_context: HashMap::new(),
-        staging_target_path: staging_path.to_string(),
-        volume_capability: VolumeCapability {
-            access_type: AccessType::Mount {
-                fs_type: fs_type.to_string(),
-                mount_flags: vec![],
-            },
-            access_mode: AccessMode::SingleNodeWriter,
-        },
-        secrets: HashMap::new(),
-        volume_context: HashMap::new(),
-    })
-    .await
-    .with_context(|| format!("Failed to stage volume {}", volume_id))?;
-
-    // Publish the volume (bind mount to pod)
-    csi.node_publish_volume(NodePublishVolumeRequest {
-        volume_id: volume_id.to_string(),
-        publish_context: HashMap::new(),
-        staging_target_path: staging_path.to_string(),
-        target_path: target_path.to_string(),
-        volume_capability: VolumeCapability {
-            access_type: AccessType::Mount {
-                fs_type: fs_type.to_string(),
-                mount_flags: vec![],
-            },
-            access_mode: AccessMode::SingleNodeWriter,
-        },
-        readonly,
-        secrets: HashMap::new(),
-        volume_context: HashMap::new(),
-    })
-    .await
-    .with_context(|| format!("Failed to publish volume {} to {}", volume_id, target_path))?;
-
-    info!(
-        volume_id = %volume_id,
-        target_path = %target_path,
-        "CSI volume setup complete"
-    );
-
-    Ok(())
+    if let Some(staging) = staging {
+        client.stage(v, staging).await?;
+    }
+    client.publish(v, staging, target).await
 }
 
-/// Teardown a volume after pod termination.
+/// `sha256(input)`, lower-case hex.
+pub fn sha256_hex(input: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(input.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+/// The VolumeAttachment name for a volume on a node: `csi-` + sha256 of
+/// handle, driver and node, concatenated.
 ///
-/// This performs the full CSI node cleanup:
-/// 1. NodeUnpublishVolume (remove bind mount)
-/// 2. NodeUnstageVolume (unmount global mount)
-pub async fn teardown_volume(
-    csi: &dyn CsiNode,
-    volume_id: &str,
-    staging_path: &str,
-    target_path: &str,
-) -> Result<()> {
-    info!(
-        volume_id = %volume_id,
-        staging_path = %staging_path,
-        target_path = %target_path,
-        "Tearing down CSI volume"
-    );
+/// **It has to match what the attach/detach controller wrote**
+/// (rustkube `attachdetach.rs::attachment_name`, which is upstream's
+/// `getAttachmentName`), because the kubelet does not list attachments. It
+/// GETs this one by name.
+pub fn attachment_name(volume_handle: &str, driver: &str, node: &str) -> String {
+    format!("csi-{}", sha256_hex(&format!("{volume_handle}{driver}{node}")))
+}
 
-    // Unpublish the volume (remove bind mount)
-    if let Err(e) = csi
-        .node_unpublish_volume(NodeUnpublishVolumeRequest {
-            volume_id: volume_id.to_string(),
-            target_path: target_path.to_string(),
-        })
-        .await
-    {
-        warn!(
-            volume_id = %volume_id,
-            target_path = %target_path,
-            error = %e,
-            "Failed to unpublish volume (continuing)"
-        );
+/// The global staging path for a volume, upstream's layout:
+/// `<root>/plugins/kubernetes.io/csi/<driver>/<sha256(handle)>/globalmount`.
+///
+/// Hashed because a volume handle is the driver's string and may hold
+/// anything, `/` included.
+pub fn staging_path(state_root: &str, driver: &str, volume_handle: &str) -> String {
+    format!(
+        "{}/plugins/kubernetes.io/csi/{driver}/{}/globalmount",
+        state_root.trim_end_matches('/'),
+        sha256_hex(volume_handle)
+    )
+}
+
+/// Where a pod's CSI volume is published:
+/// `<root>/pods/<uid>/volumes/kubernetes.io~csi/<volume>/mount`.
+pub fn publish_path(state_root: &str, pod_uid: &str, volume: &str) -> String {
+    format!(
+        "{}/pods/{pod_uid}/volumes/kubernetes.io~csi/{volume}/mount",
+        state_root.trim_end_matches('/')
+    )
+}
+
+/// Is `path` a mount point in PID 1's mount namespace?
+///
+/// **This is the check that stops a CSI volume from becoming scratch.** The
+/// driver mounts in its own namespace. If the mount does not propagate to
+/// the node's namespace, where stormpump resolves binds, the directory still
+/// exists (the driver created it on the shared filesystem) and the pod's
+/// bind finds it empty. The pod would then write its data onto the node's
+/// root and lose it with the pod, which is exactly what 5236dbe stopped for
+/// stormblock claims. So the kubelet looks where the engine will look.
+///
+/// `mountinfo` is PID 1's `/proc/1/mountinfo`, read through the host PID
+/// namespace the kubelet shares.
+pub fn is_mount_point(mountinfo: &str, path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    mountinfo.lines().any(|l| {
+        // Field 5 is the mount point, with spaces and friends octal-escaped.
+        l.split(' ').nth(4).map(unescape_mountinfo).as_deref() == Some(path)
+    })
+}
+
+fn unescape_mountinfo(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 3 < b.len() && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c)) {
+            let v = (b[i + 1] - b'0') * 64 + (b[i + 2] - b'0') * 8 + (b[i + 3] - b'0');
+            out.push(v);
+            i += 4;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
     }
-
-    // Unstage the volume (unmount global mount)
-    if let Err(e) = csi
-        .node_unstage_volume(NodeUnstageVolumeRequest {
-            volume_id: volume_id.to_string(),
-            staging_target_path: staging_path.to_string(),
-        })
-        .await
-    {
-        warn!(
-            volume_id = %volume_id,
-            staging_path = %staging_path,
-            error = %e,
-            "Failed to unstage volume (continuing)"
-        );
-    }
-
-    info!(
-        volume_id = %volume_id,
-        "CSI volume teardown complete"
-    );
-
-    Ok(())
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_unix_csi_client_identity() {
-        let client = UnixCsiClient::new(
-            PathBuf::from("/tmp/csi.sock"),
-            "test-driver".to_string(),
-            "node-1".to_string(),
+    #[test]
+    fn attachment_name_matches_the_controllers() {
+        // The same vector rustkube's attachdetach.rs tests: sha256 of
+        // "volhandle" + "csi.example.com" + "node1".
+        let a = attachment_name("volhandle", "csi.example.com", "node1");
+        assert!(a.starts_with("csi-") && a.len() == 68);
+        assert_eq!(a, format!("csi-{}", sha256_hex("volhandlecsi.example.comnode1")));
+        assert_eq!(
+            sha256_hex(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
-
-        let info = client.get_plugin_info().await.unwrap();
-        assert_eq!(info.name, "test-driver");
-
-        let caps = client.get_plugin_capabilities().await.unwrap();
-        assert!(caps.contains(&CsiCapability::ControllerService));
     }
 
-    #[tokio::test]
-    async fn test_unix_csi_client_node() {
-        let client = UnixCsiClient::new(
-            PathBuf::from("/tmp/csi.sock"),
-            "test-driver".to_string(),
-            "node-1".to_string(),
+    #[test]
+    fn paths_follow_upstreams_layout() {
+        assert_eq!(
+            staging_path("/var/lib/kubelet/", "hostpath.csi.k8s.io", ""),
+            "/var/lib/kubelet/plugins/kubernetes.io/csi/hostpath.csi.k8s.io/\
+             e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855/globalmount"
         );
-
-        let info = client.node_get_info().await.unwrap();
-        assert_eq!(info.node_id, "node-1");
-        assert_eq!(info.max_volumes_per_node, 256);
-
-        let caps = client.node_get_capabilities().await.unwrap();
-        assert!(caps.contains(&NodeCapability::StageUnstageVolume));
+        assert_eq!(
+            publish_path("/var/lib/kubelet", "u1", "data"),
+            "/var/lib/kubelet/pods/u1/volumes/kubernetes.io~csi/data/mount"
+        );
     }
 
-    #[tokio::test]
-    async fn test_volume_lifecycle() {
-        let client = UnixCsiClient::new(
-            PathBuf::from("/tmp/csi.sock"),
-            "test-driver".to_string(),
-            "node-1".to_string(),
-        );
-
-        let tempdir = tempfile::tempdir().unwrap();
-        let staging_path = tempdir.path().join("staging");
-        let target_path = tempdir.path().join("target");
-
-        // Setup should succeed (stub creates directories)
-        setup_volume(
-            &client,
-            "vol-123",
-            staging_path.to_str().unwrap(),
-            target_path.to_str().unwrap(),
-            "ext4",
-            false,
-        )
-        .await
-        .unwrap();
-
-        assert!(staging_path.exists());
-        assert!(target_path.exists());
-
-        // Teardown should succeed
-        teardown_volume(
-            &client,
-            "vol-123",
-            staging_path.to_str().unwrap(),
-            target_path.to_str().unwrap(),
-        )
-        .await
-        .unwrap();
+    #[test]
+    fn access_modes_map_as_upstream_does() {
+        let plain = NodeCapabilities::default();
+        let multi = NodeCapabilities { single_node_multi_writer: true, ..plain };
+        assert_eq!(access_mode("ReadWriteOnce", plain), Mode::SingleNodeWriter);
+        assert_eq!(access_mode("ReadWriteOnce", multi), Mode::SingleNodeMultiWriter);
+        // Without the capability the driver cannot be told "one pod", so it
+        // is told "one node", and the kubelet's own RWOP check holds the rest.
+        assert_eq!(access_mode("ReadWriteOncePod", plain), Mode::SingleNodeWriter);
+        assert_eq!(access_mode("ReadWriteOncePod", multi), Mode::SingleNodeSingleWriter);
+        assert_eq!(access_mode("ReadOnlyMany", plain), Mode::MultiNodeReaderOnly);
+        assert_eq!(access_mode("ReadWriteMany", plain), Mode::MultiNodeMultiWriter);
     }
 
-    #[tokio::test]
-    async fn test_controller_operations() {
-        let client = UnixCsiClient::new(
-            PathBuf::from("/tmp/csi.sock"),
-            "test-driver".to_string(),
-            "node-1".to_string(),
-        );
-
-        // Create volume
-        let vol = client
-            .create_volume(CreateVolumeRequest {
-                name: "test-vol".to_string(),
-                capacity_bytes: 1024 * 1024 * 1024, // 1 GiB
-                volume_capabilities: vec![VolumeCapability {
-                    access_type: AccessType::Mount {
-                        fs_type: "ext4".to_string(),
-                        mount_flags: vec![],
-                    },
-                    access_mode: AccessMode::SingleNodeWriter,
-                }],
-                parameters: HashMap::new(),
-                secrets: HashMap::new(),
-                volume_content_source: None,
-                accessibility_requirements: None,
-            })
-            .await
-            .unwrap();
-
-        assert!(vol.volume_id.starts_with("vol-"));
-        assert_eq!(vol.capacity_bytes, 1024 * 1024 * 1024);
-
-        // Publish volume
-        let publish_info = client
-            .controller_publish_volume(ControllerPublishRequest {
-                volume_id: vol.volume_id.clone(),
-                node_id: "node-1".to_string(),
-                volume_capability: VolumeCapability {
-                    access_type: AccessType::Mount {
-                        fs_type: "ext4".to_string(),
-                        mount_flags: vec![],
-                    },
-                    access_mode: AccessMode::SingleNodeWriter,
-                },
-                readonly: false,
-                secrets: HashMap::new(),
-                volume_context: HashMap::new(),
-            })
-            .await
-            .unwrap();
-
-        assert!(publish_info.publish_context.is_empty());
-
-        // Unpublish volume
-        client
-            .controller_unpublish_volume(ControllerUnpublishRequest {
-                volume_id: vol.volume_id.clone(),
-                node_id: "node-1".to_string(),
-                secrets: HashMap::new(),
-            })
-            .await
-            .unwrap();
-
-        // Delete volume
-        client.delete_volume(&vol.volume_id).await.unwrap();
+    #[test]
+    fn a_mount_point_is_found_in_pid_1s_mountinfo() {
+        let mi = "\
+22 1 0:21 / / rw,relatime shared:1 - erofs /dev/vda ro
+140 22 0:52 / /var/lib/kubelet/pods/u1/volumes/kubernetes.io~csi/data/mount rw shared:70 - tmpfs tmpfs rw
+141 22 0:53 / /mnt/with\\040space rw - tmpfs tmpfs rw
+";
+        assert!(is_mount_point(mi, "/var/lib/kubelet/pods/u1/volumes/kubernetes.io~csi/data/mount"));
+        assert!(is_mount_point(mi, "/var/lib/kubelet/pods/u1/volumes/kubernetes.io~csi/data/mount/"));
+        assert!(is_mount_point(mi, "/mnt/with space"));
+        // The directory exists, and nothing is mounted on it: the case that
+        // would hand a pod scratch storage.
+        assert!(!is_mount_point(mi, "/var/lib/kubelet/pods/u2/volumes/kubernetes.io~csi/data/mount"));
+        assert!(!is_mount_point(mi, "/var/lib/kubelet"));
     }
 }
