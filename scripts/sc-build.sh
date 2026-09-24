@@ -20,6 +20,10 @@ if [[ ! -d ../rustkube/pkg/apimachinery ]]; then
   git -C .deps/rustkube checkout -q FETCH_HEAD
   echo "sc-build.sh: rustkube@$(git -C .deps/rustkube rev-parse --short HEAD) for apimachinery"
   sed -i 's#path = "\.\./rustkube/#path = ".deps/rustkube/#' Cargo.toml
+  # A path dependency under the workspace directory is taken as a member of
+  # it, and apimachinery would then inherit *this* workspace's dependencies.
+  # Excluded, it finds its own workspace root, which is .deps/rustkube.
+  sed -i 's#^\[workspace\]$#[workspace]\nexclude = [".deps"]#' Cargo.toml
 fi
 cmd="${*:-cargo build && cargo test}"
 bash -c "$cmd"
