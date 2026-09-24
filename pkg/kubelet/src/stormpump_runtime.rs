@@ -103,6 +103,11 @@ struct Container {
     spec_handle: Option<Handle>,
     /// The handle for the running workload. `None` until started.
     workload_handle: Option<Handle>,
+    /// The volumes registered for this container at start — its root, its
+    /// logs and its mounts — released when it is removed. They were never
+    /// released, so a claim's device mount outlived every pod that used it
+    /// and the volume was later detached under a live filesystem.
+    volume_handles: Vec<Handle>,
     /// The image's volume, registered with the engine. `None` until started.
     root_handle: Option<Handle>,
     /// The directory this container's log file is opened in:
@@ -721,6 +726,7 @@ impl RuntimeService for StormpumpRuntime {
             image: config.image.clone(),
             spec_handle: Some(spec),
             workload_handle: None,
+            volume_handles: Vec::new(),
             root_handle: None,
             // The image ref is the mounted path, which is what pull_image
             // returned. A pod whose image was never pulled has none, and
@@ -846,8 +852,14 @@ impl RuntimeService for StormpumpRuntime {
                             None => e,
                         }
                     })
+                    .map(|w| {
+                        let mut held = vec![root, logs];
+                        held.extend(mounts.iter().copied());
+                        (w, held)
+                    })
             })
             .await?;
+        let (workload, held) = workload;
 
 
         let mut containers = self.containers.lock().await;
@@ -855,6 +867,7 @@ impl RuntimeService for StormpumpRuntime {
             .get_mut(container_id)
             .ok_or_else(|| CriError::NotFound(format!("container {container_id}")))?;
         c.workload_handle = Some(workload);
+        c.volume_handles = held;
         c.state = ContainerState::Running;
         c.started_at = now_nanos();
         tracing::info!(
@@ -887,18 +900,25 @@ impl RuntimeService for StormpumpRuntime {
     }
 
     async fn remove_container(&self, container_id: &str) -> Result<(), CriError> {
-        let workload = self
-            .containers
-            .lock()
-            .await
-            .remove(container_id)
-            .and_then(|c| c.workload_handle);
+        let removed = self.containers.lock().await.remove(container_id);
+        let (workload, volumes) = match removed {
+            Some(c) => (c.workload_handle, c.volume_handles),
+            None => (None, Vec::new()),
+        };
         if let Some(w) = workload {
             // Frees the pidfd and the cgroup, which the process dying does not.
             // Refused while it is still running, so this follows a stop.
             let _ = self
                 .on_ring(move |r| r.workload_release(w))
                 .await;
+        }
+        // Then the volumes it held. The last release of a claim's device
+        // mount unmounts it in the engine, which is what makes the claim safe
+        // to detach and delete afterwards.
+        for v in volumes {
+            if let Err(e) = self.on_ring(move |r| r.volume_release(v)).await {
+                tracing::warn!(container = %container_id, volume = ?v, "releasing a volume: {e}");
+            }
         }
         Ok(())
     }
@@ -1370,6 +1390,7 @@ mod tests {
                     log_dir: String::new(),
                     mount_sources: Vec::new(),
                     workload_handle: None,
+            volume_handles: Vec::new(),
                     root_handle: None,
                     root_path: None,
                     state: ContainerState::Created,
@@ -1494,6 +1515,7 @@ mod tests {
                     image: "busybox".into(),
                     spec_handle: None,
                     workload_handle: None,
+            volume_handles: Vec::new(),
                     root_handle: None,
                     root_path: None,
                     state: ContainerState::Created,

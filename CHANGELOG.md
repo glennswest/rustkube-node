@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### 2026-09-24
+- **fix(runtime):** a container's volume registrations (root, logs, mounts) are
+  released when it is removed. They never were, so a claim's device mount
+  outlived its pods, the claim was detached and deleted under the live
+  filesystem, and every `sync` on the node hung on the recoverable ublk device.
+  The last release now unmounts (stormpump 23aaab7), and stormblock refuses a
+  detach while mounted (0718bd1).
+
 ### 2026-09-23 (PVCs)
 - **fix(storage):** claims find the blanks the image ships. The kubelet looked
   for `pvc-1M`; the image and sbregistry name them `pvc-ext4j-<MiB>m`. Minting

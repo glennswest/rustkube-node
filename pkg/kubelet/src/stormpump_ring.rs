@@ -431,6 +431,20 @@ impl RingClient {
         Ok(())
     }
 
+    /// Release a registered volume. The last release of a device mount
+    /// unmounts it in the engine; a mount still in use answers EBUSY.
+    pub fn volume_release(&self, volume: Handle) -> Result<(), RingError> {
+        self.submit(
+            Sqe {
+                opcode: Op::VolumeRelease as u8,
+                primary: volume,
+                ..Default::default()
+            },
+            None,
+        )?;
+        Ok(())
+    }
+
     /// Free an exited workload's handle, its pidfd and its cgroup.
     pub fn workload_release(&self, workload: Handle) -> Result<(), RingError> {
         self.submit(
