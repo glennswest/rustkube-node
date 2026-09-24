@@ -47,6 +47,6 @@ Steps:
 7. [x] Tests: a mock driver and registrar on a real Unix socket, the full round trip.
 8. [x] Docs (`docs/csi.md`), CHANGELOG.
 9. [ ] End to end with csi-driver-host-path: blocked on step 6 (stormpump#35).
-10. [ ] Build verified with `sc-build scripts/sc-build.sh` (in progress).
+10. [x] Build verified: `sc-build scripts/sc-build.sh` at 004b2e7, build clean, all kubelet tests pass.
 
 Related, filed elsewhere: rustkube#94 (no ephemeral-volume controller).
