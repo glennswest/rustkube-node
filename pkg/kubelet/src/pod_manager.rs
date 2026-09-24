@@ -19,6 +19,8 @@ use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
+mod csi_volumes;
+
 /// State of a managed pod on this node.
 #[derive(Debug, Clone)]
 pub struct PodState {
@@ -255,6 +257,13 @@ pub struct PodManager {
     /// Per-container restart backoff, so a container that keeps dying is not
     /// recreated on every sync tick (#25).
     backoff: crate::crashloop::CrashLoopBackoff,
+    /// The external CSI drivers registered on this node (#52). Empty until
+    /// the kubelet's registration loop finds one, and a claim of an
+    /// unregistered driver waits.
+    csi: Arc<crate::csi_plugins::CsiPlugins>,
+    /// PID 1's mountinfo, where a published CSI volume must appear before a
+    /// pod is given it (`csi::is_mount_point`). Overridable in tests.
+    csi_mountinfo: String,
 }
 
 impl PodManager {
@@ -295,7 +304,16 @@ impl PodManager {
             cluster_domain: "cluster.local".to_string(),
             ca_pem: None,
             backoff: crate::crashloop::CrashLoopBackoff::new(),
+            csi: Arc::new(crate::csi_plugins::CsiPlugins::new(node_name)),
+            csi_mountinfo: "/proc/1/mountinfo".to_string(),
         }
+    }
+
+    /// Use this registry of CSI drivers: the one the kubelet's registration
+    /// loop fills.
+    pub fn with_csi(mut self, csi: Arc<crate::csi_plugins::CsiPlugins>) -> Self {
+        self.csi = csi;
+        self
     }
 
     /// Cluster CA (PEM) to write into ServiceAccount `ca.crt` for pods.
@@ -666,7 +684,41 @@ impl PodManager {
                     }
                 }
                 dir
-            } else if let Some(claim) = vol["persistentVolumeClaim"]["claimName"].as_str() {
+            } else if let Some(claim) = claim_of(pod, vol) {
+                let claim = claim.as_str();
+                // Another driver's volume: a claim bound to a PV whose
+                // `csi.driver` is not ours. Its driver mounts it (#52).
+                let pvc_path = format!("/api/v1/namespaces/{namespace}/persistentvolumeclaims/{claim}");
+                match self.api_get(&pvc_path).await {
+                    Some(pvc) => {
+                        if let Some(pv) = self.external_csi_pv(&pvc).await {
+                            let readonly =
+                                vol["persistentVolumeClaim"]["readOnly"].as_bool().unwrap_or(false);
+                            match self.mount_csi_claim(pod, &name, &pvc, &pv, readonly).await {
+                                Ok(dir) => {
+                                    map.insert(name, ResolvedVolume { path: dir, fstype: None });
+                                    continue;
+                                }
+                                Err(e) => {
+                                    return Err(CriError::VolumeNotReady(format!(
+                                        "PVC {namespace}/{claim}: {e}"
+                                    )))
+                                }
+                            }
+                        }
+                    }
+                    // A generic ephemeral volume's claim is made for the pod
+                    // by a controller, and until it exists there is nothing
+                    // to mount. Say which claim, and why it may never appear.
+                    None if vol.get("ephemeral").is_some() => {
+                        return Err(CriError::VolumeNotReady(format!(
+                            "generic ephemeral volume {name}: claim {namespace}/{claim} does not \
+                             exist yet (it is created from the pod's volumeClaimTemplate by the \
+                             ephemeral-volume controller)"
+                        )));
+                    }
+                    None => {}
+                }
                 // A real volume on stormblock, not a directory.
                 //
                 // The claim is cloned from a blank filesystem that was made
@@ -717,14 +769,23 @@ impl PodManager {
                         )));
                     }
                 }
+            } else if vol.get("csi").is_some() {
+                // An inline CSI volume, which lives and dies with the pod.
+                match self.mount_csi_inline(pod, vol).await {
+                    Ok(dir) => {
+                        map.insert(name, ResolvedVolume { path: dir, fstype: None });
+                        continue;
+                    }
+                    Err(e) => return Err(CriError::VolumeNotReady(format!("volume {name}: {e}"))),
+                }
             } else if vol.get("emptyDir").is_some() {
                 // What emptyDir means: per-pod scratch.
                 let dir = pod_volume_dir(&self.state_root, uid, "empty-dir", &name);
                 let _ = std::fs::create_dir_all(&dir);
                 dir
             } else {
-                // Any other volume type — inline csi, ephemeral, nfs, iscsi —
-                // is one this node cannot provide yet. Turning it into an empty
+                // Any other volume type (in-tree nfs, iscsi, and the rest)
+                // is one this node cannot provide yet. A CSI driver for it can. Turning it into an empty
                 // directory gave the pod a volume that looked right and held
                 // nothing; waiting says what is missing.
                 let kind = vol
@@ -732,8 +793,8 @@ impl PodManager {
                     .and_then(|o| o.keys().find(|k| k.as_str() != "name").cloned())
                     .unwrap_or_else(|| "unknown".into());
                 return Err(CriError::VolumeNotReady(format!(
-                    "volume {name} is of type {kind}, which this node does not provide \
-                     (external CSI drivers: see stormcos issue)"
+                    "volume {name} is of type {kind}, which this node does not provide; \
+                     use a CSI driver for it (docs/csi.md)"
                 )));
             };
             // **Check it is there, and say which one is not.**
@@ -2896,6 +2957,11 @@ impl PodManager {
             }
         }
 
+        // Its CSI volumes, now that nothing binds them. From the records on
+        // disk rather than `state`, so a pod adopted after a restart is
+        // covered. Whatever cannot be undone now is retried by the sweep.
+        self.teardown_csi_volumes(uid).await;
+
         Ok(())
     }
 }
@@ -3057,6 +3123,22 @@ fn pod_claims(pod: &Value) -> impl Iterator<Item = &str> {
 }
 
 /// Per-pod volume directory: <state_root>/pods/<uid>/volumes/kubernetes.io~<kind>/<name>.
+/// The claim a volume mounts: `persistentVolumeClaim.claimName`, or for a
+/// generic ephemeral volume the claim made for it, `<pod>-<volume>` (the
+/// name upstream's ephemeral-volume controller gives it, and the one
+/// rustkube's attach/detach controller looks for).
+fn claim_of(pod: &Value, vol: &Value) -> Option<String> {
+    if let Some(c) = vol["persistentVolumeClaim"]["claimName"].as_str() {
+        return Some(c.to_string());
+    }
+    vol.get("ephemeral")?;
+    Some(format!(
+        "{}-{}",
+        pod["metadata"]["name"].as_str().unwrap_or(""),
+        vol["name"].as_str().unwrap_or("")
+    ))
+}
+
 fn pod_volume_dir(state_root: &str, uid: &str, kind: &str, name: &str) -> String {
     format!("{state_root}/pods/{uid}/volumes/kubernetes.io~{kind}/{name}")
 }
@@ -3249,7 +3331,12 @@ fn resolve_mounts(spec: &Value, volumes: &HashMap<String, ResolvedVolume>) -> Ve
                     // projected/emptyDir live under .../volumes/kubernetes.io~*)
                     // so the container can read them under enforcing SELinux;
                     // never relabel hostPath (arbitrary host system paths).
-                    let selinux_relabel = host_path.contains("/volumes/kubernetes.io~");
+                    //
+                    // Not a CSI volume: its filesystem is the driver's, which
+                    // may not take labels at all (NFS), and relabelling a
+                    // volume that is shared with other pods is not ours to do.
+                    let selinux_relabel = host_path.contains("/volumes/kubernetes.io~")
+                        && !host_path.contains("/volumes/kubernetes.io~csi/");
                     Some(Mount {
                         container_path: m["mountPath"].as_str().unwrap_or("").to_string(),
                         host_path,

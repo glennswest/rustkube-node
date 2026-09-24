@@ -101,6 +101,9 @@ pub struct Kubelet {
     /// directory that is not there is a fact about the configuration, not an
     /// event, and repeating it only buries the lines that are events.
     said_no_static_dir: std::sync::atomic::AtomicBool,
+    /// The external CSI drivers on this node, shared with the pod manager
+    /// and kept current by the registration loop (#52).
+    csi: Arc<crate::csi_plugins::CsiPlugins>,
 }
 
 impl Kubelet {
@@ -127,6 +130,10 @@ impl Kubelet {
             insecure_skip_tls_verify: config.insecure_skip_tls_verify,
         })?;
 
+        let csi = Arc::new(
+            crate::csi_plugins::CsiPlugins::new(&config.node_name)
+                .with_api(api_client.clone(), &config.api_server_url),
+        );
         let pod_manager = Arc::new(
             PodManager::with_api(
                 runtime.clone(),
@@ -136,7 +143,8 @@ impl Kubelet {
                 &node_ip,
                 api_client.clone(),
             )
-            .with_ca_pem(config.apiserver_ca.clone()),
+            .with_ca_pem(config.apiserver_ca.clone())
+            .with_csi(csi.clone()),
         );
 
         Ok(Self {
@@ -148,6 +156,7 @@ impl Kubelet {
             api_client,
             node_ip,
             said_no_static_dir: std::sync::atomic::AtomicBool::new(false),
+            csi,
         })
     }
 
@@ -333,6 +342,21 @@ impl Kubelet {
                 loop {
                     interval.tick().await;
                     pm.reclaim_released().await;
+                }
+            });
+        }
+
+        // External CSI drivers (#52): register what appears in
+        // plugins_registry, and undo the volumes of pods that are gone
+        // (deleted while the kubelet was down, or a teardown due a retry).
+        tokio::spawn(self.csi.clone().run());
+        {
+            let pm = self.pod_manager.clone();
+            tokio::spawn(async move {
+                let mut interval = time::interval(Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    pm.sweep_csi_volumes().await;
                 }
             });
         }
