@@ -3646,7 +3646,7 @@ mod tests {
 
     /// In-memory runtime for pod lifecycle tests.
     #[derive(Default)]
-    struct FakeRuntime {
+    pub(super) struct FakeRuntime {
         sandboxes: Mutex<HashMap<String, (PodSandboxState, PodSandboxConfig)>>,
         containers: Mutex<HashMap<String, FakeContainer>>,
         next_id: AtomicU32,

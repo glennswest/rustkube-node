@@ -452,3 +452,489 @@ pub(super) fn csi_records(state_root: &str) -> Vec<(String, VolData)> {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    //! The whole node side against a real gRPC driver on a Unix socket: a mock
+    //! registrar and node plugin, a fake apiserver, and PID 1's mountinfo as a
+    //! file the mock driver writes to when it "mounts".
+
+    use super::*;
+    use crate::csi::proto;
+    use crate::csi_plugins::{registration_proto as reg, CsiPlugins};
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+    use tonic::{Request, Response, Status};
+
+    const NODE: &str = "test-node";
+    const DRIVER: &str = "test.csi.io";
+
+    type R<T> = Result<Response<T>, Status>;
+
+    /// A node plugin that records its calls and "mounts" by creating the
+    /// target and listing it in the mountinfo file, when `propagates`.
+    #[derive(Clone)]
+    struct MockDriver {
+        calls: Arc<Mutex<Vec<String>>>,
+        stage: Arc<Mutex<Option<proto::NodeStageVolumeRequest>>>,
+        publish: Arc<Mutex<Option<proto::NodePublishVolumeRequest>>>,
+        mountinfo: PathBuf,
+        propagates: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl MockDriver {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+        fn record(&self, c: &str) {
+            self.calls.lock().unwrap().push(c.to_string());
+        }
+    }
+
+    #[tonic::async_trait]
+    impl proto::identity_server::Identity for MockDriver {
+        async fn get_plugin_info(&self, _: Request<proto::GetPluginInfoRequest>) -> R<proto::GetPluginInfoResponse> {
+            Ok(Response::new(proto::GetPluginInfoResponse {
+                name: DRIVER.into(),
+                vendor_version: "1.0".into(),
+                manifest: Default::default(),
+            }))
+        }
+        async fn get_plugin_capabilities(
+            &self,
+            _: Request<proto::GetPluginCapabilitiesRequest>,
+        ) -> R<proto::GetPluginCapabilitiesResponse> {
+            Ok(Response::new(proto::GetPluginCapabilitiesResponse { capabilities: vec![] }))
+        }
+        async fn probe(&self, _: Request<proto::ProbeRequest>) -> R<proto::ProbeResponse> {
+            Ok(Response::new(proto::ProbeResponse { ready: Some(true) }))
+        }
+    }
+
+    #[tonic::async_trait]
+    impl proto::node_server::Node for MockDriver {
+        async fn node_stage_volume(&self, r: Request<proto::NodeStageVolumeRequest>) -> R<proto::NodeStageVolumeResponse> {
+            self.record("stage");
+            *self.stage.lock().unwrap() = Some(r.into_inner());
+            Ok(Response::new(proto::NodeStageVolumeResponse {}))
+        }
+        async fn node_unstage_volume(&self, _: Request<proto::NodeUnstageVolumeRequest>) -> R<proto::NodeUnstageVolumeResponse> {
+            self.record("unstage");
+            Ok(Response::new(proto::NodeUnstageVolumeResponse {}))
+        }
+        async fn node_publish_volume(&self, r: Request<proto::NodePublishVolumeRequest>) -> R<proto::NodePublishVolumeResponse> {
+            self.record("publish");
+            let r = r.into_inner();
+            std::fs::create_dir_all(&r.target_path).unwrap();
+            if self.propagates.load(std::sync::atomic::Ordering::SeqCst) {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new().append(true).create(true).open(&self.mountinfo).unwrap();
+                writeln!(f, "140 22 0:52 / {} rw shared:70 - tmpfs tmpfs rw", r.target_path).unwrap();
+            }
+            *self.publish.lock().unwrap() = Some(r);
+            Ok(Response::new(proto::NodePublishVolumeResponse {}))
+        }
+        async fn node_unpublish_volume(&self, r: Request<proto::NodeUnpublishVolumeRequest>) -> R<proto::NodeUnpublishVolumeResponse> {
+            self.record("unpublish");
+            let _ = std::fs::remove_dir(r.into_inner().target_path);
+            Ok(Response::new(proto::NodeUnpublishVolumeResponse {}))
+        }
+        async fn node_get_volume_stats(&self, _: Request<proto::NodeGetVolumeStatsRequest>) -> R<proto::NodeGetVolumeStatsResponse> {
+            Err(Status::unimplemented("stats"))
+        }
+        async fn node_expand_volume(&self, _: Request<proto::NodeExpandVolumeRequest>) -> R<proto::NodeExpandVolumeResponse> {
+            Err(Status::unimplemented("expand"))
+        }
+        async fn node_get_capabilities(
+            &self,
+            _: Request<proto::NodeGetCapabilitiesRequest>,
+        ) -> R<proto::NodeGetCapabilitiesResponse> {
+            use proto::node_service_capability::{rpc::Type, Rpc, Type as Cap};
+            Ok(Response::new(proto::NodeGetCapabilitiesResponse {
+                capabilities: vec![proto::NodeServiceCapability {
+                    r#type: Some(Cap::Rpc(Rpc { r#type: Type::StageUnstageVolume as i32 })),
+                }],
+            }))
+        }
+        async fn node_get_info(&self, _: Request<proto::NodeGetInfoRequest>) -> R<proto::NodeGetInfoResponse> {
+            Ok(Response::new(proto::NodeGetInfoResponse {
+                node_id: "driver-id-of-test-node".into(),
+                max_volumes_per_node: 0,
+                accessible_topology: Some(proto::Topology {
+                    segments: HashMap::from([("topology.test.csi.io/node".into(), NODE.into())]),
+                }),
+            }))
+        }
+    }
+
+    /// The registrar sidecar: points the kubelet at the driver's socket.
+    #[derive(Clone)]
+    struct MockRegistrar {
+        endpoint: String,
+        notified: Arc<Mutex<Option<reg::RegistrationStatus>>>,
+    }
+
+    #[tonic::async_trait]
+    impl reg::registration_server::Registration for MockRegistrar {
+        async fn get_info(&self, _: Request<reg::InfoRequest>) -> R<reg::PluginInfo> {
+            Ok(Response::new(reg::PluginInfo {
+                r#type: "CSIPlugin".into(),
+                name: DRIVER.into(),
+                endpoint: self.endpoint.clone(),
+                supported_versions: vec!["1.0.0".into()],
+            }))
+        }
+        async fn notify_registration_status(
+            &self,
+            r: Request<reg::RegistrationStatus>,
+        ) -> R<reg::RegistrationStatusResponse> {
+            *self.notified.lock().unwrap() = Some(r.into_inner());
+            Ok(Response::new(reg::RegistrationStatusResponse {}))
+        }
+    }
+
+    /// A fake apiserver: GET what is stored, 404 otherwise; POST and PUT
+    /// store; PATCH is recorded.
+    #[derive(Clone, Default)]
+    struct FakeApi {
+        objects: Arc<Mutex<HashMap<String, Value>>>,
+        patches: Arc<Mutex<Vec<(String, Value)>>>,
+    }
+
+    impl FakeApi {
+        fn put(&self, path: &str, v: Value) {
+            self.objects.lock().unwrap().insert(path.to_string(), v);
+        }
+        fn get(&self, path: &str) -> Option<Value> {
+            self.objects.lock().unwrap().get(path).cloned()
+        }
+        async fn serve(&self) -> String {
+            use axum::http::{Method, StatusCode};
+            let api = self.clone();
+            let app = axum::Router::new().fallback(
+                move |method: Method, uri: axum::http::Uri, body: axum::body::Bytes| {
+                    let api = api.clone();
+                    async move {
+                        let path = uri.path().to_string();
+                        let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                        match method {
+                            Method::GET => match api.get(&path) {
+                                Some(v) => (StatusCode::OK, axum::Json(v)),
+                                None => (StatusCode::NOT_FOUND, axum::Json(json!({}))),
+                            },
+                            Method::POST => {
+                                let name = body["metadata"]["name"].as_str().unwrap_or("").to_string();
+                                api.put(&format!("{path}/{name}"), body.clone());
+                                (StatusCode::CREATED, axum::Json(body))
+                            }
+                            Method::PUT => {
+                                api.put(&path, body.clone());
+                                (StatusCode::OK, axum::Json(body))
+                            }
+                            Method::PATCH => {
+                                api.patches.lock().unwrap().push((path, body.clone()));
+                                (StatusCode::OK, axum::Json(body))
+                            }
+                            _ => (StatusCode::METHOD_NOT_ALLOWED, axum::Json(json!({}))),
+                        }
+                    }
+                },
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            format!("http://{addr}")
+        }
+    }
+
+    struct Rig {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        driver: MockDriver,
+        registrar: MockRegistrar,
+        api: FakeApi,
+        csi: Arc<CsiPlugins>,
+        mgr: PodManager,
+    }
+
+    async fn rig() -> Rig {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let registry = root.join("plugins_registry");
+        std::fs::create_dir_all(&registry).unwrap();
+        std::fs::create_dir_all(root.join("plugins/test")).unwrap();
+        let mountinfo = root.join("mountinfo");
+        std::fs::write(&mountinfo, "22 1 0:21 / / rw - erofs /dev/vda ro\n").unwrap();
+
+        let driver = MockDriver {
+            calls: Default::default(),
+            stage: Default::default(),
+            publish: Default::default(),
+            mountinfo: mountinfo.clone(),
+            propagates: Arc::new(true.into()),
+        };
+        let sock = root.join("plugins/test/csi.sock");
+        let identity = proto::identity_server::IdentityServer::new(driver.clone());
+        let node = proto::node_server::NodeServer::new(driver.clone());
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(identity)
+                .add_service(node)
+                .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(listener))
+                .await
+                .unwrap()
+        });
+
+        let registrar = MockRegistrar {
+            endpoint: format!("unix://{}", sock.display()),
+            notified: Default::default(),
+        };
+        let reg_svc = reg::registration_server::RegistrationServer::new(registrar.clone());
+        let listener = tokio::net::UnixListener::bind(registry.join(format!("{DRIVER}-reg.sock"))).unwrap();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(reg_svc)
+                .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(listener))
+                .await
+                .unwrap()
+        });
+
+        let api = FakeApi::default();
+        let url = api.serve().await;
+        api.put(&format!("/api/v1/nodes/{NODE}"), json!({"metadata": {"name": NODE, "uid": "node-uid"}}));
+
+        let csi = Arc::new(
+            CsiPlugins::new(NODE)
+                .with_api(reqwest::Client::new(), &url)
+                .with_registry_dir(&registry),
+        );
+        let rt = Arc::new(crate::pod_manager::tests::FakeRuntime::default());
+        let mut mgr = PodManager::with_api(rt.clone(), rt, NODE, &url, "127.0.0.1", reqwest::Client::new())
+            .with_csi(csi.clone());
+        mgr.state_root = root.join("kubelet").to_string_lossy().into_owned();
+        mgr.csi_mountinfo = mountinfo.to_string_lossy().into_owned();
+        Rig { _dir: dir, root, driver, registrar, api, csi, mgr }
+    }
+
+    fn claim_pod(uid: &str, name: &str) -> Value {
+        json!({
+            "metadata": {"name": name, "namespace": "default", "uid": uid},
+            "spec": {
+                "nodeName": NODE,
+                "serviceAccountName": "app",
+                "volumes": [{"name": "data", "persistentVolumeClaim": {"claimName": "data"}}],
+                "containers": [{"name": "c", "image": "busybox"}],
+            },
+        })
+    }
+
+    fn store_claim(api: &FakeApi) {
+        api.put(
+            "/api/v1/namespaces/default/persistentvolumeclaims/data",
+            json!({"metadata": {"name": "data", "namespace": "default"},
+                   "spec": {"storageClassName": "test", "volumeName": "pv-data",
+                            "accessModes": ["ReadWriteOnce"]}}),
+        );
+        api.put(
+            "/api/v1/persistentvolumes/pv-data",
+            json!({"metadata": {"name": "pv-data"},
+                   "spec": {"accessModes": ["ReadWriteOnce"],
+                            "mountOptions": ["noatime"],
+                            "csi": {"driver": DRIVER, "volumeHandle": "vol-1", "fsType": "ext4",
+                                    "volumeAttributes": {"share": "a"}}}}),
+        );
+        api.put(
+            &format!("/apis/storage.k8s.io/v1/csidrivers/{DRIVER}"),
+            json!({"metadata": {"name": DRIVER}, "spec": {"attachRequired": true, "podInfoOnMount": true}}),
+        );
+    }
+
+    fn attach(api: &FakeApi) {
+        let va = csi::attachment_name("vol-1", DRIVER, NODE);
+        api.put(
+            &format!("/apis/storage.k8s.io/v1/volumeattachments/{va}"),
+            json!({"metadata": {"name": va},
+                   "status": {"attached": true, "attachmentMetadata": {"devicePath": "/dev/sdx"}}}),
+        );
+    }
+
+    fn not_ready(r: Result<HashMap<String, super::super::ResolvedVolume>, crate::cri::CriError>) -> String {
+        match r {
+            Err(crate::cri::CriError::VolumeNotReady(m)) => m,
+            other => panic!("expected VolumeNotReady, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_driver_registers_and_is_recorded_in_csinode() {
+        let rig = rig().await;
+        rig.csi.scan_once().await;
+        assert_eq!(rig.csi.names().await, vec![DRIVER.to_string()]);
+        let reg = rig.csi.get(DRIVER).await.unwrap();
+        assert_eq!(reg.node.node_id, "driver-id-of-test-node");
+        assert!(reg.caps.stage_unstage);
+        // The registrar was told.
+        let n = rig.registrar.notified.lock().unwrap().clone().unwrap();
+        assert!(n.plugin_registered, "{}", n.error);
+
+        // CSINode lists it, with the driver's node ID, owned by the Node.
+        let cn = rig.api.get(&format!("/apis/storage.k8s.io/v1/csinodes/{NODE}")).unwrap();
+        assert_eq!(cn["spec"]["drivers"][0]["name"], DRIVER);
+        assert_eq!(cn["spec"]["drivers"][0]["nodeID"], "driver-id-of-test-node");
+        assert_eq!(cn["spec"]["drivers"][0]["topologyKeys"], json!(["topology.test.csi.io/node"]));
+        assert_eq!(cn["metadata"]["ownerReferences"][0]["uid"], "node-uid");
+        // And the topology is on the node.
+        let patches = rig.api.patches.lock().unwrap().clone();
+        assert_eq!(patches[0].1["metadata"]["labels"]["topology.test.csi.io/node"], NODE);
+
+        // The registrar goes: so does the driver, from here and CSINode.
+        std::fs::remove_file(rig.root.join(format!("plugins_registry/{DRIVER}-reg.sock"))).unwrap();
+        rig.csi.scan_once().await;
+        assert!(rig.csi.names().await.is_empty());
+        let cn = rig.api.get(&format!("/apis/storage.k8s.io/v1/csinodes/{NODE}")).unwrap();
+        assert_eq!(cn["spec"]["drivers"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_claim_of_another_driver_is_staged_published_and_torn_down() {
+        let rig = rig().await;
+        store_claim(&rig.api);
+        let pod = claim_pod("uid-1", "app-1");
+
+        // Not registered yet: the pod waits, and says which driver.
+        let m = not_ready(rig.mgr.resolve_volumes(&pod).await);
+        assert!(m.contains("not registered"), "{m}");
+
+        rig.csi.scan_once().await;
+        // Registered, not attached: waits on the VolumeAttachment by name.
+        let m = not_ready(rig.mgr.resolve_volumes(&pod).await);
+        assert!(m.contains(&csi::attachment_name("vol-1", DRIVER, NODE)), "{m}");
+        assert!(rig.driver.calls().is_empty(), "nothing is staged before the attach");
+
+        attach(&rig.api);
+        let vols = rig.mgr.resolve_volumes(&pod).await.unwrap();
+        let target = csi::publish_path(&rig.mgr.state_root, "uid-1", "data");
+        assert_eq!(vols["data"].path, target);
+        assert_eq!(vols["data"].fstype, None, "the engine binds a published directory");
+        assert_eq!(rig.driver.calls(), vec!["stage", "publish"]);
+
+        let stage = rig.driver.stage.lock().unwrap().clone().unwrap();
+        assert_eq!(stage.volume_id, "vol-1");
+        assert_eq!(stage.staging_target_path, csi::staging_path(&rig.mgr.state_root, DRIVER, "vol-1"));
+        assert_eq!(stage.publish_context["devicePath"], "/dev/sdx");
+        let publish = rig.driver.publish.lock().unwrap().clone().unwrap();
+        assert_eq!(publish.target_path, target);
+        assert_eq!(publish.staging_target_path, stage.staging_target_path);
+        assert_eq!(publish.volume_context["share"], "a");
+        assert_eq!(publish.volume_context["csi.storage.k8s.io/pod.name"], "app-1");
+        assert_eq!(publish.volume_context["csi.storage.k8s.io/serviceAccount.name"], "app");
+        let cap = publish.volume_capability.unwrap();
+        match cap.access_type.unwrap() {
+            proto::volume_capability::AccessType::Mount(m) => {
+                assert_eq!(m.fs_type, "ext4");
+                assert_eq!(m.mount_flags, vec!["noatime".to_string()]);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            cap.access_mode.unwrap().mode,
+            proto::volume_capability::access_mode::Mode::SingleNodeWriter as i32
+        );
+
+        // A second pod on the node shares the staged volume.
+        let pod2 = claim_pod("uid-2", "app-2");
+        rig.mgr.resolve_volumes(&pod2).await.unwrap();
+
+        // The first pod goes: unpublished, and not unstaged, because the
+        // second still has it.
+        rig.mgr.stop_pod("uid-1").await.unwrap();
+        assert_eq!(rig.driver.calls(), vec!["stage", "publish", "stage", "publish", "unpublish"]);
+        assert!(!Path::new(&target).exists());
+        // The last one goes: unstaged.
+        rig.mgr.stop_pod("uid-2").await.unwrap();
+        assert_eq!(
+            rig.driver.calls(),
+            vec!["stage", "publish", "stage", "publish", "unpublish", "unpublish", "unstage"]
+        );
+        assert!(csi_records(&rig.mgr.state_root).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_mount_the_node_cannot_see_is_refused_not_given_as_scratch() {
+        let rig = rig().await;
+        store_claim(&rig.api);
+        attach(&rig.api);
+        rig.csi.scan_once().await;
+        // The driver mounts in its own namespace and nothing propagates.
+        rig.driver.propagates.store(false, std::sync::atomic::Ordering::SeqCst);
+        let m = not_ready(rig.mgr.resolve_volumes(&claim_pod("uid-1", "app-1")).await);
+        assert!(m.contains("not visible on the node"), "{m}");
+        assert!(m.contains("Bidirectional"), "{m}");
+        // The record is there, so the sweep can undo the publish once the pod is gone.
+        assert_eq!(csi_records(&rig.mgr.state_root).len(), 1);
+        rig.api.put("/api/v1/pods", json!({"items": []}));
+        rig.mgr.sweep_csi_volumes().await;
+        assert!(rig.driver.calls().ends_with(&["unpublish".to_string(), "unstage".to_string()]));
+        assert!(csi_records(&rig.mgr.state_root).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_sweep_leaves_a_live_pods_volumes_alone() {
+        let rig = rig().await;
+        store_claim(&rig.api);
+        attach(&rig.api);
+        rig.csi.scan_once().await;
+        let pod = claim_pod("uid-1", "app-1");
+        rig.mgr.resolve_volumes(&pod).await.unwrap();
+        // Bound here and not finished, per the apiserver: a pod mid-start.
+        rig.api.put("/api/v1/pods", json!({"items": [pod]}));
+        rig.mgr.sweep_csi_volumes().await;
+        assert_eq!(rig.driver.calls(), vec!["stage", "publish"]);
+        assert_eq!(csi_records(&rig.mgr.state_root).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_inline_volume_is_published_only_for_an_ephemeral_capable_driver() {
+        let rig = rig().await;
+        rig.csi.scan_once().await;
+        let pod = json!({
+            "metadata": {"name": "p", "namespace": "default", "uid": "uid-9"},
+            "spec": {"nodeName": NODE, "volumes": [
+                {"name": "scratch", "csi": {"driver": DRIVER, "volumeAttributes": {"size": "1Gi"}}}
+            ]},
+        });
+        rig.api.put(
+            &format!("/apis/storage.k8s.io/v1/csidrivers/{DRIVER}"),
+            json!({"spec": {"attachRequired": false, "volumeLifecycleModes": ["Persistent"]}}),
+        );
+        let m = not_ready(rig.mgr.resolve_volumes(&pod).await);
+        assert!(m.contains("Ephemeral"), "{m}");
+
+        rig.api.put(
+            &format!("/apis/storage.k8s.io/v1/csidrivers/{DRIVER}"),
+            json!({"spec": {"attachRequired": false, "volumeLifecycleModes": ["Ephemeral"]}}),
+        );
+        rig.mgr.resolve_volumes(&pod).await.unwrap();
+        // Publish only: an inline volume is neither attached nor staged.
+        assert_eq!(rig.driver.calls(), vec!["publish"]);
+        let publish = rig.driver.publish.lock().unwrap().clone().unwrap();
+        assert_eq!(publish.volume_context["csi.storage.k8s.io/ephemeral"], "true");
+        assert_eq!(publish.volume_id, format!("csi-{}", csi::sha256_hex("uid-9scratch")));
+        rig.mgr.stop_pod("uid-9").await.unwrap();
+        assert_eq!(rig.driver.calls(), vec!["publish", "unpublish"]);
+    }
+
+    #[tokio::test]
+    async fn a_generic_ephemeral_volume_waits_for_its_claim_by_name() {
+        let rig = rig().await;
+        let pod = json!({
+            "metadata": {"name": "web", "namespace": "default", "uid": "uid-e"},
+            "spec": {"nodeName": NODE, "volumes": [
+                {"name": "cache", "ephemeral": {"volumeClaimTemplate": {"spec": {}}}}
+            ]},
+        });
+        let m = not_ready(rig.mgr.resolve_volumes(&pod).await);
+        assert!(m.contains("default/web-cache"), "{m}");
+    }
+}
