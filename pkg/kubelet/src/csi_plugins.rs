@@ -407,8 +407,9 @@ fn resolve_endpoint(endpoint: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_csinode_entry_carries_the_drivers_node_id_and_topology() {
+    // A tokio test only because a client's lazy channel spawns its worker.
+    #[tokio::test]
+    async fn a_csinode_entry_carries_the_drivers_node_id_and_topology() {
         let r = Registered {
             name: "hostpath.csi.k8s.io".into(),
             client: CsiDriverClient::new(Path::new("/nonexistent")),
