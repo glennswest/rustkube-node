@@ -80,6 +80,17 @@ from the claim's, so a PV deleted over a surviving clone would let a later
 claim of the same name in the same namespace adopt the previous tenant's
 data.
 
+## Storage
+
+Claims of the built-in `stormblock` class are cloned and attached by the
+node itself (`pkg/kubelet/src/storage.rs`). Every other StorageClass goes
+through its CSI driver. The kubelet registers node plugins from
+`/var/lib/kubelet/plugins_registry`, writes `CSINode`, and stages and
+publishes volumes. It will not give a pod a volume whose mount has not reached
+the node. See [docs/csi.md](docs/csi.md). The mounts of external drivers need
+Bidirectional propagation in the engine (stormpump#35), and until that lands
+pods on such claims wait with that reason.
+
 ## Relationship to rustkube
 
 - **Control plane** (kube-apiserver, controller-manager, scheduler, fastetcd)

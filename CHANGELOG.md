@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+### 2026-09-24 (external CSI drivers, #52)
+- **feat(csi):** `csi.rs` is a real CSI node client: gRPC over the driver's
+  Unix socket, from the vendored CSI v1.9.0 proto. It was a stub that logged
+  each call and created the directories, and it never reached a driver.
+- **feat(csi):** driver registration. Registrar sockets in
+  `/var/lib/kubelet/plugins_registry` are found (GetInfo), the driver is
+  asked about the node (NodeGetInfo, NodeGetCapabilities), and `CSINode`
+  lists exactly the registered drivers with their node IDs and topology
+  keys. Topology becomes node labels, and the registrar is told the outcome.
+  A removed socket deregisters its driver.
+- **feat(csi):** a claim bound to another driver's PV mounts. The kubelet
+  waits for its VolumeAttachment when the CSIDriver requires attach, stages
+  to upstream's `globalmount`, publishes to the pod's `kubernetes.io~csi`
+  directory, and has the engine bind that directory. It unpublishes when the
+  pod goes, and unstages when the last pod on the node lets go. Records
+  (`vol_data.json`) are written before any driver call, and a 30 s sweep
+  undoes what a restart or a failed start left behind.
+- **feat(csi):** inline `csi:` volumes, for drivers that allow `Ephemeral`.
+  Generic `ephemeral:` volumes resolve to their `<pod>-<volume>` claim and
+  wait for it, with a reason (rustkube#94: nothing creates it yet).
+- **fix(csi):** a published volume is given to a pod only when it is a mount
+  point in PID 1's mountinfo. A driver's mount that stayed in its own
+  namespace would otherwise hand the pod an empty directory. That is the
+  state until the engine does Bidirectional propagation (stormpump#35).
+- **fix(kubelet):** Bidirectional mount propagation is for privileged
+  containers only, as upstream rules. An unprivileged container is mounted
+  Private, with a warning.
+- **fix(kubelet):** CSI volumes are not SELinux-relabelled.
+- **build:** `scripts/sc-build.sh` builds on the build box without a sibling
+  rustkube checkout, by cloning it inside the scratch tree.
+- **docs:** `docs/csi.md`, including the mount-propagation decision.
+
 ### 2026-09-24
 - **fix(runtime):** a container's volume registrations (root, logs, mounts) are
   released when it is removed. They never were, so a claim's device mount

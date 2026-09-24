@@ -412,6 +412,11 @@ fn spec_for(config: &ContainerConfig, sandbox: &PodSandboxConfig) -> stormpump::
             .mounts
             .iter()
             .take(MAX_MOUNTS)
+            // `m.propagation` has nowhere to go yet: the engine's mounts are
+            // all private, so a Bidirectional one (a CSI node plugin's
+            // /var/lib/kubelet) does not push its mounts back to the node.
+            // The kubelet catches the result before a pod is given an empty
+            // volume (`csi::is_mount_point`). stormpump#35 adds the field.
             .map(|m| stormpump::spec::Mount {
                 dst: m.container_path.clone(),
                 readonly: m.readonly,
