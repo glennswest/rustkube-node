@@ -21,7 +21,13 @@ cargo build --release --target x86_64-unknown-linux-musl
 ```
 
 This needs `../rustkube` checked out as a sibling and `protoc` on the host, for
-the CRI gRPC codegen.
+the gRPC codegen (CRI, CSI, and plugin registration).
+
+On the build box, use `sc-build scripts/sc-build.sh` (optionally followed by
+a command, which defaults to `cargo build && cargo test`). sc-build builds in a
+scratch directory with no sibling, so the script clones rustkube inside the
+scratch tree (`RUSTKUBE_REF`, default `main`) and points the path dependency
+there.
 
 ## Why a golden
 
