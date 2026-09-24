@@ -3342,7 +3342,25 @@ fn resolve_mounts(spec: &Value, volumes: &HashMap<String, ResolvedVolume>) -> Ve
                         host_path,
                         readonly: m["readOnly"].as_bool().unwrap_or(false),
                         propagation: match m["mountPropagation"].as_str() {
-                            Some("Bidirectional") => MountPropagation::Bidirectional,
+                            // Only a privileged container may push mounts back
+                            // to the node, as upstream rules. Anything else asking
+                            // gets Private. That cannot hand a pod an empty volume:
+                            // a CSI driver whose mounts do not reach the node is
+                            // caught by the kubelet's mountinfo check, and the pod
+                            // waits with the reason (`csi::is_mount_point`).
+                            Some("Bidirectional")
+                                if spec["securityContext"]["privileged"].as_bool() == Some(true) =>
+                            {
+                                MountPropagation::Bidirectional
+                            }
+                            Some("Bidirectional") => {
+                                warn!(
+                                    "container {}: mountPropagation Bidirectional on {vol_name} \
+                                     needs a privileged container; mounted Private",
+                                    spec["name"].as_str().unwrap_or("?")
+                                );
+                                MountPropagation::Private
+                            }
                             Some("HostToContainer") => MountPropagation::HostToContainer,
                             _ => MountPropagation::Private,
                         },
@@ -4283,6 +4301,25 @@ mod tests {
         assert_eq!(c.mounts[0].host_path, "/sys/fs/bpf");
         assert_eq!(c.mounts[0].container_path, "/sys/fs/bpf");
         assert_eq!(c.mounts[0].propagation, MountPropagation::Bidirectional);
+    }
+
+    #[test]
+    fn only_a_privileged_container_gets_bidirectional_propagation() {
+        let mut volumes = HashMap::new();
+        volumes.insert(
+            "kubelet".to_string(),
+            ResolvedVolume { path: "/var/lib/kubelet".to_string(), fstype: None },
+        );
+        let spec = |privileged: bool| {
+            json!({
+                "name": "csi-plugin",
+                "securityContext": {"privileged": privileged},
+                "volumeMounts": [{"name": "kubelet", "mountPath": "/var/lib/kubelet",
+                                  "mountPropagation": "Bidirectional"}]
+            })
+        };
+        assert_eq!(resolve_mounts(&spec(true), &volumes)[0].propagation, MountPropagation::Bidirectional);
+        assert_eq!(resolve_mounts(&spec(false), &volumes)[0].propagation, MountPropagation::Private);
     }
 
     #[test]
