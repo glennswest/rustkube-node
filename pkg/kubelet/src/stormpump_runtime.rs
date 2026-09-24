@@ -915,9 +915,40 @@ impl RuntimeService for StormpumpRuntime {
         // Then the volumes it held. The last release of a claim's device
         // mount unmounts it in the engine, which is what makes the claim safe
         // to detach and delete afterwards.
+        // A mount still in use answers EBUSY and keeps its entry; that is a
+        // process finishing its teardown, so try again for a while rather
+        // than leave the claim mounted for ever (which makes it impossible to
+        // detach and reclaim). In the background: removal does not wait.
+        let mut busy = Vec::new();
         for v in volumes {
             if let Err(e) = self.on_ring(move |r| r.volume_release(v)).await {
-                tracing::warn!(container = %container_id, volume = ?v, "releasing a volume: {e}");
+                tracing::debug!(container = %container_id, volume = ?v, "releasing a volume: {e}");
+                busy.push(v);
+            }
+        }
+        if !busy.is_empty() {
+            if let Ok(ring) = self.ring() {
+                let id = container_id.to_string();
+                tokio::spawn(async move {
+                    for attempt in 1..=30 {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        let pending = std::mem::take(&mut busy);
+                        for v in pending {
+                            let r = ring.clone();
+                            let ok = tokio::task::spawn_blocking(move || r.volume_release(v).is_ok())
+                                .await
+                                .unwrap_or(false);
+                            if !ok {
+                                busy.push(v);
+                            }
+                        }
+                        if busy.is_empty() {
+                            tracing::info!(container = %id, attempt, "volumes released");
+                            return;
+                        }
+                    }
+                    tracing::warn!(container = %id, volumes = ?busy, "volumes still in use after a minute; left registered");
+                });
             }
         }
         Ok(())

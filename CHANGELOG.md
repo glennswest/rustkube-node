@@ -9,6 +9,8 @@
   filesystem, and every `sync` on the node hung on the recoverable ublk device.
   The last release now unmounts (stormpump 23aaab7), and stormblock refuses a
   detach while mounted (0718bd1).
+- **fix(runtime):** a volume release answered EBUSY (a mount still in use) is
+  retried every 2 s for a minute in the background, not dropped.
 
 ### 2026-09-23 (PVCs)
 - **fix(storage):** claims find the blanks the image ships. The kubelet looked
