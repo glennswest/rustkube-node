@@ -35,15 +35,18 @@ Findings, 2026-09-24:
   shared mount on the host.
 
 Steps:
-1. [ ] Vendor `csi.proto` and the plugin-registration proto; build.rs generates clients (and servers, for tests).
-2. [ ] `csi.rs`: a real gRPC client over the driver's Unix socket (Identity + Node).
-3. [ ] `csi_plugins.rs`: watch `/var/lib/kubelet/plugins_registry`, GetInfo, NodeGetInfo,
+1. [x] Vendor `csi.proto` and the plugin-registration proto; build.rs generates clients (and servers, for tests).
+2. [x] `csi.rs`: a real gRPC client over the driver's Unix socket (Identity + Node).
+3. [x] `csi_plugins.rs`: watch `/var/lib/kubelet/plugins_registry`, GetInfo, NodeGetInfo,
        write `CSINode` and the topology labels, NotifyRegistrationStatus, and deregister when the socket goes.
-4. [ ] Mount: a claim bound to a PV of another driver waits for its VolumeAttachment
+4. [x] Mount: a claim bound to a PV of another driver waits for its VolumeAttachment
        (when the CSIDriver has `attachRequired`), then NodeStage and NodePublish, and the published directory is bound in.
        Write `vol_data.json` beside the mount so teardown survives a kubelet restart.
-5. [ ] Unmount: NodeUnpublish when the pod goes, NodeUnstage when it is the last pod on the node.
-6. [ ] Pass `mountPropagation` through to stormpump once it has the field. File the stormpump issue now.
-7. [ ] Tests: a mock driver and registrar on a real Unix socket, the full round trip.
-8. [ ] Docs (`docs/csi.md`), CHANGELOG.
-9. [ ] End to end with csi-driver-host-path: blocked on step 6 (stormpump).
+5. [x] Unmount: NodeUnpublish when the pod goes, NodeUnstage when it is the last pod on the node.
+6. [ ] Pass `mountPropagation` through to stormpump once it has the field. Filed as stormpump#35. Until then the mountinfo check keeps pods waiting instead of giving them an empty directory.
+7. [x] Tests: a mock driver and registrar on a real Unix socket, the full round trip.
+8. [x] Docs (`docs/csi.md`), CHANGELOG.
+9. [ ] End to end with csi-driver-host-path: blocked on step 6 (stormpump#35).
+10. [ ] Build verified with `sc-build scripts/sc-build.sh` (in progress).
+
+Related, filed elsewhere: rustkube#94 (no ephemeral-volume controller).
