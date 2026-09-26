@@ -22,6 +22,22 @@ golden (`scripts/build-golden.sh`), not a package. The cross-project rules are i
 
 ## Work plan
 
+### In progress: #58, the golden build cannot load the workspace
+
+The golden build fetches this repo alone, at one commit, and runs
+`cargo build --release --locked`. `apimachinery` was `path = "../rustkube/..."`,
+so there is no sibling there and the manifest does not load.
+
+Steps:
+1. [ ] `apimachinery` becomes a git dependency on rustkube, pinned by `rev`
+       (v0.15.2, e7f4fdb). A rustkube bump is an explicit change here.
+2. [ ] Regenerate `Cargo.lock` for it on dev (`cargo update -p apimachinery`, no cargo on this VM).
+3. [ ] Remove `scripts/sc-build.sh` and `.deps/`; docs (README, BUILD.md), CHANGELOG.
+4. [ ] `sc-build 'cargo build --release --locked --target x86_64-unknown-linux-musl'`, then `sc-build` (build + test).
+5. [ ] Close #58, request the golden.
+
+### Parked: #52 on stormpump#35 (P1)
+
 ### In progress: #52, external StorageClasses (the CSI node side)
 
 Findings, 2026-09-24:
