@@ -31,7 +31,7 @@ so there is no sibling there and the manifest does not load.
 Steps:
 1. [x] `apimachinery` becomes a git dependency on rustkube, pinned by `rev`
        (v0.15.2, e7f4fdb). A rustkube bump is an explicit change here.
-2. [ ] Regenerate `Cargo.lock` for it on dev (no cargo on this VM). `cargo update -p apimachinery` cannot
+2. [x] Regenerate `Cargo.lock` for it on dev (no cargo on this VM). `cargo update -p apimachinery` cannot
        match the old path entry, so use `cargo metadata`, which rewrites the lock minimally.
 3. [x] Remove `scripts/sc-build.sh` and `.deps/`; docs (README, BUILD.md), CHANGELOG.
 4. [ ] `sc-build 'cargo build --release --locked --target x86_64-unknown-linux-musl'`, then `sc-build` (build + test).
