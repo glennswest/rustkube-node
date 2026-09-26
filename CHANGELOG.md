@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### 2026-09-26 (golden build, #58)
+- **fix(build):** rustkube's `apimachinery` is a git dependency pinned by
+  `rev` (rustkube v0.15.2, e7f4fdb), not `path = "../rustkube/..."`. The
+  golden build fetches this repository alone and runs `--locked`, and it
+  could not load the workspace without the sibling. `Cargo.lock` records the
+  commit, so a rustkube bump is an explicit change here.
+- **chore(build):** `scripts/sc-build.sh` and `.deps/` are gone. They cloned
+  rustkube into sc-build's scratch tree, and plain `sc-build` now works.
+
 ### 2026-09-24 (external CSI drivers, #52)
 - **feat(csi):** `csi.rs` is a real CSI node client: gRPC over the driver's
   Unix socket, from the vendored CSI v1.9.0 proto. It was a stub that logged

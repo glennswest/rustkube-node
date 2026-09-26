@@ -20,14 +20,14 @@ For a plain compile, without touching the forge:
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-This needs `../rustkube` checked out as a sibling and `protoc` on the host, for
-the gRPC codegen (CRI, CSI, and plugin registration).
+This needs `protoc` on the host, for the gRPC codegen (CRI, CSI, and plugin
+registration). rustkube's `apimachinery` crate comes from git at the commit
+pinned in `Cargo.toml`, so the checkout builds on its own, with `--locked`, and
+needs no sibling. To move to a newer rustkube, change that `rev` and run
+`cargo update -p apimachinery`.
 
-On the build box, use `sc-build scripts/sc-build.sh` (optionally followed by
-a command, which defaults to `cargo build && cargo test`). sc-build builds in a
-scratch directory with no sibling, so the script clones rustkube inside the
-scratch tree (`RUSTKUBE_REF`, default `main`) and points the path dependency
-there.
+On the build box, use plain `sc-build` (`cargo build && cargo test`), or
+`sc-build '<command>'`.
 
 ## Why a golden
 

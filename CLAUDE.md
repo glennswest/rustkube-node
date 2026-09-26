@@ -12,9 +12,9 @@ golden (`scripts/build-golden.sh`), not a package. The cross-project rules are i
 
 ## Build and test
 
-`sc-build` from this checkout, after `git push` (see `../CLAUDE.md`). Needs the
-`rustkube` repository as a sibling (the `apimachinery` path dependency) and
-`protoc` on the build box, for the vendored protos in `pkg/kubelet/proto`:
+`sc-build` from this checkout, after `git push` (see `../CLAUDE.md`). The
+checkout builds on its own: `apimachinery` is a git dependency on rustkube,
+pinned by `rev` in `Cargo.toml`. It needs `protoc` on the build box, for the vendored protos in `pkg/kubelet/proto`:
 
 - `api.proto`: CRI v1 (kubernetes/cri-api, release-1.32)
 - `csi/csi.proto`: CSI spec v1.9.0

@@ -5,5 +5,3 @@
 .terragrunt-cache/
 deploy/terragrunt/rknode/pki/
 
-# sc-build: rustkube cloned inside the scratch tree (scripts/sc-build.sh)
-.deps/

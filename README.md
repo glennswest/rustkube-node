@@ -97,17 +97,13 @@ pods on such claims wait with that reason.
   lives in [rustkube](https://github.com/glennswest/rustkube).
 - **DNS** is external (see [microdns](https://github.com/glennswest/microdns) —
   the K8s DNS source runs there).
-- Shared types come from rustkube's `apimachinery` crate via a **sibling path
-  dependency**:
+- Shared types come from rustkube's `apimachinery` crate, as a **git
+  dependency pinned to a commit** (`Cargo.toml`, `[workspace.dependencies]`):
   ```toml
-  apimachinery = { path = "../rustkube/pkg/apimachinery" }
+  apimachinery = { git = "https://github.com/glennswest/rustkube", rev = "<commit>" }
   ```
-  So check out `rustkube` as a sibling directory:
-  ```
-  projects/
-    rustkube/        # control plane (has pkg/apimachinery)
-    rustkube-node/   # this repo
-  ```
+  This checkout builds on its own. Moving to a newer rustkube means changing
+  `rev` and running `cargo update -p apimachinery`.
 
 ## Build
 
@@ -126,8 +122,7 @@ No tar, no loop device, no second copy of anything. See [docs/BUILD.md](docs/BUI
 To compile without touching the forge:
 
 ```bash
-# requires ../rustkube checked out as a sibling, and `protoc` on the build
-# host (CRI gRPC codegen)
+# requires `protoc` on the build host (CRI/CSI gRPC codegen)
 cargo build --release            # produces target/release/{kubelet,kube-proxy}
 cargo build --release --target x86_64-unknown-linux-musl   # static
 ```
