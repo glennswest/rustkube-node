@@ -7,7 +7,7 @@ golden (`scripts/build-golden.sh`), not a package. The cross-project rules are i
 
 ## Version
 
-`0.9.0`. There is one version location: `[workspace.package] version` in
+`0.10.0`. There is one version location: `[workspace.package] version` in
 `Cargo.toml` (every crate uses `version.workspace = true`).
 
 ## Build and test

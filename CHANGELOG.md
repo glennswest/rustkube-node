@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+<!-- New unreleased changes go here -->
+
+## [v0.10.0] — 2026-09-26
 
 ### 2026-09-26 (golden build, #58)
 - **fix(build):** rustkube's `apimachinery` is a git dependency pinned by
