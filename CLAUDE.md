@@ -22,7 +22,7 @@ pinned by `rev` in `Cargo.toml`. It needs `protoc` on the build box, for the ven
 
 ## Work plan
 
-### In progress: #58, the golden build cannot load the workspace
+### Done: #58, the golden build cannot load the workspace
 
 The golden build fetches this repo alone, at one commit, and runs
 `cargo build --release --locked`. `apimachinery` was `path = "../rustkube/..."`,
@@ -34,8 +34,8 @@ Steps:
 2. [x] Regenerate `Cargo.lock` for it on dev (no cargo on this VM). `cargo update -p apimachinery` cannot
        match the old path entry, so use `cargo metadata`, which rewrites the lock minimally.
 3. [x] Remove `scripts/sc-build.sh` and `.deps/`; docs (README, BUILD.md), CHANGELOG.
-4. [ ] `sc-build 'cargo build --release --locked --target x86_64-unknown-linux-musl'`, then `sc-build` (build + test).
-5. [ ] Close #58, request the golden.
+4. [x] `sc-build 'cargo build --release --locked --target x86_64-unknown-linux-musl'`, then `cargo test --locked`: passed at 6741e93.
+5. [x] Close #58, request the golden.
 
 ### Parked on stormpump#35 (P1): #52, external StorageClasses (the CSI node side)
 
