@@ -36,9 +36,7 @@ Steps:
 4. [ ] `sc-build 'cargo build --release --locked --target x86_64-unknown-linux-musl'`, then `sc-build` (build + test).
 5. [ ] Close #58, request the golden.
 
-### Parked: #52 on stormpump#35 (P1)
-
-### In progress: #52, external StorageClasses (the CSI node side)
+### Parked on stormpump#35 (P1): #52, external StorageClasses (the CSI node side)
 
 Findings, 2026-09-24:
 - `csi.rs` was a stub. It logged calls and created directories, and it never

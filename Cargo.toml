@@ -44,10 +44,11 @@ license = "Apache-2.0"
 repository = "https://github.com/glennswest/rustkube-node"
 
 [workspace.dependencies]
-# Shared types — sibling path dep on rustkube's apimachinery crate (single
-# source of truth; matches the multi-repo path-dep pattern used across the
-# effort). Requires the `rustkube` repo checked out as a sibling directory.
-apimachinery = { path = "../rustkube/pkg/apimachinery" }
+# Shared types: rustkube's apimachinery crate, from git at a pinned commit
+# (rustkube v0.15.2). A golden is built from this repository alone, at one
+# commit, with `--locked`, so a sibling path cannot work there (#58). Moving to
+# a newer rustkube is an explicit change of `rev` here, and Cargo.lock records it.
+apimachinery = { git = "https://github.com/glennswest/rustkube", rev = "e7f4fdb4b58044260ffe396a1a0d659876e5264a" }
 
 # Internal libs (pkg/) — consumed by the cmd/ binary crates
 kubelet = { path = "pkg/kubelet" }
