@@ -59,6 +59,23 @@ Steps:
        x86_64-unknown-linux-musl`, then `cargo test --locked`): passed (kubelet 189). Stage golden requested;
        #35 closed (verified by sc-build only, not on a node).
 
+### In progress: #64, PVC size test (the medium suite's first test)
+
+Started 2026-09-27. No `test/` existed (that is #61), so this adds the container, modelled on
+stormblock-csi's `test/` (own workspace, static musl binary, scratch image, the image doubles as
+the workload pods' program). Short and long report one skip pointing at #61.
+
+Steps:
+1. [ ] Kubelet: `parse_quantity` reads fractions (`3.5Gi` parsed as nothing, and the claim got 1 MiB).
+2. [ ] `test/`: Cargo.toml (lock seeded from stormblock-csi/test, same deps), env, api, report, workload
+       (`sized <path> <seed> <bytes> <lo> <hi>`: write, read back, statvfs total in (lo, hi]).
+3. [ ] medium `pvc-size-*`: every ladder class + 1, 1Mi+1, 17Mi, 1500M, 3.5Gi, 600Gi, in parallel; each bound,
+       status capacity = its class, df in (previous class, class], deleted, PV gone. 2Ti: FailedMount /
+       waiting reason "larger than the largest size class", never bound. 1Ti timed against a budget
+       (`RUSTKUBE_NODE_TEST_MINT_BUDGET`, default 20 min). Overcommit: skip until #62 decides.
+4. [ ] Containerfile (repo root context), Job yaml, docs, CHANGELOG, sc-build (root + `cd test`).
+5. [ ] Not runnable from here: stormcentral runs it on a test machine (`stormcentral test run`).
+
 ### Done: #63, a pod waiting on its claim stays visible (ContainerCreating + reason)
 
 Found, 2026-09-27: two causes. (1) A pod whose volumes are not ready gets a Pending status and is never
