@@ -3,6 +3,25 @@
 ## [Unreleased]
 <!-- New unreleased changes go here -->
 
+### 2026-09-27 (engine token, #66, stormcos#104)
+- **fix(kubelet):** every call to the node's stormblock engine carries the
+  engine's token (`Authorization: Bearer`). stormblock 17 refuses its API
+  without one, so claims, VM disks and image pulls stopped attaching. The pod
+  manager sent the apiserver's token, and system_claims, the VM manager and
+  the stormpump image service sent none. They now share one `EngineClient`
+  (`engine.rs`) built from `--stormblock` and the token lookup stormblock's
+  CLI uses: `$STORMBLOCK_API_TOKEN`, then `$STORMBLOCK_TOKEN_FILE` (default
+  `/run/stormblock/engine/api_token`), then `/etc/stormblock/api_token`, then
+  `/var/lib/stormblock/api_token`. While no token is found it is looked for on
+  every call, because the engine mints it at start and the kubelet may be
+  first. After a 401 it is read again and the call retried once.
+- **fix(build):** `scripts/build-golden.sh` sends the engine's token, found the
+  same way, on curl's stdin rather than its command line.
+- **BREAKING (library):** `Kubelet::with_engine` takes only the ring (the engine
+  is `KubeletConfig::engine`). `VmManager::with_storage` and
+  `StormpumpImages::with_storage` take an `EngineClient`, and so does
+  `system_claims::mirror`.
+
 ## [v0.10.0] — 2026-09-26
 
 ### 2026-09-26 (golden build, #58)

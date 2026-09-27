@@ -83,7 +83,16 @@ data.
 ## Storage
 
 Claims of the built-in `stormblock` class are cloned and attached by the
-node itself (`pkg/kubelet/src/storage.rs`). Every other StorageClass goes
+node itself (`pkg/kubelet/src/storage.rs`), through the node's stormblock
+engine (`--stormblock`, default `http://127.0.0.1:9090`). The engine requires
+its own token, and the kubelet presents it on every call
+(`pkg/kubelet/src/engine.rs`). It reads the token from `$STORMBLOCK_API_TOKEN`,
+or else from the file at `$STORMBLOCK_TOKEN_FILE` (default
+`/run/stormblock/engine/api_token`, set by stormcos), then
+`/etc/stormblock/api_token`, then `/var/lib/stormblock/api_token`. The engine
+mints the token when it starts, and the kubelet may start first, so while no
+token is found the kubelet looks again on every call. After a 401 it reads the
+token again and retries once. Every other StorageClass goes
 through its CSI driver. The kubelet registers node plugins from
 `/var/lib/kubelet/plugins_registry`, writes `CSINode`, and stages and
 publishes volumes. It will not give a pod a volume whose mount has not reached
