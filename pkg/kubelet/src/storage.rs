@@ -97,33 +97,51 @@ pub fn class_for(want: u64) -> Option<(&'static str, u64)> {
     SIZE_CLASSES.iter().copied().find(|(_, size)| *size >= want)
 }
 
-/// Parse a Kubernetes quantity (`"1Gi"`, `"512Mi"`, `"1000000"`) into bytes.
+/// Parse a Kubernetes quantity (`"1Gi"`, `"512Mi"`, `"3.5Gi"`, `"1000000"`) into bytes.
 ///
 /// Binary suffixes are powers of 1024 and decimal ones powers of 1000, as
 /// upstream defines them. `1Gi` and `1G` are different numbers, and treating
 /// them alike under-provisions by 7% without saying so.
+///
+/// **Fractions too** (#64). `3.5Gi` did not parse, and [`claim_bytes`] read a
+/// claim it could not parse as asking for nothing, so a 3.5 GiB claim got the
+/// 1 MiB class. A fraction is rounded up to a whole byte, as upstream rounds a
+/// storage request, and computed in integers so `0.1Gi` is not off by one.
 pub fn parse_quantity(q: &str) -> Option<u64> {
     let q = q.trim();
-    let (num, mult) = if let Some(n) = q.strip_suffix("Ki") {
-        (n, 1024u64)
-    } else if let Some(n) = q.strip_suffix("Mi") {
-        (n, 1024 * 1024)
-    } else if let Some(n) = q.strip_suffix("Gi") {
-        (n, 1024 * 1024 * 1024)
-    } else if let Some(n) = q.strip_suffix("Ti") {
-        (n, 1024u64.pow(4))
-    } else if let Some(n) = q.strip_suffix('K').or_else(|| q.strip_suffix('k')) {
-        (n, 1000)
-    } else if let Some(n) = q.strip_suffix('M') {
-        (n, 1_000_000)
-    } else if let Some(n) = q.strip_suffix('G') {
-        (n, 1_000_000_000)
-    } else if let Some(n) = q.strip_suffix('T') {
-        (n, 1_000_000_000_000)
-    } else {
-        (q, 1)
+    let split = q.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(q.len());
+    let (num, suffix) = q.split_at(split);
+    let mult: u64 = match suffix {
+        "" => 1,
+        "Ki" => 1 << 10,
+        "Mi" => 1 << 20,
+        "Gi" => 1 << 30,
+        "Ti" => 1 << 40,
+        "Pi" => 1 << 50,
+        "k" | "K" => 1_000,
+        "M" => 1_000_000,
+        "G" => 1_000_000_000,
+        "T" => 1_000_000_000_000,
+        "P" => 1_000_000_000_000_000,
+        _ => return None,
     };
-    num.trim().parse::<u64>().ok().map(|n| n * mult)
+    let (whole, frac) = num.split_once('.').unwrap_or((num, ""));
+    if whole.is_empty() && frac.is_empty() {
+        return None;
+    }
+    let whole: u64 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
+    let mut bytes = whole.checked_mul(mult)?;
+    let frac = frac.trim_end_matches('0');
+    if !frac.is_empty() {
+        if frac.len() > 18 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let digits: u128 = frac.parse().ok()?;
+        let scale = 10u128.pow(frac.len() as u32);
+        let part = (digits * mult as u128).div_ceil(scale);
+        bytes = bytes.checked_add(u64::try_from(part).ok()?)?;
+    }
+    Some(bytes)
 }
 
 /// How much a claim asked for, defaulting to the smallest class.
@@ -294,6 +312,24 @@ mod tests {
         assert_eq!(parse_quantity("512Mi"), Some(512 * 1024 * 1024));
         assert_eq!(parse_quantity("1048576"), Some(1048576));
         assert_eq!(parse_quantity("nonsense"), None);
+    }
+
+    #[test]
+    fn fractions_parse_and_round_up() {
+        // A 3.5Gi claim used to parse as nothing and get the 1 MiB class.
+        assert_eq!(parse_quantity("3.5Gi"), Some(3584 * 1024 * 1024));
+        assert_eq!(class_for(parse_quantity("3.5Gi").unwrap()).map(|c| c.0), Some("4G"));
+        assert_eq!(parse_quantity("1.5k"), Some(1500));
+        assert_eq!(parse_quantity(".5Ki"), Some(512));
+        // Rounded up to a whole byte.
+        assert_eq!(parse_quantity("0.1"), Some(1));
+        assert_eq!(parse_quantity("0.1Gi"), Some(107_374_183));
+        assert_eq!(parse_quantity("2.000"), Some(2));
+        assert_eq!(parse_quantity("1500M"), Some(1_500_000_000));
+        assert_eq!(parse_quantity("."), None);
+        assert_eq!(parse_quantity("1.2.3Gi"), None);
+        assert_eq!(parse_quantity("1Xi"), None);
+        assert_eq!(parse_quantity(""), None);
     }
 
     #[test]

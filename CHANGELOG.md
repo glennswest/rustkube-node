@@ -3,6 +3,11 @@
 ## [Unreleased]
 <!-- New unreleased changes go here -->
 
+### 2026-09-27 (PVC size test, #64)
+- **fix(kubelet):** a claim for a fractional size (`3.5Gi`) did not parse, and
+  a claim that does not parse was read as asking for nothing, so it got the
+  1 MiB class. Fractions now parse and round up to a whole byte.
+
 ### 2026-09-27 (a pod waiting on its claim, #63)
 - **fix(kubelet):** a pod whose volumes were not ready was reported Pending and
   then forgotten. `kubectl logs` said "not found on this node" and the pod had
