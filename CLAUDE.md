@@ -37,6 +37,18 @@ not the release path.
 
 ## Work plan
 
+### In progress: #57, pod limits onto stormpump `Spec.limits`, container stats from `QUERY`
+
+Steps:
+1. [x] `spec_for`: `memory_limit_bytes` → `memory_max` (+ `swap_max = 0`), `cpu_quota`/`cpu_period` → `cpu_max`.
+       Nothing sets `unified`/pids here, so those have no source yet.
+2. [x] Ring client: one request owns the arena at a time (payloads all go at offset 0), and a request can
+       have its region copied back after completion. `query_stats`.
+3. [x] `list_container_stats`: `QUERY` stats → CPU (exact) and memory (`memory_current`, includes page cache).
+4. [ ] **Decision (owner):** `cpu_shares` → `cpu_weight`. stormpump workloads are flat siblings, node services
+       included (default weight 100). Upstream's conversion puts every pod below them (1 CPU → 39, no request → 1).
+5. [ ] Tests, docs, CHANGELOG, sc-build.
+
 ### Done: #36, kubelet metrics under upstream's names
 
 Found, 2026-09-27: `/metrics` and `/metrics/cadvisor` exist, but hand-written. `/metrics` has two gauges,

@@ -42,7 +42,17 @@ struct Request {
     sqe: Sqe,
     /// Written into the arena before the SQE is pushed, if any.
     payload: Option<Vec<u8>>,
-    reply: mpsc::Sender<Result<Cqe, RingError>>,
+    /// Copy the request's arena region back after it completes: the engine
+    /// answered in it (`QUERY`'s stats block).
+    read_back: bool,
+    reply: mpsc::Sender<Result<Reply, RingError>>,
+}
+
+/// A completion, and the arena region the engine answered in when the request
+/// asked for it back.
+struct Reply {
+    cqe: Cqe,
+    arena: Vec<u8>,
 }
 
 /// A descriptor to hand the engine, under a name.
@@ -245,10 +255,14 @@ impl RingClient {
     /// for a container start is around 200 µs, so the queue is empty long
     /// before the next pod arrives.
     pub fn submit(&self, sqe: Sqe, payload: Option<Vec<u8>>) -> Result<Cqe, RingError> {
+        self.request(sqe, payload, false).map(|r| r.cqe)
+    }
+
+    fn request(&self, sqe: Sqe, payload: Option<Vec<u8>>, read_back: bool) -> Result<Reply, RingError> {
         let (reply, answer) = mpsc::channel();
         {
             let tx = self.tx.lock().map_err(|_| RingError::Gone)?;
-            tx.send(Request { sqe, payload, reply }).map_err(|_| RingError::Gone)?;
+            tx.send(Request { sqe, payload, read_back, reply }).map_err(|_| RingError::Gone)?;
         }
         // Outside the lock: another caller must be able to submit while this
         // one waits, or the ring serialises on the client rather than on the
@@ -473,6 +487,23 @@ impl RingClient {
         out
     }
 
+    /// What a workload has consumed, from its cgroup (#57).
+    ///
+    /// `QUERY` with room for the stats block. `Ok(None)` when the engine wrote
+    /// none: a workload with no cgroup has nothing to report, and that is not a
+    /// workload that used nothing.
+    pub fn query_stats(
+        &self,
+        workload: Handle,
+    ) -> Result<Option<stormpump_abi::query::Stats>, RingError> {
+        let r = self.request(
+            Sqe { opcode: Op::Query as u8, primary: workload, ..Default::default() },
+            Some(vec![0u8; stormpump_abi::query::STATS_END]),
+            true,
+        )?;
+        Ok(stormpump_abi::query::stats(r.cqe.flags, &r.arena))
+    }
+
     /// Ask about a workload without changing it.
     pub fn query(&self, workload: Handle) -> Result<Cqe, RingError> {
         self.submit(
@@ -484,6 +515,14 @@ impl RingClient {
             None,
         )
     }
+}
+
+/// The bytes of `region` in `arena`, clipped to what exists: an engine that
+/// named a region past the end gets an empty reply, not a panic.
+fn arena_region(arena: &[u8], region: ArenaRef) -> Vec<u8> {
+    let start = region.offset() as usize;
+    let end = start.saturating_add(region.len() as usize);
+    arena.get(start..end).map(<[u8]>::to_vec).unwrap_or_default()
 }
 
 /// How long to wait for one completion.
@@ -505,7 +544,15 @@ fn run(
     let mut next_id: u64 = 1;
     // Requests submitted and not yet answered. More than one can be in flight
     // when a completion for an earlier request arrives out of order.
-    let mut waiting: HashMap<u64, mpsc::Sender<Result<Cqe, RingError>>> = HashMap::new();
+    let mut waiting: HashMap<u64, mpsc::Sender<Result<Reply, RingError>>> = HashMap::new();
+    // **One request owns the arena at a time.** Every payload is written at
+    // offset 0, and a reply (`QUERY`'s stats) is written back into the same
+    // region, so a second request taking the arena before the first completed
+    // would overwrite what the engine has yet to read, or what it answered.
+    // The id of the request that has it, whether its region is to be copied
+    // back, and a request that is waiting for it.
+    let mut arena_holder: Option<(u64, bool)> = None;
+    let mut parked: Option<Request> = None;
     // Which op each outstanding request was, so a failure can name it.
     let mut sent: HashMap<u64, u8> = HashMap::new();
 
@@ -529,7 +576,17 @@ fn run(
             let _ = dep.reply.send(result);
         }
 
-        match rx.recv_timeout(std::time::Duration::from_millis(2)) {
+        let next = match parked.take() {
+            Some(req) => Ok(req),
+            None => rx.recv_timeout(std::time::Duration::from_millis(2)),
+        };
+        match next {
+            Ok(req) if req.payload.is_some() && arena_holder.is_some() => {
+                // Wait for the arena. The completion that frees it is drained
+                // below; the pause keeps this from spinning meanwhile.
+                parked = Some(req);
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
             Ok(req) => {
                 let id = next_id;
                 next_id += 1;
@@ -550,6 +607,9 @@ fn run(
                     continue;
                 }
                 sent.insert(id, sqe.opcode);
+                if req.payload.is_some() {
+                    arena_holder = Some((id, req.read_back));
+                }
                 waiting.insert(id, req.reply);
                 stormpump::transport::kick(submit);
             }
@@ -571,6 +631,17 @@ fn run(
                 if !cqe.is_err() {
                     sent.remove(&cqe.user_data);
                 }
+                // The arena is free again, once what the engine answered in
+                // it has been copied out.
+                let mut arena = Vec::new();
+                if let Some((holder, read_back)) = arena_holder {
+                    if holder == cqe.user_data {
+                        if read_back && !cqe.is_err() {
+                            arena = arena_region(mapping.arena(), cqe.arena);
+                        }
+                        arena_holder = None;
+                    }
+                }
                 let answer = if cqe.is_err() {
                     Err(RingError::Failed {
                         op: sent.remove(&cqe.user_data).unwrap_or(0),
@@ -578,7 +649,7 @@ fn run(
                         step: cqe.aux,
                     })
                 } else {
-                    Ok(cqe)
+                    Ok(Reply { cqe, arena })
                 };
                 let _ = reply.send(answer);
             }
@@ -600,6 +671,30 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reply is read from the region the request offered, and a region the
+    /// arena does not have is an empty reply rather than a panic.
+    #[test]
+    fn a_reply_is_read_from_its_own_region() {
+        let arena: Vec<u8> = (0..64u8).collect();
+        let r = ArenaRef::new(8, 4).unwrap();
+        assert_eq!(arena_region(&arena, r), vec![8, 9, 10, 11]);
+        let past = ArenaRef::new(60, 16).unwrap();
+        assert!(arena_region(&arena, past).is_empty());
+    }
+
+    /// The stats block `QUERY` writes decodes from a region laid out the way
+    /// the engine lays it out.
+    #[test]
+    fn the_stats_block_decodes_from_a_read_back_region() {
+        use stormpump_abi::query;
+        let st = query::Stats { cpu_usage_usec: 7, memory_current: 9, ..Default::default() };
+        let mut region = vec![0u8; query::STATS_END];
+        region[query::REPLY_LEN..query::STATS_END].copy_from_slice(&st.to_bytes());
+        assert_eq!(query::stats(query::WROTE_STATS, &region), Some(st));
+        // No flag, no stats: an unwritten block is not a workload that used nothing.
+        assert_eq!(query::stats(0, &region), None);
+    }
 
     #[test]
     fn the_token_is_sixteen_bytes_and_says_who_we_are() {

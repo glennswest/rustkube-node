@@ -452,8 +452,57 @@ fn spec_for(config: &ContainerConfig, sandbox: &PodSandboxConfig) -> stormpump::
             uts: false,
         },
         tty: config.tty,
+        // `cpu_shares` (the CPU *request*) is not mapped onto `cpu_weight`
+        // yet. Every stormpump workload is a sibling under one cgroup parent,
+        // node services included, and upstream's conversion gives a pod
+        // weights far below the engine's default of 100 (1 CPU → 39, no
+        // request → 1, stormpump's filler weight). Upstream's pods compete
+        // only inside `kubepods`. Which way this node goes is open on #57.
+        limits: limits_for(config),
         ..Spec::default()
     }
+}
+
+/// A container's stats from the engine's block. `u64::MAX` is the engine's
+/// "the kernel did not say", and becomes `None`, never a number.
+fn stats_info(
+    mut info: crate::cri::ContainerStatsInfo,
+    st: &stormpump_abi::query::Stats,
+) -> crate::cri::ContainerStatsInfo {
+    let known = |v: u64| (v != stormpump_abi::query::UNKNOWN).then_some(v);
+    info.cpu_usage_core_nanos = known(st.cpu_usage_usec).map(|us| us.saturating_mul(1000));
+    info.memory_working_set_bytes = known(st.memory_current);
+    info
+}
+
+/// What the container's `resources` ask of the engine (#57): the CRI numbers
+/// the pod manager derived from the pod spec, onto stormpump's `Limits`.
+///
+/// - `memory_limit_bytes` → `memory.max`, and `memory.swap.max = 0`: the
+///   kubelet runs with swap off, and upstream gives a limited container no
+///   swap, where the engine's default would let it spill past its limit.
+/// - `cpu_quota` / `cpu_period` → `cpu.max`.
+///
+/// Zero means "not set" in CRI, and becomes "not declared" here: a declared
+/// limit is applied or the spawn is refused, so only what was asked for goes
+/// in.
+fn limits_for(config: &ContainerConfig) -> stormpump::spec::Limits {
+    let mut l = stormpump::spec::Limits::default();
+    if config.memory_limit_bytes > 0 {
+        l.memory_max = Some(config.memory_limit_bytes as u64);
+        l.swap_max = Some(0);
+    }
+    if config.cpu_quota > 0 {
+        l.cpu_max = Some(stormpump::spec::CpuMax {
+            quota_us: config.cpu_quota as u64,
+            period_us: if config.cpu_period > 0 {
+                config.cpu_period as u64
+            } else {
+                stormpump::spec::CpuMax::DEFAULT_PERIOD_US
+            },
+        });
+    }
+    l
 }
 
 fn now_nanos() -> i64 {
@@ -1010,6 +1059,58 @@ impl RuntimeService for StormpumpRuntime {
         })
     }
 
+    /// What each running container has consumed, from the engine's `QUERY`
+    /// stats block (#57).
+    ///
+    /// CPU is exact (`cpu_usage_usec`). Memory is `memory.current`, which
+    /// counts the page cache that upstream's working set subtracts
+    /// (`inactive_file`); the stats block has nothing to subtract it with, so
+    /// this reads high for a container that does a lot of file I/O. A field
+    /// the kernel did not provide stays `None`, and a container the engine has
+    /// no stats for is left out.
+    async fn list_container_stats(
+        &self,
+    ) -> Result<Vec<crate::cri::ContainerStatsInfo>, CriError> {
+        self.absorb_exits().await;
+        let Some(ring) = self.ring.clone() else {
+            return Ok(vec![]);
+        };
+        let running: Vec<(Handle, crate::cri::ContainerStatsInfo)> = {
+            let containers = self.containers.lock().await;
+            containers
+                .values()
+                .filter(|c| c.state == ContainerState::Running)
+                .filter_map(|c| {
+                    Some((
+                        c.workload_handle?,
+                        crate::cri::ContainerStatsInfo {
+                            container_id: c.id.clone(),
+                            name: c.name.clone(),
+                            pod: c.pod.clone(),
+                            namespace: c.namespace.clone(),
+                            ..Default::default()
+                        },
+                    ))
+                })
+                .collect()
+        };
+        // One blocking task for the lot: each query is a ring round trip of
+        // microseconds, and a task per container would cost more than the
+        // queries.
+        let stats = tokio::task::spawn_blocking(move || {
+            running
+                .into_iter()
+                .filter_map(|(h, info)| {
+                    let st = ring.query_stats(h).ok().flatten()?;
+                    Some(stats_info(info, &st))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|e| CriError::Runtime(format!("stats: {e}")))?;
+        Ok(stats)
+    }
+
     async fn list_containers(
         &self,
         sandbox_id: Option<&str>,
@@ -1409,6 +1510,74 @@ mod tests {
 
     fn rt() -> StormpumpRuntime {
         StormpumpRuntime::new("/nonexistent/stormpump.sock")
+    }
+
+    /// A pod's limits reach the engine (#57): memory.max with no swap, and
+    /// cpu.max from the quota and period. Unset (0) is not declared.
+    #[test]
+    fn resource_limits_become_the_specs_limits() {
+        let cc = ContainerConfig {
+            name: "app".into(),
+            command: vec!["/bin/app".into()],
+            memory_limit_bytes: 512 * 1024 * 1024,
+            cpu_quota: 50_000,
+            cpu_period: 100_000,
+            cpu_shares: 512,
+            ..Default::default()
+        };
+        let spec = spec_for(&cc, &PodSandboxConfig::default());
+        assert_eq!(spec.limits.memory_max, Some(512 * 1024 * 1024));
+        assert_eq!(spec.limits.swap_max, Some(0));
+        assert_eq!(
+            spec.limits.cpu_max,
+            Some(stormpump::spec::CpuMax { quota_us: 50_000, period_us: 100_000 })
+        );
+        assert_eq!(spec.limits.pids_max, None);
+        // The request is not a weight yet (open on #57).
+        assert_eq!(spec.cpu_weight, stormpump::spec::Spec::default().cpu_weight);
+
+        // What the engine receives is what was set: through the wire and back.
+        let back = stormpump::spec::Spec::decode(&spec.encode()).unwrap();
+        assert_eq!(back.limits, spec.limits);
+    }
+
+    #[test]
+    fn a_container_without_limits_declares_none() {
+        let cc = ContainerConfig {
+            name: "app".into(),
+            command: vec!["/bin/app".into()],
+            cpu_period: 100_000,
+            ..Default::default()
+        };
+        assert!(spec_for(&cc, &PodSandboxConfig::default()).limits.is_empty());
+        // A quota with no period gets the kernel's.
+        let cc = ContainerConfig { cpu_quota: 25_000, cpu_period: 0, ..cc };
+        assert_eq!(
+            limits_for(&cc).cpu_max,
+            Some(stormpump::spec::CpuMax { quota_us: 25_000, period_us: 100_000 })
+        );
+    }
+
+    /// The engine's "unknown" is no number, not u64::MAX and not 0.
+    #[test]
+    fn stats_map_onto_cri_and_unknown_stays_unknown() {
+        let st = stormpump_abi::query::Stats {
+            cpu_usage_usec: 2_500_000,
+            memory_current: 4096,
+            ..Default::default()
+        };
+        let info = stats_info(crate::cri::ContainerStatsInfo::default(), &st);
+        assert_eq!(info.cpu_usage_core_nanos, Some(2_500_000_000));
+        assert_eq!(info.memory_working_set_bytes, Some(4096));
+
+        let unknown = stats_info(crate::cri::ContainerStatsInfo::default(), &Default::default());
+        assert_eq!(unknown.cpu_usage_core_nanos, None);
+        assert_eq!(unknown.memory_working_set_bytes, None);
+    }
+
+    #[tokio::test]
+    async fn no_engine_is_no_stats_not_an_error() {
+        assert!(rt().list_container_stats().await.unwrap().is_empty());
     }
 
     #[tokio::test]
