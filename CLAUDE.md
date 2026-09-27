@@ -37,7 +37,7 @@ not the release path.
 
 ## Work plan
 
-### In progress: #35, VMs reconciled against VMIs: deletion stops them, orphans found
+### Done: #35, VMs reconciled against VMIs: deletion stops them, orphans found
 
 Found, 2026-09-27 (test2's QEMU outlived its VMI on C2NR0Q2): a VM outlives a kubelet restart (the engine
 supervises it; the token reclaims ownership), but its handle lived only in `vms`, in memory. A restarted
@@ -46,14 +46,15 @@ stopped every VM (and deleted its root); a terminating VMI (deletionTimestamp) w
 test1 not restarted is the VM controller's: rustkube#104.
 
 Steps:
-1. [ ] A failed list is not an empty one: `list_for_node` → Option, the watch's LIST checks status; no sync on failure.
-2. [ ] The registration (`/run/stormvm/<ns>/<name>/vm.json`) is the record: after the spawn it is rewritten with
+1. [x] A failed list is not an empty one: `list_for_node` → Option, the watch's LIST checks status; no sync on failure.
+2. [x] The registration (`/run/stormvm/<ns>/<name>/vm.json`) is the record: after the spawn it is rewritten with
        `running_as(handle)` and the disks (volume ids, owned).
-3. [ ] Reconcile registrations each sync: not in `vms` → with a handle, query it: running+desired → adopt,
-       else stop. Without a handle (older kubelet, or died mid-start): control socket alive → adopt as
-       handle-less if desired, else ACPI powerdown, then QMP `quit` after the grace; dead → release, deregister.
-4. [ ] A terminating VMI is not desired. Finalizer `storm.io/vm` added once it runs, removed once it is stopped.
-5. [ ] Tests, docs, CHANGELOG, sc-build.
+3. [x] `reconcile_registered` each sync: running+wanted → adopt; running+unwanted → stop; gone+wanted → Failed
+       record (not restarted behind the VM controller); gone+unwanted → leftovers released. Handle-less:
+       liveness is a connect to the control socket; stop is ACPI, 30 s, then QMP `quit` / chv `vmm.shutdown`.
+4. [x] A terminating VMI is not desired. Finalizer `storm.io/vm` ensured each sync while running (rv-guarded),
+       removed once stopped.
+5. [x] Tests, docs (README), CHANGELOG. sc-build at 2331af9: all pass (kubelet 189). Not run on a node.
 
 ### In progress: #59, every node volume a complete, current PV + PVC set
 
