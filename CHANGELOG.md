@@ -3,6 +3,24 @@
 ## [Unreleased]
 <!-- New unreleased changes go here -->
 
+### 2026-09-27 (VM disks, #73, #74)
+- **feat(vm):** `emptyDisk` volumes (stormvm's `DiskSource::Empty`, #73). The
+  VM's `<ns>.<vm>-<disk>` volume is found by name, or created blank with the
+  disk's capacity, the engine's default redundancy and the `storm.io/vm`
+  label. It is found again on every later start, and it is owned by the VM.
+  An engine that cannot list volumes fails the start rather than making a
+  second blank.
+- **fix(vm):** a `persistentVolumeClaim` disk is resolved as a claim
+  (stormvm's `DiskSource::Claim`, #74). It used to reach stormblock as a
+  volume id and fail with "invalid UUID". The pod manager resolves and
+  attaches it exactly as for a pod. The VM waits while the claim is unbound,
+  of another class, or used by a pod on this node, and deleting the VM keeps
+  the claim's volume.
+- **fix(vm):** which disks a VM owns (and deletes) is an explicit list:
+  golden clones, the cloud-init seed, and empty disks.
+- **chore(deps):** stormvm 1b0d941 (v0.10.0), with stormpump 30a76d3 and
+  stormcast 801f822, as `cargo update -p stormvm-spec` resolved them.
+
 ## [v0.11.0] — 2026-09-27
 
 ### 2026-09-27 (engine token, #66, stormcos#104)

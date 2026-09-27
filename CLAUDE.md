@@ -29,11 +29,11 @@ stormvm v0.10.0 (1b0d941) adds `DiskSource::Empty` (emptyDisk) and `DiskSource::
 `vm_manager::resolve_disks` matches exhaustively, so the lock bump and both arms land together.
 
 Steps:
-1. [ ] Lock: `cargo update -p stormvm-spec` on dev (all stormvm crates move to 1b0d941).
-2. [ ] Empty (#73): find `<vm>-<disk>` by name, else create it blank with the disk's size (no redundancy), label `storm.io/vm`; owned by the VM.
-3. [ ] Claim (#74): the pod manager resolves it (`provision_claim`, shared): bound → its volume, unbound stormblock-class → provisioned,
+1. [x] Lock: `cargo update -p stormvm-spec` on dev (all stormvm crates move to 1b0d941).
+2. [x] Empty (#73): find `<vm>-<disk>` by name, else create it blank with the disk's size (no redundancy), label `storm.io/vm`; owned by the VM.
+3. [x] Claim (#74): the pod manager resolves it (`provision_claim`, shared): bound → its volume, unbound stormblock-class → provisioned,
        other class → Waiting. A pod on this node holding the claim → Waiting with its name. Not owned: deleting the VM keeps the volume.
-4. [ ] Ownership is an explicit list (Golden, CloudInit, Empty), so a new source is not owned by default.
+4. [x] Ownership is an explicit list (Golden, CloudInit, Empty), so a new source is not owned by default.
 5. [ ] Tests, docs, CHANGELOG, sc-build, release, golden, close both.
 
 ### Done: #66 (P0, stormcos#104), the kubelet presents no stormblock engine token

@@ -100,6 +100,24 @@ the node. See [docs/csi.md](docs/csi.md). The mounts of external drivers need
 Bidirectional propagation in the engine (stormpump#35), and until that lands
 pods on such claims wait with that reason.
 
+### Virtual machine disks
+
+With `--runtime=stormpump` the kubelet also runs the VirtualMachineInstances
+assigned to its node (`pkg/kubelet/src/vm_manager.rs`). Each volume of a VMI
+becomes a stormblock volume attached here:
+
+| VMI volume | Disk | Deleted with the VM |
+|---|---|---|
+| `dataVolume` / `containerDisk` | a clone of the named golden | yes |
+| `cloudInitNoCloud` | a generated `cidata` seed | yes |
+| `emptyDisk: {capacity}` | a blank volume `<ns>.<vm>-<disk>`, made once and reused on every later start | yes |
+| `persistentVolumeClaim: {claimName}` | the claim's volume, resolved exactly as for a pod (a bound claim uses its volume, an unbound `stormblock` claim is provisioned) | no, it belongs to the claim |
+
+A claim's disk waits, with the reason on the VMI, while the claim is unbound,
+belongs to another StorageClass, or is in use by a pod on this node. A pod
+mounts the filesystem and a VM writes the raw device, so the two must not
+share it.
+
 ## Relationship to rustkube
 
 - **Control plane** (kube-apiserver, controller-manager, scheduler, fastetcd)
