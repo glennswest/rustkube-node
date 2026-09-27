@@ -59,7 +59,7 @@ Steps:
        x86_64-unknown-linux-musl`, then `cargo test --locked`): passed (kubelet 189). Stage golden requested;
        #35 closed (verified by sc-build only, not on a node).
 
-### In progress: #63, a pod waiting on its claim stays visible (ContainerCreating + reason)
+### Done: #63, a pod waiting on its claim stays visible (ContainerCreating + reason)
 
 Found, 2026-09-27: two causes. (1) A pod whose volumes are not ready gets a Pending status and is never
 recorded, so `pod_uid` misses it: `logs` says "not found on this node", no container statuses. (2) The
@@ -73,8 +73,8 @@ Steps:
        with the reason; `logs` answers 400 "waiting to start: ContainerCreating" instead of 404.
 3. [x] FailedMount Event on the pod; past 5 min the message says "timed out after Nm waiting for …" and the
        pod keeps retrying, Pending (upstream's behaviour: a mount timeout does not fail the pod).
-4. [ ] Tests, docs (README), CHANGELOG done at c78baf0/93796b5. sc-build running; then close, and note on #70
-       that its wait-for-ready half landed here (the Event on the claim did not).
+4. [x] Tests, docs (README), CHANGELOG. sc-build at c78baf0: all pass (kubelet 193). Closed; noted on #70
+       (wait-for-ready done here, Event on the claim still open). Not run on a node. Unreleased.
 
 ### Next: #62, CSIStorageCapacity for the built-in class (findings only, not started)
 
