@@ -123,6 +123,24 @@ belongs to another StorageClass, or is in use by a pod on this node. A pod
 mounts the filesystem and a VM writes the raw device, so the two must not
 share it.
 
+### Virtual machine lifecycle
+
+- **A VMI being deleted stops its machine.** While a machine runs, its VMI
+  carries the finalizer `storm.io/vm`, so the deletion completes only once the
+  machine is gone. The stop is ACPI with a 30 s grace, then a kill, then the
+  disks are detached.
+- **A VM outlives a kubelet restart** (the engine supervises it), so the kubelet
+  records each one where a restarted kubelet finds it: the machine's
+  registration, `/run/stormvm/<ns>/<name>/vm.json`, with the engine's workload
+  handle and its disks. On every sync, a registered machine the kubelet does
+  not know is adopted when its VMI still wants it, and stopped when not.
+- A machine started by an older kubelet has no handle recorded. If its VMI is
+  gone, it is stopped through its own control socket: ACPI, then `quit`.
+- A failed VMI list is skipped, not read as "no machines". Reading it that way
+  stopped every VM on the node.
+- Restarting a `running: true` VM whose instance ended is the VM controller's
+  job (rustkube#104).
+
 ## Relationship to rustkube
 
 - **Control plane** (kube-apiserver, controller-manager, scheduler, fastetcd)

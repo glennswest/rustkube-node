@@ -3,6 +3,26 @@
 ## [Unreleased]
 <!-- New unreleased changes go here -->
 
+### 2026-09-27 (VM lifecycle, #35)
+- **fix(vm):** a failed VirtualMachineInstance list (an apiserver that did not
+  answer, or an error status) was read as "no machines here". Every VM on the
+  node was stopped and its root deleted. The pass is now skipped.
+- **fix(vm):** a VMI being deleted (`deletionTimestamp`) was still treated as
+  wanted, and its machine kept running. It is now stopped. While a machine
+  runs, its VMI holds the finalizer `storm.io/vm`, which comes off once the
+  machine is stopped, so the delete completes only after the VM is gone.
+- **fix(vm):** a VM outlives a kubelet restart, but its handle lived only in
+  memory. A restarted kubelet could not stop it, and deleting the VMI left the
+  hypervisor running (test2 on C2NR0Q2). The registration
+  (`/run/stormvm/<ns>/<name>/vm.json`) now records the workload handle and the
+  disks. Each sync adopts a registered machine that its VMI still wants, and
+  stops one that nothing wants.
+- **fix(vm):** a machine with no recorded handle (started by an older kubelet)
+  whose VMI is gone is stopped through its control socket: ACPI, a 30 s
+  grace, then `quit`.
+- **fix(vm):** a stopped machine's workload handle is released in the engine
+  (its pidfd and cgroup), as an ended one's already was.
+
 ### 2026-09-27 (node volumes as PV + PVC sets, #59)
 - **feat(kubelet):** every `<component>-data`, `-state` and `-logs` volume on
   the node is a PV and its bound PVC in `kube-system`, labelled
