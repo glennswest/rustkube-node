@@ -287,17 +287,10 @@ async fn healthz() -> impl IntoResponse {
     "ok"
 }
 
+/// The kubelet's own metrics, under upstream's names (#36; `metrics.rs`).
 async fn metrics(State(pm): State<Arc<PodManager>>) -> impl IntoResponse {
-    let (pods, containers) = pm.metrics_snapshot().await;
-    let body = format!(
-        "# HELP kubelet_running_pods Number of pods managed by this kubelet.\n\
-         # TYPE kubelet_running_pods gauge\n\
-         kubelet_running_pods {pods}\n\
-         # HELP kubelet_running_containers Number of containers managed by this kubelet.\n\
-         # TYPE kubelet_running_containers gauge\n\
-         kubelet_running_containers {containers}\n"
-    );
-    ([("content-type", "text/plain; version=0.0.4")], body)
+    let snap = pm.metrics_snapshot().await;
+    ([("content-type", "text/plain; version=0.0.4")], crate::metrics::render_kubelet(&snap))
 }
 
 /// `GET /vmInstance/{address}` — the instance metadata for whoever holds it.
@@ -339,33 +332,15 @@ async fn pods(State(pm): State<Arc<PodManager>>) -> impl IntoResponse {
     Json(pm.pods_json().await)
 }
 
-/// cAdvisor-style container metrics scraped by Prometheus.
+/// cAdvisor-shaped container and pod metrics, from the runtime at scrape time
+/// (#36; `metrics::render_cadvisor`).
 async fn metrics_cadvisor(State(pm): State<Arc<PodManager>>) -> impl IntoResponse {
-    let stats = pm.container_stats().await;
-    let mut body = String::new();
-    body.push_str("# HELP container_cpu_usage_seconds_total Cumulative CPU time consumed (seconds).\n");
-    body.push_str("# TYPE container_cpu_usage_seconds_total counter\n");
-    for s in &stats {
-        let labels = format!(
-            "container=\"{}\",pod=\"{}\",namespace=\"{}\"",
-            s.name, s.pod, s.namespace
-        );
-        let secs = s.cpu_usage_core_nanos as f64 / 1e9;
-        body.push_str(&format!("container_cpu_usage_seconds_total{{{labels}}} {secs}\n"));
-    }
-    body.push_str("# HELP container_memory_working_set_bytes Current working set (bytes).\n");
-    body.push_str("# TYPE container_memory_working_set_bytes gauge\n");
-    for s in &stats {
-        let labels = format!(
-            "container=\"{}\",pod=\"{}\",namespace=\"{}\"",
-            s.name, s.pod, s.namespace
-        );
-        body.push_str(&format!(
-            "container_memory_working_set_bytes{{{labels}}} {}\n",
-            s.memory_working_set_bytes
-        ));
-    }
-    ([("content-type", "text/plain; version=0.0.4")], body)
+    let containers = pm.container_stats().await;
+    let pods = pm.pod_network_stats().await;
+    (
+        [("content-type", "text/plain; version=0.0.4")],
+        crate::metrics::render_cadvisor(&containers, &pods),
+    )
 }
 
 /// Minimal Summary API (metrics-server / `kubectl top`) — node + per-pod
@@ -378,15 +353,17 @@ async fn stats_summary(State(pm): State<Arc<PodManager>>) -> impl IntoResponse {
     let mut node_cpu = 0u64;
     let mut node_mem = 0u64;
     for s in &stats {
-        node_cpu += s.cpu_usage_core_nanos;
-        node_mem += s.memory_working_set_bytes;
+        // A container the runtime reported no number for adds nothing, and
+        // its own entry leaves the field out rather than claiming 0.
+        node_cpu += s.cpu_usage_core_nanos.unwrap_or(0);
+        node_mem += s.memory_working_set_bytes.unwrap_or(0);
         by_pod
             .entry((s.namespace.clone(), s.pod.clone()))
             .or_default()
             .push(serde_json::json!({
                 "name": s.name,
-                "cpu": {"usageCoreNanoSeconds": s.cpu_usage_core_nanos},
-                "memory": {"workingSetBytes": s.memory_working_set_bytes},
+                "cpu": s.cpu_usage_core_nanos.map(|n| serde_json::json!({"usageCoreNanoSeconds": n})),
+                "memory": s.memory_working_set_bytes.map(|b| serde_json::json!({"workingSetBytes": b})),
             }));
     }
     let pods: Vec<serde_json::Value> = by_pod
@@ -586,8 +563,10 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let text = String::from_utf8_lossy(&body);
-        assert!(text.contains("kubelet_running_pods 0"));
-        assert!(text.contains("kubelet_running_containers 0"));
+        // Values are process-wide and other tests set them too, so this
+        // checks the names; metrics.rs checks the numbers.
+        assert!(text.contains("kubelet_running_pods "), "{text}");
+        assert!(text.contains(r#"kubelet_running_containers{container_state="running"}"#), "{text}");
     }
 
     #[tokio::test]

@@ -194,8 +194,29 @@ pub struct ContainerStatsInfo {
     pub pod: String,
     pub namespace: String,
     /// Cumulative CPU usage in nanoseconds (for the cadvisor counter).
-    pub cpu_usage_core_nanos: u64,
-    pub memory_working_set_bytes: u64,
+    /// `None` when the runtime did not report it: absent is not zero (#36).
+    pub cpu_usage_core_nanos: Option<u64>,
+    pub memory_working_set_bytes: Option<u64>,
+    /// Bytes the container's writable layer uses.
+    pub fs_usage_bytes: Option<u64>,
+}
+
+/// One network interface's counters, inside a pod.
+#[derive(Debug, Clone, Default)]
+pub struct InterfaceStats {
+    pub name: String,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+}
+
+/// A pod's network counters. Network belongs to the pod's sandbox, not to any
+/// one container, as in cAdvisor.
+#[derive(Debug, Clone, Default)]
+pub struct PodNetworkStats {
+    pub sandbox_id: String,
+    pub pod: String,
+    pub namespace: String,
+    pub interfaces: Vec<InterfaceStats>,
 }
 
 /// Container status information.
@@ -272,6 +293,11 @@ pub trait RuntimeService: Send + Sync + 'static {
     /// Resource-usage stats for all containers. Default: none (runtimes that
     /// don't implement stats return an empty list).
     async fn list_container_stats(&self) -> Result<Vec<ContainerStatsInfo>, CriError> {
+        Ok(vec![])
+    }
+
+    /// Network counters per pod sandbox. Default: none.
+    async fn list_pod_network_stats(&self) -> Result<Vec<PodNetworkStats>, CriError> {
         Ok(vec![])
     }
 

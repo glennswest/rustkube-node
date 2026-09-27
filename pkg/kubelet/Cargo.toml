@@ -34,6 +34,9 @@ stormvm-vmm = { git = "https://github.com/glennswest/stormvm", branch = "main" }
 stormvm-control = { git = "https://github.com/glennswest/stormvm", branch = "main" }
 stormvm-cloudinit = { git = "https://github.com/glennswest/stormvm", branch = "main" }
 apimachinery = { workspace = true }
+# The kubelet's /metrics (#36): the same recorder rustkube's components use.
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 cni = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }

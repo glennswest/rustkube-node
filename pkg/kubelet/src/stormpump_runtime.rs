@@ -681,6 +681,33 @@ impl RuntimeService for StormpumpRuntime {
             .collect())
     }
 
+    /// Each ready pod's interfaces, from its network namespace (#36).
+    ///
+    /// The sandbox's netns is named by its holder process
+    /// (`/proc/<holder>/ns/net`), and `/proc/<holder>/net/dev` is that
+    /// namespace's counters, which is where cAdvisor reads them too. No engine
+    /// call is needed. A pod on the host network has no namespace of its own,
+    /// and so no series, as upstream.
+    async fn list_pod_network_stats(
+        &self,
+    ) -> Result<Vec<crate::cri::PodNetworkStats>, CriError> {
+        let sandboxes = self.sandboxes.lock().await;
+        Ok(sandboxes
+            .values()
+            .filter(|sb| sb.state == PodSandboxState::Ready)
+            .filter_map(|sb| {
+                let dev = sb.netns.as_deref()?.strip_suffix("/ns/net")?.to_string() + "/net/dev";
+                let text = std::fs::read_to_string(dev).ok()?;
+                Some(crate::cri::PodNetworkStats {
+                    sandbox_id: sb.id.clone(),
+                    pod: sb.config.name.clone(),
+                    namespace: sb.config.namespace.clone(),
+                    interfaces: crate::metrics::parse_net_dev(&text),
+                })
+            })
+            .collect())
+    }
+
     async fn create_container(
         &self,
         sandbox_id: &str,

@@ -599,13 +599,15 @@ impl RuntimeService for CriGrpcClient {
                     cpu_usage_core_nanos: s
                         .cpu
                         .and_then(|c| c.usage_core_nano_seconds)
-                        .map(|v| v.value)
-                        .unwrap_or(0),
+                        .map(|v| v.value),
                     memory_working_set_bytes: s
                         .memory
                         .and_then(|m| m.working_set_bytes)
-                        .map(|v| v.value)
-                        .unwrap_or(0),
+                        .map(|v| v.value),
+                    fs_usage_bytes: s
+                        .writable_layer
+                        .and_then(|w| w.used_bytes)
+                        .map(|v| v.value),
                 }
             })
             .collect())

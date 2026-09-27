@@ -7,6 +7,7 @@
 pub mod dns;
 pub mod engine;
 pub mod events;
+pub mod metrics;
 pub mod mirror;
 pub mod storage;
 pub mod system_claims;

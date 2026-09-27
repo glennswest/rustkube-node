@@ -267,6 +267,9 @@ pub struct PodManager {
     /// PID 1's mountinfo, where a published CSI volume must appear before a
     /// pod is given it (`csi::is_mount_point`). Overridable in tests.
     csi_mountinfo: String,
+    /// When each pod (by uid) was first seen and not yet started, for
+    /// `kubelet_pod_start_duration_seconds` (#36).
+    first_seen: std::sync::Mutex<HashMap<String, Instant>>,
 }
 
 impl PodManager {
@@ -310,6 +313,7 @@ impl PodManager {
             backoff: crate::crashloop::CrashLoopBackoff::new(),
             csi: Arc::new(crate::csi_plugins::CsiPlugins::new(node_name)),
             csi_mountinfo: "/proc/1/mountinfo".to_string(),
+            first_seen: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1750,6 +1754,8 @@ impl PodManager {
     pub async fn sync_pods(&self, desired_pods: &[Value]) -> SyncOutcome {
         let mut outcome = SyncOutcome::default();
         let mut desired_uids: Vec<String> = Vec::new();
+        let mut relist = std::time::Duration::ZERO;
+        let mut relisted = false;
 
         for pod in desired_pods {
             let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
@@ -1803,8 +1809,18 @@ impl PodManager {
 
             if !is_known {
                 // New pod — start it
+                let seen = *self
+                    .first_seen
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(uid.to_string())
+                    .or_insert_with(Instant::now);
                 match self.start_pod(pod).await {
-                    Ok(status) => outcome.updates.push(status),
+                    Ok(status) => {
+                        self.first_seen.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+                        crate::metrics::observe_pod_start(seen.elapsed().as_secs_f64());
+                        outcome.updates.push(status)
+                    }
                     // A volume that is not there yet is **Pending**, not
                     // Failed. Upstream retries a hostPath that does not exist
                     // because it may appear — another component creates it, a
@@ -1864,7 +1880,11 @@ impl PodManager {
                         state.pod = pod.clone();
                     }
                 }
-                match self.check_pod_status(uid).await {
+                let t = Instant::now();
+                let checked = self.check_pod_status(uid).await;
+                relist += t.elapsed();
+                relisted = true;
+                match checked {
                     Ok(status) => outcome.updates.push(status),
                     Err(e) => {
                         warn!("Failed to check pod {namespace}/{name} status: {e}");
@@ -1872,6 +1892,16 @@ impl PodManager {
                 }
             }
         }
+        // The pass over known pods is this kubelet's relist: there is no
+        // separate PLEG, and this is where their state is read back from the
+        // runtime (probes run in it too).
+        if relisted {
+            crate::metrics::observe_relist(relist.as_secs_f64());
+        }
+        self.first_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|uid, _| desired_uids.contains(uid));
 
         // Pods we track that are no longer desired — stop them.
         let orphaned: Vec<PodState> = {
@@ -2900,11 +2930,23 @@ impl PodManager {
         self.runtime.list_container_stats().await.unwrap_or_default()
     }
 
-    /// (managed pod count, total container count) for the /metrics endpoint.
-    pub async fn metrics_snapshot(&self) -> (usize, usize) {
-        let pods = self.pods.read().await;
-        let containers = pods.values().map(|p| p.container_ids.len()).sum();
-        (pods.len(), containers)
+    /// What `/metrics` reports, read at scrape time: pods with a sandbox, and
+    /// every container the runtime lists, by state (#36).
+    pub async fn metrics_snapshot(&self) -> crate::metrics::KubeletSnapshot {
+        let running_pods =
+            self.pods.read().await.values().filter(|p| p.sandbox_id.is_some()).count();
+        let containers = self
+            .runtime
+            .list_containers(None)
+            .await
+            .map(|cs| cs.into_iter().map(|c| c.state).collect())
+            .unwrap_or_default();
+        crate::metrics::KubeletSnapshot { running_pods, containers }
+    }
+
+    /// Per-pod network counters from the runtime (for /metrics/cadvisor).
+    pub async fn pod_network_stats(&self) -> Vec<crate::cri::PodNetworkStats> {
+        self.runtime.list_pod_network_stats().await.unwrap_or_default()
     }
 
     /// A v1 PodList of the pods this kubelet manages (for the /pods endpoint).
