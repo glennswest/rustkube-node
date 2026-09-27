@@ -494,7 +494,20 @@ impl PodManager {
         );
         pv["status"] = serde_json::json!({ "phase": "Bound" });
         if self.api_post("/api/v1/persistentvolumes", &pv).await.is_none() {
-            debug!("PV {pv_name} not created (it may already exist)");
+            // **It exists: bring it up to what was provisioned** (#64). The
+            // control plane's provisioner (rustkube `stormblock.rs`) writes
+            // the PV once the scheduler picks a node, before the pod starts
+            // here, with the claim's *request* as its capacity: it leaves the
+            // class to the node. This did nothing when the PV was there, so a
+            // 3.5Gi claim on a 4 GiB volume said 3.5Gi for good.
+            let pv_path = format!("/api/v1/persistentvolumes/{pv_name}");
+            if let Some(existing) = self.api_get(&pv_path).await {
+                if let Some(updated) = crate::system_claims::reconcile_pv(&existing, &pv, Some(&pvc)) {
+                    if self.api_put(&pv_path, &updated).await.is_none() {
+                        warn!("PV {pv_name}: could not record its capacity and source");
+                    }
+                }
+            }
         }
 
         // Bind the claim to it. Read-modify-write rather than a patch,
@@ -509,6 +522,10 @@ impl PodManager {
                 "accessModes": ["ReadWriteOnce"],
                 "capacity": capacity,
             });
+        } else {
+            // Bound by the binder to the request-sized PV: the capacity is
+            // the class's, which is what `df` in the pod shows.
+            pvc["status"]["capacity"] = capacity;
         }
         if pvc == before {
             return;

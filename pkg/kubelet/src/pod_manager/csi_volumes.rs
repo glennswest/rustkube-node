@@ -599,6 +599,8 @@ mod tests {
     struct FakeApi {
         objects: Arc<Mutex<HashMap<String, Value>>>,
         patches: Arc<Mutex<Vec<(String, Value)>>>,
+        /// POST of an object that exists answers 409, as a real apiserver does.
+        strict: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl FakeApi {
@@ -624,7 +626,11 @@ mod tests {
                             },
                             Method::POST => {
                                 let name = body["metadata"]["name"].as_str().unwrap_or("").to_string();
-                                api.put(&format!("{path}/{name}"), body.clone());
+                                let at = format!("{path}/{name}");
+                                if api.strict.load(std::sync::atomic::Ordering::SeqCst) && api.get(&at).is_some() {
+                                    return (StatusCode::CONFLICT, axum::Json(json!({})));
+                                }
+                                api.put(&at, body.clone());
                                 (StatusCode::CREATED, axum::Json(body))
                             }
                             Method::PUT => {
@@ -936,5 +942,38 @@ mod tests {
         });
         let m = not_ready(rig.mgr.resolve_volumes(&pod).await);
         assert!(m.contains("default/web-cache"), "{m}");
+    }
+
+    #[tokio::test]
+    async fn a_request_sized_pv_is_brought_up_to_the_class() {
+        // #64: the control plane writes the PV with the claim's request and
+        // the binder binds it before the pod starts here. The node's class is
+        // what the volume is, and both objects must say so.
+        let rig = rig().await;
+        rig.api.strict.store(true, std::sync::atomic::Ordering::SeqCst);
+        let claim = "/api/v1/namespaces/default/persistentvolumeclaims/db";
+        let pv = "/api/v1/persistentvolumes/pvc-default-db";
+        rig.api.put(
+            claim,
+            json!({"metadata": {"name": "db", "namespace": "default", "uid": "uid-c"},
+                   "spec": {"volumeName": "pvc-default-db", "storageClassName": "stormblock",
+                            "resources": {"requests": {"storage": "3.5Gi"}}},
+                   "status": {"phase": "Bound", "capacity": {"storage": "3.5Gi"}}}),
+        );
+        rig.api.put(
+            pv,
+            json!({"metadata": {"name": "pvc-default-db"},
+                   "spec": {"capacity": {"storage": "3.5Gi"},
+                            "csi": {"driver": "stormblock.storm.io", "volumeHandle": "pvc-default-db"},
+                            "claimRef": {"namespace": "default", "name": "db", "uid": "uid-c"}},
+                   "status": {"phase": "Bound"}}),
+        );
+        rig.mgr.bind_claim("default", "db", "pvc-default-db", 4 << 30).await;
+        let pv = rig.api.get(pv).unwrap();
+        assert_eq!(pv["spec"]["capacity"]["storage"], "4Gi");
+        assert_eq!(pv["spec"]["claimRef"]["uid"], "uid-c");
+        let c = rig.api.get(claim).unwrap();
+        assert_eq!(c["status"]["phase"], "Bound");
+        assert_eq!(c["status"]["capacity"]["storage"], "4Gi");
     }
 }

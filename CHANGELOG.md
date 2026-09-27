@@ -7,6 +7,11 @@
 - **fix(kubelet):** a claim for a fractional size (`3.5Gi`) did not parse, and
   a claim that does not parse was read as asking for nothing, so it got the
   1 MiB class. Fractions now parse and round up to a whole byte.
+- **fix(kubelet):** when the control plane wrote a claim's PV first (with the
+  claim's request as its capacity) and the binder bound it, the kubelet left
+  both as they were. A 3.5Gi claim on a 4 GiB volume said 3.5Gi for good. The
+  existing PV's capacity and CSI source are now brought up to what was
+  provisioned, and so is the claim's status capacity.
 
 ### 2026-09-27 (a pod waiting on its claim, #63)
 - **fix(kubelet):** a pod whose volumes were not ready was reported Pending and
