@@ -47,7 +47,7 @@ Steps:
 3. [x] `list_container_stats`: `QUERY` stats → CPU (exact) and memory (`memory_current`, includes page cache).
 4. [ ] **Decision (owner):** `cpu_shares` → `cpu_weight`. stormpump workloads are flat siblings, node services
        included (default weight 100). Upstream's conversion puts every pod below them (1 CPU → 39, no request → 1).
-5. [ ] Tests, docs, CHANGELOG, sc-build.
+5. [x] Tests, docs, CHANGELOG. sc-build at 4245b8f: all pass (kubelet 177). Issue stays open on step 4.
 
 ### Done: #36, kubelet metrics under upstream's names
 
