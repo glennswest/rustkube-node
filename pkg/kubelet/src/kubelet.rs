@@ -180,7 +180,8 @@ impl Kubelet {
                 self.api_client.clone(),
                 &self.config.api_server_url,
             )
-            .with_storage(self.config.engine.clone()),
+            .with_storage(self.config.engine.clone())
+            .with_claims(self.pod_manager.clone()),
         ));
         self
     }

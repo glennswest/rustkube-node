@@ -304,6 +304,10 @@ pub struct VmManager {
     api_url: String,
     /// The engine client, with the engine's token (#66).
     engine: crate::engine::EngineClient,
+    /// The pod manager, which resolves a disk that names a claim the way it
+    /// resolves a pod's (#74). `None` in tests and wherever there is no
+    /// apiserver, and a claim disk then fails and says why.
+    claims: Option<Arc<crate::pod_manager::PodManager>>,
     /// Events about virtual machines.
     ///
     /// A VM that will not start failed in this file, and the reason — a
@@ -361,6 +365,7 @@ impl VmManager {
             api,
             api_url,
             engine: crate::engine::EngineClient::default(),
+            claims: None,
             events,
             vms: Mutex::new(HashMap::new()),
             desired: Mutex::new(HashMap::new()),
@@ -391,6 +396,12 @@ impl VmManager {
             }
         });
         self.event(&obj, etype, reason, message).await;
+    }
+
+    /// Resolve claim disks through the pod manager (#74).
+    pub fn with_claims(mut self, pods: Arc<crate::pod_manager::PodManager>) -> VmManager {
+        self.claims = Some(pods);
+        self
     }
 
     /// The node's engine, shared with the rest of the kubelet.
@@ -900,6 +911,49 @@ impl VmManager {
                     }
                 }
                 DiskSource::Volume(v) => v.clone(),
+                // A PersistentVolumeClaim in the VM's namespace (#74). The
+                // pod manager resolves it and attaches it, exactly as for a
+                // pod, so the device is taken from that and the attach below
+                // is skipped. Anything that stops it resolving (unbound,
+                // another class, a pod using it here) is something that can
+                // change, so the machine waits rather than fails.
+                DiskSource::Claim(c) => {
+                    let Some(pods) = &self.claims else {
+                        self.release(&done).await;
+                        return Err(StartFail::Failed(format!(
+                            "disk {}: claim {c} needs an apiserver to resolve, and this kubelet \
+                             has none",
+                            d.name
+                        )));
+                    };
+                    match pods.claim_for_vm(&vm.namespace, c).await {
+                        Ok((volume_id, device)) => {
+                            done.push(ResolvedDisk {
+                                name: d.name.clone(),
+                                device,
+                                volume_id: Some(volume_id),
+                                readonly: d.readonly,
+                                bus: d.bus,
+                            });
+                            continue;
+                        }
+                        Err(why) => {
+                            self.release(&done).await;
+                            return Err(StartFail::Waiting(format!("disk {}: {why}", d.name)));
+                        }
+                    }
+                }
+                // A blank disk the VM owns, KubeVirt's `emptyDisk` (#73). Made
+                // once and found by name on every later start, as the
+                // standalone path does: a data disk that came back blank after
+                // a restart would lose everything the guest wrote to it.
+                DiskSource::Empty => match self.empty_volume(vm, &d.name, d.size.as_deref()).await {
+                    Ok(id) => id,
+                    Err(e) => {
+                        self.release(&done).await;
+                        return Err(StartFail::Failed(format!("disk {}: {e}", d.name)));
+                    }
+                },
                 DiskSource::CloudInit => match self.seed_volume(vm).await {
                     Ok(id) => id,
                     Err(e) => {
@@ -936,12 +990,16 @@ impl VmManager {
             };
             // Whose disk is this?
             //
-            // A clone of a golden and a cloud-init seed were made *for* this
-            // machine and go with it. A `volume:<id>` was handed to it and is
-            // somebody else's — deleting that is deleting data the machine
-            // was only borrowing. stormvm's own `delete` states the rule; the
-            // kubelet did not implement it.
-            let ours = !matches!(d.from, DiskSource::Volume(_));
+            // A clone of a golden, a cloud-init seed and an empty disk were
+            // made *for* this machine and go with it. A `volume:<id>` or a
+            // claim was handed to it and is somebody else's — deleting that
+            // is deleting data the machine was only borrowing. stormvm's own
+            // `delete` states the rule. Listed rather than excluded, so a
+            // source stormvm adds later is kept until someone decides.
+            let ours = matches!(
+                d.from,
+                DiskSource::Golden(_) | DiskSource::CloudInit | DiskSource::Empty
+            );
             if ours {
                 owned.push(volume_id.clone());
             }
@@ -1090,6 +1148,55 @@ impl VmManager {
         .await
         .map_err(|e| format!("writing the seed: {e}"))?;
         Ok(id)
+    }
+
+    /// The VM's empty disk: the volume `<ns>-<vm>-<disk>` if it exists,
+    /// otherwise a new blank one of `size`.
+    ///
+    /// No `redundancy`: the engine's default, not the seed's `none`, because
+    /// this is the guest's data. No filesystem either: what goes on the disk
+    /// is the guest's business.
+    async fn empty_volume(
+        &self,
+        vm: &VmSpec,
+        disk: &str,
+        size: Option<&str>,
+    ) -> Result<String, String> {
+        let name = stormvm_node::start::volume_name(vm, disk);
+        if let Some(id) = self.volume_by_name(&name).await? {
+            return Ok(id);
+        }
+        let size = size.ok_or_else(|| "an empty disk needs a size".to_string())?;
+        let body = json!({
+            "name": name,
+            "size": size,
+            "label": format!("storm.io/vm={}", vm.id()),
+        });
+        let v = self
+            .post(&format!("{}/api/v1/volumes", self.storage), &body)
+            .await
+            .map_err(|e| format!("creating empty disk {name}: {e}"))?;
+        v["id"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| format!("stormblock returned no volume for {name}: {v}"))
+    }
+
+    /// A volume's id by name. `Ok(None)` only when the engine answered and
+    /// has no such volume: "could not ask" must not become "make a new one",
+    /// or a restart during an engine hiccup gives the guest a blank disk.
+    async fn volume_by_name(&self, name: &str) -> Result<Option<String>, String> {
+        let url = format!("{}/api/v1/volumes", self.storage);
+        let resp = self.engine.get(&url).await.map_err(|e| format!("listing volumes: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("listing volumes: {}", resp.status()));
+        }
+        let list: Value = resp.json().await.map_err(|e| format!("listing volumes: {e}"))?;
+        Ok(list["items"]
+            .as_array()
+            .and_then(|a| a.iter().find(|v| v["name"].as_str() == Some(name)))
+            .and_then(|v| v["id"].as_str())
+            .map(String::from))
     }
 
     /// Best effort: a start that has already gone wrong must not be made worse
@@ -1872,5 +1979,213 @@ mod seed_tests {
         assert!(seed_text(&serde_json::json!({"stringData": {"userdata": "  "}})).is_none());
         // Two fields, neither named: ambiguous, so not guessed.
         assert!(seed_text(&serde_json::json!({"stringData": {"a": "x", "b": "y"}})).is_none());
+    }
+
+    /// An apiserver and an engine on one port (their paths do not overlap):
+    /// a claim `default/data` bound to the stormblock volume `vol-claim`, the
+    /// pods `pods` lists, and an engine whose volumes are `vols`. Creates are
+    /// recorded, attaches answer a device, and any write to the apiserver
+    /// (the claim's binding) is accepted.
+    struct Fake {
+        url: String,
+        vols: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        created: Arc<std::sync::Mutex<Vec<Value>>>,
+        pods: Arc<std::sync::Mutex<Value>>,
+        list_fails: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    async fn fake() -> Fake {
+        use axum::routing::{get, post};
+        type Shared<T> = Arc<std::sync::Mutex<T>>;
+        let vols: Shared<Vec<(String, String)>> =
+            Arc::new(std::sync::Mutex::new(vec![("vol-claim".into(), "pvc-default-data".into())]));
+        let created: Shared<Vec<Value>> = Arc::default();
+        let pods: Shared<Value> = Arc::new(std::sync::Mutex::new(json!({"items": []})));
+        let list_fails = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let (v1, v2, c1, p1, f1) =
+            (vols.clone(), vols.clone(), created.clone(), pods.clone(), list_fails.clone());
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/volumes",
+                get(move || {
+                    let (v, f) = (v1.clone(), f1.clone());
+                    async move {
+                        if f.load(std::sync::atomic::Ordering::SeqCst) {
+                            return (axum::http::StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({})));
+                        }
+                        let items: Vec<Value> = v
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .map(|(id, name)| json!({"id": id, "name": name}))
+                            .collect();
+                        (axum::http::StatusCode::OK, axum::Json(json!({ "items": items })))
+                    }
+                })
+                .post(move |axum::Json(body): axum::Json<Value>| {
+                    let (v, c) = (v2.clone(), c1.clone());
+                    async move {
+                        let id = format!("vol-{}", v.lock().unwrap().len());
+                        v.lock().unwrap().push((id.clone(), body["name"].as_str().unwrap().into()));
+                        c.lock().unwrap().push(body);
+                        axum::Json(json!({ "id": id }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/volumes/{id}/attach",
+                post(|axum::extract::Path(id): axum::extract::Path<String>| async move {
+                    axum::Json(json!({ "device_hint": format!("/dev/ublk-{id}") }))
+                }),
+            )
+            .route(
+                "/api/v1/namespaces/default/persistentvolumeclaims/data",
+                get(|| async {
+                    axum::Json(json!({
+                        "metadata": {"name": "data", "namespace": "default"},
+                        "spec": {
+                            "storageClassName": "stormblock",
+                            "volumeName": "pvc-default-data",
+                            "resources": {"requests": {"storage": "1Gi"}}
+                        }
+                    }))
+                }),
+            )
+            .route(
+                "/api/v1/persistentvolumes/pvc-default-data",
+                get(|| async {
+                    axum::Json(json!({
+                        "metadata": {"name": "pvc-default-data"},
+                        "spec": {"csi": {"driver": "stormblock.storm.io", "volumeHandle": "pvc-default-data"}}
+                    }))
+                }),
+            )
+            .route(
+                "/api/v1/pods",
+                get(move || {
+                    let p = p1.clone();
+                    async move { axum::Json(p.lock().unwrap().clone()) }
+                }),
+            )
+            .fallback(|| async { axum::Json(json!({})) });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Fake { url, vols, created, pods, list_fails }
+    }
+
+    fn manager_for(f: &Fake, with_claims: bool) -> VmManager {
+        let engine =
+            crate::engine::EngineClient::new(&f.url, crate::engine::TokenSource::none());
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), "").with_storage(engine.clone());
+        if !with_claims {
+            return m;
+        }
+        let rt = Arc::new(crate::pod_manager::tests::FakeRuntime::default());
+        let pods = crate::pod_manager::PodManager::with_api(
+            rt.clone(),
+            rt,
+            "n1",
+            &f.url,
+            "127.0.0.1",
+            reqwest::Client::new(),
+        )
+        .with_engine(engine);
+        m.with_claims(Arc::new(pods))
+    }
+
+    /// A VMI with one disk, `data`, from the given volume source.
+    fn vm_with(volume: Value) -> VmSpec {
+        let mut obj = vmi("n1");
+        obj["spec"]["domain"]["devices"] = json!({ "disks": [{ "name": "data", "disk": { "bus": "virtio" } }] });
+        let mut v = volume;
+        v["name"] = json!("data");
+        obj["spec"]["volumes"] = json!([v]);
+        stormvm_spec::kube::from_kube(&obj).unwrap()
+    }
+
+    /// An emptyDisk is made blank once, owned by the VM, and found again on
+    /// the next start rather than made again (#73).
+    #[tokio::test]
+    async fn an_empty_disk_is_created_once_and_reused() {
+        let f = fake().await;
+        let m = manager_for(&f, false);
+        let vm = vm_with(json!({ "emptyDisk": { "capacity": "2Gi" } }));
+        assert_eq!(vm.disks[0].from, DiskSource::Empty);
+
+        let (disks, owned) = m.resolve_disks(&vm).await.unwrap();
+        let made = f.created.lock().unwrap().clone();
+        assert_eq!(made.len(), 1);
+        assert_eq!(made[0]["name"], json!(stormvm_node::start::volume_name(&vm, "data")));
+        assert_eq!(made[0]["size"], json!("2Gi"));
+        assert_eq!(made[0]["label"], json!("storm.io/vm=default/web-1"));
+        // The engine's default redundancy, not the seed's `none`: this is data.
+        assert!(made[0].get("redundancy").is_none(), "{}", made[0]);
+        let id = disks[0].volume_id.clone().unwrap();
+        assert_eq!(owned, vec![id.clone()], "the VM owns its empty disk");
+
+        // Started again: the same volume, nothing new made.
+        let (again, _) = m.resolve_disks(&vm).await.unwrap();
+        assert_eq!(again[0].volume_id.as_deref(), Some(id.as_str()));
+        assert_eq!(f.created.lock().unwrap().len(), 1);
+    }
+
+    /// An engine that cannot list is not an engine with no such volume. A
+    /// blank made then would replace the guest's data after a restart.
+    #[tokio::test]
+    async fn an_empty_disk_is_not_made_when_the_engine_cannot_say_it_exists() {
+        let f = fake().await;
+        f.list_fails.store(true, std::sync::atomic::Ordering::SeqCst);
+        let m = manager_for(&f, false);
+        let vm = vm_with(json!({ "emptyDisk": { "capacity": "2Gi" } }));
+        assert!(matches!(m.resolve_disks(&vm).await, Err(StartFail::Failed(_))));
+        assert!(f.created.lock().unwrap().is_empty());
+    }
+
+    /// A claim is resolved to its bound volume, attached, and not owned: the
+    /// claim outlives the VM (#74).
+    #[tokio::test]
+    async fn a_claim_disk_is_its_bound_volume_and_not_the_vms() {
+        let f = fake().await;
+        let m = manager_for(&f, true);
+        let vm = vm_with(json!({ "persistentVolumeClaim": { "claimName": "data" } }));
+        assert_eq!(vm.disks[0].from, DiskSource::Claim("data".into()));
+
+        let (disks, owned) = m.resolve_disks(&vm).await.unwrap();
+        assert_eq!(disks[0].volume_id.as_deref(), Some("vol-claim"));
+        assert_eq!(disks[0].device, "/dev/ublk-vol-claim");
+        assert!(owned.is_empty(), "deleting the VM must not delete the claim's volume");
+        assert!(f.created.lock().unwrap().is_empty());
+        assert_eq!(f.vols.lock().unwrap().len(), 1);
+    }
+
+    /// A pod on this node using the claim: the VM waits, and says which pod.
+    #[tokio::test]
+    async fn a_claim_a_pod_here_uses_makes_the_vm_wait() {
+        let f = fake().await;
+        *f.pods.lock().unwrap() = json!({"items": [{
+            "metadata": {"name": "db", "namespace": "default"},
+            "spec": {"nodeName": "n1", "volumes": [{"name": "d", "persistentVolumeClaim": {"claimName": "data"}}]},
+            "status": {"phase": "Running"}
+        }]});
+        let m = manager_for(&f, true);
+        let vm = vm_with(json!({ "persistentVolumeClaim": { "claimName": "data" } }));
+        match m.resolve_disks(&vm).await {
+            Err(StartFail::Waiting(why)) => assert!(why.contains("pod default/db"), "{why}"),
+            other => panic!("expected Waiting, got {other:?}"),
+        }
+    }
+
+    /// No apiserver to ask: a claim cannot be resolved, and it says so.
+    #[tokio::test]
+    async fn a_claim_disk_without_an_apiserver_fails_and_says_why() {
+        let f = fake().await;
+        let m = manager_for(&f, false);
+        let vm = vm_with(json!({ "persistentVolumeClaim": { "claimName": "data" } }));
+        match m.resolve_disks(&vm).await {
+            Err(StartFail::Failed(why)) => assert!(why.contains("apiserver"), "{why}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 }

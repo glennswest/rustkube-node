@@ -1078,6 +1078,48 @@ impl PodManager {
         claim: &str,
         pod_uid: &str,
     ) -> Result<String, ClaimError> {
+        self.provision_claim_volume(namespace, claim, pod_uid).await.map(|(_, dev)| dev)
+    }
+
+    /// A claim as a block device on this node, for a virtual machine's disk
+    /// (#74). The same path a pod's claim takes: a bound claim gets its own
+    /// volume, and an unbound claim of the built-in class is provisioned.
+    ///
+    /// Returns the volume id and the attached device. The VM manager records
+    /// the id, to detach it when the machine stops. The claim outlives the
+    /// machine, so the id is never the VM's to delete.
+    ///
+    /// Refused while a pod on this node uses the claim. A pod mounts the
+    /// claim's filesystem and a VM writes the raw device, and two writers on
+    /// one ext4 is corruption, whatever the access mode says.
+    pub(crate) async fn claim_for_vm(
+        &self,
+        namespace: &str,
+        claim: &str,
+    ) -> Result<(String, String), String> {
+        match self.claim_holder_here(namespace, claim).await {
+            Ok(Some(pod)) => {
+                return Err(format!(
+                    "claim {namespace}/{claim} is in use by pod {namespace}/{pod} on this node"
+                ))
+            }
+            Ok(None) => {}
+            Err(e) => return Err(format!("claim {namespace}/{claim}: {e}")),
+        }
+        self.provision_claim_volume(namespace, claim, "").await.map_err(|e| match e {
+            ClaimError::NotOurs(why) => format!("waiting for claim {claim} to bind: {why}"),
+            ClaimError::InUse(why) => why,
+            ClaimError::Failed(why) => format!("claim {namespace}/{claim}: {why}"),
+        })
+    }
+
+    /// [`Self::provision_claim`], answering the volume id too.
+    async fn provision_claim_volume(
+        &self,
+        namespace: &str,
+        claim: &str,
+        pod_uid: &str,
+    ) -> Result<(String, String), ClaimError> {
         let name = crate::storage::volume_name(namespace, claim);
 
         // What the claim asked for, rounded up to a class. The class is also
@@ -1228,7 +1270,7 @@ impl PodManager {
             // that was not made, and after the attach so a bound claim means
             // storage a pod can actually use.
             self.bind_claim(namespace, claim, &name, class_bytes).await;
-            return Ok(dev.to_string());
+            return Ok((vol_id, dev.to_string()));
         }
         Err(ClaimError::Failed(format!(
             "volume {name} did not attach locally: {info} — an NVMe-oF attach needs a \
@@ -3645,7 +3687,7 @@ fn parse_memory_bytes(s: &str) -> i64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::cri::{
         ContainerStatusInfo, ExecSyncResult, ImageInfo, PodSandboxState, PodSandboxStatusInfo,
@@ -3666,7 +3708,7 @@ mod tests {
 
     /// In-memory runtime for pod lifecycle tests.
     #[derive(Default)]
-    pub(super) struct FakeRuntime {
+    pub(crate) struct FakeRuntime {
         sandboxes: Mutex<HashMap<String, (PodSandboxState, PodSandboxConfig)>>,
         containers: Mutex<HashMap<String, FakeContainer>>,
         next_id: AtomicU32,
