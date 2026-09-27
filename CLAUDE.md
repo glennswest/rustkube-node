@@ -57,7 +57,7 @@ Steps:
 5. [ ] **Owner decision (a), open:** names collide across nodes. `kube-system/fastetcd-data` and PV
        `storm-fastetcd-data` exist once per cluster, so only the first node's volumes are represented; the
        others log a warning. Asked on the issue.
-6. [x] Tests (fake apiserver + engine end to end), docs (`docs/node-volumes.md`), CHANGELOG. sc-build: pending.
+6. [x] Tests (fake apiserver + engine end to end), docs (`docs/node-volumes.md`), CHANGELOG. sc-build at 30bb887: all pass (kubelet 185).
 
 ### In progress: #57, pod limits onto stormpump `Spec.limits`, container stats from `QUERY`
 
