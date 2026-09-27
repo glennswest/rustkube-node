@@ -20,6 +20,21 @@ pinned by `rev` in `Cargo.toml`. It needs `protoc` on the build box, for the ven
 - `csi/csi.proto`: CSI spec v1.9.0
 - `pluginregistration/api.proto`: the kubelet plugin-registration API (k8s.io/kubelet v0.32.0)
 
+## Release goldens: `component stage`, never `component build`
+
+The stormcos image runs rustkube-node as a **stage golden**: stormd, its config
+and the kubelet. Build a release golden with
+
+    stormcentral component stage rustkube-node --url http://stormcentral.g8.lo
+
+`stormcentral component build rustkube-node` makes a bin-only golden (the
+binaries alone). 11.49 shipped one and the kubelet could not start.
+stormcentral now refuses that mix-up. The goldens requested with `build` for
+v0.10.0–v0.12.0 (ca8caa9be480, fdc1c7497472, 2e39fa8daf0a) are bin-only. The
+owner built the stage golden for v0.12.0: golden-rustkube-node-ce66e97945ad
+(image 11.50). `scripts/build-golden.sh` also makes a bin-only golden, and is
+not the release path.
+
 ## Work plan
 
 ### Done: #73 + #74, stormvm v0.10.0's DiskSource (Empty, Claim)

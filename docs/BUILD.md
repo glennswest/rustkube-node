@@ -2,6 +2,19 @@
 
 What this repository produces, and why it is a golden rather than a package.
 
+## The release golden
+
+A stormcos image runs rustkube-node as a **stage golden** (stormd, its config
+and the kubelet), built by stormcentral through stormcos's stage mode:
+
+```bash
+stormcentral component stage rustkube-node --url http://stormcentral.g8.lo
+```
+
+`stormcentral component build rustkube-node` and `scripts/build-golden.sh`
+(below) make a bin-only golden, the binaries alone. A node cannot start its
+kubelet from one (image 11.49), so neither is a release.
+
 ## The short version
 
 ```bash

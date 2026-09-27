@@ -3,6 +3,12 @@
 ## [Unreleased]
 <!-- New unreleased changes go here -->
 
+### 2026-09-27
+- **docs(build):** a release golden is a stage golden
+  (`stormcentral component stage rustkube-node`), not `component build` or
+  `scripts/build-golden.sh`. Those make bin-only goldens, and 11.49 shipped
+  one and the kubelet could not start.
+
 ## [v0.12.0] — 2026-09-27
 
 ### 2026-09-27 (VM disks, #73, #74)
