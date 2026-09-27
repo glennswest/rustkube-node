@@ -3,6 +3,8 @@
 ## [Unreleased]
 <!-- New unreleased changes go here -->
 
+## [v0.11.0] — 2026-09-27
+
 ### 2026-09-27 (engine token, #66, stormcos#104)
 - **fix(kubelet):** every call to the node's stormblock engine carries the
   engine's token (`Authorization: Bearer`). stormblock 17 refuses its API

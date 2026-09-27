@@ -7,7 +7,7 @@ golden (`scripts/build-golden.sh`), not a package. The cross-project rules are i
 
 ## Version
 
-`0.10.0`. There is one version location: `[workspace.package] version` in
+`0.11.0`. There is one version location: `[workspace.package] version` in
 `Cargo.toml` (every crate uses `version.workspace = true`).
 
 ## Build and test
@@ -34,7 +34,8 @@ Steps:
        every call while none is found (the engine mints it at start). Tests.
 2. [x] pod_manager, system_claims, vm_manager and stormpump_runtime use it instead of the apiserver client or a bare client.
 3. [x] `scripts/build-golden.sh`: curl carries the token.
-4. [ ] Docs, CHANGELOG, sc-build, release, golden.
+4. [x] Docs, CHANGELOG. sc-build at ca6dd06: build clean, all tests pass (kubelet 161, including engine::tests).
+5. [ ] Release v0.11.0, golden, close #66.
 
 ### Done: #58, the golden build cannot load the workspace
 
