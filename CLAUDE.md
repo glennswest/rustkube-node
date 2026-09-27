@@ -37,6 +37,27 @@ not the release path.
 
 ## Work plan
 
+### In progress: #59, every node volume a complete, current PV + PVC set
+
+Found, 2026-09-27: `system_claims.rs` creates once and never updates, skips `*-logs`, and leaves
+`claimRef` without uid and the binding annotations off. rustkube's binder (persistentvolume.rs) owns PV
+phases (Bound if the claim exists, Released if not) and the protection finalizers, so the mirror writes
+objects and bindings, not phases. The engine marks nothing as logs: kind comes from the name suffix
+(`-data`, `-state`, `-logs`), and `role` is only the slab half (system|data), recorded as an annotation.
+
+Steps:
+1. [ ] Shared builder for a complete pair: labels `storm.io/volume-kind`, `storm.io/component`; PVC annotations
+       bind-completed, bound-by-controller, storage-provisioner (+beta), selected-node; PV provisioned-by
+       `stormblock.storm.io`, `claimRef` with uid+resourceVersion, `csi.fsType` from `fs.kind`,
+       `volumeAttributes` (golden, fs uuid), annotations health/access/role.
+2. [ ] Reconciler: list once per pass; create what is missing (PVC first, then PV with its uid), bring
+       existing ones up to date (size only grows, labels, annotations, claimRef uid). Only objects annotated
+       with this node; another node's same-named object is left alone.
+3. [ ] `bind_claim` (built-in driver claims) uses the same builder.
+4. [ ] **Owner decisions:** (a) names collide across nodes (`storm-fastetcd-data` on every node);
+       (b) a vanished volume: the binder makes a PV Released only when its claim is gone.
+5. [ ] Tests, docs, CHANGELOG, sc-build.
+
 ### In progress: #57, pod limits onto stormpump `Spec.limits`, container stats from `QUERY`
 
 Steps:
