@@ -3,6 +3,8 @@
 ## [Unreleased]
 <!-- New unreleased changes go here -->
 
+## [v0.12.0] — 2026-09-27
+
 ### 2026-09-27 (VM disks, #73, #74)
 - **feat(vm):** `emptyDisk` volumes (stormvm's `DiskSource::Empty`, #73). The
   VM's `<ns>.<vm>-<disk>` volume is found by name, or created blank with the

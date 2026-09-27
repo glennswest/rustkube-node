@@ -7,7 +7,7 @@ golden (`scripts/build-golden.sh`), not a package. The cross-project rules are i
 
 ## Version
 
-`0.11.0`. There is one version location: `[workspace.package] version` in
+`0.12.0`. There is one version location: `[workspace.package] version` in
 `Cargo.toml` (every crate uses `version.workspace = true`).
 
 ## Build and test
@@ -22,7 +22,7 @@ pinned by `rev` in `Cargo.toml`. It needs `protoc` on the build box, for the ven
 
 ## Work plan
 
-### In progress: #73 + #74, stormvm v0.10.0's DiskSource (Empty, Claim)
+### Done: #73 + #74, stormvm v0.10.0's DiskSource (Empty, Claim)
 
 stormvm v0.10.0 (1b0d941) adds `DiskSource::Empty` (emptyDisk) and `DiskSource::Claim`
 (a PVC, which used to arrive as `Volume(<claim name>)` and fail with "invalid UUID").
@@ -34,7 +34,8 @@ Steps:
 3. [x] Claim (#74): the pod manager resolves it (`provision_claim`, shared): bound → its volume, unbound stormblock-class → provisioned,
        other class → Waiting. A pod on this node holding the claim → Waiting with its name. Not owned: deleting the VM keeps the volume.
 4. [x] Ownership is an explicit list (Golden, CloudInit, Empty), so a new source is not owned by default.
-5. [ ] Tests, docs, CHANGELOG, sc-build, release, golden, close both.
+5. [x] Tests, docs, CHANGELOG. sc-build at 6e4b48f: all pass (kubelet 166). Release v0.12.0, golden, close both.
+   Follow-up filed: #80 (a pod can mount a claim a VM here is using).
 
 ### Done: #66 (P0, stormcos#104), the kubelet presents no stormblock engine token
 
