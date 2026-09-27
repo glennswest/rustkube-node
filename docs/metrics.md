@@ -43,7 +43,7 @@ still declared (HELP and TYPE), so a scraper can see the name exists.
 | Runtime | CPU, memory | Filesystem | Network |
 |---|---|---|---|
 | CRI (`--runtime=cri`) | yes | yes (writable layer) | not yet |
-| stormpump (`--runtime=stormpump`) | not yet: #57 maps stormpump's `QUERY` stats onto `ContainerStats` | no: an image's clone is shared by its containers and there is no per-container writable layer yet | yes, from `/proc/<sandbox holder>/net/dev` |
+| stormpump (`--runtime=stormpump`) | yes, from the engine's `QUERY` stats block (#57). Memory is `memory.current`, which includes page cache that upstream's working set leaves out | no: an image's clone is shared by its containers and there is no per-container writable layer yet | yes, from `/proc/<sandbox holder>/net/dev` |
 
 ## Not here, on purpose
 

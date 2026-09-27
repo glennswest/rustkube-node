@@ -3,6 +3,21 @@
 ## [Unreleased]
 <!-- New unreleased changes go here -->
 
+### 2026-09-27 (stormpump limits and stats, #57)
+- **feat(stormpump):** a container's resource limits reach the engine.
+  `limits.memory` becomes `memory.max`, with `memory.swap.max = 0` as
+  upstream gives a limited container with swap off. `limits.cpu` becomes
+  `cpu.max`. A declared limit is applied or the spawn is refused by
+  stormpump, so a limit is never silently dropped again. The CPU *request*
+  is not mapped to `cpu.weight` yet (open on #57).
+- **feat(stormpump):** container stats from the engine's `QUERY`: CPU and
+  memory for `/metrics/cadvisor` and `/stats/summary`. Memory is
+  `memory.current`, which includes page cache.
+- **fix(stormpump):** the ring client gives the shared arena to one request at
+  a time. Every payload was written at offset 0 while other requests could
+  still be in flight. A request can also have its region read back after it
+  completes.
+
 ### 2026-09-27 (metrics, #36)
 - **feat(kubelet):** `/metrics` under upstream's names, through the Prometheus
   recorder rustkube's components use. It carries `kubelet_running_pods`,
