@@ -12,6 +12,10 @@
   both as they were. A 3.5Gi claim on a 4 GiB volume said 3.5Gi for good. The
   existing PV's capacity and CSI source are now brought up to what was
   provisioned, and so is the claim's status capacity.
+- **test:** `test/`, the test container per stormcentral's test standard, with
+  a medium suite of PVC sizes. It covers every class and arbitrary sizes, each
+  bound, sized, written, read, deleted and reclaimed; 2Ti must be refused with
+  the reason. Short and long report a skip until #61.
 
 ### 2026-09-27 (a pod waiting on its claim, #63)
 - **fix(kubelet):** a pod whose volumes were not ready was reported Pending and

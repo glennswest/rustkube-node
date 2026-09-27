@@ -154,6 +154,32 @@ share it.
 - Restarting a `running: true` VM whose instance ended is the VM controller's
   job (rustkube#104).
 
+## Tests on a node
+
+`test/` is the test container, per stormcentral's `docs/test-standard.md`. It
+is a standalone crate (its own workspace and `Cargo.lock`) built into a
+scratch image from `test/Containerfile`, started as `/test <suite>`, and run by
+stormcentral as a Job (`test/rustkube-node-test.yaml`):
+
+    stormcentral test run rustkube-node medium --url http://stormcentral.g8.lo
+
+- **medium** (< 30 min): claims of the built-in `stormblock` class (#64).
+  - It makes a claim at every size class (1Mi … 1Ti) and at arbitrary sizes:
+    1 byte, 1Mi+1, 17Mi, 1500M, 3.5Gi and 600Gi. The claims run in parallel.
+  - For each one, a pod writes and reads back 64 KiB and checks that `df` is
+    within the class the request rounds to. The test then checks that the claim
+    is Bound with that class as its status capacity, and deletes the pod and
+    the claim. The PV must be reclaimed.
+  - A 2Ti claim must be refused with the reason, and never bound.
+  - Every case has `RUSTKUBE_NODE_TEST_MINT_BUDGET` (default 1200 s), because a
+    class may be minted on first use.
+  - Overcommit is reported skip until #62.
+- **short**, **long**: not written yet (#61). Each reports one skip.
+
+The same image is the workload pods' program (`/test sized <path> <seed>
+<bytes> <lo> <hi>`), so a run pulls nothing else. Check it builds with
+`sc-build 'cd test && cargo test --locked && cargo build --release --locked'`.
+
 ## Relationship to rustkube
 
 - **Control plane** (kube-apiserver, controller-manager, scheduler, fastetcd)
