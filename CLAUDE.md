@@ -22,6 +22,20 @@ pinned by `rev` in `Cargo.toml`. It needs `protoc` on the build box, for the ven
 
 ## Work plan
 
+### In progress: #66 (P0, stormcos#104), the kubelet presents no stormblock engine token
+
+The engine (stormblock ≥ 17) requires `Authorization: Bearer <token>` on its API.
+Every engine call from the kubelet got 401, so claims and VM disks did not attach.
+
+Steps:
+1. [ ] `engine.rs`: one engine client. The token comes from `$STORMBLOCK_API_TOKEN`, then the
+       file at `$STORMBLOCK_TOKEN_FILE` (default `/run/stormblock/engine/api_token`), then
+       `/etc/stormblock/api_token`, then `/var/lib/stormblock/api_token`. It is re-read on a 401, and on
+       every call while none is found (the engine mints it at start). Tests.
+2. [ ] pod_manager, system_claims, vm_manager and stormpump_runtime use it instead of the apiserver client or a bare client.
+3. [ ] `scripts/build-golden.sh`: curl carries the token.
+4. [ ] Docs, CHANGELOG, sc-build, release, golden.
+
 ### Done: #58, the golden build cannot load the workspace
 
 The golden build fetches this repo alone, at one commit, and runs
