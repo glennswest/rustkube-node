@@ -37,7 +37,7 @@ not the release path.
 
 ## Work plan
 
-### In progress: #36, kubelet metrics under upstream's names
+### Done: #36, kubelet metrics under upstream's names
 
 Found, 2026-09-27: `/metrics` and `/metrics/cadvisor` exist, but hand-written. `/metrics` has two gauges,
 `kubelet_running_containers` has no `container_state`, there is no `process_*`, and the cadvisor side has
@@ -52,7 +52,8 @@ Steps:
 2. [x] cadvisor: `ContainerStatsInfo` fields optional (absent ≠ 0), plus `fs_usage_bytes` (CRI writable layer).
        Pod network from a new `list_pod_network_stats`. stormpump reads `/proc/<holder>/net/dev` of the sandbox.
        Series labelled `{container,id,namespace,pod}`, and network also `{interface}`, per pod.
-3. [ ] Tests, docs (`docs/metrics.md`), CHANGELOG, sc-build, close.
+3. [x] Tests, docs (`docs/metrics.md`), CHANGELOG. sc-build at f239350: all pass (kubelet 171). Closed.
+   stormpump CPU/memory series wait on #57 (ring client must read QUERY's reply arena; noted there).
 
 ### Done: #73 + #74, stormvm v0.10.0's DiskSource (Empty, Claim)
 
