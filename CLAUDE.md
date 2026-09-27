@@ -59,6 +59,38 @@ Steps:
        x86_64-unknown-linux-musl`, then `cargo test --locked`): passed (kubelet 189). Stage golden requested;
        #35 closed (verified by sc-build only, not on a node).
 
+### In progress: #63, a pod waiting on its claim stays visible (ContainerCreating + reason)
+
+Found, 2026-09-27: two causes. (1) A pod whose volumes are not ready gets a Pending status and is never
+recorded, so `pod_uid` misses it: `logs` says "not found on this node", no container statuses. (2) The
+engine client has no timeout and `mint_template` is one synchronous POST, so a 1 TiB blank's format holds
+the whole sync loop (stormblock#141 keeps formatting after a client leaves).
+
+Steps:
+1. [ ] Mint in the background (one in flight per blank); a template not `ready` is a wait naming its state
+       ("template pvc-ext4j-1048576m awaiting_format"), not a clone attempt.
+2. [ ] Waiting pods recorded (uid, reason, since): statuses report every container `waiting: ContainerCreating`
+       with the reason; `logs` answers 400 "waiting to start: ContainerCreating" instead of 404.
+3. [ ] FailedMount Event on the pod; past 5 min the message says "timed out after Nm waiting for …" and the
+       pod keeps retrying, Pending (upstream's behaviour: a mount timeout does not fail the pod).
+4. [ ] Tests, docs, CHANGELOG, sc-build, close.
+
+### Next: #62, CSIStorageCapacity for the built-in class (findings only, not started)
+
+Found, 2026-09-27:
+- Engine: `GET /api/v1/slabs` items have `role` (system|data), `total_bytes`, `free_bytes`. Claims live in
+  the data half (blanks minted `role: data`). `/api/v1/volumes`: `virtual_size_bytes`, `allocated_bytes`.
+  No overcommit guard in stormblock (clone never checks space; writes get NoSpace). Pool pressure gauges
+  only, pool-wide, only with growth enabled; no Event.
+- rustkube scheduler (`pkg/scheduler/src/volumebinding.rs` `capacity_fits`): applies to unbound claims whose
+  class provisioner is a CSIDriver with `storageCapacity: true`; matches `storageClassName` + `nodeTopology`
+  selector on node labels; compares `maximumVolumeSize` (else `capacity`) against the raw request (not the
+  class). No object for a node → node rejected.
+- stormcos `46-csidriver.yaml` (`stormblock.storm.io`) lacks `storageCapacity: true`: publishing does nothing
+  until stormcos flips it, and it must flip only after every node publishes. Provisioner `stormblock.storm.io`, WFFC.
+- Open for the owner: overcommit ratio default (class size counted at bind vs written bytes), and whether
+  to size clones to the exact request.
+
 ### In progress: #59, every node volume a complete, current PV + PVC set
 
 Found, 2026-09-27: `system_claims.rs` creates once and never updates, skips `*-logs`, and leaves
