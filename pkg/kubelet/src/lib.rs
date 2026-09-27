@@ -5,6 +5,7 @@
 //! and reports node status via Lease heartbeats.
 
 pub mod dns;
+pub mod engine;
 pub mod events;
 pub mod mirror;
 pub mod storage;
