@@ -1,0 +1,30 @@
+[package]
+name = "rustkube-node-test"
+version = "0.1.0"
+edition = "2021"
+description = "rustkube-node's test container (stormcentral docs/test-standard.md): short, medium and long suites against the kubelet on a running node."
+license = "Apache-2.0"
+publish = false
+
+# Its own workspace: the root workspace's builds never see it, and it has its
+# own Cargo.lock (seeded from stormblock-csi's test crate, which uses the same
+# four crates).
+[workspace]
+
+[lib]
+name = "rustkube_node_test"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rustkube-node-test"
+path = "src/main.rs"
+
+# The kubelet is never linked in: it is reached through the Kubernetes API.
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde_json = "1"
+libc = "0.2"
+
+[profile.release]
+strip = true

@@ -1,0 +1,119 @@
+# rustkube-node-test-<suite>: how stormcentral runs rustkube-node's tests on a
+# test machine, per stormcentral docs/test-standard.md.
+#
+# Test metadata (what the runner matches against the machine):
+#   suites:   medium (< 30 min): claims of the built-in stormblock class at
+#             every size class and arbitrary sizes (#64).
+#             short, long: not written yet (#61); each reports one skip.
+#   requires: []            (storage comes from the node's stormblock engine
+#                            through the kubelet. Where the class is not
+#                            offered — no StorageClass stormblock of
+#                            stormblock.storm.io — medium reports one skip.)
+#   privileged: no          (the Job and its workload pods run unprivileged;
+#                            workload pods run as uid 0 with no capabilities,
+#                            to own a fresh filesystem's root)
+#   api:      namespaced in the run's namespace: PVCs, pods, events (read).
+#             Cluster-scoped: read StorageClasses and PVs.
+#   images:   only ${IMAGE}: the workload pods run it too
+#             (RUSTKUBE_NODE_TEST_IMAGE)
+#   external: none
+#
+# The runner creates the namespace test-rustkube-node-<suite>-<run id>, fills
+# in NAMESPACE / RUN_ID / NODE / API / SUITE / TIMEOUT / TIMEOUT_PLUS_MARGIN /
+# COMMIT / IMAGE below, applies this, waits for the Job, collects /results
+# with the logs, and deletes the namespace (which deletes the run's claims;
+# their PVs are reclaimed), then the cluster-scoped objects by their
+# storm.io/test-run label.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rustkube-node-test
+  namespace: ${NAMESPACE}
+  labels: { storm.io/test-run: "${RUN_ID}" }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rustkube-node-test
+  namespace: ${NAMESPACE}
+  labels: { storm.io/test-run: "${RUN_ID}" }
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims", "pods"]
+    verbs: ["create", "get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rustkube-node-test
+  namespace: ${NAMESPACE}
+  labels: { storm.io/test-run: "${RUN_ID}" }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: rustkube-node-test }
+subjects:
+  - { kind: ServiceAccount, name: rustkube-node-test, namespace: "${NAMESPACE}" }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rustkube-node-test-${RUN_ID}
+  labels: { storm.io/test-run: "${RUN_ID}" }
+rules:
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rustkube-node-test-${RUN_ID}
+  labels: { storm.io/test-run: "${RUN_ID}" }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: "rustkube-node-test-${RUN_ID}" }
+subjects:
+  - { kind: ServiceAccount, name: rustkube-node-test, namespace: "${NAMESPACE}" }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rustkube-node-test
+  namespace: ${NAMESPACE}
+  labels: { storm.io/test-run: "${RUN_ID}" }
+spec:
+  backoffLimit: 0            # a retry would hide the finding
+  activeDeadlineSeconds: ${TIMEOUT_PLUS_MARGIN}
+  template:
+    metadata:
+      labels: { storm.io/test-run: "${RUN_ID}" }
+    spec:
+      restartPolicy: Never
+      serviceAccountName: rustkube-node-test
+      automountServiceAccountToken: true
+      containers:
+        - name: rustkube-node-test
+          image: ${IMAGE}
+          command: ["/test", "${SUITE}"]
+          env:
+            - { name: STORM_API, value: "${API}" }
+            - { name: STORM_NAMESPACE, value: "${NAMESPACE}" }
+            - { name: STORM_RUN_ID, value: "${RUN_ID}" }
+            - { name: STORM_NODE, value: "${NODE}" }
+            - { name: STORM_SUITE, value: "${SUITE}" }
+            - { name: STORM_TIMEOUT, value: "${TIMEOUT}" }
+            - { name: STORM_COMPONENT, value: rustkube-node }
+            - { name: STORM_COMMIT, value: "${COMMIT}" }
+            - { name: RUSTKUBE_NODE_TEST_IMAGE, value: "${IMAGE}" }
+          volumeMounts:
+            - { name: results, mountPath: /results }
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - { name: results, emptyDir: {} }
