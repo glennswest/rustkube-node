@@ -37,6 +37,24 @@ not the release path.
 
 ## Work plan
 
+### In progress: #35, VMs reconciled against VMIs: deletion stops them, orphans found
+
+Found, 2026-09-27 (test2's QEMU outlived its VMI on C2NR0Q2): a VM outlives a kubelet restart (the engine
+supervises it; the token reclaims ownership), but its handle lived only in `vms`, in memory. A restarted
+kubelet knew nothing of it, so deleting its VMI stopped nothing. Also: a failed VMI list read as "no VMIs" and
+stopped every VM (and deleted its root); a terminating VMI (deletionTimestamp) was still desired.
+test1 not restarted is the VM controller's: rustkube#104.
+
+Steps:
+1. [ ] A failed list is not an empty one: `list_for_node` → Option, the watch's LIST checks status; no sync on failure.
+2. [ ] The registration (`/run/stormvm/<ns>/<name>/vm.json`) is the record: after the spawn it is rewritten with
+       `running_as(handle)` and the disks (volume ids, owned).
+3. [ ] Reconcile registrations each sync: not in `vms` → with a handle, query it: running+desired → adopt,
+       else stop. Without a handle (older kubelet, or died mid-start): control socket alive → adopt as
+       handle-less if desired, else ACPI powerdown, then QMP `quit` after the grace; dead → release, deregister.
+4. [ ] A terminating VMI is not desired. Finalizer `storm.io/vm` added once it runs, removed once it is stopped.
+5. [ ] Tests, docs, CHANGELOG, sc-build.
+
 ### In progress: #59, every node volume a complete, current PV + PVC set
 
 Found, 2026-09-27: `system_claims.rs` creates once and never updates, skips `*-logs`, and leaves
