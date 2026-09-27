@@ -37,6 +37,23 @@ not the release path.
 
 ## Work plan
 
+### In progress: #36, kubelet metrics under upstream's names
+
+Found, 2026-09-27: `/metrics` and `/metrics/cadvisor` exist, but hand-written. `/metrics` has two gauges,
+`kubelet_running_containers` has no `container_state`, there is no `process_*`, and the cadvisor side has
+CPU and memory only, from CRI. The stormpump runtime reports no container stats at all: `QUERY` has a stats
+block, but the ring client never reads a reply arena back. That is #57 (step 3), not this issue.
+
+Steps:
+1. [ ] `metrics.rs`: the recorder (`kubernetes_build_info` with the kubelet's version), apimachinery's `process_*`
+       collector, `kubelet_running_pods`, `kubelet_running_containers{container_state}`, and histograms
+       `kubelet_pod_start_duration_seconds` (first seen → started) and `kubelet_pleg_relist_duration_seconds`
+       (the sync pass over known pods; there is no separate PLEG). Upstream's buckets.
+2. [ ] cadvisor: `ContainerStatsInfo` fields optional (absent ≠ 0), plus `fs_usage_bytes` (CRI writable layer).
+       Pod network from a new `list_pod_network_stats`. stormpump reads `/proc/<holder>/net/dev` of the sandbox.
+       Series labelled `{container,id,namespace,pod}`, and network also `{interface}`, per pod.
+3. [ ] Tests, docs (`docs/metrics.md`), CHANGELOG, sc-build, close.
+
 ### Done: #73 + #74, stormvm v0.10.0's DiskSource (Empty, Claim)
 
 stormvm v0.10.0 (1b0d941) adds `DiskSource::Empty` (emptyDisk) and `DiskSource::Claim`
