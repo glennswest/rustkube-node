@@ -3,6 +3,24 @@
 ## [Unreleased]
 <!-- New unreleased changes go here -->
 
+### 2026-09-27 (metrics, #36)
+- **feat(kubelet):** `/metrics` under upstream's names, through the Prometheus
+  recorder rustkube's components use. It carries `kubelet_running_pods`,
+  `kubelet_running_containers{container_state}` (it had no label),
+  `kubelet_pod_start_duration_seconds` and
+  `kubelet_pleg_relist_duration_seconds` (histograms, upstream's buckets),
+  the `process_*` family (apimachinery's collector) and
+  `kubernetes_build_info` with the kubelet's own version.
+- **feat(kubelet):** `/metrics/cadvisor` adds `container_fs_usage_bytes` (CRI
+  writable layer) and `container_network_{receive,transmit}_bytes_total`
+  (per pod, per interface). Every series is labelled
+  `{container,id,namespace,pod}`. A stat the runtime did not report is no
+  series, where it used to be 0, and `/stats/summary` leaves it out the same
+  way.
+- **feat(stormpump):** pod network counters, read from the sandbox holder's
+  `/proc/<pid>/net/dev`.
+- **docs:** `docs/metrics.md`.
+
 ### 2026-09-27
 - **docs(build):** a release golden is a stage golden
   (`stormcentral component stage rustkube-node`), not `component build` or

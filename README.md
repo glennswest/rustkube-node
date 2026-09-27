@@ -45,7 +45,8 @@ TokenReview); `/healthz`, `/livez` and `/readyz` are open.
 
 | Route | What it is |
 |---|---|
-| `GET /metrics`, `/metrics/cadvisor`, `/stats/summary` | Node and pod metrics |
+| `GET /metrics`, `/metrics/cadvisor` | Prometheus metrics under upstream's names: the kubelet's own, and cAdvisor-shaped container and pod usage. See [docs/metrics.md](docs/metrics.md) |
+| `GET /stats/summary` | The Summary API (`kubectl top`, metrics-server) |
 | `GET /pods` | The pods this kubelet manages |
 | `GET /containerLogs/{ns}/{pod}/{container}` | What `kubectl logs` reads, by way of the apiserver proxy |
 | `GET /vmConsole/{ns}/{name}/{door}` | A VM's `serial` or `vnc` console, answered by stormvm's console router mounted here |

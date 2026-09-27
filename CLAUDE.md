@@ -45,11 +45,11 @@ CPU and memory only, from CRI. The stormpump runtime reports no container stats 
 block, but the ring client never reads a reply arena back. That is #57 (step 3), not this issue.
 
 Steps:
-1. [ ] `metrics.rs`: the recorder (`kubernetes_build_info` with the kubelet's version), apimachinery's `process_*`
+1. [x] `metrics.rs`: the recorder (`kubernetes_build_info` with the kubelet's version), apimachinery's `process_*`
        collector, `kubelet_running_pods`, `kubelet_running_containers{container_state}`, and histograms
        `kubelet_pod_start_duration_seconds` (first seen → started) and `kubelet_pleg_relist_duration_seconds`
        (the sync pass over known pods; there is no separate PLEG). Upstream's buckets.
-2. [ ] cadvisor: `ContainerStatsInfo` fields optional (absent ≠ 0), plus `fs_usage_bytes` (CRI writable layer).
+2. [x] cadvisor: `ContainerStatsInfo` fields optional (absent ≠ 0), plus `fs_usage_bytes` (CRI writable layer).
        Pod network from a new `list_pod_network_stats`. stormpump reads `/proc/<holder>/net/dev` of the sandbox.
        Series labelled `{container,id,namespace,pod}`, and network also `{interface}`, per pod.
 3. [ ] Tests, docs (`docs/metrics.md`), CHANGELOG, sc-build, close.
