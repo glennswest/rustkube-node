@@ -110,8 +110,12 @@ becomes a stormblock volume attached here:
 |---|---|---|
 | `dataVolume` / `containerDisk` | a clone of the named golden | yes |
 | `cloudInitNoCloud` | a generated `cidata` seed | yes |
-| `emptyDisk: {capacity}` | a blank volume `<ns>.<vm>-<disk>`, made once and reused on every later start | yes |
+| `emptyDisk: {capacity}` | a blank volume `<ns>.<vm>-<disk>`, reused if it already exists | yes |
 | `persistentVolumeClaim: {claimName}` | the claim's volume, resolved exactly as for a pod (a bound claim uses its volume, an unbound `stormblock` claim is provisioned) | no, it belongs to the claim |
+
+Today "deleted with the VM" also happens when the VM stops, so golden clones
+and empty disks come back fresh after a stop (#75). A claim's disk is never
+deleted.
 
 A claim's disk waits, with the reason on the VMI, while the claim is unbound,
 belongs to another StorageClass, or is in use by a pod on this node. A pod

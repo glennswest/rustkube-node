@@ -7,7 +7,8 @@
 - **feat(vm):** `emptyDisk` volumes (stormvm's `DiskSource::Empty`, #73). The
   VM's `<ns>.<vm>-<disk>` volume is found by name, or created blank with the
   disk's capacity, the engine's default redundancy and the `storm.io/vm`
-  label. It is found again on every later start, and it is owned by the VM.
+  label. An existing one is reused, and it is owned by the VM, so until #75
+  a stop deletes it like the VM's other disks.
   An engine that cannot list volumes fails the start rather than making a
   second blank.
 - **fix(vm):** a `persistentVolumeClaim` disk is resolved as a claim
