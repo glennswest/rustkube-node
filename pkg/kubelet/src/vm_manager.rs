@@ -302,7 +302,8 @@ pub struct VmManager {
     node_name: String,
     api: reqwest::Client,
     api_url: String,
-    http: reqwest::Client,
+    /// The engine client, with the engine's token (#66).
+    engine: crate::engine::EngineClient,
     /// Events about virtual machines.
     ///
     /// A VM that will not start failed in this file, and the reason — a
@@ -355,11 +356,11 @@ impl VmManager {
             .then(|| crate::events::EventRecorder::new(api.clone(), &api_url, &node_name));
         VmManager {
             ring,
-            storage: "http://127.0.0.1:9090".into(),
+            storage: crate::engine::DEFAULT_URL.into(),
             node_name,
             api,
             api_url,
-            http: reqwest::Client::new(),
+            engine: crate::engine::EngineClient::default(),
             events,
             vms: Mutex::new(HashMap::new()),
             desired: Mutex::new(HashMap::new()),
@@ -392,8 +393,10 @@ impl VmManager {
         self.event(&obj, etype, reason, message).await;
     }
 
-    pub fn with_storage(mut self, storage: impl Into<String>) -> VmManager {
-        self.storage = storage.into();
+    /// The node's engine, shared with the rest of the kubelet.
+    pub fn with_storage(mut self, engine: crate::engine::EngineClient) -> VmManager {
+        self.storage = engine.url().to_string();
+        self.engine = engine;
         self
     }
 
@@ -1095,7 +1098,7 @@ impl VmManager {
         for d in disks {
             let Some(id) = &d.volume_id else { continue };
             let url = format!("{}/api/v1/volumes/{id}/attach", self.storage);
-            if let Err(e) = self.http.delete(&url).send().await {
+            if let Err(e) = self.engine.delete(&url).await {
                 warn!("could not detach {id} ({}): {e}", d.name);
             }
         }
@@ -1236,7 +1239,7 @@ impl VmManager {
     async fn destroy_owned(&self, vm: &Vm) {
         for id in &vm.owned_volumes {
             let url = format!("{}/api/v1/volumes/{id}", self.storage);
-            match self.http.delete(&url).send().await {
+            match self.engine.delete(&url).await {
                 Ok(r) if r.status().is_success() => {
                     info!(vm = %vm.name, volume = %id, "deleted the machine's own volume");
                 }
@@ -1372,13 +1375,7 @@ impl VmManager {
     }
 
     async fn post(&self, url: &str, body: &Value) -> Result<Value, String> {
-        let resp = self
-            .http
-            .post(url)
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
+        let resp = self.engine.post(url, body).await.map_err(|e| e.to_string())?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {

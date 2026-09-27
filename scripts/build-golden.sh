@@ -42,13 +42,34 @@ TRIPLE="${MUSL_TRIPLE:-x86_64-unknown-linux-musl}"
 BINARIES=(kubelet kube-proxy)
 
 say() { printf '   %s\n' "$*" >&2; }
+
+# The engine's token (stormblock >= 17 refuses its API without one, #66),
+# found the way stormblock's CLI finds it: $STORMBLOCK_API_TOKEN, then the file
+# at $STORMBLOCK_TOKEN_FILE, then /etc/stormblock/api_token, then
+# /var/lib/stormblock/api_token. For the forge's engine it is that engine's
+# token, not this box's.
+engine_token() {
+    if [ -n "${STORMBLOCK_API_TOKEN:-}" ]; then
+        printf '%s' "$STORMBLOCK_API_TOKEN"; return
+    fi
+    local f
+    for f in ${STORMBLOCK_TOKEN_FILE:-} /etc/stormblock/api_token /var/lib/stormblock/api_token; do
+        if [ -r "$f" ] && [ -s "$f" ]; then tr -d '[:space:]' < "$f"; return; fi
+    done
+}
+TOKEN="$(engine_token)"
+[ -n "$TOKEN" ] || say "no stormblock token found; calling $ENGINE without one"
+
+# The header goes in on stdin (`-H @-`), so the token is not on curl's command
+# line for anyone running ps.
 api() {
     local method="$1" path="$2" body="${3:-}"
-    if [ -n "$body" ]; then
-        curl -fsS -X "$method" "$ENGINE/api/v1$path" \
-            -H 'Content-Type: application/json' -d "$body"
+    local args=(-fsS -X "$method" "$ENGINE/api/v1$path")
+    [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
+    if [ -n "$TOKEN" ]; then
+        printf 'Authorization: Bearer %s\n' "$TOKEN" | curl -H @- "${args[@]}"
     else
-        curl -fsS -X "$method" "$ENGINE/api/v1$path"
+        curl "${args[@]}"
     fi
 }
 jfield() { python3 -c 'import sys,json;print(json.load(sys.stdin).get(sys.argv[1],""))' "$1"; }

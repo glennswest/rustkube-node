@@ -58,8 +58,10 @@ struct Cli {
     #[arg(long, default_value = "http://127.0.0.1:5100")]
     registry: String,
 
-    /// This node's stormblock, which clones a golden and attaches it as a
-    /// block device. Used for virtual machines (--runtime=stormpump).
+    /// This node's stormblock engine API: claims, VM disks and pulled images
+    /// are cloned and attached through it. Its token is read from
+    /// $STORMBLOCK_API_TOKEN or $STORMBLOCK_TOKEN_FILE (default
+    /// /run/stormblock/engine/api_token), as stormblock's CLI does (#66).
     #[arg(long, env = "STORMBLOCK_URL", default_value = "http://127.0.0.1:9090")]
     stormblock: String,
 
@@ -278,6 +280,11 @@ async fn main() -> anyhow::Result<()> {
     // only the engine starts one, so every other runtime leaves this None and
     // the kubelet simply does not reconcile VMs.
     let mut engine_ring: Option<std::sync::Arc<kubelet::stormpump_ring::RingClient>> = None;
+    // The node's stormblock engine, with its token (#66): one client, shared
+    // by claims, VM disks and image pulls. The token may not exist yet (the
+    // engine mints it at start), and the client keeps looking for it.
+    let engine = kubelet::engine::EngineClient::from_env(&cli.stormblock);
+    tracing::info!("stormblock engine: {engine:?}");
 
     let (runtime, images, migration): (
         Arc<dyn kubelet::cri::RuntimeService>,
@@ -326,7 +333,8 @@ async fn main() -> anyhow::Result<()> {
                         kubelet::stormpump_runtime::StormpumpImages::new(
                             cli.registry.clone(),
                         )
-                        .with_engine(rt.ring_client(), node_name.clone()),
+                        .with_engine(rt.ring_client(), node_name.clone())
+                        .with_storage(engine.clone()),
                     );
                     let mig = Arc::new(NativeRuntime::new())
                         as Arc<dyn kubelet::cri::MigrationService>;
@@ -474,6 +482,7 @@ async fn main() -> anyhow::Result<()> {
         serving_key,
         server_auth_token,
         anonymous_auth: cli.anonymous_auth,
+        engine: engine.clone(),
         ..Default::default()
     };
     let mut kubelet = Kubelet::new(config, runtime, images, migration)?;
@@ -481,7 +490,7 @@ async fn main() -> anyhow::Result<()> {
         // The same connection the containers are started on, deliberately: a
         // workload belongs to the client that started it, so a second ring
         // would mean a second thing whose death is a VM's death.
-        kubelet = kubelet.with_engine(ring, &cli.stormblock);
+        kubelet = kubelet.with_engine(ring);
     }
     if let Err(e) = kubelet.run().await {
         anyhow::bail!("kubelet failed: {e}");

@@ -50,6 +50,9 @@ pub struct KubeletConfig {
     /// pods run locally, independent of the apiserver — this is how the control
     /// plane (apiserver, etcd) bootstraps. `None` disables static pods.
     pub pod_manifest_path: Option<std::path::PathBuf>,
+    /// This node's stormblock engine, with its token (#66). One client for
+    /// every engine call the kubelet makes.
+    pub engine: crate::engine::EngineClient,
 }
 
 impl Default for KubeletConfig {
@@ -74,6 +77,7 @@ impl Default for KubeletConfig {
             server_auth_token: None,
             anonymous_auth: false,
             pod_manifest_path: Some(std::path::PathBuf::from("/etc/kubernetes/manifests")),
+            engine: crate::engine::EngineClient::default(),
         }
     }
 }
@@ -144,6 +148,7 @@ impl Kubelet {
                 api_client.clone(),
             )
             .with_ca_pem(config.apiserver_ca.clone())
+            .with_engine(config.engine.clone())
             .with_csi(csi.clone()),
         );
 
@@ -167,11 +172,7 @@ impl Kubelet {
     /// manager so the manager gets *this* kubelet's authenticated apiserver
     /// client — a status written with an unauthenticated one is a status
     /// nobody ever sees.
-    pub fn with_engine(
-        mut self,
-        ring: Arc<crate::stormpump_ring::RingClient>,
-        stormblock: &str,
-    ) -> Self {
+    pub fn with_engine(mut self, ring: Arc<crate::stormpump_ring::RingClient>) -> Self {
         self.vms = Some(Arc::new(
             crate::vm_manager::VmManager::new(
                 Some(ring),
@@ -179,7 +180,7 @@ impl Kubelet {
                 self.api_client.clone(),
                 &self.config.api_server_url,
             )
-            .with_storage(stormblock),
+            .with_storage(self.config.engine.clone()),
         ));
         self
     }
@@ -325,11 +326,12 @@ impl Kubelet {
             let url = self.config.api_server_url.clone();
             let node = self.config.node_name.clone();
             let client = self.api_client.clone();
+            let engine = self.config.engine.clone();
             tokio::spawn(async move {
                 let mut interval = time::interval(Duration::from_secs(30));
                 loop {
                     interval.tick().await;
-                    crate::system_claims::mirror(&client, &url, "http://127.0.0.1:9090", &node).await;
+                    crate::system_claims::mirror(&client, &url, &engine, &node).await;
                 }
             });
         }

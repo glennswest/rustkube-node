@@ -244,6 +244,9 @@ pub struct PodManager {
     /// stormblock's management API on this node. Volumes for
     /// PersistentVolumeClaims are created and attached through it.
     storage_url: String,
+    /// The client for it, carrying the engine's token (#66). The apiserver
+    /// client's token means nothing to the engine.
+    engine: crate::engine::EngineClient,
     /// Kubelet state root; per-pod volume dirs live under `<state_root>/pods`.
     /// Overridable in tests. Default `/var/lib/kubelet`.
     state_root: String,
@@ -298,7 +301,8 @@ impl PodManager {
             api_url: api_url.trim_end_matches('/').to_string(),
             api_client,
             node_ip: node_ip.to_string(),
-            storage_url: "http://127.0.0.1:9090".to_string(),
+            storage_url: crate::engine::DEFAULT_URL.to_string(),
+            engine: crate::engine::EngineClient::default(),
             state_root: "/var/lib/kubelet".to_string(),
             cluster_dns: vec!["10.96.0.10".to_string()],
             cluster_domain: "cluster.local".to_string(),
@@ -311,6 +315,13 @@ impl PodManager {
 
     /// Use this registry of CSI drivers: the one the kubelet's registration
     /// loop fills.
+    /// The node's engine, shared with the rest of the kubelet.
+    pub fn with_engine(mut self, engine: crate::engine::EngineClient) -> Self {
+        self.storage_url = engine.url().to_string();
+        self.engine = engine;
+        self
+    }
+
     pub fn with_csi(mut self, csi: Arc<crate::csi_plugins::CsiPlugins>) -> Self {
         self.csi = csi;
         self
@@ -487,13 +498,7 @@ impl PodManager {
     /// it serves, and a kubelet asking another node's stormblock for a local
     /// device would get an answer that is true somewhere else.
     async fn storage_post(&self, path: &str, body: &Value) -> Option<Value> {
-        let resp = self
-            .api_client
-            .post(format!("{}{path}", self.storage_url))
-            .json(body)
-            .send()
-            .await
-            .ok()?;
+        let resp = self.engine.post(&format!("{}{path}", self.storage_url), body).await.ok()?;
         let status = resp.status();
         let text = resp.text().await.ok()?;
         if !status.is_success() {
@@ -1254,9 +1259,8 @@ impl PodManager {
     /// next step handles it — and wrong for anything that destroys data.
     async fn storage_volume_checked(&self, name: &str) -> Result<Option<(String, bool)>, String> {
         let resp = self
-            .api_client
-            .get(format!("{}/api/v1/volumes", self.storage_url))
-            .send()
+            .engine
+            .get(&format!("{}/api/v1/volumes", self.storage_url))
             .await
             .map_err(|e| format!("stormblock is not answering on this node: {e}"))?;
         if !resp.status().is_success() {
@@ -1410,9 +1414,8 @@ impl PodManager {
     /// are different facts and a controller does different things with them.
     async fn storage_delete(&self, path: &str) -> Result<(), String> {
         let resp = self
-            .api_client
-            .delete(format!("{}{path}", self.storage_url))
-            .send()
+            .engine
+            .delete(&format!("{}{path}", self.storage_url))
             .await
             .map_err(|e| format!("stormblock is not answering on this node: {e}"))?;
         let status = resp.status();
@@ -1428,8 +1431,7 @@ impl PodManager {
 
     /// GET from stormblock's management API on this node.
     async fn storage_get(&self, path: &str) -> Option<Value> {
-        let resp =
-            self.api_client.get(format!("{}{path}", self.storage_url)).send().await.ok()?;
+        let resp = self.engine.get(&format!("{}{path}", self.storage_url)).await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -4086,6 +4088,37 @@ mod tests {
         // that races a running pod pulls a filesystem away mid-write.
         assert!(!sb.detached.load(Ordering::SeqCst));
         assert!(!sb.deleted.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn claims_reach_the_engine_with_its_token_not_the_apiservers() {
+        // The engine refuses anything but its own token (#66, stormblock#107).
+        let app = axum::Router::new().route(
+            "/api/v1/volumes",
+            axum::routing::get(|h: axum::http::HeaderMap| async move {
+                match h.get("authorization").and_then(|v| v.to_str().ok()) {
+                    Some("Bearer engine-tok") => {
+                        (axum::http::StatusCode::OK, axum::Json(json!({"items": []})))
+                    }
+                    _ => (axum::http::StatusCode::UNAUTHORIZED, axum::Json(json!({}))),
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("api_token");
+        let (_rt, mgr) = manager();
+        let mgr = mgr.with_engine(crate::engine::EngineClient::new(
+            &url,
+            crate::engine::TokenSource::files([&file]),
+        ));
+        // Not minted yet: refused, and said so rather than read as "no volume".
+        assert!(mgr.storage_volume_checked("pvc-default-data").await.is_err());
+        std::fs::write(&file, "engine-tok\n").unwrap();
+        assert_eq!(mgr.storage_volume_checked("pvc-default-data").await.unwrap(), None);
     }
 
     #[tokio::test]

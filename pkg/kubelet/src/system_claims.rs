@@ -134,11 +134,19 @@ pub fn objects(v: &Value, node: &str, golden: Option<&str>) -> (Value, Value) {
 }
 
 /// One pass: every data container on this node has its PV and bound PVC.
-pub async fn mirror(client: &reqwest::Client, api_url: &str, storage_url: &str, node: &str) {
+///
+/// `client` is the apiserver's, `engine` the node's stormblock (with its own
+/// token, #66).
+pub async fn mirror(
+    client: &reqwest::Client,
+    api_url: &str,
+    engine: &crate::engine::EngineClient,
+    node: &str,
+) {
     if api_url.is_empty() {
         return;
     }
-    let vols: Value = match client.get(format!("{storage_url}/api/v1/volumes")).send().await {
+    let vols: Value = match engine.get(&format!("{}/api/v1/volumes", engine.url())).await {
         Ok(r) if r.status().is_success() => match r.json().await {
             Ok(v) => v,
             Err(_) => return,

@@ -1035,6 +1035,9 @@ pub struct StormpumpImages {
     registry: String,
     /// This node's stormblock, which attaches a clone as a block device.
     storage: String,
+    /// Its client, with the engine's token (#66). `http` is for the registry,
+    /// which must not be sent the engine's token.
+    engine: crate::engine::EngineClient,
     /// Passed to the attach, because a volume is attached *somewhere*.
     node_name: String,
     http: reqwest::Client,
@@ -1139,7 +1142,8 @@ impl StormpumpImages {
     pub fn new(registry: impl Into<String>) -> StormpumpImages {
         StormpumpImages {
             registry: registry.into(),
-            storage: DEFAULT_STORAGE_URL.to_string(),
+            storage: crate::engine::DEFAULT_URL.to_string(),
+            engine: crate::engine::EngineClient::default(),
             node_name: String::new(),
             http: reqwest::Client::new(),
             ring: None,
@@ -1159,8 +1163,10 @@ impl StormpumpImages {
         self
     }
 
-    pub fn with_storage(mut self, storage: impl Into<String>) -> StormpumpImages {
-        self.storage = storage.into();
+    /// The node's engine, shared with the rest of the kubelet.
+    pub fn with_storage(mut self, engine: crate::engine::EngineClient) -> StormpumpImages {
+        self.storage = engine.url().to_string();
+        self.engine = engine;
         self
     }
 
@@ -1177,10 +1183,6 @@ impl StormpumpImages {
 /// filesystem is already on the node and the "pull" is a lookup.
 const PALLET_ROOT: &str = "/pallets";
 
-/// This node's stormblock. The engine is local by construction: a volume is
-/// attached to the node that will use it.
-const DEFAULT_STORAGE_URL: &str = "http://127.0.0.1:9090";
-
 impl StormpumpImages {
     /// POST JSON and read JSON back, or say why not.
     ///
@@ -1194,6 +1196,20 @@ impl StormpumpImages {
     ) -> Result<serde_json::Value, String> {
         let resp =
             self.http.post(url).json(body).send().await.map_err(|e| format!("{url}: {e}"))?;
+        Self::json_answer(url, resp).await
+    }
+
+    /// [`Self::post`] to the engine, with its token.
+    async fn post_engine(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let resp = self.engine.post(url, body).await.map_err(|e| format!("{url}: {e}"))?;
+        Self::json_answer(url, resp).await
+    }
+
+    async fn json_answer(url: &str, resp: reqwest::Response) -> Result<serde_json::Value, String> {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -1204,8 +1220,7 @@ impl StormpumpImages {
 
     /// A volume's id by name, from this node's stormblock.
     async fn volume_id(&self, name: &str) -> Option<String> {
-        let resp =
-            self.http.get(format!("{}/api/v1/volumes", self.storage)).send().await.ok()?;
+        let resp = self.engine.get(&format!("{}/api/v1/volumes", self.storage)).await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -1298,7 +1313,7 @@ impl ImageService for StormpumpImages {
         })?;
         let attach = serde_json::json!({ "node": self.node_name, "transport": "ublk" });
         let info: serde_json::Value = self
-            .post(&format!("{}/api/v1/volumes/{vol_id}/attach", self.storage), &attach)
+            .post_engine(&format!("{}/api/v1/volumes/{vol_id}/attach", self.storage), &attach)
             .await
             .map_err(|e| CriError::ImagePull(format!("could not attach {volume}: {e}")))?;
         let device = info["device_hint"].as_str().ok_or_else(|| {

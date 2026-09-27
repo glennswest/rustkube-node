@@ -109,6 +109,8 @@ commit its manifest records.
 | Variable | Default | What it is |
 |---|---|---|
 | `STORMBLOCK_ENGINE` | `http://forge.g16.lo:9090` | the forge's management API |
+| `STORMBLOCK_API_TOKEN` | unset | that engine's token (stormblock ≥ 17 requires one) |
+| `STORMBLOCK_TOKEN_FILE` | unset | a file holding it; then `/etc/stormblock/api_token`, `/var/lib/stormblock/api_token` |
 | `GOLDEN_NQN` | `nqn.2026-09.lo.g16:stormcos` | the NVMe subsystem to attach from |
 | `GOLDEN_NAME` | `rustkube-node` | the golden's name; the volume is `golden-<name>` |
 | `GOLDEN_SIZE` | `96M` | argument 1 overrides |
