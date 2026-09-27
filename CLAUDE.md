@@ -46,17 +46,18 @@ objects and bindings, not phases. The engine marks nothing as logs: kind comes f
 (`-data`, `-state`, `-logs`), and `role` is only the slab half (system|data), recorded as an annotation.
 
 Steps:
-1. [ ] Shared builder for a complete pair: labels `storm.io/volume-kind`, `storm.io/component`; PVC annotations
-       bind-completed, bound-by-controller, storage-provisioner (+beta), selected-node; PV provisioned-by
-       `stormblock.storm.io`, `claimRef` with uid+resourceVersion, `csi.fsType` from `fs.kind`,
-       `volumeAttributes` (golden, fs uuid), annotations health/access/role.
-2. [ ] Reconciler: list once per pass; create what is missing (PVC first, then PV with its uid), bring
-       existing ones up to date (size only grows, labels, annotations, claimRef uid). Only objects annotated
-       with this node; another node's same-named object is left alone.
-3. [ ] `bind_claim` (built-in driver claims) uses the same builder.
-4. [ ] **Owner decisions:** (a) names collide across nodes (`storm-fastetcd-data` on every node);
-       (b) a vanished volume: the binder makes a PV Released only when its claim is gone.
-5. [ ] Tests, docs, CHANGELOG, sc-build.
+1. [x] Shared builder (`stormblock_pv`, `bind_pvc`, `objects`): labels `storm.io/volume-kind`, `storm.io/component`;
+       PVC bind-completed, bound-by-controller, storage-provisioner (+beta), selected-node; PV provisioned-by,
+       `claimRef` with uid+resourceVersion, `csi.fsType`, `volumeAttributes`, health/access/role annotations.
+2. [x] Reconciler: two lists a pass; PVC first, then PV with its uid; size only grows; labels/annotations merged;
+       claimRef follows the claim's uid. Only objects annotated with this node. Nothing written when current.
+3. [x] `bind_claim` (built-in driver claims) uses the same builder.
+4. [x] (b) A vanished volume: the mirror deletes its claim, the binder makes the PV Released, the PV is never
+       deleted (the issue's stated outcome). Not on a listing with none of the node's volumes.
+5. [ ] **Owner decision (a), open:** names collide across nodes. `kube-system/fastetcd-data` and PV
+       `storm-fastetcd-data` exist once per cluster, so only the first node's volumes are represented; the
+       others log a warning. Asked on the issue.
+6. [x] Tests (fake apiserver + engine end to end), docs (`docs/node-volumes.md`), CHANGELOG. sc-build: pending.
 
 ### In progress: #57, pod limits onto stormpump `Spec.limits`, container stats from `QUERY`
 
