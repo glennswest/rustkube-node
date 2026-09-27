@@ -270,7 +270,43 @@ pub struct PodManager {
     /// When each pod (by uid) was first seen and not yet started, for
     /// `kubelet_pod_start_duration_seconds` (#36).
     first_seen: std::sync::Mutex<HashMap<String, Instant>>,
+    /// Pods (by uid) that are this node's but not started, and what they wait
+    /// on (#63). Without this a pod waiting on its claim was known to nobody:
+    /// `logs` said "not found on this node" and it had no container statuses.
+    waiting: std::sync::Mutex<HashMap<String, WaitingPod>>,
+    /// Blanks being minted in the background, by name (#63). A 1 TiB blank
+    /// takes minutes to format, and the sync loop must not wait for it.
+    minting: Arc<std::sync::Mutex<HashMap<String, Mint>>>,
 }
+
+/// A pod this node has admitted and not started, and why.
+#[derive(Debug, Clone)]
+pub struct WaitingPod {
+    pub namespace: String,
+    pub name: String,
+    /// What it waits on, as `describe` shows it.
+    pub reason: String,
+}
+
+/// A background mint of a size-class blank.
+#[derive(Debug, Clone)]
+enum Mint {
+    InFlight,
+    /// The engine refused it. Reported once, then the next claim tries again.
+    Failed(String),
+}
+
+/// How long a pod waits on its volumes before the reason says it timed out.
+///
+/// The pod keeps waiting and retrying past it, as upstream's does: a mount
+/// timeout is an Event and a message, not a Failed pod, because the volume may
+/// still come (a 1 TiB blank formatting, an engine restarting).
+pub const VOLUME_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long a claim waits, inline, for a mint it started before it lets the
+/// sync move on. A small class is ready well inside it, so the first claim of
+/// a class usually still starts on the pass that asked.
+const MINT_INLINE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl PodManager {
     pub fn new(
@@ -314,6 +350,8 @@ impl PodManager {
             csi: Arc::new(crate::csi_plugins::CsiPlugins::new(node_name)),
             csi_mountinfo: "/proc/1/mountinfo".to_string(),
             first_seen: std::sync::Mutex::new(HashMap::new()),
+            waiting: std::sync::Mutex::new(HashMap::new()),
+            minting: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -1204,8 +1242,16 @@ impl PodManager {
                 // stamps the clone with its own filesystem UUID — two live
                 // filesystems must never claim one identity (stormblock#76).
                 let blank = crate::storage::template_name(class);
-                let template = match self.storage_template(&blank).await {
-                    Some(id) => id,
+                let template = match self.storage_template_state(&blank).await {
+                    // A blank not sealed yet cannot be cloned. Formatting a
+                    // 1 TiB class takes minutes (stormblock#141), and the claim
+                    // waits with the state named rather than failing a clone.
+                    Some((id, state)) if state == "ready" => id,
+                    Some((_, state)) => {
+                        return Err(ClaimError::Failed(format!(
+                            "waiting for volume {name}: template {blank} {state}"
+                        )))
+                    }
                     // Mint it, rather than refusing the claim (#45).
                     //
                     // The alternative — which this replaces — capped the class
@@ -1219,7 +1265,14 @@ impl PodManager {
                     //
                     // One `mkfs` ever, per class, per node: the first claim of
                     // a class pays for it and every claim after is a clone.
-                    None => self.mint_template(&blank, class).await?,
+                    //
+                    // In the background (#63): the POST answers when the
+                    // format is done, and a 1 TiB class held the whole sync
+                    // loop for it. Every pod on the node stopped being
+                    // reconciled, and the waiting pod was nowhere.
+                    None => self.mint_template(&blank, class).await.map_err(|e| {
+                        ClaimError::Failed(format!("waiting for volume {name}: {e}"))
+                    })?,
                 };
 
                 // Through the template, not the volume: `fstemplates/{id}/clone`
@@ -1311,34 +1364,60 @@ impl PodManager {
             }))
     }
 
-    /// Lay down a blank filesystem for a size class, once.
+    /// Mint the blank for a size class ([`mint_blank`]) in the background,
+    /// one at a time per blank, and answer its id once it is `ready`.
     ///
-    /// Returns what `storage_volume` would have: the id, and whether it is
-    /// sealed. The caller seals if it is not, so this does not have to.
-    ///
-    /// The name is `template_name`'s, and that matters more than it looks:
-    /// stormcos once had the registry looking a blank up as `pvc-ext4j-<mib>m`
-    /// while the image called it `pvc-1M`, and neither side could see the
-    /// other's name. Minting through the same function the lookup uses is what
-    /// keeps that from coming back from this side.
-    async fn mint_template(&self, blank: &str, class: &str) -> Result<String, ClaimError> {
-        info!("no blank {blank} on this node — minting it (one mkfs, ever, for class {class})");
-        // `role: data`: the blank, and so every claim cloned from it, lives in
-        // the half no install formats — a claim shares its blank's unwritten
-        // extents, and the system half is replaced by every install.
-        let body = serde_json::json!({ "name": blank, "size": class, "fs": "ext4", "role": "data" });
-        // stormblock formats and seals it, and answers `{"template": {...}}`.
-        // A racing pod on the same node mints the same class and gets 409, so
-        // the answer is looked up either way: that is both the id and the
-        // check that the template is really there.
-        let made = self.storage_post("/api/v1/fstemplates", &body).await;
-        if let Some(id) = self.storage_template(blank).await {
-            return Ok(id);
+    /// `Err` is what the claim waits on: the mint in flight, the template's
+    /// state while it formats, or the engine's refusal (once; the next claim
+    /// tries again). The mint is waited for inline for [`MINT_INLINE_WAIT`]
+    /// only, so a small class is cloned on the pass that asked and a 1 TiB one
+    /// does not hold the sync loop (#63).
+    async fn mint_template(&self, blank: &str, class: &str) -> Result<String, String> {
+        let started = {
+            let mut m = self.minting.lock().unwrap_or_else(|e| e.into_inner());
+            match m.get(blank).cloned() {
+                Some(Mint::InFlight) => None,
+                Some(Mint::Failed(e)) => {
+                    m.remove(blank);
+                    return Err(e);
+                }
+                None => {
+                    m.insert(blank.to_string(), Mint::InFlight);
+                    Some(())
+                }
+            }
+        };
+        if started.is_some() {
+            info!("no blank {blank} on this node — minting it (one mkfs, ever, for class {class})");
+            let engine = self.engine.clone();
+            let url = format!("{}/api/v1/fstemplates", self.storage_url);
+            let minting = self.minting.clone();
+            let (blank, class) = (blank.to_string(), class.to_string());
+            let task = tokio::spawn(async move {
+                let failed = mint_blank(&engine, &url, &blank, &class).await.err();
+                let mut m = minting.lock().unwrap_or_else(|e| e.into_inner());
+                match failed {
+                    Some(e) => {
+                        warn!("{e}");
+                        m.insert(blank, Mint::Failed(e));
+                    }
+                    None => {
+                        m.remove(&blank);
+                    }
+                }
+            });
+            // A small class is done in well under this, and then the claim
+            // goes on to its clone on this same pass.
+            let _ = tokio::time::timeout(MINT_INLINE_WAIT, task).await;
         }
-        Err(ClaimError::Failed(format!(
-            "stormblock would not mint the blank {blank}: {}",
-            made.map(|m| m.to_string()).unwrap_or_else(|| "no answer".into())
-        )))
+        match self.storage_template_state(blank).await {
+            Some((id, state)) if state == "ready" => Ok(id),
+            Some((_, state)) => Err(format!("template {blank} {state}")),
+            None => match self.minting.lock().unwrap_or_else(|e| e.into_inner()).get(blank) {
+                Some(Mint::Failed(e)) => Err(e.clone()),
+                _ => Err(format!("minting template {blank} (one mkfs for class {class})")),
+            },
+        }
     }
 
     /// Clone what a claim's `dataSource` names into the claim's own volume.
@@ -1429,10 +1508,14 @@ impl PodManager {
         self.storage_volume_id(handle).await
     }
 
-    /// A filesystem template's id, by name.
-    async fn storage_template(&self, name: &str) -> Option<String> {
+    /// A filesystem template's id and state (`ready`, `awaiting_format`,
+    /// `awaiting_seed`), by name.
+    /// An engine that reports no state is taken as ready, which is what every
+    /// template it answered for was before states existed.
+    async fn storage_template_state(&self, name: &str) -> Option<(String, String)> {
         let t: Value = self.storage_get(&format!("/api/v1/fstemplates/{name}")).await?;
-        t["id"].as_str().map(String::from)
+        let id = t["id"].as_str()?.to_string();
+        Some((id, t["state"].as_str().unwrap_or("ready").to_string()))
     }
 
     /// DELETE on stormblock's management API on this node.
@@ -1802,6 +1885,7 @@ impl PodManager {
                 match self.start_pod(pod).await {
                     Ok(status) => {
                         self.first_seen.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+                        self.waiting.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
                         crate::metrics::observe_pod_start(seen.elapsed().as_secs_f64());
                         outcome.updates.push(status)
                     }
@@ -1816,34 +1900,21 @@ impl PodManager {
                     // and nothing retried it.
                     Err(CriError::NetworkNotReady(what)) => {
                         warn!("Pod {namespace}/{name} waiting on the pod network: {what}");
-                        outcome.updates.push(PodStatusUpdate {
-                            namespace: namespace.to_string(),
-                            name: name.to_string(),
-                            phase: "Pending".to_string(),
-                            message: format!("network is not ready: {what}"),
-                            container_statuses: vec![],
-                            init_container_statuses: vec![],
-                            declared_init_containers: declared_init_containers(pod),
-                            pod_ip: None,
-                        });
+                        let message = format!("network is not ready: {what}");
+                        outcome.updates.push(self.waiting_pod(pod, message));
                     }
+                    // Admitted and waiting, not missing (#63): the pod is
+                    // recorded, its containers are `ContainerCreating` with
+                    // the reason, and `describe` has a FailedMount Event.
                     Err(CriError::VolumeNotReady(what)) => {
                         warn!("Pod {namespace}/{name} waiting on volumes: {what}");
-                        outcome.updates.push(PodStatusUpdate {
-                            namespace: namespace.to_string(),
-                            name: name.to_string(),
-                            phase: "Pending".to_string(),
-                            message: format!(
-                                "Unable to attach or mount volumes: unmounted volumes=[{what}]"
-                            ),
-                            container_statuses: vec![],
-                            init_container_statuses: vec![],
-                            declared_init_containers: declared_init_containers(pod),
-                            pod_ip: None,
-                        });
+                        let message = volume_wait_message(&what, seen.elapsed());
+                        self.event(pod, "Warning", "FailedMount", &message).await;
+                        outcome.updates.push(self.waiting_pod(pod, message));
                     }
                     Err(e) => {
                         error!("Failed to start pod {namespace}/{name}: {e}");
+                        self.waiting.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
                         outcome.updates.push(PodStatusUpdate {
                             namespace: namespace.to_string(),
                             name: name.to_string(),
@@ -1883,6 +1954,10 @@ impl PodManager {
             crate::metrics::observe_relist(relist.as_secs_f64());
         }
         self.first_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|uid, _| desired_uids.contains(uid));
+        self.waiting
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|uid, _| desired_uids.contains(uid));
@@ -2940,6 +3015,39 @@ impl PodManager {
     /// (`/var/log/pods/<ns>_<pod>_<uid>/`) while the URL `kubectl logs` sends
     /// does not — and because a pod this node has never heard of should be a
     /// 404 rather than an empty log.
+    /// Record a pod as admitted and waiting, and the status that says so:
+    /// Pending, every container `waiting: ContainerCreating` with `message`.
+    fn waiting_pod(&self, pod: &Value, message: String) -> PodStatusUpdate {
+        let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
+        let name = pod["metadata"]["name"].as_str().unwrap_or("").to_string();
+        let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default").to_string();
+        self.waiting.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            uid.to_string(),
+            WaitingPod { namespace: namespace.clone(), name: name.clone(), reason: message.clone() },
+        );
+        PodStatusUpdate {
+            namespace,
+            name,
+            phase: "Pending".to_string(),
+            container_statuses: creating_statuses(pod, &message),
+            message,
+            init_container_statuses: vec![],
+            declared_init_containers: declared_init_containers(pod),
+            pod_ip: None,
+        }
+    }
+
+    /// Why a pod this node has admitted is not started yet, when it is
+    /// waiting (#63). `logs` answers with it rather than "not found".
+    pub fn waiting_reason(&self, namespace: &str, name: &str) -> Option<String> {
+        self.waiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .find(|w| w.namespace == namespace && w.name == name)
+            .map(|w| w.reason.clone())
+    }
+
     pub async fn pod_uid(&self, namespace: &str, name: &str) -> Option<String> {
         let pods = self.pods.read().await;
         pods.values()
@@ -2949,7 +3057,7 @@ impl PodManager {
 
     pub async fn pods_json(&self) -> Value {
         let pods = self.pods.read().await;
-        let items: Vec<Value> = pods
+        let mut items: Vec<Value> = pods
             .values()
             .map(|p| {
                 serde_json::json!({
@@ -2961,6 +3069,14 @@ impl PodManager {
                 })
             })
             .collect();
+        // Admitted and waiting pods are this node's too (#63).
+        let waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        items.extend(waiting.iter().filter(|(uid, _)| !pods.contains_key(*uid)).map(|(uid, w)| {
+            serde_json::json!({
+                "metadata": {"name": w.name, "namespace": w.namespace, "uid": uid},
+                "status": {"phase": "Pending", "message": w.reason}
+            })
+        }));
         serde_json::json!({"kind": "PodList", "apiVersion": "v1", "items": items})
     }
 
@@ -3046,6 +3162,41 @@ impl PodManager {
 /// `NotOurs` is permanent and deterministic, so the same fallback would give
 /// a pod scratch storage *forever* because its claim belongs to another
 /// driver, which is that trade's cost without its benefit.
+/// Lay down a blank filesystem for a size class, once: `POST /api/v1/fstemplates`.
+///
+/// The name is `template_name`'s, and that matters more than it looks:
+/// stormcos once had the registry looking a blank up as `pvc-ext4j-<mib>m`
+/// while the image called it `pvc-1M`, and neither side could see the other's
+/// name. Minting through the same function the lookup uses keeps that from
+/// coming back from this side.
+///
+/// `role: data`: the blank, and so every claim cloned from it, lives in the
+/// half no install formats — a claim shares its blank's unwritten extents, and
+/// the system half is replaced by every install. stormblock formats and seals
+/// it. A racing mint of the same class gets 409, which is not a failure: the
+/// caller looks the template up either way.
+async fn mint_blank(
+    engine: &crate::engine::EngineClient,
+    url: &str,
+    blank: &str,
+    class: &str,
+) -> Result<(), String> {
+    let body = serde_json::json!({ "name": blank, "size": class, "fs": "ext4", "role": "data" });
+    let resp = engine
+        .post(url, &body)
+        .await
+        .map_err(|e| format!("stormblock would not mint the blank {blank}: {e}"))?;
+    let status = resp.status();
+    if status.is_success() || status.as_u16() == 409 {
+        return Ok(());
+    }
+    let text = resp.text().await.unwrap_or_default();
+    Err(format!(
+        "stormblock would not mint the blank {blank}: {status}: {}",
+        text.chars().take(200).collect::<String>()
+    ))
+}
+
 #[derive(Debug)]
 enum ClaimError {
     /// Another provisioner's claim. Never falls back.
@@ -3127,6 +3278,50 @@ pub struct ContainerStatusReport {
 }
 
 /// How many init containers a pod declares.
+/// Every container of a pod that has not started, as `ContainerCreating`
+/// with why. An empty list read as "this pod has no containers", and
+/// `kubectl get pod` showed Pending with nothing under it (#63).
+fn creating_statuses(pod: &Value, message: &str) -> Vec<ContainerStatusReport> {
+    pod["spec"]["containers"]
+        .as_array()
+        .map(|cs| {
+            cs.iter()
+                .map(|c| ContainerStatusReport {
+                    name: c["name"].as_str().unwrap_or("").to_string(),
+                    container_id: String::new(),
+                    state: "waiting".to_string(),
+                    ready: false,
+                    restart_count: 0,
+                    exit_code: 0,
+                    image: c["image"].as_str().unwrap_or("").to_string(),
+                    image_ref: String::new(),
+                    reason: "ContainerCreating".to_string(),
+                    message: message.to_string(),
+                    started_at: 0,
+                    finished_at: 0,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// What a pod waiting on its volumes says, upstream's shape. Past
+/// [`VOLUME_WAIT_TIMEOUT`] it says it timed out, and it keeps waiting.
+///
+/// The minutes are the timeout's, not the elapsed time, so the message is the
+/// same on every sync and the Event aggregates instead of multiplying.
+pub fn volume_wait_message(what: &str, waited: std::time::Duration) -> String {
+    if waited >= VOLUME_WAIT_TIMEOUT {
+        format!(
+            "Unable to attach or mount volumes: unmounted volumes=[{what}]: timed out after {}m \
+             waiting for the condition; still retrying",
+            VOLUME_WAIT_TIMEOUT.as_secs() / 60
+        )
+    } else {
+        format!("Unable to attach or mount volumes: unmounted volumes=[{what}]")
+    }
+}
+
 pub fn declared_init_containers(pod: &Value) -> usize {
     pod["spec"]["initContainers"]
         .as_array()
@@ -4113,6 +4308,133 @@ pub(crate) mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         FakeStormblock { detached, deleted, url: format!("http://{addr}") }
+    }
+
+    #[tokio::test]
+    async fn a_pod_waiting_on_a_volume_is_admitted_not_missing() {
+        // #63: a pod whose volume is not ready was reported Pending and then
+        // forgotten, so `logs` said "not found on this node" and it had no
+        // container statuses.
+        let (rt, mgr) = manager();
+        let mut p = pod("uid-1", "probe", "Always", simple_container());
+        p["spec"]["volumes"] = json!([{"name": "share", "nfs": {"server": "x", "path": "/"}}]);
+
+        let outcome = mgr.sync_pods(&[p.clone()]).await;
+        let u = &outcome.updates[0];
+        assert_eq!(u.phase, "Pending");
+        assert!(u.message.starts_with("Unable to attach or mount volumes"), "{}", u.message);
+        assert_eq!(u.container_statuses.len(), 1);
+        let c = &u.container_statuses[0];
+        assert_eq!((c.name.as_str(), c.state.as_str()), ("app", "waiting"));
+        assert_eq!(c.reason, "ContainerCreating");
+        assert!(c.message.contains("volume share is of type nfs"), "{}", c.message);
+        assert!(c.container_id.is_empty());
+        assert!(rt.created_names().is_empty());
+
+        // The node knows it, and says why.
+        let why = mgr.waiting_reason("default", "probe").expect("recorded as waiting");
+        assert!(why.contains("nfs"));
+        let listed = mgr.pods_json().await;
+        assert_eq!(listed["items"][0]["metadata"]["uid"], "uid-1");
+        assert_eq!(listed["items"][0]["status"]["phase"], "Pending");
+
+        // Still waiting on the next pass, and gone once the pod is.
+        mgr.sync_pods(&[p]).await;
+        assert!(mgr.waiting_reason("default", "probe").is_some());
+        mgr.sync_pods(&[]).await;
+        assert!(mgr.waiting_reason("default", "probe").is_none());
+        assert_eq!(mgr.pods_json().await["items"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn a_long_volume_wait_says_it_timed_out_and_stays_stable() {
+        let short = volume_wait_message("v: template t awaiting_format", std::time::Duration::from_secs(10));
+        assert!(!short.contains("timed out"));
+        let long = volume_wait_message("v: template t awaiting_format", VOLUME_WAIT_TIMEOUT);
+        assert!(long.contains("timed out after 5m"), "{long}");
+        assert!(long.contains("still retrying"));
+        // The same text later, so the FailedMount Event aggregates.
+        assert_eq!(
+            long,
+            volume_wait_message("v: template t awaiting_format", VOLUME_WAIT_TIMEOUT * 3)
+        );
+    }
+
+    /// A stormblock whose `POST /api/v1/fstemplates` takes `format` to answer,
+    /// like a 1 TiB blank being formatted, and whose template reads `state`
+    /// once minted (none before). Counts the POSTs.
+    async fn slow_minting_stormblock(
+        format: std::time::Duration,
+        state: &'static str,
+    ) -> (String, Arc<AtomicU32>) {
+        use axum::routing::{get as http_get, post as http_post};
+        let posts = Arc::new(AtomicU32::new(0));
+        let made = Arc::new(AtomicBool::new(false));
+        let (p, m, m2) = (posts.clone(), made.clone(), made.clone());
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/fstemplates",
+                http_post(move || {
+                    let (p, m) = (p.clone(), m.clone());
+                    async move {
+                        p.fetch_add(1, Ordering::SeqCst);
+                        // Persisted before the format, as stormblock does.
+                        m.store(true, Ordering::SeqCst);
+                        tokio::time::sleep(format).await;
+                        (axum::http::StatusCode::CREATED, axum::Json(json!({"template": {}})))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/fstemplates/{name}",
+                http_get(move || {
+                    let m = m2.clone();
+                    async move {
+                        if m.load(Ordering::SeqCst) {
+                            Ok(axum::Json(json!({"id": "tpl-1", "state": state})))
+                        } else {
+                            Err(axum::http::StatusCode::NOT_FOUND)
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), posts)
+    }
+
+    fn with_stormblock(mgr: PodManager, url: &str) -> PodManager {
+        mgr.with_engine(crate::engine::EngineClient::new(url, crate::engine::TokenSource::none()))
+    }
+
+    #[tokio::test]
+    async fn a_slow_mint_does_not_hold_the_sync() {
+        // #63: a 1 TiB blank's format held the whole sync loop.
+        let (url, posts) = slow_minting_stormblock(std::time::Duration::from_secs(30), "awaiting_format").await;
+        let (_rt, mgr) = manager();
+        let mgr = with_stormblock(mgr, &url);
+
+        let t = Instant::now();
+        let e = mgr.mint_template("pvc-ext4j-1048576m", "1T").await.unwrap_err();
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "waited {:?}", t.elapsed());
+        assert_eq!(e, "template pvc-ext4j-1048576m awaiting_format");
+
+        // The next claim waits on the same mint rather than starting another.
+        let e = mgr.mint_template("pvc-ext4j-1048576m", "1T").await.unwrap_err();
+        assert_eq!(e, "template pvc-ext4j-1048576m awaiting_format");
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_quick_mint_is_ready_on_the_pass_that_asked() {
+        let (url, posts) = slow_minting_stormblock(std::time::Duration::ZERO, "ready").await;
+        let (_rt, mgr) = manager();
+        let mgr = with_stormblock(mgr, &url);
+        assert_eq!(mgr.mint_template("pvc-ext4j-1m", "1M").await.unwrap(), "tpl-1");
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

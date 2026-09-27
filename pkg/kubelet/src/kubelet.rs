@@ -870,15 +870,21 @@ impl Kubelet {
                     }
                 };
 
-                serde_json::json!({
+                let mut status = serde_json::json!({
                     "name": cs.name,
                     "state": state_obj,
                     "ready": cs.ready,
                     "restartCount": cs.restart_count,
                     "image": cs.image,
                     "imageID": cs.image_ref,
-                    "containerID": format!("containerd://{}", cs.container_id)
-                })
+                });
+                // A container not created yet has no id, and upstream leaves
+                // the field out rather than naming `containerd://` (#63).
+                if !cs.container_id.is_empty() {
+                    status["containerID"] =
+                        serde_json::json!(format!("containerd://{}", cs.container_id));
+                }
+                status
             })
             .collect();
 

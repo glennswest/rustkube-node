@@ -690,6 +690,11 @@ async fn container_logs(
         })
 }
 
+/// Upstream's answer to `logs` on a container that has not started.
+fn waiting_to_start(container: &str, pod: &str, why: &str) -> String {
+    format!("container \"{container}\" in pod \"{pod}\" is waiting to start: ContainerCreating ({why})\n")
+}
+
 /// Which file holds the run the caller asked for.
 ///
 /// Restarts are numbered from 0, so the current run is the highest-numbered
@@ -703,6 +708,12 @@ async fn log_file(
     opts: &LogOptions,
 ) -> Result<String, Response> {
     let Some(uid) = pm.pod_uid(namespace, pod).await else {
+        // A pod this node admitted and has not started is not "not found"
+        // (#63): upstream answers 400 with why it is waiting.
+        if let Some(why) = pm.waiting_reason(namespace, pod) {
+            return Err((StatusCode::BAD_REQUEST, waiting_to_start(container, pod, &why))
+                .into_response());
+        }
         return Err((
             StatusCode::NOT_FOUND,
             format!("pod {namespace}/{pod} not found on this node\n"),
