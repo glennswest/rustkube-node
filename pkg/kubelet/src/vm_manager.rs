@@ -52,6 +52,107 @@ fn deregister(namespace: &str, name: &str) {
         warn!(vm = %name, namespace = %namespace, "could not drop the console registration: {e}");
     }
 }
+/// Held on a VMI while this node runs its machine, so the object's deletion
+/// completes only once the machine is gone (#35). Without it the object went
+/// at once, and a kubelet that missed the moment left the hypervisor running
+/// with nothing in the cluster that showed or controlled it.
+pub const FINALIZER: &str = "storm.io/vm";
+
+/// Is this VMI being deleted?
+fn terminating(obj: &Value) -> bool {
+    !obj["metadata"]["deletionTimestamp"].is_null()
+}
+
+/// The registration's disks, from what a start resolved: every attached
+/// volume, and whether this machine made it. An owned volume that is not a
+/// disk is recorded too, with no device, so a stop can still delete it.
+fn registered_disks(disks: &[ResolvedDisk], owned: &[String]) -> Vec<stormvm_node::console::RegisteredDisk> {
+    let mut out: Vec<_> = disks
+        .iter()
+        .map(|d| stormvm_node::console::RegisteredDisk {
+            name: d.name.clone(),
+            volume_id: d.volume_id.clone(),
+            owned: d.volume_id.as_ref().is_some_and(|id| owned.contains(id)),
+            device: d.device.clone(),
+        })
+        .collect();
+    for id in owned {
+        if !disks.iter().any(|d| d.volume_id.as_ref() == Some(id)) {
+            out.push(stormvm_node::console::RegisteredDisk {
+                name: String::new(),
+                volume_id: Some(id.clone()),
+                owned: true,
+                device: String::new(),
+            });
+        }
+    }
+    out
+}
+
+/// A machine as its registration describes it: what a kubelet that did not
+/// start it (this one, before a restart) knows about it.
+fn vm_of(reg: &stormvm_node::console::Registration) -> Vm {
+    let disks = reg
+        .disks
+        .iter()
+        .filter(|d| !d.device.is_empty())
+        .map(|d| ResolvedDisk {
+            name: d.name.clone(),
+            device: d.device.clone(),
+            volume_id: d.volume_id.clone(),
+            readonly: false,
+            bus: Default::default(),
+        })
+        .collect();
+    Vm {
+        namespace: reg.namespace.clone(),
+        name: reg.name.clone(),
+        uid: reg.uid.clone(),
+        log_dir: format!("{LOG_ROOT}/{}_{}_{}/{}", reg.namespace, reg.name, reg.uid, reg.name),
+        handle: reg.workload.map(Handle).unwrap_or(Handle::NONE),
+        disks,
+        phase: Phase::Running,
+        exit_code: 0,
+        message: String::new(),
+        started_unix: reg.started,
+        ready_unix: None,
+        owned_volumes: reg.disks.iter().filter(|d| d.owned).filter_map(|d| d.volume_id.clone()).collect(),
+        nics: Vec::new(),
+    }
+}
+
+/// Is a hypervisor listening on its control socket? For a machine with no
+/// engine handle, the only way left to tell a live one from a dead one.
+///
+/// A connect, not a command: QMP serves one client at a time, and a console
+/// holding it must not make the machine look dead. A dead hypervisor leaves
+/// its socket file behind, and a connect to it is refused.
+fn control_alive(reg: &stormvm_node::console::Registration) -> bool {
+    reg.control_socket
+        .as_deref()
+        .is_some_and(|p| std::os::unix::net::UnixStream::connect(p).is_ok())
+}
+
+/// The merge patch that adds or removes [`FINALIZER`], or `None` when the
+/// object already is that way. Carries the object's resourceVersion, so it
+/// applies only to the version it was computed from.
+pub fn finalizer_patch(obj: &Value, present: bool) -> Option<Value> {
+    let mut list: Vec<Value> = obj["metadata"]["finalizers"].as_array().cloned().unwrap_or_default();
+    if list.iter().any(|f| f == FINALIZER) == present {
+        return None;
+    }
+    if present {
+        list.push(json!(FINALIZER));
+    } else {
+        list.retain(|f| f != FINALIZER);
+    }
+    let mut meta = json!({ "finalizers": list });
+    if let Some(rv) = obj["metadata"]["resourceVersion"].as_str() {
+        meta["resourceVersion"] = json!(rv);
+    }
+    Some(json!({ "metadata": meta }))
+}
+
 /// The bridge a VM lands on when its network does not name one.
 ///
 /// A bridge of the node's own rather than the node's uplink: attaching taps
@@ -437,13 +538,20 @@ impl VmManager {
         self.absorb_ends().await;
 
         let mut want: Vec<(String, Value)> = Vec::new();
+        let mut going: Vec<(String, Value)> = Vec::new();
         for obj in desired {
             let uid = obj["metadata"]["uid"].as_str().unwrap_or("").to_string();
             if uid.is_empty() {
                 warn!("a VirtualMachineInstance with no uid was skipped");
                 continue;
             }
-            want.push((uid, obj.clone()));
+            // Being deleted is not wanted: its machine stops now, and the
+            // object goes once it has (the finalizer).
+            if terminating(obj) {
+                going.push((uid, obj.clone()));
+            } else {
+                want.push((uid, obj.clone()));
+            }
         }
         // The cache of record, replaced rather than merged.
         {
@@ -451,6 +559,11 @@ impl VmManager {
             *d = want.iter().map(|(u, o)| (u.clone(), o.clone())).collect();
         }
         self.synced.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Machines running here that this process does not know: started
+        // before a restart, or by a kubelet that kept no record. Adopted when
+        // their object still wants them, stopped when it does not.
+        self.reconcile_registered(&want).await;
 
         // Stops before starts. A deleted VMI's replacement derives the same
         // tap name, and a tap exists while any process holds its descriptor —
@@ -464,6 +577,10 @@ impl VmManager {
         for vm in gone {
             self.stop(&vm).await;
             self.vms.lock().await.remove(&vm.uid);
+        }
+        // The machine is gone, so its object may go too.
+        for (_, obj) in &going {
+            self.set_finalizer(obj, false).await;
         }
 
         for (uid, obj) in &want {
@@ -492,6 +609,19 @@ impl VmManager {
                 // only to a log on a node with no shell.
                 self.event(obj, "Warning", "FailedStart", &e).await;
                 self.record_failure(uid, obj, &e).await;
+            }
+        }
+
+        // Every machine running here holds its object until it is stopped.
+        // Each pass rather than once at start: a status write moves the
+        // resourceVersion, and the add is guarded by it.
+        let running: std::collections::HashSet<String> = {
+            let vms = self.vms.lock().await;
+            vms.values().filter(|v| !v.phase.terminal()).map(|v| v.uid.clone()).collect()
+        };
+        for (uid, obj) in &want {
+            if running.contains(uid) {
+                self.set_finalizer(obj, true).await;
             }
         }
     }
@@ -694,6 +824,14 @@ impl VmManager {
         };
 
         info!(vm = %vm.name, namespace = %ns, ?handle, "vm started");
+        // The record a restarted kubelet finds it by (#35): the engine keeps
+        // the machine across a restart, and this process's memory does not.
+        // Without the handle, deleting its object stopped nothing.
+        let mut reg = registration.clone().running_as(handle.0);
+        reg.disks = registered_disks(&disks, &owned_volumes);
+        if let Err(e) = stormvm_node::console::write(RUN_ROOT, &reg) {
+            warn!(vm = %vm.name, "could not record the running machine's handle: {e}");
+        }
         self.event(obj, "Normal", "Started",
                    &format!("Started virtual machine {}", vm.name)).await;
         let rec = Vm {
@@ -773,21 +911,33 @@ impl VmManager {
                     self.patch_status(&with).await;
                 }
             }
-            let r = ring.clone();
-            let handle = vm.handle;
-            let answer = tokio::task::spawn_blocking(move || r.query(handle)).await;
-            let Ok(Ok(cqe)) = answer else { continue };
-            // aux: 0 running, 1 parked, 2 | (wait status << 8).
-            if cqe.aux & 0xff != 2 {
-                continue;
-            }
-            let status = (cqe.aux >> 8) as i32;
-            let signal = status & 0x7f;
-            let code = if signal != 0 { 128 + signal } else { (status >> 8) & 0xff };
+            let code = if vm.handle.is_none() {
+                // Adopted without a handle: its control socket is the only
+                // sign of life, and there is no exit status to read.
+                match stormvm_node::console::find(RUN_ROOT, &vm.namespace, &vm.name) {
+                    Some(reg) if control_alive(&reg) => continue,
+                    _ => -1,
+                }
+            } else {
+                let r = ring.clone();
+                let handle = vm.handle;
+                let answer = tokio::task::spawn_blocking(move || r.query(handle)).await;
+                let Ok(Ok(cqe)) = answer else { continue };
+                // aux: 0 running, 1 parked, 2 | (wait status << 8).
+                if cqe.aux & 0xff != 2 {
+                    continue;
+                }
+                let status = (cqe.aux >> 8) as i32;
+                let signal = status & 0x7f;
+                if signal != 0 { 128 + signal } else { (status >> 8) & 0xff }
+            };
             let mut done = vm.clone();
             done.phase = if code == 0 { Phase::Succeeded } else { Phase::Failed };
             done.exit_code = code;
             done.message = match (code, hypervisor_said(&vm.log_dir)) {
+                (-1, _) => "the hypervisor ended; its exit status is unknown (it was started by an \
+                            earlier kubelet, which kept no handle)"
+                    .to_string(),
                 // **What it said, not that it failed.** "the hypervisor exited
                 // with 1" is true and useless: the reason is in a file on a
                 // node with no shell, and reading it has cost this stack whole
@@ -804,7 +954,7 @@ impl VmManager {
                 self.event_of(&done, "Warning", "Failed", &done.message).await;
             }
             self.release(&done.disks).await;
-            if let Some(r) = self.ring.clone() {
+            if let Some(r) = self.ring.clone().filter(|_| !done.handle.is_none()) {
                 let h = done.handle;
                 let _ = tokio::task::spawn_blocking(move || r.workload_release(h)).await;
             }
@@ -814,7 +964,9 @@ impl VmManager {
     }
 
     async fn stop(&self, vm: &Vm) {
-        if let Some(ring) = self.ring.clone() {
+        if vm.handle.is_none() && !vm.phase.terminal() {
+            self.stop_by_control(vm).await;
+        } else if let Some(ring) = self.ring.clone() {
             let handle = vm.handle;
             // A machine gets a real grace period: ACPI shutdown, then a kill.
             // Thirty seconds is what a guest needs to flush and unmount, and
@@ -844,6 +996,8 @@ impl VmManager {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             }
+            // Its pidfd and cgroup, which the engine holds until asked.
+            let _ = tokio::task::spawn_blocking(move || ring.workload_release(handle)).await;
         }
         // The door closes with the machine. A registration that outlives its
         // VM is a console door onto a socket nothing is bound to, which reads
@@ -1343,6 +1497,157 @@ impl VmManager {
     /// After the detach, and best-effort: a volume that will not delete is
     /// worth a line, not a failed teardown. The machine is already gone, and
     /// refusing to finish would leave the *registration* behind too.
+    /// Every registered machine this process does not know, reconciled
+    /// against what is wanted (#35).
+    ///
+    /// The engine keeps a machine running across a kubelet restart, and this
+    /// process's `vms` does not survive one. So a machine can be running here
+    /// that nothing tracks: deleting its object stopped nothing, and the
+    /// hypervisor went on with an address and a disk and no object anywhere.
+    ///
+    /// - running, and its object wants it: adopted, as though started here;
+    /// - running, and nothing wants it: stopped, disks given back;
+    /// - gone, and its object wants it: recorded as ended, so it is not
+    ///   started again behind the VM controller's back;
+    /// - gone, and nothing wants it: its leftovers released.
+    ///
+    /// Only on a sync, which has a list that answered: an empty `want` from an
+    /// apiserver that did not answer never reaches here.
+    async fn reconcile_registered(&self, want: &[(String, Value)]) {
+        let Some(ring) = self.ring.clone() else { return };
+        let known: std::collections::HashSet<String> = self.vms.lock().await.keys().cloned().collect();
+        for reg in stormvm_node::console::list(RUN_ROOT) {
+            if reg.uid.is_empty() || known.contains(&reg.uid) {
+                continue;
+            }
+            let obj = want.iter().find(|(u, _)| *u == reg.uid).map(|(_, o)| o);
+            let vm = vm_of(&reg);
+            // Some(true) running, Some(false) exited with a status the engine
+            // still holds, None gone or unknowable.
+            let state = match reg.workload {
+                Some(h) => {
+                    let r = ring.clone();
+                    match tokio::task::spawn_blocking(move || r.query(Handle(h))).await {
+                        Ok(Ok(cqe)) => Some(cqe.aux & 0xff != 2),
+                        _ => None,
+                    }
+                }
+                None => control_alive(&reg).then_some(true),
+            };
+            let id = format!("{}/{}", vm.namespace, vm.name);
+            match (state, obj) {
+                (Some(true), Some(obj)) => {
+                    info!(vm = %id, handle = ?vm.handle, "adopted a running machine");
+                    self.event(obj, "Normal", "Adopted",
+                               &format!("Virtual machine {} was already running on {}", vm.name, self.node_name))
+                        .await;
+                    self.vms.lock().await.insert(vm.uid.clone(), vm.clone());
+                    self.patch_status(&vm).await;
+                }
+                // Its end is the engine's to report: `absorb_ends` reads it.
+                (Some(false), Some(_)) => {
+                    self.vms.lock().await.insert(vm.uid.clone(), vm);
+                }
+                (None, Some(_)) => {
+                    let mut done = vm;
+                    done.phase = Phase::Failed;
+                    done.exit_code = -1;
+                    done.message = "the machine was gone when the kubelet restarted".into();
+                    warn!(vm = %id, "{}", done.message);
+                    self.event_of(&done, "Warning", "Failed", &done.message).await;
+                    self.release(&done.disks).await;
+                    self.vms.lock().await.insert(done.uid.clone(), done.clone());
+                    self.patch_status(&done).await;
+                }
+                (running, None) => {
+                    if running == Some(true) {
+                        warn!(vm = %id, uid = %vm.uid, "running with no VirtualMachineInstance; stopping it");
+                    }
+                    self.stop(&vm).await;
+                }
+            }
+        }
+    }
+
+    /// Stop a machine there is no engine handle for, through its own control
+    /// socket: ACPI first, with the same grace as the engine's stop, then the
+    /// hypervisor told to quit.
+    ///
+    /// Only for a machine started by a kubelet that kept no handle. Every
+    /// start now records one, and the engine's stop is the one to use.
+    async fn stop_by_control(&self, vm: &Vm) {
+        use stormvm_control::{Kind, Machine};
+        let Some(reg) = stormvm_node::console::find(RUN_ROOT, &vm.namespace, &vm.name) else { return };
+        if !control_alive(&reg) {
+            return;
+        }
+        let kind = Kind::parse(&reg.vmm);
+        let Some(sock) = reg.control_socket.clone() else { return };
+        let m = Machine { kind, control: Some(sock.clone()), agent: None };
+        let short = std::time::Duration::from_secs(5);
+        if let Ok(Err(e)) = tokio::time::timeout(short, m.softreboot()).await {
+            warn!(vm = %vm.name, "ACPI shutdown not delivered: {e}");
+        }
+        let gone_within = |secs: u64| {
+            let reg = reg.clone();
+            async move {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+                while control_alive(&reg) {
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                true
+            }
+        };
+        if gone_within(30).await {
+            return;
+        }
+        warn!(vm = %vm.name, "did not shut down within its grace period; telling the hypervisor to quit");
+        let forced = match kind {
+            Kind::Qemu => tokio::time::timeout(short, stormvm_control::qmp::command(&sock, "quit", None))
+                .await
+                .map(|r| r.map(|_| ())),
+            Kind::CloudHypervisor => {
+                tokio::time::timeout(short, stormvm_control::chv::put(&sock, "vmm.shutdown")).await
+            }
+        };
+        if let Ok(Err(e)) = forced {
+            warn!(vm = %vm.name, "quit not delivered: {e}");
+        }
+        if !gone_within(5).await {
+            warn!(vm = %vm.name, "the hypervisor is still running; it has no engine handle to kill");
+        }
+    }
+
+    /// Add or remove this node's finalizer on a VMI. Guarded by the object's
+    /// resourceVersion, so a stale copy loses rather than overwrites; the
+    /// next sync has a fresher one.
+    async fn set_finalizer(&self, obj: &Value, present: bool) {
+        if self.api_url.is_empty() {
+            return;
+        }
+        let Some(body) = finalizer_patch(obj, present) else { return };
+        let ns = obj["metadata"]["namespace"].as_str().unwrap_or("default");
+        let name = obj["metadata"]["name"].as_str().unwrap_or("");
+        let url = format!("{}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{name}", self.api_url);
+        match self
+            .api
+            .patch(&url)
+            .header("content-type", "application/merge-patch+json")
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                info!("{ns}/{name}: finalizer {FINALIZER} {}", if present { "added" } else { "removed" })
+            }
+            Ok(r) => tracing::debug!("{ns}/{name}: finalizer not updated: {}", r.status()),
+            Err(e) => tracing::debug!("{ns}/{name}: finalizer not updated: {e}"),
+        }
+    }
+
     async fn destroy_owned(&self, vm: &Vm) {
         for id in &vm.owned_volumes {
             let url = format!("{}/api/v1/volumes/{id}", self.storage);
@@ -1737,6 +2042,129 @@ mod tests {
             "metadata": { "name": "web-1", "namespace": "default", "uid": "u-1" },
             "spec": { "nodeName": node, "domain": { "memory": { "guest": "1Gi" } } }
         })
+    }
+
+    #[test]
+    fn the_finalizer_is_added_once_and_removed_once() {
+        let mut obj = vmi("n1");
+        obj["metadata"]["resourceVersion"] = json!("7");
+        obj["metadata"]["finalizers"] = json!(["other"]);
+        let add = finalizer_patch(&obj, true).expect("added");
+        assert_eq!(add["metadata"]["finalizers"], json!(["other", FINALIZER]));
+        assert_eq!(add["metadata"]["resourceVersion"], "7", "guarded by the version it was read at");
+        assert!(finalizer_patch(&obj, false).is_none(), "not there, nothing to remove");
+
+        obj["metadata"]["finalizers"] = json!(["other", FINALIZER]);
+        assert!(finalizer_patch(&obj, true).is_none(), "there already");
+        let rm = finalizer_patch(&obj, false).expect("removed");
+        assert_eq!(rm["metadata"]["finalizers"], json!(["other"]), "another controller's is kept");
+    }
+
+    #[test]
+    fn a_registration_carries_what_a_restarted_kubelet_needs() {
+        let disks = vec![
+            ResolvedDisk { name: "root".into(), device: "/dev/ublkb1".into(), volume_id: Some("v-root".into()),
+                           readonly: false, bus: Default::default() },
+            ResolvedDisk { name: "data".into(), device: "/dev/ublkb2".into(), volume_id: Some("v-claim".into()),
+                           readonly: false, bus: Default::default() },
+        ];
+        let owned = vec!["v-root".to_string(), "v-seed".to_string()];
+        let reg = stormvm_node::console::Registration {
+            namespace: "default".into(),
+            name: "web-1".into(),
+            uid: "u-1".into(),
+            serial_socket: None,
+            vnc_socket: None,
+            serial_log: None,
+            hypervisor_log: None,
+            control_socket: None,
+            agent_socket: None,
+            vmm: "qemu".into(),
+            started: 100,
+            workload: Some(42),
+            disks: registered_disks(&disks, &owned),
+        };
+        // Through the file format, as a restarted kubelet reads it.
+        let reg: stormvm_node::console::Registration =
+            serde_json::from_str(&serde_json::to_string(&reg).unwrap()).unwrap();
+        let vm = vm_of(&reg);
+        assert_eq!(vm.handle, Handle(42));
+        assert_eq!(vm.uid, "u-1");
+        assert_eq!(vm.started_unix, 100);
+        assert_eq!(vm.log_dir, format!("{LOG_ROOT}/default_web-1_u-1/web-1"));
+        // Both disks are detached on a stop; only what it made is deleted.
+        let attached: Vec<_> = vm.disks.iter().filter_map(|d| d.volume_id.clone()).collect();
+        assert_eq!(attached, vec!["v-root", "v-claim"]);
+        assert_eq!(vm.owned_volumes, vec!["v-root", "v-seed"]);
+        assert_eq!(vm_of(&stormvm_node::console::Registration { workload: None, ..reg }).handle, Handle::NONE);
+    }
+
+    #[test]
+    fn a_hypervisor_is_alive_while_its_control_socket_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let reg = |p: Option<String>| stormvm_node::console::Registration {
+            namespace: "default".into(),
+            name: "web-1".into(),
+            uid: "u-1".into(),
+            serial_socket: None,
+            vnc_socket: None,
+            serial_log: None,
+            hypervisor_log: None,
+            control_socket: p,
+            agent_socket: None,
+            vmm: "qemu".into(),
+            started: 0,
+            workload: None,
+            disks: Vec::new(),
+        };
+        let r = reg(Some(sock.to_string_lossy().into()));
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        assert!(control_alive(&r));
+        // A dead hypervisor leaves its socket file behind.
+        drop(listener);
+        assert!(sock.exists());
+        assert!(!control_alive(&r));
+        assert!(!control_alive(&reg(None)));
+    }
+
+    /// A VMI being deleted is not started, and its finalizer comes off once
+    /// nothing runs here for it, which is what lets the delete complete.
+    #[tokio::test]
+    async fn a_deleted_vmi_is_let_go_once_its_machine_is_stopped() {
+        use axum::routing::patch;
+        let patches: Arc<std::sync::Mutex<Vec<(String, Value)>>> = Arc::default();
+        let p = patches.clone();
+        let app = axum::Router::new()
+            .route(
+                "/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{name}",
+                patch(move |uri: axum::http::Uri, axum::Json(body): axum::Json<Value>| {
+                    let p = p.clone();
+                    async move {
+                        p.lock().unwrap().push((uri.path().to_string(), body));
+                        axum::Json(json!({}))
+                    }
+                }),
+            )
+            .fallback(|| async { axum::Json(json!({})) });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), &url);
+        let mut obj = vmi("n1");
+        obj["metadata"]["deletionTimestamp"] = json!("2026-09-27T00:00:00Z");
+        obj["metadata"]["finalizers"] = json!([FINALIZER]);
+        obj["metadata"]["resourceVersion"] = json!("9");
+        m.sync(&[obj]).await;
+
+        assert!(m.running().await.is_empty(), "a VMI being deleted is not started");
+        let got = patches.lock().unwrap().clone();
+        let rm: Vec<_> = got.iter().filter(|(path, _)| !path.ends_with("/status")).collect();
+        assert_eq!(rm.len(), 1, "{got:?}");
+        assert_eq!(rm[0].0, "/apis/kubevirt.io/v1/namespaces/default/virtualmachineinstances/web-1");
+        assert_eq!(rm[0].1["metadata"]["finalizers"], json!([]));
+        assert_eq!(rm[0].1["metadata"]["resourceVersion"], "9");
     }
 
     /// The console doors resolve a VM out of the run directory, so a machine
