@@ -5,3 +5,6 @@
 .terragrunt-cache/
 deploy/terragrunt/rknode/pki/
 
+
+# Scratch
+tmp/
