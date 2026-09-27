@@ -67,13 +67,14 @@ engine client has no timeout and `mint_template` is one synchronous POST, so a 1
 the whole sync loop (stormblock#141 keeps formatting after a client leaves).
 
 Steps:
-1. [ ] Mint in the background (one in flight per blank); a template not `ready` is a wait naming its state
+1. [x] Mint in the background (one in flight per blank); a template not `ready` is a wait naming its state
        ("template pvc-ext4j-1048576m awaiting_format"), not a clone attempt.
-2. [ ] Waiting pods recorded (uid, reason, since): statuses report every container `waiting: ContainerCreating`
+2. [x] Waiting pods recorded (uid, reason, since): statuses report every container `waiting: ContainerCreating`
        with the reason; `logs` answers 400 "waiting to start: ContainerCreating" instead of 404.
-3. [ ] FailedMount Event on the pod; past 5 min the message says "timed out after Nm waiting for …" and the
+3. [x] FailedMount Event on the pod; past 5 min the message says "timed out after Nm waiting for …" and the
        pod keeps retrying, Pending (upstream's behaviour: a mount timeout does not fail the pod).
-4. [ ] Tests, docs, CHANGELOG, sc-build, close.
+4. [ ] Tests, docs (README), CHANGELOG done at c78baf0/93796b5. sc-build running; then close, and note on #70
+       that its wait-for-ready half landed here (the Event on the claim did not).
 
 ### Next: #62, CSIStorageCapacity for the built-in class (findings only, not started)
 
