@@ -1573,7 +1573,13 @@ pub async fn watch_for_node<F>(
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             continue;
         };
-        let Ok(v) = resp.json::<Value>().await else {
+        // An error answer is not an empty list (#35): a Status body has no
+        // items, and handing that on stopped every machine on the node.
+        let v = match resp.status().is_success() {
+            true => resp.json::<Value>().await.ok().filter(|v| v["items"].is_array()),
+            false => None,
+        };
+        let Some(v) = v else {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             continue;
         };
@@ -1668,7 +1674,11 @@ pub async fn watch_for_node<F>(
     }
 }
 
-pub async fn list_for_node(api: &reqwest::Client, api_url: &str, node: &str) -> Vec<Value> {
+///
+/// `None` when the list failed. **A failed list is not an empty one**: read as
+/// "no machines here", it stopped every VM on the node and deleted the roots
+/// they owned, over an apiserver that did not answer for a moment (#35).
+pub async fn list_for_node(api: &reqwest::Client, api_url: &str, node: &str) -> Option<Vec<Value>> {
     // Ask for this node's machines, not the cluster's.
     //
     // This listed **every VMI in the cluster** and filtered locally, every
@@ -1688,15 +1698,14 @@ pub async fn list_for_node(api: &reqwest::Client, api_url: &str, node: &str) -> 
         "{}/apis/kubevirt.io/v1/virtualmachineinstances?fieldSelector=status.nodeName%3D{node}",
         api_url.trim_end_matches('/')
     );
-    let Ok(resp) = api.get(&url).send().await else {
-        return Vec::new();
-    };
+    let resp = api.get(&url).send().await.ok()?;
     if !resp.status().is_success() {
-        return Vec::new();
+        return None;
     }
-    let Ok(v) = resp.json::<Value>().await else {
-        return Vec::new();
-    };
+    let v = resp.json::<Value>().await.ok()?;
+    if !v["items"].is_array() {
+        return None;
+    }
     // Filtered again locally, deliberately.
     //
     // An apiserver that does not implement this field selector answers with
@@ -1705,14 +1714,7 @@ pub async fn list_for_node(api: &reqwest::Client, api_url: &str, node: &str) -> 
     // is cheap and it is the one that decides.
     v["items"]
         .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter(|o| assigned_to(o, node))
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default()
+        .map(|items| items.iter().filter(|o| assigned_to(o, node)).cloned().collect())
 }
 
 /// Whether a VMI is this node's.

@@ -534,7 +534,7 @@ impl Kubelet {
             // when something *changes*, and a node whose machines are all
             // steady would sit idle forever having started none of them.
             let want = match vms.watched().await {
-                Some(w) => w,
+                Some(w) => Some(w),
                 None => {
                     crate::vm_manager::list_for_node(
                         &self.api_client,
@@ -544,7 +544,11 @@ impl Kubelet {
                     .await
                 }
             };
-            vms.sync(&want).await;
+            // No answer is not "no machines": skip the pass rather than stop
+            // every VM on the node (#35).
+            if let Some(want) = want {
+                vms.sync(&want).await;
+            }
         }
 
         // Sync pod states
