@@ -47,8 +47,8 @@ TokenReview); `/healthz`, `/livez` and `/readyz` are open.
 |---|---|
 | `GET /metrics`, `/metrics/cadvisor` | Prometheus metrics under upstream's names: the kubelet's own, and cAdvisor-shaped container and pod usage. See [docs/metrics.md](docs/metrics.md) |
 | `GET /stats/summary` | The Summary API (`kubectl top`, metrics-server) |
-| `GET /pods` | The pods this kubelet manages |
-| `GET /containerLogs/{ns}/{pod}/{container}` | What `kubectl logs` reads, by way of the apiserver proxy |
+| `GET /pods` | The pods this kubelet manages, including admitted pods still waiting to start (`Pending`, with the reason) |
+| `GET /containerLogs/{ns}/{pod}/{container}` | What `kubectl logs` reads, by way of the apiserver proxy. A pod waiting to start answers `400 … is waiting to start: ContainerCreating (<reason>)`, as upstream does |
 | `GET /vmConsole/{ns}/{name}/{door}` | A VM's `serial` or `vnc` console, answered by stormvm's console router mounted here |
 | `DELETE /volumes/{ns}/{claim}` | Delete the stormblock clone behind a released claim |
 
@@ -100,6 +100,19 @@ publishes volumes. It will not give a pod a volume whose mount has not reached
 the node. See [docs/csi.md](docs/csi.md). The mounts of external drivers need
 Bidirectional propagation in the engine (stormpump#35), and until that lands
 pods on such claims wait with that reason.
+
+**A pod whose volumes are not ready waits, and says why.** It is `Pending`,
+every container is `waiting: ContainerCreating` with the reason (for example
+`waiting for volume pvc-default-data: template pvc-ext4j-1048576m
+awaiting_format`), and `describe` shows a `FailedMount` Event. After 5 minutes
+the reason says it timed out, and the kubelet keeps retrying. As upstream, a
+mount timeout does not fail the pod, because the volume may still come.
+
+The first claim of a size class mints its blank (one `mkfs`). The mint runs in
+the background and is waited for inline for 2 seconds, so a small class is
+cloned on the pass that asked. A large one (a 1 TiB blank formats for minutes)
+does not hold the sync loop: its claims wait on the template's state until it
+is `ready`.
 
 ### Virtual machine disks
 

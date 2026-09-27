@@ -3,6 +3,20 @@
 ## [Unreleased]
 <!-- New unreleased changes go here -->
 
+### 2026-09-27 (a pod waiting on its claim, #63)
+- **fix(kubelet):** a pod whose volumes were not ready was reported Pending and
+  then forgotten. `kubectl logs` said "not found on this node" and the pod had
+  no container statuses. It is now recorded as waiting: every container reports
+  `waiting: ContainerCreating` with the reason, `/pods` lists it, `logs` answers
+  400 "waiting to start", and a `FailedMount` Event is written. After 5 minutes
+  the reason says it timed out, and it keeps retrying.
+- **fix(kubelet):** minting a size-class blank was one synchronous engine call,
+  so a 1 TiB blank's format held the whole sync loop. It now runs in the
+  background, one per blank, waited for inline for 2 s. A template that is not
+  `ready` is a wait that names its state, not a clone attempt.
+- **fix(kubelet):** a container status with no container id leaves out
+  `containerID` instead of reporting `containerd://`.
+
 ## [v0.13.0] — 2026-09-27
 
 ### 2026-09-27 (VM lifecycle, #35)
