@@ -1898,88 +1898,6 @@ mod tests {
         assert_eq!(all[0].phase, Phase::Failed);
         assert!(all[0].message.contains("no ring"), "{}", all[0].message);
     }
-}
-
-/// The cloud-init document inside a Secret, from `data` or `stringData`.
-///
-/// `data` is base64 and `stringData` is not. Both are checked because the
-/// apiserver is supposed to fold the second into the first on write and
-/// rustkube does not, so a secret written the documented way stays in
-/// `stringData` and a reader that only knows `data` finds nothing.
-///
-/// The key is `userdata` by convention, but any single entry is taken when
-/// that name is absent: a seed with one field and the wrong name is obviously
-/// the seed, and failing there would mean a guest with no login over a
-/// spelling.
-fn seed_text(secret: &Value) -> Option<String> {
-    use base64::Engine as _;
-    let pick = |m: &Value| -> Option<(String, String)> {
-        let obj = m.as_object()?;
-        let (k, v) = obj
-            .get_key_value("userdata")
-            .or_else(|| obj.get_key_value("userData"))
-            .or_else(|| if obj.len() == 1 { obj.iter().next() } else { None })?;
-        Some((k.clone(), v.as_str()?.to_string()))
-    };
-    if let Some((_, raw)) = secret.get("stringData").and_then(|m| pick(m)) {
-        if !raw.trim().is_empty() {
-            return Some(raw);
-        }
-    }
-    if let Some((_, b64)) = secret.get("data").and_then(|m| pick(m)) {
-        let bytes = base64::engine::general_purpose::STANDARD.decode(b64.trim()).ok()?;
-        let text = String::from_utf8(bytes).ok()?;
-        if !text.trim().is_empty() {
-            return Some(text);
-        }
-    }
-    None
-}
-
-#[cfg(test)]
-mod seed_tests {
-    use super::*;
-
-    /// A seed written as `stringData` is still a seed.
-    ///
-    /// The apiserver is supposed to fold `stringData` into `data` on write.
-    /// rustkube does not, so a secret created the documented way comes back
-    /// exactly as written -- and a reader that only knows `data` finds
-    /// nothing, which presents as a guest with no login and no reason.
-    #[test]
-    fn a_seed_is_read_from_string_data() {
-        let s = serde_json::json!({
-            "stringData": {"userdata": "#cloud-config\nhostname: web-1\n"}
-        });
-        assert!(seed_text(&s).unwrap().contains("hostname: web-1"));
-    }
-
-    /// And from `data`, which is base64.
-    #[test]
-    fn a_seed_is_read_from_base64_data() {
-        use base64::Engine as _;
-        let b = base64::engine::general_purpose::STANDARD.encode("#cloud-config\nssh_authorized_keys:\n");
-        let s = serde_json::json!({"data": {"userdata": b}});
-        assert!(seed_text(&s).unwrap().contains("ssh_authorized_keys"));
-    }
-
-    /// One field under another name is obviously the seed.
-    ///
-    /// Failing over a spelling would mean a guest nobody can log into.
-    #[test]
-    fn a_single_oddly_named_field_is_taken_as_the_seed() {
-        let s = serde_json::json!({"stringData": {"user-data": "#cloud-config\n"}});
-        assert_eq!(seed_text(&s).as_deref(), Some("#cloud-config\n"));
-    }
-
-    /// Nothing usable is None, not an empty document.
-    #[test]
-    fn an_empty_secret_is_no_seed_at_all() {
-        assert!(seed_text(&serde_json::json!({})).is_none());
-        assert!(seed_text(&serde_json::json!({"stringData": {"userdata": "  "}})).is_none());
-        // Two fields, neither named: ambiguous, so not guessed.
-        assert!(seed_text(&serde_json::json!({"stringData": {"a": "x", "b": "y"}})).is_none());
-    }
 
     /// An apiserver and an engine on one port (their paths do not overlap):
     /// a claim `default/data` bound to the stormblock volume `vol-claim`, the
@@ -2188,4 +2106,87 @@ mod seed_tests {
             other => panic!("expected Failed, got {other:?}"),
         }
     }
+}
+
+/// The cloud-init document inside a Secret, from `data` or `stringData`.
+///
+/// `data` is base64 and `stringData` is not. Both are checked because the
+/// apiserver is supposed to fold the second into the first on write and
+/// rustkube does not, so a secret written the documented way stays in
+/// `stringData` and a reader that only knows `data` finds nothing.
+///
+/// The key is `userdata` by convention, but any single entry is taken when
+/// that name is absent: a seed with one field and the wrong name is obviously
+/// the seed, and failing there would mean a guest with no login over a
+/// spelling.
+fn seed_text(secret: &Value) -> Option<String> {
+    use base64::Engine as _;
+    let pick = |m: &Value| -> Option<(String, String)> {
+        let obj = m.as_object()?;
+        let (k, v) = obj
+            .get_key_value("userdata")
+            .or_else(|| obj.get_key_value("userData"))
+            .or_else(|| if obj.len() == 1 { obj.iter().next() } else { None })?;
+        Some((k.clone(), v.as_str()?.to_string()))
+    };
+    if let Some((_, raw)) = secret.get("stringData").and_then(|m| pick(m)) {
+        if !raw.trim().is_empty() {
+            return Some(raw);
+        }
+    }
+    if let Some((_, b64)) = secret.get("data").and_then(|m| pick(m)) {
+        let bytes = base64::engine::general_purpose::STANDARD.decode(b64.trim()).ok()?;
+        let text = String::from_utf8(bytes).ok()?;
+        if !text.trim().is_empty() {
+            return Some(text);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+
+    /// A seed written as `stringData` is still a seed.
+    ///
+    /// The apiserver is supposed to fold `stringData` into `data` on write.
+    /// rustkube does not, so a secret created the documented way comes back
+    /// exactly as written -- and a reader that only knows `data` finds
+    /// nothing, which presents as a guest with no login and no reason.
+    #[test]
+    fn a_seed_is_read_from_string_data() {
+        let s = serde_json::json!({
+            "stringData": {"userdata": "#cloud-config\nhostname: web-1\n"}
+        });
+        assert!(seed_text(&s).unwrap().contains("hostname: web-1"));
+    }
+
+    /// And from `data`, which is base64.
+    #[test]
+    fn a_seed_is_read_from_base64_data() {
+        use base64::Engine as _;
+        let b = base64::engine::general_purpose::STANDARD.encode("#cloud-config\nssh_authorized_keys:\n");
+        let s = serde_json::json!({"data": {"userdata": b}});
+        assert!(seed_text(&s).unwrap().contains("ssh_authorized_keys"));
+    }
+
+    /// One field under another name is obviously the seed.
+    ///
+    /// Failing over a spelling would mean a guest nobody can log into.
+    #[test]
+    fn a_single_oddly_named_field_is_taken_as_the_seed() {
+        let s = serde_json::json!({"stringData": {"user-data": "#cloud-config\n"}});
+        assert_eq!(seed_text(&s).as_deref(), Some("#cloud-config\n"));
+    }
+
+    /// Nothing usable is None, not an empty document.
+    #[test]
+    fn an_empty_secret_is_no_seed_at_all() {
+        assert!(seed_text(&serde_json::json!({})).is_none());
+        assert!(seed_text(&serde_json::json!({"stringData": {"userdata": "  "}})).is_none());
+        // Two fields, neither named: ambiguous, so not guessed.
+        assert!(seed_text(&serde_json::json!({"stringData": {"a": "x", "b": "y"}})).is_none());
+    }
+
 }
