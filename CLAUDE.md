@@ -55,10 +55,9 @@ Steps:
 4. [x] A terminating VMI is not desired. Finalizer `storm.io/vm` ensured each sync while running (rv-guarded),
        removed once stopped.
 5. [x] Tests, docs (README), CHANGELOG. sc-build at 2331af9: all pass (kubelet 189). Not run on a node.
-6. [ ] **Where it stopped (2026-09-27, session restart):** released v0.13.0 (e8211b6, tag pushed). Release
-       sc-build (`--release --target x86_64-unknown-linux-musl`, `--locked`, Cargo.lock bumped by hand) was
-       running and unconfirmed. Next: rerun it; if it passes, `stormcentral component stage rustkube-node
-       --url http://stormcentral.g8.lo`, then close #35 (verified by sc-build only, not on a node).
+6. [x] Released v0.13.0 (e8211b6). Release sc-build at cf6aee2 (`--release --locked --target
+       x86_64-unknown-linux-musl`, then `cargo test --locked`): passed (kubelet 189). Stage golden requested;
+       #35 closed (verified by sc-build only, not on a node).
 
 ### In progress: #59, every node volume a complete, current PV + PVC set
 
