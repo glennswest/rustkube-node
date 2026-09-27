@@ -424,50 +424,37 @@ impl PodManager {
         // PVs, one from each side, and the claim was repointed away from the
         // one the binder had matched.
         let pv_name = volume.to_string();
-        let capacity = serde_json::json!({ "storage": format!("{bytes}") });
-        let pv = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "PersistentVolume",
-            "metadata": {
-                "name": pv_name,
-                "annotations": {
-                    // Which node holds it. A stormblock clone is local to the
-                    // node that made it, and that is the whole reason the
-                    // class binds on first consumer.
-                    "storm.io/node": self.node_name,
-                    "storm.io/volume": volume,
-                },
-            },
-            "spec": {
-                "capacity": capacity,
-                "accessModes": ["ReadWriteOnce"],
-                "persistentVolumeReclaimPolicy": "Delete",
-                "storageClassName": crate::storage::STORAGE_CLASS,
-                "volumeMode": "Filesystem",
-                "claimRef": {
-                    "kind": "PersistentVolumeClaim",
-                    "namespace": namespace,
-                    "name": claim,
-                },
-                // Not a real CSI volume: this node attached it directly. The
-                // handle is recorded so the volume behind a PV is findable
-                // without asking stormblock to match on name.
-                "csi": {
-                    "driver": "stormblock.storm.io",
-                    "volumeHandle": volume,
-                },
-                // A clone lives on the node that made it; the scheduler must
-                // bring a pod here to use it.
-                "nodeAffinity": { "required": { "nodeSelectorTerms": [{
-                    "matchExpressions": [{
-                        "key": "kubernetes.io/hostname",
-                        "operator": "In",
-                        "values": [self.node_name],
-                    }],
-                }]}},
-            },
-            "status": { "phase": "Bound" },
-        });
+
+        // What the engine knows of the clone: its filesystem and uuid, and
+        // what it was cloned from, for the PV's CSI source (#59). The size is
+        // the class's, which is what was provisioned.
+        let list = self.storage_get("/api/v1/volumes").await.unwrap_or_default();
+        let items = list["items"].as_array().cloned().unwrap_or_default();
+        let names: std::collections::HashMap<String, String> = items
+            .iter()
+            .filter_map(|v| Some((v["id"].as_str()?.to_string(), v["name"].as_str()?.to_string())))
+            .collect();
+        let mut facts = items
+            .iter()
+            .find(|v| v["name"].as_str() == Some(volume))
+            .map(|v| crate::system_claims::VolumeFacts::of(v, &names))
+            .unwrap_or_else(|| crate::system_claims::VolumeFacts { name: volume.to_string(), ..Default::default() });
+        facts.bytes = bytes;
+
+        // The claim first, so the volume's claimRef can carry its uid: a PV
+        // naming a claim by name alone reads as bound to whichever claim of
+        // that name exists, including one made again after a delete.
+        let path = format!("/api/v1/namespaces/{namespace}/persistentvolumeclaims/{claim}");
+        let Some(mut pvc) = self.api_get(&path).await else { return };
+
+        let mut pv = crate::system_claims::stormblock_pv(
+            &facts,
+            &pv_name,
+            &self.node_name,
+            crate::system_claims::claim_ref(&pvc),
+            "Delete",
+        );
+        pv["status"] = serde_json::json!({ "phase": "Bound" });
         if self.api_post("/api/v1/persistentvolumes", &pv).await.is_none() {
             debug!("PV {pv_name} not created (it may already exist)");
         }
@@ -475,22 +462,19 @@ impl PodManager {
         // Bind the claim to it. Read-modify-write rather than a patch,
         // because the claim carries a resourceVersion and losing a concurrent
         // edit here would be a claim pointing at the wrong volume.
-        let path = format!("/api/v1/namespaces/{namespace}/persistentvolumeclaims/{claim}");
-        let Some(mut pvc) = self.api_get(&path).await else { return };
-        if pvc["status"]["phase"].as_str() == Some("Bound")
-            && pvc["spec"]["volumeName"].as_str() == Some(pv_name.as_str())
-        {
+        let before = pvc.clone();
+        crate::system_claims::bind_pvc(&mut pvc, &pv_name, &self.node_name, volume);
+        let capacity = serde_json::json!({ "storage": crate::system_claims::quantity(bytes) });
+        if pvc["status"]["phase"].as_str() != Some("Bound") {
+            pvc["status"] = serde_json::json!({
+                "phase": "Bound",
+                "accessModes": ["ReadWriteOnce"],
+                "capacity": capacity,
+            });
+        }
+        if pvc == before {
             return;
         }
-        pvc["spec"]["volumeName"] = serde_json::json!(pv_name);
-        if pvc["spec"]["storageClassName"].as_str().is_none() {
-            pvc["spec"]["storageClassName"] = serde_json::json!(crate::storage::STORAGE_CLASS);
-        }
-        pvc["status"] = serde_json::json!({
-            "phase": "Bound",
-            "accessModes": ["ReadWriteOnce"],
-            "capacity": capacity,
-        });
         if self.api_put(&path, &pvc).await.is_some() {
             info!("PVC {namespace}/{claim} bound to {pv_name}");
         }

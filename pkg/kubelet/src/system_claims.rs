@@ -205,56 +205,73 @@ fn labels(kind: &str, component: &str) -> Value {
     json!({ LABEL: "true", KIND_LABEL: kind, COMPONENT_LABEL: component })
 }
 
-/// The PV and PVC for one node volume, as they should be. The PV's `claimRef`
-/// has no uid until the claim exists ([`reconcile_pv`] adds it).
-pub fn objects(f: &VolumeFacts, kind: &str, component: &str, node: &str) -> (Value, Value) {
-    let capacity = json!({ "storage": quantity(f.bytes) });
-    let labels = labels(kind, component);
-    let pv = json!({
+/// A stormblock PV for volume `f` on `node`, naming `claim_ref` as its claim.
+///
+/// The one builder for every stormblock PV this kubelet writes: the node's own
+/// volumes (Retain) and the built-in driver's claims (`bind_claim`, Delete).
+/// Labels are the caller's.
+pub fn stormblock_pv(f: &VolumeFacts, pv_name: &str, node: &str, claim_ref: Value, reclaim: &str) -> Value {
+    json!({
         "apiVersion": "v1",
         "kind": "PersistentVolume",
         "metadata": {
-            "name": pv_name(&f.name),
-            "labels": labels,
+            "name": pv_name,
             "annotations": pv_state_annotations(f, node),
         },
         "spec": {
-            "capacity": capacity,
+            "capacity": { "storage": quantity(f.bytes) },
             "accessModes": ["ReadWriteOnce"],
-            "persistentVolumeReclaimPolicy": "Retain",
+            "persistentVolumeReclaimPolicy": reclaim,
             "storageClassName": crate::storage::STORAGE_CLASS,
             "volumeMode": "Filesystem",
-            "claimRef": {
-                "apiVersion": "v1",
-                "kind": "PersistentVolumeClaim",
-                "namespace": NAMESPACE,
-                "name": f.name,
-            },
+            "claimRef": claim_ref,
             "csi": csi_source(f),
             "nodeAffinity": node_affinity(node),
         },
-    });
-    let mut spec = json!({
-        "accessModes": ["ReadWriteOnce"],
-        "storageClassName": crate::storage::STORAGE_CLASS,
-        "volumeName": pv_name(&f.name),
-        "volumeMode": "Filesystem",
-        "resources": { "requests": capacity },
-    });
-    if let Some(g) = &f.golden {
-        spec["dataSourceRef"] = json!({ "apiGroup": "storm.io", "kind": "Golden", "name": g });
+    })
+}
+
+/// Point `pvc` at `pv_name` and give it the annotations a bound, provisioned
+/// claim carries. Everything else on it is kept.
+pub fn bind_pvc(pvc: &mut Value, pv_name: &str, node: &str, volume: &str) {
+    pvc["spec"]["volumeName"] = json!(pv_name);
+    if pvc["spec"]["storageClassName"].as_str().is_none() {
+        pvc["spec"]["storageClassName"] = json!(crate::storage::STORAGE_CLASS);
     }
-    let pvc = json!({
+    merge_map(pvc, "annotations", &Value::Object(pvc_bound_annotations(node, volume)));
+}
+
+/// The PV and PVC for one node volume, as they should be. The PV's `claimRef`
+/// has no uid until the claim exists ([`reconcile_pv`] adds it).
+pub fn objects(f: &VolumeFacts, kind: &str, component: &str, node: &str) -> (Value, Value) {
+    let labels = labels(kind, component);
+    let claim_ref = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "namespace": NAMESPACE,
+        "name": f.name,
+    });
+    let mut pv = stormblock_pv(f, &pv_name(&f.name), node, claim_ref, "Retain");
+    pv["metadata"]["labels"] = labels.clone();
+    let mut pvc = json!({
         "apiVersion": "v1",
         "kind": "PersistentVolumeClaim",
         "metadata": {
             "name": f.name,
             "namespace": NAMESPACE,
             "labels": labels,
-            "annotations": pvc_bound_annotations(node, &f.name),
         },
-        "spec": spec,
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "storageClassName": crate::storage::STORAGE_CLASS,
+            "volumeMode": "Filesystem",
+            "resources": { "requests": { "storage": quantity(f.bytes) } },
+        },
     });
+    if let Some(g) = &f.golden {
+        pvc["spec"]["dataSourceRef"] = json!({ "apiGroup": "storm.io", "kind": "Golden", "name": g });
+    }
+    bind_pvc(&mut pvc, &pv_name(&f.name), node, &f.name);
     (pv, pvc)
 }
 
@@ -504,6 +521,25 @@ pub async fn mirror(
             }
         }
     }
+
+    // A volume that went away: its claim goes, and the binder makes the PV
+    // Released. The PV itself is never deleted here (Retain): it is the record
+    // of where the data was, for an administrator. Only on a listing that
+    // named at least one of this node's volumes (above), so an engine that
+    // answers with nothing yet does not let go of every claim at once.
+    let present: std::collections::HashSet<&str> = mirrored.iter().map(|(f, _, _)| f.name.as_str()).collect();
+    for (name, c) in &pvcs {
+        if !is_ours(c, node) || !c["metadata"]["deletionTimestamp"].is_null() || present.contains(name.as_str()) {
+            continue;
+        }
+        match client.delete(format!("{pvc_base}/{name}")).send().await {
+            Ok(r) if r.status().is_success() => {
+                info!("volume {name} is gone from this node: claim {NAMESPACE}/{name} deleted, its PV kept")
+            }
+            Ok(r) => debug!("PVC {NAMESPACE}/{name} not deleted: {}", r.status()),
+            Err(e) => debug!("PVC {NAMESPACE}/{name} not deleted: {e}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -704,6 +740,45 @@ mod tests {
         let writes = api.writes();
         mirror(&client, &api.url, &engine, "node2").await;
         assert_eq!(api.writes(), writes);
+
+        // A volume that went away: its claim goes, its PV stays (Retain), and
+        // the other volume's pair is untouched.
+        let fewer = fake::engine(json!({"items": [
+            {"id": "a", "name": "fastetcd-data", "role": "data", "virtual_size_bytes": 1u64 << 30,
+             "fs": {"kind": "ext4"}, "fs_uuid": "u-a", "health": "healthy", "access": "rw"},
+        ]}))
+        .await;
+        mirror(&client, &api.url, &fewer, "node1").await;
+        assert!(api.get(&format!("/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims/fastetcd-logs")).is_none());
+        assert!(api.get("/api/v1/persistentvolumes/storm-fastetcd-logs").is_some(), "the PV is never deleted");
+        assert!(api.get(&format!("/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims/fastetcd-data")).is_some());
+
+        // An engine that lists none of the node's volumes lets go of nothing.
+        let empty = fake::engine(json!({"items": []})).await;
+        mirror(&client, &api.url, &empty, "node1").await;
+        assert!(api.get(&format!("/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims/fastetcd-data")).is_some());
+    }
+
+    #[test]
+    fn a_driver_claim_is_bound_the_same_way() {
+        let mut pvc = json!({"metadata": {"name": "db", "namespace": "default", "uid": "u-1",
+                                          "annotations": {"keep": "me"}},
+                             "spec": {"resources": {"requests": {"storage": "1Gi"}}}});
+        bind_pvc(&mut pvc, "pvc-default-db", "node1", "pvc-default-db");
+        assert_eq!(pvc["spec"]["volumeName"], "pvc-default-db");
+        assert_eq!(pvc["spec"]["storageClassName"], crate::storage::STORAGE_CLASS);
+        let a = &pvc["metadata"]["annotations"];
+        assert_eq!(a["keep"], "me");
+        assert_eq!(a["pv.kubernetes.io/bind-completed"], "yes");
+        assert_eq!(a["volume.kubernetes.io/selected-node"], "node1");
+
+        let f = VolumeFacts { name: "pvc-default-db".into(), bytes: 1 << 30, fs_type: Some("ext4".into()),
+                              ..Default::default() };
+        let pv = stormblock_pv(&f, "pvc-default-db", "node1", claim_ref(&pvc), "Delete");
+        assert_eq!(pv["spec"]["claimRef"]["uid"], "u-1");
+        assert_eq!(pv["spec"]["persistentVolumeReclaimPolicy"], "Delete");
+        assert_eq!(pv["spec"]["csi"]["fsType"], "ext4");
+        assert!(pv["metadata"]["labels"].is_null(), "a driver claim is not a system volume");
     }
 
     /// A small in-memory apiserver: GET, list, POST (uid and resourceVersion
@@ -796,6 +871,13 @@ mod tests {
                     s.insert(path.to_string(), obj.clone());
                     ok(obj)
                 }
+                Method::DELETE => match s.remove(path) {
+                    Some(v) => {
+                        *writes.lock().unwrap() += 1;
+                        ok(v)
+                    }
+                    None => (StatusCode::NOT_FOUND, axum::Json(json!({}))),
+                },
                 _ => (StatusCode::METHOD_NOT_ALLOWED, axum::Json(json!({}))),
             }
         }
