@@ -22,7 +22,7 @@ pinned by `rev` in `Cargo.toml`. It needs `protoc` on the build box, for the ven
 
 ## Work plan
 
-### In progress: #66 (P0, stormcos#104), the kubelet presents no stormblock engine token
+### Done: #66 (P0, stormcos#104), the kubelet presents no stormblock engine token
 
 The engine (stormblock ≥ 17) requires `Authorization: Bearer <token>` on its API.
 Every engine call from the kubelet got 401, so claims and VM disks did not attach.
@@ -35,7 +35,7 @@ Steps:
 2. [x] pod_manager, system_claims, vm_manager and stormpump_runtime use it instead of the apiserver client or a bare client.
 3. [x] `scripts/build-golden.sh`: curl carries the token.
 4. [x] Docs, CHANGELOG. sc-build at ca6dd06: build clean, all tests pass (kubelet 161, including engine::tests).
-5. [ ] Release v0.11.0, golden, close #66.
+5. [x] Released v0.11.0 (036b976), golden-rustkube-node-fdc1c7497472, #66 closed.
 
 ### Done: #58, the golden build cannot load the workspace
 
