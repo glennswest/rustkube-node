@@ -56,8 +56,9 @@ Steps:
        removed once stopped.
 5. [x] Tests, docs (README), CHANGELOG. sc-build at 2331af9: all pass (kubelet 189). Not run on a node.
 6. [x] Released v0.13.0 (e8211b6). Release sc-build at cf6aee2 (`--release --locked --target
-       x86_64-unknown-linux-musl`, then `cargo test --locked`): passed (kubelet 189). Stage golden requested;
-       #35 closed (verified by sc-build only, not on a node).
+       x86_64-unknown-linux-musl`, then `cargo test --locked`): passed (kubelet 189). Stage golden
+       golden-rustkube-node-d9a108728be0 (at ccb7bfc; the first stage try died on dev: no NVMe device). No
+       release request was filed by stage: stormcentral#117. #35 closed (sc-build only, not on a node).
 
 ### In progress: #64, PVC size test (the medium suite's first test)
 
