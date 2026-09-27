@@ -1,35 +1,46 @@
-//! The node's own data containers, listed as PersistentVolumeClaims.
+//! The node's own volumes, as complete, current PV + PVC sets (#49, #59).
 //!
-//! Every service on a stormcos node keeps its state in a stormblock data
-//! volume — `fastetcd-data`, `stormcert-data`, `registry-data`, `stormcos-state`
-//! — a copy-on-write clone of a golden, mounted at boot by the initramfs. That
-//! *is* this platform's storage class at work: a claim is a clone of a data
-//! volume. But none of them appeared in the API, so the cluster showed zero
-//! claims on a node running two dozen, and nothing a Kubernetes tool could see
-//! said where a service's data lives or how big it is (rustkube-node#49).
+//! Every service on a stormcos node keeps its state in stormblock volumes:
+//! `fastetcd-data`, `stormcert-data`, `stormcos-state`, and a `<component>-logs`
+//! volume per component. Each is a copy-on-write clone of a golden, mounted at
+//! boot by the initramfs. That *is* this platform's storage class at work: a
+//! claim is a clone of a data volume. So each one is represented the way any
+//! Kubernetes claim is: **a PV and its bound PVC, always together**.
 //!
-//! This mirrors them, the way `mirror_node_services` mirrors the services:
-//!
-//! - namespace `kube-system`, beside the service's own pod: the node's services
-//!   are mirrored there (`mirror.rs`), and a service's data belongs with it —
-//!   `kube-system/fastetcd-data` next to `kube-system/fastetcd-<node>`
+//! - namespace `kube-system`, beside the service's own mirrored pod
+//!   (`mirror.rs`): `kube-system/fastetcd-data` next to `kube-system/fastetcd-<node>`
 //! - a `PersistentVolume` named `storm-<volume>`, class `stormblock`, the
-//!   stormblock volume as its CSI handle, pinned to this node, reclaim
-//!   **Retain**: deleting the object must never delete a service's data.
-//! - a `PersistentVolumeClaim` named `<volume>`, already bound to it, with the
-//!   golden it was cloned from as its `dataSourceRef`.
+//!   stormblock volume as its CSI handle with its filesystem and golden, pinned
+//!   to this node, reclaim **Retain**: deleting the object must never delete a
+//!   service's data
+//! - a `PersistentVolumeClaim` named `<volume>`, bound to it, with the golden it
+//!   was cloned from as its `dataSourceRef`
+//! - on both, `storm.io/volume-kind` (`data`, `state` or `logs`) and
+//!   `storm.io/component` (`fastetcd`), so `kubectl get pvc -l
+//!   storm.io/volume-kind=logs` lists the log volumes
 //!
-//! Created bound, so neither provisioner acts on them: the control plane's
-//! skips claims with a `volumeName`, and the kubelet mounts a bound claim's own
-//! volume rather than deriving one. A claim can name one of these as its
-//! `dataSource` to get a clone of a service's data.
+//! Written as a dynamically provisioned pair of any driver reads: the PVC
+//! carries `pv.kubernetes.io/bind-completed`, `bound-by-controller`,
+//! `volume.kubernetes.io/storage-provisioner` and `selected-node`, and the
+//! PV's `claimRef` carries the claim's uid.
 //!
-//! stormblock is the source of truth. This only ever creates; a volume that
-//! goes away leaves its objects for an administrator, which is what Retain
-//! means everywhere else too.
+//! **A reconciler, not a one-shot.** stormblock is the source of truth, and
+//! every pass (30 s) brings the API up to it: a missing object is created again
+//! (etcd wiped, namespace deleted, a claim deleted by hand), a volume that grew
+//! grows its objects, health and access are kept current, and a volume created
+//! after boot gets the same set. Phases and protection finalizers are the
+//! binder's (rustkube's `persistentvolume.rs`), so this writes objects and
+//! bindings, never phases, except the claim's first status, which saves it
+//! reading as Unknown until the binder's next pass.
+//!
+//! **Only this node's objects.** An object is this node's when it carries the
+//! mirror's label and `storm.io/node` names this node. Anything else under the
+//! same name is left alone, never overwritten.
 
-use serde_json::{json, Value};
-use tracing::{debug, info};
+use std::collections::HashMap;
+
+use serde_json::{json, Map, Value};
+use tracing::{debug, info, warn};
 
 /// Where the node's own claims live: with the node's services.
 pub const NAMESPACE: &str = "kube-system";
@@ -37,20 +48,43 @@ pub const NAMESPACE: &str = "kube-system";
 /// Marks the objects this mirror owns — and marks a volume a node service has
 /// mounted, which a pod may clone but must not mount.
 pub const LABEL: &str = "storm.io/system-volume";
+/// What the volume holds: `data`, `state` or `logs`.
+pub const KIND_LABEL: &str = "storm.io/volume-kind";
+/// The component it belongs to: `fastetcd` for `fastetcd-logs`.
+pub const COMPONENT_LABEL: &str = "storm.io/component";
 
-/// Is this stormblock volume one of the node's data containers?
+/// The CSI driver name the class's PVs carry, and the provisioner the claims name.
+pub const DRIVER: &str = "stormblock.storm.io";
+
+/// What a node volume holds and whose it is, from its name, or `None` when it
+/// is not one of the node's service volumes.
 ///
-/// A writable data-role volume named `*-data` or `*-state`. Goldens are sealed
-/// and are what these are cloned *from*; `pvc-*` are claims already; `standby-*`
-/// are pre-minted clones waiting for a claim.
+/// Writable, and named `<component>-data`, `-state` or `-logs`. Goldens are
+/// sealed and are what these are cloned *from*; `pvc-*` are claims already
+/// (the built-in driver's, `bind_claim`); `standby-*` are pre-minted clones
+/// that are nobody's until a claim takes them. The engine marks nothing as
+/// logs, and `role` is only the slab half (`system` or `data`), so the name is
+/// what says.
+pub fn kind_of(v: &Value) -> Option<(&'static str, String)> {
+    let name = v["name"].as_str()?;
+    if v["sealed"].as_bool().unwrap_or(false)
+        || name.ends_with(".golden")
+        || name.starts_with("pvc-")
+        || name.starts_with("standby-")
+    {
+        return None;
+    }
+    for (suffix, kind) in [("-data", "data"), ("-state", "state"), ("-logs", "logs")] {
+        if let Some(component) = name.strip_suffix(suffix).filter(|c| !c.is_empty()) {
+            return Some((kind, component.to_string()));
+        }
+    }
+    None
+}
+
+/// Kept for callers and tests that ask the old question.
 pub fn is_data_container(v: &Value) -> bool {
-    let name = v["name"].as_str().unwrap_or("");
-    v["role"].as_str() == Some("data")
-        && !v["sealed"].as_bool().unwrap_or(false)
-        && !name.ends_with(".golden")
-        && !name.starts_with("pvc-")
-        && !name.starts_with("standby-")
-        && (name.ends_with("-data") || name.ends_with("-state"))
+    matches!(kind_of(v), Some(("data" | "state", _)))
 }
 
 /// Bytes as a Kubernetes quantity: `1Gi` rather than `1073741824`.
@@ -65,28 +99,124 @@ pub fn quantity(bytes: u64) -> String {
     bytes.to_string()
 }
 
-/// The PV name for a data container.
+/// The PV name for a node volume.
 pub fn pv_name(volume: &str) -> String {
     format!("storm-{volume}")
 }
 
-/// The PV and PVC for one data container.
-pub fn objects(v: &Value, node: &str, golden: Option<&str>) -> (Value, Value) {
-    let name = v["name"].as_str().unwrap_or("");
-    let bytes = v["virtual_size_bytes"].as_u64().unwrap_or(0);
-    let capacity = json!({ "storage": quantity(bytes) });
-    let labels = json!({ LABEL: "true" });
+/// What the engine says about one volume, as the objects need it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct VolumeFacts {
+    pub name: String,
+    pub bytes: u64,
+    /// `fs.kind`: `ext4`, `xfs`, …
+    pub fs_type: Option<String>,
+    pub fs_uuid: Option<String>,
+    /// The golden it was cloned from, without `.golden`.
+    pub golden: Option<String>,
+    pub health: Option<String>,
+    pub access: Option<String>,
+    /// The slab half: `system` or `data`.
+    pub role: Option<String>,
+}
+
+impl VolumeFacts {
+    /// From one entry of the engine's volume list. `names` maps every volume's
+    /// id to its name, for the parent.
+    pub fn of(v: &Value, names: &HashMap<String, String>) -> VolumeFacts {
+        let s = |k: &str| v[k].as_str().filter(|x| !x.is_empty()).map(String::from);
+        VolumeFacts {
+            name: s("name").unwrap_or_default(),
+            bytes: v["virtual_size_bytes"].as_u64().unwrap_or(0),
+            fs_type: v["fs"]["kind"].as_str().filter(|x| !x.is_empty()).map(String::from),
+            fs_uuid: s("fs_uuid"),
+            golden: v["parent"]
+                .as_str()
+                .and_then(|p| names.get(p))
+                .map(|g| g.strip_suffix(".golden").unwrap_or(g).to_string()),
+            health: s("health"),
+            access: s("access"),
+            role: s("role"),
+        }
+    }
+}
+
+/// The CSI source of a stormblock PV: the handle, and what is known about the
+/// filesystem and where it came from.
+pub fn csi_source(f: &VolumeFacts) -> Value {
+    let mut csi = json!({ "driver": DRIVER, "volumeHandle": f.name });
+    if let Some(t) = &f.fs_type {
+        csi["fsType"] = json!(t);
+    }
+    let mut attrs = Map::new();
+    if let Some(g) = &f.golden {
+        attrs.insert("storm.io/golden".into(), json!(g));
+    }
+    if let Some(u) = &f.fs_uuid {
+        attrs.insert("storm.io/fs-uuid".into(), json!(u));
+    }
+    if !attrs.is_empty() {
+        csi["volumeAttributes"] = Value::Object(attrs);
+    }
+    csi
+}
+
+/// The annotations a PV carries about its volume's current state.
+pub fn pv_state_annotations(f: &VolumeFacts, node: &str) -> Map<String, Value> {
+    let mut a = Map::new();
+    a.insert("storm.io/node".into(), json!(node));
+    a.insert("storm.io/volume".into(), json!(f.name));
+    a.insert("pv.kubernetes.io/provisioned-by".into(), json!(DRIVER));
+    for (k, v) in [("storm.io/health", &f.health), ("storm.io/access", &f.access), ("storm.io/role", &f.role)]
+    {
+        if let Some(v) = v {
+            a.insert(k.into(), json!(v));
+        }
+    }
+    a
+}
+
+/// The annotations a bound, provisioned claim carries, as upstream's binder
+/// and scheduler leave them.
+pub fn pvc_bound_annotations(node: &str, volume: &str) -> Map<String, Value> {
+    let mut a = Map::new();
+    a.insert("pv.kubernetes.io/bind-completed".into(), json!("yes"));
+    a.insert("pv.kubernetes.io/bound-by-controller".into(), json!("yes"));
+    a.insert("volume.kubernetes.io/storage-provisioner".into(), json!(DRIVER));
+    a.insert("volume.beta.kubernetes.io/storage-provisioner".into(), json!(DRIVER));
+    a.insert("volume.kubernetes.io/selected-node".into(), json!(node));
+    a.insert("storm.io/node".into(), json!(node));
+    a.insert("storm.io/volume".into(), json!(volume));
+    a
+}
+
+/// The PV's `nodeAffinity`: a stormblock clone lives on the node that made it.
+pub fn node_affinity(node: &str) -> Value {
+    json!({ "required": { "nodeSelectorTerms": [{
+        "matchExpressions": [{
+            "key": "kubernetes.io/hostname",
+            "operator": "In",
+            "values": [node],
+        }],
+    }]}})
+}
+
+fn labels(kind: &str, component: &str) -> Value {
+    json!({ LABEL: "true", KIND_LABEL: kind, COMPONENT_LABEL: component })
+}
+
+/// The PV and PVC for one node volume, as they should be. The PV's `claimRef`
+/// has no uid until the claim exists ([`reconcile_pv`] adds it).
+pub fn objects(f: &VolumeFacts, kind: &str, component: &str, node: &str) -> (Value, Value) {
+    let capacity = json!({ "storage": quantity(f.bytes) });
+    let labels = labels(kind, component);
     let pv = json!({
         "apiVersion": "v1",
         "kind": "PersistentVolume",
         "metadata": {
-            "name": pv_name(name),
+            "name": pv_name(&f.name),
             "labels": labels,
-            "annotations": {
-                "storm.io/node": node,
-                "storm.io/volume": name,
-                "pv.kubernetes.io/provisioned-by": "stormblock.storm.io/system",
-            },
+            "annotations": pv_state_annotations(f, node),
         },
         "spec": {
             "capacity": capacity,
@@ -95,48 +225,169 @@ pub fn objects(v: &Value, node: &str, golden: Option<&str>) -> (Value, Value) {
             "storageClassName": crate::storage::STORAGE_CLASS,
             "volumeMode": "Filesystem",
             "claimRef": {
+                "apiVersion": "v1",
                 "kind": "PersistentVolumeClaim",
                 "namespace": NAMESPACE,
-                "name": name,
+                "name": f.name,
             },
-            "csi": { "driver": "stormblock.storm.io", "volumeHandle": name },
-            "nodeAffinity": { "required": { "nodeSelectorTerms": [{
-                "matchExpressions": [{
-                    "key": "kubernetes.io/hostname",
-                    "operator": "In",
-                    "values": [node],
-                }],
-            }]}},
+            "csi": csi_source(f),
+            "nodeAffinity": node_affinity(node),
         },
     });
     let mut spec = json!({
         "accessModes": ["ReadWriteOnce"],
         "storageClassName": crate::storage::STORAGE_CLASS,
-        "volumeName": pv_name(name),
+        "volumeName": pv_name(&f.name),
         "volumeMode": "Filesystem",
         "resources": { "requests": capacity },
     });
-    if let Some(g) = golden {
+    if let Some(g) = &f.golden {
         spec["dataSourceRef"] = json!({ "apiGroup": "storm.io", "kind": "Golden", "name": g });
     }
     let pvc = json!({
         "apiVersion": "v1",
         "kind": "PersistentVolumeClaim",
         "metadata": {
-            "name": name,
+            "name": f.name,
             "namespace": NAMESPACE,
             "labels": labels,
-            "annotations": { "storm.io/node": node, "storm.io/volume": name },
+            "annotations": pvc_bound_annotations(node, &f.name),
         },
         "spec": spec,
     });
     (pv, pvc)
 }
 
-/// One pass: every data container on this node has its PV and bound PVC.
+/// Is this object the mirror's, for this node? Only those are ever written.
+pub fn is_ours(obj: &Value, node: &str) -> bool {
+    obj["metadata"]["labels"][LABEL].as_str() == Some("true")
+        && obj["metadata"]["annotations"]["storm.io/node"].as_str() == Some(node)
+}
+
+/// Merge `want`'s entries into `obj[section]`, keeping everything else there.
+fn merge_map(obj: &mut Value, section: &str, want: &Value) {
+    let Some(want) = want.as_object() else { return };
+    if !obj["metadata"][section].is_object() {
+        obj["metadata"][section] = json!({});
+    }
+    for (k, v) in want {
+        obj["metadata"][section][k] = v.clone();
+    }
+}
+
+/// An existing claim brought up to date, or `None` when it already is.
+///
+/// Labels and annotations are merged, not replaced: another tool's are kept.
+/// The request only grows, as a claim's may: a volume that was expanded is a
+/// claim that asked for more, and one that reads smaller than its request is
+/// left alone rather than shrunk.
+pub fn reconcile_pvc(existing: &Value, want: &Value) -> Option<Value> {
+    let mut obj = existing.clone();
+    merge_map(&mut obj, "labels", &want["metadata"]["labels"]);
+    merge_map(&mut obj, "annotations", &want["metadata"]["annotations"]);
+    let want_req = &want["spec"]["resources"]["requests"]["storage"];
+    let have = obj["spec"]["resources"]["requests"]["storage"]
+        .as_str()
+        .and_then(crate::storage::parse_quantity)
+        .unwrap_or(0);
+    let wanted = want_req.as_str().and_then(crate::storage::parse_quantity).unwrap_or(0);
+    if wanted > have {
+        obj["spec"]["resources"]["requests"]["storage"] = want_req.clone();
+    }
+    (obj != *existing).then_some(obj)
+}
+
+/// An existing volume brought up to date, or `None` when it already is.
+///
+/// Capacity and the CSI source follow the engine; the `claimRef` follows the
+/// claim's uid, so a claim that was deleted and made again is the one the
+/// volume names.
+pub fn reconcile_pv(existing: &Value, want: &Value, claim: Option<&Value>) -> Option<Value> {
+    let mut obj = existing.clone();
+    merge_map(&mut obj, "labels", &want["metadata"]["labels"]);
+    merge_map(&mut obj, "annotations", &want["metadata"]["annotations"]);
+    obj["spec"]["capacity"] = want["spec"]["capacity"].clone();
+    obj["spec"]["csi"] = want["spec"]["csi"].clone();
+    // Only a different claim moves the reference. Its resourceVersion changes
+    // every time the binder touches it, and following that would rewrite the
+    // volume on every pass; upstream records it once, at binding.
+    if let Some(c) = claim {
+        if obj["spec"]["claimRef"]["uid"] != c["metadata"]["uid"] {
+            obj["spec"]["claimRef"] = claim_ref(c);
+        }
+    }
+    (obj != *existing).then_some(obj)
+}
+
+/// A `claimRef` naming this claim exactly: namespace, name, uid, resourceVersion.
+pub fn claim_ref(pvc: &Value) -> Value {
+    let m = &pvc["metadata"];
+    let mut r = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "namespace": m["namespace"],
+        "name": m["name"],
+    });
+    if let Some(uid) = m["uid"].as_str() {
+        r["uid"] = json!(uid);
+    }
+    if let Some(rv) = m["resourceVersion"].as_str() {
+        r["resourceVersion"] = json!(rv);
+    }
+    r
+}
+
+/// Objects of a list, by name.
+fn by_name(list: &Value) -> HashMap<String, Value> {
+    list["items"]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|o| Some((o["metadata"]["name"].as_str()?.to_string(), o.clone())))
+        .collect()
+}
+
+async fn get_json(client: &reqwest::Client, url: &str) -> Option<Value> {
+    match client.get(url).send().await {
+        Ok(r) if r.status().is_success() => r.json().await.ok(),
+        _ => None,
+    }
+}
+
+/// POST, and the object as the apiserver stored it.
+async fn create(client: &reqwest::Client, url: &str, obj: &Value) -> Option<Value> {
+    match client.post(url).json(obj).send().await {
+        Ok(r) if r.status().is_success() => r.json().await.ok(),
+        Ok(r) => {
+            debug!("create {url}: {}", r.status());
+            None
+        }
+        Err(e) => {
+            debug!("create {url}: {e}");
+            None
+        }
+    }
+}
+
+async fn replace(client: &reqwest::Client, url: &str, obj: &Value) -> Option<Value> {
+    match client.put(url).json(obj).send().await {
+        Ok(r) if r.status().is_success() => r.json().await.ok(),
+        Ok(r) => {
+            debug!("update {url}: {}", r.status());
+            None
+        }
+        Err(e) => {
+            debug!("update {url}: {e}");
+            None
+        }
+    }
+}
+
+/// One pass: every node volume has its complete, current PV and bound PVC.
 ///
 /// `client` is the apiserver's, `engine` the node's stormblock (with its own
-/// token, #66).
+/// token, #66). Nothing is written unless it differs from what is there.
 pub async fn mirror(
     client: &reqwest::Client,
     api_url: &str,
@@ -154,59 +405,102 @@ pub async fn mirror(
         _ => return,
     };
     let items = vols["items"].as_array().cloned().unwrap_or_default();
-    let by_id: std::collections::HashMap<&str, &str> = items
+    let names: HashMap<String, String> = items
         .iter()
-        .filter_map(|v| Some((v["id"].as_str()?, v["name"].as_str()?)))
+        .filter_map(|v| Some((v["id"].as_str()?.to_string(), v["name"].as_str()?.to_string())))
         .collect();
-    let containers: Vec<&Value> = items.iter().filter(|v| is_data_container(v)).collect();
-    if containers.is_empty() {
+    let mirrored: Vec<(VolumeFacts, &'static str, String)> = items
+        .iter()
+        .filter_map(|v| {
+            let (kind, component) = kind_of(v)?;
+            Some((VolumeFacts::of(v, &names), kind, component))
+        })
+        .collect();
+    if mirrored.is_empty() {
         return;
     }
 
     let ns_path = format!("{api_url}/api/v1/namespaces/{NAMESPACE}");
-    if !matches!(client.get(&ns_path).send().await, Ok(r) if r.status().is_success()) {
+    if get_json(client, &ns_path).await.is_none() {
         let ns = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": NAMESPACE}});
         let _ = client.post(format!("{api_url}/api/v1/namespaces")).json(&ns).send().await;
     }
 
-    for v in containers {
-        let name = v["name"].as_str().unwrap_or("");
-        let golden = v["parent"]
-            .as_str()
-            .and_then(|p| by_id.get(p).copied())
-            .map(|g| g.strip_suffix(".golden").unwrap_or(g).to_string());
-        let (pv, pvc) = objects(v, node, golden.as_deref());
+    // Everything there is, read once: two lists a pass rather than two GETs a
+    // volume.
+    let pvc_base = format!("{api_url}/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims");
+    let pv_base = format!("{api_url}/api/v1/persistentvolumes");
+    let Some(pvcs) = get_json(client, &pvc_base).await.map(|l| by_name(&l)) else { return };
+    let Some(pvs) = get_json(client, &pv_base).await.map(|l| by_name(&l)) else { return };
 
-        let pv_path = format!("{api_url}/api/v1/persistentvolumes/{}", pv_name(name));
-        if !matches!(client.get(&pv_path).send().await, Ok(r) if r.status().is_success()) {
-            match client.post(format!("{api_url}/api/v1/persistentvolumes")).json(&pv).send().await {
-                Ok(r) if r.status().is_success() => info!("listed data container {name} as PV {}", pv_name(name)),
-                Ok(r) => debug!("PV {} not created: {}", pv_name(name), r.status()),
-                Err(e) => debug!("PV {} not created: {e}", pv_name(name)),
+    for (f, kind, component) in &mirrored {
+        let (want_pv, want_pvc) = objects(f, kind, component, node);
+        let pvname = pv_name(&f.name);
+
+        // The claim first: the volume's claimRef names the claim's uid, which
+        // exists only once the claim does.
+        let claim = match pvcs.get(&f.name) {
+            Some(c) if !is_ours(c, node) => {
+                debug!("PVC {NAMESPACE}/{} belongs to another node or tool; left alone", f.name);
+                continue;
             }
-        }
-
-        let pvc_path = format!("{api_url}/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims/{name}");
-        if !matches!(client.get(&pvc_path).send().await, Ok(r) if r.status().is_success()) {
-            let url = format!("{api_url}/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims");
-            match client.post(url).json(&pvc).send().await {
-                Ok(r) if r.status().is_success() => {
-                    info!("listed data container {name} as PVC {NAMESPACE}/{name}");
+            Some(c) if !c["metadata"]["deletionTimestamp"].is_null() => {
+                // Being deleted: the binder lets it go once nothing mounts it,
+                // and the next pass makes it again.
+                continue;
+            }
+            Some(c) => match reconcile_pvc(c, &want_pvc) {
+                Some(updated) => {
+                    let got = replace(client, &format!("{pvc_base}/{}", f.name), &updated).await;
+                    if got.is_some() {
+                        info!("PVC {NAMESPACE}/{} brought up to date", f.name);
+                    }
+                    got.or_else(|| Some(c.clone()))
+                }
+                None => Some(c.clone()),
+            },
+            None => {
+                let made = create(client, &pvc_base, &want_pvc).await;
+                if let Some(mut made) = made.clone() {
+                    info!("listed {kind} volume {} as PVC {NAMESPACE}/{}", f.name, f.name);
                     // Bound from the first moment it is visible: a claim with
-                    // no status reads as Unknown until the binder's next pass,
-                    // and a console shows every service's data as unhealthy
-                    // for that window.
-                    if let Ok(mut made) = r.json::<Value>().await {
-                        made["status"] = json!({
-                            "phase": "Bound",
-                            "accessModes": ["ReadWriteOnce"],
-                            "capacity": pvc["spec"]["resources"]["requests"].clone(),
-                        });
-                        let _ = client.put(&pvc_path).json(&made).send().await;
+                    // no status reads as Unknown until the binder's next pass.
+                    made["status"] = json!({
+                        "phase": "Bound",
+                        "accessModes": ["ReadWriteOnce"],
+                        "capacity": want_pvc["spec"]["resources"]["requests"].clone(),
+                    });
+                    let _ = replace(client, &format!("{pvc_base}/{}", f.name), &made).await;
+                }
+                made
+            }
+        };
+
+        match pvs.get(&pvname) {
+            Some(pv) if !is_ours(pv, node) => {
+                warn!(
+                    "PV {pvname} is another node's ({}); this node's {} has no volume object \
+                     (names collide across nodes)",
+                    pv["metadata"]["annotations"]["storm.io/node"].as_str().unwrap_or("?"),
+                    f.name
+                );
+            }
+            Some(pv) if !pv["metadata"]["deletionTimestamp"].is_null() => {}
+            Some(pv) => {
+                if let Some(updated) = reconcile_pv(pv, &want_pv, claim.as_ref()) {
+                    if replace(client, &format!("{pv_base}/{pvname}"), &updated).await.is_some() {
+                        info!("PV {pvname} brought up to date");
                     }
                 }
-                Ok(r) => debug!("PVC {NAMESPACE}/{name} not created: {}", r.status()),
-                Err(e) => debug!("PVC {NAMESPACE}/{name} not created: {e}"),
+            }
+            None => {
+                let mut pv = want_pv;
+                if let Some(c) = &claim {
+                    pv["spec"]["claimRef"] = claim_ref(c);
+                }
+                if create(client, &pv_base, &pv).await.is_some() {
+                    info!("listed {kind} volume {} as PV {pvname}", f.name);
+                }
             }
         }
     }
@@ -217,35 +511,144 @@ mod tests {
     use super::*;
 
     fn vol(name: &str, role: &str, sealed: bool) -> Value {
-        json!({"name": name, "role": role, "sealed": sealed, "virtual_size_bytes": 1u64 << 30})
+        json!({"id": format!("id-{name}"), "name": name, "role": role, "sealed": sealed,
+               "virtual_size_bytes": 1u64 << 30})
+    }
+
+    fn facts(name: &str) -> VolumeFacts {
+        VolumeFacts {
+            name: name.into(),
+            bytes: 1 << 30,
+            fs_type: Some("ext4".into()),
+            fs_uuid: Some("u-1".into()),
+            golden: Some("fastetcd-data".into()),
+            health: Some("healthy".into()),
+            access: Some("rw".into()),
+            role: Some("data".into()),
+        }
     }
 
     #[test]
-    fn the_data_containers_are_the_ones_listed() {
-        assert!(is_data_container(&vol("fastetcd-data", "data", false)));
-        assert!(is_data_container(&vol("stormcos-state", "data", false)));
-        // What they are cloned from, not a container.
-        assert!(!is_data_container(&vol("fastetcd-data.golden", "data", true)));
-        // Already a claim, or waiting to become one.
-        assert!(!is_data_container(&vol("pvc-default-db", "data", false)));
-        assert!(!is_data_container(&vol("standby-pvc-ext4j-1m-12345678", "data", false)));
-        // A cloud image, a log, a system volume.
-        assert!(!is_data_container(&vol("fedora-44-x86_64", "data", false)));
-        assert!(!is_data_container(&vol("fastetcd-logs", "system", false)));
-        assert!(!is_data_container(&vol("stormpump", "system", false)));
+    fn the_node_volumes_are_data_state_and_logs() {
+        assert_eq!(kind_of(&vol("fastetcd-data", "data", false)), Some(("data", "fastetcd".into())));
+        assert_eq!(kind_of(&vol("stormcos-state", "data", false)), Some(("state", "stormcos".into())));
+        // Logs are claims too, whichever slab half they are on.
+        assert_eq!(
+            kind_of(&vol("rustkube-apiserver-logs", "system", false)),
+            Some(("logs", "rustkube-apiserver".into()))
+        );
+        // What they are cloned from, a claim already, a standby, a root.
+        assert_eq!(kind_of(&vol("fastetcd-data.golden", "data", true)), None);
+        assert_eq!(kind_of(&vol("fastetcd-logs", "data", true)), None);
+        assert_eq!(kind_of(&vol("pvc-default-db", "data", false)), None);
+        assert_eq!(kind_of(&vol("standby-pvc-ext4j-1m-12345678", "data", false)), None);
+        assert_eq!(kind_of(&vol("fedora-44-x86_64", "data", false)), None);
+        assert_eq!(kind_of(&vol("stormpump", "system", false)), None);
+        assert_eq!(kind_of(&vol("-logs", "system", false)), None);
     }
 
     #[test]
-    fn a_data_container_is_a_bound_claim_that_keeps_its_data() {
-        let (pv, pvc) = objects(&vol("fastetcd-data", "data", false), "node1", Some("fastetcd-data"));
-        assert_eq!(pv["metadata"]["name"], "storm-fastetcd-data");
-        assert_eq!(pv["spec"]["persistentVolumeReclaimPolicy"], "Retain");
-        assert_eq!(pv["spec"]["csi"]["volumeHandle"], "fastetcd-data");
+    fn facts_come_from_the_engines_listing() {
+        let golden = json!({"id": "g", "name": "fastetcd-data.golden"});
+        let v = json!({"id": "v", "name": "fastetcd-data", "virtual_size_bytes": 1u64 << 30,
+                       "fs": {"kind": "ext4"}, "fs_uuid": "u-1", "parent": "g",
+                       "health": "healthy", "access": "rw", "role": "data"});
+        let names = HashMap::from([("g".to_string(), "fastetcd-data.golden".to_string())]);
+        let _ = golden;
+        assert_eq!(VolumeFacts::of(&v, &names), facts("fastetcd-data"));
+    }
+
+    #[test]
+    fn a_node_volume_is_a_complete_bound_pair() {
+        let (pv, pvc) = objects(&facts("fastetcd-logs"), "logs", "fastetcd", "node1");
+        // They name each other.
+        assert_eq!(pv["metadata"]["name"], "storm-fastetcd-logs");
+        assert_eq!(pv["spec"]["claimRef"]["name"], "fastetcd-logs");
         assert_eq!(pv["spec"]["claimRef"]["namespace"], NAMESPACE);
-        assert_eq!(pvc["spec"]["volumeName"], "storm-fastetcd-data");
-        assert_eq!(pvc["spec"]["storageClassName"], "stormblock");
+        assert_eq!(pvc["spec"]["volumeName"], "storm-fastetcd-logs");
+        // The same kind and component on both.
+        for o in [&pv, &pvc] {
+            assert_eq!(o["metadata"]["labels"][KIND_LABEL], "logs");
+            assert_eq!(o["metadata"]["labels"][COMPONENT_LABEL], "fastetcd");
+            assert_eq!(o["metadata"]["labels"][LABEL], "true");
+            assert!(is_ours(o, "node1"));
+            assert!(!is_ours(o, "node2"));
+        }
+        // Keeps its data, and says what is on it and where it came from.
+        assert_eq!(pv["spec"]["persistentVolumeReclaimPolicy"], "Retain");
+        assert_eq!(pv["spec"]["csi"]["driver"], DRIVER);
+        assert_eq!(pv["spec"]["csi"]["volumeHandle"], "fastetcd-logs");
+        assert_eq!(pv["spec"]["csi"]["fsType"], "ext4");
+        assert_eq!(pv["spec"]["csi"]["volumeAttributes"]["storm.io/golden"], "fastetcd-data");
+        assert_eq!(pv["spec"]["csi"]["volumeAttributes"]["storm.io/fs-uuid"], "u-1");
+        let a = &pv["metadata"]["annotations"];
+        assert_eq!(a["pv.kubernetes.io/provisioned-by"], DRIVER);
+        assert_eq!(a["storm.io/health"], "healthy");
+        assert_eq!(a["storm.io/role"], "data");
+        // Reads like any dynamically provisioned, bound claim.
+        let a = &pvc["metadata"]["annotations"];
+        assert_eq!(a["pv.kubernetes.io/bind-completed"], "yes");
+        assert_eq!(a["pv.kubernetes.io/bound-by-controller"], "yes");
+        assert_eq!(a["volume.kubernetes.io/storage-provisioner"], DRIVER);
+        assert_eq!(a["volume.beta.kubernetes.io/storage-provisioner"], DRIVER);
+        assert_eq!(a["volume.kubernetes.io/selected-node"], "node1");
         assert_eq!(pvc["spec"]["dataSourceRef"]["kind"], "Golden");
         assert_eq!(pvc["spec"]["resources"]["requests"]["storage"], "1Gi");
+    }
+
+    #[test]
+    fn a_claim_ref_carries_the_claims_uid() {
+        let pvc = json!({"metadata": {"name": "c", "namespace": "kube-system", "uid": "u-9",
+                                      "resourceVersion": "42"}});
+        let r = claim_ref(&pvc);
+        assert_eq!(r["uid"], "u-9");
+        assert_eq!(r["resourceVersion"], "42");
+        assert_eq!(r["kind"], "PersistentVolumeClaim");
+    }
+
+    #[test]
+    fn an_up_to_date_pair_is_not_rewritten() {
+        let (pv, pvc) = objects(&facts("fastetcd-data"), "data", "fastetcd", "node1");
+        assert!(reconcile_pvc(&pvc, &pvc).is_none());
+        assert!(reconcile_pv(&pv, &pv, None).is_none());
+    }
+
+    #[test]
+    fn a_grown_volume_grows_its_objects_and_a_claim_never_shrinks() {
+        let (pv, pvc) = objects(&facts("fastetcd-data"), "data", "fastetcd", "node1");
+        let mut bigger = facts("fastetcd-data");
+        bigger.bytes = 2 << 30;
+        bigger.health = Some("degraded".into());
+        let (want_pv, want_pvc) = objects(&bigger, "data", "fastetcd", "node1");
+
+        let pvc2 = reconcile_pvc(&pvc, &want_pvc).expect("request grows");
+        assert_eq!(pvc2["spec"]["resources"]["requests"]["storage"], "2Gi");
+        let pv2 = reconcile_pv(&pv, &want_pv, None).expect("capacity and health follow");
+        assert_eq!(pv2["spec"]["capacity"]["storage"], "2Gi");
+        assert_eq!(pv2["metadata"]["annotations"]["storm.io/health"], "degraded");
+
+        // Smaller than the request: the request stays.
+        let (_, smaller) = objects(&facts("fastetcd-data"), "data", "fastetcd", "node1");
+        assert!(reconcile_pvc(&pvc2, &smaller).is_none());
+    }
+
+    #[test]
+    fn another_tools_labels_and_annotations_are_kept() {
+        let (_, mut pvc) = objects(&facts("fastetcd-data"), "data", "fastetcd", "node1");
+        pvc["metadata"]["labels"]["team"] = json!("db");
+        pvc["metadata"]["annotations"]["note"] = json!("keep");
+        let (_, want) = objects(&facts("fastetcd-data"), "data", "fastetcd", "node1");
+        assert!(reconcile_pvc(&pvc, &want).is_none(), "nothing of ours changed");
+    }
+
+    #[test]
+    fn a_claim_made_again_is_the_one_the_volume_names() {
+        let (mut pv, _) = objects(&facts("fastetcd-data"), "data", "fastetcd", "node1");
+        pv["spec"]["claimRef"]["uid"] = json!("old");
+        let claim = json!({"metadata": {"name": "fastetcd-data", "namespace": NAMESPACE, "uid": "new",
+                                        "resourceVersion": "7"}});
+        let got = reconcile_pv(&pv, &pv.clone(), Some(&claim)).expect("uid follows the claim");
+        assert_eq!(got["spec"]["claimRef"]["uid"], "new");
     }
 
     #[test]
@@ -254,5 +657,161 @@ mod tests {
         assert_eq!(quantity(64 << 20), "64Mi");
         assert_eq!(quantity(3 << 40), "3Ti");
         assert_eq!(quantity(1000), "1000");
+    }
+
+    /// The whole pass against a fake apiserver and engine: every volume gets
+    /// exactly one PV and one PVC that name each other, a deleted claim comes
+    /// back, and another node's same-named object is left alone.
+    #[tokio::test]
+    async fn every_node_volume_gets_its_pair_and_a_deleted_claim_comes_back() {
+        let api = fake::Api::serve().await;
+        let engine = fake::engine(json!({"items": [
+            {"id": "g", "name": "fastetcd-data.golden", "sealed": true, "role": "data", "virtual_size_bytes": 1u64 << 30},
+            {"id": "a", "name": "fastetcd-data", "parent": "g", "role": "data", "virtual_size_bytes": 1u64 << 30,
+             "fs": {"kind": "ext4"}, "fs_uuid": "u-a", "health": "healthy", "access": "rw"},
+            {"id": "b", "name": "fastetcd-logs", "role": "system", "virtual_size_bytes": 64u64 << 20,
+             "fs": {"kind": "ext4"}},
+            {"id": "c", "name": "pvc-default-db", "role": "data", "virtual_size_bytes": 1u64 << 30},
+        ]}))
+        .await;
+        let client = reqwest::Client::new();
+
+        mirror(&client, &api.url, &engine, "node1").await;
+        for name in ["fastetcd-data", "fastetcd-logs"] {
+            let pvc = api.get(&format!("/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims/{name}")).unwrap();
+            let pv = api.get(&format!("/api/v1/persistentvolumes/storm-{name}")).unwrap();
+            assert_eq!(pvc["spec"]["volumeName"], json!(format!("storm-{name}")));
+            assert_eq!(pv["spec"]["claimRef"]["uid"], pvc["metadata"]["uid"], "{name}");
+            assert_eq!(pv["metadata"]["labels"][KIND_LABEL], pvc["metadata"]["labels"][KIND_LABEL]);
+            assert_eq!(pvc["status"]["phase"], "Bound");
+        }
+        assert_eq!(api.count("persistentvolumeclaims"), 2, "pvc-* is the built-in driver's");
+        assert_eq!(api.count("persistentvolumes"), 2);
+
+        // A second pass changes nothing.
+        let writes = api.writes();
+        mirror(&client, &api.url, &engine, "node1").await;
+        assert_eq!(api.writes(), writes, "an up-to-date pair is not rewritten");
+
+        // Deleted by hand: made again, and the volume names the new claim.
+        api.delete(&format!("/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims/fastetcd-data"));
+        mirror(&client, &api.url, &engine, "node1").await;
+        let pvc = api.get(&format!("/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims/fastetcd-data")).unwrap();
+        let pv = api.get("/api/v1/persistentvolumes/storm-fastetcd-data").unwrap();
+        assert_eq!(pv["spec"]["claimRef"]["uid"], pvc["metadata"]["uid"]);
+
+        // Another node's pass leaves this node's objects as they are.
+        let writes = api.writes();
+        mirror(&client, &api.url, &engine, "node2").await;
+        assert_eq!(api.writes(), writes);
+    }
+
+    /// A small in-memory apiserver: GET, list, POST (uid and resourceVersion
+    /// assigned), PUT and DELETE by path.
+    mod fake {
+        use super::*;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        pub struct Api {
+            pub url: String,
+            store: Arc<Mutex<HashMap<String, Value>>>,
+            writes: Arc<Mutex<usize>>,
+        }
+
+        impl Api {
+            pub async fn serve() -> Api {
+                let store: Arc<Mutex<HashMap<String, Value>>> = Arc::default();
+                let writes: Arc<Mutex<usize>> = Arc::default();
+                let (s, w) = (store.clone(), writes.clone());
+                let app = axum::Router::new().fallback(
+                    move |method: axum::http::Method,
+                          uri: axum::http::Uri,
+                          body: axum::body::Bytes| {
+                        let (s, w) = (s.clone(), w.clone());
+                        async move { handle(&s, &w, method, uri.path(), &body) }
+                    },
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                Api { url, store, writes }
+            }
+            pub fn get(&self, path: &str) -> Option<Value> {
+                self.store.lock().unwrap().get(path).cloned()
+            }
+            pub fn delete(&self, path: &str) {
+                self.store.lock().unwrap().remove(path);
+            }
+            pub fn count(&self, resource: &str) -> usize {
+                self.store.lock().unwrap().keys().filter(|k| k.contains(&format!("/{resource}/"))).count()
+            }
+            pub fn writes(&self) -> usize {
+                *self.writes.lock().unwrap()
+            }
+        }
+
+        fn handle(
+            store: &Mutex<HashMap<String, Value>>,
+            writes: &Mutex<usize>,
+            method: axum::http::Method,
+            path: &str,
+            body: &[u8],
+        ) -> (axum::http::StatusCode, axum::Json<Value>) {
+            use axum::http::{Method, StatusCode};
+            let mut s = store.lock().unwrap();
+            let ok = |v: Value| (StatusCode::OK, axum::Json(v));
+            match method {
+                Method::GET => {
+                    if let Some(v) = s.get(path) {
+                        return ok(v.clone());
+                    }
+                    let prefix = format!("{path}/");
+                    let items: Vec<Value> =
+                        s.iter().filter(|(k, _)| k.starts_with(&prefix)).map(|(_, v)| v.clone()).collect();
+                    if path.ends_with("persistentvolumes") || path.ends_with("persistentvolumeclaims") {
+                        return ok(json!({ "items": items }));
+                    }
+                    (StatusCode::NOT_FOUND, axum::Json(json!({})))
+                }
+                Method::POST => {
+                    let mut obj: Value = serde_json::from_slice(body).unwrap();
+                    let name = obj["metadata"]["name"].as_str().unwrap().to_string();
+                    let key = format!("{path}/{name}");
+                    if s.contains_key(&key) {
+                        return (StatusCode::CONFLICT, axum::Json(json!({})));
+                    }
+                    *writes.lock().unwrap() += 1;
+                    let n = *writes.lock().unwrap();
+                    obj["metadata"]["uid"] = json!(format!("uid-{n}"));
+                    obj["metadata"]["resourceVersion"] = json!(n.to_string());
+                    s.insert(key, obj.clone());
+                    ok(obj)
+                }
+                Method::PUT => {
+                    let mut obj: Value = serde_json::from_slice(body).unwrap();
+                    *writes.lock().unwrap() += 1;
+                    let n = *writes.lock().unwrap();
+                    obj["metadata"]["resourceVersion"] = json!(n.to_string());
+                    s.insert(path.to_string(), obj.clone());
+                    ok(obj)
+                }
+                _ => (StatusCode::METHOD_NOT_ALLOWED, axum::Json(json!({}))),
+            }
+        }
+
+        pub async fn engine(volumes: Value) -> crate::engine::EngineClient {
+            let app = axum::Router::new().route(
+                "/api/v1/volumes",
+                axum::routing::get(move || {
+                    let v = volumes.clone();
+                    async move { axum::Json(v) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            crate::engine::EngineClient::new(&url, crate::engine::TokenSource::none())
+        }
     }
 }
