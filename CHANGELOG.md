@@ -3,6 +3,27 @@
 ## [Unreleased]
 <!-- New unreleased changes go here -->
 
+### 2026-09-27 (node volumes as PV + PVC sets, #59)
+- **feat(kubelet):** every `<component>-data`, `-state` and `-logs` volume on
+  the node is a PV and its bound PVC in `kube-system`, labelled
+  `storm.io/volume-kind` (`data`, `state`, `logs`) and `storm.io/component`.
+  The `-logs` volumes were not represented at all.
+- **feat(kubelet):** the pair reads like a dynamically provisioned claim: the
+  PV's `claimRef` carries the claim's uid, `csi.fsType` and `volumeAttributes`
+  (golden, fs uuid), and health, access and role annotations. The PVC carries
+  `bind-completed`, `bound-by-controller`, `storage-provisioner` and
+  `selected-node`.
+- **feat(kubelet):** a reconciler, not create-once. Every 30 s a missing
+  object is made again, a grown volume grows its objects (a request never
+  shrinks), and labels, annotations and the claim's uid are kept current.
+  Nothing is written when nothing changed. Only objects annotated with this
+  node are touched.
+- **feat(kubelet):** a volume that goes away has its claim deleted, so the
+  binder marks its PV Released. The PV is never deleted (Retain).
+- **feat(kubelet):** the built-in driver's claims (`bind_claim`) use the same
+  builder: the PV names the claim's uid and carries fsType and attributes, and
+  the claim gets the same binding annotations.
+
 ### 2026-09-27 (stormpump limits and stats, #57)
 - **feat(stormpump):** a container's resource limits reach the engine.
   `limits.memory` becomes `memory.max`, with `memory.swap.max = 0` as
