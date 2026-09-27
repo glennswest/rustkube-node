@@ -3,6 +3,8 @@
 ## [Unreleased]
 <!-- New unreleased changes go here -->
 
+## [v0.13.0] — 2026-09-27
+
 ### 2026-09-27 (VM lifecycle, #35)
 - **fix(vm):** a failed VirtualMachineInstance list (an apiserver that did not
   answer, or an error status) was read as "no machines here". Every VM on the
