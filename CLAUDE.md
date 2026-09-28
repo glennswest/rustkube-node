@@ -67,12 +67,16 @@ stormvm 2be5900 (lock moves 1b0d941 → dc1b7ea, `cargo update -p stormvm-net` o
 (`addresses()`, drop joins its thread, ≤1 s RCVTIMEO). `Made.binding == "host-bridge"` marks a tap on a node bridge.
 
 Steps:
-1. [ ] Lock bump; `resolve_nics` takes the uid and starts a snooper per host-bridge NIC before the spawn (a failure
+1. [x] Lock bump; `resolve_nics` takes the uid and starts a snooper per host-bridge NIC before the spawn (a failure
        to open it is a warning, not a failed start); `start` keeps them, into `snoopers[uid]` once running.
-2. [ ] Callback → unbounded channel → pump task (spawned in `run`): that NIC's addresses + `patch_status` at once.
-3. [ ] `absorb_ends`: snooper per NIC first, then guest agent, then neighbour table. Snoopers dropped (in
+2. [x] Callback → unbounded channel → pump task (spawned in `run`): that NIC's addresses + `patch_status` at once.
+3. [x] `absorb_ends`: snooper per NIC first, then guest agent, then neighbour table. Snoopers dropped (in
        spawn_blocking) when the VM stops or ends.
-4. [ ] Tests, docs, CHANGELOG, sc-build. On-node check waits on C2NR0Q2.
+4. [x] Tests, docs (README), CHANGELOG. sc-build at 3ad9ea8: build clean, all pass (kubelet 205).
+       The bump had also moved stormpump (30a76d3 → e8ccef9) and stormcast; pinned back with `--precise`, because
+       stormvm-node doesn't build against stormpump's `Mount.propagation` (filed stormvm#65, which also blocks #81).
+5. [ ] On the test host (the issue's done-when): a new bridged VM shows its lease in `status.interfaces[].ipAddress`
+       within seconds. Waits on C2NR0Q2 (unreachable) and a release. Then close.
 
 ### In progress: #87, static (mirror) pods: logs and stale status
 
