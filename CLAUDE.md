@@ -60,7 +60,7 @@ Steps:
        golden-rustkube-node-d9a108728be0 (at ccb7bfc; the first stage try died on dev: no NVMe device). No
        release request was filed by stage: stormcentral#117. #35 closed (sc-build only, not on a node).
 
-### In progress: #72, `kubectl logs` on a node service's mirror pod reads its stormd log volume
+### Done: #72, `kubectl logs` on a node service's mirror pod reads its stormd log volume
 
 Found, 2026-09-28: a mirror pod (`kube-system/<asset>-<node>`) is not in the pod manager, so `containerLogs`
 answers "not found on this node" (#87 is the same miss). stormd writes `<proc>.log` (current),
@@ -71,11 +71,13 @@ answers "not found on this node" (#87 is the same miss). stormd writes `<proc>.l
 stormpump's `/run/stormpump/logs/w<id>.log`, and assets.json does not name the id: stormpump issue, not here.
 
 Steps:
-1. [ ] `node_logs.rs`: boot.d parse (spec → host path of its /var/log/stormd), current run (rotations + live, every
+1. [x] `node_logs.rs`: boot.d parse (spec → host path of its /var/log/stormd), current run (rotations + live, every
        process, merged by time, `[proc]` prefix when more than one), `--previous` = newest `.failed.log`.
-2. [ ] `containerLogs`: a pod this node does not run, in kube-system, named `<asset>-<node>`, container `<asset>` →
+2. [x] `containerLogs`: a pod this node does not run, in kube-system, named `<asset>-<node>`, container `<asset>` →
        node logs. tailLines, sinceSeconds/sinceTime, timestamps, limitBytes, follow (polls the live files).
-3. [ ] Tests, docs (README), CHANGELOG, sc-build. File stormpump: log id in assets.json.
+3. [x] Tests, docs (README), CHANGELOG. sc-build at ec32b92: all pass (kubelet 202). Filed stormpump#55 (log id in
+       assets.json) for stormblock/registry/timesync; #87 keeps those and the stale-status half. Not run on a node:
+       whether `/hostroot/logs/<svc>` shows the mounted volume is unchecked (C2NR0Q2 down). Unreleased.
 
 ### In progress: #64, PVC size test (the medium suite's first test)
 
