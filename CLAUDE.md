@@ -67,15 +67,19 @@ stormblock-csi's `test/` (own workspace, static musl binary, scratch image, the 
 the workload pods' program). Short and long report one skip pointing at #61.
 
 Steps:
-1. [ ] Kubelet: `parse_quantity` reads fractions (`3.5Gi` parsed as nothing, and the claim got 1 MiB).
-2. [ ] `test/`: Cargo.toml (lock seeded from stormblock-csi/test, same deps), env, api, report, workload
+1. [x] Kubelet: `parse_quantity` reads fractions (`3.5Gi` parsed as nothing, and the claim got 1 MiB).
+2. [x] `test/`: Cargo.toml (lock seeded from stormblock-csi/test, same deps), env, api, report, workload
        (`sized <path> <seed> <bytes> <lo> <hi>`: write, read back, statvfs total in (lo, hi]).
-3. [ ] medium `pvc-size-*`: every ladder class + 1, 1Mi+1, 17Mi, 1500M, 3.5Gi, 600Gi, in parallel; each bound,
+3. [x] medium `pvc-size-*`: every ladder class + 1, 1Mi+1, 17Mi, 1500M, 3.5Gi, 600Gi, in parallel; each bound,
        status capacity = its class, df in (previous class, class], deleted, PV gone. 2Ti: FailedMount /
        waiting reason "larger than the largest size class", never bound. 1Ti timed against a budget
        (`RUSTKUBE_NODE_TEST_MINT_BUDGET`, default 20 min). Overcommit: skip until #62 decides.
-4. [ ] Containerfile (repo root context), Job yaml, docs, CHANGELOG, sc-build (root + `cd test`).
-5. [ ] Not runnable from here: stormcentral runs it on a test machine (`stormcentral test run`).
+4. [x] Containerfile (repo root context), Job yaml, docs, CHANGELOG. Also found and fixed: a request-sized PV
+       (control plane first) never got the class's capacity (30ce985). sc-build: root at 30ce985 all pass
+       (kubelet 195); `cd test` at f63d8c2: 15 tests pass `--locked`, release binary runs (sized, short skip).
+5. [ ] On a machine: run 831e049d94 (medium, e2ae178, C2NR0Q2) sat at "podman build" > 60 min while every
+       other run there failed at push / sbregistry :5100 refused. Rerun when the test pipeline is healthy; the
+       machine's kubelet predates c5187a6/30ce985, so 3.5gi and capacity cases should fail until a release.
 
 ### Done: #63, a pod waiting on its claim stays visible (ContainerCreating + reason)
 
