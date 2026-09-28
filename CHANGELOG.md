@@ -11,7 +11,8 @@
   preferred over the guest agent, and the agent over the neighbour table. A
   guest with no agent that the node had never talked to used to report no
   address at all.
-- **chore(deps):** stormvm crates 1b0d941 → dc1b7ea.
+- **chore(deps):** stormvm crates 1b0d941 → dc1b7ea. stormpump stays at 30a76d3:
+  stormvm-node still builds `stormpump::spec::Mount` without `propagation`.
 
 ### 2026-09-28 (stale mirror pods, #87)
 - **fix(kubelet):** a node service that PID 1 did not start on this boot kept
