@@ -98,7 +98,10 @@ Steps:
 4. [x] Tests, docs (README), CHANGELOG. sc-build at c78baf0: all pass (kubelet 193). Closed; noted on #70
        (wait-for-ready done here, Event on the claim still open). Not run on a node. Unreleased.
 
-### Next: #62, CSIStorageCapacity for the built-in class (findings only, not started)
+### Blocked on owner decision: #62, CSIStorageCapacity for the built-in class (findings only, not started)
+
+2026-09-28: stopped before code. What a node publishes, and when the kubelet refuses a claim, both depend on
+how a claim counts against the slab, and the issue leaves that open. Questions posted on #62; resume from the answer.
 
 Found, 2026-09-27:
 - Engine: `GET /api/v1/slabs` items have `role` (system|data), `total_bytes`, `free_bytes`. Claims live in
