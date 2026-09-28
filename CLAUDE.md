@@ -68,10 +68,12 @@ last_error), but one not started on this boot is not in the table, and the mirro
 assets, so its pod keeps the last boot's Running and startTime (registry, stormstorage on C2NR0Q2 at 17:32).
 
 Steps:
-1. [ ] Each pass: list this node's mirror pods (`storm.io/component=node-service`, spec.nodeName); one whose asset
+1. [x] Each pass: list this node's mirror pods (`storm.io/component=node-service`, spec.nodeName); one whose asset
        is not in the table gets status "not started on this boot" (phase Pending, waiting NotStarted, not
        Ready), written once (skipped when already so), with a Warning Event. Never deleted.
-2. [ ] Tests, docs, CHANGELOG, sc-build.
+2. [x] Tests, docs (README), CHANGELOG. sc-build at 7f4f3d1: all pass (kubelet 203). Not run on a node.
+3. [ ] registry/stormblock/timesync logs: after stormpump#55 names each asset's `w<id>.log`, serve it (and the
+       previous incarnation's for `--previous`) from `/hostrun/stormpump/logs`. Then close #87.
 
 ### Done: #72, `kubectl logs` on a node service's mirror pod reads its stormd log volume
 
