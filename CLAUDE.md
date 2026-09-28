@@ -80,6 +80,10 @@ Steps:
 5. [ ] On a machine: run 831e049d94 (medium, e2ae178, C2NR0Q2) sat at "podman build" > 60 min while every
        other run there failed at push / sbregistry :5100 refused. Rerun when the test pipeline is healthy; the
        machine's kubelet predates c5187a6/30ce985, so 3.5gi and capacity cases should fail until a release.
+       2026-09-28: 831e049d94 still at "podman build" (>1 day, no timeout; the queue behind it waits). :5100
+       answers again (stormcentral#71). Doing: `test/build.sh` builds the static binary on dev, the
+       Containerfile is `FROM scratch` + COPY (no rust:1-alpine pull, no compile in podman), as cadvisor's;
+       file the hung run on stormcentral; rerun.
 
 ### Done: #63, a pod waiting on its claim stays visible (ContainerCreating + reason)
 
