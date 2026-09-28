@@ -3,6 +3,16 @@
 ## [Unreleased]
 <!-- New unreleased changes go here -->
 
+### 2026-09-28 (a bridged VM's address from its tap, #91)
+- **feat(kubelet):** a VM NIC on a node bridge is watched on its tap from
+  before the spawn (stormvm-net `snoop_tap`, stormvm 2be5900). The address the
+  guest leases from the segment's DHCP server reaches
+  `status.interfaces[].ipAddress` as soon as it is seen. The tap watcher is
+  preferred over the guest agent, and the agent over the neighbour table. A
+  guest with no agent that the node had never talked to used to report no
+  address at all.
+- **chore(deps):** stormvm crates 1b0d941 → dc1b7ea.
+
 ### 2026-09-28 (stale mirror pods, #87)
 - **fix(kubelet):** a node service that PID 1 did not start on this boot kept
   its mirror pod's status from the previous boot (Running, the old

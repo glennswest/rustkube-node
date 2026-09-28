@@ -446,6 +446,50 @@ pub struct VmManager {
     /// are different answers and only one of them is safe to act on: a guest
     /// told the second at boot configures itself as nobody.
     synced: std::sync::atomic::AtomicBool,
+    /// What each running machine's bridged taps have shown the guest take
+    /// (#91), by uid: the NIC's index and its watcher. A guest on a node
+    /// bridge gets its address from a DHCP server the node does not run, and
+    /// the tap is the one place the node sees the lease go by. Not in [`Vm`],
+    /// which is cloned freely and a watcher is not.
+    snoopers: std::sync::Mutex<HashMap<String, Vec<(usize, stormvm_net::Snooper)>>>,
+    /// Where the watchers report a change, for [`Self::spawn_address_pump`]
+    /// to write it to the VMI at once rather than on the next sync.
+    snoop_tx: tokio::sync::mpsc::UnboundedSender<Snooped>,
+    snoop_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Snooped>>>,
+}
+
+/// A tap watcher's news: the guest behind NIC `nic` of machine `uid` now
+/// holds `addresses`.
+#[derive(Debug)]
+struct Snooped {
+    uid: String,
+    nic: usize,
+    addresses: Vec<String>,
+}
+
+/// Per NIC, what the tap watcher saw, over what the agent or the neighbour
+/// table said (#91).
+///
+/// The watcher saw the lease itself, so it is right where the others are
+/// stale or silent; a NIC it has seen nothing on keeps the other answer.
+/// `None` only when nobody has an answer for any NIC.
+fn prefer_snooped(
+    other: Option<Vec<Vec<String>>>,
+    snooped: Vec<Vec<String>>,
+) -> Option<Vec<Vec<String>>> {
+    if snooped.iter().all(|s| s.is_empty()) {
+        return other;
+    }
+    let mut out = other.unwrap_or_default();
+    if out.len() < snooped.len() {
+        out.resize(snooped.len(), Vec::new());
+    }
+    for (slot, s) in out.iter_mut().zip(snooped) {
+        if !s.is_empty() {
+            *slot = s;
+        }
+    }
+    Some(out)
 }
 
 impl VmManager {
@@ -459,6 +503,7 @@ impl VmManager {
         let api_url = api_url.into().trim_end_matches('/').to_string();
         let events = (!api_url.is_empty())
             .then(|| crate::events::EventRecorder::new(api.clone(), &api_url, &node_name));
+        let (snoop_tx, snoop_rx) = tokio::sync::mpsc::unbounded_channel();
         VmManager {
             ring,
             storage: crate::engine::DEFAULT_URL.into(),
@@ -472,6 +517,73 @@ impl VmManager {
             desired: Mutex::new(HashMap::new()),
             watched: Mutex::new(None),
             synced: std::sync::atomic::AtomicBool::new(false),
+            snoopers: std::sync::Mutex::new(HashMap::new()),
+            snoop_tx,
+            snoop_rx: std::sync::Mutex::new(Some(snoop_rx)),
+        }
+    }
+
+    /// Write a tap watcher's news to the VMI as it arrives (#91): "within
+    /// seconds of the guest's DHCP", not on the next sync. Once; later calls
+    /// do nothing.
+    pub fn spawn_address_pump(self: &Arc<Self>) {
+        let rx = self.snoop_rx.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let Some(mut rx) = rx else { return };
+        let me = Arc::downgrade(self);
+        tokio::spawn(async move {
+            while let Some(news) = rx.recv().await {
+                let Some(me) = me.upgrade() else { return };
+                me.snooped(news).await;
+            }
+        });
+    }
+
+    /// One NIC's addresses changed on the tap. An empty list (a release, an
+    /// expiry) is left to the sync, which falls back to the other sources.
+    /// News for a machine not recorded yet (a lease in the instant before
+    /// `start` records it) is not lost: the sync reads the watcher too.
+    async fn snooped(&self, news: Snooped) {
+        if news.addresses.is_empty() {
+            return;
+        }
+        let updated = {
+            let mut vms = self.vms.lock().await;
+            let Some(vm) = vms.get_mut(&news.uid) else { return };
+            if vm.phase.terminal() {
+                return;
+            }
+            let Some(nic) = vm.nics.get_mut(news.nic) else { return };
+            if nic.addresses == news.addresses {
+                return;
+            }
+            info!(vm = %vm.name, nic = %nic.name, addresses = ?news.addresses, "guest address seen on its tap");
+            nic.addresses = news.addresses;
+            if vm.ready_unix.is_none() {
+                vm.ready_unix = Some(now_unix());
+            }
+            vm.clone()
+        };
+        self.patch_status(&updated).await;
+    }
+
+    /// What each NIC's tap watcher has seen, empty where there is none.
+    fn snooped_addresses(&self, uid: &str, nics: usize) -> Vec<Vec<String>> {
+        let mut out = vec![Vec::new(); nics];
+        let map = self.snoopers.lock().unwrap_or_else(|e| e.into_inner());
+        for (i, s) in map.get(uid).into_iter().flatten() {
+            if let Some(slot) = out.get_mut(*i) {
+                *slot = s.addresses();
+            }
+        }
+        out
+    }
+
+    /// Stop watching a machine's taps. Off the async threads: dropping a
+    /// watcher joins its thread, which wakes at most a second later.
+    fn drop_snoopers(&self, uid: &str) {
+        let gone = self.snoopers.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+        if let Some(gone) = gone {
+            tokio::task::spawn_blocking(move || drop(gone));
         }
     }
 
@@ -733,7 +845,9 @@ impl VmManager {
         // NICs, before the plan: the tap has to exist so its descriptor can
         // be named, and it has to be deposited so the engine can find it by
         // that name.
-        let (nics, nic_reports) = match self.resolve_nics(&ns, &vm, &ring).await {
+        // The tap watchers come back too, held here until the machine is
+        // recorded: a start that fails below drops them with it.
+        let (nics, nic_reports, snoopers) = match self.resolve_nics(uid, &ns, &vm, &ring).await {
             Ok(n) => n,
             Err(e) => {
                 self.release(&disks).await;
@@ -850,6 +964,9 @@ impl VmManager {
             message: String::new(),
         };
         self.vms.lock().await.insert(uid.to_string(), rec.clone());
+        if !snoopers.is_empty() {
+            self.snoopers.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), snoopers);
+        }
         self.patch_status(&rec).await;
         Ok(())
     }
@@ -892,6 +1009,10 @@ impl VmManager {
                 Some(a) if a.iter().any(|v| !v.is_empty()) => Some(a),
                 other => neighbour_addresses(&vm).or(other),
             };
+            // The tap watcher first of all (#91): it saw the lease, on a
+            // bridge where the agent may be absent and the neighbour table
+            // knows only what the node has talked to.
+            let addrs = prefer_snooped(addrs, self.snooped_addresses(&vm.uid, vm.nics.len()));
             if let Some(addrs) = addrs {
                 let changed = vm.nics.iter().map(|n| &n.addresses).ne(addrs.iter());
                 // The agent answering *is* the readiness signal: it runs in
@@ -953,6 +1074,7 @@ impl VmManager {
             } else {
                 self.event_of(&done, "Warning", "Failed", &done.message).await;
             }
+            self.drop_snoopers(&done.uid);
             self.release(&done.disks).await;
             if let Some(r) = self.ring.clone().filter(|_| !done.handle.is_none()) {
                 let h = done.handle;
@@ -964,6 +1086,7 @@ impl VmManager {
     }
 
     async fn stop(&self, vm: &Vm) {
+        self.drop_snoopers(&vm.uid);
         if vm.handle.is_none() && !vm.phase.terminal() {
             self.stop_by_control(vm).await;
         } else if let Some(ring) = self.ring.clone() {
@@ -1199,10 +1322,11 @@ impl VmManager {
     /// reaches the bridge.
     async fn resolve_nics(
         &self,
+        uid: &str,
         namespace: &str,
         vm: &VmSpec,
         ring: &Arc<RingClient>,
-    ) -> Result<(Vec<plan::ResolvedNic>, Vec<NicReport>), String> {
+    ) -> Result<(Vec<plan::ResolvedNic>, Vec<NicReport>, Vec<(usize, stormvm_net::Snooper)>), String> {
         let defaults = stormvm_net::Defaults { uplink_bridge: DEFAULT_BRIDGE.to_string() };
         // Pure: every decision that could be wrong is made here, with no
         // privilege and nothing created yet.
@@ -1210,6 +1334,7 @@ impl VmManager {
 
         let mut out = Vec::with_capacity(plans.len());
         let mut reports = Vec::with_capacity(plans.len());
+        let mut snoopers = Vec::new();
         for p in &plans {
             // No sandbox: a VM on the pod network wants a namespace this
             // kubelet does not pop here yet, and `realise` refuses that
@@ -1231,6 +1356,22 @@ impl VmManager {
                     .map_err(|e| format!("interface {nic}: {e:?}"))?;
             }
             let mac = made.address.as_ref().map(|a| a.mac.clone()).unwrap_or_else(|| p.mac.clone());
+            // A tap on one of the node's bridges: the guest's address comes
+            // from the segment's DHCP server, and the tap is where the node
+            // sees it (#91). Watched before the spawn, because a guest that
+            // DHCPs in its first second would otherwise do it unwatched. A
+            // watcher that cannot open is a warning: the machine still runs,
+            // and the agent and the neighbour table still answer.
+            if made.binding == "host-bridge" {
+                let (tx, id, i) = (self.snoop_tx.clone(), uid.to_string(), reports.len());
+                let seen = move |addresses: Vec<String>| {
+                    let _ = tx.send(Snooped { uid: id.clone(), nic: i, addresses });
+                };
+                match stormvm_net::snoop_tap(&p.tap, &mac, seen) {
+                    Ok(s) => snoopers.push((i, s)),
+                    Err(e) => warn!(vm = %vm.name, nic = %p.nic, "cannot watch {} for the guest's address: {e}", p.tap),
+                }
+            }
             reports.push(NicReport {
                 name: p.nic.clone(),
                 mac: mac.clone(),
@@ -1246,7 +1387,7 @@ impl VmManager {
                 transport: made.transport,
             });
         }
-        Ok((out, reports))
+        Ok((out, reports, snoopers))
     }
 
 
@@ -2035,6 +2176,68 @@ fn assigned_to(obj: &Value, node: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tap watcher wins per NIC where it has seen something; elsewhere
+    /// the agent's or the neighbour table's answer stands (#91).
+    #[test]
+    fn a_snooped_address_is_preferred_per_nic() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // Nothing seen on any tap: the other answer, even none.
+        assert_eq!(prefer_snooped(None, vec![vec![], vec![]]), None);
+        assert_eq!(
+            prefer_snooped(Some(vec![s(&["10.0.0.9"])]), vec![vec![]]),
+            Some(vec![s(&["10.0.0.9"])])
+        );
+        // The lease beats a stale neighbour entry on net0; net1 keeps the agent's.
+        assert_eq!(
+            prefer_snooped(
+                Some(vec![s(&["192.168.30.99"]), s(&["fd00::5"])]),
+                vec![s(&["192.168.30.4"]), vec![]]
+            ),
+            Some(vec![s(&["192.168.30.4"]), s(&["fd00::5"])])
+        );
+        // No agent, no neighbour entry: the tap alone answers.
+        assert_eq!(
+            prefer_snooped(None, vec![vec![], s(&["192.168.30.4", "fe80::1"])]),
+            Some(vec![vec![], s(&["192.168.30.4", "fe80::1"])])
+        );
+    }
+
+    /// News from a watcher lands on its NIC and the machine counts as up;
+    /// news for an unknown machine, or an empty list, changes nothing.
+    #[tokio::test]
+    async fn snooped_news_updates_the_nic_it_names() {
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), "");
+        let vm = Vm {
+            namespace: "default".into(),
+            name: "test2".into(),
+            uid: "u-2".into(),
+            log_dir: String::new(),
+            handle: Handle::NONE,
+            disks: vec![],
+            phase: Phase::Running,
+            exit_code: 0,
+            message: String::new(),
+            started_unix: 1,
+            ready_unix: None,
+            owned_volumes: vec![],
+            nics: vec![
+                NicReport { name: "net0".into(), mac: "02:00:00:00:00:01".into(), addresses: vec![], binding: "bridge".into() },
+                NicReport { name: "net1".into(), mac: "02:00:00:00:00:02".into(), addresses: vec![], binding: "bridge".into() },
+            ],
+        };
+        m.vms.lock().await.insert("u-2".into(), vm);
+
+        m.snooped(Snooped { uid: "other".into(), nic: 0, addresses: vec!["1.2.3.4".into()] }).await;
+        m.snooped(Snooped { uid: "u-2".into(), nic: 1, addresses: vec![] }).await;
+        assert!(m.vms.lock().await["u-2"].nics.iter().all(|n| n.addresses.is_empty()));
+
+        m.snooped(Snooped { uid: "u-2".into(), nic: 1, addresses: vec!["192.168.30.4".into()] }).await;
+        let vm = m.vms.lock().await["u-2"].clone();
+        assert!(vm.nics[0].addresses.is_empty());
+        assert_eq!(vm.nics[1].addresses, vec!["192.168.30.4".to_string()]);
+        assert!(vm.ready_unix.is_some());
+    }
 
     fn vmi(node: &str) -> Value {
         json!({

@@ -162,6 +162,14 @@ share it.
   stopped every VM on the node.
 - Restarting a `running: true` VM whose instance ended is the VM controller's
   job (rustkube#104).
+- **A guest's address** goes to `status.interfaces[].ipAddress` / `ipAddresses`
+  from three sources, in this order:
+  - **The tap watcher:** a NIC on one of the node's bridges (`host`,
+    `bridged:<name>`, `storm.io/bridge`) is watched from before the spawn
+    (stormvm-net `snoop_tap`). The guest's DHCP, DHCPv6 or SLAAC is seen on
+    the tap and written to the VMI straight away, not on the next sync.
+  - **The QEMU guest agent**, when the guest runs one.
+  - **The node's neighbour table** (`/proc/net/arp`).
 
 ## Tests on a node
 

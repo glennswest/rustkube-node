@@ -370,6 +370,8 @@ impl Kubelet {
         // changed, and reconciliation is what makes the node match it, which
         // is also needed when nothing changed and something drifted.
         if let Some(vms) = self.vms.clone() {
+            // A bridged guest's address, written as its tap shows it (#91).
+            vms.spawn_address_pump();
             let api = self.api_client.clone();
             let url = self.config.api_server_url.clone();
             let node = self.config.node_name.clone();
