@@ -9,6 +9,7 @@ pub mod engine;
 pub mod events;
 pub mod metrics;
 pub mod mirror;
+pub mod node_logs;
 pub mod storage;
 pub mod system_claims;
 pub mod stormpump_ring;

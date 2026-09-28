@@ -3,6 +3,14 @@
 ## [Unreleased]
 <!-- New unreleased changes go here -->
 
+### 2026-09-28 (node service logs, #72)
+- **feat(kubelet):** `kubectl logs -n kube-system <asset>-<node>` reads the
+  service's stormd log volume: the volume its boot unit mounts at
+  `/var/log/stormd`, seen under `/hostroot`. The current run covers every
+  process with its rotations, merged in time order. `--previous` is the newest
+  failed run. tail, since, timestamps, limit and follow work. It used to answer
+  "not found on this node".
+
 ### 2026-09-28 (PVC size test, #64)
 - **build(test):** `test/build.sh` builds the static test binary on the build
   box, and `test/Containerfile` only copies it into a scratch image. The image

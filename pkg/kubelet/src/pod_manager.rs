@@ -277,6 +277,8 @@ pub struct PodManager {
     /// Blanks being minted in the background, by name (#63). A 1 TiB blank
     /// takes minutes to format, and the sync loop must not wait for it.
     minting: Arc<std::sync::Mutex<HashMap<String, Mint>>>,
+    /// Where the host's root is seen, for the node services' logs (#72).
+    host_root: std::path::PathBuf,
 }
 
 /// A pod this node has admitted and not started, and why.
@@ -352,7 +354,34 @@ impl PodManager {
             first_seen: std::sync::Mutex::new(HashMap::new()),
             waiting: std::sync::Mutex::new(HashMap::new()),
             minting: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            host_root: crate::node_logs::HOST_ROOT.into(),
         }
+    }
+
+    /// See the host's root here rather than at `/hostroot`: for tests.
+    pub fn with_host_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.host_root = root.into();
+        self
+    }
+
+    /// The stormd log directory behind a node service's mirror pod (#72):
+    /// `kube-system/<asset>-<node>`, container `<asset>`, and a boot unit that
+    /// mounts a volume at the asset's `/var/log/stormd`. `None` for anything
+    /// else, including a service not run by stormd.
+    pub fn node_service_log_dir(
+        &self,
+        namespace: &str,
+        pod: &str,
+        container: &str,
+    ) -> Option<std::path::PathBuf> {
+        if namespace != "kube-system" {
+            return None;
+        }
+        let asset = pod.strip_suffix(&format!("-{}", self.node_name))?;
+        if asset.is_empty() || asset != container {
+            return None;
+        }
+        crate::node_logs::log_dir(&self.host_root, asset)
     }
 
     /// Use this registry of CSI drivers: the one the kubelet's registration

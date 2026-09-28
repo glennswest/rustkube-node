@@ -591,6 +591,61 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["kind"], "PodList");
     }
+
+    /// `kubectl logs -n kube-system fastetcd-<node>` reads fastetcd's stormd
+    /// log volume, found through the boot unit that mounts it (#72).
+    #[tokio::test]
+    async fn a_node_service_mirror_pod_reads_its_stormd_log_volume() {
+        let root = tempfile::tempdir().unwrap();
+        let bd = root.path().join("etc/stormpump/boot.d");
+        std::fs::create_dir_all(&bd).unwrap();
+        std::fs::write(
+            bd.join("30-kube"),
+            "volume felogs /logs/fastetcd\nspec fastetcd\n  mount felogs /var/log/stormd\n\
+             volume reg /pallets/registry\nspec registry\n  root reg\n",
+        )
+        .unwrap();
+        let logs = root.path().join("logs/fastetcd");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("fastetcd.log"),
+            "2026-09-28T10:00:00.000Z stdout info serving\n2026-09-28T10:00:01.000Z stderr warn slow\n",
+        )
+        .unwrap();
+        std::fs::write(logs.join("fastetcd.20260827T000000.failed.log"), "2026-09-27T00:00:00.000Z stderr error boom\n")
+            .unwrap();
+
+        let rt = Arc::new(NoopRt);
+        let pm = Arc::new(PodManager::new(rt.clone(), rt, "n1").with_host_root(root.path()));
+        let get = |uri: &str| {
+            let app = router(pm.clone());
+            let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            async move {
+                let resp = app.oneshot(req).await.unwrap();
+                let status = resp.status();
+                let body = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+                (status, String::from_utf8_lossy(&body).into_owned())
+            }
+        };
+
+        let (st, body) = get("/containerLogs/kube-system/fastetcd-n1/fastetcd").await;
+        assert_eq!((st, body.as_str()), (StatusCode::OK, "serving\nslow\n"));
+        let (_, body) = get("/containerLogs/kube-system/fastetcd-n1/fastetcd?tailLines=1&timestamps=true").await;
+        assert_eq!(body, "2026-09-28T10:00:01.000Z slow\n");
+        let (st, body) = get("/containerLogs/kube-system/fastetcd-n1/fastetcd?previous=true").await;
+        assert_eq!((st, body.as_str()), (StatusCode::OK, "boom\n"));
+
+        // Not run by stormd, another node's mirror, or the wrong container:
+        // not this node's to answer.
+        for uri in [
+            "/containerLogs/kube-system/registry-n1/registry",
+            "/containerLogs/kube-system/fastetcd-n2/fastetcd",
+            "/containerLogs/kube-system/fastetcd-n1/other",
+            "/containerLogs/default/fastetcd-n1/fastetcd",
+        ] {
+            assert_eq!(get(uri).await.0, StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
 }
 
 
@@ -617,6 +672,13 @@ async fn container_logs(
     Path((namespace, pod, container)): Path<(String, String, String)>,
     Query(opts): Query<LogOptions>,
 ) -> Response {
+    // A node service's mirror pod is no pod this kubelet runs (#72): its log
+    // is on the service's stormd log volume.
+    if pm.pod_uid(&namespace, &pod).await.is_none() && pm.waiting_reason(&namespace, &pod).is_none() {
+        if let Some(dir) = pm.node_service_log_dir(&namespace, &pod, &container) {
+            return node_service_logs(dir, &namespace, &pod, &container, opts).await;
+        }
+    }
     let path = match log_file(&pm, &namespace, &pod, &container, &opts).await {
         Ok(p) => p,
         Err(resp) => return resp,
@@ -679,6 +741,90 @@ async fn container_logs(
         }
     });
 
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(axum::body::Body::from_stream(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
+        .unwrap_or_else(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response()
+        })
+}
+
+/// `containerLogs` for a node service's mirror pod: its stormd log volume
+/// ([`crate::node_logs`]).
+///
+/// The current run is every process stormd runs there, rotations included,
+/// merged in time order. `previous` is the newest failed run. `follow` polls
+/// the live files, as for a pod, until the directory goes or the client hangs
+/// up; a line written in the instant between a poll and a rotation is missed.
+async fn node_service_logs(
+    dir: std::path::PathBuf,
+    namespace: &str,
+    pod: &str,
+    container: &str,
+    opts: LogOptions,
+) -> Response {
+    use crate::node_logs;
+    let mut budget = opts.limit_bytes;
+
+    if opts.previous.unwrap_or(false) {
+        let Some(file) = node_logs::previous_failed(&dir) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("container {container} has no previous failed run in {}\n", dir.display()),
+            )
+                .into_response();
+        };
+        return match std::fs::read_to_string(&file) {
+            Ok(t) => (StatusCode::OK, cap(filter_log(&t, &opts), &mut budget)).into_response(),
+            Err(e) => (StatusCode::NOT_FOUND, format!("cannot read {}: {e}\n", file.display()))
+                .into_response(),
+        };
+    }
+
+    if node_logs::current_files(&dir).is_empty() {
+        // Named, because the likely cause is the volume not being visible
+        // here rather than the service writing nothing.
+        return (
+            StatusCode::NOT_FOUND,
+            format!("no logs for container {container} in {namespace}/{pod}: nothing in {}\n", dir.display()),
+        )
+            .into_response();
+    }
+    let (text, mut offsets) = node_logs::read_current(&dir);
+    let head = cap(filter_log(&text, &opts), &mut budget);
+    if !opts.follow.unwrap_or(false) || budget == Some(0) {
+        return (StatusCode::OK, head).into_response();
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(16);
+    if !head.is_empty() && tx.send(Ok(head.into_bytes())).await.is_err() {
+        return (StatusCode::OK, String::new()).into_response();
+    }
+    let opts = LogOptions { tail_lines: None, ..opts };
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if !dir.is_dir() {
+                return;
+            }
+            let mut chunks = Vec::new();
+            for (proc_name, live) in node_logs::live_files(&dir) {
+                let offset = offsets.entry(live.clone()).or_insert(0);
+                let chunk = tail_from(&live.to_string_lossy(), offset).unwrap_or_default();
+                chunks.push((proc_name, chunk));
+            }
+            let out = cap(filter_log(&node_logs::merge(&chunks), &opts), &mut budget);
+            if !out.is_empty() && tx.send(Ok(out.into_bytes())).await.is_err() {
+                return; // client hung up
+            }
+            if budget == Some(0) {
+                return;
+            }
+        }
+    });
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/plain; charset=utf-8")
