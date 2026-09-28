@@ -3,6 +3,15 @@
 ## [Unreleased]
 <!-- New unreleased changes go here -->
 
+### 2026-09-28 (accessCredentials, #92)
+- **feat(kubelet):** a VMI's `spec.accessCredentials` is honoured.
+  - `noCloud` / `configDrive` keys are read from their Secrets into the
+    seed's `public-keys` at start.
+  - `qemuGuestAgent` keys are set through the agent once it answers, and again
+    whenever the Secret changes, without a reboot.
+  - `AccessCredentialsSynchronized` is reported in `status.conditions`, merged
+    with any others.
+
 ### 2026-09-28 (a bridged VM's address from its tap, #91)
 - **feat(kubelet):** a VM NIC on a node bridge is watched on its tap from
   before the spawn (stormvm-net `snoop_tap`, stormvm 2be5900). The address the

@@ -118,6 +118,9 @@ fn vm_of(reg: &stormvm_node::console::Registration) -> Vm {
         ready_unix: None,
         owned_volumes: reg.disks.iter().filter(|d| d.owned).filter_map(|d| d.volume_id.clone()).collect(),
         nics: Vec::new(),
+        // Whatever reached its seed was decided by the kubelet that started
+        // it; the agent's keys are applied again from the Secret.
+        access: Access::default(),
     }
 }
 
@@ -196,6 +199,76 @@ pub struct Vm {
     /// nothing else. A console could not show what network a guest was on,
     /// and neither could anyone debugging why it could not be reached.
     pub nics: Vec<NicReport>,
+    /// How its SSH keys (`spec.accessCredentials`) have fared (#92).
+    pub access: Access,
+}
+
+/// What became of a machine's `accessCredentials` (#92), for the
+/// `AccessCredentialsSynchronized` condition and for applying agent keys again
+/// only when a Secret changes.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Access {
+    /// Why the boot-time (`noCloud`) keys did not all reach the seed. Empty
+    /// when they did, or there were none.
+    pub boot: Vec<String>,
+    /// Per (Secret, user), the keys the guest agent last accepted.
+    pub applied: Vec<(String, String, Vec<String>)>,
+    /// Why the agent's keys did not all arrive, as of the last try. `None`:
+    /// the agent has not answered yet.
+    pub agent: Option<Vec<String>>,
+    /// The condition as last reported.
+    pub condition: Option<Value>,
+}
+
+/// Whether every set of keys arrived, or everything that did not. `None` for
+/// a machine that asked for none.
+fn access_outcome(
+    creds: &[stormvm_spec::access::AccessCredential],
+    access: &Access,
+) -> Option<Result<(), String>> {
+    if creds.is_empty() {
+        return None;
+    }
+    let mut problems = access.boot.clone();
+    if creds.iter().any(|c| !c.at_boot()) {
+        match &access.agent {
+            None => problems.push("waiting for the guest agent to answer".to_string()),
+            Some(p) => problems.extend(p.iter().cloned()),
+        }
+    }
+    Some(if problems.is_empty() { Ok(()) } else { Err(problems.join("; ")) })
+}
+
+/// The condition for `outcome`, keeping `prev`'s `lastTransitionTime` when the
+/// status has not changed: the time is when it became true or false, not
+/// when it was last looked at.
+fn access_condition(prev: Option<&Value>, outcome: &Result<(), String>, now: &str) -> Value {
+    let mut c = stormvm_spec::access::condition(outcome, now);
+    if let Some(p) = prev.filter(|p| p["status"] == c["status"]) {
+        c["lastTransitionTime"] = p["lastTransitionTime"].clone();
+    }
+    c
+}
+
+/// `existing` conditions with the access one replaced (or added). A merge
+/// patch replaces a list whole, so the others are carried over rather than
+/// lost.
+fn with_condition(existing: &Value, cond: &Value) -> Value {
+    let mut out: Vec<Value> = existing
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|c| c["type"] != stormvm_spec::access::CONDITION)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    out.push(cond.clone());
+    Value::Array(out)
+}
+
+fn now_rfc3339() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 fn now_unix() -> u64 {
@@ -578,6 +651,133 @@ impl VmManager {
         out
     }
 
+    /// A Secret's SSH public keys, in the machine's namespace (#92).
+    async fn secret_keys(&self, ns: &str, name: &str) -> Result<Vec<String>, String> {
+        if self.api_url.is_empty() {
+            return Err(format!("Secret {name}: no apiserver to read it from"));
+        }
+        let url = format!("{}/api/v1/namespaces/{ns}/secrets/{name}", self.api_url);
+        let r = self.api.get(&url).send().await.map_err(|e| format!("Secret {name}: {e}"))?;
+        match r.status().as_u16() {
+            200 => {}
+            404 => return Err(format!("Secret {ns}/{name} not found")),
+            code => return Err(format!("Secret {ns}/{name}: {code}")),
+        }
+        let secret: Value = r.json().await.map_err(|e| format!("Secret {name}: {e}"))?;
+        Ok(stormvm_spec::access::keys_in_secret(&secret))
+    }
+
+    /// The keys for the seed, from every `noCloud` / `configDrive`
+    /// credential, and why any set could not be had.
+    async fn boot_keys(&self, vm: &VmSpec) -> (Vec<String>, Vec<String>) {
+        let (mut keys, mut problems) = (Vec::new(), Vec::new());
+        let has_seed = vm.disks.iter().any(|d| d.from == DiskSource::CloudInit);
+        for c in vm.access_credentials.iter().filter(|c| c.at_boot()) {
+            if !has_seed {
+                // KubeVirt refuses this shape; here the machine still runs,
+                // and the condition says why the key is not in it.
+                problems.push(format!(
+                    "Secret {}: noCloud keys ride the cloud-init seed, and this VMI has no \
+                     cloudInitNoCloud volume",
+                    c.secret
+                ));
+                continue;
+            }
+            match self.secret_keys(&vm.namespace, &c.secret).await {
+                Ok(k) if k.is_empty() => problems.push(format!("Secret {} holds no keys", c.secret)),
+                Ok(k) => {
+                    for key in k {
+                        if !keys.contains(&key) {
+                            keys.push(key);
+                        }
+                    }
+                }
+                Err(e) => problems.push(e),
+            }
+        }
+        (keys, problems)
+    }
+
+    /// Keep a running machine's agent-delivered keys current, and its
+    /// condition with them (#92).
+    ///
+    /// Read from the VMI as it is now, so a credential added to a running
+    /// machine ("Add my keys") and a machine adopted after a restart are both
+    /// covered. Each Secret is read on every sync, and a user's keys are sent
+    /// to the agent only when they differ from what it last accepted, with
+    /// `reset`: the Secret is the truth, and a key taken out of it leaves the
+    /// guest. A Secret that is missing, or holds no keys, is reported and
+    /// leaves the guest's keys as they are: emptying a machine's
+    /// `authorized_keys` because a Secret went missing is a lock-out.
+    async fn sync_access(&self, uid: &str, agent_up: bool) {
+        let Some(obj) = self.desired.lock().await.get(uid).cloned() else { return };
+        // Refused credentials refused the machine at start.
+        let Ok(creds) = stormvm_spec::access::from_kube(&obj["spec"]) else { return };
+        let Some(vm) = self.vms.lock().await.get(uid).cloned() else { return };
+        let mut access = vm.access.clone();
+
+        let agent_creds: Vec<(&str, &[String])> = creds
+            .iter()
+            .filter_map(|c| match &c.propagation {
+                stormvm_spec::access::Propagation::GuestAgent { users } => {
+                    Some((c.secret.as_str(), users.as_slice()))
+                }
+                _ => None,
+            })
+            .collect();
+        if agent_up && !agent_creds.is_empty() {
+            let sock = format!("{RUN_ROOT}/{}/{}/agent.sock", vm.namespace, vm.name);
+            let (mut applied, mut problems) = (Vec::new(), Vec::new());
+            for (secret, users) in agent_creds {
+                let keep = |applied: &mut Vec<(String, String, Vec<String>)>| {
+                    applied.extend(vm.access.applied.iter().filter(|a| a.0 == secret).cloned());
+                };
+                let keys = match self.secret_keys(&vm.namespace, secret).await {
+                    Ok(k) if k.is_empty() => {
+                        problems.push(format!("Secret {secret} holds no keys; the guest's were left as they are"));
+                        keep(&mut applied);
+                        continue;
+                    }
+                    Ok(k) => k,
+                    Err(e) => {
+                        problems.push(e);
+                        keep(&mut applied);
+                        continue;
+                    }
+                };
+                for user in users {
+                    let sent = vm.access.applied.iter().any(|(s, u, k)| s == secret && u == user && *k == keys);
+                    if sent {
+                        applied.push((secret.to_string(), user.clone(), keys.clone()));
+                        continue;
+                    }
+                    match stormvm_control::qga::set_authorized_keys(&sock, user, &keys).await {
+                        Ok(()) => {
+                            info!(vm = %vm.name, user = %user, secret = %secret, keys = keys.len(),
+                                  "authorized keys set through the guest agent");
+                            applied.push((secret.to_string(), user.clone(), keys.clone()));
+                        }
+                        Err(e) => problems.push(format!("user {user} (Secret {secret}): {e}")),
+                    }
+                }
+            }
+            access.applied = applied;
+            access.agent = Some(problems);
+        }
+        let outcome = access_outcome(&creds, &access);
+        access.condition = outcome.map(|o| access_condition(access.condition.as_ref(), &o, &now_rfc3339()));
+        if access == vm.access {
+            return;
+        }
+        let updated = {
+            let mut vms = self.vms.lock().await;
+            let Some(cur) = vms.get_mut(uid) else { return };
+            cur.access = access;
+            cur.clone()
+        };
+        self.patch_status(&updated).await;
+    }
+
     /// Stop watching a machine's taps. Off the async threads: dropping a
     /// watcher joins its thread, which wakes at most a second later.
     fn drop_snoopers(&self, uid: &str) {
@@ -832,7 +1032,11 @@ impl VmManager {
 
         // Storage first. Nothing has been asked of the engine yet, so a golden
         // that does not exist costs a failed status and no cleanup.
-        let (disks, owned_volumes) = self.resolve_disks(&vm).await?;
+        // SSH keys that ride the seed (#92), fetched before the seed is made.
+        // A Secret that cannot be read does not stop the machine: the key may
+        // be in its user-data too, and the condition says what is missing.
+        let (boot_keys, boot_problems) = self.boot_keys(&vm).await;
+        let (disks, owned_volumes) = self.resolve_disks_with_keys(&vm, &boot_keys).await?;
 
         // The pod log directory, because that is where `kubectl logs` looks.
         // The container name is the VM's, so the path is the one the kubelet's
@@ -948,7 +1152,7 @@ impl VmManager {
         }
         self.event(obj, "Normal", "Started",
                    &format!("Started virtual machine {}", vm.name)).await;
-        let rec = Vm {
+        let mut rec = Vm {
             namespace: ns,
             name: vm.name.clone(),
             uid: uid.to_string(),
@@ -962,7 +1166,11 @@ impl VmManager {
             owned_volumes,
             nics: nic_reports,
             message: String::new(),
+            access: Access { boot: boot_problems, ..Access::default() },
         };
+        if let Some(outcome) = access_outcome(&vm.access_credentials, &rec.access) {
+            rec.access.condition = Some(access_condition(None, &outcome, &now_rfc3339()));
+        }
         self.vms.lock().await.insert(uid.to_string(), rec.clone());
         if !snoopers.is_empty() {
             self.snoopers.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), snoopers);
@@ -1005,7 +1213,11 @@ impl VmManager {
             // the neighbour table with the address it took. Second, not
             // first: the agent knows every address on every interface, and
             // the neighbour table knows only what has been seen from here.
-            let addrs = match guest_addresses(&vm).await {
+            let agent = guest_addresses(&vm).await;
+            // An answer, even one with no addresses, is an agent that can
+            // take keys (#92).
+            let agent_up = agent.is_some();
+            let addrs = match agent {
                 Some(a) if a.iter().any(|v| !v.is_empty()) => Some(a),
                 other => neighbour_addresses(&vm).or(other),
             };
@@ -1032,6 +1244,8 @@ impl VmManager {
                     self.patch_status(&with).await;
                 }
             }
+            // Its SSH keys through the agent, and the condition (#92).
+            self.sync_access(&vm.uid, agent_up).await;
             let code = if vm.handle.is_none() {
                 // Adopted without a handle: its control socket is the only
                 // sign of life, and there is no exit status to read.
@@ -1135,6 +1349,15 @@ impl VmManager {
     /// Clone or attach every disk. Failure gives back what it already took —
     /// an attachment left behind is a device nobody will ever release.
     async fn resolve_disks(&self, vm: &VmSpec) -> Result<(Vec<ResolvedDisk>, Vec<String>), StartFail> {
+        self.resolve_disks_with_keys(vm, &[]).await
+    }
+
+    /// [`Self::resolve_disks`], with SSH keys for the seed's `public-keys`.
+    async fn resolve_disks_with_keys(
+        &self,
+        vm: &VmSpec,
+        keys: &[String],
+    ) -> Result<(Vec<ResolvedDisk>, Vec<String>), StartFail> {
         let mut done: Vec<ResolvedDisk> = Vec::new();
         let mut owned: Vec<String> = Vec::new();
         for d in &vm.disks {
@@ -1231,7 +1454,7 @@ impl VmManager {
                         return Err(StartFail::Failed(format!("disk {}: {e}", d.name)));
                     }
                 },
-                DiskSource::CloudInit => match self.seed_volume(vm).await {
+                DiskSource::CloudInit => match self.seed_volume(vm, keys).await {
                     Ok(id) => id,
                     Err(e) => {
                         self.release(&done).await;
@@ -1412,8 +1635,16 @@ impl VmManager {
     /// name — never from a lease. A guest that takes its name from DHCP is a
     /// guest whose identity changes when the network does, and its
     /// certificates and logs change with it.
-    async fn seed_volume(&self, vm: &VmSpec) -> Result<String, String> {
-        let seed = stormvm_cloudinit::Seed::for_vm(vm);
+    async fn seed_volume(&self, vm: &VmSpec, keys: &[String]) -> Result<String, String> {
+        let mut seed = stormvm_cloudinit::Seed::for_vm(vm);
+        // `accessCredentials` keys go in meta-data `public-keys`, never
+        // user-data, where a second `ssh_authorized_keys:` would replace the
+        // VM's own (#92).
+        for k in keys {
+            if !seed.public_keys.contains(k) {
+                seed.public_keys.push(k.clone());
+            }
+        }
 
         // 16 MiB: the files are a few hundred bytes, and FAT16 needs enough
         // clusters to be FAT16 at all. Thin, so it costs what it holds.
@@ -1825,6 +2056,7 @@ impl VmManager {
             // saying so is different from not knowing.
             nics: Vec::new(),
             message: why.to_string(),
+            access: Access::default(),
         };
         self.vms.lock().await.insert(uid.to_string(), rec.clone());
         self.patch_status(&rec).await;
@@ -1913,6 +2145,18 @@ impl VmManager {
         if !vm.message.is_empty() {
             status["reason"] = json!(if vm.phase == Phase::Failed { "Failed" } else { "Ended" });
             status["message"] = json!(vm.message);
+        }
+        // `AccessCredentialsSynchronized` (#92), with whatever conditions the
+        // object already carries: a merge patch replaces the list whole.
+        if let Some(cond) = &vm.access.condition {
+            let existing = self
+                .desired
+                .lock()
+                .await
+                .get(&vm.uid)
+                .map(|o| o["status"]["conditions"].clone())
+                .unwrap_or(Value::Null);
+            status["conditions"] = with_condition(&existing, cond);
         }
         let body = json!({ "status": status });
         if let Err(e) = self
@@ -2177,6 +2421,90 @@ fn assigned_to(obj: &Value, node: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// `AccessCredentialsSynchronized`: every problem named, an agent not yet
+    /// heard from is a reason, and the transition time holds while the status
+    /// does (#92).
+    #[test]
+    fn the_access_condition_says_what_did_not_arrive() {
+        use stormvm_spec::access::{AccessCredential, Propagation};
+        let boot = AccessCredential { secret: "k".into(), propagation: Propagation::NoCloud };
+        let agent = AccessCredential {
+            secret: "k".into(),
+            propagation: Propagation::GuestAgent { users: vec!["root".into()] },
+        };
+        assert_eq!(access_outcome(&[], &Access::default()), None);
+        assert_eq!(access_outcome(&[boot.clone()], &Access::default()), Some(Ok(())));
+        let a = Access { boot: vec!["Secret ns/k not found".into()], ..Access::default() };
+        assert_eq!(access_outcome(&[boot.clone()], &a), Some(Err("Secret ns/k not found".into())));
+        assert_eq!(
+            access_outcome(&[boot.clone(), agent.clone()], &Access::default()),
+            Some(Err("waiting for the guest agent to answer".into()))
+        );
+        let a = Access { agent: Some(vec![]), ..Access::default() };
+        assert_eq!(access_outcome(&[agent], &a), Some(Ok(())));
+
+        let t0 = access_condition(None, &Err("x".into()), "2026-09-28T10:00:00Z");
+        assert_eq!(t0["status"], "False");
+        assert_eq!(t0["message"], "x");
+        let t1 = access_condition(Some(&t0), &Err("y".into()), "2026-09-28T10:05:00Z");
+        assert_eq!(t1["lastTransitionTime"], "2026-09-28T10:00:00Z", "still False: same transition");
+        assert_eq!(t1["message"], "y");
+        let t2 = access_condition(Some(&t1), &Ok(()), "2026-09-28T10:06:00Z");
+        assert_eq!((t2["status"].as_str(), t2["lastTransitionTime"].as_str()), (Some("True"), Some("2026-09-28T10:06:00Z")));
+
+        // The others survive; the old access condition is replaced, not doubled.
+        let existing = json!([{"type": "Ready", "status": "True"}, t0]);
+        let merged = with_condition(&existing, &t2);
+        assert_eq!(merged, json!([{"type": "Ready", "status": "True"}, t2]));
+        assert_eq!(with_condition(&Value::Null, &t2), json!([t2]));
+    }
+
+    /// Boot keys come from the Secrets, `stringData` included; a missing one,
+    /// or a machine with no seed to carry them, is a reason, not a failed
+    /// start (#92).
+    #[tokio::test]
+    async fn boot_keys_are_read_from_the_secrets() {
+        use axum::routing::get;
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/namespaces/default/secrets/owner-keys",
+                get(|| async {
+                    axum::Json(json!({"stringData": {"key": "ssh-ed25519 AAAAC3Nza owner@laptop\n"}}))
+                }),
+            )
+            .fallback(|| async { (axum::http::StatusCode::NOT_FOUND, "no") });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), &url);
+
+        let creds = json!([
+            {"sshPublicKey": {"source": {"secret": {"secretName": "owner-keys"}},
+                              "propagationMethod": {"noCloud": {}}}},
+            {"sshPublicKey": {"source": {"secret": {"secretName": "gone"}},
+                              "propagationMethod": {"noCloud": {}}}},
+        ]);
+        let mut obj = vmi("n1");
+        obj["spec"]["accessCredentials"] = creds;
+        obj["spec"]["domain"]["devices"] = json!({"disks": [{"name": "ci", "disk": {"bus": "virtio"}}]});
+        obj["spec"]["volumes"] = json!([{"name": "ci", "cloudInitNoCloud": {"userData": "#cloud-config\n"}}]);
+        let vm: VmSpec = stormvm_spec::kube::from_kube(&obj).unwrap();
+        let (keys, problems) = m.boot_keys(&vm).await;
+        assert_eq!(keys, vec!["ssh-ed25519 AAAAC3Nza owner@laptop".to_string()]);
+        assert_eq!(problems, vec!["Secret default/gone not found".to_string()]);
+
+        // No cloudInitNoCloud volume: nowhere for the keys to go, and it says so.
+        let mut bare = vmi("n1");
+        bare["spec"]["accessCredentials"] = json!([
+            {"sshPublicKey": {"source": {"secret": {"secretName": "owner-keys"}},
+                              "propagationMethod": {"noCloud": {}}}}]);
+        let vm: VmSpec = stormvm_spec::kube::from_kube(&bare).unwrap();
+        let (keys, problems) = m.boot_keys(&vm).await;
+        assert!(keys.is_empty());
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("no cloudInitNoCloud volume"), "{problems:?}");
+    }
+
     /// The tap watcher wins per NIC where it has seen something; elsewhere
     /// the agent's or the neighbour table's answer stands (#91).
     #[test]
@@ -2225,6 +2553,7 @@ mod tests {
                 NicReport { name: "net0".into(), mac: "02:00:00:00:00:01".into(), addresses: vec![], binding: "bridge".into() },
                 NicReport { name: "net1".into(), mac: "02:00:00:00:00:02".into(), addresses: vec![], binding: "bridge".into() },
             ],
+            access: Access::default(),
         };
         m.vms.lock().await.insert("u-2".into(), vm);
 

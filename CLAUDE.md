@@ -60,6 +60,21 @@ Steps:
        golden-rustkube-node-d9a108728be0 (at ccb7bfc; the first stage try died on dev: no NVMe device). No
        release request was filed by stage: stormcentral#117. #35 closed (sc-build only, not on a node).
 
+### In progress: #92, a VMI's accessCredentials (keys into the seed and through the agent)
+
+stormvm e5b4d16 (in the dc1b7ea lock): `VmSpec.access_credentials`, `access::keys_in_secret`, `Seed.public_keys`,
+`qga::set_authorized_keys` (reset: true), `access::condition`.
+
+Steps:
+1. [x] Start: `noCloud` Secrets read before the disks, keys into the seed's meta-data `public-keys`. A missing
+       Secret, an empty one, or no cloudInitNoCloud volume: start anyway, reason in the condition.
+2. [x] Each sync, from the VMI as it is now: agent credentials applied once the agent answers, re-sent only
+       when the Secret's keys differ from what the agent last accepted. A missing/empty Secret leaves the
+       guest's keys alone (no lock-out). `Vm.access` holds it.
+3. [x] `AccessCredentialsSynchronized` merged into the VMI's existing conditions; transition time held while
+       the status holds.
+4. [ ] Tests, docs, CHANGELOG, sc-build. The issue's done-when (ssh in on the test host) waits on C2NR0Q2.
+
 ### In progress: #91, a bridged VM's IP from its tap (stormvm_net::snoop_tap)
 
 stormvm 2be5900 (lock moves 1b0d941 → dc1b7ea, `cargo update -p stormvm-net` on dev with

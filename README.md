@@ -170,6 +170,17 @@ share it.
     the tap and written to the VMI straight away, not on the next sync.
   - **The QEMU guest agent**, when the guest runs one.
   - **The node's neighbour table** (`/proc/net/arp`).
+- **SSH keys: `spec.accessCredentials`.**
+  - **`noCloud` / `configDrive` Secrets** are read at start, and their keys go
+    into the seed's meta-data `public-keys`, never user-data. That needs a
+    `cloudInitNoCloud` volume. A missing Secret doesn't stop the machine.
+  - **`qemuGuestAgent: {users}` Secrets** are applied through the guest agent
+    once it answers. They're applied again whenever the Secret's keys change,
+    with `reset`, so the Secret is the truth. A missing or empty Secret leaves
+    the guest's keys alone rather than locking it out.
+  - **Status:** the VMI carries `AccessCredentialsSynchronized`, with every
+    reason when it is False: a missing Secret, no seed, or an agent not
+    answering yet.
 
 ## Tests on a node
 
