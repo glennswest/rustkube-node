@@ -3058,6 +3058,52 @@ mod tests {
         assert!(all[0].message.contains("no ring"), "{}", all[0].message);
     }
 
+    /// A clone made for a start is known as fresh before anything else can
+    /// fail, and is deleted with it, so a retried start leaves nothing
+    /// behind (#76).
+    #[tokio::test]
+    async fn a_failed_start_deletes_the_clone_it_made() {
+        use axum::routing::{delete, post};
+        let deleted: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let d = deleted.clone();
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/volumes/{g}/clone",
+                post(|| async { axum::Json(json!({"id": "clone-1"})) }),
+            )
+            // The attach fails, after the clone was made.
+            .route(
+                "/api/v1/volumes/{id}/attach",
+                post(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "no ublk") }),
+            )
+            .route(
+                "/api/v1/volumes/{id}",
+                delete(move |axum::extract::Path(id): axum::extract::Path<String>| {
+                    let d = d.clone();
+                    async move {
+                        d.lock().unwrap().push(id);
+                        axum::Json(json!({}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), "")
+            .with_storage(crate::engine::EngineClient::new(&url, crate::engine::TokenSource::none()));
+
+        let mut obj = vmi("n1");
+        obj["spec"]["domain"]["devices"] = json!({"disks": [{"name": "root", "disk": {"bus": "virtio"}}]});
+        obj["spec"]["volumes"] = json!([{"name": "root", "containerDisk": {"image": "fedora-43"}}]);
+        let vm: VmSpec = stormvm_spec::kube::from_kube(&obj).unwrap();
+        let mut fresh = Vec::new();
+        let r = m.resolve_disks_with_keys(&vm, &[], &mut fresh).await;
+        assert!(matches!(r, Err(StartFail::Failed(_))), "{r:?}");
+        assert_eq!(fresh, vec!["clone-1".to_string()]);
+        m.delete_volumes("web-1", &fresh).await;
+        assert_eq!(*deleted.lock().unwrap(), vec!["clone-1".to_string()]);
+    }
+
     #[test]
     fn retries_back_off_from_ten_seconds_to_five_minutes() {
         let d = |n| retry_delay(n).as_secs();
