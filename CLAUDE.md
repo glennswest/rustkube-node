@@ -60,6 +60,19 @@ Steps:
        golden-rustkube-node-d9a108728be0 (at ccb7bfc; the first stage try died on dev: no NVMe device). No
        release request was filed by stage: stormcentral#117. #35 closed (sc-build only, not on a node).
 
+### In progress: #87, static (mirror) pods: logs and stale status
+
+Logs: stormd services answered by #72. registry/stormblock/timesync wait on stormpump#55 (assets.json names no log).
+Stale status, found 2026-09-28: stormpump lists every asset it tried to start (refused ones too, with
+last_error), but one not started on this boot is not in the table, and the mirror writes only pods for listed
+assets, so its pod keeps the last boot's Running and startTime (registry, stormstorage on C2NR0Q2 at 17:32).
+
+Steps:
+1. [ ] Each pass: list this node's mirror pods (`storm.io/component=node-service`, spec.nodeName); one whose asset
+       is not in the table gets status "not started on this boot" (phase Pending, waiting NotStarted, not
+       Ready), written once (skipped when already so), with a Warning Event. Never deleted.
+2. [ ] Tests, docs, CHANGELOG, sc-build.
+
 ### Done: #72, `kubectl logs` on a node service's mirror pod reads its stormd log volume
 
 Found, 2026-09-28: a mirror pod (`kube-system/<asset>-<node>`) is not in the pod manager, so `containerLogs`
