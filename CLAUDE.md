@@ -84,6 +84,11 @@ Steps:
        answers again (stormcentral#71). Doing: `test/build.sh` builds the static binary on dev, the
        Containerfile is `FROM scratch` + COPY (no rust:1-alpine pull, no compile in podman), as cadvisor's;
        file the hung run on stormcentral; rerun.
+       Done: 38dba5a (build.sh verified on dev: static-pie, `/test short` exits 2 with no runner env). Hung run
+       filed as stormcentral#139. Rerun 20d0bf509c (38dba5a) sat at "power" 15:56–16:51 UTC; C2NR0Q2 then
+       unreachable (no ping, no route). **Waiting on the test machine**; rerun
+       `stormcentral test run rustkube-node medium --commit <head>` when it answers. Overcommit case still
+       waits on #62 (owner decision).
 
 ### Done: #63, a pod waiting on its claim stays visible (ContainerCreating + reason)
 
