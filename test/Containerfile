@@ -1,26 +1,20 @@
 # rustkube-node-test: rustkube-node's test container, per stormcentral
 # docs/test-standard.md. One image for all three suites, started as
 # `/test <suite>`; run as a Job in the run's own namespace
-# (test/rustkube-node-test.yaml).
+# (test/rustkube-node-test.yaml). The same image is what the suites' workload
+# pods run (`/test sized …`), so nothing else is pulled.
 #
-#   podman build -f test/Containerfile --build-arg COMMIT=$(git rev-parse HEAD) \
-#     -t rustkube-node-test .
+# The context is the repo root; test/build.sh (run first, on the build box)
+# builds the static musl binary into test/.stage/test. Compiling inside
+# `podman build` pulled rust:1-alpine and built with no cache on every run.
 #
-# The context is the repo root, as the standard has it; only test/ is used.
-# The crate is standalone (its own workspace and Cargo.lock) and links
-# nothing from the kubelet. The binary is static (musl) and needs nothing
-# under it, so the image is scratch: it verifies the apiserver with the
-# ServiceAccount's mounted ca.crt, not a trust store. The same image is what
-# the suites' workload pods run (`/test sized …`).
-FROM docker.io/library/rust:1-alpine AS build
-RUN apk add --no-cache musl-dev
-WORKDIR /src
-COPY test/Cargo.toml test/Cargo.lock ./
-COPY test/src src
-RUN cargo build --release --locked --bin rustkube-node-test
-
+#   test/build.sh && podman build -f test/Containerfile \
+#     --build-arg COMMIT=$(git rev-parse HEAD) -t rustkube-node-test .
+#
+# The binary needs nothing under it: it verifies the apiserver with the
+# ServiceAccount's mounted ca.crt, not a trust store.
 FROM scratch
 ARG COMMIT=unknown
 LABEL storm.io/test-of="rustkube-node" storm.io/test-commit="${COMMIT}"
-COPY --from=build /src/target/release/rustkube-node-test /test
+COPY test/.stage/test /test
 ENTRYPOINT ["/test"]

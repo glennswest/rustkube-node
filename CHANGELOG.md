@@ -3,6 +3,11 @@
 ## [Unreleased]
 <!-- New unreleased changes go here -->
 
+### 2026-09-28 (PVC size test, #64)
+- **build(test):** `test/build.sh` builds the static test binary on the build
+  box, and `test/Containerfile` only copies it into a scratch image. The image
+  used to compile inside `podman build` from `rust:1-alpine`, with no cache.
+
 ### 2026-09-27 (PVC size test, #64)
 - **fix(kubelet):** a claim for a fractional size (`3.5Gi`) did not parse, and
   a claim that does not parse was read as asking for nothing, so it got the

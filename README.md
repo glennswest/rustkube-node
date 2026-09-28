@@ -157,8 +157,9 @@ share it.
 ## Tests on a node
 
 `test/` is the test container, per stormcentral's `docs/test-standard.md`. It
-is a standalone crate (its own workspace and `Cargo.lock`) built into a
-scratch image from `test/Containerfile`, started as `/test <suite>`, and run by
+is a standalone crate (its own workspace and `Cargo.lock`). `test/build.sh`
+builds its static binary on the build box, and `test/Containerfile` copies it
+into a scratch image. The image is started as `/test <suite>` and run by
 stormcentral as a Job (`test/rustkube-node-test.yaml`):
 
     stormcentral test run rustkube-node medium --url http://stormcentral.g8.lo

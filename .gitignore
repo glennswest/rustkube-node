@@ -8,3 +8,6 @@ deploy/terragrunt/rknode/pki/
 
 # Scratch
 tmp/
+
+# Test binary staged by test/build.sh
+test/.stage/
