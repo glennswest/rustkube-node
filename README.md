@@ -160,6 +160,15 @@ share it.
   gone, it is stopped through its own control socket: ACPI, then `quit`.
 - A failed VMI list is skipped, not read as "no machines". Reading it that way
   stopped every VM on the node.
+- **A failed start is retried**, with backoff from 10 s doubling to 5 min.
+  - The VMI stays Pending with reason `FailedStart` and a message giving the
+    attempt, the wait and the error. Each attempt also has a Warning Event.
+  - A new spec (`metadata.generation`) is tried at once.
+  - A missing golden is not a failure: it waits and is tried on every sync.
+  - A start gives up, and the VMI goes Failed, only when its VirtualMachine's
+    `runStrategy` is `Once` or `Manual`.
+  - A failed start deletes the root clone and seed it made. An `emptyDisk` it
+    found is kept.
 - Restarting a `running: true` VM whose instance ended is the VM controller's
   job (rustkube#104).
 - **A guest's address** goes to `status.interfaces[].ipAddress` / `ipAddresses`

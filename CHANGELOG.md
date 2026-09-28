@@ -3,6 +3,17 @@
 ## [Unreleased]
 <!-- New unreleased changes go here -->
 
+### 2026-09-28 (a failed VM start is retried, #76)
+- **fix(kubelet):** a VM start that failed was recorded Failed and never tried
+  again, so a moment of stormblock being down left the machine dead until it
+  was recreated.
+  - It is now retried with backoff (10 s doubling to 5 min, and at once on a
+    spec change), Pending with the reason and a Warning Event each attempt.
+  - It is Failed only when the VirtualMachine's `runStrategy` is `Once` or
+    `Manual`.
+- **fix(kubelet):** a failed start deletes the golden clone and seed it made.
+  It used to only detach them, which would leave two volumes behind per retry.
+
 ### 2026-09-28 (accessCredentials, #92)
 - **feat(kubelet):** a VMI's `spec.accessCredentials` is honoured.
   - `noCloud` / `configDrive` keys are read from their Secrets into the

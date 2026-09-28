@@ -406,7 +406,8 @@ pub enum StartFail {
     /// Something is missing that is expected to arrive. The machine stays
     /// Pending and the next sync tries again.
     Waiting(String),
-    /// It will not work. The machine is Failed and nothing retries it.
+    /// It did not work. Retried with backoff, Pending with the reason, unless
+    /// the VM's run strategy (`Once`, `Manual`) says to give up (#76).
     Failed(String),
 }
 
@@ -419,9 +420,8 @@ impl StartFail {
 }
 
 impl From<String> for StartFail {
-    /// Everything that has not been classified is a failure, which is the
-    /// safe direction: a real fault retried for ever is a machine that never
-    /// reports what is wrong with it.
+    /// Everything that has not been classified is a failure: retried with
+    /// backoff and reported each time, so a real fault is never silent.
     fn from(s: String) -> Self {
         StartFail::Failed(s)
     }
@@ -529,6 +529,45 @@ pub struct VmManager {
     /// to write it to the VMI at once rather than on the next sync.
     snoop_tx: tokio::sync::mpsc::UnboundedSender<Snooped>,
     snoop_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Snooped>>>,
+    /// Failed starts waiting to be tried again, by uid (#76).
+    retries: std::sync::Mutex<HashMap<String, Retry>>,
+}
+
+/// A failed start waiting for its next try (#76).
+#[derive(Debug, Clone, PartialEq)]
+struct Retry {
+    /// The spec it failed with: a new one is tried at once.
+    generation: i64,
+    attempts: u32,
+    next: std::time::Instant,
+}
+
+/// The wait before the next try after `attempts` failures: 10 s, doubling,
+/// at most 5 min.
+fn retry_delay(attempts: u32) -> std::time::Duration {
+    let secs = 10u64.saturating_mul(1u64 << attempts.saturating_sub(1).min(16));
+    std::time::Duration::from_secs(secs.min(300))
+}
+
+/// Does the machine behind this VMI want a failed start given up on?
+///
+/// Only its VirtualMachine's run strategy says so: `Once` runs once, and
+/// `Manual` restarts only when asked. Anything else (`Always`,
+/// `RerunOnFailure`, `running: true`), and a VMI with no VirtualMachine, is
+/// retried: "Nothing should be perm." (#76). The VM is `None` when there is
+/// none or it could not be read, and that retries too.
+fn gives_up(vm: Option<&Value>) -> bool {
+    let Some(vm) = vm else { return false };
+    matches!(vm["spec"]["runStrategy"].as_str(), Some("Once") | Some("Manual"))
+}
+
+/// The VirtualMachine that owns this VMI, by name, if any.
+fn owner_vm(obj: &Value) -> Option<&str> {
+    obj["metadata"]["ownerReferences"]
+        .as_array()?
+        .iter()
+        .find(|o| o["kind"] == "VirtualMachine")?["name"]
+        .as_str()
 }
 
 /// A tap watcher's news: the guest behind NIC `nic` of machine `uid` now
@@ -593,6 +632,7 @@ impl VmManager {
             snoopers: std::sync::Mutex::new(HashMap::new()),
             snoop_tx,
             snoop_rx: std::sync::Mutex::new(Some(snoop_rx)),
+            retries: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -895,11 +935,33 @@ impl VmManager {
             self.set_finalizer(obj, false).await;
         }
 
+        // A retry for a machine no longer wanted is forgotten.
+        self.retries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|u, _| want.iter().any(|(w, _)| w == u));
+
         for (uid, obj) in &want {
             if self.vms.lock().await.contains_key(uid) {
                 continue;
             }
-            if let Err(e) = self.start(uid, obj).await {
+            // Backing off after a failed start (#76), unless the spec changed.
+            let generation = obj["metadata"]["generation"].as_i64().unwrap_or(0);
+            {
+                let mut retries = self.retries.lock().unwrap_or_else(|e| e.into_inner());
+                match retries.get(uid) {
+                    Some(r) if r.generation != generation => {
+                        retries.remove(uid);
+                    }
+                    Some(r) if std::time::Instant::now() < r.next => continue,
+                    _ => {}
+                }
+            }
+            let result = self.start(uid, obj).await;
+            if result.is_ok() {
+                self.retries.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+            }
+            if let Err(e) = result {
                 let ns = obj["metadata"]["namespace"].as_str().unwrap_or("default");
                 let name = obj["metadata"]["name"].as_str().unwrap_or("");
                 if let StartFail::Waiting(why) = &e {
@@ -914,13 +976,43 @@ impl VmManager {
                 }
                 let e = e.message().to_string();
                 warn!("{ns}/{name}: {e}");
-                // The reason, where somebody will look for it.
-                //
-                // This is the message that said `cloning golden
-                // fedora-43-x86_64 for disk root: 404 no volume` and went
-                // only to a log on a node with no shell.
-                self.event(obj, "Warning", "FailedStart", &e).await;
-                self.record_failure(uid, obj, &e).await;
+                // Given up on only when its VirtualMachine says so; otherwise
+                // Pending, with the reason and when it will be tried again.
+                // A failure recorded here used to be skipped for good, so a
+                // stormblock that was down for a moment left the machine dead
+                // until somebody recreated it (#76).
+                let owner = match owner_vm(obj) {
+                    Some(vm) => self.get_vm(ns, vm).await,
+                    None => None,
+                };
+                if gives_up(owner.as_ref()) {
+                    // The reason, where somebody will look for it.
+                    //
+                    // This is the message that said `cloning golden
+                    // fedora-43-x86_64 for disk root: 404 no volume` and went
+                    // only to a log on a node with no shell.
+                    self.event(obj, "Warning", "FailedStart", &e).await;
+                    self.record_failure(uid, obj, &e).await;
+                    continue;
+                }
+                let (attempts, wait) = {
+                    let mut retries = self.retries.lock().unwrap_or_else(|e| e.into_inner());
+                    let r = retries.entry(uid.clone()).or_insert(Retry {
+                        generation,
+                        attempts: 0,
+                        next: std::time::Instant::now(),
+                    });
+                    r.attempts += 1;
+                    let wait = retry_delay(r.attempts);
+                    r.next = std::time::Instant::now() + wait;
+                    (r.attempts, wait)
+                };
+                let why = format!(
+                    "start failed (attempt {attempts}), retrying in {}s: {e}",
+                    wait.as_secs()
+                );
+                self.event(obj, "Warning", "FailedStart", &why).await;
+                self.patch_retrying(ns, name, &why).await;
             }
         }
 
@@ -1007,7 +1099,23 @@ impl VmManager {
         out
     }
 
+    /// Start a machine; a start that fails deletes the volumes it created.
+    ///
+    /// A golden's clone and a cloud-init seed are made new on every start,
+    /// and a failed one used to only detach them. Once a failed start is
+    /// retried (#76), that is two volumes left behind per attempt. What it
+    /// found and reused (an `emptyDisk`, a claim, a `volume:`) is not
+    /// deleted: that may be the guest's data.
     async fn start(&self, uid: &str, obj: &Value) -> Result<(), StartFail> {
+        let mut fresh = Vec::new();
+        let result = self.start_attempt(uid, obj, &mut fresh).await;
+        if result.is_err() {
+            self.delete_volumes(obj["metadata"]["name"].as_str().unwrap_or(""), &fresh).await;
+        }
+        result
+    }
+
+    async fn start_attempt(&self, uid: &str, obj: &Value, fresh: &mut Vec<String>) -> Result<(), StartFail> {
         // Resolve the cloud-init secret before anything reads the spec.
         //
         // A seed may be referenced rather than inlined -- `userDataSecretRef`
@@ -1030,13 +1138,13 @@ impl VmManager {
             "no ring to stormpump: only the engine starts a machine".to_string()
         })?;
 
-        // Storage first. Nothing has been asked of the engine yet, so a golden
-        // that does not exist costs a failed status and no cleanup.
         // SSH keys that ride the seed (#92), fetched before the seed is made.
         // A Secret that cannot be read does not stop the machine: the key may
         // be in its user-data too, and the condition says what is missing.
         let (boot_keys, boot_problems) = self.boot_keys(&vm).await;
-        let (disks, owned_volumes) = self.resolve_disks_with_keys(&vm, &boot_keys).await?;
+        // Storage first. Nothing has been asked of the engine yet, so a golden
+        // that does not exist costs a failed status and no cleanup.
+        let (disks, owned_volumes) = self.resolve_disks_with_keys(&vm, &boot_keys, fresh).await?;
 
         // The pod log directory, because that is where `kubectl logs` looks.
         // The container name is the VM's, so the path is the one the kubelet's
@@ -1349,16 +1457,19 @@ impl VmManager {
     /// [`Self::resolve_disks_with_keys`] with no keys: for tests.
     #[cfg(test)]
     async fn resolve_disks(&self, vm: &VmSpec) -> Result<(Vec<ResolvedDisk>, Vec<String>), StartFail> {
-        self.resolve_disks_with_keys(vm, &[]).await
+        self.resolve_disks_with_keys(vm, &[], &mut Vec::new()).await
     }
 
     /// Clone or attach every disk. Failure gives back what it already took —
     /// an attachment left behind is a device nobody will ever release.
-    /// `keys` go into a cloud-init seed's `public-keys` (#92).
+    /// `keys` go into a cloud-init seed's `public-keys` (#92). Every volume
+    /// made new here is added to `fresh`, as it is made, so a start that
+    /// fails later can delete it (#76).
     async fn resolve_disks_with_keys(
         &self,
         vm: &VmSpec,
         keys: &[String],
+        fresh: &mut Vec<String>,
     ) -> Result<(Vec<ResolvedDisk>, Vec<String>), StartFail> {
         let mut done: Vec<ResolvedDisk> = Vec::new();
         let mut owned: Vec<String> = Vec::new();
@@ -1384,7 +1495,13 @@ impl VmManager {
                         .post(&format!("{}/api/v1/volumes/{g}/clone", self.storage), &body)
                         .await
                     {
-                        Ok(v) => v["id"].as_str().unwrap_or_default().to_string(),
+                        Ok(v) => {
+                            let id = v["id"].as_str().unwrap_or_default().to_string();
+                            if !id.is_empty() {
+                                fresh.push(id.clone());
+                            }
+                            id
+                        }
                         Err(e) => {
                             self.release(&done).await;
                             // A golden that is not here *yet* is not a
@@ -1457,7 +1574,10 @@ impl VmManager {
                     }
                 },
                 DiskSource::CloudInit => match self.seed_volume(vm, keys).await {
-                    Ok(id) => id,
+                    Ok(id) => {
+                        fresh.push(id.clone());
+                        id
+                    }
                     Err(e) => {
                         self.release(&done).await;
                         return Err(StartFail::Failed(format!("disk {}: {e}", d.name)));
@@ -1669,12 +1789,17 @@ impl VmManager {
             .into_iter()
             .map(|(name, contents)| json!({ "path": name, "contents": contents }))
             .collect();
-        self.post(
-            &format!("{}/api/v1/volumes/{id}/cidata", self.storage),
-            &json!({ "files": files, "label": "CIDATA" }),
-        )
-        .await
-        .map_err(|e| format!("writing the seed: {e}"))?;
+        if let Err(e) = self
+            .post(
+                &format!("{}/api/v1/volumes/{id}/cidata", self.storage),
+                &json!({ "files": files, "label": "CIDATA" }),
+            )
+            .await
+        {
+            // Made here and unusable: not left behind for the next try (#76).
+            self.delete_volumes(&vm.name, std::slice::from_ref(&id)).await;
+            return Err(format!("writing the seed: {e}"));
+        }
         Ok(id)
     }
 
@@ -2023,19 +2148,24 @@ impl VmManager {
     }
 
     async fn destroy_owned(&self, vm: &Vm) {
-        for id in &vm.owned_volumes {
+        self.delete_volumes(&vm.name, &vm.owned_volumes).await;
+    }
+
+    /// Delete these volumes. Best effort, each failure logged.
+    async fn delete_volumes(&self, vm: &str, ids: &[String]) {
+        for id in ids {
             let url = format!("{}/api/v1/volumes/{id}", self.storage);
             match self.engine.delete(&url).await {
                 Ok(r) if r.status().is_success() => {
-                    info!(vm = %vm.name, volume = %id, "deleted the machine's own volume");
+                    info!(vm = %vm, volume = %id, "deleted the machine's own volume");
                 }
                 Ok(r) => {
                     let code = r.status();
                     let body = r.text().await.unwrap_or_default();
-                    warn!(vm = %vm.name, volume = %id,
+                    warn!(vm = %vm, volume = %id,
                           "could not delete: {code} {}", body.trim());
                 }
-                Err(e) => warn!(vm = %vm.name, volume = %id, "could not delete: {e}"),
+                Err(e) => warn!(vm = %vm, volume = %id, "could not delete: {e}"),
             }
         }
     }
@@ -2069,14 +2199,37 @@ impl VmManager {
     /// Pending rather than Failed, with the reason — so a console shows
     /// "waiting for golden fedora-43" instead of a machine that looks broken
     /// and a person who deletes it and tries again.
+    /// A VirtualMachine by name, or `None` when there is none or it could not
+    /// be read.
+    async fn get_vm(&self, ns: &str, name: &str) -> Option<Value> {
+        if self.api_url.is_empty() {
+            return None;
+        }
+        let url = format!("{}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}", self.api_url);
+        let r = self.api.get(&url).send().await.ok()?;
+        if !r.status().is_success() {
+            return None;
+        }
+        r.json().await.ok()
+    }
+
+    /// Pending after a failed start that will be tried again (#76).
+    async fn patch_retrying(&self, ns: &str, name: &str, why: &str) {
+        self.patch_pending_as(ns, name, "FailedStart", why).await;
+    }
+
     async fn patch_pending(&self, ns: &str, name: &str, why: &str) {
+        self.patch_pending_as(ns, name, "Waiting", why).await;
+    }
+
+    async fn patch_pending_as(&self, ns: &str, name: &str, reason: &str, why: &str) {
         let url = format!(
             "{}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{name}/status",
             self.api_url
         );
         let body = json!({ "status": {
             "phase": "Pending",
-            "reason": "Waiting",
+            "reason": reason,
             "message": why,
             "nodeName": self.node_name,
         }});
@@ -2853,14 +3006,70 @@ mod tests {
 
     /// Without a ring there is no engine, and a VM that "started" without one
     /// would be a status nobody can act on.
+    ///
+    /// Retried, not recorded Failed for good (#76): a standalone VMI has no
+    /// run strategy saying to give up. Not again before its backoff, and at
+    /// once when its spec changes.
     #[tokio::test]
-    async fn no_ring_is_a_failed_vm_with_a_reason_not_a_silent_nothing() {
+    async fn a_failed_start_is_retried_with_backoff_not_given_up() {
         let m = VmManager::new(None, "n1", reqwest::Client::new(), "http://127.0.0.1:1");
+        let attempts = |m: &VmManager| m.retries.lock().unwrap().get("u-1").map(|r| (r.attempts, r.generation));
         m.sync(&[vmi("n1")]).await;
+        assert!(m.running().await.is_empty(), "not recorded: it will be tried again");
+        assert_eq!(attempts(&m), Some((1, 0)));
+
+        // Inside the backoff: not tried.
+        m.sync(&[vmi("n1")]).await;
+        assert_eq!(attempts(&m), Some((1, 0)));
+
+        // A new spec is tried at once, and counts from one.
+        let mut changed = vmi("n1");
+        changed["metadata"]["generation"] = json!(2);
+        m.sync(&[changed]).await;
+        assert_eq!(attempts(&m), Some((1, 2)));
+
+        // No longer wanted: forgotten.
+        m.sync(&[]).await;
+        assert_eq!(attempts(&m), None);
+    }
+
+    /// A VirtualMachine with `runStrategy: Once` asked for no second try: that
+    /// one is recorded Failed with the reason, as before (#76).
+    #[tokio::test]
+    async fn a_failed_start_under_run_strategy_once_is_failed_with_a_reason() {
+        use axum::routing::get;
+        let app = axum::Router::new()
+            .route(
+                "/apis/kubevirt.io/v1/namespaces/default/virtualmachines/web",
+                get(|| async { axum::Json(json!({"spec": {"runStrategy": "Once"}})) }),
+            )
+            .fallback(|| async { axum::Json(json!({})) });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), &url);
+        let mut obj = vmi("n1");
+        obj["metadata"]["ownerReferences"] = json!([{"kind": "VirtualMachine", "name": "web"}]);
+        m.sync(&[obj]).await;
         let all = m.running().await;
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].phase, Phase::Failed);
         assert!(all[0].message.contains("no ring"), "{}", all[0].message);
+    }
+
+    #[test]
+    fn retries_back_off_from_ten_seconds_to_five_minutes() {
+        let d = |n| retry_delay(n).as_secs();
+        assert_eq!((d(1), d(2), d(3), d(4), d(5), d(6), d(7)), (10, 20, 40, 80, 160, 300, 300));
+        assert_eq!(d(1000), 300);
+        assert!(!gives_up(None));
+        assert!(!gives_up(Some(&json!({"spec": {"running": true}}))));
+        assert!(!gives_up(Some(&json!({"spec": {"runStrategy": "RerunOnFailure"}}))));
+        assert!(gives_up(Some(&json!({"spec": {"runStrategy": "Manual"}}))));
+        let owned = json!({"metadata": {"ownerReferences": [{"kind": "Pod", "name": "p"}, {"kind": "VirtualMachine", "name": "vm"}]}});
+        assert_eq!(owner_vm(&owned), Some("vm"));
+        assert_eq!(owner_vm(&json!({"metadata": {}})), None);
     }
 
     /// An apiserver and an engine on one port (their paths do not overlap):
