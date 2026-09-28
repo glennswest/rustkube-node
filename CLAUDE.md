@@ -73,7 +73,9 @@ Steps:
        guest's keys alone (no lock-out). `Vm.access` holds it.
 3. [x] `AccessCredentialsSynchronized` merged into the VMI's existing conditions; transition time held while
        the status holds.
-4. [ ] Tests, docs, CHANGELOG, sc-build. The issue's done-when (ssh in on the test host) waits on C2NR0Q2.
+4. [x] Tests, docs (README), CHANGELOG. sc-build at 1f5409a: build clean, all pass (kubelet 207).
+5. [ ] The issue's done-when on the test host: console-created VM, ssh in with the key; "Add my keys" live.
+       Waits on C2NR0Q2 (unreachable) and a release. Then close.
 
 ### In progress: #91, a bridged VM's IP from its tap (stormvm_net::snoop_tap)
 
