@@ -1346,13 +1346,15 @@ impl VmManager {
         info!(vm = %vm.name, "vm stopped");
     }
 
-    /// Clone or attach every disk. Failure gives back what it already took —
-    /// an attachment left behind is a device nobody will ever release.
+    /// [`Self::resolve_disks_with_keys`] with no keys: for tests.
+    #[cfg(test)]
     async fn resolve_disks(&self, vm: &VmSpec) -> Result<(Vec<ResolvedDisk>, Vec<String>), StartFail> {
         self.resolve_disks_with_keys(vm, &[]).await
     }
 
-    /// [`Self::resolve_disks`], with SSH keys for the seed's `public-keys`.
+    /// Clone or attach every disk. Failure gives back what it already took —
+    /// an attachment left behind is a device nobody will ever release.
+    /// `keys` go into a cloud-init seed's `public-keys` (#92).
     async fn resolve_disks_with_keys(
         &self,
         vm: &VmSpec,
