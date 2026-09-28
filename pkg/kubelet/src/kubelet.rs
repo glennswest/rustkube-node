@@ -1178,6 +1178,37 @@ async fn mirror_node_services(client: &reqwest::Client, api_url: &str, node: &st
         }
     }
 
+    // Mirrors of assets PID 1 did not list on this boot (#87): not running,
+    // said once, never deleted.
+    let list_url = format!(
+        "{api_url}/api/v1/namespaces/kube-system/pods?labelSelector=storm.io%2Fcomponent%3Dnode-service"
+    );
+    if let Ok(r) = client.get(&list_url).send().await {
+        if r.status().is_success() {
+            if let Ok(list) = r.json::<Value>().await {
+                for pod in crate::mirror::stale_mirrors(&list, node, &assets) {
+                    let name = pod["metadata"]["name"].as_str().unwrap_or("");
+                    let marked = crate::mirror::not_started(pod);
+                    let put = client
+                        .put(format!("{api_url}/api/v1/namespaces/kube-system/pods/{name}/status"))
+                        .json(&marked)
+                        .send()
+                        .await;
+                    match put {
+                        Ok(r) if r.status().is_success() => {
+                            let msg = marked["status"]["message"].as_str().unwrap_or("").to_string();
+                            if let Some(ev) = &events {
+                                ev.pod_event(&marked, "Warning", crate::mirror::NOT_STARTED, &msg).await;
+                            }
+                        }
+                        Ok(r) => debug!("mirror {name}: not-started status -> {}", r.status()),
+                        Err(e) => debug!("mirror {name}: not-started status: {e}"),
+                    }
+                }
+            }
+        }
+    }
+
     let now = chrono::Utc::now();
     for a in &assets {
         // startTime from the age PID 1 reported: the two ends share no clock,

@@ -81,6 +81,15 @@ from the claim's, so a PV deleted over a surviving clone would let a later
 claim of the same name in the same namespace adopt the previous tenant's
 data.
 
+## The node's services as pods
+
+Every 15 s the kubelet reads PID 1's asset table (`/run/stormpump/assets.json`) and mirrors each asset as a
+read-only pod, `kube-system/<asset>-<node>` (labels `storm.io/asset`, `storm.io/component=node-service`).
+A running asset's pod is Running and Ready, and a stopped one is Failed. A mirror whose asset is not in the
+table on this boot (its unit was not started) becomes Pending, with its container waiting `NotStarted`, no
+`startTime`, and one Warning Event. It used to keep the previous boot's Running status. Mirrors are never
+deleted by the kubelet, and `kubectl logs` on them is described above.
+
 ## Storage
 
 Claims of the built-in `stormblock` class are cloned and attached by the

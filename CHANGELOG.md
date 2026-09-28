@@ -3,6 +3,13 @@
 ## [Unreleased]
 <!-- New unreleased changes go here -->
 
+### 2026-09-28 (stale mirror pods, #87)
+- **fix(kubelet):** a node service that PID 1 did not start on this boot kept
+  its mirror pod's status from the previous boot (Running, the old
+  `startTime`), because the mirror only wrote assets in the table. Such a
+  mirror is now marked Pending, with its container waiting `NotStarted` and a
+  Warning Event. It is written once and never deleted.
+
 ### 2026-09-28 (node service logs, #72)
 - **feat(kubelet):** `kubectl logs -n kube-system <asset>-<node>` reads the
   service's stormd log volume: the volume its boot unit mounts at
