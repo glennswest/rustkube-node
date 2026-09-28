@@ -60,6 +60,20 @@ Steps:
        golden-rustkube-node-d9a108728be0 (at ccb7bfc; the first stage try died on dev: no NVMe device). No
        release request was filed by stage: stormcentral#117. #35 closed (sc-build only, not on a node).
 
+### In progress: #91, a bridged VM's IP from its tap (stormvm_net::snoop_tap)
+
+stormvm 2be5900 (lock moves 1b0d941 → dc1b7ea, `cargo update -p stormvm-net` on dev with
+`CARGO_NET_GIT_FETCH_WITH_CLI=true`; the lock diff applied here). `snoop_tap(tap, mac, changed)` → `Snooper`
+(`addresses()`, drop joins its thread, ≤1 s RCVTIMEO). `Made.binding == "host-bridge"` marks a tap on a node bridge.
+
+Steps:
+1. [ ] Lock bump; `resolve_nics` takes the uid and starts a snooper per host-bridge NIC before the spawn (a failure
+       to open it is a warning, not a failed start); `start` keeps them, into `snoopers[uid]` once running.
+2. [ ] Callback → unbounded channel → pump task (spawned in `run`): that NIC's addresses + `patch_status` at once.
+3. [ ] `absorb_ends`: snooper per NIC first, then guest agent, then neighbour table. Snoopers dropped (in
+       spawn_blocking) when the VM stops or ends.
+4. [ ] Tests, docs, CHANGELOG, sc-build. On-node check waits on C2NR0Q2.
+
 ### In progress: #87, static (mirror) pods: logs and stale status
 
 Logs: stormd services answered by #72. registry/stormblock/timesync wait on stormpump#55 (assets.json names no log).
