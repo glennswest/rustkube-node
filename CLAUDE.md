@@ -60,6 +60,22 @@ Steps:
        golden-rustkube-node-d9a108728be0 (at ccb7bfc; the first stage try died on dev: no NVMe device). No
        release request was filed by stage: stormcentral#117. #35 closed (sc-build only, not on a node).
 
+### In progress: #76, a failed VM start is retried with backoff, not recorded Failed for good
+
+Owner: "Nothing should be perm." rustkube#104 (v0.16.0) makes the VM controller recreate a *Failed* VMI under
+Always / RerunOnFailure / running:true and leave it under Once / Manual.
+
+Found, 2026-09-28: every start clones a new root from its golden and makes a new seed, and a failed start
+only detaches (`release`), so each retry would leak two volumes.
+
+Steps:
+1. [ ] A failed start deletes the volumes it created in that attempt (golden clones, seeds; never a reused
+       emptyDisk), in `resolve_disks` and after it.
+2. [ ] `StartFail::Failed`: retry with backoff 10 s doubling to 5 min, keyed on uid + generation (a spec change
+       retries at once). Pending with the reason + attempt + next try, Warning Event each attempt.
+       Failed for good only when the owning VM's runStrategy is Once or Manual. Standalone VMI: retried.
+3. [ ] Tests, docs, CHANGELOG, sc-build.
+
 ### In progress: #92, a VMI's accessCredentials (keys into the seed and through the agent)
 
 stormvm e5b4d16 (in the dc1b7ea lock): `VmSpec.access_credentials`, `access::keys_in_secret`, `Seed.public_keys`,
