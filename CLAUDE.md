@@ -94,6 +94,8 @@ number (`stormpump_ring::OP_DEPOSIT_WITHDRAW`).
    sc-build 077ad5c `cargo build --locked && cargo test --locked`: 257 kubelet
    unit, 4 integration, 24 CNI, 17 proxy, 1 doc-test pass (1 ignored). Not run
    on a node (live validation is #102/#110).
+5. [x] Issue closed. Stage golden golden-rustkube-node-2fb5a1e7ab0d (ac738df),
+   release request stormcos#164.
 
 ### Done (history): #100, common bounded per-UID Pod/VMI workers
 

@@ -2,6 +2,7 @@
 
 ## 2026-09-29
 
+- **chore:** Stage golden golden-rustkube-node-2fb5a1e7ab0d at ac738df (#100), release request stormcos#164.
 - **feat:** Unwind a failed, panicked or abandoned VM start: a per-UID ledger
   records each tap deposit before it is sent and each volume/spec handle as it
   is registered; stormpump's `DEPOSIT_WITHDRAW` (op 9, stormpump#63) and handle
