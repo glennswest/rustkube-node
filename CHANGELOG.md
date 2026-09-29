@@ -2,6 +2,8 @@
 
 ## 2026-09-29
 
+- **docs:** Record the owner-authorized #114 merge plan and two-branch workspace validation.
+
 - **docs:** Reconcile the worker design with implemented adapters and record
   stormpump#63 as the remaining VM cancellation dependency for #100.
 

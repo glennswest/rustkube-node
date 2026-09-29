@@ -37,6 +37,20 @@ not the release path.
 
 ## Work plan
 
+### In progress: #114, merge turbomode into main
+
+2026-09-29: owner instruction in #114 supersedes the earlier no-merge hold.
+Preserve main's #91 address pump, #35 failed-list protection, #53 snapshots
+and #75 VM disk ownership in the UID worker design. Open #100/#101/#102
+work continues on main afterwards; no golden or release is requested here.
+
+1. [x] Read #114, #100, project rules and open issues; checkout is clean.
+2. [ ] Merge origin/main into turbomode; resolve and review semantic conflicts.
+3. [ ] Push and run full sc-build (cargo build --locked && cargo test --locked).
+4. [ ] Merge turbomode into main with --no-ff, push and repeat full sc-build.
+5. [ ] Record merge/test evidence and remaining work on #114, then close it.
+
+
 ### Parked on stormpump#63: #100, common bounded per-UID Pod/VMI workers
 
 2026-09-29: master's decision on #100 authorizes continuing at turbomode 9b46886,
