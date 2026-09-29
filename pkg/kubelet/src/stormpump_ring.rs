@@ -37,6 +37,15 @@ use stormpump_abi::{ArenaRef, Cqe, Op, Sqe};
 /// the first set went on running unsupervised.
 pub const TOKEN: [u8; 16] = *b"rustkube-kubelet";
 
+/// `DEPOSIT_WITHDRAW` (stormpump#63), by number: the locked stormpump-abi
+/// predates `Op::DepositWithdraw`, and the lock cannot move until stormvm#65.
+pub const OP_DEPOSIT_WITHDRAW: u8 = 9;
+
+/// The engine's answer for a handle that was already released.
+pub const ESTALE: i32 = 116;
+/// The engine's answer for an op it does not know, or a malformed argument.
+pub const EINVAL: i32 = 22;
+
 /// A request for the ring thread.
 struct Request {
     sqe: Sqe,
@@ -316,6 +325,45 @@ impl RingClient {
             .map_err(|_| RingError::Gone)?;
         }
         answer.recv().map_err(|_| RingError::Gone)?
+    }
+
+    /// Close a descriptor this client deposited that no spawn consumed
+    /// (stormpump#63). `true` when one was closed, `false` when none was held:
+    /// never deposited, consumed by a spawn, or already withdrawn. Safe to send
+    /// again, and it cannot reach a running workload, whose child holds its own
+    /// copy.
+    ///
+    /// **Why it matters**: a tap exists while anything holds its descriptor. A
+    /// VM start that deposited a tap and then failed left the engine holding
+    /// it for the life of the connection, and the next start under the same
+    /// name met EBUSY at TUNSETIFF.
+    ///
+    /// Sent after the deposit on the same thread, so the ring thread has put
+    /// the descriptor on the socket before the SQE, and the engine collects
+    /// waiting deposits before it dispatches a withdraw. An engine older than
+    /// the op answers EINVAL, the same as a bad name.
+    pub fn deposit_withdraw(&self, name: &str) -> Result<bool, RingError> {
+        let cqe = self.submit(
+            Sqe {
+                opcode: OP_DEPOSIT_WITHDRAW,
+                ..Default::default()
+            },
+            Some(name.as_bytes().to_vec()),
+        )?;
+        Ok(cqe.aux == 1)
+    }
+
+    /// Release a defined spec. ESTALE: it was released already.
+    pub fn spec_release(&self, spec: Handle) -> Result<(), RingError> {
+        self.submit(
+            Sqe {
+                opcode: Op::SpecRelease as u8,
+                primary: spec,
+                ..Default::default()
+            },
+            None,
+        )?;
+        Ok(())
     }
 
     /// Define a spec, returning its handle.

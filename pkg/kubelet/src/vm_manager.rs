@@ -553,6 +553,111 @@ impl Phase {
     }
 }
 
+/// One thing a start put in the engine that is not yet a running machine's
+/// (#100): a deposited tap, a registered volume, a defined spec.
+///
+/// A start that failed, panicked or was abandoned part way used to leave these
+/// behind. The tap is the one that hurts: a tap exists while anything holds its
+/// descriptor, so a deposit nobody spawned kept it alive for the life of the
+/// engine connection, and the next start under the same name met EBUSY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UndoKind {
+    Volume,
+    Spec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Undo {
+    /// A descriptor deposited under this name.
+    Deposit(String),
+    /// A registered volume or a defined spec.
+    Release(UndoKind, Handle),
+}
+
+impl std::fmt::Display for Undo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Undo::Deposit(name) => write!(f, "deposit {name}"),
+            Undo::Release(UndoKind::Volume, h) => write!(f, "volume handle {}", h.0),
+            Undo::Release(UndoKind::Spec, h) => write!(f, "spec handle {}", h.0),
+        }
+    }
+}
+
+/// How an [`Undo`] is carried out: the ring in a kubelet, a fake in tests.
+/// Blocking, and called off the runtime.
+pub(crate) trait Unwinder: Send + Sync {
+    fn undo(&self, step: &Undo) -> Result<(), String>;
+}
+
+impl Unwinder for RingClient {
+    fn undo(&self, step: &Undo) -> Result<(), String> {
+        let result = match step {
+            Undo::Deposit(name) => self.deposit_withdraw(name).map(|_| ()),
+            Undo::Release(UndoKind::Volume, h) => self.volume_release(*h),
+            Undo::Release(UndoKind::Spec, h) => self.spec_release(*h),
+        };
+        undone(step, result)
+    }
+}
+
+/// Whether the engine's answer to an [`Undo`] means it is done.
+fn undone(step: &Undo, result: Result<(), RingError>) -> Result<(), String> {
+    use crate::stormpump_ring::{EINVAL, ESTALE};
+    match (step, result) {
+        (_, Ok(())) => Ok(()),
+        // Our names are valid (the deposit took them), so EINVAL is an engine
+        // older than the op. Nothing can withdraw it then, and holding starts
+        // for ever would be worse than the leak: the engine closes a client's
+        // deposits when the client goes.
+        (Undo::Deposit(name), Err(RingError::Failed { errno: EINVAL, .. })) => {
+            warn!(deposit = %name, "stormpump has no DEPOSIT_WITHDRAW (older than stormpump#63); the tap stays held until this kubelet reconnects");
+            Ok(())
+        }
+        // Released already: what was wanted.
+        (Undo::Release(..), Err(RingError::Failed { errno: ESTALE, .. })) => Ok(()),
+        (_, Err(e)) => Err(e.to_string()),
+    }
+}
+
+/// Starts' leftovers by uid, written as they happen: before each deposit and
+/// as each handle is registered. Held outside the start's future, so a start
+/// that is dropped or panics still leaves the record the next pass unwinds.
+type Ledger = Arc<std::sync::Mutex<HashMap<String, Vec<Undo>>>>;
+
+/// The ledger key for leftovers of UIDs that are gone. Only handles land
+/// here: a deletion is not acknowledged while a deposit is still held.
+const ORPHANED: &str = "";
+
+fn note(ledger: &Ledger, uid: &str, step: Undo) {
+    ledger.lock().unwrap_or_else(|e| e.into_inner()).entry(uid.to_string()).or_default().push(step);
+}
+
+/// Tap watchers dropped off the runtime: dropping one joins its thread, which
+/// can take up to a second.
+struct Watchers(Vec<(usize, stormvm_net::Snooper)>);
+
+impl Watchers {
+    fn take(mut self) -> Vec<(usize, stormvm_net::Snooper)> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for Watchers {
+    fn drop(&mut self) {
+        let watchers = std::mem::take(&mut self.0);
+        if watchers.is_empty() {
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn_blocking(move || drop(watchers));
+            }
+            Err(_) => drop(watchers),
+        }
+    }
+}
+
 pub struct VmManager {
     ring: Option<Arc<RingClient>>,
     /// stormblock's management API on this node.
@@ -619,6 +724,17 @@ pub struct VmManager {
     retries: std::sync::Mutex<HashMap<String, Retry>>,
     /// When the orphan sweep last ran (#75).
     swept: std::sync::Mutex<Option<std::time::Instant>>,
+    /// What unfinished starts left in the engine, by uid (#100).
+    partial: Ledger,
+    /// Undoes it. The ring, when there is one.
+    unwinder: Option<Arc<dyn Unwinder>>,
+    /// Held from a start's first deposit to the engine's answer to its spawn,
+    /// and by every withdraw (#100). stormvm names a deposit `tap-<nic>`, and
+    /// the engine keys deposits by client and name, so two machines starting
+    /// at once with a NIC called `default` would replace each other's tap:
+    /// this is what keeps the per-UID workers from doing that. The window is
+    /// milliseconds; disks are resolved outside it.
+    deposit_window: Mutex<()>,
 }
 
 /// A failed start waiting for its next try (#76).
@@ -704,6 +820,7 @@ impl VmManager {
         let events = (!api_url.is_empty())
             .then(|| crate::events::EventRecorder::new(api.clone(), &api_url, &node_name));
         let (snoop_tx, snoop_rx) = tokio::sync::mpsc::unbounded_channel();
+        let unwinder = ring.clone().map(|r| r as Arc<dyn Unwinder>);
         VmManager {
             ring,
             storage: crate::engine::DEFAULT_URL.into(),
@@ -724,7 +841,86 @@ impl VmManager {
             snoop_rx: std::sync::Mutex::new(Some(snoop_rx)),
             retries: std::sync::Mutex::new(HashMap::new()),
             swept: std::sync::Mutex::new(None),
+            partial: Arc::default(),
+            unwinder,
+            deposit_window: Mutex::new(()),
         }
+    }
+
+    #[cfg(test)]
+    fn with_unwinder(mut self, unwinder: Arc<dyn Unwinder>) -> Self {
+        self.unwinder = Some(unwinder);
+        self
+    }
+
+    /// Undo what unfinished starts of `uid` left in the engine (#100), and
+    /// retry the leftovers of UIDs already gone.
+    ///
+    /// `Err` names the deposits still held: a tap the engine holds is a tap
+    /// the next start under this name cannot open, so the caller waits.
+    /// A handle that would not release is a leak, not a conflict: it is kept
+    /// and retried, and does not hold anything up. On `last` (the uid is
+    /// being let go) those move to [`ORPHANED`], retried by later passes.
+    ///
+    /// Only from this uid's own worker, which the executor never runs twice
+    /// at once: nothing else notes steps under it meanwhile. Inside the
+    /// deposit window, because a deposit is named `tap-<nic>` in one namespace
+    /// per client: withdrawing `tap-default` while another machine sits
+    /// between its deposit and its spawn would take that machine's tap.
+    async fn unwind(&self, uid: &str, last: bool) -> Result<(), String> {
+        let _window = self.deposit_window.lock().await;
+        self.unwind_held(uid, last).await
+    }
+
+    /// [`Self::unwind`], by a caller already inside the deposit window.
+    async fn unwind_held(&self, uid: &str, last: bool) -> Result<(), String> {
+        let steps: Vec<(String, Undo)> = {
+            let mut ledger = self.partial.lock().unwrap_or_else(|e| e.into_inner());
+            let mut steps = Vec::new();
+            for key in [uid, ORPHANED] {
+                // Newest first: the reverse of how they were made.
+                for step in ledger.remove(key).unwrap_or_default().into_iter().rev() {
+                    steps.push((key.to_string(), step));
+                }
+            }
+            steps
+        };
+        if steps.is_empty() {
+            return Ok(());
+        }
+        let left = match self.unwinder.clone() {
+            None => steps
+                .into_iter()
+                .map(|(k, s)| (k, s, "no connection to stormpump".to_string()))
+                .collect(),
+            Some(u) => {
+                let kept = steps.clone();
+                match tokio::task::spawn_blocking(move || {
+                    steps
+                        .into_iter()
+                        .filter_map(|(k, s)| u.undo(&s).err().map(|e| (k, s, e)))
+                        .collect::<Vec<_>>()
+                })
+                .await
+                {
+                    Ok(left) => left,
+                    Err(e) => kept.into_iter().map(|(k, s)| (k, s, format!("undo task: {e}"))).collect(),
+                }
+            }
+        };
+        let mut held = Vec::new();
+        let mut ledger = self.partial.lock().unwrap_or_else(|e| e.into_inner());
+        // Put back oldest first, so the next pass undoes newest first again.
+        for (key, step, why) in left.into_iter().rev() {
+            if matches!(step, Undo::Deposit(_)) {
+                held.push(format!("{step}: {why}"));
+            } else {
+                warn!(vm_uid = %uid, "could not release {step} of an unfinished start: {why}");
+            }
+            let key = if last && !matches!(step, Undo::Deposit(_)) { ORPHANED.to_string() } else { key };
+            ledger.entry(key).or_default().push(step);
+        }
+        if held.is_empty() { Ok(()) } else { Err(held.join("; ")) }
     }
 
     /// Write a tap watcher's news to the VMI as it arrives (#91): "within
@@ -1009,6 +1205,10 @@ impl VmManager {
                 self.vms.lock().await.remove(uid);
             }
             self.retries.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+            // A failed start's tap still held would meet a successor of the
+            // same name: the deletion (and its name) is held until it goes.
+            self.unwind(uid, true).await
+                .map_err(|e| anyhow::anyhow!("VM start cleanup pending for {uid}: {e}"))?;
             if let Some(object) = object { anyhow::ensure!(self.set_finalizer(object, false).await,"VM finalizer cleanup pending"); }
             return Ok(true);
         }
@@ -1257,7 +1457,17 @@ impl VmManager {
     /// retried (#76), that is two volumes left behind per attempt. What it
     /// found and reused (an `emptyDisk`, a claim, a `volume:`) is not
     /// deleted: that may be the guest's data.
+    ///
+    /// What the attempt put in the engine (taps, volume and spec handles) is
+    /// undone too, in [`Self::launch`]'s window (#100), and a start does not
+    /// begin while an earlier one's tap is still held: it would only meet
+    /// EBUSY.
     async fn start(&self, uid: &str, obj: &Value) -> Result<(), StartFail> {
+        if let Err(e) = self.unwind(uid, false).await {
+            return Err(StartFail::Waiting(format!(
+                "an earlier start's tap is still held by stormpump: {e}"
+            )));
+        }
         let _disks = self.disk_lifecycle.read().await;
         let mut fresh = Vec::new();
         let result = self.start_attempt(uid, obj, &mut fresh).await;
@@ -1307,98 +1517,23 @@ impl VmManager {
             self.release(&disks).await;
             return Err(StartFail::Failed(format!("could not make {dir}: {e}")));
         }
-        // NICs, before the plan: the tap has to exist so its descriptor can
-        // be named, and it has to be deposited so the engine can find it by
-        // that name.
-        // The tap watchers come back too, held here until the machine is
-        // recorded: a start that fails below drops them with it.
-        let (nics, nic_reports, snoopers) = match self.resolve_nics(uid, &ns, &vm, &ring).await {
-            Ok(n) => n,
+        // Taps, plan and spawn, inside the deposit window (#100): a failure
+        // there is unwound before another start may deposit.
+        let launched = {
+            let _window = self.deposit_window.lock().await;
+            let launched = self.launch(uid, &ns, &vm, ring, &disks, &dir).await;
+            if launched.is_err() {
+                if let Err(e) = self.unwind_held(uid, false).await {
+                    warn!(vm = %vm.name, "a failed start's taps are still held, retried before the next: {e}");
+                }
+            }
+            launched
+        };
+        let (handle, nic_reports, snoopers, registration) = match launched {
+            Ok(l) => l,
             Err(e) => {
                 self.release(&disks).await;
                 return Err(StartFail::Failed(e));
-            }
-        };
-
-        let logging = Logging::pod(&dir, 0);
-
-        // Register the machine for the console doors, before the spawn
-        // (rustkube-node#38).
-        //
-        // stormvm's console daemon resolves a VM out of the run directory
-        // rather than out of an apiserver — it is a different process from
-        // whatever started the machine and has to answer "where is
-        // default/web-1's serial socket" across its own restart, with no
-        // cluster to ask. `stormvm start` writes this file; the kubelet did
-        // not, so a VM the kubelet started was invisible: `/api/v1/vms` empty
-        // and every attach a 404.
-        //
-        // Before the spawn, and from the same `logging` and run dir the plan
-        // is built from, so it describes *this* machine rather than a second
-        // reading of the spec. The console reports a door open only when the
-        // socket is actually there, so a registration that precedes the
-        // hypervisor is right: it says what was asked for, and the socket says
-        // whether the machine got that far.
-        let registration = stormvm_node::console::Registration::of(&vm, uid, &logging, RUN_ROOT);
-        if let Err(e) = stormvm_node::console::write(RUN_ROOT, &registration) {
-            // Not fatal: a machine that runs without a console door is worse
-            // than one that does not run at all only to whoever wanted the
-            // door. Warned rather than swallowed, because the symptom at the
-            // console end is a 404 with nothing to say why.
-            warn!(vm = %vm.name, "could not register for the console doors: {e}");
-        }
-
-        let built = match plan::build_with_nics(&vm, &disks, &nics, &logging, RUN_ROOT) {
-            Ok(p) => p,
-            Err(e) => {
-                deregister(&vm.namespace, &vm.name);
-                self.release(&disks).await;
-                return Err(StartFail::Failed(format!("{e:#}")));
-            }
-        };
-
-        // The run directory, from the plan rather than rebuilt here.
-        //
-        // It is `<RUN_ROOT>/<ns>/<name>` now that a VM is qualified by its
-        // namespace (stormvm#6), and the plan has already told the hypervisor
-        // to bind its sockets there. A second `format!` that disagreed would
-        // leave qemu binding into a directory nobody made, and the failure
-        // names neither the path nor the reason — which is why the plan
-        // carries it out rather than expecting it to be derived twice.
-        //
-        // After the plan, therefore, not before.
-        if let Err(e) = std::fs::create_dir_all(&built.run_dir) {
-            deregister(&vm.namespace, &vm.name);
-            self.release(&disks).await;
-            return Err(StartFail::Failed(format!("could not make {}: {e}", built.run_dir)));
-        }
-
-        // The ring is blocking and owns its own thread; the async side reaches
-        // it through `spawn_blocking`, as the container path does.
-        let domain = built.domain;
-        let volumes = built.volumes.clone();
-        let spec_bytes = built.spec.clone();
-        let started = tokio::task::spawn_blocking(move || -> Result<Handle, RingError> {
-            let mut handles = Vec::with_capacity(volumes.len());
-            for path in &volumes {
-                handles.push(ring.volume_register(path)?);
-            }
-            let spec = ring.spec_define(spec_bytes)?;
-            // No root and no sandbox: a machine's root is a disk on the
-            // hypervisor's command line, and a VM is not put in a pod's
-            // network namespace by the engine — its NIC is a tap, which is a
-            // descriptor rather than a namespace.
-            ring.spawn(spec, Handle::NONE, handles[0], Handle::NONE, &handles[1..], domain)
-        })
-        .await
-        .map_err(|e| format!("ring task: {e}"))?;
-
-        let handle = match started {
-            Ok(h) => h,
-            Err(e) => {
-                deregister(&vm.namespace, &vm.name);
-                self.release(&disks).await;
-                return Err(StartFail::Failed(format!("stormpump refused: {e:?}")));
             }
         };
 
@@ -1433,11 +1568,127 @@ impl VmManager {
             rec.access.condition = Some(access_condition(None, &outcome, &now_rfc3339()));
         }
         self.vms.lock().await.insert(uid.to_string(), rec.clone());
+        let snoopers = snoopers.take();
         if !snoopers.is_empty() {
             self.snoopers.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), snoopers);
         }
         self.patch_status(&rec).await;
         Ok(())
+    }
+
+    /// Taps, console registration, plan and spawn: everything from the first
+    /// deposit to the engine's answer (#100). Called only inside the deposit
+    /// window; on `Err` the caller unwinds what the ledger says before leaving
+    /// it, and gives the disks back.
+    async fn launch(
+        &self,
+        uid: &str,
+        ns: &str,
+        vm: &VmSpec,
+        ring: Arc<RingClient>,
+        disks: &[ResolvedDisk],
+        dir: &str,
+    ) -> Result<(Handle, Vec<NicReport>, Watchers, stormvm_node::console::Registration), String> {
+        // NICs, before the plan: the tap has to exist so its descriptor can
+        // be named, and it has to be deposited so the engine can find it by
+        // that name.
+        // The tap watchers come back too, held here until the machine is
+        // recorded: a start that fails below drops them with it.
+        let (nics, nic_reports, snoopers) = self.resolve_nics(uid, ns, vm, &ring).await?;
+        let snoopers = Watchers(snoopers);
+
+        let logging = Logging::pod(dir, 0);
+
+        // Register the machine for the console doors, before the spawn
+        // (rustkube-node#38).
+        //
+        // stormvm's console daemon resolves a VM out of the run directory
+        // rather than out of an apiserver — it is a different process from
+        // whatever started the machine and has to answer "where is
+        // default/web-1's serial socket" across its own restart, with no
+        // cluster to ask. `stormvm start` writes this file; the kubelet did
+        // not, so a VM the kubelet started was invisible: `/api/v1/vms` empty
+        // and every attach a 404.
+        //
+        // Before the spawn, and from the same `logging` and run dir the plan
+        // is built from, so it describes *this* machine rather than a second
+        // reading of the spec. The console reports a door open only when the
+        // socket is actually there, so a registration that precedes the
+        // hypervisor is right: it says what was asked for, and the socket says
+        // whether the machine got that far.
+        let registration = stormvm_node::console::Registration::of(vm, uid, &logging, RUN_ROOT);
+        if let Err(e) = stormvm_node::console::write(RUN_ROOT, &registration) {
+            // Not fatal: a machine that runs without a console door is worse
+            // than one that does not run at all only to whoever wanted the
+            // door. Warned rather than swallowed, because the symptom at the
+            // console end is a 404 with nothing to say why.
+            warn!(vm = %vm.name, "could not register for the console doors: {e}");
+        }
+
+        let built = match plan::build_with_nics(vm, disks, &nics, &logging, RUN_ROOT) {
+            Ok(p) => p,
+            Err(e) => {
+                deregister(&vm.namespace, &vm.name);
+                return Err(format!("{e:#}"));
+            }
+        };
+
+        // The run directory, from the plan rather than rebuilt here.
+        //
+        // It is `<RUN_ROOT>/<ns>/<name>` now that a VM is qualified by its
+        // namespace (stormvm#6), and the plan has already told the hypervisor
+        // to bind its sockets there. A second `format!` that disagreed would
+        // leave qemu binding into a directory nobody made, and the failure
+        // names neither the path nor the reason — which is why the plan
+        // carries it out rather than expecting it to be derived twice.
+        //
+        // After the plan, therefore, not before.
+        if let Err(e) = std::fs::create_dir_all(&built.run_dir) {
+            deregister(&vm.namespace, &vm.name);
+            return Err(format!("could not make {}: {e}", built.run_dir));
+        }
+
+        // The ring is blocking and owns its own thread; the async side reaches
+        // it through `spawn_blocking`, as the container path does.
+        let domain = built.domain;
+        let volumes = built.volumes.clone();
+        let spec_bytes = built.spec.clone();
+        // Each handle is noted as the engine gives it, and the whole record
+        // is let go the moment the spawn succeeds — here, not after the await,
+        // so an abandoned start's record is right either way (#100).
+        let (ledger, owner) = (self.partial.clone(), uid.to_string());
+        let started = tokio::task::spawn_blocking(move || -> Result<Handle, RingError> {
+            let mut handles = Vec::with_capacity(volumes.len());
+            for path in &volumes {
+                let h = ring.volume_register(path)?;
+                note(&ledger, &owner, Undo::Release(UndoKind::Volume, h));
+                handles.push(h);
+            }
+            let spec = ring.spec_define(spec_bytes)?;
+            note(&ledger, &owner, Undo::Release(UndoKind::Spec, spec));
+            // No root and no sandbox: a machine's root is a disk on the
+            // hypervisor's command line, and a VM is not put in a pod's
+            // network namespace by the engine — its NIC is a tap, which is a
+            // descriptor rather than a namespace.
+            let h = ring.spawn(spec, Handle::NONE, handles[0], Handle::NONE, &handles[1..], domain)?;
+            // Deposits consumed; handles the machine's now.
+            ledger.lock().unwrap_or_else(|e| e.into_inner()).remove(&owner);
+            Ok(h)
+        })
+        .await;
+
+        match started {
+            Ok(Ok(handle)) => Ok((handle, nic_reports, snoopers, registration)),
+            Ok(Err(e)) => {
+                deregister(&vm.namespace, &vm.name);
+                Err(format!("stormpump refused: {e:?}"))
+            }
+            Err(e) => {
+                deregister(&vm.namespace, &vm.name);
+                Err(format!("ring task: {e}"))
+            }
+        }
+
     }
 
     /// Ask the engine about every running VM, because an exit that nothing
@@ -1872,7 +2123,9 @@ impl VmManager {
 
         let mut out = Vec::with_capacity(plans.len());
         let mut reports = Vec::with_capacity(plans.len());
-        let mut snoopers = Vec::new();
+        // Wrapped so a later NIC's failure drops the earlier watchers off the
+        // runtime rather than joining their threads on it.
+        let mut snoopers = Watchers(Vec::new());
         for p in &plans {
             // No sandbox: a VM on the pod network wants a namespace this
             // kubelet does not pop here yet, and `realise` refuses that
@@ -1888,6 +2141,9 @@ impl VmManager {
                 let r = ring.clone();
                 let slot = p.slot();
                 let nic = p.nic.clone();
+                // Noted before it is sent: a start abandoned mid-deposit must
+                // still withdraw it, and withdrawing one never sent is a no-op.
+                note(&self.partial, uid, Undo::Deposit(slot.clone()));
                 tokio::task::spawn_blocking(move || r.deposit_fd(&slot, fd))
                     .await
                     .map_err(|e| format!("deposit task: {e}"))?
@@ -1906,7 +2162,7 @@ impl VmManager {
                     let _ = tx.send(Snooped { uid: id.clone(), nic: i, addresses });
                 };
                 match stormvm_net::snoop_tap(&p.tap, &mac, seen) {
-                    Ok(s) => snoopers.push((i, s)),
+                    Ok(s) => snoopers.0.push((i, s)),
                     Err(e) => warn!(vm = %vm.name, nic = %p.nic, "cannot watch {} for the guest's address: {e}", p.tap),
                 }
             }
@@ -1925,7 +2181,7 @@ impl VmManager {
                 transport: made.transport,
             });
         }
-        Ok((out, reports, snoopers))
+        Ok((out, reports, snoopers.take()))
     }
 
 
@@ -3377,6 +3633,129 @@ mod tests {
         // No longer wanted: forgotten.
         m.sync(&[]).await;
         assert_eq!(attempts(&m), None);
+    }
+
+    /// A fake engine for undoing starts (#100): records what it was asked,
+    /// refuses deposits or handles while told to.
+    #[derive(Default)]
+    struct FakeUndo {
+        deposits_fail: std::sync::atomic::AtomicBool,
+        handles_fail: std::sync::atomic::AtomicBool,
+        seen: std::sync::Mutex<Vec<Undo>>,
+    }
+
+    impl Unwinder for FakeUndo {
+        fn undo(&self, step: &Undo) -> Result<(), String> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.seen.lock().unwrap().push(step.clone());
+            match step {
+                Undo::Deposit(_) if self.deposits_fail.load(SeqCst) => Err("the connection to stormpump is gone".into()),
+                Undo::Release(..) if self.handles_fail.load(SeqCst) => Err("EBUSY".into()),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    fn undo_manager() -> (VmManager, Arc<FakeUndo>) {
+        let undo = Arc::new(FakeUndo::default());
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), "").with_unwinder(undo.clone());
+        (m, undo)
+    }
+
+    fn ledger(m: &VmManager, uid: &str) -> Vec<Undo> {
+        m.partial.lock().unwrap().get(uid).cloned().unwrap_or_default()
+    }
+
+    /// An earlier start's tap still held blocks the next start (Waiting, not
+    /// Failed: nothing is wrong with the spec), and once it is withdrawn the
+    /// start goes ahead. Newest first (#100).
+    #[tokio::test]
+    async fn a_start_waits_while_an_earlier_starts_tap_is_held() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (m, undo) = undo_manager();
+        note(&m.partial, "u-1", Undo::Deposit("tap-default".into()));
+        note(&m.partial, "u-1", Undo::Release(UndoKind::Volume, Handle(7)));
+        undo.deposits_fail.store(true, SeqCst);
+
+        match m.start("u-1", &vmi("n1")).await {
+            Err(StartFail::Waiting(why)) => assert!(why.contains("tap-default"), "{why}"),
+            other => panic!("expected Waiting, got {other:?}"),
+        }
+        assert_eq!(
+            undo.seen.lock().unwrap().clone(),
+            vec![Undo::Release(UndoKind::Volume, Handle(7)), Undo::Deposit("tap-default".into())]
+        );
+        assert_eq!(ledger(&m, "u-1"), vec![Undo::Deposit("tap-default".into())], "the released handle is not kept");
+
+        undo.deposits_fail.store(false, SeqCst);
+        // Past the unwind: this manager has no ring, so the start itself fails there.
+        match m.start("u-1", &vmi("n1")).await {
+            Err(StartFail::Failed(why)) => assert!(why.contains("no ring"), "{why}"),
+            other => panic!("expected the ring failure, got {other:?}"),
+        }
+        assert!(ledger(&m, "u-1").is_empty());
+    }
+
+    /// A deleted VMI is not let go (nor its name) while its failed start's
+    /// tap is held; a handle that will not release does not hold it, and is
+    /// retried by later passes under the orphan key (#100).
+    #[tokio::test]
+    async fn a_deletion_is_held_until_its_taps_are_withdrawn() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (m, undo) = undo_manager();
+        note(&m.partial, "u-1", Undo::Deposit("tap-default".into()));
+        note(&m.partial, "u-1", Undo::Release(UndoKind::Spec, Handle(9)));
+        undo.deposits_fail.store(true, SeqCst);
+        undo.handles_fail.store(true, SeqCst);
+
+        let e = m.reconcile_one("u-1", None).await.unwrap_err();
+        assert!(e.to_string().contains("tap-default"), "{e}");
+        assert_eq!(ledger(&m, "u-1"), vec![Undo::Deposit("tap-default".into())]);
+        assert_eq!(ledger(&m, ORPHANED), vec![Undo::Release(UndoKind::Spec, Handle(9))]);
+
+        undo.deposits_fail.store(false, SeqCst);
+        assert!(m.reconcile_one("u-1", None).await.unwrap());
+        assert!(ledger(&m, "u-1").is_empty());
+        assert_eq!(ledger(&m, ORPHANED).len(), 1, "still refused: kept, and not blocking");
+
+        undo.handles_fail.store(false, SeqCst);
+        m.unwind("u-2", false).await.unwrap();
+        assert!(m.partial.lock().unwrap().values().all(Vec::is_empty));
+    }
+
+    /// A withdraw waits for a start that is between its deposit and its
+    /// spawn: deposits are named `tap-<nic>` per client, so it could be that
+    /// start's tap (#100).
+    #[tokio::test]
+    async fn a_withdraw_waits_for_the_deposit_window() {
+        let (m, undo) = undo_manager();
+        let m = Arc::new(m);
+        note(&m.partial, "u-1", Undo::Deposit("tap-default".into()));
+        let window = m.deposit_window.lock().await;
+        let task = tokio::spawn({
+            let m = m.clone();
+            async move { m.unwind("u-1", false).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(undo.seen.lock().unwrap().is_empty(), "withdrew inside another start's window");
+        drop(window);
+        task.await.unwrap().unwrap();
+        assert_eq!(undo.seen.lock().unwrap().clone(), vec![Undo::Deposit("tap-default".into())]);
+    }
+
+    /// What the engine's answers mean for an undo (#100).
+    #[test]
+    fn undo_outcomes() {
+        let failed = |errno| Err(RingError::Failed { op: 9, errno, step: 0 });
+        let tap = Undo::Deposit("tap-default".into());
+        let vol = Undo::Release(UndoKind::Volume, Handle(1));
+        assert!(undone(&tap, Ok(())).is_ok());
+        assert!(undone(&tap, failed(22)).is_ok(), "an engine without the op cannot be waited on");
+        assert!(undone(&tap, Err(RingError::Gone)).is_err());
+        assert!(undone(&tap, failed(116)).is_err());
+        assert!(undone(&vol, failed(116)).is_ok(), "released already");
+        assert!(undone(&vol, failed(16)).is_err());
+        assert!(undone(&vol, Err(RingError::Timeout)).is_err());
     }
 
     #[tokio::test]
