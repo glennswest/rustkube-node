@@ -48,7 +48,7 @@ repository = "https://github.com/glennswest/rustkube-node"
 # (rustkube v0.15.2). A golden is built from this repository alone, at one
 # commit, with `--locked`, so a sibling path cannot work there (#58). Moving to
 # a newer rustkube is an explicit change of `rev` here, and Cargo.lock records it.
-apimachinery = { git = "https://github.com/glennswest/rustkube", rev = "e7f4fdb4b58044260ffe396a1a0d659876e5264a" }
+apimachinery = { git = "https://github.com/glennswest/rustkube", rev = "2b3f2c16dde2f9b9519e39aac299d007aaae8cbe" }
 
 # Internal libs (pkg/) — consumed by the cmd/ binary crates
 kubelet = { path = "pkg/kubelet" }

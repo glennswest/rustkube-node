@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased — turbomode (not yet built or measured)
+
+- Watch-driven Pod/VMI work, separate Pod/VM loops, stormpump exit and Linux
+  manifest notifications. Preserve live Pods when desired-state reads fail.
+- Stable startTime, unchanged-status suppression and revision-guarded status
+  writes. Failed terminating-Pod teardown is not acknowledged as complete.
+- Paired architecture/measurement plan in docs/event-driven-design.md;
+  #99–#102 track remaining indexed workers, local events and real-node tests.
+
+
 ## [Unreleased]
 <!-- New unreleased changes go here -->
 

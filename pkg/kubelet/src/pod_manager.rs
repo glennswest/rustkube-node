@@ -177,7 +177,10 @@ fn ensure_host_path(path: &str, typ: &str) {
         "DirectoryOrCreate" => {
             let target = on_host(path);
             if let Err(e) = std::fs::create_dir_all(&target) {
-                warn!("hostPath {path}: could not create {} : {e}", target.display());
+                warn!(
+                    "hostPath {path}: could not create {} : {e}",
+                    target.display()
+                );
             }
         }
         "FileOrCreate" => {
@@ -194,7 +197,11 @@ fn ensure_host_path(path: &str, typ: &str) {
             // create_new so a race with another pod does not truncate a file
             // something is already holding — xtables.lock is a lock file, and
             // truncating one under its holder is worse than losing the race.
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&target) {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)
+            {
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(e) => warn!("hostPath {path}: could not create file: {e}"),
@@ -316,7 +323,14 @@ impl PodManager {
         images: Arc<dyn ImageService>,
         node_name: &str,
     ) -> Self {
-        Self::with_api(runtime, images, node_name, "", "127.0.0.1", reqwest::Client::new())
+        Self::with_api(
+            runtime,
+            images,
+            node_name,
+            "",
+            "127.0.0.1",
+            reqwest::Client::new(),
+        )
     }
 
     pub fn with_api(
@@ -332,13 +346,8 @@ impl PodManager {
             images,
             pods: RwLock::new(HashMap::new()),
             node_name: node_name.to_string(),
-            events: (!api_url.is_empty()).then(|| {
-                crate::events::EventRecorder::new(
-                    api_client.clone(),
-                    api_url,
-                    node_name,
-                )
-            }),
+            events: (!api_url.is_empty())
+                .then(|| crate::events::EventRecorder::new(api_client.clone(), api_url, node_name)),
             api_url: api_url.trim_end_matches('/').to_string(),
             api_client,
             node_ip: node_ip.to_string(),
@@ -410,13 +419,17 @@ impl PodManager {
         if self.api_url.is_empty() {
             return None;
         }
-        let resp = self.api_client.get(format!("{}{path}", self.api_url)).send().await.ok()?;
+        let resp = self
+            .api_client
+            .get(format!("{}{path}", self.api_url))
+            .send()
+            .await
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }
         resp.json::<Value>().await.ok()
     }
-
 
     /// Emit a pod event, if there is a recorder.
     ///
@@ -495,24 +508,37 @@ impl PodManager {
         // What the engine knows of the clone: its filesystem and uuid, and
         // what it was cloned from, for the PV's CSI source (#59). The size is
         // the class's, which is what was provisioned.
-        let list = self.storage_get("/api/v1/volumes").await.unwrap_or_default();
+        let list = self
+            .storage_get("/api/v1/volumes")
+            .await
+            .unwrap_or_default();
         let items = list["items"].as_array().cloned().unwrap_or_default();
         let names: std::collections::HashMap<String, String> = items
             .iter()
-            .filter_map(|v| Some((v["id"].as_str()?.to_string(), v["name"].as_str()?.to_string())))
+            .filter_map(|v| {
+                Some((
+                    v["id"].as_str()?.to_string(),
+                    v["name"].as_str()?.to_string(),
+                ))
+            })
             .collect();
         let mut facts = items
             .iter()
             .find(|v| v["name"].as_str() == Some(volume))
             .map(|v| crate::system_claims::VolumeFacts::of(v, &names))
-            .unwrap_or_else(|| crate::system_claims::VolumeFacts { name: volume.to_string(), ..Default::default() });
+            .unwrap_or_else(|| crate::system_claims::VolumeFacts {
+                name: volume.to_string(),
+                ..Default::default()
+            });
         facts.bytes = bytes;
 
         // The claim first, so the volume's claimRef can carry its uid: a PV
         // naming a claim by name alone reads as bound to whichever claim of
         // that name exists, including one made again after a delete.
         let path = format!("/api/v1/namespaces/{namespace}/persistentvolumeclaims/{claim}");
-        let Some(mut pvc) = self.api_get(&path).await else { return };
+        let Some(mut pvc) = self.api_get(&path).await else {
+            return;
+        };
 
         let mut pv = crate::system_claims::stormblock_pv(
             &facts,
@@ -522,7 +548,11 @@ impl PodManager {
             "Delete",
         );
         pv["status"] = serde_json::json!({ "phase": "Bound" });
-        if self.api_post("/api/v1/persistentvolumes", &pv).await.is_none() {
+        if self
+            .api_post("/api/v1/persistentvolumes", &pv)
+            .await
+            .is_none()
+        {
             // **It exists: bring it up to what was provisioned** (#64). The
             // control plane's provisioner (rustkube `stormblock.rs`) writes
             // the PV once the scheduler picks a node, before the pod starts
@@ -531,7 +561,9 @@ impl PodManager {
             // 3.5Gi claim on a 4 GiB volume said 3.5Gi for good.
             let pv_path = format!("/api/v1/persistentvolumes/{pv_name}");
             if let Some(existing) = self.api_get(&pv_path).await {
-                if let Some(updated) = crate::system_claims::reconcile_pv(&existing, &pv, Some(&pvc)) {
+                if let Some(updated) =
+                    crate::system_claims::reconcile_pv(&existing, &pv, Some(&pvc))
+                {
                     if self.api_put(&pv_path, &updated).await.is_none() {
                         warn!("PV {pv_name}: could not record its capacity and source");
                     }
@@ -570,11 +602,18 @@ impl PodManager {
     /// it serves, and a kubelet asking another node's stormblock for a local
     /// device would get an answer that is true somewhere else.
     async fn storage_post(&self, path: &str, body: &Value) -> Option<Value> {
-        let resp = self.engine.post(&format!("{}{path}", self.storage_url), body).await.ok()?;
+        let resp = self
+            .engine
+            .post(&format!("{}{path}", self.storage_url), body)
+            .await
+            .ok()?;
         let status = resp.status();
         let text = resp.text().await.ok()?;
         if !status.is_success() {
-            warn!("stormblock {path} -> {status}: {}", text.chars().take(200).collect::<String>());
+            warn!(
+                "stormblock {path} -> {status}: {}",
+                text.chars().take(200).collect::<String>()
+            );
             return None;
         }
         serde_json::from_str(&text).ok()
@@ -679,7 +718,12 @@ impl PodManager {
         // metadata.labels['x'] / metadata.annotations['x']
         if let Some(rest) = path.strip_prefix("metadata.labels['") {
             let key = rest.strip_suffix("']")?;
-            return Some(pod["metadata"]["labels"][key].as_str().unwrap_or("").to_string());
+            return Some(
+                pod["metadata"]["labels"][key]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+            );
         }
         if let Some(rest) = path.strip_prefix("metadata.annotations['") {
             let key = rest.strip_suffix("']")?;
@@ -692,7 +736,10 @@ impl PodManager {
         }
         let v = match path {
             "metadata.name" => pod["metadata"]["name"].as_str().unwrap_or("").to_string(),
-            "metadata.namespace" => pod["metadata"]["namespace"].as_str().unwrap_or("default").to_string(),
+            "metadata.namespace" => pod["metadata"]["namespace"]
+                .as_str()
+                .unwrap_or("default")
+                .to_string(),
             "metadata.uid" => pod["metadata"]["uid"].as_str().unwrap_or("").to_string(),
             "spec.nodeName" => self.node_name.clone(),
             "spec.serviceAccountName" => pod["spec"]["serviceAccountName"]
@@ -749,13 +796,12 @@ impl PodManager {
                 // Projected volume (e.g. kube-api-access: SA token + CA + downward API).
                 let dir = pod_volume_dir(&self.state_root, uid, "projected", &name);
                 let _ = std::fs::create_dir_all(&dir);
-                self.materialize_projected(pod, namespace, &dir, sources).await;
+                self.materialize_projected(pod, namespace, &dir, sources)
+                    .await;
                 // Ensure the SA volume has a usable ca.crt even if the cluster
                 // has no kube-root-ca.crt configMap to source it from.
                 if let Some(ca) = &self.ca_pem {
-                    let has_sat = sources
-                        .iter()
-                        .any(|s| !s["serviceAccountToken"].is_null());
+                    let has_sat = sources.iter().any(|s| !s["serviceAccountToken"].is_null());
                     if has_sat {
                         let _ = std::fs::write(format!("{dir}/ca.crt"), ca);
                     }
@@ -765,15 +811,23 @@ impl PodManager {
                 let claim = claim.as_str();
                 // Another driver's volume: a claim bound to a PV whose
                 // `csi.driver` is not ours. Its driver mounts it (#52).
-                let pvc_path = format!("/api/v1/namespaces/{namespace}/persistentvolumeclaims/{claim}");
+                let pvc_path =
+                    format!("/api/v1/namespaces/{namespace}/persistentvolumeclaims/{claim}");
                 match self.api_get(&pvc_path).await {
                     Some(pvc) => {
                         if let Some(pv) = self.external_csi_pv(&pvc).await {
-                            let readonly =
-                                vol["persistentVolumeClaim"]["readOnly"].as_bool().unwrap_or(false);
+                            let readonly = vol["persistentVolumeClaim"]["readOnly"]
+                                .as_bool()
+                                .unwrap_or(false);
                             match self.mount_csi_claim(pod, &name, &pvc, &pv, readonly).await {
                                 Ok(dir) => {
-                                    map.insert(name, ResolvedVolume { path: dir, fstype: None });
+                                    map.insert(
+                                        name,
+                                        ResolvedVolume {
+                                            path: dir,
+                                            fstype: None,
+                                        },
+                                    );
                                     continue;
                                 }
                                 Err(e) => {
@@ -810,7 +864,10 @@ impl PodManager {
                     Ok(device) => {
                         map.insert(
                             name,
-                            ResolvedVolume { path: device, fstype: Some("ext4".to_string()) },
+                            ResolvedVolume {
+                                path: device,
+                                fstype: Some("ext4".to_string()),
+                            },
                         );
                         continue;
                     }
@@ -850,7 +907,13 @@ impl PodManager {
                 // An inline CSI volume, which lives and dies with the pod.
                 match self.mount_csi_inline(pod, vol).await {
                     Ok(dir) => {
-                        map.insert(name, ResolvedVolume { path: dir, fstype: None });
+                        map.insert(
+                            name,
+                            ResolvedVolume {
+                                path: dir,
+                                fstype: None,
+                            },
+                        );
                         continue;
                     }
                     Err(e) => return Err(CriError::VolumeNotReady(format!("volume {name}: {e}"))),
@@ -945,7 +1008,13 @@ impl PodManager {
                     }
                 }
             }
-            map.insert(name, ResolvedVolume { path: host_path, fstype: None });
+            map.insert(
+                name,
+                ResolvedVolume {
+                    path: host_path,
+                    fstype: None,
+                },
+            );
         }
         Ok(map)
     }
@@ -988,7 +1057,9 @@ impl PodManager {
     ///
     /// Never a system volume: those are Retain, and carry the system label.
     pub async fn reclaim_released(&self) {
-        let Some(pvs) = self.api_get("/api/v1/persistentvolumes").await else { return };
+        let Some(pvs) = self.api_get("/api/v1/persistentvolumes").await else {
+            return;
+        };
         for pv in pvs["items"].as_array().cloned().unwrap_or_default() {
             if pv["spec"]["csi"]["driver"].as_str() != Some("stormblock.storm.io")
                 || pv["status"]["phase"].as_str() != Some("Released")
@@ -997,14 +1068,22 @@ impl PodManager {
             {
                 continue;
             }
-            let here = pv["metadata"]["annotations"]["storm.io/node"].as_str() == Some(&self.node_name)
+            let here = pv["metadata"]["annotations"]["storm.io/node"].as_str()
+                == Some(&self.node_name)
                 || pv["spec"]["nodeAffinity"]["required"]["nodeSelectorTerms"]
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .flat_map(|t| t["matchExpressions"].as_array().cloned().unwrap_or_default())
+                    .flat_map(|t| {
+                        t["matchExpressions"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default()
+                    })
                     .any(|e| {
-                        e["values"].as_array().is_some_and(|v| v.iter().any(|n| n.as_str() == Some(&self.node_name)))
+                        e["values"]
+                            .as_array()
+                            .is_some_and(|v| v.iter().any(|n| n.as_str() == Some(&self.node_name)))
                     });
             if !here {
                 continue;
@@ -1078,8 +1157,10 @@ impl PodManager {
         // and stormblock refuses to delete a volume it is still serving — so
         // without this the delete comes back 409 for every volume that was
         // ever mounted, which is all of them.
-        self.storage_delete(&format!("/api/v1/volumes/{vol_id}/attach")).await?;
-        self.storage_delete(&format!("/api/v1/volumes/{vol_id}")).await?;
+        self.storage_delete(&format!("/api/v1/volumes/{vol_id}/attach"))
+            .await?;
+        self.storage_delete(&format!("/api/v1/volumes/{vol_id}"))
+            .await?;
         info!("released volume {name} ({vol_id}) for claim {namespace}/{claim}");
         Ok(VolumeRelease::Released)
     }
@@ -1107,13 +1188,9 @@ impl PodManager {
         if self.api_url.is_empty() {
             return Ok(None);
         }
-        let pods = self
-            .api_get("/api/v1/pods")
-            .await
-            .ok_or_else(|| {
-                "cannot confirm the volume is unused: the apiserver pod list is unavailable"
-                    .to_string()
-            })?;
+        let pods = self.api_get("/api/v1/pods").await.ok_or_else(|| {
+            "cannot confirm the volume is unused: the apiserver pod list is unavailable".to_string()
+        })?;
         let holder = pods["items"]
             .as_array()
             .map(|a| a.as_slice())
@@ -1122,7 +1199,10 @@ impl PodManager {
             .find(|p| {
                 p["spec"]["nodeName"].as_str() == Some(&self.node_name)
                     && p["metadata"]["namespace"].as_str() == Some(namespace)
-                    && !matches!(p["status"]["phase"].as_str(), Some("Succeeded") | Some("Failed"))
+                    && !matches!(
+                        p["status"]["phase"].as_str(),
+                        Some("Succeeded") | Some("Failed")
+                    )
                     && pod_claims(p).any(|c| c == claim)
             })
             .and_then(|p| p["metadata"]["name"].as_str())
@@ -1150,7 +1230,9 @@ impl PodManager {
         claim: &str,
         pod_uid: &str,
     ) -> Result<String, ClaimError> {
-        self.provision_claim_volume(namespace, claim, pod_uid).await.map(|(_, dev)| dev)
+        self.provision_claim_volume(namespace, claim, pod_uid)
+            .await
+            .map(|(_, dev)| dev)
     }
 
     /// A claim as a block device on this node, for a virtual machine's disk
@@ -1178,11 +1260,13 @@ impl PodManager {
             Ok(None) => {}
             Err(e) => return Err(format!("claim {namespace}/{claim}: {e}")),
         }
-        self.provision_claim_volume(namespace, claim, "").await.map_err(|e| match e {
-            ClaimError::NotOurs(why) => format!("waiting for claim {claim} to bind: {why}"),
-            ClaimError::InUse(why) => why,
-            ClaimError::Failed(why) => format!("claim {namespace}/{claim}: {why}"),
-        })
+        self.provision_claim_volume(namespace, claim, "")
+            .await
+            .map_err(|e| match e {
+                ClaimError::NotOurs(why) => format!("waiting for claim {claim} to bind: {why}"),
+                ClaimError::InUse(why) => why,
+                ClaimError::Failed(why) => format!("claim {namespace}/{claim}: {why}"),
+            })
     }
 
     /// [`Self::provision_claim`], answering the volume id too.
@@ -1255,7 +1339,10 @@ impl PodManager {
         // a claim with `dataSource: {kind: PersistentVolumeClaim, name: <it>}`
         // in this namespace gets a copy-on-write copy.
         if let Some(pv) = pvc["spec"]["volumeName"].as_str().filter(|v| !v.is_empty()) {
-            if let Some(pv) = self.api_get(&format!("/api/v1/persistentvolumes/{pv}")).await {
+            if let Some(pv) = self
+                .api_get(&format!("/api/v1/persistentvolumes/{pv}"))
+                .await
+            {
                 if pv["metadata"]["labels"][crate::system_claims::LABEL].as_str() == Some("true") {
                     return Err(ClaimError::InUse(format!(
                         "{namespace}/{claim} is a node service's live data volume; mount a clone \
@@ -1328,10 +1415,16 @@ impl PodManager {
                 let created: Value = self
                     .storage_post(&format!("/api/v1/fstemplates/{template}/clone"), &body)
                     .await
-                    .ok_or_else(|| ClaimError::Failed(format!("stormblock would not clone {blank} to {name}")))?;
+                    .ok_or_else(|| {
+                        ClaimError::Failed(format!("stormblock would not clone {blank} to {name}"))
+                    })?;
                 created["volume_id"]
                     .as_str()
-                    .ok_or_else(|| ClaimError::Failed(format!("clone of {blank} returned no volume: {created}")))?
+                    .ok_or_else(|| {
+                        ClaimError::Failed(format!(
+                            "clone of {blank} returned no volume: {created}"
+                        ))
+                    })?
                     .to_string()
             }
         };
@@ -1348,7 +1441,11 @@ impl PodManager {
         let info: Value = self
             .storage_post(&format!("/api/v1/volumes/{vol_id}/attach"), &attach)
             .await
-            .ok_or_else(|| ClaimError::Failed(format!("stormblock would not attach {name} as a local device")))?;
+            .ok_or_else(|| {
+                ClaimError::Failed(format!(
+                    "stormblock would not attach {name} as a local device"
+                ))
+            })?;
         if let Some(dev) = info["device_hint"].as_str() {
             info!("PVC {namespace}/{claim} -> {name} ({class}) at {dev}");
             // Say so on the claim, now that there is something to point at.
@@ -1377,7 +1474,10 @@ impl PodManager {
             .as_array()?
             .iter()
             .find(|v| v["name"].as_str() == Some(name))?;
-        Some((v["id"].as_str()?.to_string(), v["sealed"].as_bool().unwrap_or(false)))
+        Some((
+            v["id"].as_str()?.to_string(),
+            v["sealed"].as_bool().unwrap_or(false),
+        ))
     }
 
     /// A volume's id and seal state by name, telling "no such volume" apart
@@ -1406,7 +1506,10 @@ impl PodManager {
             .iter()
             .find(|v| v["name"].as_str() == Some(name))
             .and_then(|v| {
-                Some((v["id"].as_str()?.to_string(), v["sealed"].as_bool().unwrap_or(false)))
+                Some((
+                    v["id"].as_str()?.to_string(),
+                    v["sealed"].as_bool().unwrap_or(false),
+                ))
             }))
     }
 
@@ -1459,9 +1562,16 @@ impl PodManager {
         match self.storage_template_state(blank).await {
             Some((id, state)) if state == "ready" => Ok(id),
             Some((_, state)) => Err(format!("template {blank} {state}")),
-            None => match self.minting.lock().unwrap_or_else(|e| e.into_inner()).get(blank) {
+            None => match self
+                .minting
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(blank)
+            {
                 Some(Mint::Failed(e)) => Err(e.clone()),
-                _ => Err(format!("minting template {blank} (one mkfs for class {class})")),
+                _ => Err(format!(
+                    "minting template {blank} (one mkfs for class {class})"
+                )),
             },
         }
     }
@@ -1491,8 +1601,14 @@ impl PodManager {
                 let mut c = Vec::new();
                 let path = format!("/api/v1/namespaces/{src_ns}/persistentvolumeclaims/{src}");
                 if let Some(src_pvc) = self.api_get(&path).await {
-                    if let Some(pv) = src_pvc["spec"]["volumeName"].as_str().filter(|v| !v.is_empty()) {
-                        if let Some(pv) = self.api_get(&format!("/api/v1/persistentvolumes/{pv}")).await {
+                    if let Some(pv) = src_pvc["spec"]["volumeName"]
+                        .as_str()
+                        .filter(|v| !v.is_empty())
+                    {
+                        if let Some(pv) = self
+                            .api_get(&format!("/api/v1/persistentvolumes/{pv}"))
+                            .await
+                        {
                             if let Some(h) = pv["spec"]["csi"]["volumeHandle"].as_str() {
                                 c.push(h.to_string());
                             }
@@ -1535,18 +1651,23 @@ impl PodManager {
         let made: Value = self
             .storage_post("/api/v1/volumes/snapshots", &body)
             .await
-            .ok_or_else(|| ClaimError::Failed(format!("stormblock would not clone {src_name} to {name}")))?;
+            .ok_or_else(|| {
+                ClaimError::Failed(format!("stormblock would not clone {src_name} to {name}"))
+            })?;
         info!("claim {namespace}/{name}: cloned from {src_name}");
-        made["id"]
-            .as_str()
-            .map(String::from)
-            .ok_or_else(|| ClaimError::Failed(format!("clone of {src_name} returned no id: {made}")))
+        made["id"].as_str().map(String::from).ok_or_else(|| {
+            ClaimError::Failed(format!("clone of {src_name} returned no id: {made}"))
+        })
     }
 
     /// The stormblock volume behind a claim's bound PV, when it is ours.
     async fn bound_volume(&self, pvc: &Value) -> Option<String> {
-        let pv_name = pvc["spec"]["volumeName"].as_str().filter(|v| !v.is_empty())?;
-        let pv = self.api_get(&format!("/api/v1/persistentvolumes/{pv_name}")).await?;
+        let pv_name = pvc["spec"]["volumeName"]
+            .as_str()
+            .filter(|v| !v.is_empty())?;
+        let pv = self
+            .api_get(&format!("/api/v1/persistentvolumes/{pv_name}"))
+            .await?;
         if pv["spec"]["csi"]["driver"].as_str() != Some("stormblock.storm.io") {
             return None;
         }
@@ -1559,7 +1680,9 @@ impl PodManager {
     /// An engine that reports no state is taken as ready, which is what every
     /// template it answered for was before states existed.
     async fn storage_template_state(&self, name: &str) -> Option<(String, String)> {
-        let t: Value = self.storage_get(&format!("/api/v1/fstemplates/{name}")).await?;
+        let t: Value = self
+            .storage_get(&format!("/api/v1/fstemplates/{name}"))
+            .await?;
         let id = t["id"].as_str()?.to_string();
         Some((id, t["state"].as_str().unwrap_or("ready").to_string()))
     }
@@ -1590,7 +1713,11 @@ impl PodManager {
 
     /// GET from stormblock's management API on this node.
     async fn storage_get(&self, path: &str) -> Option<Value> {
-        let resp = self.engine.get(&format!("{}{path}", self.storage_url)).await.ok()?;
+        let resp = self
+            .engine
+            .get(&format!("{}{path}", self.storage_url))
+            .await
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -1609,7 +1736,9 @@ impl PodManager {
         for src in sources {
             if let Some(sat) = src.get("serviceAccountToken").filter(|v| !v.is_null()) {
                 let path = sat["path"].as_str().unwrap_or("token");
-                let sa = pod["spec"]["serviceAccountName"].as_str().unwrap_or("default");
+                let sa = pod["spec"]["serviceAccountName"]
+                    .as_str()
+                    .unwrap_or("default");
                 let aud = sat["audience"].as_str();
                 if let Some(token) = self.request_sa_token(namespace, sa, aud).await {
                     let _ = std::fs::write(format!("{dir}/{path}"), token);
@@ -1625,8 +1754,10 @@ impl PodManager {
                 let name = sec["name"].as_str().unwrap_or("");
                 let decoded = self.fetch_secret_decoded(namespace, name).await;
                 if let Some(data) = decoded {
-                    let asmap: serde_json::Map<String, Value> =
-                        data.into_iter().map(|(k, v)| (k, Value::String(v))).collect();
+                    let asmap: serde_json::Map<String, Value> = data
+                        .into_iter()
+                        .map(|(k, v)| (k, Value::String(v)))
+                        .collect();
                     write_projected_items(dir, sec["items"].as_array(), Some(&asmap));
                 }
             } else if let Some(dw) = src.get("downwardAPI").filter(|v| !v.is_null()) {
@@ -1703,7 +1834,8 @@ impl PodManager {
         if pod["spec"]["containers"].as_array().is_some_and(|cs| {
             cs.iter().any(|c| {
                 c["volumeMounts"].as_array().is_some_and(|ms| {
-                    ms.iter().any(|m| m["mountPath"].as_str() == Some("/etc/resolv.conf"))
+                    ms.iter()
+                        .any(|m| m["mountPath"].as_str() == Some("/etc/resolv.conf"))
                 })
             })
         }) {
@@ -1713,10 +1845,7 @@ impl PodManager {
         let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
         let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default");
         let host_network = pod["spec"]["hostNetwork"].as_bool().unwrap_or(false);
-        let policy = crate::dns::DnsPolicy::parse(
-            pod["spec"]["dnsPolicy"].as_str(),
-            host_network,
-        );
+        let policy = crate::dns::DnsPolicy::parse(pod["spec"]["dnsPolicy"].as_str(), host_network);
         let node_resolv = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
         let content = crate::dns::resolv_conf(
             policy,
@@ -1770,7 +1899,9 @@ impl PodManager {
         }
         let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
         let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default");
-        let sa = pod["spec"]["serviceAccountName"].as_str().unwrap_or("default");
+        let sa = pod["spec"]["serviceAccountName"]
+            .as_str()
+            .unwrap_or("default");
 
         let dir = pod_volume_dir(&self.state_root, uid, "secret", "kube-api-access");
         let _ = std::fs::create_dir_all(&dir);
@@ -1865,6 +1996,12 @@ impl PodManager {
     /// Starts new pods, checks running ones (probes, restarts), and stops pods
     /// that carry a deletionTimestamp or disappeared from the desired set.
     pub async fn sync_pods(&self, desired_pods: &[Value]) -> SyncOutcome {
+        self.sync_pods_observed(desired_pods, true).await
+    }
+
+    /// Incomplete API or manifest reads may reconcile known work, but cannot
+    /// prove a Pod is absent. Keep live Pods and pending volume state intact.
+    pub async fn sync_pods_observed(&self, desired_pods: &[Value], complete: bool) -> SyncOutcome {
         let mut outcome = SyncOutcome::default();
         let mut desired_uids: Vec<String> = Vec::new();
         let mut relist = std::time::Duration::ZERO;
@@ -1888,7 +2025,9 @@ impl PodManager {
                 if is_known {
                     info!("Pod {namespace}/{name} is terminating — stopping");
                     if let Err(e) = self.stop_pod(uid).await {
+                        apimachinery::reactor::failed();
                         error!("Failed to stop terminating pod {namespace}/{name}: {e}");
+                        continue;
                     }
                 }
                 outcome.removed.push(RemovedPod {
@@ -1930,8 +2069,14 @@ impl PodManager {
                     .or_insert_with(Instant::now);
                 match self.start_pod(pod).await {
                     Ok(status) => {
-                        self.first_seen.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
-                        self.waiting.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+                        self.first_seen
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(uid);
+                        self.waiting
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(uid);
                         crate::metrics::observe_pod_start(seen.elapsed().as_secs_f64());
                         outcome.updates.push(status)
                     }
@@ -1959,8 +2104,12 @@ impl PodManager {
                         outcome.updates.push(self.waiting_pod(pod, message));
                     }
                     Err(e) => {
+                        apimachinery::reactor::failed();
                         error!("Failed to start pod {namespace}/{name}: {e}");
-                        self.waiting.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+                        self.waiting
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(uid);
                         outcome.updates.push(PodStatusUpdate {
                             namespace: namespace.to_string(),
                             name: name.to_string(),
@@ -1988,6 +2137,7 @@ impl PodManager {
                 match checked {
                     Ok(status) => outcome.updates.push(status),
                     Err(e) => {
+                        apimachinery::reactor::failed();
                         warn!("Failed to check pod {namespace}/{name} status: {e}");
                     }
                 }
@@ -1998,6 +2148,9 @@ impl PodManager {
         // runtime (probes run in it too).
         if relisted {
             crate::metrics::observe_relist(relist.as_secs_f64());
+        }
+        if !complete {
+            return outcome;
         }
         self.first_seen
             .lock()
@@ -2022,6 +2175,7 @@ impl PodManager {
                 state.namespace, state.name
             );
             if let Err(e) = self.stop_pod(&state.uid).await {
+                apimachinery::reactor::failed();
                 error!(
                     "Failed to stop orphaned pod {}/{}: {e}",
                     state.namespace, state.name
@@ -2191,7 +2345,6 @@ impl PodManager {
         let sandbox_config = build_sandbox_config(pod);
         let volumes = self.resolve_volumes(pod).await?;
 
-
         // **The kubelet cannot check host paths from here.** It runs in a
         // container; the mounts happen in the engine's namespace, which is the
         // host's. A `Path::exists()` on this side asks the kubelet's own
@@ -2278,20 +2431,42 @@ impl PodManager {
             //
             // The image is checked first, so the event says which of the two
             // actually happened.
-            let present = self.images.image_status(image).await.ok().flatten().is_some();
+            let present = self
+                .images
+                .image_status(image)
+                .await
+                .ok()
+                .flatten()
+                .is_some();
             if !present {
-                self.event(pod, "Normal", "Pulling", &format!("Pulling image \"{image}\"")).await;
+                self.event(
+                    pod,
+                    "Normal",
+                    "Pulling",
+                    &format!("Pulling image \"{image}\""),
+                )
+                .await;
             }
             let image_ref = match self.ensure_image(image, container_spec).await {
                 Ok(r) => {
                     if present {
                         // Upstream's word for an image that was already
                         // there, and the one `describe` readers expect.
-                        self.event(pod, "Normal", "Pulled",
-                                   &format!("Container image \"{image}\" already present on machine")).await;
+                        self.event(
+                            pod,
+                            "Normal",
+                            "Pulled",
+                            &format!("Container image \"{image}\" already present on machine"),
+                        )
+                        .await;
                     } else {
-                        self.event(pod, "Normal", "Pulled",
-                                   &format!("Successfully pulled image \"{image}\"")).await;
+                        self.event(
+                            pod,
+                            "Normal",
+                            "Pulled",
+                            &format!("Successfully pulled image \"{image}\""),
+                        )
+                        .await;
                     }
                     r
                 }
@@ -2299,15 +2474,22 @@ impl PodManager {
                     // The reason an image did not resolve is the whole
                     // diagnosis, and it lived only in a log on a node with no
                     // shell.
-                    self.event(pod, "Warning", "Failed",
-                               &format!("Failed to pull image \"{image}\": {e}")).await;
+                    self.event(
+                        pod,
+                        "Warning",
+                        "Failed",
+                        &format!("Failed to pull image \"{image}\": {e}"),
+                    )
+                    .await;
                     return Err(e);
                 }
             };
 
             // Build container config (resolve env valueFrom + mounts, then
             // inject the SA credential mount + KUBERNETES_SERVICE_* env).
-            let mut envs = self.resolve_env(pod, container_spec, pod_ip.as_deref()).await;
+            let mut envs = self
+                .resolve_env(pod, container_spec, pod_ip.as_deref())
+                .await;
             merge_env(&mut envs, self.service_account_env());
             let mut mounts = resolve_mounts(container_spec, &volumes);
             push_mount(&mut mounts, sa_mount.clone());
@@ -2324,25 +2506,45 @@ impl PodManager {
                 .await
             {
                 Ok(id) => {
-                    self.event(pod, "Normal", "Created",
-                               &format!("Created container {container_name}")).await;
+                    self.event(
+                        pod,
+                        "Normal",
+                        "Created",
+                        &format!("Created container {container_name}"),
+                    )
+                    .await;
                     id
                 }
                 Err(e) => {
-                    self.event(pod, "Warning", "Failed",
-                               &format!("Error creating container {container_name}: {e}")).await;
+                    self.event(
+                        pod,
+                        "Warning",
+                        "Failed",
+                        &format!("Error creating container {container_name}: {e}"),
+                    )
+                    .await;
                     return Err(e);
                 }
             };
 
             // Start container
             if let Err(e) = self.runtime.start_container(&container_id).await {
-                self.event(pod, "Warning", "Failed",
-                           &format!("Error starting container {container_name}: {e}")).await;
+                self.event(
+                    pod,
+                    "Warning",
+                    "Failed",
+                    &format!("Error starting container {container_name}: {e}"),
+                )
+                .await;
                 return Err(e);
             }
-            self.event(pod, "Normal", "Started",
-                       &format!("Started container {container_name}")).await;
+            self.event(
+                pod,
+                "Normal",
+                "Started",
+                &format!("Started container {container_name}"),
+            )
+            .await;
             info!("Started container {container_name} ({container_id}) in {namespace}/{name}");
 
             // A container with a readiness probe starts not-ready until the
@@ -2422,7 +2624,12 @@ impl PodManager {
             .as_array()
             .map(|a| {
                 a.iter()
-                    .map(|c| (c["name"].as_str().unwrap_or("unnamed").to_string(), c.clone()))
+                    .map(|c| {
+                        (
+                            c["name"].as_str().unwrap_or("unnamed").to_string(),
+                            c.clone(),
+                        )
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -2603,15 +2810,28 @@ impl PodManager {
                             not_ready(&mut container_statuses);
                             continue;
                         }
-                        match run_probe(startup, &spec, &cid, &pod_ip, pod_netns.as_deref(), &self.runtime).await {
+                        match run_probe(
+                            startup,
+                            &spec,
+                            &cid,
+                            &pod_ip,
+                            pod_netns.as_deref(),
+                            &self.runtime,
+                        )
+                        .await
+                        {
                             ProbeResult::Success => {
-                                info!("Startup probe passed for {}/{}/{name}", state.namespace, state.name);
+                                info!(
+                                    "Startup probe passed for {}/{}/{name}",
+                                    state.namespace, state.name
+                                );
                                 state.startup_passed.insert(name.clone(), true);
                                 state.liveness_failures.insert(name.clone(), 0);
                                 // fall through to liveness/readiness this cycle
                             }
                             ProbeResult::Failure(reason) => {
-                                let failures = state.liveness_failures.entry(name.clone()).or_insert(0);
+                                let failures =
+                                    state.liveness_failures.entry(name.clone()).or_insert(0);
                                 *failures += 1;
                                 let threshold = probe_failure_threshold(startup);
                                 warn!(
@@ -2619,8 +2839,21 @@ impl PodManager {
                                     state.namespace, state.name, *failures
                                 );
                                 if *failures >= threshold {
-                                    info!("Startup threshold reached — restarting {}/{}/{name}", state.namespace, state.name);
-                                    if self.restart_container(&mut state, &name, &cid, &spec, &sandbox_config, &mut container_statuses).await {
+                                    info!(
+                                        "Startup threshold reached — restarting {}/{}/{name}",
+                                        state.namespace, state.name
+                                    );
+                                    if self
+                                        .restart_container(
+                                            &mut state,
+                                            &name,
+                                            &cid,
+                                            &spec,
+                                            &sandbox_config,
+                                            &mut container_statuses,
+                                        )
+                                        .await
+                                    {
                                         continue;
                                     }
                                 }
@@ -2641,7 +2874,16 @@ impl PodManager {
                     let liveness = &spec["livenessProbe"];
                     let mut restarted = false;
                     if !liveness.is_null() && elapsed >= probe_initial_delay(liveness) {
-                        match run_probe(liveness, &spec, &cid, &pod_ip, pod_netns.as_deref(), &self.runtime).await {
+                        match run_probe(
+                            liveness,
+                            &spec,
+                            &cid,
+                            &pod_ip,
+                            pod_netns.as_deref(),
+                            &self.runtime,
+                        )
+                        .await
+                        {
                             ProbeResult::Failure(reason) => {
                                 let failures =
                                     state.liveness_failures.entry(name.clone()).or_insert(0);
@@ -2685,7 +2927,15 @@ impl PodManager {
                         false
                     } else {
                         matches!(
-                            run_probe(readiness, &spec, &cid, &pod_ip, pod_netns.as_deref(), &self.runtime).await,
+                            run_probe(
+                                readiness,
+                                &spec,
+                                &cid,
+                                &pod_ip,
+                                pod_netns.as_deref(),
+                                &self.runtime
+                            )
+                            .await,
                             ProbeResult::Success
                         )
                     };
@@ -2807,9 +3057,7 @@ impl PodManager {
         // and partial starts. Initial creation is not gated by restartPolicy.
         let missing: Vec<String> = container_specs
             .keys()
-            .filter(|n| {
-                !state.container_ids.contains_key(*n) && !state.terminated.contains_key(*n)
-            })
+            .filter(|n| !state.container_ids.contains_key(*n) && !state.terminated.contains_key(*n))
             .cloned()
             .collect();
         for name in missing {
@@ -2949,10 +3197,7 @@ impl PodManager {
         let volumes = match self.resolve_volumes(&state.pod).await {
             Ok(v) => v,
             Err(e) => {
-                warn!(
-                    "Container {}/{}/{name}: {e}",
-                    state.namespace, state.name
-                );
+                warn!("Container {}/{}/{name}: {e}", state.namespace, state.name);
                 return false;
             }
         };
@@ -2983,7 +3228,9 @@ impl PodManager {
 
         match result {
             Ok((new_cid, image_ref)) => {
-                state.container_ids.insert(name.to_string(), new_cid.clone());
+                state
+                    .container_ids
+                    .insert(name.to_string(), new_cid.clone());
                 state.started.insert(name.to_string(), Instant::now());
                 let ready = spec["readinessProbe"].is_null();
                 state.ready.insert(name.to_string(), ready);
@@ -3032,26 +3279,40 @@ impl PodManager {
     /// Per-container resource stats from the runtime (for /metrics/cadvisor
     /// and /stats/summary).
     pub async fn container_stats(&self) -> Vec<crate::cri::ContainerStatsInfo> {
-        self.runtime.list_container_stats().await.unwrap_or_default()
+        self.runtime
+            .list_container_stats()
+            .await
+            .unwrap_or_default()
     }
 
     /// What `/metrics` reports, read at scrape time: pods with a sandbox, and
     /// every container the runtime lists, by state (#36).
     pub async fn metrics_snapshot(&self) -> crate::metrics::KubeletSnapshot {
-        let running_pods =
-            self.pods.read().await.values().filter(|p| p.sandbox_id.is_some()).count();
+        let running_pods = self
+            .pods
+            .read()
+            .await
+            .values()
+            .filter(|p| p.sandbox_id.is_some())
+            .count();
         let containers = self
             .runtime
             .list_containers(None)
             .await
             .map(|cs| cs.into_iter().map(|c| c.state).collect())
             .unwrap_or_default();
-        crate::metrics::KubeletSnapshot { running_pods, containers }
+        crate::metrics::KubeletSnapshot {
+            running_pods,
+            containers,
+        }
     }
 
     /// Per-pod network counters from the runtime (for /metrics/cadvisor).
     pub async fn pod_network_stats(&self) -> Vec<crate::cri::PodNetworkStats> {
-        self.runtime.list_pod_network_stats().await.unwrap_or_default()
+        self.runtime
+            .list_pod_network_stats()
+            .await
+            .unwrap_or_default()
     }
 
     /// A v1 PodList of the pods this kubelet manages (for the /pods endpoint).
@@ -3066,11 +3327,21 @@ impl PodManager {
     fn waiting_pod(&self, pod: &Value, message: String) -> PodStatusUpdate {
         let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
         let name = pod["metadata"]["name"].as_str().unwrap_or("").to_string();
-        let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default").to_string();
-        self.waiting.lock().unwrap_or_else(|e| e.into_inner()).insert(
-            uid.to_string(),
-            WaitingPod { namespace: namespace.clone(), name: name.clone(), reason: message.clone() },
-        );
+        let namespace = pod["metadata"]["namespace"]
+            .as_str()
+            .unwrap_or("default")
+            .to_string();
+        self.waiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                uid.to_string(),
+                WaitingPod {
+                    namespace: namespace.clone(),
+                    name: name.clone(),
+                    reason: message.clone(),
+                },
+            );
         PodStatusUpdate {
             namespace,
             name,
@@ -3116,13 +3387,22 @@ impl PodManager {
             })
             .collect();
         // Admitted and waiting pods are this node's too (#63).
-        let waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        items.extend(waiting.iter().filter(|(uid, _)| !pods.contains_key(*uid)).map(|(uid, w)| {
-            serde_json::json!({
-                "metadata": {"name": w.name, "namespace": w.namespace, "uid": uid},
-                "status": {"phase": "Pending", "message": w.reason}
-            })
-        }));
+        let waiting = self
+            .waiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        items.extend(
+            waiting
+                .iter()
+                .filter(|(uid, _)| !pods.contains_key(*uid))
+                .map(|(uid, w)| {
+                    serde_json::json!({
+                        "metadata": {"name": w.name, "namespace": w.namespace, "uid": uid},
+                        "status": {"phase": "Pending", "message": w.reason}
+                    })
+                }),
+        );
         serde_json::json!({"kind": "PodList", "apiVersion": "v1", "items": items})
     }
 
@@ -3154,7 +3434,7 @@ impl PodManager {
                 restart_counts: HashMap::new(),
                 ready: HashMap::new(),
                 liveness_failures: HashMap::new(),
-                    startup_passed: HashMap::new(),
+                startup_passed: HashMap::new(),
                 started: HashMap::new(),
                 terminated: HashMap::new(),
                 init_statuses: Vec::new(),
@@ -3258,9 +3538,7 @@ enum ClaimError {
 impl std::fmt::Display for ClaimError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ClaimError::NotOurs(m) | ClaimError::InUse(m) | ClaimError::Failed(m) => {
-                f.write_str(m)
-            }
+            ClaimError::NotOurs(m) | ClaimError::InUse(m) | ClaimError::Failed(m) => f.write_str(m),
         }
     }
 }
@@ -3386,7 +3664,10 @@ fn build_sandbox_config(pod: &Value) -> PodSandboxConfig {
     let any_privileged = ["containers", "initContainers"].iter().any(|k| {
         pod["spec"][k]
             .as_array()
-            .map(|a| a.iter().any(|c| c["securityContext"]["privileged"].as_bool() == Some(true)))
+            .map(|a| {
+                a.iter()
+                    .any(|c| c["securityContext"]["privileged"].as_bool() == Some(true))
+            })
             .unwrap_or(false)
     });
 
@@ -3399,7 +3680,11 @@ fn build_sandbox_config(pod: &Value) -> PodSandboxConfig {
         log_directory: format!("/var/log/pods/{namespace}_{name}_{uid}"),
         dns_servers: pod["spec"]["dnsConfig"]["nameservers"]
             .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_else(|| vec!["10.96.0.10".to_string()]),
         dns_searches: vec![
             format!("{namespace}.svc.cluster.local"),
@@ -3660,7 +3945,8 @@ fn resolve_mounts(spec: &Value, volumes: &HashMap<String, ResolvedVolume>) -> Ve
                             // caught by the kubelet's mountinfo check, and the pod
                             // waits with the reason (`csi::is_mount_point`).
                             Some("Bidirectional")
-                                if spec["securityContext"]["privileged"].as_bool() == Some(true) =>
+                                if spec["securityContext"]["privileged"].as_bool()
+                                    == Some(true) =>
                             {
                                 MountPropagation::Bidirectional
                             }
@@ -3784,8 +4070,7 @@ fn build_container_config(
     // container's resolved environment (`$$` escapes to a literal `$`;
     // unknown names are left verbatim). Required by many workloads —
     // e.g. cilium-operator passes `--debug=$(CILIUM_DEBUG)`.
-    let env_map: HashMap<&str, &str> =
-        envs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let env_map: HashMap<&str, &str> = envs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
     let command: Vec<String> = spec["command"]
         .as_array()
@@ -3810,7 +4095,11 @@ fn build_container_config(
     let sc = &spec["securityContext"];
     let add_capabilities: Vec<String> = sc["capabilities"]["add"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     // securityContext.seLinuxOptions — pass the container's SELinux label to the
@@ -3823,7 +4112,9 @@ fn build_container_config(
     // the cpu quota (hard cap) and memory limit from *limits* (0 = unlimited).
     let cpu_request = spec["resources"]["requests"]["cpu"].as_str().unwrap_or("0");
     let cpu_limit = spec["resources"]["limits"]["cpu"].as_str().unwrap_or("0");
-    let mem_limit = spec["resources"]["limits"]["memory"].as_str().unwrap_or("0");
+    let mem_limit = spec["resources"]["limits"]["memory"]
+        .as_str()
+        .unwrap_or("0");
 
     // CRI log path, relative to the sandbox log_directory: <container>/<attempt>.log.
     // Enables `crictl logs` / `kubectl logs`.
@@ -3835,10 +4126,7 @@ fn build_container_config(
         image: image_ref.to_string(),
         command,
         args,
-        working_dir: spec["workingDir"]
-            .as_str()
-            .unwrap_or("")
-            .to_string(),
+        working_dir: spec["workingDir"].as_str().unwrap_or("").to_string(),
         envs,
         mounts,
         labels: HashMap::new(),
@@ -3907,8 +4195,7 @@ fn apply_pod_namespaces(config: &mut ContainerConfig, pod: &Value) {
     config.host_network = spec["hostNetwork"].as_bool().unwrap_or(false);
     config.host_pid = spec["hostPID"].as_bool().unwrap_or(false);
     config.host_ipc = spec["hostIPC"].as_bool().unwrap_or(false);
-    config.share_process_namespace =
-        spec["shareProcessNamespace"].as_bool().unwrap_or(false);
+    config.share_process_namespace = spec["shareProcessNamespace"].as_bool().unwrap_or(false);
     // A container without its own seccompProfile inherits the pod's.
     if config.seccomp_profile.is_none() {
         config.seccomp_profile = parse_seccomp(&spec["securityContext"]);
@@ -4003,7 +4290,10 @@ pub(crate) mod tests {
 
         /// Make a container (by name) exit with `code` immediately when started.
         fn set_exit_on_start(&self, name: &str, code: i32) {
-            self.exit_on_start.lock().unwrap().insert(name.to_string(), code);
+            self.exit_on_start
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), code);
         }
 
         fn created_names(&self) -> Vec<String> {
@@ -4038,7 +4328,11 @@ pub(crate) mod tests {
         }
 
         async fn run_pod_sandbox(&self, config: &PodSandboxConfig) -> Result<String, CriError> {
-            let id = format!("sb-{}-{}", config.uid, self.next_id.fetch_add(1, Ordering::SeqCst));
+            let id = format!(
+                "sb-{}-{}",
+                config.uid,
+                self.next_id.fetch_add(1, Ordering::SeqCst)
+            );
             self.sandboxes
                 .lock()
                 .unwrap()
@@ -4099,7 +4393,11 @@ pub(crate) mod tests {
             _sandbox_config: &PodSandboxConfig,
         ) -> Result<String, CriError> {
             *self.last_container_config.lock().unwrap() = Some(config.clone());
-            let id = format!("c-{}-{}", config.name, self.next_id.fetch_add(1, Ordering::SeqCst));
+            let id = format!(
+                "c-{}-{}",
+                config.name,
+                self.next_id.fetch_add(1, Ordering::SeqCst)
+            );
             self.containers.lock().unwrap().insert(
                 id.clone(),
                 FakeContainer {
@@ -4264,25 +4562,39 @@ pub(crate) mod tests {
         let (_rt, mgr) = manager();
         {
             let mut pods = mgr.pods.write().await;
-            pods.insert("uid-1".into(), state_holding("uid-1", "db", "data", "Running"));
+            pods.insert(
+                "uid-1".into(),
+                state_holding("uid-1", "db", "data", "Running"),
+            );
         }
 
         // A second pod on this node wanting the same claim finds the holder —
         // this is the case the scheduler cannot catch, because a static pod or
         // one written straight onto spec.nodeName never passes a filter.
         assert_eq!(
-            mgr.other_pod_holding("default", "data", "uid-2").await.as_deref(),
+            mgr.other_pod_holding("default", "data", "uid-2")
+                .await
+                .as_deref(),
             Some("db")
         );
 
         // The holder does not find itself: a restart re-resolves its own
         // volumes and must not refuse to come back up.
-        assert!(mgr.other_pod_holding("default", "data", "uid-1").await.is_none());
+        assert!(mgr
+            .other_pod_holding("default", "data", "uid-1")
+            .await
+            .is_none());
 
         // A different claim, and the same claim in another namespace, are
         // different volumes.
-        assert!(mgr.other_pod_holding("default", "other", "uid-2").await.is_none());
-        assert!(mgr.other_pod_holding("prod", "data", "uid-2").await.is_none());
+        assert!(mgr
+            .other_pod_holding("default", "other", "uid-2")
+            .await
+            .is_none());
+        assert!(mgr
+            .other_pod_holding("prod", "data", "uid-2")
+            .await
+            .is_none());
 
         // A terminal pod holds nothing — its containers are gone, so nothing
         // of it is writing and the claim is free.
@@ -4290,7 +4602,10 @@ pub(crate) mod tests {
             let mut pods = mgr.pods.write().await;
             pods.get_mut("uid-1").unwrap().phase = "Succeeded".into();
         }
-        assert!(mgr.other_pod_holding("default", "data", "uid-2").await.is_none());
+        assert!(mgr
+            .other_pod_holding("default", "data", "uid-2")
+            .await
+            .is_none());
     }
 
     /// A stand-in for stormblock's management API on loopback: it holds at
@@ -4353,7 +4668,11 @@ pub(crate) mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        FakeStormblock { detached, deleted, url: format!("http://{addr}") }
+        FakeStormblock {
+            detached,
+            deleted,
+            url: format!("http://{addr}"),
+        }
     }
 
     #[tokio::test]
@@ -4368,17 +4687,27 @@ pub(crate) mod tests {
         let outcome = mgr.sync_pods(&[p.clone()]).await;
         let u = &outcome.updates[0];
         assert_eq!(u.phase, "Pending");
-        assert!(u.message.starts_with("Unable to attach or mount volumes"), "{}", u.message);
+        assert!(
+            u.message.starts_with("Unable to attach or mount volumes"),
+            "{}",
+            u.message
+        );
         assert_eq!(u.container_statuses.len(), 1);
         let c = &u.container_statuses[0];
         assert_eq!((c.name.as_str(), c.state.as_str()), ("app", "waiting"));
         assert_eq!(c.reason, "ContainerCreating");
-        assert!(c.message.contains("volume share is of type nfs"), "{}", c.message);
+        assert!(
+            c.message.contains("volume share is of type nfs"),
+            "{}",
+            c.message
+        );
         assert!(c.container_id.is_empty());
         assert!(rt.created_names().is_empty());
 
         // The node knows it, and says why.
-        let why = mgr.waiting_reason("default", "probe").expect("recorded as waiting");
+        let why = mgr
+            .waiting_reason("default", "probe")
+            .expect("recorded as waiting");
         assert!(why.contains("nfs"));
         let listed = mgr.pods_json().await;
         assert_eq!(listed["items"][0]["metadata"]["uid"], "uid-1");
@@ -4394,7 +4723,10 @@ pub(crate) mod tests {
 
     #[test]
     fn a_long_volume_wait_says_it_timed_out_and_stays_stable() {
-        let short = volume_wait_message("v: template t awaiting_format", std::time::Duration::from_secs(10));
+        let short = volume_wait_message(
+            "v: template t awaiting_format",
+            std::time::Duration::from_secs(10),
+        );
         assert!(!short.contains("timed out"));
         let long = volume_wait_message("v: template t awaiting_format", VOLUME_WAIT_TIMEOUT);
         assert!(long.contains("timed out after 5m"), "{long}");
@@ -4427,7 +4759,10 @@ pub(crate) mod tests {
                         // Persisted before the format, as stormblock does.
                         m.store(true, Ordering::SeqCst);
                         tokio::time::sleep(format).await;
-                        (axum::http::StatusCode::CREATED, axum::Json(json!({"template": {}})))
+                        (
+                            axum::http::StatusCode::CREATED,
+                            axum::Json(json!({"template": {}})),
+                        )
                     }
                 }),
             )
@@ -4453,23 +4788,37 @@ pub(crate) mod tests {
     }
 
     fn with_stormblock(mgr: PodManager, url: &str) -> PodManager {
-        mgr.with_engine(crate::engine::EngineClient::new(url, crate::engine::TokenSource::none()))
+        mgr.with_engine(crate::engine::EngineClient::new(
+            url,
+            crate::engine::TokenSource::none(),
+        ))
     }
 
     #[tokio::test]
     async fn a_slow_mint_does_not_hold_the_sync() {
         // #63: a 1 TiB blank's format held the whole sync loop.
-        let (url, posts) = slow_minting_stormblock(std::time::Duration::from_secs(30), "awaiting_format").await;
+        let (url, posts) =
+            slow_minting_stormblock(std::time::Duration::from_secs(30), "awaiting_format").await;
         let (_rt, mgr) = manager();
         let mgr = with_stormblock(mgr, &url);
 
         let t = Instant::now();
-        let e = mgr.mint_template("pvc-ext4j-1048576m", "1T").await.unwrap_err();
-        assert!(t.elapsed() < std::time::Duration::from_secs(10), "waited {:?}", t.elapsed());
+        let e = mgr
+            .mint_template("pvc-ext4j-1048576m", "1T")
+            .await
+            .unwrap_err();
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(10),
+            "waited {:?}",
+            t.elapsed()
+        );
         assert_eq!(e, "template pvc-ext4j-1048576m awaiting_format");
 
         // The next claim waits on the same mint rather than starting another.
-        let e = mgr.mint_template("pvc-ext4j-1048576m", "1T").await.unwrap_err();
+        let e = mgr
+            .mint_template("pvc-ext4j-1048576m", "1T")
+            .await
+            .unwrap_err();
         assert_eq!(e, "template pvc-ext4j-1048576m awaiting_format");
         assert_eq!(posts.load(Ordering::SeqCst), 1);
     }
@@ -4479,7 +4828,10 @@ pub(crate) mod tests {
         let (url, posts) = slow_minting_stormblock(std::time::Duration::ZERO, "ready").await;
         let (_rt, mgr) = manager();
         let mgr = with_stormblock(mgr, &url);
-        assert_eq!(mgr.mint_template("pvc-ext4j-1m", "1M").await.unwrap(), "tpl-1");
+        assert_eq!(
+            mgr.mint_template("pvc-ext4j-1m", "1M").await.unwrap(),
+            "tpl-1"
+        );
         assert_eq!(posts.load(Ordering::SeqCst), 1);
     }
 
@@ -4513,7 +4865,10 @@ pub(crate) mod tests {
         mgr.storage_url = sb.url.clone();
         {
             let mut pods = mgr.pods.write().await;
-            pods.insert("uid-1".into(), state_holding("uid-1", "db", "data", "Running"));
+            pods.insert(
+                "uid-1".into(),
+                state_holding("uid-1", "db", "data", "Running"),
+            );
         }
 
         assert_eq!(
@@ -4552,9 +4907,17 @@ pub(crate) mod tests {
             crate::engine::TokenSource::files([&file]),
         ));
         // Not minted yet: refused, and said so rather than read as "no volume".
-        assert!(mgr.storage_volume_checked("pvc-default-data").await.is_err());
+        assert!(mgr
+            .storage_volume_checked("pvc-default-data")
+            .await
+            .is_err());
         std::fs::write(&file, "engine-tok\n").unwrap();
-        assert_eq!(mgr.storage_volume_checked("pvc-default-data").await.unwrap(), None);
+        assert_eq!(
+            mgr.storage_volume_checked("pvc-default-data")
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -4634,7 +4997,10 @@ pub(crate) mod tests {
             ]}
         }]);
         let v = mgr.resolve_volumes(&p).await.unwrap();
-        let dir = &v.get("kube-api-access").expect("projected volume resolved").path;
+        let dir = &v
+            .get("kube-api-access")
+            .expect("projected volume resolved")
+            .path;
         assert!(dir.contains("kubernetes.io~projected"));
         // The downward file was written with the namespace.
         let content = std::fs::read_to_string(format!("{dir}/namespace")).unwrap_or_default();
@@ -4644,14 +5010,29 @@ pub(crate) mod tests {
     #[test]
     fn pull_policy_defaults_and_explicit() {
         // Explicit wins.
-        assert_eq!(effective_pull_policy(&json!({"imagePullPolicy": "Never"}), "x:1"), "Never");
+        assert_eq!(
+            effective_pull_policy(&json!({"imagePullPolicy": "Never"}), "x:1"),
+            "Never"
+        );
         // Default: :latest / untagged → Always; pinned tag → IfNotPresent.
-        assert_eq!(effective_pull_policy(&json!({}), "busybox:latest"), "Always");
+        assert_eq!(
+            effective_pull_policy(&json!({}), "busybox:latest"),
+            "Always"
+        );
         assert_eq!(effective_pull_policy(&json!({}), "busybox"), "Always");
-        assert_eq!(effective_pull_policy(&json!({}), "busybox:1.36"), "IfNotPresent");
+        assert_eq!(
+            effective_pull_policy(&json!({}), "busybox:1.36"),
+            "IfNotPresent"
+        );
         // A port in the registry host must not be mistaken for a tag.
-        assert_eq!(effective_pull_policy(&json!({}), "reg:5000/busybox:1.36"), "IfNotPresent");
-        assert_eq!(effective_pull_policy(&json!({}), "reg:5000/busybox"), "Always");
+        assert_eq!(
+            effective_pull_policy(&json!({}), "reg:5000/busybox:1.36"),
+            "IfNotPresent"
+        );
+        assert_eq!(
+            effective_pull_policy(&json!({}), "reg:5000/busybox"),
+            "Always"
+        );
     }
 
     #[test]
@@ -4681,7 +5062,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn service_account_mount_default_and_opt_out() {
         let (_rt, mgr) = manager(); // no apiserver → token skipped, but ns written
-        // Default pod: gets an SA mount at the standard path.
+                                    // Default pod: gets an SA mount at the standard path.
         let p = pod("uid-2", "web", "Always", simple_container());
         let m = mgr.service_account_mount(&p).await.expect("sa mount");
         assert_eq!(m.container_path, SA_MOUNT_PATH);
@@ -4703,10 +5084,7 @@ pub(crate) mod tests {
         mgr.sync_pods(&[p]).await;
         // The created app container has the KUBERNETES_SERVICE_* env + SA mount.
         let cfg = rt.last_container_config().expect("a container was created");
-        assert!(cfg
-            .envs
-            .iter()
-            .any(|(k, _)| k == "KUBERNETES_SERVICE_HOST"));
+        assert!(cfg.envs.iter().any(|(k, _)| k == "KUBERNETES_SERVICE_HOST"));
         assert!(cfg.mounts.iter().any(|m| m.container_path == SA_MOUNT_PATH));
     }
 
@@ -4745,7 +5123,10 @@ pub(crate) mod tests {
         let mut volumes = HashMap::new();
         volumes.insert(
             "bpf".to_string(),
-            ResolvedVolume { path: "/sys/fs/bpf".to_string(), fstype: None },
+            ResolvedVolume {
+                path: "/sys/fs/bpf".to_string(),
+                fstype: None,
+            },
         );
         let spec = json!({
             "name": "cilium-agent",
@@ -4777,7 +5158,10 @@ pub(crate) mod tests {
         let mut volumes = HashMap::new();
         volumes.insert(
             "kubelet".to_string(),
-            ResolvedVolume { path: "/var/lib/kubelet".to_string(), fstype: None },
+            ResolvedVolume {
+                path: "/var/lib/kubelet".to_string(),
+                fstype: None,
+            },
         );
         let spec = |privileged: bool| {
             json!({
@@ -4787,8 +5171,14 @@ pub(crate) mod tests {
                                   "mountPropagation": "Bidirectional"}]
             })
         };
-        assert_eq!(resolve_mounts(&spec(true), &volumes)[0].propagation, MountPropagation::Bidirectional);
-        assert_eq!(resolve_mounts(&spec(false), &volumes)[0].propagation, MountPropagation::Private);
+        assert_eq!(
+            resolve_mounts(&spec(true), &volumes)[0].propagation,
+            MountPropagation::Bidirectional
+        );
+        assert_eq!(
+            resolve_mounts(&spec(false), &volumes)[0].propagation,
+            MountPropagation::Private
+        );
     }
 
     #[test]
@@ -4825,7 +5215,9 @@ pub(crate) mod tests {
             Some(SeccompProfile::RuntimeDefault)
         );
         assert_eq!(
-            parse_seccomp(&json!({"seccompProfile": {"type": "Localhost", "localhostProfile": "p.json"}})),
+            parse_seccomp(
+                &json!({"seccompProfile": {"type": "Localhost", "localhostProfile": "p.json"}})
+            ),
             Some(SeccompProfile::Localhost("p.json".into()))
         );
         assert_eq!(parse_seccomp(&json!({})), None);
@@ -4834,13 +5226,19 @@ pub(crate) mod tests {
         // container, or the runtime default profile fails its syscalls with EPERM.
         let mut c = build_container_config(&simple_container(), "img", vec![], vec![]);
         assert_eq!(c.seccomp_profile, None);
-        apply_pod_namespaces(&mut c, &json!({"spec": {"securityContext": {"seccompProfile": {"type": "Unconfined"}}}}));
+        apply_pod_namespaces(
+            &mut c,
+            &json!({"spec": {"securityContext": {"seccompProfile": {"type": "Unconfined"}}}}),
+        );
         assert_eq!(c.seccomp_profile, Some(SeccompProfile::Unconfined));
 
         // A container's own profile wins over the pod's.
         let own = json!({"name": "a", "image": "x", "securityContext": {"seccompProfile": {"type": "RuntimeDefault"}}});
         let mut c2 = build_container_config(&own, "x", vec![], vec![]);
-        apply_pod_namespaces(&mut c2, &json!({"spec": {"securityContext": {"seccompProfile": {"type": "Unconfined"}}}}));
+        apply_pod_namespaces(
+            &mut c2,
+            &json!({"spec": {"securityContext": {"seccompProfile": {"type": "Unconfined"}}}}),
+        );
         assert_eq!(c2.seccomp_profile, Some(SeccompProfile::RuntimeDefault));
     }
 
@@ -4856,7 +5254,10 @@ pub(crate) mod tests {
         let envs = vec![("CILIUM_DEBUG".to_string(), "false".to_string())];
         let c = build_container_config(&spec, "x", envs, vec![]);
         assert_eq!(c.command, vec!["cilium-operator-generic"]);
-        assert_eq!(c.args, vec!["--config-dir=/tmp/cilium/config-map", "--debug=false"]);
+        assert_eq!(
+            c.args,
+            vec!["--config-dir=/tmp/cilium/config-map", "--debug=false"]
+        );
     }
 
     #[test]
@@ -4895,7 +5296,8 @@ pub(crate) mod tests {
         assert_eq!(se.level, "s0");
         assert_eq!(se.user, "");
         // A container without seLinuxOptions gets None (default label).
-        let plain = build_container_config(&json!({"name": "a", "image": "x"}), "x", vec![], vec![]);
+        let plain =
+            build_container_config(&json!({"name": "a", "image": "x"}), "x", vec![], vec![]);
         assert!(plain.selinux_options.is_none());
     }
 
@@ -5044,6 +5446,20 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn incomplete_desired_state_never_stops_a_live_pod() {
+        let (runtime, manager) = manager();
+        let desired = pod("uid-preserve", "web", "Always", simple_container());
+        manager.sync_pods(&[desired]).await;
+        assert_eq!(runtime.live_sandbox_count(), 1);
+        let partial = manager.sync_pods_observed(&[], false).await;
+        assert!(partial.removed.is_empty());
+        assert_eq!(runtime.live_sandbox_count(), 1);
+        let complete = manager.sync_pods_observed(&[], true).await;
+        assert_eq!(complete.removed.len(), 1);
+        assert_eq!(runtime.live_sandbox_count(), 0);
+    }
+
+    #[tokio::test]
     async fn stops_orphaned_pod() {
         let (rt, mgr) = manager();
         let p = pod("uid-1", "web", "Always", simple_container());
@@ -5154,7 +5570,10 @@ pub(crate) mod tests {
         let mut done = pod("uid-2", "job", "Never", simple_container());
         done["status"] = json!({"phase": "Succeeded"});
         let outcome = mgr2.sync_pods(&[done]).await;
-        assert!(rt2.container_ids().is_empty(), "a finished job is not restarted");
+        assert!(
+            rt2.container_ids().is_empty(),
+            "a finished job is not restarted"
+        );
         assert!(outcome.updates.is_empty());
     }
 
@@ -5170,7 +5589,10 @@ pub(crate) mod tests {
         let cid = rt.container_ids().pop().unwrap();
         rt.set_container_state(&cid, ContainerState::Exited, 1);
         let u = &mgr.sync_pods(&[p.clone()]).await.updates[0];
-        assert_eq!(u.container_statuses[0].restart_count, 1, "the first restart is immediate");
+        assert_eq!(
+            u.container_statuses[0].restart_count, 1,
+            "the first restart is immediate"
+        );
 
         // Second crash, straight away: held, not recreated.
         let cid = rt.container_ids().pop().unwrap();

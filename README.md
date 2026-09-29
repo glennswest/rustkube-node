@@ -8,6 +8,26 @@ development; the code stays upstream-shaped and monorepo-mergeable.
 > the binaries build, but a node does not yet fully join a cluster or run pods.
 > See the tracking issues.
 
+## Event-driven branch
+
+`turbomode` pairs with rustkube's branch of the same name. Pod and VMI
+assignment/volume watches enqueue coalesced reconciliation work; Pod and VM
+subscriptions run independently; runtime mutations remain serialized until
+per-claim admission is implemented (#100). Stormpump exits and Linux static-manifest changes
+also wake workers. Failed or incomplete Pod/manifest reads cannot stop live
+Pods by treating an unknown desired set as empty. Status publication retains
+startTime, skips unchanged status and uses the observed resourceVersion.
+
+This is an **unbuilt first migration**, not a measured subsecond release.
+Active workloads still use an explicit runtime/probe/volume observation
+fallback, and several mirror/CSI tasks retain their existing schedules.
+Per-UID concurrency and complete local event sources are tracked in
+[#100](https://github.com/glennswest/rustkube-node/issues/100) and
+[#101](https://github.com/glennswest/rustkube-node/issues/101).
+See [the design and baseline](docs/event-driven-design.md) and
+[#102](https://github.com/glennswest/rustkube-node/issues/102) for validation.
+Builds run on dev only, after 10:00 America/Chicago on 2026-09-29.
+
 ## Components
 
 Upstream-shaped: thin `cmd/<component>` binaries over `pkg/<lib>` libraries
