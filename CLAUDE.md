@@ -51,7 +51,10 @@ already passed (211 tests). No main merge, golden or live deployment now.
    per-claim mutation exclusion and partial Pod-start state added.
    sc-build at cdb0a4b passed 216 unit + four integration tests. Init waits now
    yield with retained sandbox/container state; VM stop yields during engine grace.
-   Added deletion-during-operation/replacement/staged-init tests; validation pending.
+   Added deletion-during-operation/replacement/staged-init tests; sc-build at
+   d501d34 passed 220 unit + four integration tests. Image waits now yield to a
+   four-slot deduplicated pull pool; reclamation takes an admission reservation.
+   Slow-image/fast-start and reclamation exclusion tests added; validation pending.
 2. [ ] Wire Pod/VMI adapters to the common executor; retain state across failed cleanup,
        use observed UID preconditions, and preserve bootstrap through unavailable API reads.
 3. [ ] Add dependency indexes, staged waits and slow/fast/cancellation regression tests.

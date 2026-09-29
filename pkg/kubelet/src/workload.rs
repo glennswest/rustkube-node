@@ -108,6 +108,15 @@ pub struct Reservations {
     state: Mutex<Admissions>,
     ready: Arc<WorkQueue<Key>>,
 }
+/// A transient destructive operation participates in the same admission table.
+pub struct ClaimGuard {
+    reservations: Arc<Reservations>,
+    key: Key,
+}
+impl Drop for ClaimGuard {
+    fn drop(&mut self) { self.reservations.release(&self.key); }
+}
+
 impl Reservations {
     pub fn new(ready: Arc<WorkQueue<Key>>) -> Self {
         Self {
@@ -178,6 +187,16 @@ impl Reservations {
             }
         }
         Some(guards)
+    }
+
+    pub fn reclaim(self: &Arc<Self>,namespace:&str,claim:&str)->Option<ClaimGuard> {
+        let key=Key{kind:Kind::Pod,namespace:namespace.into(),name:format!("reclaim-{claim}"),uid:uuid::Uuid::new_v4().to_string()};
+        if !self.acquire(&key,&[(Resource::Claim(namespace.into(),claim.into()),Access::Exclusive)]) {
+            // A request-scoped waiter has no runtime work to enqueue.
+            self.release(&key);
+            return None;
+        }
+        Some(ClaimGuard{reservations:self.clone(),key})
     }
 
     pub fn claims(&self,key:&Key) -> Vec<(Resource,Access)> {
@@ -465,6 +484,16 @@ mod tests {
         assert!(e.reservations.try_operations(&[claim.clone()]).is_none());
         drop(held);
         assert!(e.reservations.try_operations(&[claim]).is_some());
+    }
+
+    #[test]
+    fn reclaim_excludes_start_until_its_request_finishes() {
+        let e=Executor::new();let resource=Resource::Claim("ns".into(),"data".into());
+        let guard=e.reservations.reclaim("ns","data").unwrap();
+        assert!(!e.reservations.acquire(&key(Kind::Pod,"p"),&[(resource.clone(),Access::SharedFilesystem)]));
+        assert!(e.reservations.reclaim("ns","data").is_none());
+        drop(guard);
+        assert!(e.reservations.acquire(&key(Kind::Pod,"p"),&[(resource,Access::SharedFilesystem)]));
     }
 
     struct SlowVm {

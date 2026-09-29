@@ -193,3 +193,10 @@ startup without recreating the sandbox. VM shutdown sends the engine's grace
 request once and yields until QUERY confirms exit. Finalizer cleanup failures
 remain retryable. Deletion during a side effect waits for its completion before
 the UID's cleanup pass; the same-name successor remains admission-blocked.
+
+Image waiting is a separate stage: up to four pulls run concurrently outside
+the eight runtime workers. Concurrent requests for the same image/policy share
+a pull, while each startup retains its result. Later Always requests resolve
+the tag again. Completion wakes the inverse image index. Claim reclamation
+reserves exclusively in the admission table before checking holders/deleting,
+so an in-flight start cannot slip between its check and delete.

@@ -2,6 +2,10 @@
 
 ## 2026-09-29
 
+- **feat:** Prepare images in a separate four-slot pool, share in-flight pulls,
+  and wake only image dependents on completion. Claim reclamation now takes an
+  exclusive admission reservation against concurrent starts (#100).
+
 - **feat:** Yield init-container and VM shutdown waits between UID passes;
   reuse partial startup state and retry finalizer cleanup with UID guards.
 - **test:** Cover staged init resume/delete, deletion during an active operation,

@@ -21,6 +21,9 @@ use tracing::{debug, error, info, warn};
 
 mod csi_volumes;
 
+type ImageResult = Arc<std::sync::Mutex<Option<Result<String, String>>>>;
+type ImageKey = (String, String);
+
 /// State of a managed pod on this node.
 #[derive(Debug, Clone)]
 pub struct PodState {
@@ -288,6 +291,10 @@ pub struct PodManager {
     /// Where the host's root is seen, for the node services' logs (#72).
     host_root: std::path::PathBuf,
     admission: Option<Arc<crate::workload::Reservations>>,
+    start_images: std::sync::Mutex<HashMap<String,HashMap<ImageKey,ImageResult>>>,
+    image_inflight: Arc<std::sync::Mutex<HashMap<ImageKey,ImageResult>>>,
+    image_slots: Arc<tokio::sync::Semaphore>,
+    image_changes: tokio::sync::broadcast::Sender<String>,
 }
 
 /// A pod this node has admitted and not started, and why.
@@ -347,6 +354,10 @@ impl PodManager {
             images,
             pods: RwLock::new(HashMap::new()),
             admission: None,
+            start_images: Default::default(),
+            image_inflight: Default::default(),
+            image_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            image_changes: tokio::sync::broadcast::channel(128).0,
             node_name: node_name.to_string(),
             events: (!api_url.is_empty())
                 .then(|| crate::events::EventRecorder::new(api_client.clone(), api_url, node_name)),
@@ -371,6 +382,75 @@ impl PodManager {
     }
 
     /// See the host's root here rather than at `/hostroot`: for tests.
+    pub fn subscribe_image_changes(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.image_changes.subscribe()
+    }
+
+    /// Prepare all startup images off the worker pool, coalescing concurrent
+    /// pulls of the same image/policy. Completed results belong to this startup,
+    /// so a later Always request resolves its tag again.
+    fn prepare_images(&self,pod:&Value)->Result<(),CriError> {
+        let uid=pod["metadata"]["uid"].as_str().unwrap_or("");
+        let mut starts=self.start_images.lock().unwrap();
+        let results=starts.entry(uid.into()).or_default();
+        for spec in ["initContainers","containers"].iter().flat_map(|field|
+            pod["spec"][*field].as_array().into_iter().flatten()) {
+            let image=spec["image"].as_str().unwrap_or("");
+            let key=(image.to_string(),effective_pull_policy(spec,image).to_string());
+            results.entry(key.clone()).or_insert_with(|| {
+                let mut inflight=self.image_inflight.lock().unwrap();
+                if let Some(result)=inflight.get(&key) {return result.clone();}
+                let result:ImageResult=Arc::new(std::sync::Mutex::new(None));
+                inflight.insert(key.clone(),result.clone());
+                let state=result.clone(); let images=self.images.clone();
+                let all=self.image_inflight.clone(); let slots=self.image_slots.clone();
+                let changed=self.image_changes.clone();
+                tokio::spawn(async move {
+                    let _slot=slots.acquire_owned().await.unwrap();
+                    let (image,policy)=&key;
+                    let answer=match policy.as_str() {
+                        "Never"=>match images.image_status(image).await {
+                            Ok(Some(info))=>Ok(image_present_ref(&info,image)),
+                            Ok(None)=>Err(CriError::ImagePull(format!("image {image} not present and imagePullPolicy is Never"))),
+                            Err(error)=>Err(error),
+                        },
+                        "IfNotPresent"=>match images.image_status(image).await {
+                            Ok(Some(info))=>Ok(image_present_ref(&info,image)),
+                            _=>images.pull_image(image).await,
+                        },
+                        _=>images.pull_image(image).await,
+                    };
+                    *state.lock().unwrap()=Some(answer.map_err(|e|e.to_string()));
+                    all.lock().unwrap().remove(&key);
+                    let _=changed.send(image.clone());
+                });
+                result
+            });
+        }
+        for (key,result) in results.iter() {
+            match result.lock().unwrap().as_ref() {
+                None=>return Err(CriError::Pending(format!("waiting for image {}",key.0))),
+                Some(Err(error))=>return Err(CriError::ImagePull(error.clone())),
+                Some(Ok(_))=>{}
+            }
+        }
+        Ok(())
+    }
+
+    async fn startup_image(&self,pod:&Value,image:&str,spec:&Value)->Result<String,CriError> {
+        if self.admission.is_none() {return self.ensure_image(image,spec).await;}
+        let key=(image.to_string(),effective_pull_policy(spec,image).to_string());
+        let starts=self.start_images.lock().unwrap();
+        let result=starts.get(pod["metadata"]["uid"].as_str().unwrap_or(""))
+            .and_then(|images|images.get(&key)).ok_or_else(||CriError::Pending(format!("waiting for image {image}")))?;
+        let value=result.lock().unwrap().clone();
+        match value {
+            Some(Ok(reference))=>Ok(reference),
+            Some(Err(error))=>Err(CriError::ImagePull(error)),
+            None=>Err(CriError::Pending(format!("waiting for image {image}"))),
+        }
+    }
+
     pub fn with_admission(mut self, admission: Arc<crate::workload::Reservations>) -> Self {
         self.admission = Some(admission);
         self
@@ -1154,10 +1234,12 @@ impl PodManager {
         // Refuse while a pod here still has it. A delete that races a running
         // pod pulls a filesystem out from under a process mid-write, and the
         // pod finds out as EIO on a device that no longer exists.
-        if let Some(owner) = self.admission.as_ref().and_then(|a|
-            a.holder(&crate::workload::Resource::Claim(namespace.into(), claim.into()))) {
-            return Ok(VolumeRelease::InUse(format!("{:?} {}/{}",owner.kind,owner.namespace,owner.name)));
-        }
+        let _reclaim=if let Some(admission)=&self.admission {
+            match admission.reclaim(namespace,claim) {
+                Some(guard)=>Some(guard),
+                None=>return Ok(VolumeRelease::InUse("claim has an active workload or cleanup reservation".into())),
+            }
+        } else {None};
         if let Some(holder) = self.claim_holder_here(namespace, claim).await? {
             return Ok(VolumeRelease::InUse(holder));
         }
@@ -2139,6 +2221,7 @@ impl PodManager {
                         outcome.updates.push(self.waiting_pod(pod, message));
                     }
                     Err(e) => {
+                        self.start_images.lock().unwrap().remove(uid);
                         if let Some(state)=self.pods.write().await.get_mut(uid) { state.phase="Cleanup".into(); }
                         apimachinery::reactor::failed();
                         error!("Failed to start pod {namespace}/{name}: {e}");
@@ -2259,7 +2342,7 @@ impl PodManager {
             let existing=self.pods.read().await.get(uid).and_then(|p|p.container_ids.get(cname).cloned());
             let image = spec["image"].as_str().unwrap_or("");
             info!("Init container {ns}/{name}/{cname}: ensuring image {image}");
-            let image_ref = self.ensure_image(image, spec).await?;
+            let image_ref = self.startup_image(pod,image, spec).await?;
             let mut envs = self.resolve_env(pod, spec, pod_ip).await;
             merge_env(&mut envs, self.service_account_env());
             let mut mounts = resolve_mounts(spec, volumes);
@@ -2389,6 +2472,7 @@ impl PodManager {
         let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
 
         info!("Starting pod {namespace}/{name}");
+        if self.admission.is_some() {self.prepare_images(pod)?;}
 
         let sandbox_config = build_sandbox_config(pod);
         let volumes = self.resolve_volumes(pod).await?;
@@ -2508,7 +2592,7 @@ impl PodManager {
                 )
                 .await;
             }
-            let image_ref = match self.ensure_image(image, container_spec).await {
+            let image_ref = match self.startup_image(pod,image,container_spec).await {
                 Ok(r) => {
                     if present {
                         // Upstream's word for an image that was already
@@ -3535,6 +3619,7 @@ impl PodManager {
             ));
         }
         self.pods.write().await.remove(uid);
+        self.start_images.lock().unwrap().remove(uid);
         self.backoff.forget_pod(uid);
         self.first_seen
             .lock()
@@ -4345,6 +4430,8 @@ pub(crate) mod tests {
         removed_sandboxes: Mutex<Vec<String>>,
         removed_containers: Mutex<Vec<String>>,
         fail_stop: AtomicBool,
+        slow_image: Mutex<Option<Arc<tokio::sync::Notify>>>,
+        image_pulls: AtomicU32,
     }
 
     impl FakeRuntime {
@@ -4562,6 +4649,9 @@ pub(crate) mod tests {
     #[async_trait]
     impl ImageService for FakeRuntime {
         async fn pull_image(&self, image: &str) -> Result<String, CriError> {
+            self.image_pulls.fetch_add(1,Ordering::SeqCst);
+            let gate=if image=="slow" {self.slow_image.lock().unwrap().clone()} else {None};
+            if let Some(gate)=gate {gate.notified().await;}
             Ok(format!("{image}@sha256:fake"))
         }
 
@@ -5042,6 +5132,36 @@ pub(crate) mod tests {
         assert!(!sc.host_ipc);
     }
 
+    async fn prepared(mgr:&PodManager,p:&Value) {
+        let mut changed=mgr.subscribe_image_changes();
+        loop {
+            match mgr.prepare_images(p) {
+                Ok(())=>return,
+                Err(CriError::Pending(_))=>{tokio::time::timeout(std::time::Duration::from_secs(1),changed.recv()).await.unwrap().unwrap();},
+                Err(error)=>panic!("{error}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_image_is_shared_and_does_not_hold_an_unrelated_start() {
+        let (rt,mgr)=manager();let e=crate::workload::Executor::new();
+        let mgr=mgr.with_admission(e.reservations.clone());
+        let gate=Arc::new(tokio::sync::Notify::new());
+        *rt.slow_image.lock().unwrap()=Some(gate.clone());
+        let slow=pod("slow","slow","Always",json!({"name":"app","image":"slow"}));
+        let mut other=slow.clone();other["metadata"]["uid"]=json!("other");
+        assert!(matches!(mgr.start_pod(&slow).await,Err(CriError::Pending(_))));
+        assert!(matches!(mgr.start_pod(&other).await,Err(CriError::Pending(_))));
+        let fast=pod("fast","fast","Always",json!({"name":"app","image":"fast"}));
+        prepared(&mgr,&fast).await;
+        assert_eq!(mgr.start_pod(&fast).await.unwrap().phase,"Running");
+        assert_eq!(rt.image_pulls.load(Ordering::SeqCst),2,"one slow pull shared, one fast");
+        let mut changed=mgr.subscribe_image_changes();
+        gate.notify_one();changed.recv().await.unwrap();
+        assert_eq!(mgr.start_pod(&slow).await.unwrap().phase,"Running");
+    }
+
     #[tokio::test]
     async fn staged_init_yields_reuses_sandbox_and_deletion_cleans_partial_start() {
         let (rt,mgr)=manager();
@@ -5049,6 +5169,7 @@ pub(crate) mod tests {
         let mgr=mgr.with_admission(executor.reservations.clone());
         let mut p=pod("staged","staged","Always",json!({"name":"app","image":"test"}));
         p["spec"]["initContainers"]=json!([{"name":"init","image":"test"}]);
+        prepared(&mgr,&p).await;
         let result=tokio::time::timeout(std::time::Duration::from_millis(200),mgr.start_pod(&p)).await.unwrap();
         assert!(matches!(result,Err(CriError::Pending(_))));
         assert_eq!(rt.sandboxes.lock().unwrap().len(),1);
@@ -5070,6 +5191,7 @@ pub(crate) mod tests {
         let mgr=mgr.with_admission(executor.reservations.clone());
         let mut p=pod("staged-done","staged-done","Always",json!({"name":"app","image":"test"}));
         p["spec"]["initContainers"]=json!([{"name":"init","image":"test"}]);
+        prepared(&mgr,&p).await;
         assert!(matches!(mgr.start_pod(&p).await,Err(CriError::Pending(_))));
         let cid=mgr.pods.read().await["staged-done"].container_ids["init"].clone();
         rt.set_container_state(&cid,ContainerState::Exited,0);

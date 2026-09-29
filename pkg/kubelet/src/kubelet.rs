@@ -388,6 +388,7 @@ impl Kubelet {
         let mut exits = self.runtime_changes.clone();
         let mut volumes = Some(self.pod_manager.subscribe_volume_changes());
         let mut drivers = Some(self.csi.subscribe_changes());
+        let mut images = self.pod_manager.subscribe_image_changes();
         let mut files = tokio::task::JoinSet::new();
         if let Some(path) = self.config.pod_manifest_path.clone() {
             let changed = worker.clone();
@@ -398,6 +399,14 @@ impl Kubelet {
         loop {
             let work = tokio::select! {
                 work = worker.next() => work,
+                image = images.recv() => {
+                    match image {
+                        Ok(image)=>self.workloads.wake_dependency(&Dependency::Image(image)),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_))=>self.workloads.wake_kind(Kind::Pod),
+                        Err(_)=>{}
+                    }
+                    continue;
+                },
                 _ = runtime_changed(&mut volumes) => { self.workloads.wake_kind(Kind::Pod); worker.enqueue(); continue; },
                 _ = runtime_changed(&mut drivers) => { self.workloads.wake_kind(Kind::Pod); worker.enqueue(); continue; },
                 _ = runtime_changed(&mut exits) => { self.workloads.wake_kind(Kind::Pod); worker.enqueue(); continue; },
