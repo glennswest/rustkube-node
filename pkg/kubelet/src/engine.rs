@@ -166,6 +166,10 @@ impl EngineClient {
         self.send(Method::POST, url, Some(body)).await
     }
 
+    pub async fn put(&self, url: &str, body: &Value) -> reqwest::Result<Response> {
+        self.send(Method::PUT, url, Some(body)).await
+    }
+
     pub async fn delete(&self, url: &str) -> reqwest::Result<Response> {
         self.send(Method::DELETE, url, None).await
     }

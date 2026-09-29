@@ -58,6 +58,85 @@ fn deregister(namespace: &str, name: &str) {
 /// with nothing in the cluster that showed or controlled it.
 pub const FINALIZER: &str = "storm.io/vm";
 
+/// `"true"` on a VMI or its VirtualMachine: its disks get no owner, so the
+/// orphan sweep never deletes them — they outlive even the VM (#75).
+pub const RETAIN_ANNOTATION: &str = "storm.io/retain-disks";
+
+/// How often, at most, the orphan sweep asks the engine and the apiserver.
+const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Who a machine's disks belong to, as stormblock records it
+/// (`owner {kind, namespace, name, uid}`, stormblock#115).
+///
+/// **The VirtualMachine, not the VMI** (#75): a restart deletes the VMI and
+/// makes a new one, and the disks are the VM's to keep across that. A VMI with
+/// no VirtualMachine owns its own. `Null` when either carries
+/// [`RETAIN_ANNOTATION`]: nothing owns them, so nothing deletes them.
+fn disk_owner(vmi: &Value, vm: Option<&Value>) -> Value {
+    let retained = |o: &Value| o["metadata"]["annotations"][RETAIN_ANNOTATION].as_str() == Some("true");
+    if retained(vmi) || vm.is_some_and(retained) {
+        return Value::Null;
+    }
+    let ns = vmi["metadata"]["namespace"].as_str().unwrap_or("default");
+    let by_vm = vmi["metadata"]["ownerReferences"]
+        .as_array()
+        .and_then(|refs| refs.iter().find(|o| o["kind"] == "VirtualMachine"));
+    match by_vm {
+        Some(r) => json!({
+            "kind": "VirtualMachine",
+            "namespace": ns,
+            "name": r["name"].as_str().unwrap_or(""),
+            "uid": r["uid"].as_str().unwrap_or(""),
+        }),
+        None => json!({
+            "kind": "VirtualMachineInstance",
+            "namespace": ns,
+            "name": vmi["metadata"]["name"].as_str().unwrap_or(""),
+            "uid": vmi["metadata"]["uid"].as_str().unwrap_or(""),
+        }),
+    }
+}
+
+/// Is this volume, found under the name a disk would have, left by an
+/// earlier object of the same name? A VM deleted and made again under one
+/// name is a new machine, and must not boot the old one's root.
+fn left_by_another(found: &Value, owner: &Value) -> bool {
+    let theirs = found["owner"]["uid"].as_str().unwrap_or("");
+    let ours = owner["uid"].as_str().unwrap_or("");
+    !theirs.is_empty() && !ours.is_empty() && theirs != ours
+}
+
+/// The apiserver path of a disk owner, for the sweep. `None` for an owner
+/// this kubelet did not write.
+fn owner_path(owner: &Value) -> Option<String> {
+    let plural = match owner["kind"].as_str()? {
+        "VirtualMachine" => "virtualmachines",
+        "VirtualMachineInstance" => "virtualmachineinstances",
+        _ => return None,
+    };
+    let ns = owner["namespace"].as_str().filter(|n| !n.is_empty())?;
+    let name = owner["name"].as_str().filter(|n| !n.is_empty())?;
+    Some(format!("/apis/kubevirt.io/v1/namespaces/{ns}/{plural}/{name}"))
+}
+
+/// Has a disk's owner gone for good, from the apiserver's answer to a GET of
+/// it? Only a 404, another uid (a new object under the old name) or a
+/// deletionTimestamp say so. Anything else — a 5xx, a 403, no answer — keeps
+/// the disk: deleting on "could not ask" is how data goes.
+fn owner_gone(status: u16, obj: Option<&Value>, owner: &Value) -> bool {
+    match status {
+        404 => true,
+        200..=299 => {
+            let Some(obj) = obj else { return false };
+            let uid = owner["uid"].as_str().unwrap_or("");
+            let now = obj["metadata"]["uid"].as_str().unwrap_or("");
+            (!uid.is_empty() && !now.is_empty() && uid != now)
+                || !obj["metadata"]["deletionTimestamp"].is_null()
+        }
+        _ => false,
+    }
+}
+
 /// Is this VMI being deleted?
 fn terminating(obj: &Value) -> bool {
     !obj["metadata"]["deletionTimestamp"].is_null()
@@ -531,6 +610,8 @@ pub struct VmManager {
     snoop_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Snooped>>>,
     /// Failed starts waiting to be tried again, by uid (#76).
     retries: std::sync::Mutex<HashMap<String, Retry>>,
+    /// When the orphan sweep last ran (#75).
+    swept: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 /// A failed start waiting for its next try (#76).
@@ -633,6 +714,7 @@ impl VmManager {
             snoop_tx,
             snoop_rx: std::sync::Mutex::new(Some(snoop_rx)),
             retries: std::sync::Mutex::new(HashMap::new()),
+            swept: std::sync::Mutex::new(None),
         }
     }
 
@@ -935,6 +1017,12 @@ impl VmManager {
             self.set_finalizer(obj, false).await;
         }
 
+        // Disks whose VirtualMachine (or VMI) has gone for good (#75). After
+        // the stops, so a machine just stopped no longer holds them; before
+        // the starts, so a disk left by an earlier VM of the same name is
+        // gone before its successor looks for it.
+        self.sweep_orphans().await;
+
         // A retry for a machine no longer wanted is forgotten.
         self.retries
             .lock()
@@ -1144,7 +1232,8 @@ impl VmManager {
         let (boot_keys, boot_problems) = self.boot_keys(&vm).await;
         // Storage first. Nothing has been asked of the engine yet, so a golden
         // that does not exist costs a failed status and no cleanup.
-        let (disks, owned_volumes) = self.resolve_disks_with_keys(&vm, &boot_keys, fresh).await?;
+        let owner = self.owner_of(obj).await;
+        let (disks, owned_volumes) = self.resolve_disks_with_keys(&vm, &boot_keys, &owner, fresh).await?;
 
         // The pod log directory, because that is where `kubectl logs` looks.
         // The container name is the VM's, so the path is the one the kubelet's
@@ -1449,15 +1538,18 @@ impl VmManager {
         // as "the guest is quiet" rather than "there is no guest" — so this
         // matters as much as the write (rustkube-node#38).
         deregister(&vm.namespace, &vm.name);
+        // Detached, never deleted (#75). A stop is a VirtualMachine restart
+        // as often as it is a deletion, and the disks are the VM's: its root
+        // is what the guest wrote, not the golden it came from. What is
+        // deleted, and when, is the orphan sweep's to decide.
         self.release(&vm.disks).await;
-        self.destroy_owned(vm).await;
         info!(vm = %vm.name, "vm stopped");
     }
 
     /// [`Self::resolve_disks_with_keys`] with no keys: for tests.
     #[cfg(test)]
     async fn resolve_disks(&self, vm: &VmSpec) -> Result<(Vec<ResolvedDisk>, Vec<String>), StartFail> {
-        self.resolve_disks_with_keys(vm, &[], &mut Vec::new()).await
+        self.resolve_disks_with_keys(vm, &[], &Value::Null, &mut Vec::new()).await
     }
 
     /// Clone or attach every disk. Failure gives back what it already took —
@@ -1465,10 +1557,15 @@ impl VmManager {
     /// `keys` go into a cloud-init seed's `public-keys` (#92). Every volume
     /// made new here is added to `fresh`, as it is made, so a start that
     /// fails later can delete it (#76).
+    ///
+    /// A disk the machine owns is found by name before it is made (#75): a
+    /// restart attaches the root the guest left, and the golden is needed
+    /// only the first time. `owner` goes on each ([`disk_owner`]).
     async fn resolve_disks_with_keys(
         &self,
         vm: &VmSpec,
         keys: &[String],
+        owner: &Value,
         fresh: &mut Vec<String>,
     ) -> Result<(Vec<ResolvedDisk>, Vec<String>), StartFail> {
         let mut done: Vec<ResolvedDisk> = Vec::new();
@@ -1485,12 +1582,19 @@ impl VmManager {
                     // were two distinct volumes under one name and
                     // `volume_by_name` returned whichever the map iterated
                     // first.
-                    let body = json!({
-                        "name": stormvm_node::start::volume_name(vm, &d.name),
+                    let name = stormvm_node::start::volume_name(vm, &d.name);
+                    match self.reuse(&d.name, &name, owner).await {
+                        Ok(Some(id)) => id,
+                        Ok(None) => {
+                    let mut body = json!({
+                        "name": name,
                         "size": d.size,
                         "label": format!("storm.io/vm={}", vm.id()),
                         "verify": true,
                     });
+                    if !owner.is_null() {
+                        body["owner"] = owner.clone();
+                    }
                     match self
                         .post(&format!("{}/api/v1/volumes/{g}/clone", self.storage), &body)
                         .await
@@ -1526,6 +1630,12 @@ impl VmManager {
                                 "cloning golden {g} for disk {}: {e}",
                                 d.name
                             )));
+                        }
+                    }
+                        }
+                        Err(e) => {
+                            self.release(&done).await;
+                            return Err(e);
                         }
                     }
                 }
@@ -1566,14 +1676,30 @@ impl VmManager {
                 // once and found by name on every later start, as the
                 // standalone path does: a data disk that came back blank after
                 // a restart would lose everything the guest wrote to it.
-                DiskSource::Empty => match self.empty_volume(vm, &d.name, d.size.as_deref()).await {
-                    Ok(id) => id,
-                    Err(e) => {
-                        self.release(&done).await;
-                        return Err(StartFail::Failed(format!("disk {}: {e}", d.name)));
+                DiskSource::Empty => {
+                    let name = stormvm_node::start::volume_name(vm, &d.name);
+                    let found = match self.reuse(&d.name, &name, owner).await {
+                        Ok(found) => found,
+                        Err(e) => {
+                            self.release(&done).await;
+                            return Err(e);
+                        }
+                    };
+                    match found {
+                        Some(id) => id,
+                        None => match self.empty_volume(vm, &d.name, d.size.as_deref(), owner).await {
+                            Ok(id) => {
+                                fresh.push(id.clone());
+                                id
+                            }
+                            Err(e) => {
+                                self.release(&done).await;
+                                return Err(StartFail::Failed(format!("disk {}: {e}", d.name)));
+                            }
+                        },
                     }
-                },
-                DiskSource::CloudInit => match self.seed_volume(vm, keys).await {
+                }
+                DiskSource::CloudInit => match self.seed_volume(vm, &d.name, keys, owner).await {
                     Ok(id) => {
                         fresh.push(id.clone());
                         id
@@ -1757,7 +1883,11 @@ impl VmManager {
     /// name — never from a lease. A guest that takes its name from DHCP is a
     /// guest whose identity changes when the network does, and its
     /// certificates and logs change with it.
-    async fn seed_volume(&self, vm: &VmSpec, keys: &[String]) -> Result<String, String> {
+    /// The seed is made again on every start — the keys in it can change —
+    /// under the disk's namespaced name. The one a previous start left is
+    /// deleted first: a stop only detaches (#75), and two volumes under one
+    /// name are two answers to a lookup by name.
+    async fn seed_volume(&self, vm: &VmSpec, disk: &str, keys: &[String], owner: &Value) -> Result<String, String> {
         let mut seed = stormvm_cloudinit::Seed::for_vm(vm);
         // `accessCredentials` keys go in meta-data `public-keys`, never
         // user-data, where a second `ssh_authorized_keys:` would replace the
@@ -1770,11 +1900,20 @@ impl VmManager {
 
         // 16 MiB: the files are a few hundred bytes, and FAT16 needs enough
         // clusters to be FAT16 at all. Thin, so it costs what it holds.
-        let body = json!({
-            "name": format!("{}-seed", vm.name),
+        let name = stormvm_node::start::volume_name(vm, disk);
+        if let Some(old) = self.volume_named(&name).await? {
+            if let Some(id) = old["id"].as_str() {
+                self.delete_volumes(&vm.name, &[id.to_string()]).await;
+            }
+        }
+        let mut body = json!({
+            "name": name,
             "size": "16M",
             "redundancy": "none",
         });
+        if !owner.is_null() {
+            body["owner"] = owner.clone();
+        }
         let v = self
             .post(&format!("{}/api/v1/volumes", self.storage), &body)
             .await
@@ -1803,8 +1942,8 @@ impl VmManager {
         Ok(id)
     }
 
-    /// The VM's empty disk: the volume `<ns>-<vm>-<disk>` if it exists,
-    /// otherwise a new blank one of `size`.
+    /// A new blank volume of `size` for the VM's empty disk. The caller has
+    /// already looked for the one a previous start made ([`Self::reuse`]).
     ///
     /// No `redundancy`: the engine's default, not the seed's `none`, because
     /// this is the guest's data. No filesystem either: what goes on the disk
@@ -1814,17 +1953,18 @@ impl VmManager {
         vm: &VmSpec,
         disk: &str,
         size: Option<&str>,
+        owner: &Value,
     ) -> Result<String, String> {
         let name = stormvm_node::start::volume_name(vm, disk);
-        if let Some(id) = self.volume_by_name(&name).await? {
-            return Ok(id);
-        }
         let size = size.ok_or_else(|| "an empty disk needs a size".to_string())?;
-        let body = json!({
+        let mut body = json!({
             "name": name,
             "size": size,
             "label": format!("storm.io/vm={}", vm.id()),
         });
+        if !owner.is_null() {
+            body["owner"] = owner.clone();
+        }
         let v = self
             .post(&format!("{}/api/v1/volumes", self.storage), &body)
             .await
@@ -1838,18 +1978,121 @@ impl VmManager {
     /// A volume's id by name. `Ok(None)` only when the engine answered and
     /// has no such volume: "could not ask" must not become "make a new one",
     /// or a restart during an engine hiccup gives the guest a blank disk.
-    async fn volume_by_name(&self, name: &str) -> Result<Option<String>, String> {
+    async fn volume_named(&self, name: &str) -> Result<Option<Value>, String> {
+        Ok(self.volumes().await?.into_iter().find(|v| v["name"].as_str() == Some(name)))
+    }
+
+    /// Every volume on this node's engine, as it describes them.
+    async fn volumes(&self) -> Result<Vec<Value>, String> {
         let url = format!("{}/api/v1/volumes", self.storage);
         let resp = self.engine.get(&url).await.map_err(|e| format!("listing volumes: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("listing volumes: {}", resp.status()));
         }
         let list: Value = resp.json().await.map_err(|e| format!("listing volumes: {e}"))?;
-        Ok(list["items"]
-            .as_array()
-            .and_then(|a| a.iter().find(|v| v["name"].as_str() == Some(name)))
-            .and_then(|v| v["id"].as_str())
-            .map(String::from))
+        Ok(list["items"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// The volume a previous start made for disk `disk` (named `name`), if
+    /// there is one, with its owner brought up to `owner` (#75).
+    ///
+    /// A listing that fails is a failed start, not "make a new one": that
+    /// would give a restarted guest a fresh root and leave its own beside it.
+    /// One left by an earlier object of the same name waits for the sweep.
+    async fn reuse(&self, disk: &str, name: &str, owner: &Value) -> Result<Option<String>, StartFail> {
+        let found = self
+            .volume_named(name)
+            .await
+            .map_err(|e| StartFail::Failed(format!("disk {disk}: {e}")))?;
+        let Some(v) = found else { return Ok(None) };
+        let Some(id) = v["id"].as_str().map(String::from) else { return Ok(None) };
+        if left_by_another(&v, owner) {
+            return Err(StartFail::Waiting(format!(
+                "disk {disk}: volume {name} was left by an earlier {} of this name; waiting for it to be removed",
+                v["owner"]["kind"].as_str().unwrap_or("owner")
+            )));
+        }
+        if v["owner"] != *owner {
+            self.set_volume_owner(&id, owner).await;
+        }
+        info!(volume = %id, "reusing {name} for disk {disk}");
+        Ok(Some(id))
+    }
+
+    /// Record a volume's owner (`Null`: none). Best effort: a disk left with
+    /// an old owner is kept by the sweep, never deleted early.
+    async fn set_volume_owner(&self, id: &str, owner: &Value) {
+        let url = format!("{}/api/v1/volumes/{id}/owner", self.storage);
+        match self.engine.put(&url, &json!({ "owner": owner })).await {
+            Ok(r) if r.status().is_success() => {}
+            Ok(r) => warn!(volume = %id, "owner not recorded: {}", r.status()),
+            Err(e) => warn!(volume = %id, "owner not recorded: {e}"),
+        }
+    }
+
+    /// The owner for this VMI's disks: [`disk_owner`], with its
+    /// VirtualMachine read for the retain annotation.
+    async fn owner_of(&self, obj: &Value) -> Value {
+        let ns = obj["metadata"]["namespace"].as_str().unwrap_or("default");
+        let vm = match owner_vm(obj) {
+            Some(name) => self.get_vm(ns, name).await,
+            None => None,
+        };
+        disk_owner(obj, vm.as_ref())
+    }
+
+    /// Delete the disks whose owner has gone for good (#75): its
+    /// VirtualMachine deleted (or replaced under the same name), or a VMI
+    /// with no VirtualMachine deleted. At most once a [`SWEEP_EVERY`].
+    ///
+    /// Only volumes this kubelet gave an owner to, not in use, and not held
+    /// by a machine it knows. An owner that cannot be read keeps its disks.
+    async fn sweep_orphans(&self) {
+        if self.api_url.is_empty() {
+            return;
+        }
+        {
+            let mut swept = self.swept.lock().unwrap_or_else(|e| e.into_inner());
+            if swept.is_some_and(|t| t.elapsed() < SWEEP_EVERY) {
+                return;
+            }
+            *swept = Some(std::time::Instant::now());
+        }
+        let volumes = match self.volumes().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!("orphan sweep skipped: {e}");
+                return;
+            }
+        };
+        let held: std::collections::HashSet<String> = {
+            let vms = self.vms.lock().await;
+            vms.values().flat_map(|v| v.disks.iter().filter_map(|d| d.volume_id.clone())).collect()
+        };
+        for v in volumes {
+            let Some(id) = v["id"].as_str() else { continue };
+            let owner = &v["owner"];
+            let Some(path) = owner_path(owner) else { continue };
+            if held.contains(id) || v["in_use"].as_bool() == Some(true) {
+                continue;
+            }
+            let (status, obj) = match self.api.get(format!("{}{path}", self.api_url)).send().await {
+                Ok(r) => {
+                    let status = r.status().as_u16();
+                    (status, r.json::<Value>().await.ok())
+                }
+                Err(_) => continue,
+            };
+            if !owner_gone(status, obj.as_ref(), owner) {
+                continue;
+            }
+            info!(volume = %id, "deleting {}: its {} {}/{} is gone",
+                  v["name"].as_str().unwrap_or(""),
+                  owner["kind"].as_str().unwrap_or(""),
+                  owner["namespace"].as_str().unwrap_or(""),
+                  owner["name"].as_str().unwrap_or(""));
+            self.delete_volumes(owner["name"].as_str().unwrap_or(""), &[id.to_string()]).await;
+        }
     }
 
     /// Best effort: a start that has already gone wrong must not be made worse
@@ -2037,6 +2280,14 @@ impl VmManager {
             match (state, obj) {
                 (Some(true), Some(obj)) => {
                     info!(vm = %id, handle = ?vm.handle, "adopted a running machine");
+                    // Started before disks had owners (#75): give them one
+                    // now, or the sweep could never delete them.
+                    let owner = self.owner_of(obj).await;
+                    for d in reg.disks.iter().filter(|d| d.owned) {
+                        if let Some(v) = &d.volume_id {
+                            self.set_volume_owner(v, &owner).await;
+                        }
+                    }
                     self.event(obj, "Normal", "Adopted",
                                &format!("Virtual machine {} was already running on {}", vm.name, self.node_name))
                         .await;
@@ -2145,10 +2396,6 @@ impl VmManager {
             Ok(r) => tracing::debug!("{ns}/{name}: finalizer not updated: {}", r.status()),
             Err(e) => tracing::debug!("{ns}/{name}: finalizer not updated: {e}"),
         }
-    }
-
-    async fn destroy_owned(&self, vm: &Vm) {
-        self.delete_volumes(&vm.name, &vm.owned_volumes).await;
     }
 
     /// Delete these volumes. Best effort, each failure logged.
@@ -3071,6 +3318,11 @@ mod tests {
                 "/api/v1/volumes/{g}/clone",
                 post(|| async { axum::Json(json!({"id": "clone-1"})) }),
             )
+            // Nothing made before: the root is cloned (#75 looks first).
+            .route(
+                "/api/v1/volumes",
+                axum::routing::get(|| async { axum::Json(json!({"items": []})) }),
+            )
             // The attach fails, after the clone was made.
             .route(
                 "/api/v1/volumes/{id}/attach",
@@ -3097,7 +3349,7 @@ mod tests {
         obj["spec"]["volumes"] = json!([{"name": "root", "containerDisk": {"image": "fedora-43"}}]);
         let vm: VmSpec = stormvm_spec::kube::from_kube(&obj).unwrap();
         let mut fresh = Vec::new();
-        let r = m.resolve_disks_with_keys(&vm, &[], &mut fresh).await;
+        let r = m.resolve_disks_with_keys(&vm, &[], &Value::Null, &mut fresh).await;
         assert!(matches!(r, Err(StartFail::Failed(_))), "{r:?}");
         assert_eq!(fresh, vec!["clone-1".to_string()]);
         m.delete_volumes("web-1", &fresh).await;
@@ -3123,6 +3375,317 @@ mod tests {
     /// pods `pods` lists, and an engine whose volumes are `vols`. Creates are
     /// recorded, attaches answer a device, and any write to the apiserver
     /// (the claim's binding) is accepted.
+    // ---- #75: a VM's disks outlive its VMI ----
+
+    #[test]
+    fn a_vms_disks_belong_to_the_virtual_machine_not_the_vmi() {
+        let mut obj = vmi("n1");
+        obj["metadata"]["ownerReferences"] =
+            json!([{"kind": "VirtualMachine", "name": "web", "uid": "vm-uid"}]);
+        assert_eq!(
+            disk_owner(&obj, None),
+            json!({"kind": "VirtualMachine", "namespace": "default", "name": "web", "uid": "vm-uid"})
+        );
+        // No VirtualMachine: the VMI owns its own.
+        assert_eq!(
+            disk_owner(&vmi("n1"), None),
+            json!({"kind": "VirtualMachineInstance", "namespace": "default", "name": "web-1", "uid": "u-1"})
+        );
+        // Retained, on the VMI or on its VM: no owner, so nothing deletes them.
+        let mut kept = obj.clone();
+        kept["metadata"]["annotations"] = json!({ RETAIN_ANNOTATION: "true" });
+        assert!(disk_owner(&kept, None).is_null());
+        let vm = json!({"metadata": {"annotations": { RETAIN_ANNOTATION: "true" }}});
+        assert!(disk_owner(&obj, Some(&vm)).is_null());
+    }
+
+    #[test]
+    fn only_a_404_another_uid_or_a_deletion_says_the_owner_is_gone() {
+        let owner = json!({"kind": "VirtualMachine", "namespace": "web", "name": "a", "uid": "u1"});
+        assert_eq!(owner_path(&owner).as_deref(), Some("/apis/kubevirt.io/v1/namespaces/web/virtualmachines/a"));
+        assert_eq!(owner_path(&json!({"kind": "PersistentVolumeClaim", "namespace": "x", "name": "y"})), None);
+        assert!(owner_gone(404, None, &owner));
+        assert!(!owner_gone(200, Some(&json!({"metadata": {"uid": "u1"}})), &owner));
+        assert!(owner_gone(200, Some(&json!({"metadata": {"uid": "u2"}})), &owner));
+        assert!(owner_gone(200, Some(&json!({"metadata": {"uid": "u1", "deletionTimestamp": "t"}})), &owner));
+        // Could not ask is not gone.
+        for code in [500, 503, 403, 401] {
+            assert!(!owner_gone(code, None, &owner), "{code}");
+        }
+        assert!(!owner_gone(200, None, &owner));
+    }
+
+    /// An engine for the #75 tests: volumes with owners, clone/create/delete,
+    /// owner updates; and an apiserver answering for owners by path.
+    struct DiskEngine {
+        url: String,
+        vols: Arc<std::sync::Mutex<Vec<Value>>>,
+        cloned: Arc<std::sync::Mutex<Vec<Value>>>,
+        deleted: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    async fn disk_engine(vols: Vec<Value>, owners: Vec<(&'static str, u16, Value)>) -> DiskEngine {
+        use axum::extract::Path;
+        use axum::routing::{get, post, put};
+        type Shared<T> = Arc<std::sync::Mutex<T>>;
+        let vols: Shared<Vec<Value>> = Arc::new(std::sync::Mutex::new(vols));
+        let cloned: Shared<Vec<Value>> = Arc::default();
+        let deleted: Shared<Vec<String>> = Arc::default();
+        let (v1, v2, v3, v4, v5) = (vols.clone(), vols.clone(), vols.clone(), vols.clone(), vols.clone());
+        let (c1, d1) = (cloned.clone(), deleted.clone());
+        let mut app = axum::Router::new()
+            .route(
+                "/api/v1/volumes",
+                get(move || {
+                    let v = v1.clone();
+                    async move { axum::Json(json!({ "items": v.lock().unwrap().clone() })) }
+                })
+                .post(move |axum::Json(b): axum::Json<Value>| {
+                    let v = v2.clone();
+                    async move {
+                        let mut v = v.lock().unwrap();
+                        let id = format!("vol-{}", v.len());
+                        v.push(json!({"id": id, "name": b["name"], "owner": b["owner"]}));
+                        axum::Json(json!({ "id": id }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/volumes/{g}/clone",
+                post(move |axum::Json(b): axum::Json<Value>| {
+                    let (v, c) = (v3.clone(), c1.clone());
+                    async move {
+                        let mut v = v.lock().unwrap();
+                        let id = format!("vol-{}", v.len());
+                        v.push(json!({"id": id, "name": b["name"], "owner": b["owner"]}));
+                        c.lock().unwrap().push(b);
+                        axum::Json(json!({ "id": id }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/volumes/{id}/attach",
+                post(|Path(id): Path<String>| async move {
+                    axum::Json(json!({ "device_hint": format!("/dev/ublk-{id}") }))
+                })
+                .delete(|| async { axum::Json(json!({})) }),
+            )
+            .route(
+                "/api/v1/volumes/{id}/owner",
+                put(move |Path(id): Path<String>, axum::Json(b): axum::Json<Value>| {
+                    let v = v4.clone();
+                    async move {
+                        for x in v.lock().unwrap().iter_mut() {
+                            if x["id"] == id {
+                                x["owner"] = b["owner"].clone();
+                            }
+                        }
+                        axum::Json(json!({}))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/volumes/{id}",
+                axum::routing::delete(move |Path(id): Path<String>| {
+                    let (v, d) = (v5.clone(), d1.clone());
+                    async move {
+                        v.lock().unwrap().retain(|x| x["id"] != id);
+                        d.lock().unwrap().push(id);
+                        axum::Json(json!({}))
+                    }
+                }),
+            )
+            .route("/api/v1/volumes/{id}/cidata", post(|| async { axum::Json(json!({})) }));
+        for (path, code, body) in owners {
+            app = app.route(
+                path,
+                get(move || {
+                    let body = body.clone();
+                    async move { (axum::http::StatusCode::from_u16(code).unwrap(), axum::Json(body)) }
+                }),
+            );
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        DiskEngine { url, vols, cloned, deleted }
+    }
+
+    fn disk_manager(e: &DiskEngine, api: &str) -> VmManager {
+        VmManager::new(None, "n1", reqwest::Client::new(), api)
+            .with_storage(crate::engine::EngineClient::new(&e.url, crate::engine::TokenSource::none()))
+    }
+
+    /// A VMI of VirtualMachine `web` (uid `vm-uid`): a golden root and a seed.
+    fn vm_owned_vmi(uid: &str) -> Value {
+        let mut obj = vmi("n1");
+        obj["metadata"]["uid"] = json!(uid);
+        obj["metadata"]["ownerReferences"] =
+            json!([{"kind": "VirtualMachine", "name": "web", "uid": "vm-uid"}]);
+        obj["spec"]["domain"]["devices"] = json!({"disks": [
+            {"name": "root", "disk": {"bus": "virtio"}},
+            {"name": "cloudinit", "disk": {"bus": "virtio"}},
+        ]});
+        obj["spec"]["volumes"] = json!([
+            {"name": "root", "containerDisk": {"image": "fedora-43"}},
+            {"name": "cloudinit", "cloudInitNoCloud": {"userData": "#cloud-config\n"}},
+        ]);
+        obj
+    }
+
+    /// **The issue.** A VirtualMachine restart is a new VMI: its root is the
+    /// one the first start cloned, found by name, and the golden is cloned
+    /// once. The seed is made again (its keys can change) and the old one
+    /// goes, so there is never a second volume under its name.
+    #[tokio::test]
+    async fn a_restart_reattaches_the_root_it_left_and_clones_once() {
+        let e = disk_engine(vec![], vec![]).await;
+        let m = disk_manager(&e, "");
+        let first = vm_owned_vmi("vmi-1");
+        let owner = disk_owner(&first, None);
+        let spec: VmSpec = stormvm_spec::kube::from_kube(&first).unwrap();
+        let (disks, owned) = m.resolve_disks_with_keys(&spec, &[], &owner, &mut Vec::new()).await.unwrap();
+        let root = disks[0].volume_id.clone().unwrap();
+        let seed = disks[1].volume_id.clone().unwrap();
+        assert_eq!(owned, vec![root.clone(), seed.clone()]);
+        assert_eq!(e.cloned.lock().unwrap().len(), 1);
+        assert_eq!(e.cloned.lock().unwrap()[0]["owner"], owner);
+        assert_eq!(e.cloned.lock().unwrap()[0]["name"], json!("default.web-1-root"));
+
+        // Stopped: detached, nothing deleted.
+        let vm = Vm {
+            namespace: "default".into(),
+            name: "web-1".into(),
+            uid: "vmi-1".into(),
+            log_dir: String::new(),
+            handle: Handle::NONE,
+            disks,
+            phase: Phase::Succeeded,
+            exit_code: 0,
+            message: String::new(),
+            started_unix: 1,
+            ready_unix: None,
+            owned_volumes: owned,
+            nics: vec![],
+            access: Access::default(),
+        };
+        m.stop(&vm).await;
+        assert!(e.deleted.lock().unwrap().is_empty(), "a stop deletes nothing");
+
+        // The restart: a new VMI of the same VirtualMachine.
+        let second = vm_owned_vmi("vmi-2");
+        let spec: VmSpec = stormvm_spec::kube::from_kube(&second).unwrap();
+        let (again, _) = m
+            .resolve_disks_with_keys(&spec, &[], &disk_owner(&second, None), &mut Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(again[0].volume_id.as_deref(), Some(root.as_str()), "the same root");
+        assert_eq!(e.cloned.lock().unwrap().len(), 1, "not cloned again");
+        assert_eq!(*e.deleted.lock().unwrap(), vec![seed.clone()], "only the old seed goes");
+        assert_ne!(again[1].volume_id.as_deref(), Some(seed.as_str()));
+        let names: Vec<Value> = e.vols.lock().unwrap().iter().map(|v| v["name"].clone()).collect();
+        assert_eq!(names.iter().filter(|n| **n == json!("default.web-1-cloudinit")).count(), 1);
+    }
+
+    /// A VM deleted and made again under its name is a new machine: the old
+    /// one's root is not booted, and the start waits for the sweep.
+    #[tokio::test]
+    async fn a_root_left_by_an_earlier_vm_of_the_name_is_not_reused() {
+        let old = json!({"id": "old-root", "name": "default.web-1-root",
+                         "owner": {"kind": "VirtualMachine", "namespace": "default", "name": "web", "uid": "earlier"}});
+        let e = disk_engine(vec![old], vec![]).await;
+        let m = disk_manager(&e, "");
+        let obj = vm_owned_vmi("vmi-1");
+        let spec: VmSpec = stormvm_spec::kube::from_kube(&obj).unwrap();
+        let r = m.resolve_disks_with_keys(&spec, &[], &disk_owner(&obj, None), &mut Vec::new()).await;
+        match r {
+            Err(StartFail::Waiting(why)) => assert!(why.contains("earlier VirtualMachine"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(e.cloned.lock().unwrap().is_empty());
+    }
+
+    /// A disk made before owners existed gets one when it is found, so the
+    /// sweep can find it later.
+    #[tokio::test]
+    async fn a_found_disk_is_given_its_owner() {
+        let e = disk_engine(vec![json!({"id": "r", "name": "default.web-1-root"})], vec![]).await;
+        let m = disk_manager(&e, "");
+        let obj = vm_owned_vmi("vmi-1");
+        let spec: VmSpec = stormvm_spec::kube::from_kube(&obj).unwrap();
+        let owner = disk_owner(&obj, None);
+        m.resolve_disks_with_keys(&spec, &[], &owner, &mut Vec::new()).await.unwrap();
+        let root = e.vols.lock().unwrap().iter().find(|v| v["id"] == "r").cloned().unwrap();
+        assert_eq!(root["owner"], owner);
+    }
+
+    /// The sweep deletes exactly the disks whose owner is gone for good.
+    #[tokio::test]
+    async fn the_sweep_deletes_only_what_a_gone_owner_left() {
+        let owned = |id: &str, kind: &str, name: &str, uid: &str| {
+            json!({"id": id, "name": id, "owner": {"kind": kind, "namespace": "default", "name": name, "uid": uid}})
+        };
+        let vols = vec![
+            owned("deleted-vm", "VirtualMachine", "a", "ua"),
+            owned("live-vm", "VirtualMachine", "b", "ub"),
+            owned("replaced-vm", "VirtualMachine", "c", "uc"),
+            owned("unanswered", "VirtualMachine", "d", "ud"),
+            owned("deleting-vmi", "VirtualMachineInstance", "e", "ue"),
+            {
+                let mut v = owned("in-use", "VirtualMachine", "a", "ua");
+                v["in_use"] = json!(true);
+                v
+            },
+            owned("held-here", "VirtualMachine", "a", "ua"),
+            json!({"id": "no-owner", "name": "no-owner"}),
+            json!({"id": "a-claim", "name": "a-claim",
+                   "owner": {"kind": "PersistentVolumeClaim", "namespace": "default", "name": "a"}}),
+        ];
+        let p = |plural: &str, n: &str| format!("/apis/kubevirt.io/v1/namespaces/default/{plural}/{n}");
+        let owners: Vec<(&'static str, u16, Value)> = vec![
+            (Box::leak(p("virtualmachines", "b").into_boxed_str()), 200, json!({"metadata": {"uid": "ub"}})),
+            (Box::leak(p("virtualmachines", "c").into_boxed_str()), 200, json!({"metadata": {"uid": "new"}})),
+            (Box::leak(p("virtualmachines", "d").into_boxed_str()), 500, json!({})),
+            (Box::leak(p("virtualmachineinstances", "e").into_boxed_str()), 200,
+             json!({"metadata": {"uid": "ue", "deletionTimestamp": "2026-09-29T00:00:00Z"}})),
+        ];
+        // `a` has no route: 404.
+        let e = disk_engine(vols, owners).await;
+        let m = disk_manager(&e, &e.url);
+        m.vms.lock().await.insert("x".into(), Vm {
+            namespace: "default".into(),
+            name: "x".into(),
+            uid: "x".into(),
+            log_dir: String::new(),
+            handle: Handle::NONE,
+            disks: vec![ResolvedDisk {
+                name: "root".into(),
+                device: "/dev/x".into(),
+                volume_id: Some("held-here".into()),
+                readonly: false,
+                bus: stormvm_spec::DiskBus::Virtio,
+            }],
+            phase: Phase::Running,
+            exit_code: 0,
+            message: String::new(),
+            started_unix: 1,
+            ready_unix: None,
+            owned_volumes: vec![],
+            nics: vec![],
+            access: Access::default(),
+        });
+
+        m.sweep_orphans().await;
+        let mut gone = e.deleted.lock().unwrap().clone();
+        gone.sort();
+        assert_eq!(gone, vec!["deleted-vm", "deleting-vmi", "replaced-vm"]);
+
+        // Not again within the minute.
+        e.vols.lock().unwrap().push(owned("later", "VirtualMachine", "a", "ua"));
+        m.sweep_orphans().await;
+        assert_eq!(e.deleted.lock().unwrap().len(), 3);
+    }
+
     struct Fake {
         url: String,
         vols: Arc<std::sync::Mutex<Vec<(String, String)>>>,
