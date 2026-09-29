@@ -12,19 +12,19 @@ development; the code stays upstream-shaped and monorepo-mergeable.
 
 `turbomode` pairs with rustkube's branch of the same name. Pod and VMI
 assignment/volume watches enqueue coalesced reconciliation work; Pod and VM
-subscriptions run independently; runtime mutations remain serialized until
-per-claim admission is implemented (#100). Stormpump exits and Linux static-manifest changes
+subscriptions run independently; runtime work now uses one eight-worker Pod/VMI executor with name/claim
+reservations and recovery barriers (#100, validation in progress). Stormpump exits and Linux static-manifest changes
 also wake workers. CSI registrar sockets use filesystem notifications;
 successful registrations wake Pod workers, with deadlines for pending failures. Failed or incomplete Pod/manifest reads cannot stop live
 Pods by treating an unknown desired set as empty. Status publication retains
 startTime, skips unchanged status and uses the observed resourceVersion.
 Pod teardown retains its runtime record until stopping and volume cleanup succeed.
 CSI teardown preserves its retry record through failed unstage calls and refuses
-cleanup from unreadable records or incomplete Pod lists. A common Pod/VMI
-executor and claim-reservation module is drafted, but its runtime adapters are
-not wired yet; the serialized loops still govern production execution.
+cleanup from unreadable records or incomplete Pod lists. Pod and VMI adapters share that executor. Failed startup/cleanup records are
+retained, and same-name successors wait for the previous UID to release its resources.
 
-This is an **unbuilt first migration**, not a measured subsecond release.
+The executor foundation passed dev tests at `5e9148c`; adapter validation is
+in progress. This is not a measured subsecond release.
 Active workloads still use an explicit runtime/probe/volume observation
 fallback, and service/volume mirrors and CSI cleanup tasks retain their existing schedules.
 Per-UID concurrency and complete local event sources are tracked in

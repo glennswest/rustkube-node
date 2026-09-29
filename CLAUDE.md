@@ -45,7 +45,10 @@ already passed (211 tests). No main merge, golden or live deployment now.
 
 1. [ ] Audit runtime state/locks and recovery; protect claim/name admission before concurrency.
    Found: VM stop considered query errors/timeouts an exit and ignored detach HTTP errors.
-   First checkpoint retains failed cleanup and guards Pod deletion by UID; validation pending.
+   First checkpoint retains failed cleanup and guards Pod deletion by UID.
+   sc-build at 5e9148c passed 216 kubelet tests plus four integration tests.
+   Adapters now wired to one eight-worker pool; startup recovery/admission,
+   per-claim mutation exclusion and partial Pod-start state added, validation pending.
 2. [ ] Wire Pod/VMI adapters to the common executor; retain state across failed cleanup,
        use observed UID preconditions, and preserve bootstrap through unavailable API reads.
 3. [ ] Add dependency indexes, staged waits and slow/fast/cancellation regression tests.

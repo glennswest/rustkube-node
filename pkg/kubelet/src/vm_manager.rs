@@ -539,6 +539,57 @@ impl VmManager {
         *self.watched.lock().await = Some(objs);
     }
 
+    /// Startup adoption records facts only; cleanup belongs to the UID worker.
+    pub async fn adopt_registered(&self) {
+        let mut records = self.vms.lock().await;
+        for reg in stormvm_node::console::list(RUN_ROOT) {
+            if !reg.uid.is_empty() {
+                records.entry(reg.uid.clone()).or_insert_with(|| vm_of(&reg));
+            }
+        }
+    }
+
+    pub async fn cache_specs(&self, objects: &[Value]) {
+        *self.desired.lock().await = objects.iter().filter_map(|o|
+            o["metadata"]["uid"].as_str().map(|uid| (uid.into(), o.clone()))).collect();
+        self.synced.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub async fn has_unknown_claims(&self) -> bool {
+        let keys: Vec<_> = self.vms.lock().await.keys().cloned().collect();
+        let desired = self.desired.lock().await;
+        keys.iter().any(|uid| !desired.contains_key(uid))
+    }
+
+    /// Only this UID is observed or mutated. The common executor protects its
+    /// name/claims, including while a terminating predecessor retains disks.
+    pub async fn reconcile_one(&self, uid: &str, object: Option<&Value>) -> anyhow::Result<bool> {
+        if object.map_or(true, terminating) {
+            let vm = self.vms.lock().await.get(uid).cloned();
+            if let Some(vm) = vm {
+                anyhow::ensure!(self.stop(&vm).await, "VM cleanup pending for {uid}");
+                self.vms.lock().await.remove(uid);
+            }
+            if let Some(object) = object { self.set_finalizer(object, false).await; }
+            return Ok(true);
+        }
+        let object = object.unwrap();
+        self.absorb_ends_for(Some(uid)).await;
+        if !self.vms.lock().await.contains_key(uid) {
+            match self.start(uid, object).await {
+                Ok(()) => {}
+                Err(StartFail::Waiting(why)) => {
+                    self.patch_pending(object["metadata"]["namespace"].as_str().unwrap_or("default"),
+                        object["metadata"]["name"].as_str().unwrap_or(""), &why).await;
+                    return Ok(false);
+                }
+                Err(error) => return Err(anyhow::anyhow!(error.message().to_string())),
+            }
+        }
+        self.set_finalizer(object, true).await;
+        Ok(false)
+    }
+
     pub async fn sync(&self, desired: &[Value]) {
         self.absorb_ends().await;
 
@@ -869,11 +920,13 @@ impl VmManager {
     /// drained by the container runtime, and a shared channel has exactly one
     /// reader. A query per VM per sync is a handful of round trips at ~200 µs
     /// each, which is not worth a second mechanism to avoid.
-    async fn absorb_ends(&self) {
+    async fn absorb_ends(&self) { self.absorb_ends_for(None).await; }
+
+    async fn absorb_ends_for(&self, uid: Option<&str>) {
         let Some(ring) = self.ring.clone() else { return };
         let live: Vec<Vm> = {
             let vms = self.vms.lock().await;
-            vms.values().filter(|v| !v.phase.terminal()).cloned().collect()
+            vms.values().filter(|v| !v.phase.terminal() && uid.map_or(true, |uid| uid == v.uid)).cloned().collect()
         };
         for vm in live {
             // Ask the guest what address it has, and report it when it

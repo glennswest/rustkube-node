@@ -52,7 +52,7 @@ pub enum Dependency {
     Driver(String),
 }
 
-fn dependencies(key: &Key, object: &Value) -> HashSet<Dependency> {
+pub fn dependencies(key: &Key, object: &Value) -> HashSet<Dependency> {
     let mut out = HashSet::new();
     for volume in object["spec"]["volumes"].as_array().into_iter().flatten() {
         if let Some(name) = volume["persistentVolumeClaim"]["claimName"].as_str() {
@@ -99,6 +99,7 @@ struct Admissions {
     holders: HashMap<Resource, HashMap<Key, Access>>,
     owned: HashMap<Key, HashSet<Resource>>,
     waiting: HashMap<Resource, HashSet<Key>>,
+    operations: HashMap<Resource, Arc<tokio::sync::Mutex<()>>>,
 }
 
 /// Reservations describe live resources, not mutex guards. They outlive a
@@ -164,6 +165,34 @@ impl Reservations {
         true
     }
 
+    /// Shared filesystem holders may coexist, but stage/unstage/clone mutations
+    /// for one claim must not run simultaneously. Never wait holding a subset.
+    pub fn try_operations(&self, claims: &[(Resource, Access)]) -> Option<Vec<tokio::sync::OwnedMutexGuard<()>>> {
+        let mut state = self.state.lock().unwrap();
+        let mut guards = Vec::new();
+        let mut seen = HashSet::new();
+        for (resource, _) in claims {
+            if seen.insert(resource.clone()) {
+                let lock = state.operations.entry(resource.clone()).or_default().clone();
+                guards.push(lock.try_lock_owned().ok()?);
+            }
+        }
+        Some(guards)
+    }
+
+    pub fn claims(&self,key:&Key) -> Vec<(Resource,Access)> {
+        let state=self.state.lock().unwrap();
+        state.owned.get(key).into_iter().flatten().filter_map(|resource| {
+            if matches!(resource,Resource::Claim(..)) {
+                state.holders.get(resource)?.get(key).map(|mode|(resource.clone(),*mode))
+            } else {None}
+        }).collect()
+    }
+
+    pub fn holder(&self, resource: &Resource) -> Option<Key> {
+        self.state.lock().unwrap().holders.get(resource)?.keys().next().cloned()
+    }
+
     /// Recovery records are facts, even if a previous kubelet admitted
     /// conflicting users. Record all holders; never erase one to make a new
     /// admission pass. Unknown claims must be handled by the startup barrier.
@@ -215,13 +244,13 @@ pub trait Adapter: Send + Sync {
 pub struct Executor {
     pub ready: Arc<WorkQueue<Key>>,
     desired: Mutex<Desired>,
-    pub reservations: Reservations,
+    pub reservations: Arc<Reservations>,
 }
 impl Executor {
     pub fn new() -> Arc<Self> {
         let ready = WorkQueue::new();
         Arc::new(Self {
-            reservations: Reservations::new(ready.clone()),
+            reservations: Arc::new(Reservations::new(ready.clone())),
             ready,
             desired: Mutex::new(Desired::default()),
         })
@@ -278,7 +307,7 @@ impl Executor {
             .map(|(_,v)| v.clone()).collect()
     }
 
-    pub async fn run(&self, adapter: &dyn Adapter, concurrency: usize) {
+    pub async fn run(&self, adapter: Arc<dyn Adapter>, concurrency: usize) {
         let mut active = FuturesUnordered::new();
         let mut failures = HashMap::<Key, u32>::new();
         loop {
@@ -286,12 +315,20 @@ impl Executor {
                 work = self.ready.next(), if active.len() < concurrency.max(1) => {
                     self.ready.cancel_deadline(work.key());
                     let desired = self.desired.lock().unwrap().objects.get(work.key()).cloned();
-                    active.push(async move {
+                    let adapter=adapter.clone();
+                    // Dropping the supervisor must not cancel an in-flight
+                    // runtime RPC after the engine accepted its side effect.
+                    // An intent change dirties this UID and runs cleanup next.
+                    active.push(tokio::spawn(async move {
                         let result = adapter.reconcile(work.key(),desired).await;
                         (work,result)
-                    });
+                    }));
                 }
-                Some((work,result)) = active.next(), if !active.is_empty() => {
+                Some(completed) = active.next(), if !active.is_empty() => {
+                    let (work,result)=match completed {
+                        Ok(done)=>done,
+                        Err(error)=>{ tracing::error!(%error,"workload task panicked"); continue; }
+                    };
                     match result {
                         Ok(next) => {
                             failures.remove(work.key());
@@ -406,7 +443,7 @@ mod tests {
         executor.ready.add(key(Kind::Pod, "fast"));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runner = executor.clone();
-        let task = tokio::spawn(async move { runner.run(&SlowVm { completed: tx }, 2).await });
+        let task = tokio::spawn(async move { runner.run(Arc::new(SlowVm { completed: tx }), 2).await });
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), rx.recv())
                 .await

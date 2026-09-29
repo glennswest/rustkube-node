@@ -287,6 +287,7 @@ pub struct PodManager {
     volume_changes: tokio::sync::watch::Sender<u64>,
     /// Where the host's root is seen, for the node services' logs (#72).
     host_root: std::path::PathBuf,
+    admission: Option<Arc<crate::workload::Reservations>>,
 }
 
 /// A pod this node has admitted and not started, and why.
@@ -345,6 +346,7 @@ impl PodManager {
             runtime,
             images,
             pods: RwLock::new(HashMap::new()),
+            admission: None,
             node_name: node_name.to_string(),
             events: (!api_url.is_empty())
                 .then(|| crate::events::EventRecorder::new(api_client.clone(), api_url, node_name)),
@@ -369,6 +371,24 @@ impl PodManager {
     }
 
     /// See the host's root here rather than at `/hostroot`: for tests.
+    pub fn with_admission(mut self, admission: Arc<crate::workload::Reservations>) -> Self {
+        self.admission = Some(admission);
+        self
+    }
+
+    pub async fn known_pods(&self) -> Vec<PodState> {
+        self.pods.read().await.values().cloned().collect()
+    }
+
+    pub async fn cache_specs(&self, desired: &[Value]) {
+        let mut pods = self.pods.write().await;
+        for object in desired {
+            if let Some(state) = object["metadata"]["uid"].as_str().and_then(|uid| pods.get_mut(uid)) {
+                state.pod = object.clone();
+            }
+        }
+    }
+
     pub fn with_host_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
         self.host_root = root.into();
         self
@@ -1134,6 +1154,10 @@ impl PodManager {
         // Refuse while a pod here still has it. A delete that races a running
         // pod pulls a filesystem out from under a process mid-write, and the
         // pod finds out as EIO on a device that no longer exists.
+        if let Some(owner) = self.admission.as_ref().and_then(|a|
+            a.holder(&crate::workload::Resource::Claim(namespace.into(), claim.into()))) {
+            return Ok(VolumeRelease::InUse(format!("{:?} {}/{}",owner.kind,owner.namespace,owner.name)));
+        }
         if let Some(holder) = self.claim_holder_here(namespace, claim).await? {
             return Ok(VolumeRelease::InUse(holder));
         }
@@ -2054,6 +2078,14 @@ impl PodManager {
                 continue;
             }
 
+            let partial = self.pods.read().await.get(uid).is_some_and(|p| p.phase=="Starting");
+            if partial {
+                if let Err(error)=self.stop_pod(uid).await {
+                    warn!(%error, %uid, "partial Pod start cleanup pending");
+                    continue;
+                }
+            }
+
             let is_known = {
                 let pods = self.pods.read().await;
                 pods.contains_key(uid)
@@ -2233,6 +2265,9 @@ impl PodManager {
                 .runtime
                 .create_container(sandbox_id, &config, sandbox_config)
                 .await?;
+            if let Some(state)=self.pods.write().await.get_mut(pod["metadata"]["uid"].as_str().unwrap_or("")) {
+                state.container_ids.insert(cname.into(),cid.clone());
+            }
             self.runtime.start_container(&cid).await?;
             info!("Init container {ns}/{name}/{cname} started, waiting for completion");
 
@@ -2358,6 +2393,15 @@ impl PodManager {
 
         // Create pod sandbox
         let sandbox_id = self.runtime.run_pod_sandbox(&sandbox_config).await?;
+        // Persist each side effect before the next await. A failed or cancelled
+        // start is cleaned by this UID before another sandbox can be created.
+        self.pods.write().await.insert(uid.into(), PodState {
+            namespace:namespace.into(),name:name.into(),uid:uid.into(),
+            sandbox_id:Some(sandbox_id.clone()),container_ids:HashMap::new(),
+            phase:"Starting".into(),pod:pod.clone(),pod_ip:None,
+            restart_counts:HashMap::new(),ready:HashMap::new(),liveness_failures:HashMap::new(),
+            startup_passed:HashMap::new(),started:HashMap::new(),terminated:HashMap::new(),init_statuses:Vec::new(),
+        });
         info!("Created sandbox {sandbox_id} for {namespace}/{name}");
 
         // Get sandbox IP
@@ -2527,6 +2571,9 @@ impl PodManager {
                 }
             };
 
+            if let Some(state)=self.pods.write().await.get_mut(uid) {
+                state.container_ids.insert(container_name.into(),container_id.clone());
+            }
             // Start container
             if let Err(e) = self.runtime.start_container(&container_id).await {
                 self.event(

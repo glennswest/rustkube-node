@@ -2,6 +2,10 @@
 
 ## 2026-09-29
 
+- **feat:** Connect Pod/VMI UID adapters to one eight-worker executor with
+  recovery barriers, shared claim admission, per-claim mutation exclusion and
+  retained partial Pod-start records. Runtime/probe deadlines remain for #101.
+
 - **feat:** Add independent desired-state sources, inverse claim/image/driver
   indexes and recovery admission seeding to the common executor (#100).
 

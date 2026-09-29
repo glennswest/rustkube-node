@@ -4,7 +4,9 @@
 
 use crate::cri::{ImageService, MigrationService, RuntimeService};
 use crate::node_status::NodeReporter;
-use crate::pod_manager::{InitContainerStatusReport, PodManager, RemovalReason};
+use crate::workload::{self, Access, Dependency, Executor, Key, Kind, Next, Resource};
+use std::sync::atomic::{AtomicBool, Ordering};
+use crate::pod_manager::{InitContainerStatusReport, PodManager};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::time::{self, Duration};
@@ -109,11 +111,12 @@ pub struct Kubelet {
     /// and kept current by the registration loop (#52).
     csi: Arc<crate::csi_plugins::CsiPlugins>,
     watches: apimachinery::reactor::WatchHub,
-    last_desired_pods: tokio::sync::RwLock<Option<Vec<Value>>>,
+    last_claims: std::sync::Mutex<std::collections::HashMap<Dependency,Value>>,
     static_read_complete: std::sync::atomic::AtomicBool,
     runtime_changes: Option<tokio::sync::watch::Receiver<u64>>,
-    // Keep shared volume mutations serialized until per-claim admission (#100).
-    reconcile_admission: tokio::sync::Mutex<()>,
+    workloads: Arc<Executor>,
+    pods_synced: AtomicBool,
+    vmis_synced: AtomicBool,
 }
 
 impl Kubelet {
@@ -144,6 +147,7 @@ impl Kubelet {
             crate::csi_plugins::CsiPlugins::new(&config.node_name)
                 .with_api(api_client.clone(), &config.api_server_url),
         );
+        let workloads = Executor::new();
         let pod_manager = Arc::new(
             PodManager::with_api(
                 runtime.clone(),
@@ -155,7 +159,8 @@ impl Kubelet {
             )
             .with_ca_pem(config.apiserver_ca.clone())
             .with_engine(config.engine.clone())
-            .with_csi(csi.clone()),
+            .with_csi(csi.clone())
+            .with_admission(workloads.reservations.clone()),
         );
 
         Ok(Self {
@@ -168,10 +173,12 @@ impl Kubelet {
             node_ip,
             said_no_static_dir: std::sync::atomic::AtomicBool::new(false),
             watches: Default::default(),
-            last_desired_pods: tokio::sync::RwLock::new(None),
+            last_claims: Default::default(),
             static_read_complete: std::sync::atomic::AtomicBool::new(true),
             runtime_changes: None,
-            reconcile_admission: tokio::sync::Mutex::new(()),
+            workloads,
+            pods_synced: AtomicBool::new(false),
+            vmis_synced: AtomicBool::new(false),
             csi,
         })
     }
@@ -199,7 +206,11 @@ impl Kubelet {
     }
 
     /// Run the kubelet. Blocks forever.
-    pub async fn run(&self) -> anyhow::Result<()> {
+    pub async fn run(self) -> anyhow::Result<()> {
+        Arc::new(self).run_inner().await
+    }
+
+    async fn run_inner(self: &Arc<Self>) -> anyhow::Result<()> {
         info!("Kubelet starting for node {}", self.config.node_name);
 
         // Query the container runtime version for nodeInfo (e.g. cri-o://1.32.0).
@@ -211,24 +222,12 @@ impl Kubelet {
             }
         };
 
-        // Static pods first: the control plane (apiserver, etcd, controller,
-        // scheduler) ships as static-pod manifests and must run LOCALLY,
-        // independent of the apiserver — that is how the apiserver itself
-        // starts. Run them now (and continuously in the sync loop below) so we
-        // never deadlock waiting for a control plane that nothing brings up.
-        let static_pods = self.load_static_pods();
-        if !static_pods.is_empty() {
-            info!(
-                "running {} static pod(s) from {}",
-                static_pods.len(),
-                self.config
-                    .pod_manifest_path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default()
-            );
-            self.pod_manager.sync_pods(&static_pods).await;
-        }
+        // Recover before any start. Reserve every observed name, even when
+        // the API is unavailable and the old claim set is not yet known.
+        self.pod_manager.recover_state().await;
+        if let Some(vms) = &self.vms { vms.adopt_registered().await; }
+        else { self.vmis_synced.store(true, Ordering::Release); }
+        self.seed_names().await?;
 
         // Register the node in the BACKGROUND with backoff — never block the pod
         // loops on it. Static pods keep running (and get retried in the sync
@@ -274,7 +273,7 @@ impl Kubelet {
 
         // Adopt pods already running in the runtime (e.g. after a kubelet
         // restart) so we reconcile rather than double-create sandboxes.
-        self.pod_manager.recover_state().await;
+        // Recovery above precedes all admission.
 
         // Inbound kubelet HTTPS server (:10250) — /healthz, /metrics, /pods.
         {
@@ -376,8 +375,11 @@ impl Kubelet {
             });
         }
 
-        // Independent event subscriptions; shared volume mutations remain serialized.
-        tokio::try_join!(self.pod_loop(), self.vm_loop())?;
+        // One bounded executor for both kinds; producers never perform runtime I/O.
+        tokio::try_join!(self.pod_loop(), self.vm_loop(), async {
+            self.workloads.run(self.clone(), 8).await;
+            Ok::<(), anyhow::Error>(())
+        })?;
         Ok(())
     }
 
@@ -396,9 +398,9 @@ impl Kubelet {
         loop {
             let work = tokio::select! {
                 work = worker.next() => work,
-                _ = runtime_changed(&mut volumes) => { worker.enqueue(); continue; },
-                _ = runtime_changed(&mut drivers) => { worker.enqueue(); continue; },
-                _ = runtime_changed(&mut exits) => { worker.enqueue(); continue; },
+                _ = runtime_changed(&mut volumes) => { self.workloads.wake_kind(Kind::Pod); worker.enqueue(); continue; },
+                _ = runtime_changed(&mut drivers) => { self.workloads.wake_kind(Kind::Pod); worker.enqueue(); continue; },
+                _ = runtime_changed(&mut exits) => { self.workloads.wake_kind(Kind::Pod); worker.enqueue(); continue; },
             };
             worker
                 .run(async {
@@ -430,8 +432,8 @@ impl Kubelet {
         loop {
             let work = tokio::select! {
                 work = worker.next() => work,
-                _ = runtime_changed(&mut volumes) => { worker.enqueue(); continue; },
-                _ = runtime_changed(&mut exits) => { worker.enqueue(); continue; },
+                _ = runtime_changed(&mut volumes) => { self.workloads.wake_kind(Kind::VirtualMachine); worker.enqueue(); continue; },
+                _ = runtime_changed(&mut exits) => { self.workloads.wake_kind(Kind::VirtualMachine); worker.enqueue(); continue; },
             };
             worker
                 .run(async {
@@ -450,19 +452,28 @@ impl Kubelet {
                                 .cloned()
                                 .collect();
                             self.observe_volume_dependencies();
-                            {
-                                let _admission = self.reconcile_admission.lock().await;
-                                vms.sync(&want).await;
-                            }
-                            if !want.is_empty() {
-                                // Engine disk readiness and legacy hypervisor
-                                // control sockets do not yet expose all changes.
-                                apimachinery::reactor::requeue_after(
-                                    self.config.sync_interval.max(Duration::from_millis(100)),
-                                );
+                            vms.cache_specs(&want).await;
+                            match self.seed_claims(Kind::VirtualMachine, &want).await {
+                                Ok(()) => {
+                                    if self.workloads.replace_source("api-vmis",Kind::VirtualMachine,&want).is_ok() {
+                                        self.vmis_synced.store(true,Ordering::Release);
+                                    }
+                                }
+                                Err(error) => { apimachinery::reactor::failed(); warn!(%error,"VM admission recovery pending"); }
                             }
                         }
-                        Err(error) => debug!("VMI desired state unavailable: {error}"),
+                        Err(error) => {
+                            debug!("VMI desired state unavailable: {error}");
+                            // No CRD is a supported Pod-only cluster. Never
+                            // treat this as deletion of registered machines.
+                            if vms.running().await.is_empty() {
+                                if let Ok(response)=self.api_client.get(url.clone()).send().await {
+                                    if response.status().as_u16()==404 {
+                                        self.vmis_synced.store(true,Ordering::Release);
+                                    }
+                                }
+                            }
+                        },
                     }
                 })
                 .await;
@@ -578,146 +589,96 @@ impl Kubelet {
         pods
     }
 
-    /// Sync pods: fetch desired pods from API server, reconcile with actual.
+    /// Publish independent snapshots; unavailable sources never imply deletion.
     async fn sync(&self) -> anyhow::Result<()> {
-        let mut url = reqwest::Url::parse(&format!("{}/api/v1/pods", self.config.api_server_url))?;
-        url.query_pairs_mut().append_pair(
-            "fieldSelector",
-            &format!("spec.nodeName={}", self.config.node_name),
-        );
-        self.watches.observe(&self.api_client, url.to_string());
-        let desired = apimachinery::reactor::check(
-            apimachinery::reflector::list(&self.api_client, url.as_str()).await,
-        );
-        let complete = desired.is_ok();
-        let mut my_pods: Vec<Value> = match desired {
-            Ok(list) => {
-                let pods: Vec<_> = list["items"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .filter(|p| p["spec"]["nodeName"].as_str() == Some(&self.config.node_name))
-                    // Mirrors record work owned by PID 1, not kubelet input.
-                    .filter(|p| {
-                        p["metadata"]["annotations"]["kubernetes.io/config.source"].as_str()
-                            != Some("stormpump")
-                    })
-                    .cloned()
-                    .collect();
-                *self.last_desired_pods.write().await = Some(pods.clone());
-                pods
-            }
-            Err(error) => {
-                debug!("Pod desired state unavailable; preserving live Pods: {error}");
-                self.last_desired_pods
-                    .read()
-                    .await
-                    .clone()
-                    .unwrap_or_default()
-            }
-        };
-
-        // Static pods always run, whether or not the apiserver knows them. This
-        // is what keeps the control plane up (and retries it) during bootstrap.
-        for sp in self.load_static_pods() {
-            let uid = sp["metadata"]["uid"].as_str().unwrap_or("").to_string();
-            if !my_pods
-                .iter()
-                .any(|p| p["metadata"]["uid"].as_str() == Some(uid.as_str()))
-            {
-                my_pods.push(sp);
-            }
-        }
-
-        // Sync pod states
-        if !my_pods.is_empty() {
-            self.observe_volume_dependencies();
-            // Explicit observation fallback while legacy runtime/probe/volume
-            // sources lack complete notifications. API changes never wait on
-            // this deadline; stormpump exits also enqueue immediately.
-            apimachinery::reactor::requeue_after(
-                self.config.sync_interval.max(Duration::from_millis(100)),
-            );
-        }
-        let complete = complete
-            && self
-                .static_read_complete
-                .load(std::sync::atomic::Ordering::Relaxed);
-        if !complete {
-            apimachinery::reactor::failed();
-        }
-        let outcome = {
-            let _admission = self.reconcile_admission.lock().await;
-            self.pod_manager
-                .sync_pods_observed(&my_pods, complete)
-                .await
-        };
-
-        // Report status updates back to API server
-        for update in &outcome.updates {
-            let Some(source) = my_pods.iter().find(|pod| {
-                pod["metadata"]["name"] == update.name
-                    && pod["metadata"]["namespace"] == update.namespace
-            }) else {
-                continue;
-            };
-            if let Err(e) = self.report_pod_status(update, source).await {
-                apimachinery::reactor::failed();
-                error!(
-                    "Failed to report status for {}/{}: {e}",
-                    update.namespace, update.name
-                );
-            }
-        }
-
-        // Confirm terminating pods: containers are down, so force-delete the
-        // pod object to finish the API-side deletion. Orphaned pods are already
-        // gone from the API server — nothing to confirm.
-        for removed in &outcome.removed {
-            if removed.reason != RemovalReason::Deleting {
-                continue;
-            }
-            let path = format!(
-                "{}/api/v1/namespaces/{}/pods/{}?gracePeriodSeconds=0",
-                self.config.api_server_url, removed.namespace, removed.name
-            );
-            match self.api_client.delete(&path)
-                .json(&serde_json::json!({"apiVersion":"v1", "kind":"DeleteOptions",
-                    "preconditions":{"uid":removed.uid}, "gracePeriodSeconds":0}))
-                .send().await {
-                Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 404 => {
-                    info!(
-                        "Confirmed deletion of pod {}/{}",
-                        removed.namespace, removed.name
-                    );
-                }
-                Ok(resp) => {
-                    warn!(
-                        "Failed to confirm deletion of {}/{}: HTTP {}",
-                        removed.namespace,
-                        removed.name,
-                        resp.status()
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to confirm deletion of {}/{}: {e}",
-                        removed.namespace, removed.name
-                    );
-                }
-            }
-        }
-
-        // Handle migration annotations on pods assigned to this node
-        for pod in &my_pods {
-            if let Err(e) = self.handle_migration_annotations(pod).await {
-                let name = pod["metadata"]["name"].as_str().unwrap_or("?");
-                let ns = pod["metadata"]["namespace"].as_str().unwrap_or("?");
-                warn!("Migration annotation handling failed for {ns}/{name}: {e}");
-            }
-        }
-
+        let static_pods = self.load_static_pods();
+        if self.static_read_complete.load(Ordering::Acquire) {
+            self.pod_manager.cache_specs(&static_pods).await;
+            self.seed_claims(Kind::Pod, &static_pods).await?;
+            self.workloads.replace_source("static",Kind::Pod,&static_pods)?;
+        } else { apimachinery::reactor::failed(); }
+        let mut url = reqwest::Url::parse(&format!("{}/api/v1/pods",self.config.api_server_url))?;
+        url.query_pairs_mut().append_pair("fieldSelector",&format!("spec.nodeName={}",self.config.node_name));
+        self.watches.observe(&self.api_client,url.to_string());
+        let list = apimachinery::reactor::check(apimachinery::reflector::list(&self.api_client,url.as_str()).await)?;
+        let want: Vec<_> = list["items"].as_array().unwrap().iter().filter(|p|
+            p["spec"]["nodeName"].as_str()==Some(&self.config.node_name)
+            && p["metadata"]["annotations"]["kubernetes.io/config.source"].as_str()!=Some("stormpump")
+            && !p["metadata"]["uid"].as_str().unwrap_or("").starts_with("static-"))
+            .cloned().collect();
+        self.pod_manager.cache_specs(&want).await;
+        self.seed_claims(Kind::Pod,&want).await?;
+        self.workloads.replace_source("api-pods",Kind::Pod,&want)?;
+        self.pods_synced.store(true,Ordering::Release);
+        self.observe_volume_dependencies();
+        // Dependency collection changes wake only affected claim users.
+        self.refresh_claim_dependencies().await;
         Ok(())
+    }
+
+    async fn seed_names(&self) -> anyhow::Result<()> {
+        let mut api = Vec::new(); let mut statics = Vec::new();
+        for pod in self.pod_manager.known_pods().await {
+            let object = serde_json::json!({"metadata":{"namespace":pod.namespace,"name":pod.name,"uid":pod.uid}});
+            let key=Key::of(Kind::Pod,&object)?;
+            self.workloads.reservations.seed(&key,&[]);
+            if key.uid.starts_with("static-") { statics.push(object); } else { api.push(object); }
+        }
+        self.workloads.replace_source("api-pods",Kind::Pod,&api)?;
+        self.workloads.replace_source("static",Kind::Pod,&statics)?;
+        if let Some(vms)=&self.vms {
+            let mut objects=Vec::new();
+            for vm in vms.running().await {
+                let object=serde_json::json!({"metadata":{"namespace":vm.namespace,"name":vm.name,"uid":vm.uid}});
+                self.workloads.reservations.seed(&Key::of(Kind::VirtualMachine,&object)?,&[]);
+                objects.push(object);
+            }
+            self.workloads.replace_source("api-vmis",Kind::VirtualMachine,&objects)?;
+        }
+        Ok(())
+    }
+
+    async fn claims_for(&self,key:&Key,object:&Value) -> anyhow::Result<Vec<(Resource,Access)>> {
+        let mut claims=Vec::new();
+        for dependency in workload::dependencies(key,object) {
+            let Dependency::Claim(ns,name)=dependency else {continue};
+            let response=self.api_client.get(format!("{}/api/v1/namespaces/{ns}/persistentvolumeclaims/{name}",self.config.api_server_url)).send().await?;
+            let pvc:Value=response.error_for_status()?.json().await?;
+            let mode=if key.kind==Kind::VirtualMachine || crate::storage::is_rwop(&pvc) {Access::Exclusive} else {Access::SharedFilesystem};
+            claims.push((Resource::Claim(ns,name),mode));
+        }
+        Ok(claims)
+    }
+
+    async fn seed_claims(&self,kind:Kind,objects:&[Value]) -> anyhow::Result<()> {
+        let known:std::collections::HashSet<String>=match kind {
+            Kind::Pod=>self.pod_manager.known_pods().await.into_iter().map(|p|p.uid).collect(),
+            Kind::VirtualMachine=>match &self.vms {Some(v)=>v.running().await.into_iter().map(|v|v.uid).collect(),None=>Default::default()},
+        };
+        for object in objects {
+            let key=Key::of(kind,object)?;
+            if known.contains(&key.uid) {
+                let claims=self.claims_for(&key,object).await?;
+                self.workloads.reservations.seed(&key,&claims);
+            }
+        }
+        Ok(())
+    }
+
+    async fn refresh_claim_dependencies(&self) {
+        // The WatchHub coalesces collection events; compare claim objects here
+        // instead of sending every event to every runtime worker.
+        let url=format!("{}/api/v1/persistentvolumeclaims",self.config.api_server_url);
+        if let Ok(list)=apimachinery::reflector::list(&self.api_client,&url).await {
+            if let Some(items)=list["items"].as_array() {
+                let mut previous=self.last_claims.lock().unwrap();
+                let current:std::collections::HashMap<_,_>=items.iter().filter_map(|p|Some((
+                    Dependency::Claim(p["metadata"]["namespace"].as_str()?.into(),p["metadata"]["name"].as_str()?.into()),p.clone()))).collect();
+                for (key,value) in &current { if previous.get(key)!=Some(value) {self.workloads.wake_dependency(key);} }
+                for key in previous.keys() {if !current.contains_key(key) {self.workloads.wake_dependency(key);} }
+                *previous=current;
+            }
+        }
     }
 
     /// Handle migration-related annotations on pods.
@@ -1136,6 +1097,65 @@ impl Kubelet {
             })).send().await?.error_for_status()?;
 
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl workload::Adapter for Kubelet {
+    async fn reconcile(&self,key:&Key,desired:Option<Value>) -> anyhow::Result<Next> {
+        let retry=self.config.sync_interval.max(Duration::from_millis(100));
+        let deleting=desired.as_ref().map_or(true,|o| !o["metadata"]["deletionTimestamp"].is_null());
+        if deleting {
+            let claims=self.workloads.reservations.claims(key);
+            let Some(_operations)=self.workloads.reservations.try_operations(&claims) else {return Ok(Next::After(Duration::from_millis(100)))};
+            match key.kind {
+                Kind::Pod=> {
+                    self.pod_manager.stop_pod(&key.uid).await?;
+                    if let Some(object)=&desired {
+                        // Never acknowledge deletion of a same-name successor.
+                        let response=self.api_client.delete(format!("{}/api/v1/namespaces/{}/pods/{}",self.config.api_server_url,key.namespace,key.name))
+                            .json(&serde_json::json!({"apiVersion":"v1","kind":"DeleteOptions","gracePeriodSeconds":0,
+                                "preconditions":{"uid":object["metadata"]["uid"]}})).send().await?;
+                        anyhow::ensure!(response.status().is_success() || matches!(response.status().as_u16(),404|409),"Pod deletion acknowledgement failed: {}",response.status());
+                    }
+                }
+                Kind::VirtualMachine=> {
+                    if let Some(vms)=&self.vms { vms.reconcile_one(&key.uid,desired.as_ref()).await?; }
+                }
+            }
+            self.workloads.reservations.release(key);
+            return Ok(Next::AwaitEvent);
+        }
+        let object=desired.unwrap();
+        // Recovery placeholder objects are never launch specifications.
+        if object["spec"].is_null() {return Ok(Next::After(retry))}
+        let static_without_claims=key.kind==Kind::Pod && key.uid.starts_with("static-")
+            && !workload::dependencies(key,&object).iter().any(|d| matches!(d,Dependency::Claim(..)));
+        if !static_without_claims {
+            if !self.pods_synced.load(Ordering::Acquire) || !self.vmis_synced.load(Ordering::Acquire)
+                || self.pod_manager.known_pods().await.iter().any(|p|p.pod.is_null())
+                || match &self.vms {Some(v)=>v.has_unknown_claims().await,None=>false} {
+                return Ok(Next::After(retry));
+            }
+        }
+        let claims=self.claims_for(key,&object).await?;
+        if !self.workloads.reservations.acquire(key,&claims) {return Ok(Next::AwaitEvent)}
+        let Some(_operations)=self.workloads.reservations.try_operations(&claims) else {return Ok(Next::After(Duration::from_millis(100)))};
+        match key.kind {
+            Kind::Pod=> {
+                // Incomplete collection semantics deliberately suppress orphan
+                // sweeping: absence is handled by the deleted UID's own worker.
+                let outcome=self.pod_manager.sync_pods_observed(&[object.clone()],false).await;
+                for update in &outcome.updates {self.report_pod_status(update,&object).await?;}
+                self.handle_migration_annotations(&object).await?;
+            }
+            Kind::VirtualMachine=> {
+                if let Some(vms)=&self.vms {vms.reconcile_one(&key.uid,Some(&object)).await?;}
+            }
+        }
+        // Runtime/probe observation remains a per-UID deadline until #101's
+        // complete event sources replace it. No whole-node runtime pass.
+        Ok(Next::After(retry))
     }
 }
 

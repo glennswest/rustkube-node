@@ -174,3 +174,15 @@ so static-manifest replacement cannot imply API Pod deletion. Its inverse
 claim/image/driver indexes target dependent UIDs, and status-only updates do
 not enqueue runtime work. Recovery seeding retains all observed holders and
 never downgrades an exclusive reservation. Adapter wiring remains in progress.
+
+Adapter checkpoint (#100): Pod and VMI producers publish snapshots to one
+eight-worker executor. UID work owns name/claim reservations until confirmed
+cleanup; shared filesystem users serialize claim mutations without serializing
+unrelated claims. Recovery seeds names before admission and waits for complete
+Pod/VMI views plus known claim ownership before admitting API workloads. Static
+Pods without claims can bootstrap during an API outage. An intent change queues
+a follow-up instead of aborting a runtime RPC; spawned operations retain their
+state even if the supervisor future is dropped. Pod start records the sandbox
+and each container before proceeding, so failed starts clean up before retry.
+Per-UID observation deadlines remain pending #101. This checkpoint is not yet
+validated or a claim of completion of the staged/cancellation acceptance matrix.
