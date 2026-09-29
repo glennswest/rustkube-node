@@ -60,7 +60,7 @@ Steps:
        golden-rustkube-node-d9a108728be0 (at ccb7bfc; the first stage try died on dev: no NVMe device). No
        release request was filed by stage: stormcentral#117. #35 closed (sc-build only, not on a node).
 
-### In progress: #75, a VM's disks outlive its VMI: restart does not re-clone
+### Done: #75, a VM's disks outlive its VMI: restart does not re-clone
 
 Found, 2026-09-29: `stop` → `destroy_owned` deleted every golden clone, seed and emptyDisk, and the golden clone was
 unconditional, so each VirtualMachine restart (a new VMI) re-cloned root. stormblock#115 (closed) gives a volume an
@@ -68,16 +68,17 @@ unconditional, so each VirtualMachine restart (a new VMI) re-cloned root. stormb
 The VMI's ownerReferences carry its VirtualMachine's uid (rustkube virtualmachine.rs).
 
 Steps:
-1. [ ] Find before create: a golden disk or emptyDisk named `volume_name(vm, disk)` is reused, cloned/created only
+1. [x] Find before create: a golden disk or emptyDisk named `volume_name(vm, disk)` is reused, cloned/created only
        when missing (a failed listing is a failed start, never "make a new one"). Owner on each: the VMI's
        VirtualMachine (kind, ns, name, uid), else the VMI itself. A found disk owned by an earlier object of the
        same name (other uid) waits for the sweep. Seed: namespaced name, the old one replaced each start.
-2. [ ] Stop detaches only. `destroy_owned` goes.
-3. [ ] Orphan sweep (≤ once a minute): engine volumes owned by a VirtualMachine/VMI, not attached to a machine
-       here, whose owner is 404 / another uid / being deleted → deleted. Any other answer keeps them.
-4. [ ] `storm.io/retain-disks: "true"` (VMI or VM annotation): disks get no owner, so the sweep never deletes them.
-       Owners set on disks of adopted machines too.
-5. [ ] Tests, docs (README), CHANGELOG, sc-build.
+2. [x] Stop detaches only. `destroy_owned` gone.
+3. [x] Orphan sweep (≤ once a minute): engine volumes owned by a VirtualMachine/VMI, not in use and not held by a
+       machine here, whose owner is 404 / another uid / being deleted → deleted. Any other answer keeps them.
+4. [x] `storm.io/retain-disks: "true"` (VMI or VM annotation): disks get no owner, never swept. Owners set on the
+       disks of adopted machines too.
+5. [x] Tests, docs (README), CHANGELOG. sc-build at 9149ea1: all pass (kubelet 227). Not run on a node
+       (C2NR0Q2). Unreleased. Closed.
 
 ### Parked: #100 (turbomode branch, not main), bounded per-UID Pod/VM workers
 

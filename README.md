@@ -137,14 +137,34 @@ becomes a stormblock volume attached here:
 
 | VMI volume | Disk | Deleted with the VM |
 |---|---|---|
-| `dataVolume` / `containerDisk` | a clone of the named golden | yes |
-| `cloudInitNoCloud` | a generated `cidata` seed | yes |
-| `emptyDisk: {capacity}` | a blank volume `<ns>.<vm>-<disk>`, reused if it already exists | yes |
+| `dataVolume` / `containerDisk` | `<ns>.<vmi>-<disk>`, a clone of the named golden made on the first start and reattached on every later one | yes |
+| `cloudInitNoCloud` | `<ns>.<vmi>-<disk>`, a generated `cidata` seed, made again on each start (the old one is replaced) | yes |
+| `emptyDisk: {capacity}` | a blank volume `<ns>.<vmi>-<disk>`, reused if it already exists | yes |
 | `persistentVolumeClaim: {claimName}` | the claim's volume, resolved exactly as for a pod (a bound claim uses its volume, an unbound `stormblock` claim is provisioned) | no, it belongs to the claim |
 
-Today "deleted with the VM" also happens when the VM stops, so golden clones
-and empty disks come back fresh after a stop (#75). A claim's disk is never
-deleted.
+**A stop only detaches (#75).** A VirtualMachine restart is a new VMI, and it
+finds its disks by name: the root is what the guest wrote, and the golden is
+needed only the first time. A listing that fails is a failed start, never
+"make a new one".
+
+**"The VM" is the VirtualMachine.** Each disk the machine makes carries a
+stormblock owner (`owner {kind, namespace, name, uid}`, stormblock#115). The
+owner is the VMI's VirtualMachine, or the VMI itself when there is none.
+Once a minute the kubelet sweeps the engine's volumes. A disk is deleted when
+its owner is gone for good: a 404, a new object under the same name (another
+uid), or a `deletionTimestamp`. Any other answer keeps it, and so does a disk
+in use or attached to a machine here.
+
+**Same name, new VM:** a disk left by an earlier VM of the same name (another
+owner uid) is not booted. The start waits, with the reason on the VMI, until
+the sweep removes it.
+
+**Keeping disks:** `storm.io/retain-disks: "true"` on the VMI or its
+VirtualMachine gives its disks no owner. The sweep never deletes them, and a
+VM made again under that name reattaches them. Disks of a machine adopted
+after a kubelet restart are given their owner then.
+
+A claim's disk is never deleted.
 
 A claim's disk waits, with the reason on the VMI, while the claim is unbound,
 belongs to another StorageClass, or is in use by a pod on this node. A pod
@@ -156,7 +176,7 @@ share it.
 - **A VMI being deleted stops its machine.** While a machine runs, its VMI
   carries the finalizer `storm.io/vm`, so the deletion completes only once the
   machine is gone. The stop is ACPI with a 30 s grace, then a kill, then the
-  disks are detached.
+  disks are detached (never deleted: see above).
 - **A VM outlives a kubelet restart** (the engine supervises it), so the kubelet
   records each one where a restarted kubelet finds it: the machine's
   registration, `/run/stormvm/<ns>/<name>/vm.json`, with the engine's workload

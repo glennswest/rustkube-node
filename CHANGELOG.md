@@ -3,6 +3,25 @@
 ## [Unreleased]
 <!-- New unreleased changes go here -->
 
+### 2026-09-29 (a VM's disks outlive its VMI, #75)
+- **fix(kubelet):** a VM stop deleted every disk the machine had made, and a
+  golden was cloned on every start, so each VirtualMachine restart brought
+  the guest back as a fresh image.
+  - A golden clone or emptyDisk is found by name (`<ns>.<vmi>-<disk>`) and
+    reattached. It is cloned or created only when missing, and a failed
+    listing is a failed start.
+  - A stop only detaches.
+  - Each disk gets a stormblock owner: the VMI's VirtualMachine, or the VMI
+    itself without one. A sweep, at most once a minute, deletes disks whose
+    owner is gone for good (404, another uid, being deleted), never on an
+    unanswered GET.
+  - A disk left by an earlier VM of the same name is not reused: the start
+    waits for the sweep.
+  - `storm.io/retain-disks: "true"` keeps a machine's disks unowned, so they
+    are never swept.
+  - The seed is namespaced and replaced each start.
+- **feat(kubelet):** `EngineClient::put`.
+
 ### 2026-09-29 (VirtualMachineSnapshot, #53)
 - **feat(kubelet):** a `VirtualMachineSnapshot` of a VM this node runs is
   taken.
