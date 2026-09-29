@@ -53,7 +53,7 @@ not the release path.
 
 ## Work plan
 
-### In progress: documentation refresh from code (#54), 2026-09-29
+### Done: documentation refresh from code (#54), 2026-09-29
 
 Scope: current main at 5bb1a38 and `git log --since=2026-09-18`.
 Work on docs/code-refresh-20260929; preserve turbomode separately, with no merge
@@ -67,7 +67,14 @@ or golden from that experimental branch.
    New P2 follow-ups: #111 restartable init sidecars, #112 backoff persistence,
    #113 explicit default-valued apiserver precedence. Existing gaps are linked
    in docs/status.md; #3 now records the no-cni help/behavior mismatch.
-4. [ ] Validate the pushed documentation head with sc-build and document results.
+4. [x] ad43ee9 passed remote sc-build `cargo build --locked && cargo test --locked`:
+   227 kubelet unit tests, four integration tests and the CNI/proxy suites passed;
+   one doc-test ignored. Remote exit 0 in 74 seconds; scratch drive deleted.
+   The local runs.jsonl append failed (read-only filesystem); remote verification
+   completed. All 26 CLI flags, 11 routes and local doc links were checked.
+5. [x] Documentation only: no version bump or runtime change. Fast-forward these
+   commits onto main; preserve turbomode. Request the standard stage golden
+   after pushing main, recording release tracking on #54.
 
 
 

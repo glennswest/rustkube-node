@@ -8,6 +8,7 @@
   CLI/environment defaults, ports/routes, shipping workflow and an issue-linked
   capability audit; preserve the built-in stormblock PVC description. Separate
   experimental turbomode and unverified live acceptance from main behavior.
+- **docs:** Record passing remote build/tests at ad43ee9 and the CLI/route/link audit.
 - **docs:** Track uncovered sidecar/backoff/endpoint-precedence gaps as
   #111/#112/#113; correct no-cni and legacy builder documentation without changing code.
 
