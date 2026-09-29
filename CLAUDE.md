@@ -60,6 +60,17 @@ Steps:
        golden-rustkube-node-d9a108728be0 (at ccb7bfc; the first stage try died on dev: no NVMe device). No
        release request was filed by stage: stormcentral#117. #35 closed (sc-build only, not on a node).
 
+### In progress: #83, the console router is told where stormblock is (the snapshot verb)
+
+stormvm's `Config.stormblock` was left `None` in both mounts of `stormvm_console::router`, so
+`PUT /api/v1/vms/{ns}/{name}/snapshot` answered 409 on every node. stormvm_block::Client reads the engine token
+itself (`Token::from_env`, same order as engine.rs).
+
+Steps:
+1. [ ] `server.rs`: one `console(stormblock)` builder; `ServerConfig.stormblock_url` from the kubelet's engine URL
+       (`--stormblock`); `router()` (tests) uses `engine::DEFAULT_URL`. Test: snapshot no longer answers the 409.
+2. [ ] Docs (README), CHANGELOG, sc-build. Then close.
+
 ### Done: #76, a failed VM start is retried with backoff, not recorded Failed for good
 
 Owner: "Nothing should be perm." rustkube#104 (v0.16.0) makes the VM controller recreate a *Failed* VMI under
