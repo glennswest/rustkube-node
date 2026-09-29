@@ -284,6 +284,7 @@ pub struct PodManager {
     /// Blanks being minted in the background, by name (#63). A 1 TiB blank
     /// takes minutes to format, and the sync loop must not wait for it.
     minting: Arc<std::sync::Mutex<HashMap<String, Mint>>>,
+    volume_changes: tokio::sync::watch::Sender<u64>,
     /// Where the host's root is seen, for the node services' logs (#72).
     host_root: std::path::PathBuf,
 }
@@ -312,12 +313,11 @@ enum Mint {
 /// still come (a 1 TiB blank formatting, an engine restarting).
 pub const VOLUME_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// How long a claim waits, inline, for a mint it started before it lets the
-/// sync move on. A small class is ready well inside it, so the first claim of
-/// a class usually still starts on the pass that asked.
-const MINT_INLINE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
-
 impl PodManager {
+    pub fn subscribe_volume_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.volume_changes.subscribe()
+    }
+
     pub fn new(
         runtime: Arc<dyn RuntimeService>,
         images: Arc<dyn ImageService>,
@@ -363,6 +363,7 @@ impl PodManager {
             first_seen: std::sync::Mutex::new(HashMap::new()),
             waiting: std::sync::Mutex::new(HashMap::new()),
             minting: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            volume_changes: tokio::sync::watch::channel(0).0,
             host_root: crate::node_logs::HOST_ROOT.into(),
         }
     }
@@ -1518,9 +1519,8 @@ impl PodManager {
     ///
     /// `Err` is what the claim waits on: the mint in flight, the template's
     /// state while it formats, or the engine's refusal (once; the next claim
-    /// tries again). The mint is waited for inline for [`MINT_INLINE_WAIT`]
-    /// only, so a small class is cloned on the pass that asked and a 1 TiB one
-    /// does not hold the sync loop (#63).
+    /// tries again). Completion wakes waiting workers; reconciliation never
+    /// waits inline for formatting to finish.
     async fn mint_template(&self, blank: &str, class: &str) -> Result<String, String> {
         let started = {
             let mut m = self.minting.lock().unwrap_or_else(|e| e.into_inner());
@@ -1541,8 +1541,9 @@ impl PodManager {
             let engine = self.engine.clone();
             let url = format!("{}/api/v1/fstemplates", self.storage_url);
             let minting = self.minting.clone();
+            let changed = self.volume_changes.clone();
             let (blank, class) = (blank.to_string(), class.to_string());
-            let task = tokio::spawn(async move {
+            tokio::spawn(async move {
                 let failed = mint_blank(&engine, &url, &blank, &class).await.err();
                 let mut m = minting.lock().unwrap_or_else(|e| e.into_inner());
                 match failed {
@@ -1554,10 +1555,9 @@ impl PodManager {
                         m.remove(&blank);
                     }
                 }
+                drop(m);
+                changed.send_modify(|generation| *generation = generation.wrapping_add(1));
             });
-            // A small class is done in well under this, and then the claim
-            // goes on to its clone on this same pass.
-            let _ = tokio::time::timeout(MINT_INLINE_WAIT, task).await;
         }
         match self.storage_template_state(blank).await {
             Some((id, state)) if state == "ready" => Ok(id),
@@ -4744,20 +4744,24 @@ pub(crate) mod tests {
     async fn slow_minting_stormblock(
         format: std::time::Duration,
         state: &'static str,
-    ) -> (String, Arc<AtomicU32>) {
+    ) -> (String, Arc<AtomicU32>, Arc<tokio::sync::Notify>) {
         use axum::routing::{get as http_get, post as http_post};
         let posts = Arc::new(AtomicU32::new(0));
         let made = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let signal = started.clone();
         let (p, m, m2) = (posts.clone(), made.clone(), made.clone());
         let app = axum::Router::new()
             .route(
                 "/api/v1/fstemplates",
                 http_post(move || {
                     let (p, m) = (p.clone(), m.clone());
+                    let signal = signal.clone();
                     async move {
                         p.fetch_add(1, Ordering::SeqCst);
                         // Persisted before the format, as stormblock does.
                         m.store(true, Ordering::SeqCst);
+                        signal.notify_one();
                         tokio::time::sleep(format).await;
                         (
                             axum::http::StatusCode::CREATED,
@@ -4784,7 +4788,7 @@ pub(crate) mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        (format!("http://{addr}"), posts)
+        (format!("http://{addr}"), posts, started)
     }
 
     fn with_stormblock(mgr: PodManager, url: &str) -> PodManager {
@@ -4797,7 +4801,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_slow_mint_does_not_hold_the_sync() {
         // #63: a 1 TiB blank's format held the whole sync loop.
-        let (url, posts) =
+        let (url, posts, started) =
             slow_minting_stormblock(std::time::Duration::from_secs(30), "awaiting_format").await;
         let (_rt, mgr) = manager();
         let mgr = with_stormblock(mgr, &url);
@@ -4808,11 +4812,14 @@ pub(crate) mod tests {
             .await
             .unwrap_err();
         assert!(
-            t.elapsed() < std::time::Duration::from_secs(10),
+            t.elapsed() < std::time::Duration::from_secs(1),
             "waited {:?}",
             t.elapsed()
         );
-        assert_eq!(e, "template pvc-ext4j-1048576m awaiting_format");
+        assert!(e.contains("pvc-ext4j-1048576m"));
+        tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+            .await
+            .unwrap();
 
         // The next claim waits on the same mint rather than starting another.
         let e = mgr
@@ -4824,13 +4831,20 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_quick_mint_is_ready_on_the_pass_that_asked() {
-        let (url, posts) = slow_minting_stormblock(std::time::Duration::ZERO, "ready").await;
+    async fn mint_completion_notifies_without_an_api_edit_or_sync_tick() {
+        let (url, posts, _) =
+            slow_minting_stormblock(std::time::Duration::from_millis(20), "ready").await;
         let (_rt, mgr) = manager();
         let mgr = with_stormblock(mgr, &url);
+        let mut changes = mgr.subscribe_volume_changes();
+        let _ = mgr.mint_template("pvc-ext4j-1m", "1M").await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), changes.changed())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            mgr.mint_template("pvc-ext4j-1m", "1M").await.unwrap(),
-            "tpl-1"
+            mgr.storage_template_state("pvc-ext4j-1m").await,
+            Some(("tpl-1".into(), "ready".into()))
         );
         assert_eq!(posts.load(Ordering::SeqCst), 1);
     }

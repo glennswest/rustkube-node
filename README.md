@@ -130,10 +130,9 @@ the reason says it timed out, and the kubelet keeps retrying. As upstream, a
 mount timeout does not fail the pod, because the volume may still come.
 
 The first claim of a size class mints its blank (one `mkfs`). The mint runs in
-the background and is waited for inline for 2 seconds, so a small class is
-cloned on the pass that asked. A large one (a 1 TiB blank formats for minutes)
-does not hold the sync loop: its claims wait on the template's state until it
-is `ready`.
+the background without an inline wait. Completion signals the Pod and VM
+queues immediately; waiting claims check the template's state and proceed
+when it is `ready`. A large format does not hold the reconciliation pass.
 
 ### Virtual machine disks
 

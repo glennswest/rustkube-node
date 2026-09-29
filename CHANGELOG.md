@@ -2,6 +2,9 @@
 
 ## Unreleased — turbomode (not yet built or measured)
 
+- Remove the two-second inline template-mint wait; completion notifies Pod
+  and VM queues directly. Completion and slow-mint tests await dev validation.
+
 - CSI registration now wakes on filesystem changes and signals Pod workers;
   retry deadlines exist only for pending registration/publication failures.
   Failed directory scans retain registrations. Unbuilt; dev validation pending.

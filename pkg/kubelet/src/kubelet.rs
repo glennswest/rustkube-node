@@ -384,6 +384,7 @@ impl Kubelet {
     async fn pod_loop(&self) -> anyhow::Result<()> {
         let worker = self.watches.worker("kubelet-pods");
         let mut exits = self.runtime_changes.clone();
+        let mut volumes = Some(self.pod_manager.subscribe_volume_changes());
         let mut drivers = Some(self.csi.subscribe_changes());
         let mut files = tokio::task::JoinSet::new();
         if let Some(path) = self.config.pod_manifest_path.clone() {
@@ -395,6 +396,7 @@ impl Kubelet {
         loop {
             let work = tokio::select! {
                 work = worker.next() => work,
+                _ = runtime_changed(&mut volumes) => { worker.enqueue(); continue; },
                 _ = runtime_changed(&mut drivers) => { worker.enqueue(); continue; },
                 _ = runtime_changed(&mut exits) => { worker.enqueue(); continue; },
             };
@@ -416,6 +418,7 @@ impl Kubelet {
         };
         let worker = self.watches.worker("kubelet-vmis");
         let mut exits = self.runtime_changes.clone();
+        let mut volumes = Some(self.pod_manager.subscribe_volume_changes());
         let mut url = reqwest::Url::parse(&format!(
             "{}/apis/kubevirt.io/v1/virtualmachineinstances",
             self.config.api_server_url
@@ -427,6 +430,7 @@ impl Kubelet {
         loop {
             let work = tokio::select! {
                 work = worker.next() => work,
+                _ = runtime_changed(&mut volumes) => { worker.enqueue(); continue; },
                 _ = runtime_changed(&mut exits) => { worker.enqueue(); continue; },
             };
             worker
