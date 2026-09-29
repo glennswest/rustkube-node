@@ -2,6 +2,10 @@
 
 ## Unreleased — turbomode (not yet built or measured)
 
+- CSI registration now wakes on filesystem changes and signals Pod workers;
+  retry deadlines exist only for pending registration/publication failures.
+  Failed directory scans retain registrations. Unbuilt; dev validation pending.
+
 - Watch-driven Pod/VMI work, separate Pod/VM loops, stormpump exit and Linux
   manifest notifications. Preserve live Pods when desired-state reads fail.
 - Stable startTime, unchanged-status suppression and revision-guarded status

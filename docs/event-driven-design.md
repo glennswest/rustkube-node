@@ -147,3 +147,8 @@ The migration adapter serializes Pod/VM runtime mutations to preserve existing
 claim admission assumptions. Removing this lock requires per-claim reservations
 covering Pod mounts and VM raw-disk use, including rollback and restart recovery.
 Independent subscriptions alone do not provide concurrent workload execution.
+
+CSI registration migration: socket-directory notifications now drive scans;
+registration/publication failures get retry deadlines, and successful local
+registration immediately wakes Pod reconciliation. Cleanup and mirrors remain
+separate pending work. No runtime validation has run yet.

@@ -384,6 +384,7 @@ impl Kubelet {
     async fn pod_loop(&self) -> anyhow::Result<()> {
         let worker = self.watches.worker("kubelet-pods");
         let mut exits = self.runtime_changes.clone();
+        let mut drivers = Some(self.csi.subscribe_changes());
         let mut files = tokio::task::JoinSet::new();
         if let Some(path) = self.config.pod_manifest_path.clone() {
             let changed = worker.clone();
@@ -394,6 +395,7 @@ impl Kubelet {
         loop {
             let work = tokio::select! {
                 work = worker.next() => work,
+                _ = runtime_changed(&mut drivers) => { worker.enqueue(); continue; },
                 _ = runtime_changed(&mut exits) => { worker.enqueue(); continue; },
             };
             worker
