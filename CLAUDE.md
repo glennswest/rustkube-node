@@ -71,13 +71,16 @@ live only in the engine of the node that took it. The VMI shape has no raw-volum
 containerDisk → golden, PVC, cloudInit, emptyDisk), so "rewire the disks" needs a decision: owner.
 
 Steps:
-1. [ ] `vm_snapshot.rs`, each tick after the VMIs: list snapshots (404 → CRD absent, nothing). One whose source
+1. [x] `vm_snapshot.rs`, each tick after the VMIs: list snapshots (404 → CRD absent, nothing). One whose source
        is registered here (`/run/stormvm/<ns>/<vm>`) and has no phase: claim it (annotation
        `storm.io/snapshot-node`, rv-guarded), InProgress, `take` in the background, then Succeeded/Failed +
        group id, sourceUID, indications, Event. failureDeadline (default 5 min) from creationTimestamp. An
        InProgress one of ours not in flight (kubelet restart) is taken again: idempotent by name.
-2. [ ] Tests (fake apiserver, injected take), docs (README), CHANGELOG, sc-build.
-3. [ ] Restore: question to the owner on #53, `wait-owner`.
+2. [x] Tests (fake apiserver, injected take), docs (README), CHANGELOG. sc-build at 2b88465: all pass (kubelet 221).
+       Not run on a node (CRDs: stormcos#170; needs a running VM). Unreleased.
+3. [ ] Restore: **owner decision**, asked on #53 (2026-09-29). A = restored volumes as PV + PVC, the kubelet
+       patches the VM template's volume to the claim + node affinity (recommended); B = annotation
+       `storm.io/restored-disks` copied by rustkube's VM controller to the VMI. Resume from the answer.
 
 ### Done: #83, the console router is told where stormblock is (the snapshot verb)
 
