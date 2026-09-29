@@ -196,6 +196,25 @@ share it.
   - **Status:** the VMI carries `AccessCredentialsSynchronized`, with every
     reason when it is False: a missing Secret, no seed, or an agent not
     answering yet.
+- **Snapshots: `VirtualMachineSnapshot`** (`snapshot.kubevirt.io/v1beta1`).
+  - **Whose:** the node whose stormblock holds the VM's volumes, the one it
+    runs on (`spec.source` is a `VirtualMachine` or a `VirtualMachineInstance`).
+    That node marks the object `storm.io/snapshot-node` (against its
+    resourceVersion, so exactly one node takes it), sets `InProgress`, and
+    takes it in the background.
+  - **How:** stormvm freezes the guest (through its agent, when it has one),
+    pauses it, takes one stormblock group snapshot of every volume, named
+    `<ns>.<vm>.<snapshot>`, then unpauses and thaws.
+  - **Status:** `Succeeded` + `readyToUse`, or `Failed` with the error.
+    `virtualMachineSnapshotContentName` is the stormblock group id, and it
+    also carries `sourceUID`, `indications` and an Event on the object.
+    `failureDeadline` (default 5 min) counts from creation.
+  - **Restart:** a kubelet restarted mid-take takes it again. stormblock
+    answers a name it has seen with what it made then. A snapshot whose VM
+    has left the node is Failed.
+  - **Needs the CRDs** (stormcos#170): without them the list is a 404 and the
+    kubelet does nothing.
+  - `VirtualMachineRestore` is not served yet (#53).
 
 ## Tests on a node
 

@@ -3,6 +3,21 @@
 ## [Unreleased]
 <!-- New unreleased changes go here -->
 
+### 2026-09-29 (VirtualMachineSnapshot, #53)
+- **feat(kubelet):** a `VirtualMachineSnapshot` of a VM this node runs is
+  taken.
+  - The node marks it `storm.io/snapshot-node` (rv-guarded) and sets it
+    `InProgress`.
+  - stormvm freezes, pauses, takes one stormblock group snapshot of every
+    volume, then unpauses and thaws.
+  - The object gets `Succeeded`/`Failed`, the group id as
+    `virtualMachineSnapshotContentName`, `sourceUID`, `indications` and an
+    Event. `failureDeadline` is honoured.
+  - A take interrupted by a restart is taken again (idempotent by name).
+  - Nothing happens until the CRDs are installed (stormcos#170).
+  - `VirtualMachineRestore` waits on an owner decision (#53).
+- **feat(kubelet):** Events can name any kind of object, not only a Pod.
+
 ### 2026-09-29 (the console router knows where stormblock is, #83)
 - **fix(kubelet):** stormvm's console router was mounted without
   `Config.stormblock`, so its `snapshot` verb answered 409 "this service was
