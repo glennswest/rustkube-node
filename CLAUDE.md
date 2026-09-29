@@ -75,7 +75,24 @@ work continues on main afterwards; no golden or release is requested here.
    changes documentation only after the verified main merge.
 
 
-### Parked on stormpump#63: #100, common bounded per-UID Pod/VMI workers
+### In progress: #100 on main, VM partial-start unwind (stormpump#63 closed)
+
+2026-09-29: master moved #100 to main after the #114 merge; stormpump#63's
+`DEPOSIT_WITHDRAW` (op 9) is on stormpump main. The lock's stormpump (30a76d3)
+predates the enum variant and cannot move until stormvm#65, so the op is sent by
+number. Plan:
+1. [ ] `RingClient::deposit_withdraw` (op 9) and `spec_release`.
+2. [ ] VmManager partial-start ledger, by uid, written *before* each deposit and
+   after each volume/spec registration: a failed, panicked or cancelled start
+   leaves a record. Unwound after a failed start, before the next start of the
+   uid (Waiting while any step fails) and before its deletion is acknowledged
+   (the name reservation is kept). EINVAL on withdraw = engine predates op 9
+   (warned, dropped: the engine closes deposits when the client goes); ESTALE on
+   a release = already gone. Tap watchers of a failed start dropped off-runtime.
+3. [ ] Tests with an injected undo, docs, CHANGELOG; push; sc-build.
+4. [ ] Audit CNI partial sandbox failure and claim-reclaim HTTP cancellation.
+
+### Parked on stormpump#63 (resolved): #100, common bounded per-UID Pod/VMI workers
 
 Earlier checkpoint: #100 continued at turbomode 9b46886 (211 tests passed).
 #114 now authorizes merging; unfinished cancellation work continues on main.
