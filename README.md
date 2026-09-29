@@ -26,7 +26,9 @@ retained, and same-name successors wait for the previous UID to release its reso
 The wired adapters passed 222 unit and four integration tests on dev at
 `f3d868a`. Cleanup retains refused engine releases, CSI publication and teardown
 serialize by driver/handle, and failed runtime recovery keeps admission closed.
-Further cancellation and dependency validation is in progress. This is not a measured subsecond release.
+PV and VolumeAttachment changes route through an inverse claim index; failed
+collection reads retain the index. VM status and migration writes carry UID
+guards. Further cancellation validation is in progress. This is not a measured subsecond release.
 Active workloads still use an explicit runtime/probe/volume observation
 fallback, and service/volume mirrors and CSI cleanup tasks retain their existing schedules.
 Per-UID concurrency and complete local event sources are tracked in

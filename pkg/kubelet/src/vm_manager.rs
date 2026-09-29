@@ -582,7 +582,7 @@ impl VmManager {
                 Ok(()) => {}
                 Err(StartFail::Waiting(why)) => {
                     self.patch_pending(object["metadata"]["namespace"].as_str().unwrap_or("default"),
-                        object["metadata"]["name"].as_str().unwrap_or(""), &why).await;
+                        object["metadata"]["name"].as_str().unwrap_or(""), uid, &why).await;
                     return Ok(false);
                 }
                 Err(error) => return Err(anyhow::anyhow!(error.message().to_string())),
@@ -658,7 +658,7 @@ impl VmManager {
                     // skipped it for ever.
                     info!("{ns}/{name}: {why}");
                     self.event(obj, "Normal", "Waiting", why).await;
-                    self.patch_pending(ns, name, why).await;
+                    self.patch_pending(ns, name, uid, why).await;
                     continue;
                 }
                 let e = e.message().to_string();
@@ -1760,12 +1760,12 @@ impl VmManager {
     /// Pending rather than Failed, with the reason — so a console shows
     /// "waiting for golden fedora-43" instead of a machine that looks broken
     /// and a person who deletes it and tries again.
-    async fn patch_pending(&self, ns: &str, name: &str, why: &str) {
+    async fn patch_pending(&self, ns: &str, name: &str, uid: &str, why: &str) {
         let url = format!(
             "{}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{name}/status",
             self.api_url
         );
-        let body = json!({ "status": {
+        let body = json!({ "metadata": {"uid": uid}, "status": {
             "phase": "Pending",
             "reason": "Waiting",
             "message": why,
@@ -1839,7 +1839,7 @@ impl VmManager {
             status["reason"] = json!(if vm.phase == Phase::Failed { "Failed" } else { "Ended" });
             status["message"] = json!(vm.message);
         }
-        let body = json!({ "status": status });
+        let body = json!({ "metadata": {"uid": vm.uid}, "status": status });
         if let Err(e) = self
             .api
             .patch(&url)

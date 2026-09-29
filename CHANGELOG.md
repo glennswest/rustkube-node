@@ -2,6 +2,10 @@
 
 ## 2026-09-29
 
+- **feat:** Index PV/VolumeAttachment changes back to claim users; retain the
+  previous index when a collection cannot be read. Guard VM status, migration
+  annotations and PV deletion by observed UID; retry panicked UID adapters (#100).
+
 - **fix:** Retain stormpump container/sandbox records on refused cleanup and
   partial volume registrations on failed startup; serialize CSI publication and
   teardown by driver/handle. Require successful runtime recovery before starts (#100).

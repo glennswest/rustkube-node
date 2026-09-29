@@ -57,7 +57,9 @@ already passed (211 tests). No main merge, golden or live deployment now.
    Slow-image/fast-start and reclamation exclusion tests passed at f3d868a
    (222 unit + four integration tests). Runtime cleanup now retains refused
    releases and partial volume registrations; CSI mutations serialize by handle.
-   Failed runtime recovery keeps admission closed. Dev validation pending.
+   Failed runtime recovery keeps admission closed. af1704b passed 223 unit + four
+   integration tests. Added PV/attachment inverse routing and remaining API UID
+   guards; next: cancellation boundary coverage and VM partial-start ownership.
 2. [ ] Wire Pod/VMI adapters to the common executor; retain state across failed cleanup,
        use observed UID preconditions, and preserve bootstrap through unavailable API reads.
 3. [ ] Add dependency indexes, staged waits and slow/fast/cancellation regression tests.

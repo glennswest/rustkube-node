@@ -1198,10 +1198,14 @@ impl PodManager {
             ) else {
                 continue;
             };
+            let Some(pv_uid) = pv["metadata"]["uid"].as_str() else {continue};
             match self.release_claim_volume(ns, claim).await {
                 Ok(VolumeRelease::Released) | Ok(VolumeRelease::Absent) => {
                     let url = format!("{}/api/v1/persistentvolumes/{pv_name}", self.api_url);
-                    match self.api_client.delete(url).send().await {
+                    match self.api_client.delete(url).json(&serde_json::json!({
+                        "apiVersion":"v1", "kind":"DeleteOptions",
+                        "preconditions":{"uid":pv_uid,"resourceVersion":pv["metadata"]["resourceVersion"]}
+                    })).send().await {
                         Ok(r) if r.status().is_success() || r.status().as_u16() == 404 => {
                             info!("reclaimed {pv_name}: the volume for {ns}/{claim} is deleted")
                         }

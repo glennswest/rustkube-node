@@ -1,6 +1,6 @@
 //! One event-driven executor and resource-admission table for Pods and VMIs.
 use apimachinery::workqueue::WorkQueue;
-use futures::{stream::FuturesUnordered, StreamExt};
+use futures::{stream::FuturesUnordered, StreamExt, FutureExt};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -80,6 +80,55 @@ pub fn dependencies(key: &Key, object: &Value) -> HashSet<Dependency> {
         }
     }
     out
+}
+
+/// Joins volume/attachment notifications back to their claim users. Snapshots
+/// are committed together: an unavailable collection cannot masquerade as deletion.
+#[derive(Default)]
+pub struct VolumeIndex {
+    observed: HashMap<(String, String), Value>,
+    users: HashMap<(String, String), HashSet<Dependency>>,
+}
+impl VolumeIndex {
+    pub fn update(&mut self, claims: &[Value], volumes: &[Value], attachments: &[Value]) -> HashSet<Dependency> {
+        let mut observed = HashMap::new();
+        let mut users: HashMap<(String,String),HashSet<Dependency>> = HashMap::new();
+        for claim in claims {
+            let ns = claim["metadata"]["namespace"].as_str().unwrap_or("default");
+            let Some(name) = claim["metadata"]["name"].as_str() else {continue};
+            let dependency = Dependency::Claim(ns.into(),name.into());
+            let key = ("claim".into(),format!("{ns}/{name}"));
+            observed.insert(key.clone(),claim.clone());
+            users.entry(key).or_default().insert(dependency.clone());
+            if let Some(volume) = claim["spec"]["volumeName"].as_str() {
+                users.entry(("volume".into(),volume.into())).or_default().insert(dependency);
+            }
+        }
+        for volume in volumes {
+            let Some(name) = volume["metadata"]["name"].as_str() else {continue};
+            let key = ("volume".into(),name.into());
+            observed.insert(key.clone(),volume.clone());
+            if let (Some(ns),Some(claim)) = (volume["spec"]["claimRef"]["namespace"].as_str(),volume["spec"]["claimRef"]["name"].as_str()) {
+                users.entry(key).or_default().insert(Dependency::Claim(ns.into(),claim.into()));
+            }
+        }
+        for attachment in attachments {
+            let (Some(name),Some(volume)) = (attachment["metadata"]["name"].as_str(),attachment["spec"]["source"]["persistentVolumeName"].as_str()) else {continue};
+            let key = ("attachment".into(),name.into());
+            observed.insert(key.clone(),attachment.clone());
+            users.insert(key, users.get(&("volume".into(),volume.into())).cloned().unwrap_or_default());
+        }
+        let mut changed = HashSet::new();
+        for key in observed.keys().chain(self.observed.keys()) {
+            if observed.get(key) != self.observed.get(key) || users.get(key) != self.users.get(key) {
+                changed.extend(users.get(key).into_iter().flatten().cloned());
+                changed.extend(self.users.get(key).into_iter().flatten().cloned());
+            }
+        }
+        self.observed = observed;
+        self.users = users;
+        changed
+    }
 }
 
 #[derive(Default)]
@@ -339,7 +388,8 @@ impl Executor {
                     // runtime RPC after the engine accepted its side effect.
                     // An intent change dirties this UID and runs cleanup next.
                     active.push(tokio::spawn(async move {
-                        let result = adapter.reconcile(work.key(),desired).await;
+                        let result = std::panic::AssertUnwindSafe(adapter.reconcile(work.key(),desired))
+                            .catch_unwind().await.unwrap_or_else(|_|Err(anyhow::anyhow!("workload adapter panicked")));
                         (work,result)
                     }));
                 }
@@ -555,4 +605,21 @@ mod tests {
         ));
         assert!(reservations.acquire(&key(Kind::Pod, "unrelated"), &[(a, Access::Exclusive)]));
     }
+    #[test]
+    fn attachment_and_volume_changes_only_wake_claim_dependents() {
+        let mut index = VolumeIndex::default();
+        let claims = vec![json!({"metadata":{"namespace":"ns","name":"data"},"spec":{"volumeName":"pv"}}),
+            json!({"metadata":{"namespace":"ns","name":"other"},"spec":{"volumeName":"other-pv"}})];
+        let mut volumes = vec![json!({"metadata":{"name":"pv"}})];
+        let mut attachments = vec![json!({"metadata":{"name":"attach"},"spec":{"source":{"persistentVolumeName":"pv"}},"status":{"attached":false}})];
+        index.update(&claims,&volumes,&attachments);
+        assert!(index.update(&claims,&volumes,&attachments).is_empty());
+        let expected = HashSet::from([Dependency::Claim("ns".into(),"data".into())]);
+        attachments[0]["status"]["attached"] = json!(true);
+        assert_eq!(index.update(&claims,&volumes,&attachments),expected);
+        volumes[0]["spec"] = json!({"csi":{"volumeHandle":"new-handle"}});
+        assert_eq!(index.update(&claims,&volumes,&attachments),expected);
+        assert_eq!(index.update(&claims,&volumes,&[]),expected);
+    }
+
 }

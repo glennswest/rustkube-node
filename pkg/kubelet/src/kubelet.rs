@@ -111,7 +111,7 @@ pub struct Kubelet {
     /// and kept current by the registration loop (#52).
     csi: Arc<crate::csi_plugins::CsiPlugins>,
     watches: apimachinery::reactor::WatchHub,
-    last_claims: std::sync::Mutex<std::collections::HashMap<Dependency,Value>>,
+    last_claims: std::sync::Mutex<crate::workload::VolumeIndex>,
     static_read_complete: std::sync::atomic::AtomicBool,
     runtime_changes: Option<tokio::sync::watch::Receiver<u64>>,
     workloads: Arc<Executor>,
@@ -683,17 +683,20 @@ impl Kubelet {
     }
 
     async fn refresh_claim_dependencies(&self) {
-        // The WatchHub coalesces collection events; compare claim objects here
-        // instead of sending every event to every runtime worker.
-        let url=format!("{}/api/v1/persistentvolumeclaims",self.config.api_server_url);
-        if let Ok(list)=apimachinery::reflector::list(&self.api_client,&url).await {
-            if let Some(items)=list["items"].as_array() {
-                let mut previous=self.last_claims.lock().unwrap();
-                let current:std::collections::HashMap<_,_>=items.iter().filter_map(|p|Some((
-                    Dependency::Claim(p["metadata"]["namespace"].as_str()?.into(),p["metadata"]["name"].as_str()?.into()),p.clone()))).collect();
-                for (key,value) in &current { if previous.get(key)!=Some(value) {self.workloads.wake_dependency(key);} }
-                for key in previous.keys() {if !current.contains_key(key) {self.workloads.wake_dependency(key);} }
-                *previous=current;
+        let base = &self.config.api_server_url;
+        let claim_url = format!("{base}/api/v1/persistentvolumeclaims");
+        let volume_url = format!("{base}/api/v1/persistentvolumes");
+        let attachment_url = format!("{base}/apis/storage.k8s.io/v1/volumeattachments");
+        let (claims, volumes, attachments) = tokio::join!(
+            apimachinery::reflector::list(&self.api_client,&claim_url),
+            apimachinery::reflector::list(&self.api_client,&volume_url),
+            apimachinery::reflector::list(&self.api_client,&attachment_url),
+        );
+        if let (Ok(claims),Ok(volumes),Ok(attachments)) = (claims,volumes,attachments) {
+            if let (Some(claims),Some(volumes),Some(attachments)) =
+                (claims["items"].as_array(),volumes["items"].as_array(),attachments["items"].as_array()) {
+                let changed = self.last_claims.lock().unwrap().update(claims,volumes,attachments);
+                for dependency in changed {self.workloads.wake_dependency(&dependency);}
             }
         }
     }
@@ -731,6 +734,7 @@ impl Kubelet {
                             .header("content-type", "application/strategic-merge-patch+json")
                             .json(&serde_json::json!({
                                 "metadata": {
+                                    "uid": uid,
                                     "annotations": {
                                         "rustkube.io/checkpoint-ref": ref_json,
                                         "rustkube.io/migrate-action": "checkpoint-done",
@@ -752,6 +756,7 @@ impl Kubelet {
                             .header("content-type", "application/strategic-merge-patch+json")
                             .json(&serde_json::json!({
                                 "metadata": {
+                                    "uid": uid,
                                     "annotations": {
                                         "rustkube.io/migrate-action": "checkpoint-failed",
                                         "rustkube.io/migrate-error": e.to_string(),
@@ -796,6 +801,7 @@ impl Kubelet {
                             .header("content-type", "application/strategic-merge-patch+json")
                             .json(&serde_json::json!({
                                 "metadata": {
+                                    "uid": uid,
                                     "annotations": {
                                         "rustkube.io/migration-endpoint": endpoint,
                                         "rustkube.io/migrate-action": "target-ready",
@@ -836,6 +842,7 @@ impl Kubelet {
                             .header("content-type", "application/strategic-merge-patch+json")
                             .json(&serde_json::json!({
                                 "metadata": {
+                                    "uid": uid,
                                     "annotations": {
                                         "rustkube.io/migrate-action": "migrate-done",
                                     }
