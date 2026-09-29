@@ -369,7 +369,15 @@ Steps:
 4. [x] `sc-build 'cargo build --release --locked --target x86_64-unknown-linux-musl'`, then `cargo test --locked`: passed at 6741e93.
 5. [x] Close #58, request the golden.
 
-### Parked on stormpump#35 (P1): #52, external StorageClasses (the CSI node side)
+### Parked on stormvm#65: #52, external StorageClasses (the CSI node side)
+
+2026-09-29: stormpump#35's engine side is on stormpump main (a06ce4c..), and `/` is rshared on C2NR0Q2 (11.51).
+What is left here is step 6 = #81 (`Mount.propagation` into `spec_for`), which needs stormpump ≥ a06ce4c in the
+lock. The lock has one stormpump, shared with stormvm-node, and stormvm main (cf343c7) still builds
+`stormpump::spec::Mount` without `propagation` (plan.rs:347): stormvm#65, open. Proposed #52 and #81 after it.
+Then: bump stormpump, map propagation (#81), end to end with csi-driver-host-path on a node (step 9).
+
+(Was: parked on stormpump#35 (P1).)
 
 Findings, 2026-09-24:
 - `csi.rs` was a stub. It logged calls and created directories, and it never
