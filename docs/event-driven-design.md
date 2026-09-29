@@ -168,3 +168,9 @@ timeouts and refused detach/delete operations. Natural exits keep the engine
 handle until teardown. Legacy registrations without an engine handle cannot
 prove exit merely from an unavailable control socket; cleanup remains pending.
 Pod deletion acknowledgement uses DeleteOptions UID preconditions.
+
+The common executor now supports independent authoritative source snapshots,
+so static-manifest replacement cannot imply API Pod deletion. Its inverse
+claim/image/driver indexes target dependent UIDs, and status-only updates do
+not enqueue runtime work. Recovery seeding retains all observed holders and
+never downgrades an exclusive reservation. Adapter wiring remains in progress.

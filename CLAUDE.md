@@ -49,6 +49,8 @@ already passed (211 tests). No main merge, golden or live deployment now.
 2. [ ] Wire Pod/VMI adapters to the common executor; retain state across failed cleanup,
        use observed UID preconditions, and preserve bootstrap through unavailable API reads.
 3. [ ] Add dependency indexes, staged waits and slow/fast/cancellation regression tests.
+   Source-separated snapshots, inverse claim/image/driver indexes and recovery seeding
+   added to workload.rs; tests added, dev validation pending. Adapters not wired yet.
 4. [ ] Push each change, validate with sc-build, document evidence and remaining limitations.
 5. [ ] At the end of #100/#101 integrate main's #91 address pump, #35 failed-list
        protection and #53 snapshots as executor events/adapters before merging main.

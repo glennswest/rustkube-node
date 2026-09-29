@@ -44,6 +44,50 @@ pub enum Resource {
     Name(Kind, String, String),
     Claim(String, String),
 }
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub enum Dependency {
+    Claim(String, String),
+    Image(String),
+    Driver(String),
+}
+
+fn dependencies(key: &Key, object: &Value) -> HashSet<Dependency> {
+    let mut out = HashSet::new();
+    for volume in object["spec"]["volumes"].as_array().into_iter().flatten() {
+        if let Some(name) = volume["persistentVolumeClaim"]["claimName"].as_str() {
+            out.insert(Dependency::Claim(key.namespace.clone(), name.into()));
+        }
+        if !volume["ephemeral"].is_null() {
+            if let Some(name) = volume["name"].as_str() {
+                out.insert(Dependency::Claim(key.namespace.clone(), format!("{}-{name}", key.name)));
+            }
+        }
+        if let Some(driver) = volume["csi"]["driver"].as_str() {
+            out.insert(Dependency::Driver(driver.into()));
+        }
+        for field in ["containerDisk", "dataVolume"] {
+            if let Some(image) = volume[field][if field == "dataVolume" { "name" } else { "image" }].as_str() {
+                out.insert(Dependency::Image(image.into()));
+            }
+        }
+    }
+    for field in ["containers", "initContainers"] {
+        for container in object["spec"][field].as_array().into_iter().flatten() {
+            if let Some(image) = container["image"].as_str() {
+                out.insert(Dependency::Image(image.into()));
+            }
+        }
+    }
+    out
+}
+
+#[derive(Default)]
+struct Desired {
+    sources: HashMap<String, HashMap<Key, Value>>,
+    objects: HashMap<Key, Value>,
+    dependents: HashMap<Dependency, HashSet<Key>>,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Access {
     SharedFilesystem,
@@ -108,7 +152,9 @@ impl Reservations {
                 .holders
                 .entry(resource.clone())
                 .or_default()
-                .insert(key.clone(), *access);
+                .entry(key.clone())
+                .and_modify(|old| { if *access == Access::Exclusive { *old = *access; } })
+                .or_insert(*access);
             state
                 .owned
                 .entry(key.clone())
@@ -116,6 +162,19 @@ impl Reservations {
                 .insert(resource.clone());
         }
         true
+    }
+
+    /// Recovery records are facts, even if a previous kubelet admitted
+    /// conflicting users. Record all holders; never erase one to make a new
+    /// admission pass. Unknown claims must be handled by the startup barrier.
+    pub fn seed(&self, key: &Key, claims: &[(Resource, Access)]) {
+        let mut state = self.state.lock().unwrap();
+        for (resource, access) in std::iter::once((Resource::Name(key.kind,
+            key.namespace.clone(),key.name.clone()), Access::Exclusive)).chain(claims.iter().cloned()) {
+            state.holders.entry(resource.clone()).or_default().entry(key.clone())
+                .and_modify(|old| { if access == Access::Exclusive { *old = access; } }).or_insert(access);
+            state.owned.entry(key.clone()).or_default().insert(resource);
+        }
     }
 
     pub fn release(&self, key: &Key) {
@@ -155,7 +214,7 @@ pub trait Adapter: Send + Sync {
 /// the same bounded pool; WorkQueue guarantees one active pass per UID.
 pub struct Executor {
     pub ready: Arc<WorkQueue<Key>>,
-    desired: Mutex<HashMap<Key, Value>>,
+    desired: Mutex<Desired>,
     pub reservations: Reservations,
 }
 impl Executor {
@@ -164,37 +223,59 @@ impl Executor {
         Arc::new(Self {
             reservations: Reservations::new(ready.clone()),
             ready,
-            desired: Mutex::new(HashMap::new()),
+            desired: Mutex::new(Desired::default()),
         })
     }
 
     pub fn replace(&self, kind: Kind, objects: &[Value]) -> anyhow::Result<()> {
-        // Validate the complete snapshot before allowing absence to mean deletion.
-        let incoming = objects
-            .iter()
-            .map(|v| Ok((Key::of(kind, v)?, v.clone())))
-            .collect::<anyhow::Result<HashMap<_, _>>>()?;
-        let mut desired = self.desired.lock().unwrap();
-        let removed = desired
-            .keys()
-            .filter(|key| key.kind == kind && !incoming.contains_key(*key))
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut changed = removed.clone();
-        for key in removed {
-            desired.remove(&key);
+        self.replace_source(&format!("{kind:?}"), kind, objects)
+    }
+
+    /// Each authoritative source has its own deletion boundary. In particular,
+    /// reading static manifests cannot delete API Pods during an API outage.
+    pub fn replace_source(&self, source: &str, kind: Kind, objects: &[Value]) -> anyhow::Result<()> {
+        let mut incoming = HashMap::new();
+        for object in objects {
+            let key = Key::of(kind, object)?;
+            anyhow::ensure!(incoming.insert(key, object.clone()).is_none(), "duplicate workload UID");
         }
-        for (key, object) in incoming {
-            if desired.get(&key) != Some(&object) {
-                desired.insert(key.clone(), object);
-                changed.push(key);
+        let mut state = self.desired.lock().unwrap();
+        state.sources.insert(source.into(), incoming);
+        let objects: HashMap<_, _> = state.sources.values().flat_map(|s| s.iter())
+            .map(|(k,v)| (k.clone(),v.clone())).collect();
+        let mut changed: HashSet<_> = state.objects.keys().filter(|k| !objects.contains_key(*k)).cloned().collect();
+        for (key, object) in &objects {
+            // Status and resourceVersion echoes are not desired-state changes.
+            if state.objects.get(key).map(intent) != Some(intent(object)) {
+                changed.insert(key.clone());
             }
         }
-        drop(desired);
-        for key in changed {
-            self.ready.add(key);
+        state.dependents.clear();
+        for (key, object) in &objects {
+            for dependency in dependencies(key, object) {
+                state.dependents.entry(dependency).or_default().insert(key.clone());
+            }
         }
+        state.objects = objects;
+        drop(state);
+        for key in changed { self.ready.add(key); }
         Ok(())
+    }
+
+    pub fn wake_dependency(&self, dependency: &Dependency) {
+        let keys = self.desired.lock().unwrap().dependents.get(dependency).cloned().unwrap_or_default();
+        for key in keys { self.ready.add(key); }
+    }
+
+    pub fn wake_kind(&self, kind: Kind) {
+        let keys: Vec<_> = self.desired.lock().unwrap().objects.keys()
+            .filter(|k| k.kind == kind).cloned().collect();
+        for key in keys { self.ready.add(key); }
+    }
+
+    pub fn objects(&self, kind: Kind) -> Vec<Value> {
+        self.desired.lock().unwrap().objects.iter().filter(|(k,_)| k.kind == kind)
+            .map(|(_,v)| v.clone()).collect()
     }
 
     pub async fn run(&self, adapter: &dyn Adapter, concurrency: usize) {
@@ -204,7 +285,7 @@ impl Executor {
             tokio::select! {
                 work = self.ready.next(), if active.len() < concurrency.max(1) => {
                     self.ready.cancel_deadline(work.key());
-                    let desired = self.desired.lock().unwrap().get(work.key()).cloned();
+                    let desired = self.desired.lock().unwrap().objects.get(work.key()).cloned();
                     active.push(async move {
                         let result = adapter.reconcile(work.key(),desired).await;
                         (work,result)
@@ -230,6 +311,17 @@ impl Executor {
     }
 }
 
+/// Ignore observed status while retaining every input that can change work.
+fn intent(object: &Value) -> Value {
+    serde_json::json!({"spec":object["spec"], "metadata": {
+        "uid":object["metadata"]["uid"], "name":object["metadata"]["name"],
+        "namespace":object["metadata"]["namespace"],
+        "deletionTimestamp":object["metadata"]["deletionTimestamp"],
+        "annotations":object["metadata"]["annotations"],
+        "labels":object["metadata"]["labels"],
+        "ownerReferences":object["metadata"]["ownerReferences"]}})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +333,59 @@ mod tests {
             uid: uid.into(),
         }
     }
+    fn object(uid: &str, claim: &str) -> Value {
+        serde_json::json!({"metadata":{"name":uid,"uid":uid,"namespace":"ns"},
+            "spec":{"volumes":[{"name":"disk","persistentVolumeClaim":{"claimName":claim}}]}})
+    }
+
+    #[tokio::test]
+    async fn source_replacement_never_deletes_another_sources_work() {
+        let e = Executor::new();
+        e.replace_source("api", Kind::Pod, &[object("api", "a")]).unwrap();
+        drop(e.ready.next().await);
+        e.replace_source("static", Kind::Pod, &[object("static", "b")]).unwrap();
+        drop(e.ready.next().await);
+        e.replace_source("static", Kind::Pod, &[]).unwrap();
+        let work = e.ready.next().await;
+        assert_eq!(work.key().uid,"static");
+        assert_eq!(e.objects(Kind::Pod), vec![object("api","a")]);
+        assert!(e.replace_source("api", Kind::Pod, &[Value::Null]).is_err());
+        assert_eq!(e.objects(Kind::Pod).len(),1);
+    }
+
+    #[tokio::test]
+    async fn dependency_index_only_wakes_users_and_drops_removed_users() {
+        let e = Executor::new();
+        e.replace(Kind::Pod, &[object("a","data"), object("b","other")]).unwrap();
+        drop(e.ready.next().await); drop(e.ready.next().await);
+        e.wake_dependency(&Dependency::Claim("ns".into(),"data".into()));
+        let work=e.ready.next().await;
+        assert_eq!(work.key().uid,"a"); drop(work);
+        let mut changed=object("a","new");
+        changed["status"]=serde_json::json!({"phase":"Running"});
+        e.replace(Kind::Pod, &[changed.clone()]).unwrap();
+        drop(e.ready.next().await); drop(e.ready.next().await);
+        e.wake_dependency(&Dependency::Claim("ns".into(),"data".into()));
+        assert!(tokio::time::timeout(Duration::from_millis(20),e.ready.next()).await.is_err());
+        changed["metadata"]["resourceVersion"]=Value::String("2".into());
+        changed["status"]=serde_json::json!({"phase":"Pending"});
+        e.replace(Kind::Pod, &[changed]).unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(20),e.ready.next()).await.is_err());
+    }
+
+    #[test]
+    fn recovery_keeps_all_holders_and_never_downgrades_exclusive_access() {
+        let e=Executor::new();
+        let resource=Resource::Claim("ns".into(),"data".into());
+        let a=key(Kind::Pod,"a"); let b=key(Kind::VirtualMachine,"b");
+        e.reservations.seed(&a,&[(resource.clone(),Access::Exclusive)]);
+        assert!(e.reservations.acquire(&a,&[(resource.clone(),Access::SharedFilesystem)]));
+        assert!(!e.reservations.acquire(&b,&[(resource.clone(),Access::SharedFilesystem)]));
+        e.reservations.seed(&b,&[(resource.clone(),Access::Exclusive)]);
+        e.reservations.release(&a);
+        assert!(!e.reservations.acquire(&key(Kind::Pod,"c"),&[(resource,Access::SharedFilesystem)]));
+    }
+
     struct SlowVm {
         completed: tokio::sync::mpsc::UnboundedSender<Kind>,
     }

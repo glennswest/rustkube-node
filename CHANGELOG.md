@@ -2,6 +2,9 @@
 
 ## 2026-09-29
 
+- **feat:** Add independent desired-state sources, inverse claim/image/driver
+  indexes and recovery admission seeding to the common executor (#100).
+
 - **fix:** Match the QUERY exit helper to the ABI u32 completion field; dev
   compilation of 8ebb8b3 caught the mismatch.
 
