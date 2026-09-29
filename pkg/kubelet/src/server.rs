@@ -46,6 +46,10 @@ pub struct ServerConfig {
     pub api_url: String,
     /// Serve all routes unauthenticated (dev only).
     pub anonymous: bool,
+    /// This node's stormblock engine (`--stormblock`), for stormvm's
+    /// `snapshot` verb (#83). The console finds the engine token itself, in
+    /// the same places `engine.rs` looks.
+    pub stormblock_url: String,
 }
 
 #[derive(Clone)]
@@ -101,11 +105,22 @@ pub fn router(pod_manager: Arc<PodManager>) -> Router {
     router_with_console(
         pod_manager,
         None,
-        stormvm_console::router(stormvm_console::Config {
-            run_dir: crate::vm_manager::RUN_ROOT.into(),
-            ..Default::default()
-        }),
+        console(crate::vm_manager::RUN_ROOT, crate::engine::DEFAULT_URL),
     )
+}
+
+/// stormvm's console router over `run_dir`, told where this node's stormblock
+/// engine is.
+///
+/// Without `stormblock` the router still serves the doors and every other
+/// verb, but `snapshot` answers 409 "this service was not told where
+/// stormblock is" (#83) — so both mounts go through here.
+fn console(run_dir: &str, stormblock: &str) -> Router {
+    stormvm_console::router(stormvm_console::Config {
+        run_dir: run_dir.to_string(),
+        stormblock: Some(stormblock.to_string()),
+        ..Default::default()
+    })
 }
 
 /// The router, over a given console. Tests build one against a run directory
@@ -170,10 +185,7 @@ pub async fn serve(
     let app = router_with_console(
         pod_manager,
         vms,
-        stormvm_console::router(stormvm_console::Config {
-            run_dir: crate::vm_manager::RUN_ROOT.into(),
-            ..Default::default()
-        }),
+        console(crate::vm_manager::RUN_ROOT, &config.stormblock_url),
     )
     .layer(middleware::from_fn_with_state(auth, auth_mw));
 
@@ -1302,14 +1314,7 @@ mod console_tests {
     fn app_with_console(run_dir: &str) -> Router {
         let rt = Arc::new(super::tests::NoopRt);
         let pm = Arc::new(PodManager::new(rt.clone(), rt, "test-node"));
-        router_with_console(
-            pm,
-            None,
-            stormvm_console::router(stormvm_console::Config {
-                run_dir: run_dir.to_string(),
-                ..Default::default()
-            }),
-        )
+        router_with_console(pm, None, console(run_dir, crate::engine::DEFAULT_URL))
     }
 
     async fn get(app: Router, uri: &str) -> axum::http::Response<Body> {
@@ -1450,5 +1455,33 @@ mod console_tests {
         // And the console's own paths are not served here: this server's API
         // surface is the kubelet's, not stormvm's.
         assert_eq!(get(app, "/api/v1/vms").await.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// #83: the console is told where stormblock is, so `snapshot` gets past
+    /// "this service was not told where stormblock is" to the machine itself.
+    ///
+    /// Asked of the console router directly: the kubelet does not route the
+    /// verbs onto :10250 yet (#94). No hypervisor listens here, so the answer
+    /// is the machine's silence — which is only reached once stormblock is set.
+    #[tokio::test]
+    async fn the_snapshot_verb_knows_where_stormblock_is() {
+        use axum::extract::ConnectInfo;
+
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().to_str().unwrap();
+        register(run_dir, "default", "web-1");
+
+        let mut req = HttpRequest::builder()
+            .method("PUT")
+            .uri("/api/v1/vms/default/web-1/snapshot?name=before&quiesce=never")
+            .body(Body::empty())
+            .unwrap();
+        // The verb admits loopback, as the doors do.
+        req.extensions_mut().insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+        let resp = console(run_dir, "http://127.0.0.1:9").oneshot(req).await.unwrap();
+        let (status, body) = status_and_body(resp).await;
+
+        assert!(!body.contains("not told where stormblock is"), "{status}: {body}");
+        assert!(body.contains("hypervisor"), "{status}: {body}");
     }
 }

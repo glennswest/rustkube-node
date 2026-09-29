@@ -277,6 +277,7 @@ impl Kubelet {
                 api_client: self.api_client.clone(),
                 api_url: self.config.api_server_url.clone(),
                 anonymous: self.config.anonymous_auth,
+                stormblock_url: self.config.engine.url().to_string(),
             };
             let vms = self.vms.clone();
             tokio::spawn(async move { crate::server::serve(port, pm, vms, server_config).await });
