@@ -2,6 +2,9 @@
 
 ## 2026-09-29
 
+- **docs:** Reconcile the worker design with implemented adapters and record
+  stormpump#63 as the remaining VM cancellation dependency for #100.
+
 - **fix:** Import the JSON macro in the volume-index regression test; the full
   dev workspace build passed but test compilation exposed the missing import.
 

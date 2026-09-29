@@ -54,7 +54,9 @@ already passed (211 tests). No main merge, golden or live deployment now.
    UID guards on Pod deletion, VM status/finalizers, migration writes and PV deletion.
 4. [x] Push incremental checkpoints and run sc-build. af1704b passed 223 unit +
    four integration tests. e504f58 full workspace build passed; test compilation
-   found a missing json macro import. Fix committed next; validation pending.
+   found a missing json macro import. Fixed in 55d458c: full sc-build
+   `cargo build --locked && cargo test --locked` passed (224 kubelet unit,
+   four integration, 24 CNI, 17 proxy; one doc-test passed, one ignored).
 5. [ ] Finish cancellation at every side-effect boundary. External blocker:
    stormpump#63 has no acknowledged withdrawal for deposited VM tap FDs before
    spawn. Partial NIC/plan/registration failures can keep a tap alive in the

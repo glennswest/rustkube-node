@@ -148,19 +148,18 @@ node restart during failover. Paired control-plane HA gate: rustkube#149.
 Normal subsecond startup and deliberate lease-expiry failover time are
 measured separately. These scenarios have not yet run for this branch.
 
-The migration adapter serializes Pod/VM runtime mutations to preserve existing
-claim admission assumptions. Removing this lock requires per-claim reservations
-covering Pod mounts and VM raw-disk use, including rollback and restart recovery.
-Independent subscriptions alone do not provide concurrent workload execution.
+The initial global migration lock has been replaced by name/claim reservations
+and per-claim mutation locks. Pod mounts and VM raw-disk use share admission;
+unrelated claims can progress concurrently. Reservations survive failed cleanup.
 
 CSI registration migration: socket-directory notifications now drive scans;
 registration/publication failures get retry deadlines, and successful local
 registration immediately wakes Pod reconciliation. Cleanup and mirrors remain
-separate pending work. No runtime validation has run yet.
+separate pending work under #101. Live-node validation remains under #102.
 
 Owner clarification (2026-09-29): keep Pods and VMs as close as possible. The
 existing separate loops are a temporary adapter, not the target design. Both
-will use a common executor and admission/reservation table, with runtime-specific
+now use a common executor and admission/reservation table, with runtime-specific
 operations behind adapters.
 
 Cleanup checkpoint (#100): VM stop now retains records on query failures,
@@ -173,7 +172,7 @@ The common executor now supports independent authoritative source snapshots,
 so static-manifest replacement cannot imply API Pod deletion. Its inverse
 claim/image/driver indexes target dependent UIDs, and status-only updates do
 not enqueue runtime work. Recovery seeding retains all observed holders and
-never downgrades an exclusive reservation. Adapter wiring remains in progress.
+never downgrades an exclusive reservation. Both adapters are wired.
 
 Adapter checkpoint (#100): Pod and VMI producers publish snapshots to one
 eight-worker executor. UID work owns name/claim reservations until confirmed
@@ -184,8 +183,9 @@ Pods without claims can bootstrap during an API outage. An intent change queues
 a follow-up instead of aborting a runtime RPC; spawned operations retain their
 state even if the supervisor future is dropped. Pod start records the sandbox
 and each container before proceeding, so failed starts clean up before retry.
-Per-UID observation deadlines remain pending #101. This checkpoint is not yet
-validated or a claim of completion of the staged/cancellation acceptance matrix.
+Per-UID observation deadlines remain pending #101. Adapter unit and integration
+tests passed on dev; these are not live-node performance measurements or proof
+of completion of the entire cancellation acceptance matrix.
 
 Wait-state checkpoint: an init container still running leaves its sandbox and
 container recorded and yields for the next UID observation. Completion resumes
@@ -200,3 +200,18 @@ a pull, while each startup retains its result. Later Always requests resolve
 the tag again. Completion wakes the inverse image index. Claim reclamation
 reserves exclusively in the admission table before checking holders/deleting,
 so an in-flight start cannot slip between its check and delete.
+
+PV/VolumeAttachment observations now join back to the claim dependency index.
+The three collections are committed together; a failed collection read preserves
+its previous dependencies. Runtime recovery must inventory sandboxes and
+containers successfully before any new starts. CSI publication and teardown
+share per-driver/handle mutation exclusion. Stormpump teardown retains records
+on refused release and startup retains partially registered volume handles.
+
+Remaining #100 blocker (2026-09-29): [stormpump#63](https://github.com/glennswest/stormpump/issues/63)
+tracks acknowledged withdrawal of deposited tap descriptors. The engine currently
+keeps a deposit after a pre-spawn failure until it is replaced, consumed by spawn,
+or its shared client disconnects. A replacement cannot necessarily realise the
+same tap while that descriptor exists. VM partial-start cleanup and the complete
+side-effect cancellation test matrix therefore remain unfinished. The branch
+stays unmerged; CLAUDE.md records the resume checklist and build evidence.

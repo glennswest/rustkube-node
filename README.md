@@ -23,8 +23,8 @@ CSI teardown preserves its retry record through failed unstage calls and refuses
 cleanup from unreadable records or incomplete Pod lists. Pod and VMI adapters share that executor. Failed startup/cleanup records are
 retained, and same-name successors wait for the previous UID to release its resources.
 
-The wired adapters passed 222 unit and four integration tests on dev at
-`f3d868a`. Cleanup retains refused engine releases, CSI publication and teardown
+The full workspace build and tests passed on dev at `55d458c`, including
+224 kubelet unit and four integration tests. Cleanup retains refused engine releases, CSI publication and teardown
 serialize by driver/handle, and failed runtime recovery keeps admission closed.
 PV and VolumeAttachment changes route through an inverse claim index; failed
 collection reads retain the index. VM status and migration writes carry UID
