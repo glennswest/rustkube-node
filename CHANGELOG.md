@@ -3,6 +3,8 @@
 ## [Unreleased]
 
 ### 2026-09-29
+- **docs:** Recheck #53 and record the unanswered restore decision on #109 as
+  its work-plan blocker; preserve existing snapshot verification separately.
 - **docs:** Refresh README, build/storage/metrics references and planning docs
   against main 5bb1a38 and history since September 18 (#54). Add complete
   CLI/environment defaults, ports/routes, shipping workflow and an issue-linked

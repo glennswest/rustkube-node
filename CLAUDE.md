@@ -133,7 +133,14 @@ Work is on `turbomode`, never main; no goldens from it. Read rustkube's `docs/tu
 Merging origin/main conflicts in `kubelet.rs` (turbomode's `pod_loop`/`vm_loop` vs main's #91 address pump,
 #35 `watch_for_node`/`list_for_node`, #53 `snapshots.sync()`): aborted, owner asked on #100 (resolve, or leave).
 
-### In progress: #53, VirtualMachineSnapshot (and VirtualMachineRestore: owner decision)
+### Blocked on #109: #53, VirtualMachineSnapshot / VirtualMachineRestore
+
+2026-09-29 recheck: read #53 and #109, including comments. Snapshot support is
+already on main; #109 remains unanswered and labeled needs-owner. Stop restore
+implementation until the owner chooses disk references and node placement.
+Propose #53 after #109; then resume step 3 below, update docs/tests, push and
+verify with sc-build before completion. This recheck changes documentation only;
+no new build, live validation, release or issue closure is claimed.
 
 stormvm (in the dc1b7ea lock): `stormvm_spec::snapshot::{snapshot_request, restore_request, snapshot_status,
 restore_status}`, `stormvm_console::snapshot::take(reg, stormblock, name, Options)` (freeze → pause → one /v1
@@ -151,7 +158,7 @@ Steps:
        InProgress one of ours not in flight (kubelet restart) is taken again: idempotent by name.
 2. [x] Tests (fake apiserver, injected take), docs (README), CHANGELOG. sc-build at 2b88465: all pass (kubelet 221).
        Not run on a node (CRDs: stormcos#170; needs a running VM). Unreleased.
-3. [ ] Restore: **owner decision**, asked on #53 (2026-09-29). A = restored volumes as PV + PVC, the kubelet
+3. [ ] Restore: **owner decision**, tracked on #109 (extracted from #53, 2026-09-29). A = restored volumes as PV + PVC, the kubelet
        patches the VM template's volume to the claim + node affinity (recommended); B = annotation
        `storm.io/restored-disks` copied by rustkube's VM controller to the VMI. Resume from the answer.
 
