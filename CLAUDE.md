@@ -60,6 +60,13 @@ Steps:
        golden-rustkube-node-d9a108728be0 (at ccb7bfc; the first stage try died on dev: no NVMe device). No
        release request was filed by stage: stormcentral#117. #35 closed (sc-build only, not on a node).
 
+### Parked: #100 (turbomode branch, not main), bounded per-UID Pod/VM workers
+
+Work is on `turbomode`, never main; no goldens from it. Read rustkube's `docs/turbomode-handoff.md` (turbomode branch).
+2026-09-29: handoff step 2 done, `sc-build 'cargo test --locked -p kubelet'` at turbomode 9b46886: 211 pass.
+Merging origin/main conflicts in `kubelet.rs` (turbomode's `pod_loop`/`vm_loop` vs main's #91 address pump,
+#35 `watch_for_node`/`list_for_node`, #53 `snapshots.sync()`): aborted, owner asked on #100 (resolve, or leave).
+
 ### In progress: #53, VirtualMachineSnapshot (and VirtualMachineRestore: owner decision)
 
 stormvm (in the dc1b7ea lock): `stormvm_spec::snapshot::{snapshot_request, restore_request, snapshot_status,
