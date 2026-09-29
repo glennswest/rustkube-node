@@ -36,7 +36,9 @@ are written by the same builder, without the system labels.
 
 ## Kept current
 
-stormblock is the source of truth. Every 30 s the kubelet:
+stormblock is the source of truth. Whenever its volumes change (its
+`/apis/storage.storm.io/v1/volumes?watch=1` stream; polled every 30 s on an
+engine without it), and whenever one of these PVs or PVCs changes, the kubelet:
 
 - creates what is missing (the PVC first, then the PV with its uid), so a claim
   deleted by hand, a wiped etcd or a deleted namespace comes back;

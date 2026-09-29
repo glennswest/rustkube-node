@@ -253,3 +253,30 @@ independent starts remain concurrent. VM stop checks every detach and runtime
 release but never deletes VM-owned disks; only the owner sweep decides that.
 Main's failed-start backoff and runStrategy policy also run through the UID
 adapter. Complete event sources and cancellation coverage remain #100/#101.
+
+## Events and deadlines instead of ticks (#101)
+
+Implemented on main, 2026-09-29. The heartbeat (the node lease) is the only
+fixed schedule left.
+
+| Work | Was | Now |
+|---|---|---|
+| Live Pod | every `sync_interval` (2 s) | stormpump exits, volume/image/API events; deadlines: each probe's `periodSeconds` from `initialDelaySeconds` (a probe not due keeps its last result), CrashLoopBackOff end, waiting-start retry (¼ of the wait, 1–10 s), init-container limit |
+| Live VMI | every `sync_interval` | ring exits, API/volume events; deadlines: start backoff, waiting retry (1–30 s), guest-agent poll (2 s while booting → 30 s; 10 s handle-less). The agent has no push, so its poll is a per-machine probe period |
+| Service mirror | 15 s | inotify on `/run/stormpump`, gated on the parsed table (read at most once a second while PID 1 rewrites it every pass: stormpump#67), plus the mirror pods' watch; writes only what differs |
+| System claims | 30 s | stormblock volume watch + PV/PVC watches |
+| Reclaim | 30 s | PV watch; 5 s retry while pending |
+| CSI sweep | 30 s | this node's Pod watch; 10 s retry while a teardown is pending |
+| Snapshots, disk-owner sweep | `sync_interval` | snapshot/VM/VMI watches, take completions, stormblock volume watch; the sweep's once-a-minute floor defers events |
+
+Failures inside these workers call `apimachinery::reactor::failed()`, which
+retries on the reactor's backoff (100 ms doubling to 30 s) rather than on a
+clock. Fallbacks that remain are counted in
+`kubelet_timed_reconciles_total{cause="fallback"}`: a CRI runtime without exit
+events keeps `sync_interval` for its workloads, and an engine without the
+volume watch is polled every 30 s. CrashLoopBackOff forgiveness is judged at
+the next restart, since nothing looks at a healthy container on a clock.
+
+Verified by unit tests only: probe and backoff deadlines, a settled pod with no
+deadline, the engine watch's follow/reconnect, the sweep's deferral and VM
+start retry deadlines. Not measured on a node (#102).

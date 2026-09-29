@@ -78,7 +78,8 @@ and removes the directory, but only if it is empty, so a volume that is somehow
 still mounted is never deleted through its mount point. When no other pod on
 the node has a record for the same volume, it calls **NodeUnstageVolume**.
 
-A sweep every 30 s repeats this for any pod that has records and that the
+A sweep repeats this, on this node's Pod events and every 10 s while a
+teardown is still pending, for any pod that has records and that the
 node is no longer running. That covers a pod deleted while the kubelet was
 down, a start that failed after publishing, and an unpublish the driver
 refused. A pod the apiserver still shows as bound here and unfinished is

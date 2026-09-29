@@ -2,6 +2,21 @@
 
 ## 2026-09-29
 
+- **feat:** No global sync tick (#101). Live Pods and VMIs come back only on
+  events or their own deadlines: probe `periodSeconds`/`initialDelaySeconds`
+  (upstream timing; previously every probe ran every 2 s), CrashLoopBackOff
+  end, waiting-start backoff, init-container limit, VM guest-agent poll.
+- **feat:** Service mirror on `/run/stormpump` inotify and mirror-pod watch,
+  writing only what differs; system claims and the VM disk-owner sweep on
+  stormblock's volume watch plus PV/PVC and VM/VMI watches; reclaim on the PV
+  watch; CSI sweep on this node's Pod watch; snapshots on take completion (#101).
+- **feat:** `kubelet_timed_reconciles_total{worker,cause}` counts deadline and
+  polling-fallback work (#101).
+- **fix:** CrashLoopBackOff forgiveness is judged at restart, not only when a
+  running container happens to be observed (#101).
+- **docs:** Configuration, README, node volumes, CSI, metrics and the
+  event-driven design updated for #101. Filed stormpump#67 (assets.json is
+  rewritten every supervision pass).
 - **chore:** Stage golden golden-rustkube-node-2fb5a1e7ab0d at ac738df (#100), release request stormcos#164.
 - **feat:** Unwind a failed, panicked or abandoned VM start: a per-UID ledger
   records each tap deposit before it is sent and each volume/spec handle as it

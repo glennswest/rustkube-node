@@ -93,12 +93,24 @@ retrying once only if changed. No separate admin-token source exists (#105).
 
 `KubeletConfig::default()` has `heartbeat_interval = 10s`, `sync_interval = 2s`,
 and API URL `http://localhost:6443` (the CLI overrides that URL). These intervals
-are not CLI keys. Pods and VMIs share eight UID workers with watch-driven desired-state
-updates and per-UID runtime/probe fallback deadlines. Image pulls use four
-separate slots. Service mirrors run every 15 seconds; service-volume
-reconciliation and CSI cleanup every 30 seconds. CSI registration uses filesystem
-notifications with retry deadlines. Snapshot maintenance has its own watch and
-sync-interval fallback; the disk-owner sweep runs at most once per minute.
+are not CLI keys. The heartbeat is the only fixed schedule. Pods and VMIs share
+eight UID workers driven by watches and stormpump exits; a worker comes back
+without an event only for its own deadlines (#101): a probe's `periodSeconds`
+from its `initialDelaySeconds`, a CrashLoopBackOff's end, a waiting start
+(backoff of a quarter of the wait, 1–10 s for Pods, 1–30 s for VMIs), an init
+container's 120 s limit, and a VM guest-agent poll (2 s while booting, backing
+off to 30 s; 10 s for a machine adopted without an engine handle).
+`sync_interval` applies only to a runtime without exit events (CRI), as a
+counted fallback. Image pulls use four separate slots. The service mirror
+follows `/run/stormpump` (inotify, at most one read a second while PID 1
+rewrites the file every pass, stormpump#67) and its own mirror pods' watch.
+System claims and the disk-owner sweep follow stormblock's volume watch (30 s
+poll, counted, on an engine without one) and PV/PVC or VM/VMI watches; the
+sweep runs at most once a minute and defers, not drops, events inside that.
+Reclaim follows the PV watch (5 s retry while a claim is in use); the CSI sweep
+follows this node's Pod watch (10 s retry for a pending teardown). CSI
+registration uses filesystem notifications with retry deadlines. Snapshots
+follow their watch and take completions.
 
 Fixed paths include `/var/lib/kubelet` for volume records,
 `/var/log/pods` for container logs, `/run/stormvm/<namespace>/<name>/vm.json`

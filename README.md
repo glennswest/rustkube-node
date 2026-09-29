@@ -44,8 +44,12 @@ held, and its deletion (and the name) is held until the tap is withdrawn. A
 failed CNI ADD is followed by DEL before the sandbox goes, and a claim reclaim
 runs to completion even if its HTTP client disconnects (#100). Subsecond
 startup has not been measured on a live node.
-Active workloads still use an explicit runtime/probe/volume observation
-fallback, and service/volume mirrors and CSI cleanup tasks retain their existing schedules.
+No global sync tick remains (#101): a live Pod or VMI is looked at again
+only on an event or its own deadline (a probe period, a backoff, a pending
+retry, a guest-agent poll), and the service mirror, system claims, reclaim,
+CSI sweep and VM maintenance run on file, API-watch and stormblock volume-watch
+events. What still polls is counted in `kubelet_timed_reconciles_total`
+(see [configuration](docs/configuration.md)).
 Per-UID concurrency and complete local event sources are tracked in
 [#100](https://github.com/glennswest/rustkube-node/issues/100) and
 [#101](https://github.com/glennswest/rustkube-node/issues/101).
@@ -135,7 +139,8 @@ data.
 Readiness currently follows the asset's running state rather than a health
 endpoint (#96); lifecycle Events lack full exit detail (#50/#82).
 
-Every 15 s the kubelet reads PID 1's asset table (`/run/stormpump/assets.json`) and mirrors each asset as a
+When PID 1's asset table (`/run/stormpump/assets.json`) changes, and when a mirror pod is edited or deleted,
+the kubelet mirrors each asset as a
 read-only pod, `kube-system/<asset>-<node>` (labels `storm.io/asset`, `storm.io/component=node-service`).
 A running asset's pod is Running and Ready, and a stopped one is Failed. A mirror whose asset is not in the
 table on this boot (its unit was not started) becomes Pending, with its container waiting `NotStarted`, no

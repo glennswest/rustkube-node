@@ -3861,7 +3861,12 @@ mod tests {
         let m = VmManager::new(None, "n1", reqwest::Client::new(), "http://127.0.0.1:1");
         let mut obj = vmi("n1");
         m.reconcile_one("u-1", Some(&obj)).await.unwrap();
+        // The failed start comes back when its backoff is up, with no event
+        // and no tick (#101); inside the backoff, the same deadline.
+        let due = m.take_due("u-1").expect("the retry");
+        assert!(due <= std::time::Duration::from_secs(10) && due > std::time::Duration::from_secs(8), "{due:?}");
         m.reconcile_one("u-1", Some(&obj)).await.unwrap();
+        assert!(m.take_due("u-1").is_some(), "still due at the backoff's end");
         assert_eq!(m.retries.lock().unwrap()["u-1"].attempts, 1);
         obj["metadata"]["generation"] = json!(2);
         m.reconcile_one("u-1", Some(&obj)).await.unwrap();
@@ -3869,6 +3874,7 @@ mod tests {
         assert_eq!(m.retries.lock().unwrap()["u-1"].attempts, 1);
         m.reconcile_one("u-1", None).await.unwrap();
         assert!(!m.retries.lock().unwrap().contains_key("u-1"));
+        assert_eq!(m.take_due("u-1"), None, "a deleted machine has no deadline");
     }
 
     #[tokio::test]
@@ -4298,14 +4304,17 @@ mod tests {
             access: Access::default(),
         });
 
-        m.sweep_orphans().await;
+        // Deleted, so it comes back once the floor is up to see they went.
+        assert_eq!(m.sweep_orphans().await, Some(SWEEP_EVERY));
         let mut gone = e.deleted.lock().unwrap().clone();
         gone.sort();
         assert_eq!(gone, vec!["deleted-vm", "deleting-vmi", "replaced-vm"]);
 
-        // Not again within the minute.
+        // Not again within the minute: the event is not dropped, it is
+        // deferred to the end of the floor (#101).
         e.vols.lock().unwrap().push(owned("later", "VirtualMachine", "a", "ua"));
-        m.sweep_orphans().await;
+        let later = m.sweep_orphans().await.expect("deferred, not dropped");
+        assert!(later <= SWEEP_EVERY && later > SWEEP_EVERY - std::time::Duration::from_secs(5), "{later:?}");
         assert_eq!(e.deleted.lock().unwrap().len(), 3);
     }
 
