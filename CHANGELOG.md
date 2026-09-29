@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-09-29
+
+- **docs:** Record #100 restart plan and the decision to defer the main merge.
+
 ## Unreleased — turbomode (not yet built or measured)
 
 - Remove the two-second inline template-mint wait; completion notifies Pod

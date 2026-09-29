@@ -37,6 +37,22 @@ not the release path.
 
 ## Work plan
 
+### In progress: #100, common bounded per-UID Pod/VMI workers
+
+2026-09-29: master's decision on #100 authorizes continuing at turbomode 9b46886,
+without merging main yet. Baseline sc-build `cargo test --locked -p kubelet`
+already passed (211 tests). No main merge, golden or live deployment now.
+
+1. [ ] Audit runtime state/locks and recovery; protect claim/name admission before concurrency.
+2. [ ] Wire Pod/VMI adapters to the common executor; retain state across failed cleanup,
+       use observed UID preconditions, and preserve bootstrap through unavailable API reads.
+3. [ ] Add dependency indexes, staged waits and slow/fast/cancellation regression tests.
+4. [ ] Push each change, validate with sc-build, document evidence and remaining limitations.
+5. [ ] At the end of #100/#101 integrate main's #91 address pump, #35 failed-list
+       protection and #53 snapshots as executor events/adapters before merging main.
+       Live target remains the owner's decision under #102.
+
+
 ### Done: #35, VMs reconciled against VMIs: deletion stops them, orphans found
 
 Found, 2026-09-27 (test2's QEMU outlived its VMI on C2NR0Q2): a VM outlives a kubelet restart (the engine
