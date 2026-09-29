@@ -62,7 +62,10 @@ work continues on main afterwards; no golden or release is requested here.
 1. [x] Read #114, #100, project rules and open issues; checkout is clean.
 2. [x] Merge origin/main into turbomode; preserve address pump, failed-list
    protection, snapshot maintenance, durable disks, retry policy and credentials.
-3. [ ] Push and run full sc-build (cargo build --locked && cargo test --locked).
+3. [x] ec39c2a pushed; full sc-build `cargo build --locked && cargo test --locked`
+   passed: 251 kubelet unit, four integration, 24 CNI, 17 proxy and one doc-test;
+   one doc-test ignored. Remote exit 0 in 107s; drive deleted. Local statistics
+   append was read-only (remote result unaffected).
 4. [ ] Merge turbomode into main with --no-ff, push and repeat full sc-build.
 5. [ ] Record merge/test evidence and remaining work on #114, then close it.
 

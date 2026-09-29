@@ -2,6 +2,8 @@
 
 ## 2026-09-29
 
+- **docs:** Record successful full workspace verification of merged turbomode ec39c2a (#114).
+
 - **feat:** Integrate main into turbomode (#114), preserving tap addresses,
   snapshots, failed-list safety, durable VM disks, startup retry policy and
   access credentials within UID reconciliation. Add adapter regression coverage.
