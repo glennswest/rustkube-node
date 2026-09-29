@@ -75,6 +75,21 @@ work continues on main afterwards; no golden or release is requested here.
    changes documentation only after the verified main merge.
 
 
+### In progress: #99, request deadlines; then parked on #102 (live)
+
+2026-09-29, on main. #99 is the umbrella; #100/#101 are done, rustkube#143,
+#145, #146 and #148 are closed, and rustkube#144/#147/#149 are open there.
+Its acceptance measures real nodes (C2NR0Q2, owner's choice on #110), which
+waits on the master installing the release (stormcos#164) = #102. Code left
+here, from the #95/#63 comment mining:
+1. [ ] Ring: enforce `DEADLINE` from enqueue (queued, parked-for-arena and in
+   flight), keep the arena until the real completion, and undo a late
+   success (spawn → stop + release on exit; volume/spec/sandbox → release).
+2. [ ] CNI: bound each plugin exec (stdin + wait), kill and reap on timeout.
+3. [ ] EngineClient: connect + request timeouts; the volume watch stream
+   exempt; check a timed-out mint can be found again, not duplicated.
+4. [ ] Tests, docs, CHANGELOG, sc-build; then `propose --after` #102.
+
 ### Done: #101, events and explicit deadlines instead of sync ticks
 
 2026-09-29, on main. Heartbeat is the only fixed schedule left.
