@@ -735,6 +735,11 @@ pub struct VmManager {
     /// this is what keeps the per-UID workers from doing that. The window is
     /// milliseconds; disks are resolved outside it.
     deposit_window: Mutex<()>,
+    /// When each machine must next be looked at with no event (#101): a
+    /// start's backoff, a pending wait, the guest agent's next poll.
+    due: std::sync::Mutex<HashMap<String, std::time::Instant>>,
+    /// When a start began waiting, for the backoff of the next try (#101).
+    waiting_since: std::sync::Mutex<HashMap<String, std::time::Instant>>,
 }
 
 /// A failed start waiting for its next try (#76).
@@ -744,6 +749,23 @@ struct Retry {
     generation: i64,
     attempts: u32,
     next: std::time::Instant,
+}
+
+/// A running machine's guest is asked again this often once its agent has
+/// answered (#101). The guest agent has no push: like KubeVirt's agent
+/// poller, this is a per-machine probe period, not a node tick.
+const AGENT_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+/// Until the agent first answers (the guest is booting), and while keys are
+/// still to be delivered, it is asked sooner.
+const AGENT_FIRST: std::time::Duration = std::time::Duration::from_secs(2);
+/// A machine adopted without an engine handle: the control socket is the
+/// only sign of life, so it is checked on this period.
+const HANDLELESS_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The next try of a start that is waiting (a golden, a claim): a quarter of
+/// the wait so far, between one and thirty seconds (#101).
+fn wait_backoff(waited: std::time::Duration) -> std::time::Duration {
+    (waited / 4).clamp(std::time::Duration::from_secs(1), std::time::Duration::from_secs(30))
 }
 
 /// The wait before the next try after `attempts` failures: 10 s, doubling,
@@ -844,7 +866,34 @@ impl VmManager {
             partial: Arc::default(),
             unwinder,
             deposit_window: Mutex::new(()),
+            due: Default::default(),
+            waiting_since: Default::default(),
         }
+    }
+
+    /// Look at `uid` again by `at` at the latest (#101).
+    fn due_at(&self, uid: &str, at: std::time::Instant) {
+        self.due
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(uid.to_string())
+            .and_modify(|d| *d = (*d).min(at))
+            .or_insert(at);
+    }
+
+    fn due_in(&self, uid: &str, after: std::time::Duration) {
+        self.due_at(uid, std::time::Instant::now() + after);
+    }
+
+    /// How long until this machine must be looked at with no event, and
+    /// forget it: each pass sets what it still needs. `None`: only an event
+    /// (an exit on the ring, an API edit, a volume change).
+    pub fn take_due(&self, uid: &str) -> Option<std::time::Duration> {
+        self.due
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(uid)
+            .map(|at| at.saturating_duration_since(std::time::Instant::now()))
     }
 
     #[cfg(test)]
@@ -1205,6 +1254,8 @@ impl VmManager {
                 self.vms.lock().await.remove(uid);
             }
             self.retries.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+            self.waiting_since.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+            self.due.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
             // A failed start's tap still held would meet a successor of the
             // same name: the deletion (and its name) is held until it goes.
             self.unwind(uid, true).await
@@ -1219,7 +1270,9 @@ impl VmManager {
         }
         let running = self.vms.lock().await.get(uid).is_some_and(|vm| !vm.phase.terminal());
         if !running { return Ok(false); }
-        self.set_finalizer(object, true).await;
+        if !self.set_finalizer(object, true).await {
+            self.due_in(uid, AGENT_FIRST);
+        }
         Ok(false)
     }
 
@@ -1318,11 +1371,17 @@ impl VmManager {
                 Some(r) if r.generation != generation => {
                     retries.remove(uid);
                 }
-                Some(r) if std::time::Instant::now() < r.next => return,
+                Some(r) if std::time::Instant::now() < r.next => {
+                    self.due_at(uid, r.next);
+                    return;
+                }
                 _ => {}
             }
         }
         let result = self.start(uid, obj).await;
+        if !matches!(result, Err(StartFail::Waiting(_))) {
+            self.waiting_since.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+        }
         if result.is_ok() {
             self.retries.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
         }
@@ -1335,6 +1394,15 @@ impl VmManager {
                 // made a missing golden permanent: sync saw the uid and
                 // skipped it for ever.
                 info!("{ns}/{name}: {why}");
+                // Tried again with a backoff growing with the wait: a claim
+                // or golden that appears is an event only sometimes (#101).
+                let since = *self
+                    .waiting_since
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(uid.to_string())
+                    .or_insert_with(std::time::Instant::now);
+                self.due_in(uid, wait_backoff(since.elapsed()));
                 self.event(obj, "Normal", "Waiting", why).await;
                 self.patch_pending(ns, name, uid, why).await;
                 return;
@@ -1372,6 +1440,7 @@ impl VmManager {
                 r.next = std::time::Instant::now() + wait;
                 (r.attempts, wait)
             };
+            self.due_in(uid, wait);
             let why = format!(
                 "start failed (attempt {attempts}), retrying in {}s: {e}",
                 wait.as_secs()
@@ -1760,6 +1829,19 @@ impl VmManager {
             }
             // Its SSH keys through the agent, and the condition (#92).
             self.sync_access(&vm.uid, agent_up).await;
+            // The next time the guest is asked (#101). Its exit is an event on
+            // the ring; its addresses, its agent coming up and a changed key
+            // Secret are not. Sooner while it boots, backing off to the
+            // agent's period for a guest that never runs one.
+            let next = if agent_up {
+                AGENT_PERIOD
+            } else if vm.handle.is_none() {
+                HANDLELESS_PERIOD
+            } else {
+                let age = std::time::Duration::from_secs(now_unix().saturating_sub(vm.started_unix) as u64);
+                wait_backoff(age).min(AGENT_PERIOD)
+            };
+            self.due_in(&vm.uid, next);
             let code = if vm.handle.is_none() {
                 // Adopted without a handle: its control socket is the only
                 // sign of life, and there is no exit status to read.

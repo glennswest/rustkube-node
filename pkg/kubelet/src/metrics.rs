@@ -93,6 +93,10 @@ fn describe() {
         metrics::Unit::Seconds,
         "Duration in seconds from kubelet seeing a pod for the first time to the pod starting to run"
     );
+    metrics::describe_counter!(
+        TIMED,
+        "Reconciles scheduled by a deadline or a polling fallback rather than an event"
+    );
     metrics::describe_histogram!(
         RELIST,
         metrics::Unit::Seconds,
@@ -112,6 +116,20 @@ pub fn observe_pod_start(seconds: f64) {
 pub fn observe_relist(seconds: f64) {
     if handle().is_some() {
         metrics::histogram!(RELIST).record(seconds);
+    }
+}
+
+/// Work scheduled on a clock rather than by an event (#101).
+pub const TIMED: &str = "kubelet_timed_reconciles_total";
+
+/// A worker scheduled work with no event behind it. `worker` names it (`pod`,
+/// `vmi`, `system-claims`, …); `cause` is `deadline` (a probe period, a
+/// backoff, a pending retry: work that is due) or `fallback` (the source has
+/// no event feed, so it is polled). A `fallback` count that grows is the
+/// measure of what still polls.
+pub fn observe_timed(worker: &'static str, cause: &'static str) {
+    if handle().is_some() {
+        metrics::counter!(TIMED, "worker" => worker, "cause" => cause).increment(1);
     }
 }
 

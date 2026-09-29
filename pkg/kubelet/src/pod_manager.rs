@@ -20,6 +20,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 mod csi_volumes;
+mod deadlines;
 
 type ImageResult = Arc<std::sync::Mutex<Option<Result<String, String>>>>;
 type ImageKey = (String, String);
@@ -296,6 +297,11 @@ pub struct PodManager {
     image_slots: Arc<tokio::sync::Semaphore>,
     image_changes: tokio::sync::broadcast::Sender<String>,
     csi_operations: std::sync::Mutex<HashMap<(String,String),Arc<tokio::sync::Mutex<()>>>>,
+    /// Probe runs and each pod's next event-less look (#101).
+    deadlines: std::sync::Mutex<deadlines::Deadlines>,
+    /// Pods whose start waits only on an event (an init container's exit):
+    /// no retry backoff for them, only their own deadline (#101).
+    event_waits: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// A pod this node has admitted and not started, and why.
@@ -376,6 +382,8 @@ impl PodManager {
             csi: Arc::new(crate::csi_plugins::CsiPlugins::new(node_name)),
             csi_mountinfo: "/proc/1/mountinfo".to_string(),
             first_seen: std::sync::Mutex::new(HashMap::new()),
+            deadlines: Default::default(),
+            event_waits: Default::default(),
             waiting: std::sync::Mutex::new(HashMap::new()),
             minting: Arc::new(std::sync::Mutex::new(HashMap::new())),
             volume_changes: tokio::sync::watch::channel(0).0,
@@ -2172,6 +2180,7 @@ impl PodManager {
             if partial {
                 if let Err(error)=self.stop_pod(uid).await {
                     warn!(%error, %uid, "partial Pod start cleanup pending");
+                    self.due_in(uid, deadlines::RECHECK);
                     continue;
                 }
             }
@@ -2200,6 +2209,9 @@ impl PodManager {
                             .unwrap_or_else(|e| e.into_inner())
                             .remove(uid);
                         crate::metrics::observe_pod_start(seen.elapsed().as_secs_f64());
+                        // One look once it is up: that pass schedules its
+                        // probes (#101).
+                        self.due_in(uid, deadlines::RECHECK);
                         outcome.updates.push(status)
                     }
                     // A volume that is not there yet is **Pending**, not
@@ -2212,10 +2224,12 @@ impl PodManager {
                     // dead on a node whose network came up ten seconds later,
                     // and nothing retried it.
                     Err(CriError::Pending(what)) => {
+                        self.retry_wait(uid, seen.elapsed());
                         outcome.updates.push(self.waiting_pod(pod,what));
                     }
                     Err(CriError::NetworkNotReady(what)) => {
                         warn!("Pod {namespace}/{name} waiting on the pod network: {what}");
+                        self.retry_wait(uid, seen.elapsed());
                         let message = format!("network is not ready: {what}");
                         outcome.updates.push(self.waiting_pod(pod, message));
                     }
@@ -2224,6 +2238,7 @@ impl PodManager {
                     // the reason, and `describe` has a FailedMount Event.
                     Err(CriError::VolumeNotReady(what)) => {
                         warn!("Pod {namespace}/{name} waiting on volumes: {what}");
+                        self.retry_wait(uid, seen.elapsed());
                         let message = volume_wait_message(&what, seen.elapsed());
                         self.event(pod, "Warning", "FailedMount", &message).await;
                         outcome.updates.push(self.waiting_pod(pod, message));
@@ -2232,6 +2247,7 @@ impl PodManager {
                         self.start_images.lock().unwrap().remove(uid);
                         if let Some(state)=self.pods.write().await.get_mut(uid) { state.phase="Cleanup".into(); }
                         apimachinery::reactor::failed();
+                        self.retry_wait(uid, seen.elapsed());
                         error!("Failed to start pod {namespace}/{name}: {e}");
                         self.waiting
                             .lock()
@@ -2265,6 +2281,7 @@ impl PodManager {
                     Ok(status) => outcome.updates.push(status),
                     Err(e) => {
                         apimachinery::reactor::failed();
+                        self.due_in(uid, deadlines::RECHECK);
                         warn!("Failed to check pod {namespace}/{name} status: {e}");
                     }
                 }
@@ -2445,6 +2462,10 @@ impl PodManager {
                             return Err(CriError::Timeout);
                         }
                         if self.admission.is_some() {
+                            // Its exit is an event; only the deadline is not.
+                            let left = std::time::Duration::from_millis(MAX_WAIT_MS.saturating_sub(waited));
+                            self.due_in(uid, left);
+                            self.event_waits.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string());
                             return Err(CriError::Pending(format!("init container {cname} is running")));
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(POLL_MS)).await;
@@ -2860,8 +2881,9 @@ impl PodManager {
                             &mut container_statuses,
                         )
                         .await;
-                        self.backoff.restarted(&key);
+                        self.restarted_backoff(uid, &key);
                     } else if let Some(left) = backing_off.filter(|_| should_recreate) {
+                        self.due_in(uid, left);
                         // A pruned record is the commonest way a crash loop
                         // looks from here, so this path needs the same gate as
                         // a plain exit — it is the one the cilium-operator
@@ -2905,6 +2927,7 @@ impl PodManager {
                     continue;
                 }
                 Err(e) => {
+                    self.due_in(uid, deadlines::RECHECK);
                     // Transient error (e.g. RPC timeout): keep waiting rather than
                     // disturbing a container that may still be alive.
                     warn!(
@@ -2932,9 +2955,10 @@ impl PodManager {
 
             match status.state {
                 ContainerState::Running => {
-                    let elapsed = state
-                        .started
-                        .get(&name)
+                    // This start of the container, which its probe runs
+                    // belong to (#101). `None` when adopted.
+                    let started = state.started.get(&name).copied();
+                    let elapsed = started
                         .map(|t| t.elapsed().as_secs())
                         .unwrap_or(u64::MAX);
 
@@ -2961,12 +2985,14 @@ impl PodManager {
                                 message: String::new(),
                             });
                         };
-                        if elapsed < probe_initial_delay(startup) {
+                        // Not due: inside its initial delay, or run less
+                        // than a period ago. Its deadline is set (#101).
+                        if !self.probe_due(uid, &name, deadlines::STARTUP, startup, started) {
                             state.ready.insert(name.clone(), false);
                             not_ready(&mut container_statuses);
                             continue;
                         }
-                        match run_probe(
+                        let result = run_probe(
                             startup,
                             &spec,
                             &cid,
@@ -2974,8 +3000,9 @@ impl PodManager {
                             pod_netns.as_deref(),
                             &self.runtime,
                         )
-                        .await
-                        {
+                        .await;
+                        self.probed(uid, &name, deadlines::STARTUP, startup, started);
+                        match result {
                             ProbeResult::Success => {
                                 info!(
                                     "Startup probe passed for {}/{}/{name}",
@@ -3029,8 +3056,10 @@ impl PodManager {
                     // kill and restart the container.
                     let liveness = &spec["livenessProbe"];
                     let mut restarted = false;
-                    if !liveness.is_null() && elapsed >= probe_initial_delay(liveness) {
-                        match run_probe(
+                    if !liveness.is_null()
+                        && self.probe_due(uid, &name, deadlines::LIVENESS, liveness, started)
+                    {
+                        let result = run_probe(
                             liveness,
                             &spec,
                             &cid,
@@ -3038,8 +3067,9 @@ impl PodManager {
                             pod_netns.as_deref(),
                             &self.runtime,
                         )
-                        .await
-                        {
+                        .await;
+                        self.probed(uid, &name, deadlines::LIVENESS, liveness, started);
+                        match result {
                             ProbeResult::Failure(reason) => {
                                 let failures =
                                     state.liveness_failures.entry(name.clone()).or_insert(0);
@@ -3080,9 +3110,14 @@ impl PodManager {
                     let ready = if readiness.is_null() {
                         true
                     } else if elapsed < probe_initial_delay(readiness) {
+                        // Not yet due: its deadline is recorded.
+                        self.probe_due(uid, &name, deadlines::READINESS, readiness, started);
                         false
+                    } else if !self.probe_due(uid, &name, deadlines::READINESS, readiness, started) {
+                        // Ran less than a period ago: what it said then.
+                        state.ready.get(&name).copied().unwrap_or(false)
                     } else {
-                        matches!(
+                        let ok = matches!(
                             run_probe(
                                 readiness,
                                 &spec,
@@ -3093,7 +3128,9 @@ impl PodManager {
                             )
                             .await,
                             ProbeResult::Success
-                        )
+                        );
+                        self.probed(uid, &name, deadlines::READINESS, readiness, started);
+                        ok
                     };
                     state.ready.insert(name.clone(), ready);
                     // Up, and forgiven once it has been up long enough.
@@ -3125,6 +3162,7 @@ impl PodManager {
                     if should_restart {
                         let key = crate::crashloop::CrashLoopBackoff::key(uid, &name);
                         if let Some(left) = self.backoff.wait(&key) {
+                            self.due_in(uid, left);
                             // Backing off. Reported as waiting with the reason
                             // a reader expects, rather than recreated now: a
                             // container recreated every sync tick is a crash
@@ -3162,7 +3200,7 @@ impl PodManager {
                                 &mut container_statuses,
                             )
                             .await;
-                            self.backoff.restarted(&key);
+                            self.restarted_backoff(uid, &key);
                         }
                     } else {
                         info!(
@@ -3188,6 +3226,7 @@ impl PodManager {
                     }
                 }
                 ContainerState::Created | ContainerState::Unknown => {
+                    self.due_in(uid, deadlines::RECHECK);
                     state.ready.insert(name.clone(), false);
                     container_statuses.push(ContainerStatusReport {
                         started_at: status.started_at,
@@ -3226,6 +3265,7 @@ impl PodManager {
             // an ungated reconcile recreates it every sync tick.
             let key = crate::crashloop::CrashLoopBackoff::key(uid, &name);
             if let Some(left) = self.backoff.wait(&key) {
+                self.due_in(uid, left);
                 state.ready.insert(name.clone(), false);
                 container_statuses.push(ContainerStatusReport {
                     started_at: 0,
@@ -3259,7 +3299,7 @@ impl PodManager {
                 &mut container_statuses,
             )
             .await;
-            self.backoff.restarted(&key);
+            self.restarted_backoff(uid, &key);
         }
 
         // Pod phase.
@@ -3342,6 +3382,7 @@ impl PodManager {
                     "Cannot restart {}/{}/{name}: no sandbox",
                     state.namespace, state.name
                 );
+                self.due_in(&state.uid, deadlines::RECHECK);
                 return false;
             }
         };
@@ -3354,6 +3395,7 @@ impl PodManager {
             Ok(v) => v,
             Err(e) => {
                 warn!("Container {}/{}/{name}: {e}", state.namespace, state.name);
+                self.due_in(&state.uid, deadlines::RECHECK);
                 return false;
             }
         };
@@ -3407,6 +3449,7 @@ impl PodManager {
                 true
             }
             Err(e) => {
+                self.due_in(&state.uid, deadlines::RECHECK);
                 error!(
                     "Failed to restart container {}/{}/{name}: {e}",
                     state.namespace, state.name
@@ -3477,6 +3520,24 @@ impl PodManager {
     /// Needed because a container's log path contains the UID
     /// (`/var/log/pods/<ns>_<pod>_<uid>/`) while the URL `kubectl logs` sends
     /// does not — and because a pod this node has never heard of should be a
+    /// A restart was made (or tried): the next is gated by the backoff, and
+    /// the pod is looked at again when it runs out (#101).
+    fn restarted_backoff(&self, uid: &str, key: &str) {
+        self.backoff.restarted(key);
+        if let Some(left) = self.backoff.wait(key) {
+            self.due_in(uid, left);
+        }
+    }
+
+    /// A start that is waiting is tried again with a backoff growing with
+    /// the wait, unless what it waits on is an event (#101).
+    fn retry_wait(&self, uid: &str, waited: std::time::Duration) {
+        if self.event_waits.lock().unwrap_or_else(|e| e.into_inner()).remove(uid) {
+            return;
+        }
+        self.due_in(uid, deadlines::wait_backoff(waited));
+    }
+
     /// 404 rather than an empty log.
     /// Record a pod as admitted and waiting, and the status that says so:
     /// Pending, every container `waiting: ContainerCreating` with `message`.
@@ -3629,6 +3690,7 @@ impl PodManager {
         self.pods.write().await.remove(uid);
         self.start_images.lock().unwrap().remove(uid);
         self.backoff.forget_pod(uid);
+        self.forget_deadlines(uid);
         self.first_seen
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -5932,10 +5994,50 @@ pub(crate) mod tests {
         let outcome = mgr.sync_pods(&[p.clone()]).await;
         assert!(!outcome.updates[0].container_statuses[0].ready);
 
-        // Probe succeeding → ready.
+        // Inside its period the probe is not run again: what it said stands,
+        // and the pod asks to be looked at when the period is up (#101).
         rt.set_exec_exit_code(0);
+        mgr.take_due("uid-1");
+        let outcome = mgr.sync_pods(&[p.clone()]).await;
+        assert!(!outcome.updates[0].container_statuses[0].ready);
+        let due = mgr.take_due("uid-1").expect("the probe's next run");
+        assert!(due <= std::time::Duration::from_secs(10) && due > std::time::Duration::from_secs(8), "{due:?}");
+
+        // Probe succeeding, once due → ready.
+        mgr.expire_probes();
         let outcome = mgr.sync_pods(&[p]).await;
         assert!(outcome.updates[0].container_statuses[0].ready);
+    }
+
+    /// A running pod with no probes and nothing pending asks for no timed
+    /// look: only an event (an exit, an edit) brings its worker back (#101).
+    #[tokio::test]
+    async fn a_settled_pod_without_probes_waits_only_for_events() {
+        let (_rt, mgr) = manager();
+        let p = pod("uid-1", "web", "Always", simple_container());
+        mgr.sync_pods(&[p.clone()]).await;
+        assert!(mgr.take_due("uid-1").is_some(), "one look after the start");
+        let outcome = mgr.sync_pods(&[p]).await;
+        assert_eq!(outcome.updates[0].container_statuses[0].state, "running");
+        assert_eq!(mgr.take_due("uid-1"), None);
+    }
+
+    /// A container in CrashLoopBackOff is looked at again when its backoff
+    /// runs out, with no event and no tick (#101).
+    #[tokio::test]
+    async fn a_backoff_sets_the_pods_next_look() {
+        let (rt, mgr) = manager();
+        let p = pod("uid-1", "web", "Always", simple_container());
+        mgr.sync_pods(&[p.clone()]).await;
+        let key = crate::crashloop::CrashLoopBackoff::key("uid-1", "app");
+        mgr.backoff.restarted(&key);
+        let cid = rt.container_ids().pop().unwrap();
+        rt.set_container_state(&cid, ContainerState::Exited, 1);
+        mgr.take_due("uid-1");
+        let outcome = mgr.sync_pods(&[p]).await;
+        assert_eq!(outcome.updates[0].container_statuses[0].reason, "CrashLoopBackOff");
+        let due = mgr.take_due("uid-1").expect("the backoff's end");
+        assert!(due <= std::time::Duration::from_secs(10) && due > std::time::Duration::from_secs(8), "{due:?}");
     }
 
     #[tokio::test]
@@ -5956,7 +6058,8 @@ pub(crate) mod tests {
         let outcome = mgr.sync_pods(&[p.clone()]).await;
         assert_eq!(outcome.updates[0].container_statuses[0].restart_count, 0);
 
-        // Second failure — threshold reached, restart.
+        // Second failure, a period later — threshold reached, restart.
+        mgr.expire_probes();
         let outcome = mgr.sync_pods(&[p]).await;
         assert_eq!(outcome.updates[0].container_statuses[0].restart_count, 1);
         let new_cid = rt.container_ids().pop().unwrap();

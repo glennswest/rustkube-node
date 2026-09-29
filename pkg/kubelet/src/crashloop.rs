@@ -76,6 +76,10 @@ impl CrashLoopBackoff {
         let Ok(mut entries) = self.entries.lock() else { return };
         let now = Instant::now();
         let delay = match entries.get(key) {
+            // Up long enough since the last restart: forgiven, here as well
+            // as in `running`. Nothing looks at a healthy container on a
+            // clock any more (#101), so `running` may never have been told.
+            Some(e) if e.restarted_at.elapsed() >= STABLE => BASE,
             // Doubling from the last wait, capped. `min` rather than a
             // saturating multiply: the cap is the point, not overflow.
             Some(e) => (e.delay * 2).min(CAP),
@@ -149,6 +153,22 @@ mod tests {
         b.running(&k);
         let after = b.wait(&k).expect("still waiting: it has only just restarted");
         assert!(after <= before);
+    }
+
+    /// Forgiven at the next restart even if nobody saw it running (#101):
+    /// no clock looks at a healthy container any more.
+    #[test]
+    fn a_restart_after_a_stable_run_starts_from_the_base() {
+        let b = CrashLoopBackoff::new();
+        let k = CrashLoopBackoff::key("u-1", "app");
+        b.restarted(&k);
+        b.restarted(&k);
+        b.restarted(&k);
+        let Some(long_ago) = Instant::now().checked_sub(STABLE) else { return };
+        b.entries.lock().unwrap().get_mut(&k).unwrap().restarted_at = long_ago;
+        b.restarted(&k);
+        let left = b.wait(&k).unwrap();
+        assert!(left <= BASE && left > BASE / 2, "{left:?}");
     }
 
     #[test]

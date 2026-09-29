@@ -1216,9 +1216,35 @@ impl workload::Adapter for Kubelet {
                 if let Some(vms)=&self.vms {vms.reconcile_one(&key.uid,Some(&object)).await?;}
             }
         }
-        // Runtime/probe observation remains a per-UID deadline until #101's
-        // complete event sources replace it. No whole-node runtime pass.
-        Ok(Next::After(retry))
+        // The pass set the deadlines it still needs (probes, backoffs,
+        // pending retries); everything else is an event (#101).
+        let due = match key.kind {
+            Kind::Pod => self.pod_manager.take_due(&key.uid),
+            Kind::VirtualMachine => self.vms.as_ref().and_then(|v| v.take_due(&key.uid)),
+        };
+        Ok(self.next_look(key.kind, due))
+    }
+}
+
+impl Kubelet {
+    /// When a live workload is next looked at with no event (#101): its own
+    /// deadline, else only an event. A runtime that reports no exits (a CRI
+    /// runtime, not stormpump) cannot say a container ended, so its workloads
+    /// keep `sync_interval` as a counted fallback.
+    fn next_look(&self, kind: Kind, due: Option<Duration>) -> Next {
+        let worker = match kind { Kind::Pod => "pod", Kind::VirtualMachine => "vmi" };
+        if self.runtime_changes.is_none() {
+            let retry = self.config.sync_interval.max(Duration::from_millis(100));
+            crate::metrics::observe_timed(worker, "fallback");
+            return Next::After(due.map_or(retry, |d| d.min(retry)));
+        }
+        match due {
+            Some(d) => {
+                crate::metrics::observe_timed(worker, "deadline");
+                Next::After(d)
+            }
+            None => Next::AwaitEvent,
+        }
     }
 }
 
