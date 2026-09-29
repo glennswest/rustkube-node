@@ -162,3 +162,9 @@ Owner clarification (2026-09-29): keep Pods and VMs as close as possible. The
 existing separate loops are a temporary adapter, not the target design. Both
 will use a common executor and admission/reservation table, with runtime-specific
 operations behind adapters.
+
+Cleanup checkpoint (#100): VM stop now retains records on query failures,
+timeouts and refused detach/delete operations. Natural exits keep the engine
+handle until teardown. Legacy registrations without an engine handle cannot
+prove exit merely from an unavailable control socket; cleanup remains pending.
+Pod deletion acknowledgement uses DeleteOptions UID preconditions.

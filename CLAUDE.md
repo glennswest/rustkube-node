@@ -44,6 +44,8 @@ without merging main yet. Baseline sc-build `cargo test --locked -p kubelet`
 already passed (211 tests). No main merge, golden or live deployment now.
 
 1. [ ] Audit runtime state/locks and recovery; protect claim/name admission before concurrency.
+   Found: VM stop considered query errors/timeouts an exit and ignored detach HTTP errors.
+   First checkpoint retains failed cleanup and guards Pod deletion by UID; validation pending.
 2. [ ] Wire Pod/VMI adapters to the common executor; retain state across failed cleanup,
        use observed UID preconditions, and preserve bootstrap through unavailable API reads.
 3. [ ] Add dependency indexes, staged waits and slow/fast/cancellation regression tests.

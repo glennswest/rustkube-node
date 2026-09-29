@@ -2,6 +2,9 @@
 
 ## 2026-09-29
 
+- **fix:** Retain VM records/finalizers on unknown exit or refused disk cleanup;
+  acknowledge Pod deletion with the observed UID (#100).
+
 - **docs:** Record #100 restart plan and the decision to defer the main merge.
 
 ## Unreleased — turbomode (not yet built or measured)

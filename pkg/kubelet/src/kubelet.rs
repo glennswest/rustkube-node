@@ -681,7 +681,10 @@ impl Kubelet {
                 "{}/api/v1/namespaces/{}/pods/{}?gracePeriodSeconds=0",
                 self.config.api_server_url, removed.namespace, removed.name
             );
-            match self.api_client.delete(&path).send().await {
+            match self.api_client.delete(&path)
+                .json(&serde_json::json!({"apiVersion":"v1", "kind":"DeleteOptions",
+                    "preconditions":{"uid":removed.uid}, "gracePeriodSeconds":0}))
+                .send().await {
                 Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 404 => {
                     info!(
                         "Confirmed deletion of pod {}/{}",

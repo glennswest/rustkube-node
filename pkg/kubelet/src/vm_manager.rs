@@ -59,6 +59,10 @@ fn deregister(namespace: &str, name: &str) {
 pub const FINALIZER: &str = "storm.io/vm";
 
 /// Is this VMI being deleted?
+fn exited(aux: u64) -> bool {
+    aux & 0xff == 2
+}
+
 fn terminating(obj: &Value) -> bool {
     !obj["metadata"]["deletionTimestamp"].is_null()
 }
@@ -575,12 +579,15 @@ impl VmManager {
             vms.values().filter(|v| !keep.contains(&v.uid)).cloned().collect()
         };
         for vm in gone {
-            self.stop(&vm).await;
-            self.vms.lock().await.remove(&vm.uid);
+            if self.stop(&vm).await {
+                self.vms.lock().await.remove(&vm.uid);
+            }
         }
         // The machine is gone, so its object may go too.
-        for (_, obj) in &going {
-            self.set_finalizer(obj, false).await;
+        for (uid, obj) in &going {
+            if !self.vms.lock().await.contains_key(uid) {
+                self.set_finalizer(obj, false).await;
+            }
         }
 
         for (uid, obj) in &want {
@@ -916,7 +923,7 @@ impl VmManager {
                 // sign of life, and there is no exit status to read.
                 match stormvm_node::console::find(RUN_ROOT, &vm.namespace, &vm.name) {
                     Some(reg) if control_alive(&reg) => continue,
-                    _ => -1,
+                    _ => continue,
                 }
             } else {
                 let r = ring.clone();
@@ -953,60 +960,77 @@ impl VmManager {
             } else {
                 self.event_of(&done, "Warning", "Failed", &done.message).await;
             }
-            self.release(&done.disks).await;
-            if let Some(r) = self.ring.clone().filter(|_| !done.handle.is_none()) {
-                let h = done.handle;
-                let _ = tokio::task::spawn_blocking(move || r.workload_release(h)).await;
-            }
+            // Retain the handle and disks for checked teardown. Releasing the
+            // handle here loses the authoritative exit record before cleanup.
             self.vms.lock().await.insert(done.uid.clone(), done.clone());
             self.patch_status(&done).await;
         }
     }
 
-    async fn stop(&self, vm: &Vm) {
+    /// Keep the record and finalizer until exit and every cleanup operation
+    /// are confirmed. An unavailable query is not evidence of an exit.
+    async fn stop(&self, vm: &Vm) -> bool {
         if vm.handle.is_none() && !vm.phase.terminal() {
+            // Old registrations have no authoritative engine identity. A
+            // missing/unreachable control socket alone cannot prove exit.
             self.stop_by_control(vm).await;
-        } else if let Some(ring) = self.ring.clone() {
+            warn!(vm = %vm.name, "cannot confirm exit without an engine handle; retaining disks and registration");
+            return false;
+        }
+        if !vm.handle.is_none() && !vm.phase.terminal() {
+            let Some(ring) = self.ring.clone() else { return false };
             let handle = vm.handle;
-            // A machine gets a real grace period: ACPI shutdown, then a kill.
-            // Thirty seconds is what a guest needs to flush and unmount, and
-            // the timer is the engine's so it survives this process.
-            let r0 = ring.clone();
-            let _ = tokio::task::spawn_blocking(move || r0.stop(handle, 30)).await;
-            // And the stop is not over until the machine is gone. Removing
-            // the record is what lets a same-name VM start, and its tap
-            // exists while the hypervisor holds the descriptor — returning
-            // early hands the successor EBUSY on a dying tap. The deadline
-            // sits past the engine's own grace, so its kill has fired
-            // before this gives up; exit itself frees the tap, so a reaped
-            // status is not waited for beyond that.
+            let r = ring.clone();
+            let observed = tokio::task::spawn_blocking(move || r.query(handle)).await;
+            let Ok(Ok(cqe)) = observed else { return false };
+            if !exited(cqe.aux) {
+                let r = ring.clone();
+                if !matches!(tokio::task::spawn_blocking(move || r.stop(handle, 30)).await, Ok(Ok(_))) {
+                    return false;
+                }
+            }
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
             loop {
                 let r = ring.clone();
                 let answer = tokio::task::spawn_blocking(move || r.query(handle)).await;
                 match answer {
-                    Ok(Ok(cqe)) if cqe.aux & 0xff != 2 => {}
-                    // Exited, or the engine no longer knows the handle —
-                    // either way the machine is gone.
-                    _ => break,
+                    Ok(Ok(cqe)) if exited(cqe.aux) => break,
+                    Ok(Ok(_)) => {}
+                    _ => return false,
                 }
                 if std::time::Instant::now() >= deadline {
-                    warn!(vm = %vm.name, "still running past its grace period; moving on");
-                    break;
+                    warn!(vm = %vm.name, "exit not confirmed after grace period; retaining cleanup state");
+                    return false;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             }
-            // Its pidfd and cgroup, which the engine holds until asked.
-            let _ = tokio::task::spawn_blocking(move || ring.workload_release(handle)).await;
         }
-        // The door closes with the machine. A registration that outlives its
-        // VM is a console door onto a socket nothing is bound to, which reads
-        // as "the guest is quiet" rather than "there is no guest" — so this
-        // matters as much as the write (rustkube-node#38).
+        // Do not forget a refused detach (including HTTP 409), or delete its
+        // volume while the engine still holds it. Every operation is retryable.
+        for disk in &vm.disks {
+            let Some(id) = &disk.volume_id else { continue };
+            let url = format!("{}/api/v1/volumes/{id}/attach", self.storage);
+            match self.engine.delete(&url).await {
+                Ok(r) if r.status().is_success() || r.status().as_u16() == 404 => {}
+                _ => return false,
+            }
+        }
+        for id in &vm.owned_volumes {
+            let url = format!("{}/api/v1/volumes/{id}", self.storage);
+            match self.engine.delete(&url).await {
+                Ok(r) if r.status().is_success() || r.status().as_u16() == 404 => {}
+                _ => return false,
+            }
+        }
+        if let Some(ring) = self.ring.clone().filter(|_| !vm.handle.is_none()) {
+            let handle = vm.handle;
+            if !matches!(tokio::task::spawn_blocking(move || ring.workload_release(handle)).await, Ok(Ok(_))) {
+                return false;
+            }
+        }
         deregister(&vm.namespace, &vm.name);
-        self.release(&vm.disks).await;
-        self.destroy_owned(vm).await;
         info!(vm = %vm.name, "vm stopped");
+        true
     }
 
     /// Clone or attach every disk. Failure gives back what it already took —
@@ -1549,21 +1573,16 @@ impl VmManager {
                     self.vms.lock().await.insert(vm.uid.clone(), vm);
                 }
                 (None, Some(_)) => {
-                    let mut done = vm;
-                    done.phase = Phase::Failed;
-                    done.exit_code = -1;
-                    done.message = "the machine was gone when the kubelet restarted".into();
-                    warn!(vm = %id, "{}", done.message);
-                    self.event_of(&done, "Warning", "Failed", &done.message).await;
-                    self.release(&done.disks).await;
-                    self.vms.lock().await.insert(done.uid.clone(), done.clone());
-                    self.patch_status(&done).await;
+                    warn!(vm = %id, "engine state unknown; retaining machine and disks");
+                    self.vms.lock().await.insert(vm.uid.clone(), vm);
                 }
                 (running, None) => {
                     if running == Some(true) {
                         warn!(vm = %id, uid = %vm.uid, "running with no VirtualMachineInstance; stopping it");
                     }
-                    self.stop(&vm).await;
+                    if !self.stop(&vm).await {
+                        self.vms.lock().await.insert(vm.uid.clone(), vm);
+                    }
                 }
             }
         }
@@ -2035,6 +2054,43 @@ fn assigned_to(obj: &Value, node: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unknown_vm_exit_retains_record_and_finalizer() {
+        let f = fake().await;
+        let m = manager_for(&f, false);
+        let mut obj = vmi("n1");
+        m.record_failure("u-1", &obj, "fixture").await;
+        {
+            let mut records = m.vms.lock().await;
+            let vm = records.get_mut("u-1").unwrap();
+            vm.phase = Phase::Running;
+            vm.handle = Handle(123);
+        }
+        obj["metadata"]["deletionTimestamp"] = json!("2026-09-29T00:00:00Z");
+        m.sync(&[obj]).await;
+        assert_eq!(m.running().await.len(), 1, "no engine is not proof of exit");
+    }
+
+    #[tokio::test]
+    async fn refused_detach_keeps_vm_cleanup_record() {
+        use axum::{routing::delete, http::StatusCode};
+        let app = axum::Router::new().route("/api/v1/volumes/disk/attach",
+            delete(|| async { StatusCode::CONFLICT }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), "")
+            .with_storage(crate::engine::EngineClient::new(&url, crate::engine::TokenSource::none()));
+        m.record_failure("u-1", &vmi("n1"), "fixture").await;
+        m.vms.lock().await.get_mut("u-1").unwrap().disks.push(ResolvedDisk {
+            name: "root".into(), device: "/dev/test".into(), volume_id: Some("disk".into()),
+            readonly: false, bus: Default::default(),
+        });
+        m.sync(&[]).await;
+        assert_eq!(m.running().await.len(), 1, "HTTP 409 must remain retryable");
+        server.abort();
+    }
 
     fn vmi(node: &str) -> Value {
         json!({
