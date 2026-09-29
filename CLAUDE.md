@@ -88,7 +88,8 @@ waits on the master installing the release (stormcos#164) = #102.
    A timed-out mint is found again by name (stormblock refuses duplicates).
 4. [x] sc-build db9b783: 269 kubelet unit, 4 integration, 25 CNI, 17 proxy,
    1 doc-test pass (1 ignored). Acceptance table in docs/event-driven-design.md.
-5. [ ] Real-node measurements = #102; proposed #99 after it. Resume there.
+5. [ ] Real-node measurements = #102; proposed #99 after it (moved behind #102).
+   Stage golden golden-rustkube-node-e8bca700a793 (bba7d54), release request stormcos#164.
 
 ### Done: #101, events and explicit deadlines instead of sync ticks
 

@@ -2,6 +2,7 @@
 
 ## 2026-09-29
 
+- **chore:** Stage golden golden-rustkube-node-e8bca700a793 at bba7d54 (#99), release request stormcos#164.
 - **fix:** Bound every runtime-side request (#99). The stormpump ring's 30 s
   deadline, previously declared and never applied, now runs from enqueue: a
   request past it is answered `Timeout`, and its late completion still frees
