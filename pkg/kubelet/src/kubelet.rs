@@ -95,6 +95,9 @@ pub struct Kubelet {
     /// without it simply does not list VMIs — it does not fail, and it does not
     /// pretend.
     vms: Option<Arc<crate::vm_manager::VmManager>>,
+    /// VirtualMachineSnapshots of the machines this node runs (#53). Present
+    /// exactly when `vms` is.
+    snapshots: Option<Arc<crate::vm_snapshot::Snapshots>>,
     migration: Arc<dyn MigrationService>,
     runtime: Arc<dyn RuntimeService>,
     api_client: reqwest::Client,
@@ -167,6 +170,7 @@ impl Kubelet {
             config,
             pod_manager,
             vms: None,
+            snapshots: None,
             migration,
             runtime,
             api_client,
@@ -202,6 +206,13 @@ impl Kubelet {
             .with_storage(self.config.engine.clone())
             .with_claims(self.pod_manager.clone()),
         ));
+        self.snapshots = Some(Arc::new(crate::vm_snapshot::Snapshots::new(
+            self.api_client.clone(),
+            &self.config.api_server_url,
+            &self.config.node_name,
+            crate::vm_manager::RUN_ROOT,
+            crate::vm_snapshot::stormvm_take(self.config.engine.url().to_string()),
+        )));
         self
     }
 
@@ -296,6 +307,7 @@ impl Kubelet {
                 api_client: self.api_client.clone(),
                 api_url: self.config.api_server_url.clone(),
                 anonymous: self.config.anonymous_auth,
+                stormblock_url: self.config.engine.url().to_string(),
             };
             let vms = self.vms.clone();
             tokio::spawn(async move { crate::server::serve(port, pm, vms, server_config).await });
@@ -383,8 +395,12 @@ impl Kubelet {
             });
         }
 
+        if let Some(vms) = &self.vms {
+            vms.spawn_address_pump();
+        }
+
         // One bounded executor for both kinds; producers never perform runtime I/O.
-        tokio::try_join!(self.pod_loop(), self.vm_loop(), async {
+        tokio::try_join!(self.pod_loop(), self.vm_loop(), self.vm_maintenance_loop(), async {
             self.workloads.run(self.clone(), 8).await;
             Ok::<(), anyhow::Error>(())
         })?;
@@ -427,6 +443,29 @@ impl Kubelet {
                     }
                 })
                 .await;
+            drop(work);
+        }
+    }
+
+    // Keep main's snapshot and owner-sweep services independent of UID work.
+    // Snapshot watches wake promptly; the deadline retains completion/recovery
+    // and disk-owner checks until #101 supplies all dependency events.
+    async fn vm_maintenance_loop(&self) -> anyhow::Result<()> {
+        let Some(vms) = &self.vms else { return std::future::pending().await; };
+        let worker = self.watches.worker("kubelet-vm-maintenance");
+        let mut deadline = time::interval(self.config.sync_interval.max(Duration::from_millis(100)));
+        loop {
+            let work = tokio::select! {
+                work = worker.next() => Some(work),
+                _ = deadline.tick() => None,
+            };
+            worker.run(async {
+                self.watches.observe(&self.api_client, format!(
+                    "{}/apis/snapshot.kubevirt.io/v1beta1/virtualmachinesnapshots",
+                    self.config.api_server_url));
+                if let Some(snapshots) = &self.snapshots { snapshots.sync().await; }
+                vms.sweep_orphans().await;
+            }).await;
             drop(work);
         }
     }
@@ -1357,6 +1396,37 @@ async fn mirror_node_services(client: &reqwest::Client, api_url: &str, node: &st
             });
             if let Some(r) = &events {
                 r.pod_event(&pod, etype, reason, &message).await;
+            }
+        }
+    }
+
+    // Mirrors of assets PID 1 did not list on this boot (#87): not running,
+    // said once, never deleted.
+    let list_url = format!(
+        "{api_url}/api/v1/namespaces/kube-system/pods?labelSelector=storm.io%2Fcomponent%3Dnode-service"
+    );
+    if let Ok(r) = client.get(&list_url).send().await {
+        if r.status().is_success() {
+            if let Ok(list) = r.json::<Value>().await {
+                for pod in crate::mirror::stale_mirrors(&list, node, &assets) {
+                    let name = pod["metadata"]["name"].as_str().unwrap_or("");
+                    let marked = crate::mirror::not_started(pod);
+                    let put = client
+                        .put(format!("{api_url}/api/v1/namespaces/kube-system/pods/{name}/status"))
+                        .json(&marked)
+                        .send()
+                        .await;
+                    match put {
+                        Ok(r) if r.status().is_success() => {
+                            let msg = marked["status"]["message"].as_str().unwrap_or("").to_string();
+                            if let Some(ev) = &events {
+                                ev.pod_event(&marked, "Warning", crate::mirror::NOT_STARTED, &msg).await;
+                            }
+                        }
+                        Ok(r) => debug!("mirror {name}: not-started status -> {}", r.status()),
+                        Err(e) => debug!("mirror {name}: not-started status: {e}"),
+                    }
+                }
             }
         }
     }

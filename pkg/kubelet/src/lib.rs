@@ -32,6 +32,7 @@ pub mod server;
 pub mod vm_manager;
 pub mod vm_migrate;
 pub mod vm_runtime;
+pub mod vm_snapshot;
 
 pub use checkpoint::CriuCheckpointer;
 pub use cri_client::{CriClient, detect_cri_socket};

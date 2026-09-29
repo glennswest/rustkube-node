@@ -5,9 +5,9 @@ issues rustkube#143–#147. Preserve the kubelet API, CRI, CSI, CNI, Pod/VMI
 status and static-pod bootstrap. Build on dev only, after 10:00 America/Chicago
 on 2026-09-29. No build or runtime-validation claims before that gate.
 
-## Findings
+## Findings before turbomode
 
-The main kubelet sync waits on sync_interval, lists all Pods, filters for the
+The pre-turbomode kubelet sync waited on sync_interval, lists all Pods, filters for the
 node, then serially reconciles VMs and Pods. A VMI watch already exists but
 only replaces desired state; a timer still gates execution. Reclaim and CSI
 cleanup run every 30 seconds, plugin discovery every two seconds. Runtime
@@ -215,3 +215,15 @@ or its shared client disconnects. A replacement cannot necessarily realise the
 same tap while that descriptor exists. VM partial-start cleanup and the complete
 side-effect cancellation test matrix therefore remain unfinished. The branch
 stays unmerged; CLAUDE.md records the resume checklist and build evidence.
+
+## Main integration (#114)
+
+The UID executor preserves main's VM tap address pump and access-credential
+reporting. A failed VMI LIST leaves desired state unchanged. Snapshot requests
+have an independent watch worker and completion/recovery deadline; the owner
+sweep retains its one-minute cadence. Starts share a read lock against the
+sweep's exclusive disk-lifecycle lock, preserving sweep/start exclusion while
+independent starts remain concurrent. VM stop checks every detach and runtime
+release but never deletes VM-owned disks; only the owner sweep decides that.
+Main's failed-start backoff and runStrategy policy also run through the UID
+adapter. Complete event sources and cancellation coverage remain #100/#101.

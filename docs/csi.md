@@ -2,8 +2,8 @@
 
 A claim of the built-in class, `stormblock`, never goes through CSI. The node
 clones, attaches and mounts it itself (`pkg/kubelet/src/storage.rs`), and its
-PV names `stormblock.storm.io` as its driver only so the volume behind it can
-be found. This document covers **every other StorageClass**: a claim whose PV
+PV records `stormblock.storm.io` as the built-in driver identity. This document
+covers **every other StorageClass**: a claim whose PV
 was made by another driver's external provisioner, an inline `csi:` volume,
 and a generic `ephemeral:` volume whose claim is of such a class (#52).
 
@@ -99,13 +99,11 @@ makes the bind. So:
 - **The kubelet** passes Bidirectional through only for a privileged
   container, as upstream does. For any other container it is Private, with
   a warning.
-- **stormpump** has to make that bind `rshared`, in the same peer group as a
-  shared `/var/lib/kubelet` in PID 1's namespace. **It cannot yet.** Every
-  container namespace is `MS_PRIVATE`, and `spec::Mount` has no propagation
-  field. This is **stormpump#35**. Until it lands, a driver's mounts stay
-  in the driver's namespace. The kubelet's mountinfo check (step 5 above)
-  then keeps pods on external claims waiting, with the reason, and never
-  lets them run on an empty directory.
+- **stormpump** has implemented per-mount propagation (stormpump#35), but
+  this checkout's pinned adapter does not copy `cri::Mount.propagation` into
+  `spec::Mount` yet (#81). Updating it is blocked on stormvm#65's compatibility
+  with the engine field. Thus propagation is not complete end to end here.
+  The mountinfo check keeps consumers waiting when the mount is not visible.
 - **The kubelet's own view** of `/var/lib/kubelet` (stormcos: `mount
   kubeletdir /var/lib/kubelet`) does not need to see the mounts. The kubelet
   never reads a published volume, it only creates directories and hands paths
@@ -119,7 +117,7 @@ does the mount, in whatever namespace it runs in.
 ## Not yet
 
 - End-to-end verification with a real driver (csi-driver-host-path): waits
-  on stormpump#35.
+  on #81 and stormvm#65, tracked in #52.
 - Generic ephemeral volumes: the kubelet resolves them to the claim
   `<pod>-<volume>` and waits for it. rustkube has no controller that creates
   that claim (rustkube#94).

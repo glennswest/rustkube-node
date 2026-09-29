@@ -769,7 +769,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1166,7 +1166,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tokio",
  "tower-service",
  "tracing",
@@ -1803,7 +1803,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2244,7 +2244,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2282,9 +2282,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2577,7 +2577,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2934,7 +2934,7 @@ source = "git+https://github.com/glennswest/stormpump?branch=main#30a76d3e51092b
 [[package]]
 name = "stormvm-block"
 version = "0.10.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#1b0d9412e96b3db225238bf0c43bd1b8d26983c5"
+source = "git+https://github.com/glennswest/stormvm?branch=main#dc1b7ea73df329c9765a311db6ae31e25822de0f"
 dependencies = [
  "serde",
  "serde_json",
@@ -2945,7 +2945,7 @@ dependencies = [
 [[package]]
 name = "stormvm-cloudinit"
 version = "0.10.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#1b0d9412e96b3db225238bf0c43bd1b8d26983c5"
+source = "git+https://github.com/glennswest/stormvm?branch=main#dc1b7ea73df329c9765a311db6ae31e25822de0f"
 dependencies = [
  "serde",
  "serde_json",
@@ -2956,7 +2956,7 @@ dependencies = [
 [[package]]
 name = "stormvm-console"
 version = "0.10.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#1b0d9412e96b3db225238bf0c43bd1b8d26983c5"
+source = "git+https://github.com/glennswest/stormvm?branch=main#dc1b7ea73df329c9765a311db6ae31e25822de0f"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
@@ -2974,7 +2974,7 @@ dependencies = [
 [[package]]
 name = "stormvm-control"
 version = "0.10.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#1b0d9412e96b3db225238bf0c43bd1b8d26983c5"
+source = "git+https://github.com/glennswest/stormvm?branch=main#dc1b7ea73df329c9765a311db6ae31e25822de0f"
 dependencies = [
  "serde",
  "serde_json",
@@ -2986,7 +2986,7 @@ dependencies = [
 [[package]]
 name = "stormvm-net"
 version = "0.10.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#1b0d9412e96b3db225238bf0c43bd1b8d26983c5"
+source = "git+https://github.com/glennswest/stormvm?branch=main#dc1b7ea73df329c9765a311db6ae31e25822de0f"
 dependencies = [
  "libc",
  "stormvm-spec",
@@ -2997,7 +2997,7 @@ dependencies = [
 [[package]]
 name = "stormvm-node"
 version = "0.10.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#1b0d9412e96b3db225238bf0c43bd1b8d26983c5"
+source = "git+https://github.com/glennswest/stormvm?branch=main#dc1b7ea73df329c9765a311db6ae31e25822de0f"
 dependencies = [
  "anyhow",
  "libc",
@@ -3017,7 +3017,7 @@ dependencies = [
 [[package]]
 name = "stormvm-ring"
 version = "0.10.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#1b0d9412e96b3db225238bf0c43bd1b8d26983c5"
+source = "git+https://github.com/glennswest/stormvm?branch=main#dc1b7ea73df329c9765a311db6ae31e25822de0f"
 dependencies = [
  "stormpump",
  "stormpump-abi",
@@ -3027,7 +3027,7 @@ dependencies = [
 [[package]]
 name = "stormvm-spec"
 version = "0.10.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#1b0d9412e96b3db225238bf0c43bd1b8d26983c5"
+source = "git+https://github.com/glennswest/stormvm?branch=main#dc1b7ea73df329c9765a311db6ae31e25822de0f"
 dependencies = [
  "serde",
  "serde_json",
@@ -3038,7 +3038,7 @@ dependencies = [
 [[package]]
 name = "stormvm-vmm"
 version = "0.10.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#1b0d9412e96b3db225238bf0c43bd1b8d26983c5"
+source = "git+https://github.com/glennswest/stormvm?branch=main#dc1b7ea73df329c9765a311db6ae31e25822de0f"
 dependencies = [
  "serde",
  "stormvm-cloudinit",
@@ -3117,7 +3117,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

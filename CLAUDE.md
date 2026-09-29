@@ -2,13 +2,28 @@
 
 The node half of rustkube: the kubelet (`pkg/kubelet`, `cmd/kubelet`), kube-proxy
 (`pkg/proxy`, `cmd/kube-proxy`) and the CNI helpers (`pkg/cni`). It ships as a
-golden (`scripts/build-golden.sh`), not a package. The cross-project rules are in
+stage golden through `stormcentral component stage rustkube-node`, not the
+legacy bin-only `scripts/build-golden.sh` or a package. The cross-project rules are in
 `../CLAUDE.md`; this file is the project's own context and work plan.
 
 ## Version
 
 `0.13.0`. There is one version location: `[workspace.package] version` in
 `Cargo.toml` (every crate uses `version.workspace = true`).
+
+## Current implementation reference (2026-09-29)
+
+Main baseline: 5bb1a38. See `docs/status.md` for changes since September 18
+and issue-backed limitations, `docs/configuration.md` for every CLI/env/default,
+and `docs/api.md` for ports and actual routes. CLI runtime defaults to native;
+stormcos explicitly chooses stormpump. Cilium owns Services; the packaged
+kube-proxy is not started. PVCs use the built-in stormblock driver and sealed
+size-class blanks over ublk, with CSI only for third-party drivers.
+
+Main has VMI adoption, persistent VM-owned disks, accessCredentials, tap address
+reporting and snapshot reconciliation; restore remains #53/#109. The #114 integration adds turbomode's UID workers. Historical work-plan entries below record
+what was true at each checkpoint; they are not current deployment guarantees.
+Owner decisions are tracked in #106–#110; do not infer answers from recommendations.
 
 ## Build and test
 
@@ -45,7 +60,8 @@ and #75 VM disk ownership in the UID worker design. Open #100/#101/#102
 work continues on main afterwards; no golden or release is requested here.
 
 1. [x] Read #114, #100, project rules and open issues; checkout is clean.
-2. [ ] Merge origin/main into turbomode; resolve and review semantic conflicts.
+2. [x] Merge origin/main into turbomode; preserve address pump, failed-list
+   protection, snapshot maintenance, durable disks, retry policy and credentials.
 3. [ ] Push and run full sc-build (cargo build --locked && cargo test --locked).
 4. [ ] Merge turbomode into main with --no-ff, push and repeat full sc-build.
 5. [ ] Record merge/test evidence and remaining work on #114, then close it.
@@ -53,9 +69,8 @@ work continues on main afterwards; no golden or release is requested here.
 
 ### Parked on stormpump#63: #100, common bounded per-UID Pod/VMI workers
 
-2026-09-29: master's decision on #100 authorizes continuing at turbomode 9b46886,
-without merging main yet. Baseline sc-build `cargo test --locked -p kubelet`
-already passed (211 tests). No main merge, golden or live deployment now.
+Earlier checkpoint: #100 continued at turbomode 9b46886 (211 tests passed).
+#114 now authorizes merging; unfinished cancellation work continues on main.
 
 1. [x] Wire Pod/VMI adapters to one eight-worker executor with name/claim
    reservations; seed adopted workloads before admission. Static manifests have
@@ -83,10 +98,39 @@ already passed (211 tests). No main merge, golden or live deployment now.
    Existing tests cover shared admission, slow-image/fast-start, staged init
    resume/delete, failed teardown, same-name replacement and dirty work during
    an active operation; they do not establish every-boundary cancellation yet.
-6. [ ] At the end of #100/#101 integrate main's #91 address pump, #35 failed-list
-   protection and #53 snapshots as executor events/adapters before merging main.
-   Live target remains the owner's decision under #102. No version/release while
-   this experimental branch remains incomplete.
+6. [x] Main's #91/#35/#53/#75 behavior is integrated under #114. Live target
+   remains the owner's decision under #102/#110. Version stays 0.13.0: this
+   merges unfinished work, without cutting a feature release or golden.
+
+
+### Done: documentation refresh from code (#54), 2026-09-29
+
+Scope: current main at 5bb1a38 and `git log --since=2026-09-18`.
+Work on docs/code-refresh-20260929; preserve turbomode separately, with no merge
+or golden from that experimental branch.
+
+1. [x] Audit README, docs and current configuration/API/runtime code; distinguish
+   implementation from plans and live acceptance.
+2. [x] Correct shipping instructions, add complete CLI/default/port references,
+   and link every unsupported promise to its owning issue (file missing ones).
+3. [x] Update CHANGELOG; review for secrets; commit and push the documentation.
+   New P2 follow-ups: #111 restartable init sidecars, #112 backoff persistence,
+   #113 explicit default-valued apiserver precedence. Existing gaps are linked
+   in docs/status.md; #3 now records the no-cni help/behavior mismatch.
+4. [x] ad43ee9 passed remote sc-build `cargo build --locked && cargo test --locked`:
+   227 kubelet unit tests, four integration tests and the CNI/proxy suites passed;
+   one doc-test ignored. Remote exit 0 in 74 seconds; scratch drive deleted.
+   The local runs.jsonl append failed (read-only filesystem); remote verification
+   completed. All 26 CLI flags, 11 routes and local doc links were checked.
+5. [x] Documentation only: no version bump or runtime change. Fast-forwarded
+   onto main at 9c1fe94; turbomode preserved. Requested the standard stage once.
+6. [ ] Artifact follow-up only: stage 131edf1ad026 failed before compilation
+   fetching private stormcos be718e09b5f2 (GitHub username unavailable).
+   Added evidence to stormcentral#161 and proposed #54 after it (proposal
+   663d4471d6a0 awaits approval). No golden or
+   release request was produced. Documentation itself is published and verified;
+   resume the stage request after the platform authentication fix.
+
 
 
 ### Done: #35, VMs reconciled against VMIs: deletion stops them, orphans found
@@ -111,6 +155,140 @@ Steps:
        x86_64-unknown-linux-musl`, then `cargo test --locked`): passed (kubelet 189). Stage golden
        golden-rustkube-node-d9a108728be0 (at ccb7bfc; the first stage try died on dev: no NVMe device). No
        release request was filed by stage: stormcentral#117. #35 closed (sc-build only, not on a node).
+
+### Done: #75, a VM's disks outlive its VMI: restart does not re-clone
+
+Found, 2026-09-29: `stop` → `destroy_owned` deleted every golden clone, seed and emptyDisk, and the golden clone was
+unconditional, so each VirtualMachine restart (a new VMI) re-cloned root. stormblock#115 (closed) gives a volume an
+`owner {kind, namespace, name, uid}`, set on create/clone or `PUT /volumes/{id}/owner`, returned by the listing.
+The VMI's ownerReferences carry its VirtualMachine's uid (rustkube virtualmachine.rs).
+
+Steps:
+1. [x] Find before create: a golden disk or emptyDisk named `volume_name(vm, disk)` is reused, cloned/created only
+       when missing (a failed listing is a failed start, never "make a new one"). Owner on each: the VMI's
+       VirtualMachine (kind, ns, name, uid), else the VMI itself. A found disk owned by an earlier object of the
+       same name (other uid) waits for the sweep. Seed: namespaced name, the old one replaced each start.
+2. [x] Stop detaches only. `destroy_owned` gone.
+3. [x] Orphan sweep (≤ once a minute): engine volumes owned by a VirtualMachine/VMI, not in use and not held by a
+       machine here, whose owner is 404 / another uid / being deleted → deleted. Any other answer keeps them.
+4. [x] `storm.io/retain-disks: "true"` (VMI or VM annotation): disks get no owner, never swept. Owners set on the
+       disks of adopted machines too.
+5. [x] Tests, docs (README), CHANGELOG. sc-build at 9149ea1: all pass (kubelet 227). Not run on a node
+       (C2NR0Q2). Unreleased. Closed.
+
+### Historical checkpoint: #100 before #114 superseded the merge hold
+
+At this checkpoint work was on `turbomode`; #114 supersedes that hold. Read rustkube's `docs/turbomode-handoff.md` (turbomode branch).
+2026-09-29: handoff step 2 done, `sc-build 'cargo test --locked -p kubelet'` at turbomode 9b46886: 211 pass.
+Merging origin/main conflicts in `kubelet.rs` (turbomode's `pod_loop`/`vm_loop` vs main's #91 address pump,
+#35 `watch_for_node`/`list_for_node`, #53 `snapshots.sync()`): aborted, owner asked on #100 (resolve, or leave).
+
+### Blocked on #109: #53, VirtualMachineSnapshot / VirtualMachineRestore
+
+2026-09-29 recheck: read #53 and #109, including comments. Snapshot support is
+already on main; #109 remains unanswered and labeled needs-owner. Stop restore
+implementation until the owner chooses disk references and node placement.
+Propose #53 after #109; then resume step 3 below, update docs/tests, push and
+verify with sc-build before completion. This recheck changes documentation only;
+no new build, live validation, release or issue closure is claimed.
+
+stormvm (in the dc1b7ea lock): `stormvm_spec::snapshot::{snapshot_request, restore_request, snapshot_status,
+restore_status}`, `stormvm_console::snapshot::take(reg, stormblock, name, Options)` (freeze → pause → one /v1
+group snapshot, named `<ns>.<vm>.<snap>`, idempotent by name → unpause → thaw). stormblock#130 is closed.
+The CRDs are stormcos#170 (open): until they are installed the LIST 404s and the kubelet does nothing.
+Found: stormblock on stormcos is single-node (no cluster), so a group snapshot and any volume restored from it
+live only in the engine of the node that took it. The VMI shape has no raw-volume disk (only dataVolume,
+containerDisk → golden, PVC, cloudInit, emptyDisk), so "rewire the disks" needs a decision: owner.
+
+Steps:
+1. [x] `vm_snapshot.rs`, each tick after the VMIs: list snapshots (404 → CRD absent, nothing). One whose source
+       is registered here (`/run/stormvm/<ns>/<vm>`) and has no phase: claim it (annotation
+       `storm.io/snapshot-node`, rv-guarded), InProgress, `take` in the background, then Succeeded/Failed +
+       group id, sourceUID, indications, Event. failureDeadline (default 5 min) from creationTimestamp. An
+       InProgress one of ours not in flight (kubelet restart) is taken again: idempotent by name.
+2. [x] Tests (fake apiserver, injected take), docs (README), CHANGELOG. sc-build at 2b88465: all pass (kubelet 221).
+       Not run on a node (CRDs: stormcos#170; needs a running VM). Unreleased.
+3. [ ] Restore: **owner decision**, tracked on #109 (extracted from #53, 2026-09-29). A = restored volumes as PV + PVC, the kubelet
+       patches the VM template's volume to the claim + node affinity (recommended); B = annotation
+       `storm.io/restored-disks` copied by rustkube's VM controller to the VMI. Resume from the answer.
+
+### Done: #83, the console router is told where stormblock is (the snapshot verb)
+
+stormvm's `Config.stormblock` was left `None` in both mounts of `stormvm_console::router`, so its `snapshot`
+verb answered 409 on every node. stormvm_block::Client reads the engine token itself (`Token::from_env`, same
+order as engine.rs). The verbs are not routed onto :10250 yet: that is #94 (snapshot may now go with them).
+
+Steps:
+1. [x] `server.rs`: one `console(run_dir, stormblock)` builder; `ServerConfig.stormblock_url` from the kubelet's
+       engine URL (`--stormblock`); `router()` (tests) uses `engine::DEFAULT_URL`. Test: snapshot gets past the
+       409 to the hypervisor.
+2. [x] Docs (README), CHANGELOG. sc-build at 09cc138: all pass (kubelet 211). Closed. Not run on a node. Unreleased.
+
+### Done: #76, a failed VM start is retried with backoff, not recorded Failed for good
+
+Owner: "Nothing should be perm." rustkube#104 (v0.16.0) makes the VM controller recreate a *Failed* VMI under
+Always / RerunOnFailure / running:true and leave it under Once / Manual.
+
+Found, 2026-09-28: every start clones a new root from its golden and makes a new seed, and a failed start
+only detaches (`release`), so each retry would leak two volumes.
+
+Steps:
+1. [x] A failed start deletes the volumes it created in that attempt (golden clones, seeds; never a reused
+       emptyDisk), in `resolve_disks` and after it.
+2. [x] `StartFail::Failed`: retry with backoff 10 s doubling to 5 min, keyed on uid + generation (a spec change
+       retries at once). Pending with the reason + attempt + next try, Warning Event each attempt.
+       Failed for good only when the owning VM's runStrategy is Once or Manual. Standalone VMI: retried.
+3. [x] Tests, docs (README), CHANGELOG. sc-build at 20036bf: all pass (kubelet 210). Not run on a node. Unreleased.
+
+### In progress: #92, a VMI's accessCredentials (keys into the seed and through the agent)
+
+stormvm e5b4d16 (in the dc1b7ea lock): `VmSpec.access_credentials`, `access::keys_in_secret`, `Seed.public_keys`,
+`qga::set_authorized_keys` (reset: true), `access::condition`.
+
+Steps:
+1. [x] Start: `noCloud` Secrets read before the disks, keys into the seed's meta-data `public-keys`. A missing
+       Secret, an empty one, or no cloudInitNoCloud volume: start anyway, reason in the condition.
+2. [x] Each sync, from the VMI as it is now: agent credentials applied once the agent answers, re-sent only
+       when the Secret's keys differ from what the agent last accepted. A missing/empty Secret leaves the
+       guest's keys alone (no lock-out). `Vm.access` holds it.
+3. [x] `AccessCredentialsSynchronized` merged into the VMI's existing conditions; transition time held while
+       the status holds.
+4. [x] Tests, docs (README), CHANGELOG. sc-build at 1f5409a: build clean, all pass (kubelet 207).
+5. [ ] The issue's done-when on the test host: console-created VM, ssh in with the key; "Add my keys" live.
+       Waits on C2NR0Q2 (unreachable) and a release. Then close.
+
+### In progress: #91, a bridged VM's IP from its tap (stormvm_net::snoop_tap)
+
+stormvm 2be5900 (lock moves 1b0d941 → dc1b7ea, `cargo update -p stormvm-net` on dev with
+`CARGO_NET_GIT_FETCH_WITH_CLI=true`; the lock diff applied here). `snoop_tap(tap, mac, changed)` → `Snooper`
+(`addresses()`, drop joins its thread, ≤1 s RCVTIMEO). `Made.binding == "host-bridge"` marks a tap on a node bridge.
+
+Steps:
+1. [x] Lock bump; `resolve_nics` takes the uid and starts a snooper per host-bridge NIC before the spawn (a failure
+       to open it is a warning, not a failed start); `start` keeps them, into `snoopers[uid]` once running.
+2. [x] Callback → unbounded channel → pump task (spawned in `run`): that NIC's addresses + `patch_status` at once.
+3. [x] `absorb_ends`: snooper per NIC first, then guest agent, then neighbour table. Snoopers dropped (in
+       spawn_blocking) when the VM stops or ends.
+4. [x] Tests, docs (README), CHANGELOG. sc-build at 3ad9ea8: build clean, all pass (kubelet 205).
+       The bump had also moved stormpump (30a76d3 → e8ccef9) and stormcast; pinned back with `--precise`, because
+       stormvm-node doesn't build against stormpump's `Mount.propagation` (filed stormvm#65, which also blocks #81).
+5. [ ] On the test host (the issue's done-when): a new bridged VM shows its lease in `status.interfaces[].ipAddress`
+       within seconds. Waits on C2NR0Q2 (unreachable) and a release. Then close.
+
+### In progress: #87, static (mirror) pods: logs and stale status
+
+Logs: stormd services answered by #72. registry/stormblock/timesync wait on stormpump#55 (assets.json names no log).
+Stale status, found 2026-09-28: stormpump lists every asset it tried to start (refused ones too, with
+last_error), but one not started on this boot is not in the table, and the mirror writes only pods for listed
+assets, so its pod keeps the last boot's Running and startTime (registry, stormstorage on C2NR0Q2 at 17:32).
+
+Steps:
+1. [x] Each pass: list this node's mirror pods (`storm.io/component=node-service`, spec.nodeName); one whose asset
+       is not in the table gets status "not started on this boot" (phase Pending, waiting NotStarted, not
+       Ready), written once (skipped when already so), with a Warning Event. Never deleted.
+2. [x] Tests, docs (README), CHANGELOG. sc-build at 7f4f3d1: all pass (kubelet 203). Not run on a node.
+3. [ ] registry/stormblock/timesync logs: after stormpump#55 names each asset's `w<id>.log`, serve it (and the
+       previous incarnation's for `--previous`) from `/hostrun/stormpump/logs`. Then close #87.
 
 ### Done: #72, `kubectl logs` on a node service's mirror pod reads its stormd log volume
 
@@ -294,7 +472,15 @@ Steps:
 4. [x] `sc-build 'cargo build --release --locked --target x86_64-unknown-linux-musl'`, then `cargo test --locked`: passed at 6741e93.
 5. [x] Close #58, request the golden.
 
-### Parked on stormpump#35 (P1): #52, external StorageClasses (the CSI node side)
+### Parked on stormvm#65: #52, external StorageClasses (the CSI node side)
+
+2026-09-29: stormpump#35's engine side is on stormpump main (a06ce4c..), and `/` is rshared on C2NR0Q2 (11.51).
+What is left here is step 6 = #81 (`Mount.propagation` into `spec_for`), which needs stormpump ≥ a06ce4c in the
+lock. The lock has one stormpump, shared with stormvm-node, and stormvm main (cf343c7) still builds
+`stormpump::spec::Mount` without `propagation` (plan.rs:347): stormvm#65, open. Proposed #52 and #81 after it.
+Then: bump stormpump, map propagation (#81), end to end with csi-driver-host-path on a node (step 9).
+
+(Was: parked on stormpump#35 (P1).)
 
 Findings, 2026-09-24:
 - `csi.rs` was a stub. It logged calls and created directories, and it never

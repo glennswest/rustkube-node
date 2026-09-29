@@ -1,8 +1,9 @@
 # Kubelet metrics
 
 The kubelet serves two Prometheus endpoints on `:10250`, both behind its
-bearer-token auth, under the names upstream Kubernetes uses. A dashboard or
-alert written for an upstream kubelet works here unchanged. The control-plane
+bearer-token auth, under the names upstream Kubernetes uses. Only the families
+and semantics below are implemented; upstream dashboard compatibility is
+incomplete (#21). The control-plane
 half is rustkube's [`docs/metrics.md`](https://github.com/glennswest/rustkube/blob/main/docs/metrics.md).
 
 Code: `pkg/kubelet/src/metrics.rs`, and the handlers in `server.rs`.
@@ -51,3 +52,11 @@ still declared (HELP and TYPE), so a scraper can see the name exists.
 `kube_pod_container_status_restarts_total` belongs to kube-state-metrics and
 is derived from `status.containerStatuses[].restartCount`. A second count kept
 here would drift from the object, and the object is the one that is right.
+
+## Summary and node limits
+
+`/stats/summary` reports container CPU/memory and sums those values for the
+node CPU/memory fields; those sums exclude unreported host work. Node filesystem
+usage comes from statfs. Machine/PSI/imagefs-aware eviction integration is still
+#21. The runtime container ID in `id` is not a cgroup path (#84).
+These endpoints do not establish full metrics-server/HPA conformance.

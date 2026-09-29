@@ -64,7 +64,22 @@ impl EventRecorder {
     /// that outlives a recreated pod of the same name must not attach itself
     /// to the new one.
     pub async fn pod_event(&self, pod: &Value, etype: &str, reason: &str, message: &str) {
-        let meta = &pod["metadata"];
+        self.object_event("v1", "Pod", pod, etype, reason, message).await;
+    }
+
+    /// Record an event about any namespaced object, named by its apiVersion
+    /// and kind — a `VirtualMachineSnapshot`, say, so `kubectl describe` on it
+    /// shows what happened to it (#53).
+    pub async fn object_event(
+        &self,
+        api_version: &str,
+        kind: &str,
+        obj: &Value,
+        etype: &str,
+        reason: &str,
+        message: &str,
+    ) {
+        let meta = &obj["metadata"];
         let namespace = meta["namespace"].as_str().unwrap_or("default");
         let name = meta["name"].as_str().unwrap_or("");
         let uid = meta["uid"].as_str().unwrap_or("");
@@ -81,7 +96,7 @@ impl EventRecorder {
         // returning twenty-five of them and `oc get events` listed them fine.
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let now_micro = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
-        let key = format!("{namespace}/{name}/{uid}/{etype}/{reason}/{message}");
+        let key = format!("{kind}/{namespace}/{name}/{uid}/{etype}/{reason}/{message}");
 
         let mut seen = self.seen.lock().await;
         if let Some(prev) = seen.get_mut(&key) {
@@ -128,8 +143,8 @@ impl EventRecorder {
             "kind": "Event",
             "metadata": { "name": event_name, "namespace": namespace },
             "involvedObject": {
-                "apiVersion": "v1",
-                "kind": "Pod",
+                "apiVersion": api_version,
+                "kind": kind,
                 "namespace": namespace,
                 "name": name,
                 "uid": uid,

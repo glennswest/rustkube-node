@@ -2,6 +2,12 @@
 
 ## 2026-09-29
 
+- **feat:** Integrate main into turbomode (#114), preserving tap addresses,
+  snapshots, failed-list safety, durable VM disks, startup retry policy and
+  access credentials within UID reconciliation. Add adapter regression coverage.
+- **docs:** Refresh current architecture and merge status; unfinished #100–#102
+  work continues on main without a release or golden.
+
 - **docs:** Record the owner-authorized #114 merge plan and two-branch workspace validation.
 
 - **docs:** Reconcile the worker design with implemented adapters and record
@@ -60,7 +66,101 @@
 
 
 ## [Unreleased]
+
+### 2026-09-29
+- **docs:** Recheck #53 and record the unanswered restore decision on #109 as
+  its work-plan blocker; preserve existing snapshot verification separately.
+- **docs:** Refresh README, build/storage/metrics references and planning docs
+  against main 5bb1a38 and history since September 18 (#54). Add complete
+  CLI/environment defaults, ports/routes, shipping workflow and an issue-linked
+  capability audit; preserve the built-in stormblock PVC description. Separate
+  experimental turbomode and unverified live acceptance from main behavior.
+- **docs:** Record passing remote build/tests at ad43ee9 and the CLI/route/link audit;
+  stage-golden follow-up is blocked by platform fetch authentication (stormcentral#161),
+  with the scheduling dependency proposed and awaiting approval.
+- **docs:** Track uncovered sidecar/backoff/endpoint-precedence gaps as
+  #111/#112/#113; correct no-cni and legacy builder documentation without changing code.
+
 <!-- New unreleased changes go here -->
+
+### 2026-09-29 (a VM's disks outlive its VMI, #75)
+- **fix(kubelet):** a VM stop deleted every disk the machine had made, and a
+  golden was cloned on every start, so each VirtualMachine restart brought
+  the guest back as a fresh image.
+  - A golden clone or emptyDisk is found by name (`<ns>.<vmi>-<disk>`) and
+    reattached. It is cloned or created only when missing, and a failed
+    listing is a failed start.
+  - A stop only detaches.
+  - Each disk gets a stormblock owner: the VMI's VirtualMachine, or the VMI
+    itself without one. A sweep, at most once a minute, deletes disks whose
+    owner is gone for good (404, another uid, being deleted), never on an
+    unanswered GET.
+  - A disk left by an earlier VM of the same name is not reused: the start
+    waits for the sweep.
+  - `storm.io/retain-disks: "true"` keeps a machine's disks unowned, so they
+    are never swept.
+  - The seed is namespaced and replaced each start.
+- **feat(kubelet):** `EngineClient::put`.
+
+### 2026-09-29 (VirtualMachineSnapshot, #53)
+- **feat(kubelet):** a `VirtualMachineSnapshot` of a VM this node runs is
+  taken.
+  - The node marks it `storm.io/snapshot-node` (rv-guarded) and sets it
+    `InProgress`.
+  - stormvm freezes, pauses, takes one stormblock group snapshot of every
+    volume, then unpauses and thaws.
+  - The object gets `Succeeded`/`Failed`, the group id as
+    `virtualMachineSnapshotContentName`, `sourceUID`, `indications` and an
+    Event. `failureDeadline` is honoured.
+  - A take interrupted by a restart is taken again (idempotent by name).
+  - Nothing happens until the CRDs are installed (stormcos#170).
+  - `VirtualMachineRestore` waits on an owner decision (#53).
+- **feat(kubelet):** Events can name any kind of object, not only a Pod.
+
+### 2026-09-29 (the console router knows where stormblock is, #83)
+- **fix(kubelet):** stormvm's console router was mounted without
+  `Config.stormblock`, so its `snapshot` verb answered 409 "this service was
+  not told where stormblock is" on every node. Both mounts now pass the
+  kubelet's engine URL (`--stormblock`). The verbs are not yet routed onto
+  `:10250` (#94).
+
+### 2026-09-28 (a failed VM start is retried, #76)
+- **fix(kubelet):** a VM start that failed was recorded Failed and never tried
+  again, so a moment of stormblock being down left the machine dead until it
+  was recreated.
+  - It is now retried with backoff (10 s doubling to 5 min, and at once on a
+    spec change), Pending with the reason and a Warning Event each attempt.
+  - It is Failed only when the VirtualMachine's `runStrategy` is `Once` or
+    `Manual`.
+- **fix(kubelet):** a failed start deletes the golden clone and seed it made.
+  It used to only detach them, which would leave two volumes behind per retry.
+
+### 2026-09-28 (accessCredentials, #92)
+- **feat(kubelet):** a VMI's `spec.accessCredentials` is honoured.
+  - `noCloud` / `configDrive` keys are read from their Secrets into the
+    seed's `public-keys` at start.
+  - `qemuGuestAgent` keys are set through the agent once it answers, and again
+    whenever the Secret changes, without a reboot.
+  - `AccessCredentialsSynchronized` is reported in `status.conditions`, merged
+    with any others.
+
+### 2026-09-28 (a bridged VM's address from its tap, #91)
+- **feat(kubelet):** a VM NIC on a node bridge is watched on its tap from
+  before the spawn (stormvm-net `snoop_tap`, stormvm 2be5900). The address the
+  guest leases from the segment's DHCP server reaches
+  `status.interfaces[].ipAddress` as soon as it is seen. The tap watcher is
+  preferred over the guest agent, and the agent over the neighbour table. A
+  guest with no agent that the node had never talked to used to report no
+  address at all.
+- **chore(deps):** stormvm crates 1b0d941 → dc1b7ea. stormpump stays at 30a76d3:
+  stormvm-node still builds `stormpump::spec::Mount` without `propagation`.
+
+### 2026-09-28 (stale mirror pods, #87)
+- **fix(kubelet):** a node service that PID 1 did not start on this boot kept
+  its mirror pod's status from the previous boot (Running, the old
+  `startTime`), because the mirror only wrote assets in the table. Such a
+  mirror is now marked Pending, with its container waiting `NotStarted` and a
+  Warning Event. It is written once and never deleted.
 
 ### 2026-09-28 (node service logs, #72)
 - **feat(kubelet):** `kubectl logs -n kube-system <asset>-<node>` reads the

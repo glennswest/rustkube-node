@@ -63,6 +63,85 @@ fn exited(aux: u32) -> bool {
     aux & 0xff == 2
 }
 
+/// `"true"` on a VMI or its VirtualMachine: its disks get no owner, so the
+/// orphan sweep never deletes them — they outlive even the VM (#75).
+pub const RETAIN_ANNOTATION: &str = "storm.io/retain-disks";
+
+/// How often, at most, the orphan sweep asks the engine and the apiserver.
+const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Who a machine's disks belong to, as stormblock records it
+/// (`owner {kind, namespace, name, uid}`, stormblock#115).
+///
+/// **The VirtualMachine, not the VMI** (#75): a restart deletes the VMI and
+/// makes a new one, and the disks are the VM's to keep across that. A VMI with
+/// no VirtualMachine owns its own. `Null` when either carries
+/// [`RETAIN_ANNOTATION`]: nothing owns them, so nothing deletes them.
+fn disk_owner(vmi: &Value, vm: Option<&Value>) -> Value {
+    let retained = |o: &Value| o["metadata"]["annotations"][RETAIN_ANNOTATION].as_str() == Some("true");
+    if retained(vmi) || vm.is_some_and(retained) {
+        return Value::Null;
+    }
+    let ns = vmi["metadata"]["namespace"].as_str().unwrap_or("default");
+    let by_vm = vmi["metadata"]["ownerReferences"]
+        .as_array()
+        .and_then(|refs| refs.iter().find(|o| o["kind"] == "VirtualMachine"));
+    match by_vm {
+        Some(r) => json!({
+            "kind": "VirtualMachine",
+            "namespace": ns,
+            "name": r["name"].as_str().unwrap_or(""),
+            "uid": r["uid"].as_str().unwrap_or(""),
+        }),
+        None => json!({
+            "kind": "VirtualMachineInstance",
+            "namespace": ns,
+            "name": vmi["metadata"]["name"].as_str().unwrap_or(""),
+            "uid": vmi["metadata"]["uid"].as_str().unwrap_or(""),
+        }),
+    }
+}
+
+/// Is this volume, found under the name a disk would have, left by an
+/// earlier object of the same name? A VM deleted and made again under one
+/// name is a new machine, and must not boot the old one's root.
+fn left_by_another(found: &Value, owner: &Value) -> bool {
+    let theirs = found["owner"]["uid"].as_str().unwrap_or("");
+    let ours = owner["uid"].as_str().unwrap_or("");
+    !theirs.is_empty() && !ours.is_empty() && theirs != ours
+}
+
+/// The apiserver path of a disk owner, for the sweep. `None` for an owner
+/// this kubelet did not write.
+fn owner_path(owner: &Value) -> Option<String> {
+    let plural = match owner["kind"].as_str()? {
+        "VirtualMachine" => "virtualmachines",
+        "VirtualMachineInstance" => "virtualmachineinstances",
+        _ => return None,
+    };
+    let ns = owner["namespace"].as_str().filter(|n| !n.is_empty())?;
+    let name = owner["name"].as_str().filter(|n| !n.is_empty())?;
+    Some(format!("/apis/kubevirt.io/v1/namespaces/{ns}/{plural}/{name}"))
+}
+
+/// Has a disk's owner gone for good, from the apiserver's answer to a GET of
+/// it? Only a 404, another uid (a new object under the old name) or a
+/// deletionTimestamp say so. Anything else — a 5xx, a 403, no answer — keeps
+/// the disk: deleting on "could not ask" is how data goes.
+fn owner_gone(status: u16, obj: Option<&Value>, owner: &Value) -> bool {
+    match status {
+        404 => true,
+        200..=299 => {
+            let Some(obj) = obj else { return false };
+            let uid = owner["uid"].as_str().unwrap_or("");
+            let now = obj["metadata"]["uid"].as_str().unwrap_or("");
+            (!uid.is_empty() && !now.is_empty() && uid != now)
+                || !obj["metadata"]["deletionTimestamp"].is_null()
+        }
+        _ => false,
+    }
+}
+
 /// Is this VMI being deleted?
 fn terminating(obj: &Value) -> bool {
     !obj["metadata"]["deletionTimestamp"].is_null()
@@ -123,6 +202,9 @@ fn vm_of(reg: &stormvm_node::console::Registration) -> Vm {
         ready_unix: None,
         owned_volumes: reg.disks.iter().filter(|d| d.owned).filter_map(|d| d.volume_id.clone()).collect(),
         nics: Vec::new(),
+        // Whatever reached its seed was decided by the kubelet that started
+        // it; the agent's keys are applied again from the Secret.
+        access: Access::default(),
     }
 }
 
@@ -201,6 +283,76 @@ pub struct Vm {
     /// nothing else. A console could not show what network a guest was on,
     /// and neither could anyone debugging why it could not be reached.
     pub nics: Vec<NicReport>,
+    /// How its SSH keys (`spec.accessCredentials`) have fared (#92).
+    pub access: Access,
+}
+
+/// What became of a machine's `accessCredentials` (#92), for the
+/// `AccessCredentialsSynchronized` condition and for applying agent keys again
+/// only when a Secret changes.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Access {
+    /// Why the boot-time (`noCloud`) keys did not all reach the seed. Empty
+    /// when they did, or there were none.
+    pub boot: Vec<String>,
+    /// Per (Secret, user), the keys the guest agent last accepted.
+    pub applied: Vec<(String, String, Vec<String>)>,
+    /// Why the agent's keys did not all arrive, as of the last try. `None`:
+    /// the agent has not answered yet.
+    pub agent: Option<Vec<String>>,
+    /// The condition as last reported.
+    pub condition: Option<Value>,
+}
+
+/// Whether every set of keys arrived, or everything that did not. `None` for
+/// a machine that asked for none.
+fn access_outcome(
+    creds: &[stormvm_spec::access::AccessCredential],
+    access: &Access,
+) -> Option<Result<(), String>> {
+    if creds.is_empty() {
+        return None;
+    }
+    let mut problems = access.boot.clone();
+    if creds.iter().any(|c| !c.at_boot()) {
+        match &access.agent {
+            None => problems.push("waiting for the guest agent to answer".to_string()),
+            Some(p) => problems.extend(p.iter().cloned()),
+        }
+    }
+    Some(if problems.is_empty() { Ok(()) } else { Err(problems.join("; ")) })
+}
+
+/// The condition for `outcome`, keeping `prev`'s `lastTransitionTime` when the
+/// status has not changed: the time is when it became true or false, not
+/// when it was last looked at.
+fn access_condition(prev: Option<&Value>, outcome: &Result<(), String>, now: &str) -> Value {
+    let mut c = stormvm_spec::access::condition(outcome, now);
+    if let Some(p) = prev.filter(|p| p["status"] == c["status"]) {
+        c["lastTransitionTime"] = p["lastTransitionTime"].clone();
+    }
+    c
+}
+
+/// `existing` conditions with the access one replaced (or added). A merge
+/// patch replaces a list whole, so the others are carried over rather than
+/// lost.
+fn with_condition(existing: &Value, cond: &Value) -> Value {
+    let mut out: Vec<Value> = existing
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|c| c["type"] != stormvm_spec::access::CONDITION)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    out.push(cond.clone());
+    Value::Array(out)
+}
+
+fn now_rfc3339() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 fn now_unix() -> u64 {
@@ -338,7 +490,8 @@ pub enum StartFail {
     /// Something is missing that is expected to arrive. The machine stays
     /// Pending and the next sync tries again.
     Waiting(String),
-    /// It will not work. The machine is Failed and nothing retries it.
+    /// It did not work. Retried with backoff, Pending with the reason, unless
+    /// the VM's run strategy (`Once`, `Manual`) says to give up (#76).
     Failed(String),
 }
 
@@ -351,9 +504,8 @@ impl StartFail {
 }
 
 impl From<String> for StartFail {
-    /// Everything that has not been classified is a failure, which is the
-    /// safe direction: a real fault retried for ever is a machine that never
-    /// reports what is wrong with it.
+    /// Everything that has not been classified is a failure: retried with
+    /// backoff and reported each time, so a real fault is never silent.
     fn from(s: String) -> Self {
         StartFail::Failed(s)
     }
@@ -439,6 +591,7 @@ pub struct VmManager {
     /// partition, where one maintained by events is correct only if every
     /// event landed.
     desired: Mutex<HashMap<String, Value>>,
+    disk_lifecycle: tokio::sync::RwLock<()>,
     /// What the watch last saw, when there is one.
     ///
     /// The watch maintains this and the reconcile loop reads it, so the two
@@ -452,6 +605,91 @@ pub struct VmManager {
     /// are different answers and only one of them is safe to act on: a guest
     /// told the second at boot configures itself as nobody.
     synced: std::sync::atomic::AtomicBool,
+    /// What each running machine's bridged taps have shown the guest take
+    /// (#91), by uid: the NIC's index and its watcher. A guest on a node
+    /// bridge gets its address from a DHCP server the node does not run, and
+    /// the tap is the one place the node sees the lease go by. Not in [`Vm`],
+    /// which is cloned freely and a watcher is not.
+    snoopers: std::sync::Mutex<HashMap<String, Vec<(usize, stormvm_net::Snooper)>>>,
+    /// Where the watchers report a change, for [`Self::spawn_address_pump`]
+    /// to write it to the VMI at once rather than on the next sync.
+    snoop_tx: tokio::sync::mpsc::UnboundedSender<Snooped>,
+    snoop_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Snooped>>>,
+    /// Failed starts waiting to be tried again, by uid (#76).
+    retries: std::sync::Mutex<HashMap<String, Retry>>,
+    /// When the orphan sweep last ran (#75).
+    swept: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+/// A failed start waiting for its next try (#76).
+#[derive(Debug, Clone, PartialEq)]
+struct Retry {
+    /// The spec it failed with: a new one is tried at once.
+    generation: i64,
+    attempts: u32,
+    next: std::time::Instant,
+}
+
+/// The wait before the next try after `attempts` failures: 10 s, doubling,
+/// at most 5 min.
+fn retry_delay(attempts: u32) -> std::time::Duration {
+    let secs = 10u64.saturating_mul(1u64 << attempts.saturating_sub(1).min(16));
+    std::time::Duration::from_secs(secs.min(300))
+}
+
+/// Does the machine behind this VMI want a failed start given up on?
+///
+/// Only its VirtualMachine's run strategy says so: `Once` runs once, and
+/// `Manual` restarts only when asked. Anything else (`Always`,
+/// `RerunOnFailure`, `running: true`), and a VMI with no VirtualMachine, is
+/// retried: "Nothing should be perm." (#76). The VM is `None` when there is
+/// none or it could not be read, and that retries too.
+fn gives_up(vm: Option<&Value>) -> bool {
+    let Some(vm) = vm else { return false };
+    matches!(vm["spec"]["runStrategy"].as_str(), Some("Once") | Some("Manual"))
+}
+
+/// The VirtualMachine that owns this VMI, by name, if any.
+fn owner_vm(obj: &Value) -> Option<&str> {
+    obj["metadata"]["ownerReferences"]
+        .as_array()?
+        .iter()
+        .find(|o| o["kind"] == "VirtualMachine")?["name"]
+        .as_str()
+}
+
+/// A tap watcher's news: the guest behind NIC `nic` of machine `uid` now
+/// holds `addresses`.
+#[derive(Debug)]
+struct Snooped {
+    uid: String,
+    nic: usize,
+    addresses: Vec<String>,
+}
+
+/// Per NIC, what the tap watcher saw, over what the agent or the neighbour
+/// table said (#91).
+///
+/// The watcher saw the lease itself, so it is right where the others are
+/// stale or silent; a NIC it has seen nothing on keeps the other answer.
+/// `None` only when nobody has an answer for any NIC.
+fn prefer_snooped(
+    other: Option<Vec<Vec<String>>>,
+    snooped: Vec<Vec<String>>,
+) -> Option<Vec<Vec<String>>> {
+    if snooped.iter().all(|s| s.is_empty()) {
+        return other;
+    }
+    let mut out = other.unwrap_or_default();
+    if out.len() < snooped.len() {
+        out.resize(snooped.len(), Vec::new());
+    }
+    for (slot, s) in out.iter_mut().zip(snooped) {
+        if !s.is_empty() {
+            *slot = s;
+        }
+    }
+    Some(out)
 }
 
 impl VmManager {
@@ -465,6 +703,7 @@ impl VmManager {
         let api_url = api_url.into().trim_end_matches('/').to_string();
         let events = (!api_url.is_empty())
             .then(|| crate::events::EventRecorder::new(api.clone(), &api_url, &node_name));
+        let (snoop_tx, snoop_rx) = tokio::sync::mpsc::unbounded_channel();
         VmManager {
             ring,
             storage: crate::engine::DEFAULT_URL.into(),
@@ -477,8 +716,205 @@ impl VmManager {
             vms: Mutex::new(HashMap::new()),
             stopping: Mutex::new(Default::default()),
             desired: Mutex::new(HashMap::new()),
+            disk_lifecycle: tokio::sync::RwLock::new(()),
             watched: Mutex::new(None),
             synced: std::sync::atomic::AtomicBool::new(false),
+            snoopers: std::sync::Mutex::new(HashMap::new()),
+            snoop_tx,
+            snoop_rx: std::sync::Mutex::new(Some(snoop_rx)),
+            retries: std::sync::Mutex::new(HashMap::new()),
+            swept: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Write a tap watcher's news to the VMI as it arrives (#91): "within
+    /// seconds of the guest's DHCP", not on the next sync. Once; later calls
+    /// do nothing.
+    pub fn spawn_address_pump(self: &Arc<Self>) {
+        let rx = self.snoop_rx.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let Some(mut rx) = rx else { return };
+        let me = Arc::downgrade(self);
+        tokio::spawn(async move {
+            while let Some(news) = rx.recv().await {
+                let Some(me) = me.upgrade() else { return };
+                me.snooped(news).await;
+            }
+        });
+    }
+
+    /// One NIC's addresses changed on the tap. An empty list (a release, an
+    /// expiry) is left to the sync, which falls back to the other sources.
+    /// News for a machine not recorded yet (a lease in the instant before
+    /// `start` records it) is not lost: the sync reads the watcher too.
+    async fn snooped(&self, news: Snooped) {
+        if news.addresses.is_empty() {
+            return;
+        }
+        let updated = {
+            let mut vms = self.vms.lock().await;
+            let Some(vm) = vms.get_mut(&news.uid) else { return };
+            if vm.phase.terminal() {
+                return;
+            }
+            let Some(nic) = vm.nics.get_mut(news.nic) else { return };
+            if nic.addresses == news.addresses {
+                return;
+            }
+            info!(vm = %vm.name, nic = %nic.name, addresses = ?news.addresses, "guest address seen on its tap");
+            nic.addresses = news.addresses;
+            if vm.ready_unix.is_none() {
+                vm.ready_unix = Some(now_unix());
+            }
+            vm.clone()
+        };
+        self.patch_status(&updated).await;
+    }
+
+    /// What each NIC's tap watcher has seen, empty where there is none.
+    fn snooped_addresses(&self, uid: &str, nics: usize) -> Vec<Vec<String>> {
+        let mut out = vec![Vec::new(); nics];
+        let map = self.snoopers.lock().unwrap_or_else(|e| e.into_inner());
+        for (i, s) in map.get(uid).into_iter().flatten() {
+            if let Some(slot) = out.get_mut(*i) {
+                *slot = s.addresses();
+            }
+        }
+        out
+    }
+
+    /// A Secret's SSH public keys, in the machine's namespace (#92).
+    async fn secret_keys(&self, ns: &str, name: &str) -> Result<Vec<String>, String> {
+        if self.api_url.is_empty() {
+            return Err(format!("Secret {name}: no apiserver to read it from"));
+        }
+        let url = format!("{}/api/v1/namespaces/{ns}/secrets/{name}", self.api_url);
+        let r = self.api.get(&url).send().await.map_err(|e| format!("Secret {name}: {e}"))?;
+        match r.status().as_u16() {
+            200 => {}
+            404 => return Err(format!("Secret {ns}/{name} not found")),
+            code => return Err(format!("Secret {ns}/{name}: {code}")),
+        }
+        let secret: Value = r.json().await.map_err(|e| format!("Secret {name}: {e}"))?;
+        Ok(stormvm_spec::access::keys_in_secret(&secret))
+    }
+
+    /// The keys for the seed, from every `noCloud` / `configDrive`
+    /// credential, and why any set could not be had.
+    async fn boot_keys(&self, vm: &VmSpec) -> (Vec<String>, Vec<String>) {
+        let (mut keys, mut problems) = (Vec::new(), Vec::new());
+        let has_seed = vm.disks.iter().any(|d| d.from == DiskSource::CloudInit);
+        for c in vm.access_credentials.iter().filter(|c| c.at_boot()) {
+            if !has_seed {
+                // KubeVirt refuses this shape; here the machine still runs,
+                // and the condition says why the key is not in it.
+                problems.push(format!(
+                    "Secret {}: noCloud keys ride the cloud-init seed, and this VMI has no \
+                     cloudInitNoCloud volume",
+                    c.secret
+                ));
+                continue;
+            }
+            match self.secret_keys(&vm.namespace, &c.secret).await {
+                Ok(k) if k.is_empty() => problems.push(format!("Secret {} holds no keys", c.secret)),
+                Ok(k) => {
+                    for key in k {
+                        if !keys.contains(&key) {
+                            keys.push(key);
+                        }
+                    }
+                }
+                Err(e) => problems.push(e),
+            }
+        }
+        (keys, problems)
+    }
+
+    /// Keep a running machine's agent-delivered keys current, and its
+    /// condition with them (#92).
+    ///
+    /// Read from the VMI as it is now, so a credential added to a running
+    /// machine ("Add my keys") and a machine adopted after a restart are both
+    /// covered. Each Secret is read on every sync, and a user's keys are sent
+    /// to the agent only when they differ from what it last accepted, with
+    /// `reset`: the Secret is the truth, and a key taken out of it leaves the
+    /// guest. A Secret that is missing, or holds no keys, is reported and
+    /// leaves the guest's keys as they are: emptying a machine's
+    /// `authorized_keys` because a Secret went missing is a lock-out.
+    async fn sync_access(&self, uid: &str, agent_up: bool) {
+        let Some(obj) = self.desired.lock().await.get(uid).cloned() else { return };
+        // Refused credentials refused the machine at start.
+        let Ok(creds) = stormvm_spec::access::from_kube(&obj["spec"]) else { return };
+        let Some(vm) = self.vms.lock().await.get(uid).cloned() else { return };
+        let mut access = vm.access.clone();
+
+        let agent_creds: Vec<(&str, &[String])> = creds
+            .iter()
+            .filter_map(|c| match &c.propagation {
+                stormvm_spec::access::Propagation::GuestAgent { users } => {
+                    Some((c.secret.as_str(), users.as_slice()))
+                }
+                _ => None,
+            })
+            .collect();
+        if agent_up && !agent_creds.is_empty() {
+            let sock = format!("{RUN_ROOT}/{}/{}/agent.sock", vm.namespace, vm.name);
+            let (mut applied, mut problems) = (Vec::new(), Vec::new());
+            for (secret, users) in agent_creds {
+                let keep = |applied: &mut Vec<(String, String, Vec<String>)>| {
+                    applied.extend(vm.access.applied.iter().filter(|a| a.0 == secret).cloned());
+                };
+                let keys = match self.secret_keys(&vm.namespace, secret).await {
+                    Ok(k) if k.is_empty() => {
+                        problems.push(format!("Secret {secret} holds no keys; the guest's were left as they are"));
+                        keep(&mut applied);
+                        continue;
+                    }
+                    Ok(k) => k,
+                    Err(e) => {
+                        problems.push(e);
+                        keep(&mut applied);
+                        continue;
+                    }
+                };
+                for user in users {
+                    let sent = vm.access.applied.iter().any(|(s, u, k)| s == secret && u == user && *k == keys);
+                    if sent {
+                        applied.push((secret.to_string(), user.clone(), keys.clone()));
+                        continue;
+                    }
+                    match stormvm_control::qga::set_authorized_keys(&sock, user, &keys).await {
+                        Ok(()) => {
+                            info!(vm = %vm.name, user = %user, secret = %secret, keys = keys.len(),
+                                  "authorized keys set through the guest agent");
+                            applied.push((secret.to_string(), user.clone(), keys.clone()));
+                        }
+                        Err(e) => problems.push(format!("user {user} (Secret {secret}): {e}")),
+                    }
+                }
+            }
+            access.applied = applied;
+            access.agent = Some(problems);
+        }
+        let outcome = access_outcome(&creds, &access);
+        access.condition = outcome.map(|o| access_condition(access.condition.as_ref(), &o, &now_rfc3339()));
+        if access == vm.access {
+            return;
+        }
+        let updated = {
+            let mut vms = self.vms.lock().await;
+            let Some(cur) = vms.get_mut(uid) else { return };
+            cur.access = access;
+            cur.clone()
+        };
+        self.patch_status(&updated).await;
+    }
+
+    /// Stop watching a machine's taps. Off the async threads: dropping a
+    /// watcher joins its thread, which wakes at most a second later.
+    fn drop_snoopers(&self, uid: &str) {
+        let gone = self.snoopers.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+        if let Some(gone) = gone {
+            tokio::task::spawn_blocking(move || drop(gone));
         }
     }
 
@@ -572,22 +1008,17 @@ impl VmManager {
                 anyhow::ensure!(self.stop(&vm).await, "VM cleanup pending for {uid}");
                 self.vms.lock().await.remove(uid);
             }
+            self.retries.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
             if let Some(object) = object { anyhow::ensure!(self.set_finalizer(object, false).await,"VM finalizer cleanup pending"); }
             return Ok(true);
         }
         let object = object.unwrap();
         self.absorb_ends_for(Some(uid)).await;
         if !self.vms.lock().await.contains_key(uid) {
-            match self.start(uid, object).await {
-                Ok(()) => {}
-                Err(StartFail::Waiting(why)) => {
-                    self.patch_pending(object["metadata"]["namespace"].as_str().unwrap_or("default"),
-                        object["metadata"]["name"].as_str().unwrap_or(""), uid, &why).await;
-                    return Ok(false);
-                }
-                Err(error) => return Err(anyhow::anyhow!(error.message().to_string())),
-            }
+            self.start_with_retry(uid, object).await;
         }
+        let running = self.vms.lock().await.get(uid).is_some_and(|vm| !vm.phase.terminal());
+        if !running { return Ok(false); }
         self.set_finalizer(object, true).await;
         Ok(false)
     }
@@ -644,33 +1075,23 @@ impl VmManager {
             }
         }
 
+        // Disks whose VirtualMachine (or VMI) has gone for good (#75). After
+        // the stops, so a machine just stopped no longer holds them; before
+        // the starts, so a disk left by an earlier VM of the same name is
+        // gone before its successor looks for it.
+        self.sweep_orphans().await;
+
+        // A retry for a machine no longer wanted is forgotten.
+        self.retries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|u, _| want.iter().any(|(w, _)| w == u));
+
         for (uid, obj) in &want {
             if self.vms.lock().await.contains_key(uid) {
                 continue;
             }
-            if let Err(e) = self.start(uid, obj).await {
-                let ns = obj["metadata"]["namespace"].as_str().unwrap_or("default");
-                let name = obj["metadata"]["name"].as_str().unwrap_or("");
-                if let StartFail::Waiting(why) = &e {
-                    // Pending, and nothing is recorded in `vms` — which is
-                    // what lets the next sync try again. Recording it is what
-                    // made a missing golden permanent: sync saw the uid and
-                    // skipped it for ever.
-                    info!("{ns}/{name}: {why}");
-                    self.event(obj, "Normal", "Waiting", why).await;
-                    self.patch_pending(ns, name, uid, why).await;
-                    continue;
-                }
-                let e = e.message().to_string();
-                warn!("{ns}/{name}: {e}");
-                // The reason, where somebody will look for it.
-                //
-                // This is the message that said `cloning golden
-                // fedora-43-x86_64 for disk root: 404 no volume` and went
-                // only to a log on a node with no shell.
-                self.event(obj, "Warning", "FailedStart", &e).await;
-                self.record_failure(uid, obj, &e).await;
-            }
+            self.start_with_retry(uid, obj).await;
         }
 
         // Every machine running here holds its object until it is stopped.
@@ -684,6 +1105,79 @@ impl VmManager {
             if running.contains(uid) {
                 self.set_finalizer(obj, true).await;
             }
+        }
+    }
+
+    /// Main's failed-start policy shared by the UID adapter and legacy tests.
+    async fn start_with_retry(&self, uid: &str, obj: &Value) {
+        // Backing off after a failed start (#76), unless the spec changed.
+        let generation = obj["metadata"]["generation"].as_i64().unwrap_or(0);
+        {
+            let mut retries = self.retries.lock().unwrap_or_else(|e| e.into_inner());
+            match retries.get(uid) {
+                Some(r) if r.generation != generation => {
+                    retries.remove(uid);
+                }
+                Some(r) if std::time::Instant::now() < r.next => return,
+                _ => {}
+            }
+        }
+        let result = self.start(uid, obj).await;
+        if result.is_ok() {
+            self.retries.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+        }
+        if let Err(e) = result {
+            let ns = obj["metadata"]["namespace"].as_str().unwrap_or("default");
+            let name = obj["metadata"]["name"].as_str().unwrap_or("");
+            if let StartFail::Waiting(why) = &e {
+                // Pending, and nothing is recorded in `vms` — which is
+                // what lets the next sync try again. Recording it is what
+                // made a missing golden permanent: sync saw the uid and
+                // skipped it for ever.
+                info!("{ns}/{name}: {why}");
+                self.event(obj, "Normal", "Waiting", why).await;
+                self.patch_pending(ns, name, uid, why).await;
+                return;
+            }
+            let e = e.message().to_string();
+            warn!("{ns}/{name}: {e}");
+            // Given up on only when its VirtualMachine says so; otherwise
+            // Pending, with the reason and when it will be tried again.
+            // A failure recorded here used to be skipped for good, so a
+            // stormblock that was down for a moment left the machine dead
+            // until somebody recreated it (#76).
+            let owner = match owner_vm(obj) {
+                Some(vm) => self.get_vm(ns, vm).await,
+                None => None,
+            };
+            if gives_up(owner.as_ref()) {
+                // The reason, where somebody will look for it.
+                //
+                // This is the message that said `cloning golden
+                // fedora-43-x86_64 for disk root: 404 no volume` and went
+                // only to a log on a node with no shell.
+                self.event(obj, "Warning", "FailedStart", &e).await;
+                self.record_failure(uid, obj, &e).await;
+                return;
+            }
+            let (attempts, wait) = {
+                let mut retries = self.retries.lock().unwrap_or_else(|e| e.into_inner());
+                let r = retries.entry(uid.to_string()).or_insert(Retry {
+                    generation,
+                    attempts: 0,
+                    next: std::time::Instant::now(),
+                });
+                r.attempts += 1;
+                let wait = retry_delay(r.attempts);
+                r.next = std::time::Instant::now() + wait;
+                (r.attempts, wait)
+            };
+            let why = format!(
+                "start failed (attempt {attempts}), retrying in {}s: {e}",
+                wait.as_secs()
+            );
+            self.event(obj, "Warning", "FailedStart", &why).await;
+            self.patch_retrying(ns, name, uid, &why).await;
         }
     }
 
@@ -756,7 +1250,24 @@ impl VmManager {
         out
     }
 
+    /// Start a machine; a start that fails deletes the volumes it created.
+    ///
+    /// A golden's clone and a cloud-init seed are made new on every start,
+    /// and a failed one used to only detach them. Once a failed start is
+    /// retried (#76), that is two volumes left behind per attempt. What it
+    /// found and reused (an `emptyDisk`, a claim, a `volume:`) is not
+    /// deleted: that may be the guest's data.
     async fn start(&self, uid: &str, obj: &Value) -> Result<(), StartFail> {
+        let _disks = self.disk_lifecycle.read().await;
+        let mut fresh = Vec::new();
+        let result = self.start_attempt(uid, obj, &mut fresh).await;
+        if result.is_err() {
+            self.delete_volumes(obj["metadata"]["name"].as_str().unwrap_or(""), &fresh).await;
+        }
+        result
+    }
+
+    async fn start_attempt(&self, uid: &str, obj: &Value, fresh: &mut Vec<String>) -> Result<(), StartFail> {
         // Resolve the cloud-init secret before anything reads the spec.
         //
         // A seed may be referenced rather than inlined -- `userDataSecretRef`
@@ -779,9 +1290,14 @@ impl VmManager {
             "no ring to stormpump: only the engine starts a machine".to_string()
         })?;
 
+        // SSH keys that ride the seed (#92), fetched before the seed is made.
+        // A Secret that cannot be read does not stop the machine: the key may
+        // be in its user-data too, and the condition says what is missing.
+        let (boot_keys, boot_problems) = self.boot_keys(&vm).await;
         // Storage first. Nothing has been asked of the engine yet, so a golden
         // that does not exist costs a failed status and no cleanup.
-        let (disks, owned_volumes) = self.resolve_disks(&vm).await?;
+        let owner = self.owner_of(obj).await;
+        let (disks, owned_volumes) = self.resolve_disks_with_keys(&vm, &boot_keys, &owner, fresh).await?;
 
         // The pod log directory, because that is where `kubectl logs` looks.
         // The container name is the VM's, so the path is the one the kubelet's
@@ -794,7 +1310,9 @@ impl VmManager {
         // NICs, before the plan: the tap has to exist so its descriptor can
         // be named, and it has to be deposited so the engine can find it by
         // that name.
-        let (nics, nic_reports) = match self.resolve_nics(&ns, &vm, &ring).await {
+        // The tap watchers come back too, held here until the machine is
+        // recorded: a start that fails below drops them with it.
+        let (nics, nic_reports, snoopers) = match self.resolve_nics(uid, &ns, &vm, &ring).await {
             Ok(n) => n,
             Err(e) => {
                 self.release(&disks).await;
@@ -895,7 +1413,7 @@ impl VmManager {
         }
         self.event(obj, "Normal", "Started",
                    &format!("Started virtual machine {}", vm.name)).await;
-        let rec = Vm {
+        let mut rec = Vm {
             namespace: ns,
             name: vm.name.clone(),
             uid: uid.to_string(),
@@ -909,8 +1427,15 @@ impl VmManager {
             owned_volumes,
             nics: nic_reports,
             message: String::new(),
+            access: Access { boot: boot_problems, ..Access::default() },
         };
+        if let Some(outcome) = access_outcome(&vm.access_credentials, &rec.access) {
+            rec.access.condition = Some(access_condition(None, &outcome, &now_rfc3339()));
+        }
         self.vms.lock().await.insert(uid.to_string(), rec.clone());
+        if !snoopers.is_empty() {
+            self.snoopers.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), snoopers);
+        }
         self.patch_status(&rec).await;
         Ok(())
     }
@@ -951,10 +1476,18 @@ impl VmManager {
             // the neighbour table with the address it took. Second, not
             // first: the agent knows every address on every interface, and
             // the neighbour table knows only what has been seen from here.
-            let addrs = match guest_addresses(&vm).await {
+            let agent = guest_addresses(&vm).await;
+            // An answer, even one with no addresses, is an agent that can
+            // take keys (#92).
+            let agent_up = agent.is_some();
+            let addrs = match agent {
                 Some(a) if a.iter().any(|v| !v.is_empty()) => Some(a),
                 other => neighbour_addresses(&vm).or(other),
             };
+            // The tap watcher first of all (#91): it saw the lease, on a
+            // bridge where the agent may be absent and the neighbour table
+            // knows only what the node has talked to.
+            let addrs = prefer_snooped(addrs, self.snooped_addresses(&vm.uid, vm.nics.len()));
             if let Some(addrs) = addrs {
                 let changed = vm.nics.iter().map(|n| &n.addresses).ne(addrs.iter());
                 // The agent answering *is* the readiness signal: it runs in
@@ -974,6 +1507,8 @@ impl VmManager {
                     self.patch_status(&with).await;
                 }
             }
+            // Its SSH keys through the agent, and the condition (#92).
+            self.sync_access(&vm.uid, agent_up).await;
             let code = if vm.handle.is_none() {
                 // Adopted without a handle: its control socket is the only
                 // sign of life, and there is no exit status to read.
@@ -1016,6 +1551,7 @@ impl VmManager {
             } else {
                 self.event_of(&done, "Warning", "Failed", &done.message).await;
             }
+            self.drop_snoopers(&done.uid);
             // Retain the handle and disks for checked teardown. Releasing the
             // handle here loses the authoritative exit record before cleanup.
             self.vms.lock().await.insert(done.uid.clone(), done.clone());
@@ -1062,13 +1598,9 @@ impl VmManager {
                 _ => return false,
             }
         }
-        for id in &vm.owned_volumes {
-            let url = format!("{}/api/v1/volumes/{id}", self.storage);
-            match self.engine.delete(&url).await {
-                Ok(r) if r.status().is_success() || r.status().as_u16() == 404 => {}
-                _ => return false,
-            }
-        }
+        // Disk lifetime follows the VM owner (#75), not this VMI. The orphan
+        // sweep deletes them only after the owner is confirmed gone.
+        self.drop_snoopers(&vm.uid);
         if let Some(ring) = self.ring.clone().filter(|_| !vm.handle.is_none()) {
             let handle = vm.handle;
             if !matches!(tokio::task::spawn_blocking(move || ring.workload_release(handle)).await, Ok(Ok(_))) {
@@ -1081,9 +1613,28 @@ impl VmManager {
         true
     }
 
+    /// [`Self::resolve_disks_with_keys`] with no keys: for tests.
+    #[cfg(test)]
+    async fn resolve_disks(&self, vm: &VmSpec) -> Result<(Vec<ResolvedDisk>, Vec<String>), StartFail> {
+        self.resolve_disks_with_keys(vm, &[], &Value::Null, &mut Vec::new()).await
+    }
+
     /// Clone or attach every disk. Failure gives back what it already took —
     /// an attachment left behind is a device nobody will ever release.
-    async fn resolve_disks(&self, vm: &VmSpec) -> Result<(Vec<ResolvedDisk>, Vec<String>), StartFail> {
+    /// `keys` go into a cloud-init seed's `public-keys` (#92). Every volume
+    /// made new here is added to `fresh`, as it is made, so a start that
+    /// fails later can delete it (#76).
+    ///
+    /// A disk the machine owns is found by name before it is made (#75): a
+    /// restart attaches the root the guest left, and the golden is needed
+    /// only the first time. `owner` goes on each ([`disk_owner`]).
+    async fn resolve_disks_with_keys(
+        &self,
+        vm: &VmSpec,
+        keys: &[String],
+        owner: &Value,
+        fresh: &mut Vec<String>,
+    ) -> Result<(Vec<ResolvedDisk>, Vec<String>), StartFail> {
         let mut done: Vec<ResolvedDisk> = Vec::new();
         let mut owned: Vec<String> = Vec::new();
         for d in &vm.disks {
@@ -1098,17 +1649,30 @@ impl VmManager {
                     // were two distinct volumes under one name and
                     // `volume_by_name` returned whichever the map iterated
                     // first.
-                    let body = json!({
-                        "name": stormvm_node::start::volume_name(vm, &d.name),
+                    let name = stormvm_node::start::volume_name(vm, &d.name);
+                    match self.reuse(&d.name, &name, owner).await {
+                        Ok(Some(id)) => id,
+                        Ok(None) => {
+                    let mut body = json!({
+                        "name": name,
                         "size": d.size,
                         "label": format!("storm.io/vm={}", vm.id()),
                         "verify": true,
                     });
+                    if !owner.is_null() {
+                        body["owner"] = owner.clone();
+                    }
                     match self
                         .post(&format!("{}/api/v1/volumes/{g}/clone", self.storage), &body)
                         .await
                     {
-                        Ok(v) => v["id"].as_str().unwrap_or_default().to_string(),
+                        Ok(v) => {
+                            let id = v["id"].as_str().unwrap_or_default().to_string();
+                            if !id.is_empty() {
+                                fresh.push(id.clone());
+                            }
+                            id
+                        }
                         Err(e) => {
                             self.release(&done).await;
                             // A golden that is not here *yet* is not a
@@ -1133,6 +1697,12 @@ impl VmManager {
                                 "cloning golden {g} for disk {}: {e}",
                                 d.name
                             )));
+                        }
+                    }
+                        }
+                        Err(e) => {
+                            self.release(&done).await;
+                            return Err(e);
                         }
                     }
                 }
@@ -1173,15 +1743,34 @@ impl VmManager {
                 // once and found by name on every later start, as the
                 // standalone path does: a data disk that came back blank after
                 // a restart would lose everything the guest wrote to it.
-                DiskSource::Empty => match self.empty_volume(vm, &d.name, d.size.as_deref()).await {
-                    Ok(id) => id,
-                    Err(e) => {
-                        self.release(&done).await;
-                        return Err(StartFail::Failed(format!("disk {}: {e}", d.name)));
+                DiskSource::Empty => {
+                    let name = stormvm_node::start::volume_name(vm, &d.name);
+                    let found = match self.reuse(&d.name, &name, owner).await {
+                        Ok(found) => found,
+                        Err(e) => {
+                            self.release(&done).await;
+                            return Err(e);
+                        }
+                    };
+                    match found {
+                        Some(id) => id,
+                        None => match self.empty_volume(vm, &d.name, d.size.as_deref(), owner).await {
+                            Ok(id) => {
+                                fresh.push(id.clone());
+                                id
+                            }
+                            Err(e) => {
+                                self.release(&done).await;
+                                return Err(StartFail::Failed(format!("disk {}: {e}", d.name)));
+                            }
+                        },
                     }
-                },
-                DiskSource::CloudInit => match self.seed_volume(vm).await {
-                    Ok(id) => id,
+                }
+                DiskSource::CloudInit => match self.seed_volume(vm, &d.name, keys, owner).await {
+                    Ok(id) => {
+                        fresh.push(id.clone());
+                        id
+                    }
                     Err(e) => {
                         self.release(&done).await;
                         return Err(StartFail::Failed(format!("disk {}: {e}", d.name)));
@@ -1271,10 +1860,11 @@ impl VmManager {
     /// reaches the bridge.
     async fn resolve_nics(
         &self,
+        uid: &str,
         namespace: &str,
         vm: &VmSpec,
         ring: &Arc<RingClient>,
-    ) -> Result<(Vec<plan::ResolvedNic>, Vec<NicReport>), String> {
+    ) -> Result<(Vec<plan::ResolvedNic>, Vec<NicReport>, Vec<(usize, stormvm_net::Snooper)>), String> {
         let defaults = stormvm_net::Defaults { uplink_bridge: DEFAULT_BRIDGE.to_string() };
         // Pure: every decision that could be wrong is made here, with no
         // privilege and nothing created yet.
@@ -1282,6 +1872,7 @@ impl VmManager {
 
         let mut out = Vec::with_capacity(plans.len());
         let mut reports = Vec::with_capacity(plans.len());
+        let mut snoopers = Vec::new();
         for p in &plans {
             // No sandbox: a VM on the pod network wants a namespace this
             // kubelet does not pop here yet, and `realise` refuses that
@@ -1303,6 +1894,22 @@ impl VmManager {
                     .map_err(|e| format!("interface {nic}: {e:?}"))?;
             }
             let mac = made.address.as_ref().map(|a| a.mac.clone()).unwrap_or_else(|| p.mac.clone());
+            // A tap on one of the node's bridges: the guest's address comes
+            // from the segment's DHCP server, and the tap is where the node
+            // sees it (#91). Watched before the spawn, because a guest that
+            // DHCPs in its first second would otherwise do it unwatched. A
+            // watcher that cannot open is a warning: the machine still runs,
+            // and the agent and the neighbour table still answer.
+            if made.binding == "host-bridge" {
+                let (tx, id, i) = (self.snoop_tx.clone(), uid.to_string(), reports.len());
+                let seen = move |addresses: Vec<String>| {
+                    let _ = tx.send(Snooped { uid: id.clone(), nic: i, addresses });
+                };
+                match stormvm_net::snoop_tap(&p.tap, &mac, seen) {
+                    Ok(s) => snoopers.push((i, s)),
+                    Err(e) => warn!(vm = %vm.name, nic = %p.nic, "cannot watch {} for the guest's address: {e}", p.tap),
+                }
+            }
             reports.push(NicReport {
                 name: p.nic.clone(),
                 mac: mac.clone(),
@@ -1318,7 +1925,7 @@ impl VmManager {
                 transport: made.transport,
             });
         }
-        Ok((out, reports))
+        Ok((out, reports, snoopers))
     }
 
 
@@ -1343,16 +1950,37 @@ impl VmManager {
     /// name — never from a lease. A guest that takes its name from DHCP is a
     /// guest whose identity changes when the network does, and its
     /// certificates and logs change with it.
-    async fn seed_volume(&self, vm: &VmSpec) -> Result<String, String> {
-        let seed = stormvm_cloudinit::Seed::for_vm(vm);
+    /// The seed is made again on every start — the keys in it can change —
+    /// under the disk's namespaced name. The one a previous start left is
+    /// deleted first: a stop only detaches (#75), and two volumes under one
+    /// name are two answers to a lookup by name.
+    async fn seed_volume(&self, vm: &VmSpec, disk: &str, keys: &[String], owner: &Value) -> Result<String, String> {
+        let mut seed = stormvm_cloudinit::Seed::for_vm(vm);
+        // `accessCredentials` keys go in meta-data `public-keys`, never
+        // user-data, where a second `ssh_authorized_keys:` would replace the
+        // VM's own (#92).
+        for k in keys {
+            if !seed.public_keys.contains(k) {
+                seed.public_keys.push(k.clone());
+            }
+        }
 
         // 16 MiB: the files are a few hundred bytes, and FAT16 needs enough
         // clusters to be FAT16 at all. Thin, so it costs what it holds.
-        let body = json!({
-            "name": format!("{}-seed", vm.name),
+        let name = stormvm_node::start::volume_name(vm, disk);
+        if let Some(old) = self.volume_named(&name).await? {
+            if let Some(id) = old["id"].as_str() {
+                self.delete_volumes(&vm.name, &[id.to_string()]).await;
+            }
+        }
+        let mut body = json!({
+            "name": name,
             "size": "16M",
             "redundancy": "none",
         });
+        if !owner.is_null() {
+            body["owner"] = owner.clone();
+        }
         let v = self
             .post(&format!("{}/api/v1/volumes", self.storage), &body)
             .await
@@ -1367,17 +1995,22 @@ impl VmManager {
             .into_iter()
             .map(|(name, contents)| json!({ "path": name, "contents": contents }))
             .collect();
-        self.post(
-            &format!("{}/api/v1/volumes/{id}/cidata", self.storage),
-            &json!({ "files": files, "label": "CIDATA" }),
-        )
-        .await
-        .map_err(|e| format!("writing the seed: {e}"))?;
+        if let Err(e) = self
+            .post(
+                &format!("{}/api/v1/volumes/{id}/cidata", self.storage),
+                &json!({ "files": files, "label": "CIDATA" }),
+            )
+            .await
+        {
+            // Made here and unusable: not left behind for the next try (#76).
+            self.delete_volumes(&vm.name, std::slice::from_ref(&id)).await;
+            return Err(format!("writing the seed: {e}"));
+        }
         Ok(id)
     }
 
-    /// The VM's empty disk: the volume `<ns>-<vm>-<disk>` if it exists,
-    /// otherwise a new blank one of `size`.
+    /// A new blank volume of `size` for the VM's empty disk. The caller has
+    /// already looked for the one a previous start made ([`Self::reuse`]).
     ///
     /// No `redundancy`: the engine's default, not the seed's `none`, because
     /// this is the guest's data. No filesystem either: what goes on the disk
@@ -1387,17 +2020,18 @@ impl VmManager {
         vm: &VmSpec,
         disk: &str,
         size: Option<&str>,
+        owner: &Value,
     ) -> Result<String, String> {
         let name = stormvm_node::start::volume_name(vm, disk);
-        if let Some(id) = self.volume_by_name(&name).await? {
-            return Ok(id);
-        }
         let size = size.ok_or_else(|| "an empty disk needs a size".to_string())?;
-        let body = json!({
+        let mut body = json!({
             "name": name,
             "size": size,
             "label": format!("storm.io/vm={}", vm.id()),
         });
+        if !owner.is_null() {
+            body["owner"] = owner.clone();
+        }
         let v = self
             .post(&format!("{}/api/v1/volumes", self.storage), &body)
             .await
@@ -1411,18 +2045,122 @@ impl VmManager {
     /// A volume's id by name. `Ok(None)` only when the engine answered and
     /// has no such volume: "could not ask" must not become "make a new one",
     /// or a restart during an engine hiccup gives the guest a blank disk.
-    async fn volume_by_name(&self, name: &str) -> Result<Option<String>, String> {
+    async fn volume_named(&self, name: &str) -> Result<Option<Value>, String> {
+        Ok(self.volumes().await?.into_iter().find(|v| v["name"].as_str() == Some(name)))
+    }
+
+    /// Every volume on this node's engine, as it describes them.
+    async fn volumes(&self) -> Result<Vec<Value>, String> {
         let url = format!("{}/api/v1/volumes", self.storage);
         let resp = self.engine.get(&url).await.map_err(|e| format!("listing volumes: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("listing volumes: {}", resp.status()));
         }
         let list: Value = resp.json().await.map_err(|e| format!("listing volumes: {e}"))?;
-        Ok(list["items"]
-            .as_array()
-            .and_then(|a| a.iter().find(|v| v["name"].as_str() == Some(name)))
-            .and_then(|v| v["id"].as_str())
-            .map(String::from))
+        Ok(list["items"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// The volume a previous start made for disk `disk` (named `name`), if
+    /// there is one, with its owner brought up to `owner` (#75).
+    ///
+    /// A listing that fails is a failed start, not "make a new one": that
+    /// would give a restarted guest a fresh root and leave its own beside it.
+    /// One left by an earlier object of the same name waits for the sweep.
+    async fn reuse(&self, disk: &str, name: &str, owner: &Value) -> Result<Option<String>, StartFail> {
+        let found = self
+            .volume_named(name)
+            .await
+            .map_err(|e| StartFail::Failed(format!("disk {disk}: {e}")))?;
+        let Some(v) = found else { return Ok(None) };
+        let Some(id) = v["id"].as_str().map(String::from) else { return Ok(None) };
+        if left_by_another(&v, owner) {
+            return Err(StartFail::Waiting(format!(
+                "disk {disk}: volume {name} was left by an earlier {} of this name; waiting for it to be removed",
+                v["owner"]["kind"].as_str().unwrap_or("owner")
+            )));
+        }
+        if v["owner"] != *owner {
+            self.set_volume_owner(&id, owner).await;
+        }
+        info!(volume = %id, "reusing {name} for disk {disk}");
+        Ok(Some(id))
+    }
+
+    /// Record a volume's owner (`Null`: none). Best effort: a disk left with
+    /// an old owner is kept by the sweep, never deleted early.
+    async fn set_volume_owner(&self, id: &str, owner: &Value) {
+        let url = format!("{}/api/v1/volumes/{id}/owner", self.storage);
+        match self.engine.put(&url, &json!({ "owner": owner })).await {
+            Ok(r) if r.status().is_success() => {}
+            Ok(r) => warn!(volume = %id, "owner not recorded: {}", r.status()),
+            Err(e) => warn!(volume = %id, "owner not recorded: {e}"),
+        }
+    }
+
+    /// The owner for this VMI's disks: [`disk_owner`], with its
+    /// VirtualMachine read for the retain annotation.
+    async fn owner_of(&self, obj: &Value) -> Value {
+        let ns = obj["metadata"]["namespace"].as_str().unwrap_or("default");
+        let vm = match owner_vm(obj) {
+            Some(name) => self.get_vm(ns, name).await,
+            None => None,
+        };
+        disk_owner(obj, vm.as_ref())
+    }
+
+    /// Delete the disks whose owner has gone for good (#75): its
+    /// VirtualMachine deleted (or replaced under the same name), or a VMI
+    /// with no VirtualMachine deleted. At most once a [`SWEEP_EVERY`].
+    ///
+    /// Only volumes this kubelet gave an owner to, not in use, and not held
+    /// by a machine it knows. An owner that cannot be read keeps its disks.
+    pub(crate) async fn sweep_orphans(&self) {
+        if self.api_url.is_empty() {
+            return;
+        }
+        {
+            let mut swept = self.swept.lock().unwrap_or_else(|e| e.into_inner());
+            if swept.is_some_and(|t| t.elapsed() < SWEEP_EVERY) {
+                return;
+            }
+            *swept = Some(std::time::Instant::now());
+        }
+        let _disks = self.disk_lifecycle.write().await;
+        let volumes = match self.volumes().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!("orphan sweep skipped: {e}");
+                return;
+            }
+        };
+        let held: std::collections::HashSet<String> = {
+            let vms = self.vms.lock().await;
+            vms.values().flat_map(|v| v.disks.iter().filter_map(|d| d.volume_id.clone())).collect()
+        };
+        for v in volumes {
+            let Some(id) = v["id"].as_str() else { continue };
+            let owner = &v["owner"];
+            let Some(path) = owner_path(owner) else { continue };
+            if held.contains(id) || v["in_use"].as_bool() == Some(true) {
+                continue;
+            }
+            let (status, obj) = match self.api.get(format!("{}{path}", self.api_url)).send().await {
+                Ok(r) => {
+                    let status = r.status().as_u16();
+                    (status, r.json::<Value>().await.ok())
+                }
+                Err(_) => continue,
+            };
+            if !owner_gone(status, obj.as_ref(), owner) {
+                continue;
+            }
+            info!(volume = %id, "deleting {}: its {} {}/{} is gone",
+                  v["name"].as_str().unwrap_or(""),
+                  owner["kind"].as_str().unwrap_or(""),
+                  owner["namespace"].as_str().unwrap_or(""),
+                  owner["name"].as_str().unwrap_or(""));
+            self.delete_volumes(owner["name"].as_str().unwrap_or(""), &[id.to_string()]).await;
+        }
     }
 
     /// Best effort: a start that has already gone wrong must not be made worse
@@ -1610,6 +2348,14 @@ impl VmManager {
             match (state, obj) {
                 (Some(true), Some(obj)) => {
                     info!(vm = %id, handle = ?vm.handle, "adopted a running machine");
+                    // Started before disks had owners (#75): give them one
+                    // now, or the sweep could never delete them.
+                    let owner = self.owner_of(obj).await;
+                    for d in reg.disks.iter().filter(|d| d.owned) {
+                        if let Some(v) = &d.volume_id {
+                            self.set_volume_owner(v, &owner).await;
+                        }
+                    }
                     self.event(obj, "Normal", "Adopted",
                                &format!("Virtual machine {} was already running on {}", vm.name, self.node_name))
                         .await;
@@ -1714,20 +2460,21 @@ impl VmManager {
         }
     }
 
-    async fn destroy_owned(&self, vm: &Vm) {
-        for id in &vm.owned_volumes {
+    /// Delete these volumes. Best effort, each failure logged.
+    async fn delete_volumes(&self, vm: &str, ids: &[String]) {
+        for id in ids {
             let url = format!("{}/api/v1/volumes/{id}", self.storage);
             match self.engine.delete(&url).await {
                 Ok(r) if r.status().is_success() => {
-                    info!(vm = %vm.name, volume = %id, "deleted the machine's own volume");
+                    info!(vm = %vm, volume = %id, "deleted the machine's own volume");
                 }
                 Ok(r) => {
                     let code = r.status();
                     let body = r.text().await.unwrap_or_default();
-                    warn!(vm = %vm.name, volume = %id,
+                    warn!(vm = %vm, volume = %id,
                           "could not delete: {code} {}", body.trim());
                 }
-                Err(e) => warn!(vm = %vm.name, volume = %id, "could not delete: {e}"),
+                Err(e) => warn!(vm = %vm, volume = %id, "could not delete: {e}"),
             }
         }
     }
@@ -1750,6 +2497,7 @@ impl VmManager {
             // saying so is different from not knowing.
             nics: Vec::new(),
             message: why.to_string(),
+            access: Access::default(),
         };
         self.vms.lock().await.insert(uid.to_string(), rec.clone());
         self.patch_status(&rec).await;
@@ -1760,14 +2508,37 @@ impl VmManager {
     /// Pending rather than Failed, with the reason — so a console shows
     /// "waiting for golden fedora-43" instead of a machine that looks broken
     /// and a person who deletes it and tries again.
+    /// A VirtualMachine by name, or `None` when there is none or it could not
+    /// be read.
+    async fn get_vm(&self, ns: &str, name: &str) -> Option<Value> {
+        if self.api_url.is_empty() {
+            return None;
+        }
+        let url = format!("{}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}", self.api_url);
+        let r = self.api.get(&url).send().await.ok()?;
+        if !r.status().is_success() {
+            return None;
+        }
+        r.json().await.ok()
+    }
+
+    /// Pending after a failed start that will be tried again (#76).
+    async fn patch_retrying(&self, ns: &str, name: &str, uid: &str, why: &str) {
+        self.patch_pending_as(ns, name, uid, "FailedStart", why).await;
+    }
+
     async fn patch_pending(&self, ns: &str, name: &str, uid: &str, why: &str) {
+        self.patch_pending_as(ns, name, uid, "Waiting", why).await;
+    }
+
+    async fn patch_pending_as(&self, ns: &str, name: &str, uid: &str, reason: &str, why: &str) {
         let url = format!(
             "{}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{name}/status",
             self.api_url
         );
         let body = json!({ "metadata": {"uid": uid}, "status": {
             "phase": "Pending",
-            "reason": "Waiting",
+            "reason": reason,
             "message": why,
             "nodeName": self.node_name,
         }});
@@ -1838,6 +2609,18 @@ impl VmManager {
         if !vm.message.is_empty() {
             status["reason"] = json!(if vm.phase == Phase::Failed { "Failed" } else { "Ended" });
             status["message"] = json!(vm.message);
+        }
+        // `AccessCredentialsSynchronized` (#92), with whatever conditions the
+        // object already carries: a merge patch replaces the list whole.
+        if let Some(cond) = &vm.access.condition {
+            let existing = self
+                .desired
+                .lock()
+                .await
+                .get(&vm.uid)
+                .map(|o| o["status"]["conditions"].clone())
+                .unwrap_or(Value::Null);
+            status["conditions"] = with_condition(&existing, cond);
         }
         let body = json!({ "metadata": {"uid": vm.uid}, "status": status });
         if let Err(e) = self
@@ -2137,6 +2920,153 @@ mod tests {
         m.sync(&[]).await;
         assert_eq!(m.running().await.len(), 1, "HTTP 409 must remain retryable");
         server.abort();
+}
+
+    /// `AccessCredentialsSynchronized`: every problem named, an agent not yet
+    /// heard from is a reason, and the transition time holds while the status
+    /// does (#92).
+    #[test]
+    fn the_access_condition_says_what_did_not_arrive() {
+        use stormvm_spec::access::{AccessCredential, Propagation};
+        let boot = AccessCredential { secret: "k".into(), propagation: Propagation::NoCloud };
+        let agent = AccessCredential {
+            secret: "k".into(),
+            propagation: Propagation::GuestAgent { users: vec!["root".into()] },
+        };
+        assert_eq!(access_outcome(&[], &Access::default()), None);
+        assert_eq!(access_outcome(&[boot.clone()], &Access::default()), Some(Ok(())));
+        let a = Access { boot: vec!["Secret ns/k not found".into()], ..Access::default() };
+        assert_eq!(access_outcome(&[boot.clone()], &a), Some(Err("Secret ns/k not found".into())));
+        assert_eq!(
+            access_outcome(&[boot.clone(), agent.clone()], &Access::default()),
+            Some(Err("waiting for the guest agent to answer".into()))
+        );
+        let a = Access { agent: Some(vec![]), ..Access::default() };
+        assert_eq!(access_outcome(&[agent], &a), Some(Ok(())));
+
+        let t0 = access_condition(None, &Err("x".into()), "2026-09-28T10:00:00Z");
+        assert_eq!(t0["status"], "False");
+        assert_eq!(t0["message"], "x");
+        let t1 = access_condition(Some(&t0), &Err("y".into()), "2026-09-28T10:05:00Z");
+        assert_eq!(t1["lastTransitionTime"], "2026-09-28T10:00:00Z", "still False: same transition");
+        assert_eq!(t1["message"], "y");
+        let t2 = access_condition(Some(&t1), &Ok(()), "2026-09-28T10:06:00Z");
+        assert_eq!((t2["status"].as_str(), t2["lastTransitionTime"].as_str()), (Some("True"), Some("2026-09-28T10:06:00Z")));
+
+        // The others survive; the old access condition is replaced, not doubled.
+        let existing = json!([{"type": "Ready", "status": "True"}, t0]);
+        let merged = with_condition(&existing, &t2);
+        assert_eq!(merged, json!([{"type": "Ready", "status": "True"}, t2]));
+        assert_eq!(with_condition(&Value::Null, &t2), json!([t2]));
+    }
+
+    /// Boot keys come from the Secrets, `stringData` included; a missing one,
+    /// or a machine with no seed to carry them, is a reason, not a failed
+    /// start (#92).
+    #[tokio::test]
+    async fn boot_keys_are_read_from_the_secrets() {
+        use axum::routing::get;
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/namespaces/default/secrets/owner-keys",
+                get(|| async {
+                    axum::Json(json!({"stringData": {"key": "ssh-ed25519 AAAAC3Nza owner@laptop\n"}}))
+                }),
+            )
+            .fallback(|| async { (axum::http::StatusCode::NOT_FOUND, "no") });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), &url);
+
+        let creds = json!([
+            {"sshPublicKey": {"source": {"secret": {"secretName": "owner-keys"}},
+                              "propagationMethod": {"noCloud": {}}}},
+            {"sshPublicKey": {"source": {"secret": {"secretName": "gone"}},
+                              "propagationMethod": {"noCloud": {}}}},
+        ]);
+        let mut obj = vmi("n1");
+        obj["spec"]["accessCredentials"] = creds;
+        obj["spec"]["domain"]["devices"] = json!({"disks": [{"name": "ci", "disk": {"bus": "virtio"}}]});
+        obj["spec"]["volumes"] = json!([{"name": "ci", "cloudInitNoCloud": {"userData": "#cloud-config\n"}}]);
+        let vm: VmSpec = stormvm_spec::kube::from_kube(&obj).unwrap();
+        let (keys, problems) = m.boot_keys(&vm).await;
+        assert_eq!(keys, vec!["ssh-ed25519 AAAAC3Nza owner@laptop".to_string()]);
+        assert_eq!(problems, vec!["Secret default/gone not found".to_string()]);
+
+        // No cloudInitNoCloud volume: nowhere for the keys to go, and it says so.
+        let mut bare = vmi("n1");
+        bare["spec"]["accessCredentials"] = json!([
+            {"sshPublicKey": {"source": {"secret": {"secretName": "owner-keys"}},
+                              "propagationMethod": {"noCloud": {}}}}]);
+        let vm: VmSpec = stormvm_spec::kube::from_kube(&bare).unwrap();
+        let (keys, problems) = m.boot_keys(&vm).await;
+        assert!(keys.is_empty());
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("no cloudInitNoCloud volume"), "{problems:?}");
+    }
+
+    /// The tap watcher wins per NIC where it has seen something; elsewhere
+    /// the agent's or the neighbour table's answer stands (#91).
+    #[test]
+    fn a_snooped_address_is_preferred_per_nic() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // Nothing seen on any tap: the other answer, even none.
+        assert_eq!(prefer_snooped(None, vec![vec![], vec![]]), None);
+        assert_eq!(
+            prefer_snooped(Some(vec![s(&["10.0.0.9"])]), vec![vec![]]),
+            Some(vec![s(&["10.0.0.9"])])
+        );
+        // The lease beats a stale neighbour entry on net0; net1 keeps the agent's.
+        assert_eq!(
+            prefer_snooped(
+                Some(vec![s(&["192.168.30.99"]), s(&["fd00::5"])]),
+                vec![s(&["192.168.30.4"]), vec![]]
+            ),
+            Some(vec![s(&["192.168.30.4"]), s(&["fd00::5"])])
+        );
+        // No agent, no neighbour entry: the tap alone answers.
+        assert_eq!(
+            prefer_snooped(None, vec![vec![], s(&["192.168.30.4", "fe80::1"])]),
+            Some(vec![vec![], s(&["192.168.30.4", "fe80::1"])])
+        );
+    }
+
+    /// News from a watcher lands on its NIC and the machine counts as up;
+    /// news for an unknown machine, or an empty list, changes nothing.
+    #[tokio::test]
+    async fn snooped_news_updates_the_nic_it_names() {
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), "");
+        let vm = Vm {
+            namespace: "default".into(),
+            name: "test2".into(),
+            uid: "u-2".into(),
+            log_dir: String::new(),
+            handle: Handle::NONE,
+            disks: vec![],
+            phase: Phase::Running,
+            exit_code: 0,
+            message: String::new(),
+            started_unix: 1,
+            ready_unix: None,
+            owned_volumes: vec![],
+            nics: vec![
+                NicReport { name: "net0".into(), mac: "02:00:00:00:00:01".into(), addresses: vec![], binding: "bridge".into() },
+                NicReport { name: "net1".into(), mac: "02:00:00:00:00:02".into(), addresses: vec![], binding: "bridge".into() },
+            ],
+            access: Access::default(),
+        };
+        m.vms.lock().await.insert("u-2".into(), vm);
+
+        m.snooped(Snooped { uid: "other".into(), nic: 0, addresses: vec!["1.2.3.4".into()] }).await;
+        m.snooped(Snooped { uid: "u-2".into(), nic: 1, addresses: vec![] }).await;
+        assert!(m.vms.lock().await["u-2"].nics.iter().all(|n| n.addresses.is_empty()));
+
+        m.snooped(Snooped { uid: "u-2".into(), nic: 1, addresses: vec!["192.168.30.4".into()] }).await;
+        let vm = m.vms.lock().await["u-2"].clone();
+        assert!(vm.nics[0].addresses.is_empty());
+        assert_eq!(vm.nics[1].addresses, vec!["192.168.30.4".to_string()]);
+        assert!(vm.ready_unix.is_some());
     }
 
     fn vmi(node: &str) -> Value {
@@ -2422,14 +3352,166 @@ mod tests {
 
     /// Without a ring there is no engine, and a VM that "started" without one
     /// would be a status nobody can act on.
+    ///
+    /// Retried, not recorded Failed for good (#76): a standalone VMI has no
+    /// run strategy saying to give up. Not again before its backoff, and at
+    /// once when its spec changes.
     #[tokio::test]
-    async fn no_ring_is_a_failed_vm_with_a_reason_not_a_silent_nothing() {
+    async fn a_failed_start_is_retried_with_backoff_not_given_up() {
         let m = VmManager::new(None, "n1", reqwest::Client::new(), "http://127.0.0.1:1");
+        let attempts = |m: &VmManager| m.retries.lock().unwrap().get("u-1").map(|r| (r.attempts, r.generation));
         m.sync(&[vmi("n1")]).await;
+        assert!(m.running().await.is_empty(), "not recorded: it will be tried again");
+        assert_eq!(attempts(&m), Some((1, 0)));
+
+        // Inside the backoff: not tried.
+        m.sync(&[vmi("n1")]).await;
+        assert_eq!(attempts(&m), Some((1, 0)));
+
+        // A new spec is tried at once, and counts from one.
+        let mut changed = vmi("n1");
+        changed["metadata"]["generation"] = json!(2);
+        m.sync(&[changed]).await;
+        assert_eq!(attempts(&m), Some((1, 2)));
+
+        // No longer wanted: forgotten.
+        m.sync(&[]).await;
+        assert_eq!(attempts(&m), None);
+    }
+
+    #[tokio::test]
+    async fn uid_adapter_preserves_start_backoff_and_forgets_deleted_uid() {
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), "http://127.0.0.1:1");
+        let mut obj = vmi("n1");
+        m.reconcile_one("u-1", Some(&obj)).await.unwrap();
+        m.reconcile_one("u-1", Some(&obj)).await.unwrap();
+        assert_eq!(m.retries.lock().unwrap()["u-1"].attempts, 1);
+        obj["metadata"]["generation"] = json!(2);
+        m.reconcile_one("u-1", Some(&obj)).await.unwrap();
+        assert_eq!(m.retries.lock().unwrap()["u-1"].generation, 2);
+        assert_eq!(m.retries.lock().unwrap()["u-1"].attempts, 1);
+        m.reconcile_one("u-1", None).await.unwrap();
+        assert!(!m.retries.lock().unwrap().contains_key("u-1"));
+    }
+
+    #[tokio::test]
+    async fn uid_teardown_detaches_but_keeps_vm_owned_disks() {
+        use axum::{routing::delete, http::StatusCode};
+        let deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = deleted.clone();
+        let app = axum::Router::new()
+            .route("/api/v1/volumes/disk/attach", delete(|| async { StatusCode::OK }))
+            .route("/api/v1/volumes/disk", delete(move || {
+                let seen = seen.clone();
+                async move { seen.store(true, std::sync::atomic::Ordering::SeqCst); StatusCode::OK }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), "")
+            .with_storage(crate::engine::EngineClient::new(&url, crate::engine::TokenSource::none()));
+        m.record_failure("u-1", &vmi("n1"), "fixture").await;
+        {
+            let mut records = m.vms.lock().await;
+            let vm = records.get_mut("u-1").unwrap();
+            vm.disks.push(ResolvedDisk { name: "root".into(), device: "/dev/test".into(),
+                volume_id: Some("disk".into()), readonly: false, bus: Default::default() });
+            vm.owned_volumes.push("disk".into());
+        }
+        m.reconcile_one("u-1", None).await.unwrap();
+        assert!(m.running().await.is_empty());
+        assert!(!deleted.load(std::sync::atomic::Ordering::SeqCst));
+        server.abort();
+    }
+
+    /// A VirtualMachine with `runStrategy: Once` asked for no second try: that
+    /// one is recorded Failed with the reason, as before (#76).
+    #[tokio::test]
+    async fn a_failed_start_under_run_strategy_once_is_failed_with_a_reason() {
+        use axum::routing::get;
+        let app = axum::Router::new()
+            .route(
+                "/apis/kubevirt.io/v1/namespaces/default/virtualmachines/web",
+                get(|| async { axum::Json(json!({"spec": {"runStrategy": "Once"}})) }),
+            )
+            .fallback(|| async { axum::Json(json!({})) });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), &url);
+        let mut obj = vmi("n1");
+        obj["metadata"]["ownerReferences"] = json!([{"kind": "VirtualMachine", "name": "web"}]);
+        m.sync(&[obj]).await;
         let all = m.running().await;
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].phase, Phase::Failed);
         assert!(all[0].message.contains("no ring"), "{}", all[0].message);
+    }
+
+    /// A clone made for a start is known as fresh before anything else can
+    /// fail, and is deleted with it, so a retried start leaves nothing
+    /// behind (#76).
+    #[tokio::test]
+    async fn a_failed_start_deletes_the_clone_it_made() {
+        use axum::routing::{delete, post};
+        let deleted: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let d = deleted.clone();
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/volumes/{g}/clone",
+                post(|| async { axum::Json(json!({"id": "clone-1"})) }),
+            )
+            // Nothing made before: the root is cloned (#75 looks first).
+            .route(
+                "/api/v1/volumes",
+                axum::routing::get(|| async { axum::Json(json!({"items": []})) }),
+            )
+            // The attach fails, after the clone was made.
+            .route(
+                "/api/v1/volumes/{id}/attach",
+                post(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "no ublk") }),
+            )
+            .route(
+                "/api/v1/volumes/{id}",
+                delete(move |axum::extract::Path(id): axum::extract::Path<String>| {
+                    let d = d.clone();
+                    async move {
+                        d.lock().unwrap().push(id);
+                        axum::Json(json!({}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), "")
+            .with_storage(crate::engine::EngineClient::new(&url, crate::engine::TokenSource::none()));
+
+        let mut obj = vmi("n1");
+        obj["spec"]["domain"]["devices"] = json!({"disks": [{"name": "root", "disk": {"bus": "virtio"}}]});
+        obj["spec"]["volumes"] = json!([{"name": "root", "containerDisk": {"image": "fedora-43"}}]);
+        let vm: VmSpec = stormvm_spec::kube::from_kube(&obj).unwrap();
+        let mut fresh = Vec::new();
+        let r = m.resolve_disks_with_keys(&vm, &[], &Value::Null, &mut fresh).await;
+        assert!(matches!(r, Err(StartFail::Failed(_))), "{r:?}");
+        assert_eq!(fresh, vec!["clone-1".to_string()]);
+        m.delete_volumes("web-1", &fresh).await;
+        assert_eq!(*deleted.lock().unwrap(), vec!["clone-1".to_string()]);
+    }
+
+    #[test]
+    fn retries_back_off_from_ten_seconds_to_five_minutes() {
+        let d = |n| retry_delay(n).as_secs();
+        assert_eq!((d(1), d(2), d(3), d(4), d(5), d(6), d(7)), (10, 20, 40, 80, 160, 300, 300));
+        assert_eq!(d(1000), 300);
+        assert!(!gives_up(None));
+        assert!(!gives_up(Some(&json!({"spec": {"running": true}}))));
+        assert!(!gives_up(Some(&json!({"spec": {"runStrategy": "RerunOnFailure"}}))));
+        assert!(gives_up(Some(&json!({"spec": {"runStrategy": "Manual"}}))));
+        let owned = json!({"metadata": {"ownerReferences": [{"kind": "Pod", "name": "p"}, {"kind": "VirtualMachine", "name": "vm"}]}});
+        assert_eq!(owner_vm(&owned), Some("vm"));
+        assert_eq!(owner_vm(&json!({"metadata": {}})), None);
     }
 
     /// An apiserver and an engine on one port (their paths do not overlap):
@@ -2437,6 +3519,319 @@ mod tests {
     /// pods `pods` lists, and an engine whose volumes are `vols`. Creates are
     /// recorded, attaches answer a device, and any write to the apiserver
     /// (the claim's binding) is accepted.
+    // ---- #75: a VM's disks outlive its VMI ----
+
+    #[test]
+    fn a_vms_disks_belong_to_the_virtual_machine_not_the_vmi() {
+        let mut obj = vmi("n1");
+        obj["metadata"]["ownerReferences"] =
+            json!([{"kind": "VirtualMachine", "name": "web", "uid": "vm-uid"}]);
+        assert_eq!(
+            disk_owner(&obj, None),
+            json!({"kind": "VirtualMachine", "namespace": "default", "name": "web", "uid": "vm-uid"})
+        );
+        // No VirtualMachine: the VMI owns its own.
+        assert_eq!(
+            disk_owner(&vmi("n1"), None),
+            json!({"kind": "VirtualMachineInstance", "namespace": "default", "name": "web-1", "uid": "u-1"})
+        );
+        // Retained, on the VMI or on its VM: no owner, so nothing deletes them.
+        let mut kept = obj.clone();
+        kept["metadata"]["annotations"] = json!({ RETAIN_ANNOTATION: "true" });
+        assert!(disk_owner(&kept, None).is_null());
+        let vm = json!({"metadata": {"annotations": { RETAIN_ANNOTATION: "true" }}});
+        assert!(disk_owner(&obj, Some(&vm)).is_null());
+    }
+
+    #[test]
+    fn only_a_404_another_uid_or_a_deletion_says_the_owner_is_gone() {
+        let owner = json!({"kind": "VirtualMachine", "namespace": "web", "name": "a", "uid": "u1"});
+        assert_eq!(owner_path(&owner).as_deref(), Some("/apis/kubevirt.io/v1/namespaces/web/virtualmachines/a"));
+        assert_eq!(owner_path(&json!({"kind": "PersistentVolumeClaim", "namespace": "x", "name": "y"})), None);
+        assert!(owner_gone(404, None, &owner));
+        assert!(!owner_gone(200, Some(&json!({"metadata": {"uid": "u1"}})), &owner));
+        assert!(owner_gone(200, Some(&json!({"metadata": {"uid": "u2"}})), &owner));
+        assert!(owner_gone(200, Some(&json!({"metadata": {"uid": "u1", "deletionTimestamp": "t"}})), &owner));
+        // Could not ask is not gone.
+        for code in [500, 503, 403, 401] {
+            assert!(!owner_gone(code, None, &owner), "{code}");
+        }
+        assert!(!owner_gone(200, None, &owner));
+    }
+
+    /// An engine for the #75 tests: volumes with owners, clone/create/delete,
+    /// owner updates; and an apiserver answering for owners by path.
+    struct DiskEngine {
+        url: String,
+        vols: Arc<std::sync::Mutex<Vec<Value>>>,
+        cloned: Arc<std::sync::Mutex<Vec<Value>>>,
+        deleted: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    async fn disk_engine(vols: Vec<Value>, owners: Vec<(&'static str, u16, Value)>) -> DiskEngine {
+        use axum::extract::Path;
+        use axum::routing::{get, post, put};
+        type Shared<T> = Arc<std::sync::Mutex<T>>;
+        let vols: Shared<Vec<Value>> = Arc::new(std::sync::Mutex::new(vols));
+        let cloned: Shared<Vec<Value>> = Arc::default();
+        let deleted: Shared<Vec<String>> = Arc::default();
+        let (v1, v2, v3, v4, v5) = (vols.clone(), vols.clone(), vols.clone(), vols.clone(), vols.clone());
+        let (c1, d1) = (cloned.clone(), deleted.clone());
+        let mut app = axum::Router::new()
+            .route(
+                "/api/v1/volumes",
+                get(move || {
+                    let v = v1.clone();
+                    async move { axum::Json(json!({ "items": v.lock().unwrap().clone() })) }
+                })
+                .post(move |axum::Json(b): axum::Json<Value>| {
+                    let v = v2.clone();
+                    async move {
+                        let mut v = v.lock().unwrap();
+                        // Never reused, as the engine's are not.
+                        let id = format!("vol-{}", uuid::Uuid::new_v4().simple());
+                        v.push(json!({"id": id, "name": b["name"], "owner": b["owner"]}));
+                        axum::Json(json!({ "id": id }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/volumes/{g}/clone",
+                post(move |axum::Json(b): axum::Json<Value>| {
+                    let (v, c) = (v3.clone(), c1.clone());
+                    async move {
+                        let mut v = v.lock().unwrap();
+                        // Never reused, as the engine's are not.
+                        let id = format!("vol-{}", uuid::Uuid::new_v4().simple());
+                        v.push(json!({"id": id, "name": b["name"], "owner": b["owner"]}));
+                        c.lock().unwrap().push(b);
+                        axum::Json(json!({ "id": id }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/volumes/{id}/attach",
+                post(|Path(id): Path<String>| async move {
+                    axum::Json(json!({ "device_hint": format!("/dev/ublk-{id}") }))
+                })
+                .delete(|| async { axum::Json(json!({})) }),
+            )
+            .route(
+                "/api/v1/volumes/{id}/owner",
+                put(move |Path(id): Path<String>, axum::Json(b): axum::Json<Value>| {
+                    let v = v4.clone();
+                    async move {
+                        for x in v.lock().unwrap().iter_mut() {
+                            if x["id"] == id {
+                                x["owner"] = b["owner"].clone();
+                            }
+                        }
+                        axum::Json(json!({}))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/volumes/{id}",
+                axum::routing::delete(move |Path(id): Path<String>| {
+                    let (v, d) = (v5.clone(), d1.clone());
+                    async move {
+                        v.lock().unwrap().retain(|x| x["id"] != id);
+                        d.lock().unwrap().push(id);
+                        axum::Json(json!({}))
+                    }
+                }),
+            )
+            .route("/api/v1/volumes/{id}/cidata", post(|| async { axum::Json(json!({})) }));
+        for (path, code, body) in owners {
+            app = app.route(
+                path,
+                get(move || {
+                    let body = body.clone();
+                    async move { (axum::http::StatusCode::from_u16(code).unwrap(), axum::Json(body)) }
+                }),
+            );
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        DiskEngine { url, vols, cloned, deleted }
+    }
+
+    fn disk_manager(e: &DiskEngine, api: &str) -> VmManager {
+        VmManager::new(None, "n1", reqwest::Client::new(), api)
+            .with_storage(crate::engine::EngineClient::new(&e.url, crate::engine::TokenSource::none()))
+    }
+
+    /// A VMI of VirtualMachine `web` (uid `vm-uid`): a golden root and a seed.
+    fn vm_owned_vmi(uid: &str) -> Value {
+        let mut obj = vmi("n1");
+        obj["metadata"]["uid"] = json!(uid);
+        obj["metadata"]["ownerReferences"] =
+            json!([{"kind": "VirtualMachine", "name": "web", "uid": "vm-uid"}]);
+        obj["spec"]["domain"]["devices"] = json!({"disks": [
+            {"name": "root", "disk": {"bus": "virtio"}},
+            {"name": "cloudinit", "disk": {"bus": "virtio"}},
+        ]});
+        obj["spec"]["volumes"] = json!([
+            {"name": "root", "containerDisk": {"image": "fedora-43"}},
+            {"name": "cloudinit", "cloudInitNoCloud": {"userData": "#cloud-config\n"}},
+        ]);
+        obj
+    }
+
+    /// **The issue.** A VirtualMachine restart is a new VMI: its root is the
+    /// one the first start cloned, found by name, and the golden is cloned
+    /// once. The seed is made again (its keys can change) and the old one
+    /// goes, so there is never a second volume under its name.
+    #[tokio::test]
+    async fn a_restart_reattaches_the_root_it_left_and_clones_once() {
+        let e = disk_engine(vec![], vec![]).await;
+        let m = disk_manager(&e, "");
+        let first = vm_owned_vmi("vmi-1");
+        let owner = disk_owner(&first, None);
+        let spec: VmSpec = stormvm_spec::kube::from_kube(&first).unwrap();
+        let (disks, owned) = m.resolve_disks_with_keys(&spec, &[], &owner, &mut Vec::new()).await.unwrap();
+        let root = disks[0].volume_id.clone().unwrap();
+        let seed = disks[1].volume_id.clone().unwrap();
+        assert_eq!(owned, vec![root.clone(), seed.clone()]);
+        assert_eq!(e.cloned.lock().unwrap().len(), 1);
+        assert_eq!(e.cloned.lock().unwrap()[0]["owner"], owner);
+        assert_eq!(e.cloned.lock().unwrap()[0]["name"], json!("default.web-1-root"));
+
+        // Stopped: detached, nothing deleted.
+        let vm = Vm {
+            namespace: "default".into(),
+            name: "web-1".into(),
+            uid: "vmi-1".into(),
+            log_dir: String::new(),
+            handle: Handle::NONE,
+            disks,
+            phase: Phase::Succeeded,
+            exit_code: 0,
+            message: String::new(),
+            started_unix: 1,
+            ready_unix: None,
+            owned_volumes: owned,
+            nics: vec![],
+            access: Access::default(),
+        };
+        m.stop(&vm).await;
+        assert!(e.deleted.lock().unwrap().is_empty(), "a stop deletes nothing");
+
+        // The restart: a new VMI of the same VirtualMachine.
+        let second = vm_owned_vmi("vmi-2");
+        let spec: VmSpec = stormvm_spec::kube::from_kube(&second).unwrap();
+        let (again, _) = m
+            .resolve_disks_with_keys(&spec, &[], &disk_owner(&second, None), &mut Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(again[0].volume_id.as_deref(), Some(root.as_str()), "the same root");
+        assert_eq!(e.cloned.lock().unwrap().len(), 1, "not cloned again");
+        assert_eq!(*e.deleted.lock().unwrap(), vec![seed.clone()], "only the old seed goes");
+        assert_ne!(again[1].volume_id.as_deref(), Some(seed.as_str()));
+        let names: Vec<Value> = e.vols.lock().unwrap().iter().map(|v| v["name"].clone()).collect();
+        assert_eq!(names.iter().filter(|n| **n == json!("default.web-1-cloudinit")).count(), 1);
+    }
+
+    /// A VM deleted and made again under its name is a new machine: the old
+    /// one's root is not booted, and the start waits for the sweep.
+    #[tokio::test]
+    async fn a_root_left_by_an_earlier_vm_of_the_name_is_not_reused() {
+        let old = json!({"id": "old-root", "name": "default.web-1-root",
+                         "owner": {"kind": "VirtualMachine", "namespace": "default", "name": "web", "uid": "earlier"}});
+        let e = disk_engine(vec![old], vec![]).await;
+        let m = disk_manager(&e, "");
+        let obj = vm_owned_vmi("vmi-1");
+        let spec: VmSpec = stormvm_spec::kube::from_kube(&obj).unwrap();
+        let r = m.resolve_disks_with_keys(&spec, &[], &disk_owner(&obj, None), &mut Vec::new()).await;
+        match r {
+            Err(StartFail::Waiting(why)) => assert!(why.contains("earlier VirtualMachine"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(e.cloned.lock().unwrap().is_empty());
+    }
+
+    /// A disk made before owners existed gets one when it is found, so the
+    /// sweep can find it later.
+    #[tokio::test]
+    async fn a_found_disk_is_given_its_owner() {
+        let e = disk_engine(vec![json!({"id": "r", "name": "default.web-1-root"})], vec![]).await;
+        let m = disk_manager(&e, "");
+        let obj = vm_owned_vmi("vmi-1");
+        let spec: VmSpec = stormvm_spec::kube::from_kube(&obj).unwrap();
+        let owner = disk_owner(&obj, None);
+        m.resolve_disks_with_keys(&spec, &[], &owner, &mut Vec::new()).await.unwrap();
+        let root = e.vols.lock().unwrap().iter().find(|v| v["id"] == "r").cloned().unwrap();
+        assert_eq!(root["owner"], owner);
+    }
+
+    /// The sweep deletes exactly the disks whose owner is gone for good.
+    #[tokio::test]
+    async fn the_sweep_deletes_only_what_a_gone_owner_left() {
+        let owned = |id: &str, kind: &str, name: &str, uid: &str| {
+            json!({"id": id, "name": id, "owner": {"kind": kind, "namespace": "default", "name": name, "uid": uid}})
+        };
+        let vols = vec![
+            owned("deleted-vm", "VirtualMachine", "a", "ua"),
+            owned("live-vm", "VirtualMachine", "b", "ub"),
+            owned("replaced-vm", "VirtualMachine", "c", "uc"),
+            owned("unanswered", "VirtualMachine", "d", "ud"),
+            owned("deleting-vmi", "VirtualMachineInstance", "e", "ue"),
+            {
+                let mut v = owned("in-use", "VirtualMachine", "a", "ua");
+                v["in_use"] = json!(true);
+                v
+            },
+            owned("held-here", "VirtualMachine", "a", "ua"),
+            json!({"id": "no-owner", "name": "no-owner"}),
+            json!({"id": "a-claim", "name": "a-claim",
+                   "owner": {"kind": "PersistentVolumeClaim", "namespace": "default", "name": "a"}}),
+        ];
+        let p = |plural: &str, n: &str| format!("/apis/kubevirt.io/v1/namespaces/default/{plural}/{n}");
+        let owners: Vec<(&'static str, u16, Value)> = vec![
+            (Box::leak(p("virtualmachines", "b").into_boxed_str()), 200, json!({"metadata": {"uid": "ub"}})),
+            (Box::leak(p("virtualmachines", "c").into_boxed_str()), 200, json!({"metadata": {"uid": "new"}})),
+            (Box::leak(p("virtualmachines", "d").into_boxed_str()), 500, json!({})),
+            (Box::leak(p("virtualmachineinstances", "e").into_boxed_str()), 200,
+             json!({"metadata": {"uid": "ue", "deletionTimestamp": "2026-09-29T00:00:00Z"}})),
+        ];
+        // `a` has no route: 404.
+        let e = disk_engine(vols, owners).await;
+        let m = disk_manager(&e, &e.url);
+        m.vms.lock().await.insert("x".into(), Vm {
+            namespace: "default".into(),
+            name: "x".into(),
+            uid: "x".into(),
+            log_dir: String::new(),
+            handle: Handle::NONE,
+            disks: vec![ResolvedDisk {
+                name: "root".into(),
+                device: "/dev/x".into(),
+                volume_id: Some("held-here".into()),
+                readonly: false,
+                bus: stormvm_spec::DiskBus::Virtio,
+            }],
+            phase: Phase::Running,
+            exit_code: 0,
+            message: String::new(),
+            started_unix: 1,
+            ready_unix: None,
+            owned_volumes: vec![],
+            nics: vec![],
+            access: Access::default(),
+        });
+
+        m.sweep_orphans().await;
+        let mut gone = e.deleted.lock().unwrap().clone();
+        gone.sort();
+        assert_eq!(gone, vec!["deleted-vm", "deleting-vmi", "replaced-vm"]);
+
+        // Not again within the minute.
+        e.vols.lock().unwrap().push(owned("later", "VirtualMachine", "a", "ua"));
+        m.sweep_orphans().await;
+        assert_eq!(e.deleted.lock().unwrap().len(), 3);
+    }
+
     struct Fake {
         url: String,
         vols: Arc<std::sync::Mutex<Vec<(String, String)>>>,

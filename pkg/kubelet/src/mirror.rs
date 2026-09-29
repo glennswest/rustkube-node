@@ -148,6 +148,69 @@ pub fn mirror_pod(asset: &Asset, node: &str, node_uid: &str, started: &str) -> V
     })
 }
 
+/// The reason a mirror pod carries when its asset is not in PID 1's table.
+pub const NOT_STARTED: &str = "NotStarted";
+
+/// This node's mirror pods whose asset PID 1 did not list on this boot, and
+/// that do not say so yet (#87).
+///
+/// PID 1 lists every asset it tried to start, refused ones included. One it
+/// did not try (its `start` line gone, or the boot stopped before its unit)
+/// is simply absent, and the mirror used to write only listed assets, so the
+/// pod kept the previous boot's `Running` and `startTime` for good.
+///
+/// `pods` is a PodList. Only pods labelled as node services, on this node,
+/// are considered; one already marked [`NOT_STARTED`] is skipped, so a pass
+/// writes nothing when nothing changed.
+pub fn stale_mirrors<'a>(pods: &'a Value, node: &str, assets: &[Asset]) -> Vec<&'a Value> {
+    let Some(items) = pods["items"].as_array() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter(|p| p["metadata"]["labels"]["storm.io/component"] == "node-service")
+        .filter(|p| p["spec"]["nodeName"].as_str() == Some(node))
+        .filter(|p| {
+            let asset = p["metadata"]["labels"]["storm.io/asset"].as_str().unwrap_or("");
+            !asset.is_empty() && !assets.iter().any(|a| a.name == asset)
+        })
+        .filter(|p| p["status"]["containerStatuses"][0]["state"]["waiting"]["reason"] != NOT_STARTED)
+        .collect()
+}
+
+/// `pod` with the status of an asset that is not running on this boot.
+///
+/// Pending with the container waiting, not Failed: nothing ran and failed,
+/// so there is no exit to report, and a Failed pod reads as a crash. No
+/// `startTime`: the one it had was the previous boot's. Not deleted: a
+/// service that did not come back is what someone needs to see.
+pub fn not_started(pod: &Value) -> Value {
+    let mut pod = pod.clone();
+    let asset = pod["metadata"]["labels"]["storm.io/asset"].as_str().unwrap_or("").to_string();
+    let restarts = pod["status"]["containerStatuses"][0]["restartCount"].as_u64().unwrap_or(0);
+    let message = format!("{asset} is not in PID 1's asset table: it was not started on this boot");
+    pod["status"] = json!({
+        "phase": "Pending",
+        "hostIP": "",
+        "reason": NOT_STARTED,
+        "message": message,
+        "conditions": [
+            { "type": "PodScheduled", "status": "True" },
+            { "type": "Initialized", "status": "False" },
+            { "type": "ContainersReady", "status": "False" },
+            { "type": "Ready", "status": "False" },
+        ],
+        "containerStatuses": [{
+            "name": asset,
+            "image": format!("stormpump://{asset}"),
+            "ready": false,
+            "restartCount": restarts,
+            "state": { "waiting": { "reason": NOT_STARTED, "message": message } },
+        }],
+    });
+    pod
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +244,46 @@ mod tests {
             mirror_name("stormblock", "node-a"),
             mirror_name("stormblock", "node-b")
         );
+    }
+
+    /// A service PID 1 did not list on this boot keeps no stale Running (#87).
+    #[test]
+    fn a_mirror_whose_asset_is_not_listed_is_marked_not_started_once() {
+        let running = Asset { name: "fastetcd".into(), running: true, restarts: 0, age_secs: 5 };
+        let listed = mirror_pod(&running, "n1", "u", "2026-09-28T17:32:00Z");
+        let old = mirror_pod(
+            &Asset { name: "registry".into(), running: true, restarts: 3, age_secs: 9 },
+            "n1",
+            "u",
+            "2026-09-28T14:02:00Z",
+        );
+        let other_node = mirror_pod(
+            &Asset { name: "registry".into(), running: true, restarts: 0, age_secs: 9 },
+            "n2",
+            "u",
+            "2026-09-28T14:02:00Z",
+        );
+        let mut plain = old.clone();
+        plain["metadata"]["labels"] = json!({"app": "x"});
+        let list = json!({"items": [listed, old, other_node, plain]});
+
+        let stale = stale_mirrors(&list, "n1", &[running.clone()]);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0]["metadata"]["name"], "registry-n1");
+
+        let marked = not_started(stale[0]);
+        assert_eq!(marked["status"]["phase"], "Pending");
+        assert!(marked["status"].get("startTime").is_none(), "the old boot's startTime must go");
+        let cs = &marked["status"]["containerStatuses"][0];
+        assert_eq!(cs["state"]["waiting"]["reason"], NOT_STARTED);
+        assert_eq!(cs["ready"], false);
+        assert_eq!(cs["restartCount"], 3);
+        // Metadata is kept, resourceVersion included, so the write is guarded.
+        assert_eq!(marked["metadata"], stale[0]["metadata"]);
+
+        // Once marked, the next pass has nothing to write.
+        let list = json!({"items": [marked]});
+        assert!(stale_mirrors(&list, "n1", &[running]).is_empty());
     }
 
     #[test]

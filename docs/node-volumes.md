@@ -3,7 +3,8 @@
 Every service on a stormcos node keeps its state in stormblock volumes, cloned
 from goldens and mounted at boot: `<component>-data`, `<component>-state` and
 `<component>-logs`. The kubelet (`pkg/kubelet/src/system_claims.rs`) shows each
-one as a Kubernetes claim: **a PV and its bound PVC, always together** (#49, #59).
+one as a Kubernetes claim: **a PV and its bound PVC** (#49, #59), subject to
+the cross-node naming limitation below.
 
 | Object | Name | Notes |
 |---|---|---|
@@ -51,3 +52,15 @@ writes a new claim's first status, so it does not read as Unknown until then.
 
 Only objects annotated `storm.io/node: <this node>` are written. An object of
 the same name from another node is left alone.
+
+## Remaining limitations
+
+Names are not node-qualified. When two nodes both have `fastetcd-data`, the
+cluster-scoped PV and kube-system PVC can represent only the first node;
+other nodes warn and leave the objects alone (#59). Naming/migration requires
+the owner's decision (#107). Therefore this is not yet an inventory of every
+node volume in a multi-node cluster.
+
+Drive/shelf/bay/RAID placement joins are not published here (#60). The engine
+and stormdrive placement APIs are prerequisites, not proof that this mirror
+has consumed them. Capacity reservation/overcommit protection remains #62.
