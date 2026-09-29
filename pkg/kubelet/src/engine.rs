@@ -36,6 +36,18 @@ pub const DEFAULT_URL: &str = "http://127.0.0.1:9090";
 /// The token file stormcos gives the kubelet (stormcos#104).
 pub const DEFAULT_TOKEN_FILE: &str = "/run/stormblock/engine/api_token";
 /// Where stormblock's CLI looks after `$STORMBLOCK_TOKEN_FILE`.
+/// How long one ordinary engine call may take, connect to last byte (#99).
+/// The engine is on loopback and answers in milliseconds; this bounds an
+/// engine that has stopped answering, so a worker is freed with an error.
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long to wait for the engine to accept a connection.
+pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// A blank's mint answers when its format is done, which for a large class is
+/// minutes. stormblock finishes the format on its own task if the caller goes
+/// (stormblock#141) and refuses a second template of the same name, so a mint
+/// that outlives this is found again by name, not made twice.
+pub const MINT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+
 const FALLBACK_TOKEN_FILES: [&str; 2] = ["/etc/stormblock/api_token", "/var/lib/stormblock/api_token"];
 
 /// Where the engine's token can come from, in order. Not `Debug`: it can
@@ -144,7 +156,12 @@ impl EngineClient {
     pub fn new(url: &str, source: TokenSource) -> EngineClient {
         EngineClient {
             inner: Arc::new(Inner {
-                http: reqwest::Client::new(),
+                // No client-wide timeout: each request carries its own, and
+                // the volume watch carries none (#99).
+                http: reqwest::Client::builder()
+                    .connect_timeout(CONNECT_TIMEOUT)
+                    .build()
+                    .unwrap_or_default(),
                 url: url.trim_end_matches('/').to_string(),
                 source,
                 token: Mutex::new(None),
@@ -160,6 +177,18 @@ impl EngineClient {
 
     pub async fn get(&self, url: &str) -> reqwest::Result<Response> {
         self.send(Method::GET, url, None).await
+    }
+
+    /// A POST bounded by `timeout` rather than [`REQUEST_TIMEOUT`]: one the
+    /// engine answers only when a long operation is done (a mint).
+    pub async fn post_within(&self, url: &str, body: &Value, timeout: std::time::Duration) -> reqwest::Result<Response> {
+        self.send_within(Method::POST, url, Some(body), Some(timeout)).await
+    }
+
+    /// A GET with no overall bound, for a stream that is meant to stay open
+    /// (the volume watch). Connecting is still bounded.
+    async fn get_stream(&self, url: &str) -> reqwest::Result<Response> {
+        self.send_within(Method::GET, url, None, None).await
     }
 
     pub async fn post(&self, url: &str, body: &Value) -> reqwest::Result<Response> {
@@ -185,15 +214,26 @@ impl EngineClient {
         url: &str,
         body: Option<&Value>,
     ) -> reqwest::Result<Response> {
+        self.send_within(method, url, body, Some(REQUEST_TIMEOUT)).await
+    }
+
+    /// [`Self::send`], bounded by `timeout` (`None`: only the connect is).
+    async fn send_within(
+        &self,
+        method: Method,
+        url: &str,
+        body: Option<&Value>,
+        timeout: Option<std::time::Duration>,
+    ) -> reqwest::Result<Response> {
         let used = self.token();
-        let resp = self.once(method.clone(), url, body, used.as_deref()).await?;
+        let resp = self.once(method.clone(), url, body, used.as_deref(), timeout).await?;
         if resp.status() != StatusCode::UNAUTHORIZED {
             return Ok(resp);
         }
         let fresh = self.reload();
         if fresh.is_some() && fresh != used {
             info!("stormblock refused the engine token; retrying with the one now on disk");
-            return self.once(method, url, body, fresh.as_deref()).await;
+            return self.once(method, url, body, fresh.as_deref(), timeout).await;
         }
         if fresh.is_none() {
             self.say_none();
@@ -207,8 +247,12 @@ impl EngineClient {
         url: &str,
         body: Option<&Value>,
         token: Option<&str>,
+        timeout: Option<std::time::Duration>,
     ) -> reqwest::Result<Response> {
         let mut req = self.inner.http.request(method, url);
+        if let Some(t) = timeout {
+            req = req.timeout(t);
+        }
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
@@ -269,7 +313,7 @@ impl EngineClient {
         let url = format!("{}{VOLUME_WATCH}", self.url());
         let mut backoff = std::time::Duration::from_secs(1);
         loop {
-            match self.get(&url).await {
+            match self.get_stream(&url).await {
                 Ok(r) if r.status() == StatusCode::NOT_FOUND => {
                     crate::metrics::observe_timed("engine-volumes", "fallback");
                     changed();
@@ -304,6 +348,30 @@ impl EngineClient {
 
 #[cfg(test)]
 mod tests {
+
+    /// An engine that accepts and never answers frees the caller at the
+    /// bound, with an error (#99).
+    #[tokio::test]
+    async fn a_silent_engine_is_a_timeout_not_a_hang() {
+        let app = axum::Router::new().route(
+            "/api/v1/volumes",
+            axum::routing::get(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                "late"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let engine = EngineClient::new(&url, TokenSource::none());
+        let started = std::time::Instant::now();
+        let e = engine
+            .send_within(Method::GET, &format!("{url}/api/v1/volumes"), None, Some(std::time::Duration::from_millis(200)))
+            .await
+            .unwrap_err();
+        assert!(e.is_timeout(), "{e}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
 
     /// Every event line is a change; a connect is one too, and the stream
     /// ending reconnects (#101).

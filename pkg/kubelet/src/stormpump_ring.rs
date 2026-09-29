@@ -55,6 +55,10 @@ struct Request {
     /// answered in it (`QUERY`'s stats block).
     read_back: bool,
     reply: mpsc::Sender<Result<Reply, RingError>>,
+    /// When the caller stops waiting (#99): [`DEADLINE`] from when it asked,
+    /// whether the request is still queued, waiting for the arena, or in
+    /// flight.
+    expires: std::time::Instant,
 }
 
 /// A completion, and the arena region the engine answered in when the request
@@ -294,13 +298,22 @@ impl RingClient {
                 payload,
                 read_back,
                 reply,
+                expires: std::time::Instant::now() + DEADLINE,
             })
             .map_err(|_| RingError::Gone)?;
         }
         // Outside the lock: another caller must be able to submit while this
         // one waits, or the ring serialises on the client rather than on the
         // engine.
-        answer.recv().map_err(|_| RingError::Gone)?
+        //
+        // The ring thread answers by the deadline (#99). Waiting twice as
+        // long here is only a guard against that thread being stuck itself;
+        // a request it dequeues after its deadline is never submitted.
+        match answer.recv_timeout(DEADLINE * 2) {
+            Ok(answer) => answer,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(RingError::Timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(RingError::Gone),
+        }
     }
 
     /// Hand the engine a descriptor, under a name a spec can claim.
@@ -324,7 +337,11 @@ impl RingClient {
             })
             .map_err(|_| RingError::Gone)?;
         }
-        answer.recv().map_err(|_| RingError::Gone)?
+        match answer.recv_timeout(DEADLINE * 2) {
+            Ok(answer) => answer,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(RingError::Timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(RingError::Gone),
+        }
     }
 
     /// Close a descriptor this client deposited that no spawn consumed
@@ -629,6 +646,97 @@ fn arena_region(arena: &[u8], region: ArenaRef) -> Vec<u8> {
 /// rather than a kubelet that stops reconciling.
 const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// A request in flight: which op, who is waiting, and until when.
+struct Live {
+    op: u8,
+    reply: mpsc::Sender<Result<Reply, RingError>>,
+    expires: std::time::Instant,
+}
+
+/// What a completion answers.
+enum Answer {
+    /// A caller still waiting.
+    Waiting(u8, mpsc::Sender<Result<Reply, RingError>>),
+    /// A request whose caller gave up at its deadline, or one of this
+    /// thread's own undo requests: nobody is told (#99).
+    Abandoned(u8),
+    /// Nothing this thread sent.
+    Unknown,
+}
+
+/// Requests in flight, and the ones given up on (#99).
+///
+/// **A deadline does not un-send a request.** Once an SQE is on the ring the
+/// engine may act on it at any moment, and its completion still arrives. So
+/// a request past its deadline is answered `Timeout` and moved to
+/// `abandoned`, not forgotten: its completion must still free the arena, and
+/// a late success must still be undone, because nothing else owns what it
+/// made.
+#[derive(Default)]
+struct Outstanding {
+    live: HashMap<u64, Live>,
+    abandoned: HashMap<u64, u8>,
+    /// Workloads a late spawn started: stopped at once, released on exit.
+    orphans: std::collections::HashSet<u64>,
+}
+
+impl Outstanding {
+    fn insert(&mut self, id: u64, op: u8, reply: mpsc::Sender<Result<Reply, RingError>>, expires: std::time::Instant) {
+        self.live.insert(id, Live { op, reply, expires });
+    }
+
+    /// One of this thread's own requests, whose answer nobody wants.
+    fn internal(&mut self, id: u64, op: u8) {
+        self.abandoned.insert(id, op);
+    }
+
+    fn complete(&mut self, id: u64) -> Answer {
+        if let Some(l) = self.live.remove(&id) {
+            return Answer::Waiting(l.op, l.reply);
+        }
+        match self.abandoned.remove(&id) {
+            Some(op) => Answer::Abandoned(op),
+            None => Answer::Unknown,
+        }
+    }
+
+    /// Answer `Timeout` to every request past its deadline, and keep them as
+    /// abandoned.
+    fn expire(&mut self, now: std::time::Instant) {
+        let late: Vec<u64> = self.live.iter().filter(|(_, l)| l.expires <= now).map(|(id, _)| *id).collect();
+        for id in late {
+            if let Some(l) = self.live.remove(&id) {
+                let name = Op::from_u8(l.op).map_or_else(|| format!("op {}", l.op), |o| format!("{o:?}"));
+                tracing::warn!("stormpump did not answer {name} within {DEADLINE:?}; given up, its completion will be undone");
+                let _ = l.reply.send(Err(RingError::Timeout));
+                self.abandoned.insert(id, l.op);
+            }
+        }
+    }
+}
+
+/// The request that undoes a late success of `op` (#99): the caller was told
+/// it failed, so nothing holds what it made. A spawn's workload is stopped
+/// here and released when its exit arrives.
+fn undo_late(op: u8, cqe: &Cqe) -> Option<Sqe> {
+    if cqe.is_err() {
+        return None;
+    }
+    let (opcode, inline_a) = match Op::from_u8(op)? {
+        Op::Spawn => (Op::Stop, 0),
+        Op::VolumeRegister => (Op::VolumeRelease, 0),
+        Op::SpecDefine => (Op::SpecRelease, 0),
+        Op::SandboxAcquire => (Op::SandboxRelease, 0),
+        _ => return None,
+    };
+    Some(Sqe {
+        opcode: opcode as u8,
+        primary: cqe.handle(),
+        inline_a,
+        ..Default::default()
+    })
+}
+
 fn run(
     mut mapping: Mapping,
     rx: mpsc::Receiver<Request>,
@@ -642,7 +750,9 @@ fn run(
     let mut next_id: u64 = 1;
     // Requests submitted and not yet answered. More than one can be in flight
     // when a completion for an earlier request arrives out of order.
-    let mut waiting: HashMap<u64, mpsc::Sender<Result<Reply, RingError>>> = HashMap::new();
+    let mut outstanding = Outstanding::default();
+    // Undo requests not yet on the ring (it was full when they were made).
+    let mut undo: std::collections::VecDeque<Sqe> = std::collections::VecDeque::new();
     // **One request owns the arena at a time.** Every payload is written at
     // offset 0, and a reply (`QUERY`'s stats) is written back into the same
     // region, so a second request taking the arena before the first completed
@@ -651,8 +761,6 @@ fn run(
     // back, and a request that is waiting for it.
     let mut arena_holder: Option<(u64, bool)> = None;
     let mut parked: Option<Request> = None;
-    // Which op each outstanding request was, so a failure can name it.
-    let mut sent: HashMap<u64, u8> = HashMap::new();
 
     loop {
         // Take one request if there is one, without blocking so completions
@@ -674,9 +782,31 @@ fn run(
             let _ = dep.reply.send(result);
         }
 
+        // Undo requests first: each is a resource nobody owns.
+        while let Some(sqe) = undo.pop_front() {
+            let id = next_id;
+            next_id += 1;
+            let sqe = Sqe { user_data: id, ..sqe };
+            if mapping.ring().push_sqe(sqe).is_err() {
+                undo.push_front(Sqe { user_data: 0, ..sqe });
+                break;
+            }
+            outstanding.internal(id, sqe.opcode);
+            stormpump::transport::kick(submit);
+        }
+
         let next = match parked.take() {
             Some(req) => Ok(req),
             None => rx.recv_timeout(std::time::Duration::from_millis(2)),
+        };
+        // A request whose caller has stopped waiting is never submitted: it
+        // would be a side effect nobody owns (#99).
+        let next = match next {
+            Ok(req) if req.expires <= std::time::Instant::now() => {
+                let _ = req.reply.send(Err(RingError::Timeout));
+                continue;
+            }
+            other => other,
         };
         match next {
             Ok(req) if req.payload.is_some() && arena_holder.is_some() => {
@@ -704,11 +834,10 @@ fn run(
                     let _ = req.reply.send(Err(RingError::Full));
                     continue;
                 }
-                sent.insert(id, sqe.opcode);
                 if req.payload.is_some() {
                     arena_holder = Some((id, req.read_back));
                 }
-                waiting.insert(id, req.reply);
+                outstanding.insert(id, sqe.opcode, req.reply, req.expires);
                 stormpump::transport::kick(submit);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -720,6 +849,14 @@ fn run(
         stormpump::transport::drain(complete);
         while let Some(cqe) = mapping.ring().pop_cqe() {
             if cqe.user_data == 0 {
+                // An orphan's exit: release it; nobody else knows it (#99).
+                if outstanding.orphans.remove(&cqe.handle().0) {
+                    undo.push_back(Sqe {
+                        opcode: Op::WorkloadRelease as u8,
+                        primary: cqe.handle(),
+                        ..Default::default()
+                    });
+                }
                 // Unsolicited: a workload ended. Nothing asked, and something
                 // still has to hear it.
                 let _ = exits.send(Exited {
@@ -729,43 +866,49 @@ fn run(
                 exit_changes.send_modify(|revision| *revision = revision.wrapping_add(1));
                 continue;
             }
-            if let Some(reply) = waiting.remove(&cqe.user_data) {
-                if !cqe.is_err() {
-                    sent.remove(&cqe.user_data);
+            // The arena is free again, once what the engine answered in it
+            // has been copied out — whoever is (or is no longer) waiting.
+            let mut arena = Vec::new();
+            if let Some((holder, read_back)) = arena_holder {
+                if holder == cqe.user_data {
+                    if read_back && !cqe.is_err() {
+                        arena = arena_region(mapping.arena(), cqe.arena);
+                    }
+                    arena_holder = None;
                 }
-                // The arena is free again, once what the engine answered in
-                // it has been copied out.
-                let mut arena = Vec::new();
-                if let Some((holder, read_back)) = arena_holder {
-                    if holder == cqe.user_data {
-                        if read_back && !cqe.is_err() {
-                            arena = arena_region(mapping.arena(), cqe.arena);
+            }
+            match outstanding.complete(cqe.user_data) {
+                Answer::Waiting(op, reply) => {
+                    let answer = if cqe.is_err() {
+                        Err(RingError::Failed { op, errno: -cqe.result as i32, step: cqe.aux })
+                    } else {
+                        Ok(Reply { cqe, arena })
+                    };
+                    let _ = reply.send(answer);
+                }
+                Answer::Abandoned(op) => {
+                    if let Some(sqe) = undo_late(op, &cqe) {
+                        tracing::warn!(op, handle = cqe.handle().0, "a request given up on completed late; undoing it");
+                        if op == Op::Spawn as u8 {
+                            outstanding.orphans.insert(cqe.handle().0);
                         }
-                        arena_holder = None;
+                        undo.push_back(sqe);
                     }
                 }
-                let answer = if cqe.is_err() {
-                    Err(RingError::Failed {
-                        op: sent.remove(&cqe.user_data).unwrap_or(0),
-                        errno: -cqe.result as i32,
-                        step: cqe.aux,
-                    })
-                } else {
-                    Ok(Reply { cqe, arena })
-                };
-                let _ = reply.send(answer);
+                Answer::Unknown => {}
             }
         }
 
-        // Anything outstanding past the deadline is reported as such rather
-        // than waited on forever. Cheap to check: `waiting` holds one entry per
-        // request in flight, which is a handful at most.
-        if !waiting.is_empty() {
-            // A deadline per request would need a timestamp each; one shared
-            // deadline is enough because these complete in microseconds, and
-            // the case this exists for is an engine that has stopped answering
-            // at all.
-            let _ = DEADLINE;
+        // Anything past its deadline is answered `Timeout` rather than waited
+        // on forever (#99), and a request parked for the arena too.
+        let now = std::time::Instant::now();
+        outstanding.expire(now);
+        if let Some(req) = parked.take() {
+            if req.expires <= now {
+                let _ = req.reply.send(Err(RingError::Timeout));
+            } else {
+                parked = Some(req);
+            }
         }
     }
 }
@@ -773,6 +916,40 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request past its deadline is answered `Timeout` and kept, so its
+    /// late completion is recognised; one that answers in time is not (#99).
+    #[test]
+    fn a_request_past_its_deadline_times_out_and_is_kept() {
+        let mut o = Outstanding::default();
+        let now = std::time::Instant::now();
+        let (late_tx, late_rx) = mpsc::channel();
+        let (ok_tx, ok_rx) = mpsc::channel();
+        o.insert(1, Op::Spawn as u8, late_tx, now);
+        o.insert(2, Op::Query as u8, ok_tx, now + DEADLINE);
+        o.expire(now);
+        assert!(matches!(late_rx.try_recv(), Ok(Err(RingError::Timeout))));
+        assert!(ok_rx.try_recv().is_err(), "still inside its deadline");
+        assert!(matches!(o.complete(1), Answer::Abandoned(op) if op == Op::Spawn as u8));
+        assert!(matches!(o.complete(2), Answer::Waiting(..)));
+        assert!(matches!(o.complete(3), Answer::Unknown));
+        o.internal(4, Op::Stop as u8);
+        assert!(matches!(o.complete(4), Answer::Abandoned(_)));
+    }
+
+    /// What a late success made is undone; a late failure made nothing (#99).
+    #[test]
+    fn a_late_success_is_undone() {
+        let ok = Cqe::ok(1, Handle(42));
+        let undo = |op: Op| undo_late(op as u8, &ok).map(|s| (s.opcode, s.primary));
+        assert_eq!(undo(Op::Spawn), Some((Op::Stop as u8, Handle(42))));
+        assert_eq!(undo(Op::VolumeRegister), Some((Op::VolumeRelease as u8, Handle(42))));
+        assert_eq!(undo(Op::SpecDefine), Some((Op::SpecRelease as u8, Handle(42))));
+        assert_eq!(undo(Op::SandboxAcquire), Some((Op::SandboxRelease as u8, Handle(42))));
+        assert_eq!(undo(Op::Query), None);
+        assert_eq!(undo(Op::Stop), None);
+        assert!(undo_late(Op::Spawn as u8, &Cqe::err(1, 22)).is_none());
+    }
 
     /// A reply is read from the region the request offered, and a region the
     /// arena does not have is an empty reply rather than a panic.

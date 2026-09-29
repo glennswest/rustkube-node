@@ -143,14 +143,28 @@ pub fn load_network_config(conf_dir: &Path) -> Result<NetworkConfigList, CniErro
 pub struct CniInvoker {
     conf_dir: PathBuf,
     bin_dirs: Vec<PathBuf>,
+    /// How long one plugin may take, stdin to exit (rustkube-node#99).
+    timeout: std::time::Duration,
 }
+
+/// How long one plugin exec may take by default. A plugin that hangs (an
+/// agent that is down, an IPAM that never answers) otherwise held the pod's
+/// worker for ever; past this it is killed, reaped and reported as failed.
+pub const PLUGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl CniInvoker {
     pub fn new(conf_dir: impl Into<PathBuf>, bin_dirs: Vec<PathBuf>) -> Self {
         Self {
             conf_dir: conf_dir.into(),
             bin_dirs,
+            timeout: PLUGIN_TIMEOUT,
         }
+    }
+
+    /// A different bound on each plugin exec than [`PLUGIN_TIMEOUT`].
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Invoker over the standard host paths (/etc/cni/net.d, /opt/cni/bin).
@@ -256,20 +270,49 @@ impl CniInvoker {
             .spawn()
             .map_err(|e| CniError::NetnsError(format!("spawn {binary:?}: {e}")))?;
 
-        {
-            use tokio::io::AsyncWriteExt;
-            let mut stdin = child.stdin.take().expect("stdin piped");
-            stdin
-                .write_all(&stdin_bytes)
-                .await
-                .map_err(|e| CniError::NetnsError(format!("write plugin stdin: {e}")))?;
-            // Drop closes the pipe so the plugin sees EOF.
-        }
-
-        let output = child
-            .wait_with_output()
-            .await
-            .map_err(|e| CniError::NetnsError(format!("wait for {binary:?}: {e}")))?;
+        // Bounded, stdin to exit (#99). The child is kept rather than handed
+        // to `wait_with_output`, so a plugin past its time can be killed and
+        // reaped here, not left running with the worker gone.
+        let mut stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let run = async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Some(mut pipe) = stdin.take() {
+                pipe.write_all(&stdin_bytes)
+                    .await
+                    .map_err(|e| CniError::NetnsError(format!("write plugin stdin: {e}")))?;
+                // Dropped: the plugin sees EOF.
+            }
+            let read = |pipe: Option<tokio::process::ChildStdout>| async move {
+                let mut out = Vec::new();
+                if let Some(mut p) = pipe {
+                    let _ = p.read_to_end(&mut out).await;
+                }
+                out
+            };
+            let read_err = |pipe: Option<tokio::process::ChildStderr>| async move {
+                let mut out = Vec::new();
+                if let Some(mut p) = pipe {
+                    let _ = p.read_to_end(&mut out).await;
+                }
+                out
+            };
+            let (status, stdout, stderr) = tokio::join!(child.wait(), read(stdout), read_err(stderr));
+            let status = status.map_err(|e| CniError::NetnsError(format!("wait for {binary:?}: {e}")))?;
+            Ok::<_, CniError>(std::process::Output { status, stdout, stderr })
+        };
+        let output = match tokio::time::timeout(self.timeout, run).await {
+            Ok(done) => done?,
+            Err(_) => {
+                // Killed and waited for: no process and no zombie is left.
+                let _ = child.kill().await;
+                return Err(CniError::NetnsError(format!(
+                    "plugin {plugin_type} {command} did not finish within {:?}; killed",
+                    self.timeout
+                )));
+            }
+        };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         if !output.status.success() {
@@ -475,6 +518,36 @@ printf '%s' '{result}'
         // ADD order: fake-a then fake-b.
         assert!(stdins[0].0.contains("fake-a"));
         assert!(stdins[1].0.contains("fake-b"));
+    }
+
+    /// A plugin that hangs is killed and reaped at the bound, and the call
+    /// fails saying so (#99).
+    #[tokio::test]
+    async fn a_hung_plugin_is_killed_at_its_timeout() {
+        let conf = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        std::fs::write(
+            conf.path().join("10-net.conflist"),
+            r#"{"cniVersion":"1.0.0","name":"net","plugins":[{"type":"hang"}]}"#,
+        )
+        .unwrap();
+        let pidfile = bin.path().join("pid");
+        let script = format!("#!/bin/sh\necho $$ > {}\nexec sleep 30\n", pidfile.display());
+        let path = bin.path().join("hang");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let invoker = CniInvoker::new(conf.path(), vec![bin.path().to_path_buf()])
+            .with_timeout(std::time::Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        let err = invoker.add(&pod()).await.unwrap_err().to_string();
+        assert!(err.contains("did not finish"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let pid = std::fs::read_to_string(&pidfile).unwrap();
+        assert!(
+            !std::path::Path::new(&format!("/proc/{}", pid.trim())).exists(),
+            "the plugin was left running or unreaped"
+        );
     }
 
     #[tokio::test]

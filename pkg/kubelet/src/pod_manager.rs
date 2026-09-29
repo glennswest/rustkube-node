@@ -3742,8 +3742,10 @@ async fn mint_blank(
     class: &str,
 ) -> Result<(), String> {
     let body = serde_json::json!({ "name": blank, "size": class, "fs": "ext4", "role": "data" });
+    // Bounded by MINT_TIMEOUT, not the ordinary request bound: the answer
+    // comes when the format is done (#99).
     let resp = engine
-        .post(url, &body)
+        .post_within(url, &body, crate::engine::MINT_TIMEOUT)
         .await
         .map_err(|e| format!("stormblock would not mint the blank {blank}: {e}"))?;
     let status = resp.status();
