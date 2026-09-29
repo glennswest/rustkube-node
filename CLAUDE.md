@@ -60,6 +60,25 @@ Steps:
        golden-rustkube-node-d9a108728be0 (at ccb7bfc; the first stage try died on dev: no NVMe device). No
        release request was filed by stage: stormcentral#117. #35 closed (sc-build only, not on a node).
 
+### In progress: #53, VirtualMachineSnapshot (and VirtualMachineRestore: owner decision)
+
+stormvm (in the dc1b7ea lock): `stormvm_spec::snapshot::{snapshot_request, restore_request, snapshot_status,
+restore_status}`, `stormvm_console::snapshot::take(reg, stormblock, name, Options)` (freeze → pause → one /v1
+group snapshot, named `<ns>.<vm>.<snap>`, idempotent by name → unpause → thaw). stormblock#130 is closed.
+The CRDs are stormcos#170 (open): until they are installed the LIST 404s and the kubelet does nothing.
+Found: stormblock on stormcos is single-node (no cluster), so a group snapshot and any volume restored from it
+live only in the engine of the node that took it. The VMI shape has no raw-volume disk (only dataVolume,
+containerDisk → golden, PVC, cloudInit, emptyDisk), so "rewire the disks" needs a decision: owner.
+
+Steps:
+1. [ ] `vm_snapshot.rs`, each tick after the VMIs: list snapshots (404 → CRD absent, nothing). One whose source
+       is registered here (`/run/stormvm/<ns>/<vm>`) and has no phase: claim it (annotation
+       `storm.io/snapshot-node`, rv-guarded), InProgress, `take` in the background, then Succeeded/Failed +
+       group id, sourceUID, indications, Event. failureDeadline (default 5 min) from creationTimestamp. An
+       InProgress one of ours not in flight (kubelet restart) is taken again: idempotent by name.
+2. [ ] Tests (fake apiserver, injected take), docs (README), CHANGELOG, sc-build.
+3. [ ] Restore: question to the owner on #53, `wait-owner`.
+
 ### Done: #83, the console router is told where stormblock is (the snapshot verb)
 
 stormvm's `Config.stormblock` was left `None` in both mounts of `stormvm_console::router`, so its `snapshot`
