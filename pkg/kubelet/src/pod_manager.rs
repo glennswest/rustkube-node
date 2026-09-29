@@ -295,6 +295,7 @@ pub struct PodManager {
     image_inflight: Arc<std::sync::Mutex<HashMap<ImageKey,ImageResult>>>,
     image_slots: Arc<tokio::sync::Semaphore>,
     image_changes: tokio::sync::broadcast::Sender<String>,
+    csi_operations: std::sync::Mutex<HashMap<(String,String),Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// A pod this node has admitted and not started, and why.
@@ -358,6 +359,7 @@ impl PodManager {
             image_inflight: Default::default(),
             image_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             image_changes: tokio::sync::broadcast::channel(128).0,
+            csi_operations: Default::default(),
             node_name: node_name.to_string(),
             events: (!api_url.is_empty())
                 .then(|| crate::events::EventRecorder::new(api_client.clone(), api_url, node_name)),
@@ -2032,12 +2034,12 @@ impl PodManager {
     /// Reconcile the in-memory pod map with sandboxes already running in the
     /// container runtime. Called once at startup so a kubelet restart adopts
     /// the pods it was already running instead of creating duplicate sandboxes.
-    pub async fn recover_state(&self) {
+    pub async fn recover_state(&self) -> Result<(), CriError> {
         let sandboxes = match self.runtime.list_pod_sandbox().await {
             Ok(s) => s,
             Err(e) => {
                 warn!("state recovery: listing sandboxes failed: {e}");
-                return;
+                return Err(e);
             }
         };
         let mut recovered = 0;
@@ -2047,7 +2049,8 @@ impl PodManager {
             }
             // Map container name → id for the containers in this sandbox.
             let mut container_ids = HashMap::new();
-            if let Ok(cs) = self.runtime.list_containers(Some(&sb.id)).await {
+            {
+                let cs = self.runtime.list_containers(Some(&sb.id)).await?;
                 for c in cs {
                     if !c.name.is_empty() {
                         container_ids.insert(c.name, c.id);
@@ -2095,6 +2098,7 @@ impl PodManager {
         if recovered > 0 {
             info!("state recovery: adopted {recovered} running pod sandbox(es)");
         }
+        Ok(())
     }
 
     /// Sync desired pods (from API server) with actual running pods.
@@ -5701,7 +5705,7 @@ pub(crate) mod tests {
         // Simulate a kubelet restart: fresh manager, same runtime with the
         // sandbox still running.
         let mgr2 = PodManager::new(rt.clone(), rt.clone(), NODE);
-        mgr2.recover_state().await;
+        mgr2.recover_state().await.unwrap();
         // The running pod is adopted, so a re-sync does NOT create a 2nd sandbox.
         let outcome = mgr2.sync_pods(&[p]).await;
         assert_eq!(rt.live_sandbox_count(), 1, "must not double-create sandbox");

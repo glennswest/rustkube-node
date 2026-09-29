@@ -54,12 +54,16 @@ already passed (211 tests). No main merge, golden or live deployment now.
    Added deletion-during-operation/replacement/staged-init tests; sc-build at
    d501d34 passed 220 unit + four integration tests. Image waits now yield to a
    four-slot deduplicated pull pool; reclamation takes an admission reservation.
-   Slow-image/fast-start and reclamation exclusion tests added; validation pending.
+   Slow-image/fast-start and reclamation exclusion tests passed at f3d868a
+   (222 unit + four integration tests). Runtime cleanup now retains refused
+   releases and partial volume registrations; CSI mutations serialize by handle.
+   Failed runtime recovery keeps admission closed. Dev validation pending.
 2. [ ] Wire Pod/VMI adapters to the common executor; retain state across failed cleanup,
        use observed UID preconditions, and preserve bootstrap through unavailable API reads.
 3. [ ] Add dependency indexes, staged waits and slow/fast/cancellation regression tests.
    Source-separated snapshots, inverse claim/image/driver indexes and recovery seeding
-   added to workload.rs; tests added, dev validation pending. Adapters not wired yet.
+   added to workload.rs and wired to adapters; dev tests above passed.
+   Remaining audit: volume events, UID preconditions, side-effect boundary coverage.
 4. [ ] Push each change, validate with sc-build, document evidence and remaining limitations.
 5. [ ] At the end of #100/#101 integrate main's #91 address pump, #35 failed-list
        protection and #53 snapshots as executor events/adapters before merging main.

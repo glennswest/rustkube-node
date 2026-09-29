@@ -314,6 +314,7 @@ impl PodManager {
         spec: &VolumeSpec,
         data: &VolData,
     ) -> Result<String, ClaimError> {
+        let _operation=self.csi_operation(data).ok_or_else(||ClaimError::Failed("CSI volume operation in progress".into()))?;
         let target = csi::publish_path(&self.state_root, uid, vol_name);
         let dir = Path::new(&target)
             .parent()
@@ -361,6 +362,11 @@ impl PodManager {
             data.driver_name, data.volume_handle
         );
         Ok(target)
+    }
+
+    fn csi_operation(&self,data:&VolData)->Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.csi_operations.lock().unwrap().entry((data.driver_name.clone(),data.volume_handle.clone()))
+            .or_default().clone().try_lock_owned().ok()
     }
 
     /// Unpublish every CSI volume of pod `uid`, and unstage the ones no other
@@ -413,6 +419,7 @@ impl PodManager {
                 }
                 continue;
             };
+            let Some(_operation)=self.csi_operation(&data) else {clean=false;continue;};
             let Some(reg) = self.csi.get(&data.driver_name).await else {
                 debug!(
                     "CSI {}: not registered, {} stays published for now",
@@ -1147,6 +1154,21 @@ mod tests {
             .store(false, std::sync::atomic::Ordering::SeqCst);
         assert!(rig.mgr.teardown_csi_volumes("retry-uid").await);
         assert!(csi_records_checked(&rig.mgr.state_root).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn publication_lock_blocks_teardown_until_operation_finishes() {
+        let rig = rig().await;
+        store_claim(&rig.api);
+        attach(&rig.api);
+        rig.csi.scan_once().await;
+        rig.mgr.resolve_volumes(&claim_pod("locked-uid", "locked-pod")).await.unwrap();
+        let records = csi_records_checked(&rig.mgr.state_root).unwrap();
+        let guard = rig.mgr.csi_operation(&records[0].1).unwrap();
+        assert!(!rig.mgr.teardown_csi_volumes("locked-uid").await);
+        assert_eq!(csi_records_checked(&rig.mgr.state_root).unwrap().len(), 1);
+        drop(guard);
+        assert!(rig.mgr.teardown_csi_volumes("locked-uid").await);
     }
 
     #[tokio::test]

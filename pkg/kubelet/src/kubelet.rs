@@ -224,7 +224,15 @@ impl Kubelet {
 
         // Recover before any start. Reserve every observed name, even when
         // the API is unavailable and the old claim set is not yet known.
-        self.pod_manager.recover_state().await;
+        loop {
+            match self.pod_manager.recover_state().await {
+                Ok(()) => break,
+                Err(error) => {
+                    warn!(%error, "runtime recovery incomplete; startup admission remains closed");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
         if let Some(vms) = &self.vms { vms.adopt_registered().await; }
         else { self.vmis_synced.store(true, Ordering::Release); }
         self.seed_names().await?;

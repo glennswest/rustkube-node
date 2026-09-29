@@ -138,6 +138,7 @@ struct Container {
 }
 
 /// One pod sandbox.
+#[derive(Clone)]
 struct Sandbox {
     id: String,
     handle: Option<Handle>,
@@ -657,42 +658,20 @@ impl RuntimeService for StormpumpRuntime {
     }
 
     async fn remove_pod_sandbox(&self, sandbox_id: &str) -> Result<(), CriError> {
-        let removed = self.sandboxes.lock().await.remove(sandbox_id);
-
-        // Hand the address back before the namespace goes.
-        //
-        // CNI DEL is what returns the IP to the pool and tears down the host
-        // end of the veth. Skipping it leaks an address per pod — invisible
-        // until a node has churned through its /24 and pods stop getting
-        // addresses for no apparent reason. It must also happen while the
-        // holder is still alive, since the plugin is given its namespace path.
-        if let Some(sb) = &removed {
-            if let (Some(invoker), Some(ns)) = (&self.cni, &sb.netns) {
-                let pod = cni::PodNetwork::new(
-                    sandbox_id,
-                    ns,
-                    &sb.config.namespace,
-                    &sb.config.name,
-                    &sb.config.uid,
-                );
-                if let Err(e) = invoker.del(&pod).await {
-                    tracing::warn!(sandbox = %sandbox_id, "CNI DEL failed: {e}");
-                }
+        if self.containers.lock().await.values().any(|c|c.sandbox_id==sandbox_id) {
+            return Err(CriError::Pending("sandbox still has container cleanup records".into()));
+        }
+        let existing=self.sandboxes.lock().await.get(sandbox_id).cloned();
+        if let Some(sb)=existing {
+            if let (Some(invoker),Some(ns))=(&self.cni,&sb.netns) {
+                let pod=cni::PodNetwork::new(sandbox_id,ns,&sb.config.namespace,&sb.config.name,&sb.config.uid);
+                invoker.del(&pod).await.map_err(|e|CriError::NetworkNotReady(format!("CNI DEL: {e}")))?;
             }
+            if let Some(handle)=sb.handle {self.on_ring(move |r|r.sandbox_release(handle)).await?;}
         }
-
-        let handle = removed.and_then(|sb| sb.handle);
-        if let Some(h) = handle {
-            // Back to the pool, which is what makes the next start cheap. The
-            // engine defers it until the last container has left, so this may
-            // be called while they are still stopping.
-            let _ = self.on_ring(move |r| r.sandbox_release(h)).await;
-        }
-        self.forget_containers_of(sandbox_id).await;
+        self.sandboxes.lock().await.remove(sandbox_id);
         Ok(())
     }
-
-
 
     async fn pod_sandbox_status(
         &self,
@@ -881,10 +860,14 @@ impl RuntimeService for StormpumpRuntime {
             )));
         }
 
-        let workload = self
+        let (workload, held) = self
             .on_ring(move |r| {
+                let mut held = Vec::new();
+                let result = (|| {
                 let root = r.volume_register(&path)?;
+                held.push(root);
                 let logs = r.volume_register(&log_dir)?;
+                held.push(logs);
                 // One per mount point, in the spec's order.
                 let mut mounts = Vec::with_capacity(mount_sources.len());
                 for (src, fstype) in &mount_sources {
@@ -896,9 +879,15 @@ impl RuntimeService for StormpumpRuntime {
                         Some(fs) => {
                             let dev = src.rsplit('/').next().unwrap_or(src);
                             let host = format!("{PVC_ROOT}/{dev}");
-                            mounts.push(r.volume_register_device(&host, src, fs)?);
+                            let handle = r.volume_register_device(&host, src, fs)?;
+                            held.push(handle);
+                            mounts.push(handle);
                         }
-                        None => mounts.push(r.volume_register(src)?),
+                        None => {
+                            let handle = r.volume_register(src)?;
+                            held.push(handle);
+                            mounts.push(handle);
+                        },
                     }
                 }
                 // The mount *sources* by name, not only their count. A start
@@ -933,22 +922,19 @@ impl RuntimeService for StormpumpRuntime {
                             None => e,
                         }
                     })
-                    .map(|w| {
-                        let mut held = vec![root, logs];
-                        held.extend(mounts.iter().copied());
-                        (w, held)
-                    })
+                })();
+                // Preserve partial registrations even when a later operation fails.
+                Ok((result, held))
             })
             .await?;
-        let (workload, held) = workload;
-
 
         let mut containers = self.containers.lock().await;
         let c = containers
             .get_mut(container_id)
             .ok_or_else(|| CriError::NotFound(format!("container {container_id}")))?;
-        c.workload_handle = Some(workload);
         c.volume_handles = held;
+        let workload = workload.map_err(|e| CriError::Runtime(e.to_string()))?;
+        c.workload_handle = Some(workload);
         c.state = ContainerState::Running;
         c.started_at = now_nanos();
         tracing::info!(
@@ -970,7 +956,8 @@ impl RuntimeService for StormpumpRuntime {
             // Signal, grace, kill is one op: the policy timer lives in the
             // engine rather than in every client that wants to stop something.
             let grace = timeout.max(0) as u64;
-            self.on_ring(move |r| r.stop(w, grace)).await?;
+            let already_stopping=self.containers.lock().await.get(container_id).is_some_and(|c|c.finished_at!=0);
+            if !already_stopping {self.on_ring(move |r| r.stop(w, grace)).await?;}
         }
         let mut containers = self.containers.lock().await;
         if let Some(c) = containers.get_mut(container_id) {
@@ -981,57 +968,23 @@ impl RuntimeService for StormpumpRuntime {
     }
 
     async fn remove_container(&self, container_id: &str) -> Result<(), CriError> {
-        let removed = self.containers.lock().await.remove(container_id);
-        let (workload, volumes) = match removed {
-            Some(c) => (c.workload_handle, c.volume_handles),
-            None => (None, Vec::new()),
+        let (workload,volumes)={
+            let containers=self.containers.lock().await;
+            let Some(c)=containers.get(container_id) else {return Ok(())};
+            (c.workload_handle,c.volume_handles.clone())
         };
-        if let Some(w) = workload {
-            // Frees the pidfd and the cgroup, which the process dying does not.
-            // Refused while it is still running, so this follows a stop.
-            let _ = self
-                .on_ring(move |r| r.workload_release(w))
-                .await;
+        if let Some(workload)=workload {
+            // Busy/timeout is pending cleanup, never permission to forget it.
+            self.on_ring(move |r|r.workload_release(workload)).await?;
+            if let Some(c)=self.containers.lock().await.get_mut(container_id) {c.workload_handle=None;}
         }
-        // Then the volumes it held. The last release of a claim's device
-        // mount unmounts it in the engine, which is what makes the claim safe
-        // to detach and delete afterwards.
-        // A mount still in use answers EBUSY and keeps its entry; that is a
-        // process finishing its teardown, so try again for a while rather
-        // than leave the claim mounted for ever (which makes it impossible to
-        // detach and reclaim). In the background: removal does not wait.
-        let mut busy = Vec::new();
-        for v in volumes {
-            if let Err(e) = self.on_ring(move |r| r.volume_release(v)).await {
-                tracing::debug!(container = %container_id, volume = ?v, "releasing a volume: {e}");
-                busy.push(v);
+        for volume in volumes {
+            self.on_ring(move |r|r.volume_release(volume)).await?;
+            if let Some(c)=self.containers.lock().await.get_mut(container_id) {
+                c.volume_handles.retain(|held|*held!=volume);
             }
         }
-        if !busy.is_empty() {
-            if let Ok(ring) = self.ring() {
-                let id = container_id.to_string();
-                tokio::spawn(async move {
-                    for attempt in 1..=30 {
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        let pending = std::mem::take(&mut busy);
-                        for v in pending {
-                            let r = ring.clone();
-                            let ok = tokio::task::spawn_blocking(move || r.volume_release(v).is_ok())
-                                .await
-                                .unwrap_or(false);
-                            if !ok {
-                                busy.push(v);
-                            }
-                        }
-                        if busy.is_empty() {
-                            tracing::info!(container = %id, attempt, "volumes released");
-                            return;
-                        }
-                    }
-                    tracing::warn!(container = %id, volumes = ?busy, "volumes still in use after a minute; left registered");
-                });
-            }
-        }
+        self.containers.lock().await.remove(container_id);
         Ok(())
     }
 
@@ -1607,7 +1560,7 @@ mod tests {
     /// ring, and the failures a node without stormpump should give.
 
     #[tokio::test]
-    async fn removing_a_sandbox_takes_its_containers_with_it() {
+    async fn sandbox_cleanup_waits_for_container_records() {
         let r = StormpumpRuntime::new("/run/stormpump.sock");
         // Placed directly: acquiring one needs the engine, and the invariant
         // under test is about the maps rather than about the acquisition.
@@ -1652,7 +1605,17 @@ mod tests {
             );
         }
 
-        r.forget_containers_of("sb-1").await;
+        assert!(r.remove_pod_sandbox("sb-1").await.is_err());
+        assert!(r.sandboxes.lock().await.contains_key("sb-1"));
+        // A refused engine release must retain the container and its volumes.
+        r.containers.lock().await.get_mut("ct-1").unwrap().volume_handles.push(Handle::NONE);
+        assert!(r.remove_container("ct-1").await.is_err());
+        assert_eq!(r.containers.lock().await["ct-1"].volume_handles.len(), 1);
+        r.containers.lock().await.get_mut("ct-1").unwrap().volume_handles.clear();
+        r.remove_container("ct-1").await.unwrap();
+        r.remove_container("ct-2").await.unwrap();
+        r.remove_pod_sandbox("sb-1").await.unwrap();
+        assert!(!r.sandboxes.lock().await.contains_key("sb-1"));
 
         // The two in that sandbox are gone; the one in another is not.
         let left = r.list_containers(None).await.unwrap();

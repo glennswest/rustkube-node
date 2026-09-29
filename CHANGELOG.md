@@ -2,6 +2,10 @@
 
 ## 2026-09-29
 
+- **fix:** Retain stormpump container/sandbox records on refused cleanup and
+  partial volume registrations on failed startup; serialize CSI publication and
+  teardown by driver/handle. Require successful runtime recovery before starts (#100).
+
 - **feat:** Prepare images in a separate four-slot pool, share in-flight pulls,
   and wake only image dependents on completion. Claim reclamation now takes an
   exclusive admission reservation against concurrent starts (#100).
