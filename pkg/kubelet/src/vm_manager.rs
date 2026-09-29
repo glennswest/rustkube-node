@@ -58,11 +58,12 @@ fn deregister(namespace: &str, name: &str) {
 /// with nothing in the cluster that showed or controlled it.
 pub const FINALIZER: &str = "storm.io/vm";
 
-/// Is this VMI being deleted?
-fn exited(aux: u64) -> bool {
+/// QUERY reports a wait status only when the low byte is the exited state.
+fn exited(aux: u32) -> bool {
     aux & 0xff == 2
 }
 
+/// Is this VMI being deleted?
 fn terminating(obj: &Value) -> bool {
     !obj["metadata"]["deletionTimestamp"].is_null()
 }

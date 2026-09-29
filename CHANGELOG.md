@@ -2,6 +2,9 @@
 
 ## 2026-09-29
 
+- **fix:** Match the QUERY exit helper to the ABI u32 completion field; dev
+  compilation of 8ebb8b3 caught the mismatch.
+
 - **fix:** Retain VM records/finalizers on unknown exit or refused disk cleanup;
   acknowledge Pod deletion with the observed UID (#100).
 
