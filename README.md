@@ -69,6 +69,12 @@ exist. Mounted here the doors also inherit this server's TLS and bearer auth
 instead of stormvm's weaker "loopback, or a token" rule for an
 unauthenticated node-local port.
 
+The mounted router is told where this node's stormblock engine is (the
+kubelet's `--stormblock`, default `http://127.0.0.1:9090`), so its `snapshot`
+verb can take a VM's disks as one group snapshot; it finds the engine token
+itself, in the same places the kubelet does. Only the console doors are routed
+onto `:10250` so far: the control verbs (`pause`, `snapshot`, …) wait on #94.
+
 `stormvm serve` still mounts the same router on `:9095` for a developer at a
 terminal. That is a convenience for debugging a guest that will not boot, not
 a deployment shape, and nothing in a cluster depends on it.

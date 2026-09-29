@@ -3,6 +3,13 @@
 ## [Unreleased]
 <!-- New unreleased changes go here -->
 
+### 2026-09-29 (the console router knows where stormblock is, #83)
+- **fix(kubelet):** stormvm's console router was mounted without
+  `Config.stormblock`, so its `snapshot` verb answered 409 "this service was
+  not told where stormblock is" on every node. Both mounts now pass the
+  kubelet's engine URL (`--stormblock`). The verbs are not yet routed onto
+  `:10250` (#94).
+
 ### 2026-09-28 (a failed VM start is retried, #76)
 - **fix(kubelet):** a VM start that failed was recorded Failed and never tried
   again, so a moment of stormblock being down left the machine dead until it
