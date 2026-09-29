@@ -52,7 +52,7 @@ not the release path.
 
 ## Work plan
 
-### In progress: #114, merge turbomode into main
+### Done: #114, turbomode merged into main
 
 2026-09-29: owner instruction in #114 supersedes the earlier no-merge hold.
 Preserve main's #91 address pump, #35 failed-list protection, #53 snapshots
@@ -66,8 +66,13 @@ work continues on main afterwards; no golden or release is requested here.
    passed: 251 kubelet unit, four integration, 24 CNI, 17 proxy and one doc-test;
    one doc-test ignored. Remote exit 0 in 107s; drive deleted. Local statistics
    append was read-only (remote result unaffected).
-4. [ ] Merge turbomode into main with --no-ff, push and repeat full sc-build.
-5. [ ] Record merge/test evidence and remaining work on #114, then close it.
+4. [x] Main merge 600b58a pushed (--no-ff); full sc-build with the same command
+   passed in 79s, remote exit 0, identical test counts, drive deleted. The local
+   statistics append again reported read-only; no remote build/test failure.
+5. [x] Posted merge/test evidence and remaining #100/#101/#102 work on #114;
+   issue closed. No golden, release or live deployment requested. Continue
+   unfinished work on main; live target remains #110. This final checkpoint
+   changes documentation only after the verified main merge.
 
 
 ### Parked on stormpump#63: #100, common bounded per-UID Pod/VMI workers

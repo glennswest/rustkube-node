@@ -2,6 +2,9 @@
 
 ## 2026-09-29
 
+- **docs:** Record main merge 600b58a verification (297 tests passed, one ignored)
+  and completion of #114; outstanding turbomode work continues on main.
+
 - **docs:** Record successful full workspace verification of merged turbomode ec39c2a (#114).
 
 - **feat:** Integrate main into turbomode (#114), preserving tap addresses,
