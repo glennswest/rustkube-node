@@ -3444,7 +3444,8 @@ mod tests {
                     let v = v2.clone();
                     async move {
                         let mut v = v.lock().unwrap();
-                        let id = format!("vol-{}", v.len());
+                        // Never reused, as the engine's are not.
+                        let id = format!("vol-{}", uuid::Uuid::new_v4().simple());
                         v.push(json!({"id": id, "name": b["name"], "owner": b["owner"]}));
                         axum::Json(json!({ "id": id }))
                     }
@@ -3456,7 +3457,8 @@ mod tests {
                     let (v, c) = (v3.clone(), c1.clone());
                     async move {
                         let mut v = v.lock().unwrap();
-                        let id = format!("vol-{}", v.len());
+                        // Never reused, as the engine's are not.
+                        let id = format!("vol-{}", uuid::Uuid::new_v4().simple());
                         v.push(json!({"id": id, "name": b["name"], "owner": b["owner"]}));
                         c.lock().unwrap().push(b);
                         axum::Json(json!({ "id": id }))
