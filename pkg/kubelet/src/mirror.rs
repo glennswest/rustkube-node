@@ -148,6 +148,56 @@ pub fn mirror_pod(asset: &Asset, node: &str, node_uid: &str, started: &str) -> V
     })
 }
 
+/// What of the asset table a mirror reflects (#101). PID 1 rewrites the file
+/// every pass with fresh ages (stormpump#67); a change is a different name
+/// set, a service starting or stopping, or a restart.
+pub fn table_key(assets: &[Asset]) -> Vec<(String, bool, u32)> {
+    let mut key: Vec<_> = assets.iter().map(|a| (a.name.clone(), a.running, a.restarts)).collect();
+    key.sort();
+    key
+}
+
+/// The state a container status is in: `running`, `terminated` or `waiting`.
+fn state_kind(cs: &Value) -> Option<&str> {
+    ["running", "terminated", "waiting"].into_iter().find(|k| cs["state"][*k].is_object())
+}
+
+/// How far apart two RFC 3339 times are, in seconds; `None` when either is
+/// not one.
+fn seconds_apart(a: &Value, b: &Value) -> Option<i64> {
+    let parse = |v: &Value| chrono::DateTime::parse_from_rfc3339(v.as_str()?).ok();
+    Some((parse(a)? - parse(b)?).num_seconds().abs())
+}
+
+/// Does the mirror pod already say what `want` would write (#101)? Nothing is
+/// written when it does: the mirror watches its own pods, so a write that
+/// changes nothing would wake it again, for ever. `startTime` is derived from
+/// an age and may move by a second or two between passes; that is not a change.
+pub fn status_current(existing: &Value, want: &Value) -> bool {
+    let (e, w) = (&existing["status"], &want["status"]);
+    let conditions = |s: &Value| -> Vec<(String, String)> {
+        let mut c: Vec<_> = s["conditions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|c| (c["type"].as_str().unwrap_or("").to_string(), c["status"].as_str().unwrap_or("").to_string()))
+            .collect();
+        c.sort();
+        c
+    };
+    let (ec, wc) = (&e["containerStatuses"][0], &w["containerStatuses"][0]);
+    let start_same = match (&e["startTime"], &w["startTime"]) {
+        (Value::Null, Value::Null) => true,
+        (a, b) => seconds_apart(a, b).is_some_and(|d| d <= 5),
+    };
+    e["phase"] == w["phase"]
+        && conditions(e) == conditions(w)
+        && ec["ready"] == wc["ready"]
+        && ec["restartCount"] == wc["restartCount"]
+        && state_kind(ec) == state_kind(wc)
+        && start_same
+}
+
 /// The reason a mirror pod carries when its asset is not in PID 1's table.
 pub const NOT_STARTED: &str = "NotStarted";
 
@@ -284,6 +334,32 @@ mod tests {
         // Once marked, the next pass has nothing to write.
         let list = json!({"items": [marked]});
         assert!(stale_mirrors(&list, "n1", &[running]).is_empty());
+    }
+
+    /// Ages are not a change; a restart or a stop is (#101).
+    #[test]
+    fn only_state_changes_the_table_key() {
+        let a = |running, restarts, age_secs| Asset { name: "stormblock".into(), running, restarts, age_secs };
+        assert_eq!(table_key(&[a(true, 1, 5)]), table_key(&[a(true, 1, 500)]));
+        assert_ne!(table_key(&[a(true, 1, 5)]), table_key(&[a(true, 2, 5)]));
+        assert_ne!(table_key(&[a(true, 1, 5)]), table_key(&[a(false, 1, 5)]));
+    }
+
+    /// The mirror writes nothing when the pod already says it, or its own
+    /// watch would wake it for ever (#101).
+    #[test]
+    fn a_current_mirror_needs_no_write() {
+        let a = Asset { name: "stormblock".into(), running: true, restarts: 2, age_secs: 60 };
+        let p = mirror_pod(&a, "n1", "u", "2026-08-29T00:00:00Z");
+        let mut stored = p.clone();
+        stored["metadata"]["resourceVersion"] = json!("41");
+        assert!(status_current(&stored, &mirror_pod(&a, "n1", "u", "2026-08-29T00:00:02Z")), "age jitter");
+        assert!(!status_current(&stored, &mirror_pod(&a, "n1", "u", "2026-08-29T01:00:00Z")), "a new incarnation");
+        let restarted = Asset { restarts: 3, ..a.clone() };
+        assert!(!status_current(&stored, &mirror_pod(&restarted, "n1", "u", "2026-08-29T00:00:00Z")));
+        let stopped = Asset { running: false, ..a.clone() };
+        assert!(!status_current(&stored, &mirror_pod(&stopped, "n1", "u", "2026-08-29T00:00:00Z")));
+        assert!(!status_current(&not_started(&stored), &p), "marked not started, now listed again");
     }
 
     #[test]

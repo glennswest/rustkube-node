@@ -334,23 +334,9 @@ impl Kubelet {
             }
         });
 
-        // Mirror the node's own services into the API.
-        //
-        // Its own task on a slow interval: these change when PID 1 restarts
-        // something, which is rare, and a mirror that costs a write every two
-        // seconds would be worse than the invisibility it fixes.
-        {
-            let url = self.config.api_server_url.clone();
-            let node = self.config.node_name.clone();
-            let client = self.api_client.clone();
-            tokio::spawn(async move {
-                let mut interval = time::interval(Duration::from_secs(15));
-                loop {
-                    interval.tick().await;
-                    mirror_node_services(&client, &url, &node).await;
-                }
-            });
-        }
+        // Mirror the node's own services into the API: when PID 1's asset
+        // table changes, and when a mirror pod is edited or deleted (#101).
+        tokio::spawn(self.clone().service_mirror_loop());
 
         // List the node's own data containers as PVCs (rustkube-node#49): the
         // same slow cadence as the services mirror, for the same reason.
@@ -1227,6 +1213,58 @@ impl workload::Adapter for Kubelet {
 }
 
 impl Kubelet {
+    /// The node's services as mirror pods, on events only (#101).
+    ///
+    /// Two sources. PID 1's asset table, through inotify on its directory,
+    /// gated on the parsed table: PID 1 rewrites the file every pass with
+    /// fresh ages (stormpump#67), so a read is taken at most once a second and
+    /// only a changed name set, start, stop or restart goes further. And the
+    /// mirror pods themselves, watched, so one deleted or edited is put back.
+    /// The mirror writes nothing that is already current, so its own writes
+    /// settle after one pass. A failed pass retries on the reactor's backoff.
+    async fn service_mirror_loop(self: Arc<Self>) {
+        const RUN_DIR: &str = "/run/stormpump";
+        let worker = self.watches.worker("kubelet-service-mirror");
+        let changed = Arc::new(tokio::sync::Notify::new());
+        {
+            let changed = changed.clone();
+            tokio::spawn(crate::fs_watch::watch(RUN_DIR.into(), move || changed.notify_one()));
+        }
+        {
+            let worker = worker.clone();
+            tokio::spawn(async move {
+                let mut last = None;
+                loop {
+                    changed.notified().await;
+                    let text = std::fs::read_to_string(format!("{RUN_DIR}/assets.json")).unwrap_or_default();
+                    let key = crate::mirror::table_key(&crate::mirror::parse_assets(&text));
+                    if last.as_ref() != Some(&key) {
+                        last = Some(key);
+                        worker.enqueue();
+                    }
+                    // A floor, not a clock: nothing is read while the file is
+                    // quiet. Needed while PID 1 rewrites it every pass.
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            });
+        }
+        let url = self.config.api_server_url.clone();
+        let node = self.config.node_name.clone();
+        loop {
+            let work = worker.next().await;
+            worker
+                .run(async {
+                    if !url.is_empty() {
+                        self.watches.observe(&self.api_client, format!(
+                            "{url}/api/v1/namespaces/kube-system/pods?labelSelector=storm.io%2Fcomponent%3Dnode-service"));
+                    }
+                    mirror_node_services(&self.api_client, &url, &node).await;
+                })
+                .await;
+            drop(work);
+        }
+    }
+
     /// When a live workload is next looked at with no event (#101): its own
     /// deadline, else only an event. A runtime that reports no exits (a CRI
     /// runtime, not stormpump) cannot say a container ended, so its workloads
@@ -1314,7 +1352,11 @@ static LAST_SEEN: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 async fn mirror_node_services(client: &reqwest::Client, api_url: &str, node: &str) {
-    // Its own recorder: this runs on a timer of its own, not through the pod
+    // No cluster: nothing to mirror into, and nothing to retry.
+    if api_url.is_empty() {
+        return;
+    }
+    // Its own recorder: this runs on a worker of its own, not through the pod
     // manager, and building one per pass is a struct with a cloned client.
     let events = (!api_url.is_empty())
         .then(|| crate::events::EventRecorder::new(client.clone(), api_url, node));
@@ -1329,8 +1371,8 @@ async fn mirror_node_services(client: &reqwest::Client, api_url: &str, node: &st
             // services stopped appearing as pods there was no line anywhere
             // saying why, and nothing distinguished "no file" from "cannot
             // read it" from "the loop is not running". Once, at debug, is
-            // enough to answer that without a line every fifteen seconds
-            // forever on a node that will never have one.
+            // enough to answer that without a line every pass forever on a
+            // node that will never have one.
             static SAID: std::sync::Once = std::sync::Once::new();
             SAID.call_once(|| {
                 debug!("not mirroring node services: cannot read {ASSET_STATUS}: {e}");
@@ -1343,28 +1385,10 @@ async fn mirror_node_services(client: &reqwest::Client, api_url: &str, node: &st
         return;
     }
 
-    // The node's uid, so the mirrors are owned by it and collected with it.
-    let node_uid = match client
-        .get(format!("{api_url}/api/v1/nodes/{node}"))
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => r
-            .json::<Value>()
-            .await
-            .ok()
-            .and_then(|n| n["metadata"]["uid"].as_str().map(str::to_owned))
-            .unwrap_or_default(),
-        _ => return,
-    };
-    if node_uid.is_empty() {
-        return;
-    }
-
     // What changed since the last pass, as events.
     //
-    // The mirror sees every transition — it reads the same table every
-    // fifteen seconds — and reported none of them. A service that stopped, or
+    // The mirror sees every transition — it reads the table whenever it
+    // changes — and reported none of them. A service that stopped, or
     // started, or has been restarting for four minutes is exactly what an
     // event is for, and rustkube-node#50 is this.
     {
@@ -1428,35 +1452,43 @@ async fn mirror_node_services(client: &reqwest::Client, api_url: &str, node: &st
 
     // Mirrors of assets PID 1 did not list on this boot (#87): not running,
     // said once, never deleted.
+    // The mirrors there are, read once: what exists is compared rather than
+    // written blind (#101). Unreadable: nothing is written, and the pass is
+    // retried on the reactor's backoff.
     let list_url = format!(
         "{api_url}/api/v1/namespaces/kube-system/pods?labelSelector=storm.io%2Fcomponent%3Dnode-service"
     );
-    if let Ok(r) = client.get(&list_url).send().await {
-        if r.status().is_success() {
-            if let Ok(list) = r.json::<Value>().await {
-                for pod in crate::mirror::stale_mirrors(&list, node, &assets) {
-                    let name = pod["metadata"]["name"].as_str().unwrap_or("");
-                    let marked = crate::mirror::not_started(pod);
-                    let put = client
-                        .put(format!("{api_url}/api/v1/namespaces/kube-system/pods/{name}/status"))
-                        .json(&marked)
-                        .send()
-                        .await;
-                    match put {
-                        Ok(r) if r.status().is_success() => {
-                            let msg = marked["status"]["message"].as_str().unwrap_or("").to_string();
-                            if let Some(ev) = &events {
-                                ev.pod_event(&marked, "Warning", crate::mirror::NOT_STARTED, &msg).await;
-                            }
-                        }
-                        Ok(r) => debug!("mirror {name}: not-started status -> {}", r.status()),
-                        Err(e) => debug!("mirror {name}: not-started status: {e}"),
-                    }
+    let listed = match client.get(&list_url).send().await {
+        Ok(r) if r.status().is_success() => r.json::<Value>().await.ok(),
+        _ => None,
+    };
+    let Some(list) = listed else {
+        apimachinery::reactor::failed();
+        return;
+    };
+    for pod in crate::mirror::stale_mirrors(&list, node, &assets) {
+        let name = pod["metadata"]["name"].as_str().unwrap_or("");
+        let marked = crate::mirror::not_started(pod);
+        let put = client
+            .put(format!("{api_url}/api/v1/namespaces/kube-system/pods/{name}/status"))
+            .json(&marked)
+            .send()
+            .await;
+        match put {
+            Ok(r) if r.status().is_success() => {
+                let msg = marked["status"]["message"].as_str().unwrap_or("").to_string();
+                if let Some(ev) = &events {
+                    ev.pod_event(&marked, "Warning", crate::mirror::NOT_STARTED, &msg).await;
                 }
             }
+            Ok(r) => debug!("mirror {name}: not-started status -> {}", r.status()),
+            Err(e) => debug!("mirror {name}: not-started status: {e}"),
         }
     }
 
+    // The node's uid, so new mirrors are owned by it and collected with it.
+    // Asked only when there is one to create.
+    let mut node_uid: Option<String> = None;
     let now = chrono::Utc::now();
     for a in &assets {
         // startTime from the age PID 1 reported: the two ends share no clock,
@@ -1464,20 +1496,53 @@ async fn mirror_node_services(client: &reqwest::Client, api_url: &str, node: &st
         let started = (now - chrono::Duration::seconds(a.age_secs as i64))
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
-        let pod = crate::mirror::mirror_pod(a, node, &node_uid, &started);
         let name = crate::mirror::mirror_name(&a.name, node);
         let base = format!("{api_url}/api/v1/namespaces/kube-system/pods");
+        let existing = list["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|p| p["metadata"]["name"].as_str() == Some(name.as_str()));
 
-        // Create, then fall back to updating status — the object is long-lived
-        // and only its status moves.
-        let created = client.post(&base).json(&pod).send().await;
-        let exists = matches!(created, Ok(ref r) if r.status() == 409);
-        if exists {
-            let _ = client
-                .put(format!("{base}/{name}/status"))
-                .json(&pod)
-                .send()
-                .await;
+        // The object is long-lived and only its status moves; a status that
+        // already says it is not written (#101).
+        match existing {
+            Some(existing) => {
+                let pod = crate::mirror::mirror_pod(a, node, "", &started);
+                if crate::mirror::status_current(existing, &pod) {
+                    continue;
+                }
+                let mut pod = pod;
+                pod["metadata"] = existing["metadata"].clone();
+                let put = client.put(format!("{base}/{name}/status")).json(&pod).send().await;
+                if !matches!(put, Ok(ref r) if r.status().is_success() || r.status() == 409) {
+                    apimachinery::reactor::failed();
+                }
+            }
+            None => {
+                if node_uid.is_none() {
+                    node_uid = match client.get(format!("{api_url}/api/v1/nodes/{node}")).send().await {
+                        Ok(r) if r.status().is_success() => r
+                            .json::<Value>()
+                            .await
+                            .ok()
+                            .and_then(|n| n["metadata"]["uid"].as_str().map(str::to_owned))
+                            .filter(|u| !u.is_empty()),
+                        _ => None,
+                    };
+                }
+                let Some(uid) = &node_uid else {
+                    // Not registered yet: its registration is an API change
+                    // the watch does not see, so the pass is retried.
+                    apimachinery::reactor::failed();
+                    return;
+                };
+                let pod = crate::mirror::mirror_pod(a, node, uid, &started);
+                let created = client.post(&base).json(&pod).send().await;
+                if !matches!(created, Ok(ref r) if r.status().is_success() || r.status() == 409) {
+                    apimachinery::reactor::failed();
+                }
+            }
         }
     }
 }
