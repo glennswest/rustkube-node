@@ -2,6 +2,21 @@
 
 ## 2026-09-29
 
+- **feat:** Unwind a failed, panicked or abandoned VM start: a per-UID ledger
+  records each tap deposit before it is sent and each volume/spec handle as it
+  is registered; stormpump's `DEPOSIT_WITHDRAW` (op 9, stormpump#63) and handle
+  releases undo them. The next start waits while a tap is still held, and a
+  deletion keeps its name reservation until the tap is withdrawn (#100).
+- **fix:** Serialize the deposit→spawn window and every withdraw across VMs:
+  deposits are named `tap-<nic>` per engine client, so two concurrent starts
+  with the same NIC name could take each other's tap (#100).
+- **fix:** Run CNI DEL after a failed ADD before releasing the sandbox; a DEL
+  that fails keeps the sandbox and is retried before the next one (#100).
+- **fix:** The claim-reclaim endpoint finishes the detach/delete in its own
+  task, so a client disconnect no longer drops the claim's reservation while
+  stormblock is still working (#100).
+- **docs:** README, event-driven design and status updated for the above.
+
 - **docs:** Record main merge 600b58a verification (297 tests passed, one ignored)
   and completion of #114; outstanding turbomode work continues on main.
 

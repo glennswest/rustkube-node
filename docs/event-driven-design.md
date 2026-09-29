@@ -208,13 +208,39 @@ containers successfully before any new starts. CSI publication and teardown
 share per-driver/handle mutation exclusion. Stormpump teardown retains records
 on refused release and startup retains partially registered volume handles.
 
-Remaining #100 blocker (2026-09-29): [stormpump#63](https://github.com/glennswest/stormpump/issues/63)
-tracks acknowledged withdrawal of deposited tap descriptors. The engine currently
-keeps a deposit after a pre-spawn failure until it is replaced, consumed by spawn,
-or its shared client disconnects. A replacement cannot necessarily realise the
-same tap while that descriptor exists. VM partial-start cleanup and the complete
-side-effect cancellation test matrix therefore remain unfinished. The branch
-stays unmerged; CLAUDE.md records the resume checklist and build evidence.
+VM partial-start unwind (#100, on main after #114): [stormpump#63](https://github.com/glennswest/stormpump/issues/63)
+added `DEPOSIT_WITHDRAW` (op 9), which closes a deposit no spawn consumed and
+acknowledges it in the completion. The kubelet sends it by number: the locked
+stormpump-abi predates the variant, and the lock cannot move until stormvm#65.
+
+- **Ledger.** Per UID, outside the start's future: each `tap-<nic>` deposit is
+  noted *before* it is sent, each volume/spec handle as the engine returns it,
+  and the whole record is dropped inside the blocking spawn closure the moment
+  the spawn succeeds. A start that fails, panics or is abandoned leaves an
+  accurate record either way; withdrawing a deposit never sent is a no-op.
+- **Deposit window.** stormvm names deposits `tap-<nic>` and the engine keys
+  them by client and name, so two VMs with a NIC called `default` starting on
+  two workers would replace each other's tap. One kubelet-wide lock covers
+  the first deposit through the spawn's answer, and every withdraw; disk
+  resolution stays outside it and concurrent.
+- **Unwind points.** Inside the window after a failed launch; before the next
+  start of the UID (Waiting while a deposit is still held, since the same tap
+  name would meet EBUSY); and before a deletion is acknowledged, which keeps the
+  name reservation so a same-name successor cannot start first. A handle that
+  will not release is a leak, not a conflict: it is retried, and after the
+  UID is gone it moves to an orphan bucket retried by later unwinds.
+- **Engine answers.** EINVAL on withdraw means an engine older than op 9
+  (warned and dropped: the engine closes a client's deposits when it goes);
+  ESTALE on a release means already released. A kubelet restart needs no
+  ledger: its reconnect drops the old connection's deposits.
+
+Other side-effect boundaries closed at the same time: a failed CNI ADD is
+followed by DEL before the sandbox is released (DEL needs the namespace), and a
+DEL that fails keeps the sandbox, retried before the next sandbox. The
+claim-reclaim handler runs the release in its own task, so a disconnecting
+client cannot drop the claim's reservation while stormblock is still detaching
+or deleting. Tests cover each with fakes (injected undo, a scripted CNI plugin,
+a slow stormblock); none of this has run on a node (#102).
 
 ## Main integration (#114)
 

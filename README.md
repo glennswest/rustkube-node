@@ -32,11 +32,17 @@ The full workspace build and tests passed on dev at `55d458c`, including
 serialize by driver/handle, and failed runtime recovery keeps admission closed.
 PV and VolumeAttachment changes route through an inverse claim index; failed
 collection reads retain the index. VM status and migration writes carry UID
-guards. VM cancellation remains blocked on
-[stormpump#63](https://github.com/glennswest/stormpump/issues/63): the shared
-engine client cannot withdraw a deposited tap after a pre-spawn failure.
-Every-boundary cancellation coverage and VM partial-start cleanup are unfinished;
-these remain tracked in #100 after the owner-authorized merge. Subsecond
+guards. A VM start records what it puts in stormpump (each tap deposit before
+it is sent, each volume and spec handle as it is registered) outside the
+start's future; a failed, panicked or abandoned start is unwound with
+stormpump's `DEPOSIT_WITHDRAW`
+([stormpump#63](https://github.com/glennswest/stormpump/issues/63)) and handle
+releases. Deposits are named `tap-<nic>` per engine client, so the window from
+the first deposit to the spawn's answer, and every withdraw, is serialized
+across VMs. The next start of that VMI waits while one of its taps is still
+held, and its deletion (and the name) is held until the tap is withdrawn. A
+failed CNI ADD is followed by DEL before the sandbox goes, and a claim reclaim
+runs to completion even if its HTTP client disconnects (#100). Subsecond
 startup has not been measured on a live node.
 Active workloads still use an explicit runtime/probe/volume observation
 fallback, and service/volume mirrors and CSI cleanup tasks retain their existing schedules.

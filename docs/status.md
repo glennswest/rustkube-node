@@ -4,8 +4,10 @@ Reviewed 2026-09-29 against main **5bb1a38** and
 `git log --since=2026-09-18`. Version 0.13.0 is the workspace version;
 changes after its tag remain unreleased. This document describes source and
 recorded verification, not a newly tested live node. The #114 merge integrates turbomode UID workers with the main behaviors
-listed below. Cancellation, complete event sources and live acceptance remain
-open (#99–#102); no release or golden is part of this merge.
+listed below. VM partial-start unwind, CNI DEL after a failed ADD and
+reclaim-handler cancellation are done (#100, unit-tested only). Complete event
+sources and live acceptance remain open (#99, #101, #102); no release or golden
+is part of this merge.
 
 ## Changes since September 18
 
@@ -59,7 +61,7 @@ Each gap has an owning issue. These are limitations, not supported features.
 | Explicit default-valued apiserver flag overriding kubeconfig | [#113](https://github.com/glennswest/rustkube-node/issues/113) |
 | Destructive engine calls with a separate admin token | [#105](https://github.com/glennswest/rustkube-node/issues/105) |
 | Tunable max-pods/reservations/cgroup-driver | [#24](https://github.com/glennswest/rustkube-node/issues/24) |
-| Subsecond startup, fully bounded I/O/cancellation and event-driven workers on main | [#95](https://github.com/glennswest/rustkube-node/issues/95), [#99](https://github.com/glennswest/rustkube-node/issues/99), [#100](https://github.com/glennswest/rustkube-node/issues/100), [#101](https://github.com/glennswest/rustkube-node/issues/101) |
+| Subsecond startup, fully bounded I/O/cancellation and event-driven workers on main | [#95](https://github.com/glennswest/rustkube-node/issues/95), [#99](https://github.com/glennswest/rustkube-node/issues/99), [#101](https://github.com/glennswest/rustkube-node/issues/101) |
 | Complete short/medium/long live acceptance and runner image injection | [#61](https://github.com/glennswest/rustkube-node/issues/61), [#64](https://github.com/glennswest/rustkube-node/issues/64), [#97](https://github.com/glennswest/rustkube-node/issues/97), [#102](https://github.com/glennswest/rustkube-node/issues/102) |
 | Legacy bin-only builder as a supported release path | [#51](https://github.com/glennswest/rustkube-node/issues/51) |
 
