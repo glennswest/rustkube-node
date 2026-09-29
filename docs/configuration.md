@@ -93,10 +93,12 @@ retrying once only if changed. No separate admin-token source exists (#105).
 
 `KubeletConfig::default()` has `heartbeat_interval = 10s`, `sync_interval = 2s`,
 and API URL `http://localhost:6443` (the CLI overrides that URL). These intervals
-are not CLI keys. Main still serially reconciles Pods, watches VMIs and
-reconciles their current desired state. Service mirrors run every 15 seconds;
-service-volume reconciliation and CSI cleanup every 30 seconds; CSI registration
-polls every two seconds. The event-driven design is separate turbomode work.
+are not CLI keys. Pods and VMIs share eight UID workers with watch-driven desired-state
+updates and per-UID runtime/probe fallback deadlines. Image pulls use four
+separate slots. Service mirrors run every 15 seconds; service-volume
+reconciliation and CSI cleanup every 30 seconds. CSI registration uses filesystem
+notifications with retry deadlines. Snapshot maintenance has its own watch and
+sync-interval fallback; the disk-owner sweep runs at most once per minute.
 
 Fixed paths include `/var/lib/kubelet` for volume records,
 `/var/log/pods` for container logs, `/run/stormvm/<namespace>/<name>/vm.json`

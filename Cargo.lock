@@ -84,9 +84,10 @@ checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "apimachinery"
-version = "0.15.2"
-source = "git+https://github.com/glennswest/rustkube?rev=e7f4fdb4b58044260ffe396a1a0d659876e5264a#e7f4fdb4b58044260ffe396a1a0d659876e5264a"
+version = "0.18.0"
+source = "git+https://github.com/glennswest/rustkube?rev=2b3f2c16dde2f9b9519e39aac299d007aaae8cbe#2b3f2c16dde2f9b9519e39aac299d007aaae8cbe"
 dependencies = [
+ "anyhow",
  "async-trait",
  "axum 0.8.9",
  "base64",
@@ -101,6 +102,7 @@ dependencies = [
  "prost",
  "prost-reflect",
  "rcgen",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",

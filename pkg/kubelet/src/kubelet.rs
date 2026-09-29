@@ -4,7 +4,9 @@
 
 use crate::cri::{ImageService, MigrationService, RuntimeService};
 use crate::node_status::NodeReporter;
-use crate::pod_manager::{InitContainerStatusReport, PodManager, RemovalReason};
+use crate::workload::{self, Access, Dependency, Executor, Key, Kind, Next, Resource};
+use std::sync::atomic::{AtomicBool, Ordering};
+use crate::pod_manager::{InitContainerStatusReport, PodManager};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::time::{self, Duration};
@@ -111,6 +113,13 @@ pub struct Kubelet {
     /// The external CSI drivers on this node, shared with the pod manager
     /// and kept current by the registration loop (#52).
     csi: Arc<crate::csi_plugins::CsiPlugins>,
+    watches: apimachinery::reactor::WatchHub,
+    last_claims: std::sync::Mutex<crate::workload::VolumeIndex>,
+    static_read_complete: std::sync::atomic::AtomicBool,
+    runtime_changes: Option<tokio::sync::watch::Receiver<u64>>,
+    workloads: Arc<Executor>,
+    pods_synced: AtomicBool,
+    vmis_synced: AtomicBool,
 }
 
 impl Kubelet {
@@ -141,6 +150,7 @@ impl Kubelet {
             crate::csi_plugins::CsiPlugins::new(&config.node_name)
                 .with_api(api_client.clone(), &config.api_server_url),
         );
+        let workloads = Executor::new();
         let pod_manager = Arc::new(
             PodManager::with_api(
                 runtime.clone(),
@@ -152,7 +162,8 @@ impl Kubelet {
             )
             .with_ca_pem(config.apiserver_ca.clone())
             .with_engine(config.engine.clone())
-            .with_csi(csi.clone()),
+            .with_csi(csi.clone())
+            .with_admission(workloads.reservations.clone()),
         );
 
         Ok(Self {
@@ -165,6 +176,13 @@ impl Kubelet {
             api_client,
             node_ip,
             said_no_static_dir: std::sync::atomic::AtomicBool::new(false),
+            watches: Default::default(),
+            last_claims: Default::default(),
+            static_read_complete: std::sync::atomic::AtomicBool::new(true),
+            runtime_changes: None,
+            workloads,
+            pods_synced: AtomicBool::new(false),
+            vmis_synced: AtomicBool::new(false),
             csi,
         })
     }
@@ -177,6 +195,7 @@ impl Kubelet {
     /// client — a status written with an unauthenticated one is a status
     /// nobody ever sees.
     pub fn with_engine(mut self, ring: Arc<crate::stormpump_ring::RingClient>) -> Self {
+        self.runtime_changes = Some(ring.subscribe_exits());
         self.vms = Some(Arc::new(
             crate::vm_manager::VmManager::new(
                 Some(ring),
@@ -198,7 +217,11 @@ impl Kubelet {
     }
 
     /// Run the kubelet. Blocks forever.
-    pub async fn run(&self) -> anyhow::Result<()> {
+    pub async fn run(self) -> anyhow::Result<()> {
+        Arc::new(self).run_inner().await
+    }
+
+    async fn run_inner(self: &Arc<Self>) -> anyhow::Result<()> {
         info!("Kubelet starting for node {}", self.config.node_name);
 
         // Query the container runtime version for nodeInfo (e.g. cri-o://1.32.0).
@@ -210,24 +233,20 @@ impl Kubelet {
             }
         };
 
-        // Static pods first: the control plane (apiserver, etcd, controller,
-        // scheduler) ships as static-pod manifests and must run LOCALLY,
-        // independent of the apiserver — that is how the apiserver itself
-        // starts. Run them now (and continuously in the sync loop below) so we
-        // never deadlock waiting for a control plane that nothing brings up.
-        let static_pods = self.load_static_pods();
-        if !static_pods.is_empty() {
-            info!(
-                "running {} static pod(s) from {}",
-                static_pods.len(),
-                self.config
-                    .pod_manifest_path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default()
-            );
-            self.pod_manager.sync_pods(&static_pods).await;
+        // Recover before any start. Reserve every observed name, even when
+        // the API is unavailable and the old claim set is not yet known.
+        loop {
+            match self.pod_manager.recover_state().await {
+                Ok(()) => break,
+                Err(error) => {
+                    warn!(%error, "runtime recovery incomplete; startup admission remains closed");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
         }
+        if let Some(vms) = &self.vms { vms.adopt_registered().await; }
+        else { self.vmis_synced.store(true, Ordering::Release); }
+        self.seed_names().await?;
 
         // Register the node in the BACKGROUND with backoff — never block the pod
         // loops on it. Static pods keep running (and get retried in the sync
@@ -273,7 +292,7 @@ impl Kubelet {
 
         // Adopt pods already running in the runtime (e.g. after a kubelet
         // restart) so we reconcile rather than double-create sandboxes.
-        self.pod_manager.recover_state().await;
+        // Recovery above precedes all admission.
 
         // Inbound kubelet HTTPS server (:10250) — /healthz, /metrics, /pods.
         {
@@ -376,34 +395,158 @@ impl Kubelet {
             });
         }
 
-        // Follow this node's machines rather than asking every tick.
-        //
-        // The reconcile loop still runs on its interval — a watch says what
-        // changed, and reconciliation is what makes the node match it, which
-        // is also needed when nothing changed and something drifted.
-        if let Some(vms) = self.vms.clone() {
-            // A bridged guest's address, written as its tap shows it (#91).
+        if let Some(vms) = &self.vms {
             vms.spawn_address_pump();
-            let api = self.api_client.clone();
-            let url = self.config.api_server_url.clone();
-            let node = self.config.node_name.clone();
-            let sink = vms.clone();
-            tokio::spawn(async move {
-                crate::vm_manager::watch_for_node(api, url, node, move |objs| {
-                    let s = sink.clone();
-                    tokio::spawn(async move { s.set_watched(objs).await });
-                })
-                .await;
-            });
         }
 
-        // Main sync loop
-        let mut interval = time::interval(self.config.sync_interval);
+        // One bounded executor for both kinds; producers never perform runtime I/O.
+        tokio::try_join!(self.pod_loop(), self.vm_loop(), self.vm_maintenance_loop(), async {
+            self.workloads.run(self.clone(), 8).await;
+            Ok::<(), anyhow::Error>(())
+        })?;
+        Ok(())
+    }
+
+    async fn pod_loop(&self) -> anyhow::Result<()> {
+        let worker = self.watches.worker("kubelet-pods");
+        let mut exits = self.runtime_changes.clone();
+        let mut volumes = Some(self.pod_manager.subscribe_volume_changes());
+        let mut drivers = Some(self.csi.subscribe_changes());
+        let mut images = self.pod_manager.subscribe_image_changes();
+        let mut files = tokio::task::JoinSet::new();
+        if let Some(path) = self.config.pod_manifest_path.clone() {
+            let changed = worker.clone();
+            files.spawn(
+                async move { crate::fs_watch::watch(path, move || changed.enqueue()).await },
+            );
+        }
         loop {
-            interval.tick().await;
-            if let Err(e) = self.sync().await {
-                error!("Pod sync failed: {e}");
-            }
+            let work = tokio::select! {
+                work = worker.next() => work,
+                image = images.recv() => {
+                    match image {
+                        Ok(image)=>self.workloads.wake_dependency(&Dependency::Image(image)),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_))=>self.workloads.wake_kind(Kind::Pod),
+                        Err(_)=>{}
+                    }
+                    continue;
+                },
+                _ = runtime_changed(&mut volumes) => { self.workloads.wake_kind(Kind::Pod); worker.enqueue(); continue; },
+                _ = runtime_changed(&mut drivers) => { self.workloads.wake_kind(Kind::Pod); worker.enqueue(); continue; },
+                _ = runtime_changed(&mut exits) => { self.workloads.wake_kind(Kind::Pod); worker.enqueue(); continue; },
+            };
+            worker
+                .run(async {
+                    if let Err(error) = self.sync().await {
+                        apimachinery::reactor::failed();
+                        error!("Pod sync failed: {error}");
+                    }
+                })
+                .await;
+            drop(work);
+        }
+    }
+
+    // Keep main's snapshot and owner-sweep services independent of UID work.
+    // Snapshot watches wake promptly; the deadline retains completion/recovery
+    // and disk-owner checks until #101 supplies all dependency events.
+    async fn vm_maintenance_loop(&self) -> anyhow::Result<()> {
+        let Some(vms) = &self.vms else { return std::future::pending().await; };
+        let worker = self.watches.worker("kubelet-vm-maintenance");
+        let mut deadline = time::interval(self.config.sync_interval.max(Duration::from_millis(100)));
+        loop {
+            let work = tokio::select! {
+                work = worker.next() => Some(work),
+                _ = deadline.tick() => None,
+            };
+            worker.run(async {
+                self.watches.observe(&self.api_client, format!(
+                    "{}/apis/snapshot.kubevirt.io/v1beta1/virtualmachinesnapshots",
+                    self.config.api_server_url));
+                if let Some(snapshots) = &self.snapshots { snapshots.sync().await; }
+                vms.sweep_orphans().await;
+            }).await;
+            drop(work);
+        }
+    }
+
+    async fn vm_loop(&self) -> anyhow::Result<()> {
+        let Some(vms) = &self.vms else {
+            return std::future::pending().await;
+        };
+        let worker = self.watches.worker("kubelet-vmis");
+        let mut exits = self.runtime_changes.clone();
+        let mut volumes = Some(self.pod_manager.subscribe_volume_changes());
+        let mut url = reqwest::Url::parse(&format!(
+            "{}/apis/kubevirt.io/v1/virtualmachineinstances",
+            self.config.api_server_url
+        ))?;
+        url.query_pairs_mut().append_pair(
+            "fieldSelector",
+            &format!("status.nodeName={}", self.config.node_name),
+        );
+        loop {
+            let work = tokio::select! {
+                work = worker.next() => work,
+                _ = runtime_changed(&mut volumes) => { self.workloads.wake_kind(Kind::VirtualMachine); worker.enqueue(); continue; },
+                _ = runtime_changed(&mut exits) => { self.workloads.wake_kind(Kind::VirtualMachine); worker.enqueue(); continue; },
+            };
+            worker
+                .run(async {
+                    self.watches.observe(&self.api_client, url.to_string());
+                    match apimachinery::reactor::check(
+                        apimachinery::reflector::list(&self.api_client, url.as_str()).await,
+                    ) {
+                        Ok(list) => {
+                            let want: Vec<_> = list["items"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .filter(|v| {
+                                    v["status"]["nodeName"].as_str() == Some(&self.config.node_name)
+                                })
+                                .cloned()
+                                .collect();
+                            self.observe_volume_dependencies();
+                            vms.cache_specs(&want).await;
+                            match self.seed_claims(Kind::VirtualMachine, &want).await {
+                                Ok(()) => {
+                                    if self.workloads.replace_source("api-vmis",Kind::VirtualMachine,&want).is_ok() {
+                                        self.vmis_synced.store(true,Ordering::Release);
+                                    }
+                                }
+                                Err(error) => { apimachinery::reactor::failed(); warn!(%error,"VM admission recovery pending"); }
+                            }
+                        }
+                        Err(error) => {
+                            debug!("VMI desired state unavailable: {error}");
+                            // No CRD is a supported Pod-only cluster. Never
+                            // treat this as deletion of registered machines.
+                            if vms.running().await.is_empty() {
+                                if let Ok(response)=self.api_client.get(url.clone()).send().await {
+                                    if response.status().as_u16()==404 {
+                                        self.vmis_synced.store(true,Ordering::Release);
+                                    }
+                                }
+                            }
+                        },
+                    }
+                })
+                .await;
+            drop(work);
+        }
+    }
+
+    fn observe_volume_dependencies(&self) {
+        for path in [
+            "/api/v1/persistentvolumeclaims",
+            "/api/v1/persistentvolumes",
+            "/apis/storage.k8s.io/v1/volumeattachments",
+        ] {
+            self.watches.observe(
+                &self.api_client,
+                format!("{}{}", self.config.api_server_url, path),
+            );
         }
     }
 
@@ -412,6 +555,8 @@ impl Kubelet {
     /// uid derived from name+node so re-reads don't recreate them. Best-effort:
     /// unreadable/invalid files are skipped with a warning.
     fn load_static_pods(&self) -> Vec<Value> {
+        self.static_read_complete
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let mut pods = Vec::new();
         let Some(dir) = self.config.pod_manifest_path.as_ref() else {
             return pods;
@@ -422,19 +567,33 @@ impl Kubelet {
                 // Once. A node that does not use static pods reads this
                 // directory on every sync, and saying so every time is how a
                 // debug log stops being readable.
-                if !self.said_no_static_dir.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                if !self
+                    .said_no_static_dir
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
                     debug!("no static pod dir {} — none will be loaded", dir.display());
                 }
                 return pods;
             }
             Err(e) => {
+                self.static_read_complete
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 // Anything else is actionable — a permission problem, a path
                 // that is not a directory — so it keeps saying so.
                 warn!("static pod dir {}: {e}", dir.display());
                 return pods;
             }
         };
-        for ent in entries.flatten() {
+        for entry in entries {
+            let ent = match entry {
+                Ok(ent) => ent,
+                Err(error) => {
+                    self.static_read_complete
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    warn!("static pod directory entry: {error}");
+                    continue;
+                }
+            };
             let path = ent.path();
             match path.extension().and_then(|s| s.to_str()) {
                 Some("yaml") | Some("yml") | Some("json") => {}
@@ -443,6 +602,8 @@ impl Kubelet {
             let text = match std::fs::read_to_string(&path) {
                 Ok(t) => t,
                 Err(e) => {
+                    self.static_read_complete
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
                     warn!("read static pod {}: {e}", path.display());
                     continue;
                 }
@@ -450,6 +611,8 @@ impl Kubelet {
             let mut pod: Value = match serde_yaml::from_str(&text) {
                 Ok(v) => v,
                 Err(e) => {
+                    self.static_read_complete
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
                     warn!("parse static pod {}: {e}", path.display());
                     continue;
                 }
@@ -482,150 +645,99 @@ impl Kubelet {
         pods
     }
 
-    /// Sync pods: fetch desired pods from API server, reconcile with actual.
+    /// Publish independent snapshots; unavailable sources never imply deletion.
     async fn sync(&self) -> anyhow::Result<()> {
-        // Apiserver pods scheduled to this node — BEST-EFFORT: during bootstrap
-        // the apiserver may be down, but static pods must still run to bring it
-        // up, so a failed list must not abort the sync.
-        let mut my_pods: Vec<Value> = match self
-            .api_client
-            .get(format!("{}/api/v1/pods", self.config.api_server_url))
-            .send()
-            .await
-        {
-            Ok(resp) => resp
-                .json::<Value>()
-                .await
-                .ok()
-                .and_then(|v| v["items"].as_array().cloned())
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|p| p["spec"]["nodeName"].as_str() == Some(&self.config.node_name))
-                // A mirror pod describes something PID 1 is already running.
-                //
-                // **It is a record, not an instruction.** This kubelet writes
-                // one per node service and then saw it come back as a pod
-                // assigned to this node, so it tried to *start* it — spawning
-                // `stormpump://stormblock` as though it were an image, failing,
-                // and overwriting the true status with StartFailed. The node's
-                // own services then appeared permanently broken while every one
-                // of them was serving.
-                //
-                // Upstream has the same annotation for the same reason: a
-                // kubelet must not act on the objects it publishes about work
-                // it did not schedule.
-                .filter(|p| {
-                    p["metadata"]["annotations"]["kubernetes.io/config.source"].as_str()
-                        != Some("stormpump")
-                })
-                .collect(),
-            Err(e) => {
-                debug!("apiserver pod list unavailable ({e}); running static pods only");
-                Vec::new()
-            }
-        };
-
-        // Static pods always run, whether or not the apiserver knows them. This
-        // is what keeps the control plane up (and retries it) during bootstrap.
-        for sp in self.load_static_pods() {
-            let uid = sp["metadata"]["uid"].as_str().unwrap_or("").to_string();
-            if !my_pods
-                .iter()
-                .any(|p| p["metadata"]["uid"].as_str() == Some(uid.as_str()))
-            {
-                my_pods.push(sp);
-            }
-        }
-
-        // Machines assigned here, reconciled on the same tick and through the
-        // same ring. Best-effort like the pod list: a cluster with no VM CRD is
-        // the ordinary case on a node that runs none, and it must not stop pods
-        // from being synced.
-        if let Some(vms) = &self.vms {
-            // What the watch has, or a list while it is still starting.
-            //
-            // A fresh kubelet cannot wait for an event: a watch only fires
-            // when something *changes*, and a node whose machines are all
-            // steady would sit idle forever having started none of them.
-            let want = match vms.watched().await {
-                Some(w) => Some(w),
-                None => {
-                    crate::vm_manager::list_for_node(
-                        &self.api_client,
-                        &self.config.api_server_url,
-                        &self.config.node_name,
-                    )
-                    .await
-                }
-            };
-            // No answer is not "no machines": skip the pass rather than stop
-            // every VM on the node (#35).
-            if let Some(want) = want {
-                vms.sync(&want).await;
-            }
-        }
-        if let Some(snapshots) = &self.snapshots {
-            snapshots.sync().await;
-        }
-
-        // Sync pod states
-        let outcome = self.pod_manager.sync_pods(&my_pods).await;
-
-        // Report status updates back to API server
-        for update in &outcome.updates {
-            if let Err(e) = self.report_pod_status(update).await {
-                error!(
-                    "Failed to report status for {}/{}: {e}",
-                    update.namespace, update.name
-                );
-            }
-        }
-
-        // Confirm terminating pods: containers are down, so force-delete the
-        // pod object to finish the API-side deletion. Orphaned pods are already
-        // gone from the API server — nothing to confirm.
-        for removed in &outcome.removed {
-            if removed.reason != RemovalReason::Deleting {
-                continue;
-            }
-            let path = format!(
-                "{}/api/v1/namespaces/{}/pods/{}?gracePeriodSeconds=0",
-                self.config.api_server_url, removed.namespace, removed.name
-            );
-            match self.api_client.delete(&path).send().await {
-                Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 404 => {
-                    info!(
-                        "Confirmed deletion of pod {}/{}",
-                        removed.namespace, removed.name
-                    );
-                }
-                Ok(resp) => {
-                    warn!(
-                        "Failed to confirm deletion of {}/{}: HTTP {}",
-                        removed.namespace,
-                        removed.name,
-                        resp.status()
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to confirm deletion of {}/{}: {e}",
-                        removed.namespace, removed.name
-                    );
-                }
-            }
-        }
-
-        // Handle migration annotations on pods assigned to this node
-        for pod in &my_pods {
-            if let Err(e) = self.handle_migration_annotations(pod).await {
-                let name = pod["metadata"]["name"].as_str().unwrap_or("?");
-                let ns = pod["metadata"]["namespace"].as_str().unwrap_or("?");
-                warn!("Migration annotation handling failed for {ns}/{name}: {e}");
-            }
-        }
-
+        let static_pods = self.load_static_pods();
+        if self.static_read_complete.load(Ordering::Acquire) {
+            self.pod_manager.cache_specs(&static_pods).await;
+            self.seed_claims(Kind::Pod, &static_pods).await?;
+            self.workloads.replace_source("static",Kind::Pod,&static_pods)?;
+        } else { apimachinery::reactor::failed(); }
+        let mut url = reqwest::Url::parse(&format!("{}/api/v1/pods",self.config.api_server_url))?;
+        url.query_pairs_mut().append_pair("fieldSelector",&format!("spec.nodeName={}",self.config.node_name));
+        self.watches.observe(&self.api_client,url.to_string());
+        let list = apimachinery::reactor::check(apimachinery::reflector::list(&self.api_client,url.as_str()).await)?;
+        let want: Vec<_> = list["items"].as_array().unwrap().iter().filter(|p|
+            p["spec"]["nodeName"].as_str()==Some(&self.config.node_name)
+            && p["metadata"]["annotations"]["kubernetes.io/config.source"].as_str()!=Some("stormpump")
+            && !p["metadata"]["uid"].as_str().unwrap_or("").starts_with("static-"))
+            .cloned().collect();
+        self.pod_manager.cache_specs(&want).await;
+        self.seed_claims(Kind::Pod,&want).await?;
+        self.workloads.replace_source("api-pods",Kind::Pod,&want)?;
+        self.pods_synced.store(true,Ordering::Release);
+        self.observe_volume_dependencies();
+        // Dependency collection changes wake only affected claim users.
+        self.refresh_claim_dependencies().await;
         Ok(())
+    }
+
+    async fn seed_names(&self) -> anyhow::Result<()> {
+        let mut api = Vec::new(); let mut statics = Vec::new();
+        for pod in self.pod_manager.known_pods().await {
+            let object = serde_json::json!({"metadata":{"namespace":pod.namespace,"name":pod.name,"uid":pod.uid}});
+            let key=Key::of(Kind::Pod,&object)?;
+            self.workloads.reservations.seed(&key,&[]);
+            if key.uid.starts_with("static-") { statics.push(object); } else { api.push(object); }
+        }
+        self.workloads.replace_source("api-pods",Kind::Pod,&api)?;
+        self.workloads.replace_source("static",Kind::Pod,&statics)?;
+        if let Some(vms)=&self.vms {
+            let mut objects=Vec::new();
+            for vm in vms.running().await {
+                let object=serde_json::json!({"metadata":{"namespace":vm.namespace,"name":vm.name,"uid":vm.uid}});
+                self.workloads.reservations.seed(&Key::of(Kind::VirtualMachine,&object)?,&[]);
+                objects.push(object);
+            }
+            self.workloads.replace_source("api-vmis",Kind::VirtualMachine,&objects)?;
+        }
+        Ok(())
+    }
+
+    async fn claims_for(&self,key:&Key,object:&Value) -> anyhow::Result<Vec<(Resource,Access)>> {
+        let mut claims=Vec::new();
+        for dependency in workload::dependencies(key,object) {
+            let Dependency::Claim(ns,name)=dependency else {continue};
+            let response=self.api_client.get(format!("{}/api/v1/namespaces/{ns}/persistentvolumeclaims/{name}",self.config.api_server_url)).send().await?;
+            let pvc:Value=response.error_for_status()?.json().await?;
+            let mode=if key.kind==Kind::VirtualMachine || crate::storage::is_rwop(&pvc) {Access::Exclusive} else {Access::SharedFilesystem};
+            claims.push((Resource::Claim(ns,name),mode));
+        }
+        Ok(claims)
+    }
+
+    async fn seed_claims(&self,kind:Kind,objects:&[Value]) -> anyhow::Result<()> {
+        let known:std::collections::HashSet<String>=match kind {
+            Kind::Pod=>self.pod_manager.known_pods().await.into_iter().map(|p|p.uid).collect(),
+            Kind::VirtualMachine=>match &self.vms {Some(v)=>v.running().await.into_iter().map(|v|v.uid).collect(),None=>Default::default()},
+        };
+        for object in objects {
+            let key=Key::of(kind,object)?;
+            if known.contains(&key.uid) {
+                let claims=self.claims_for(&key,object).await?;
+                self.workloads.reservations.seed(&key,&claims);
+            }
+        }
+        Ok(())
+    }
+
+    async fn refresh_claim_dependencies(&self) {
+        let base = &self.config.api_server_url;
+        let claim_url = format!("{base}/api/v1/persistentvolumeclaims");
+        let volume_url = format!("{base}/api/v1/persistentvolumes");
+        let attachment_url = format!("{base}/apis/storage.k8s.io/v1/volumeattachments");
+        let (claims, volumes, attachments) = tokio::join!(
+            apimachinery::reflector::list(&self.api_client,&claim_url),
+            apimachinery::reflector::list(&self.api_client,&volume_url),
+            apimachinery::reflector::list(&self.api_client,&attachment_url),
+        );
+        if let (Ok(claims),Ok(volumes),Ok(attachments)) = (claims,volumes,attachments) {
+            if let (Some(claims),Some(volumes),Some(attachments)) =
+                (claims["items"].as_array(),volumes["items"].as_array(),attachments["items"].as_array()) {
+                let changed = self.last_claims.lock().unwrap().update(claims,volumes,attachments);
+                for dependency in changed {self.workloads.wake_dependency(&dependency);}
+            }
+        }
     }
 
     /// Handle migration-related annotations on pods.
@@ -661,6 +773,7 @@ impl Kubelet {
                             .header("content-type", "application/strategic-merge-patch+json")
                             .json(&serde_json::json!({
                                 "metadata": {
+                                    "uid": uid,
                                     "annotations": {
                                         "rustkube.io/checkpoint-ref": ref_json,
                                         "rustkube.io/migrate-action": "checkpoint-done",
@@ -682,6 +795,7 @@ impl Kubelet {
                             .header("content-type", "application/strategic-merge-patch+json")
                             .json(&serde_json::json!({
                                 "metadata": {
+                                    "uid": uid,
                                     "annotations": {
                                         "rustkube.io/migrate-action": "checkpoint-failed",
                                         "rustkube.io/migrate-error": e.to_string(),
@@ -726,6 +840,7 @@ impl Kubelet {
                             .header("content-type", "application/strategic-merge-patch+json")
                             .json(&serde_json::json!({
                                 "metadata": {
+                                    "uid": uid,
                                     "annotations": {
                                         "rustkube.io/migration-endpoint": endpoint,
                                         "rustkube.io/migrate-action": "target-ready",
@@ -750,9 +865,7 @@ impl Kubelet {
                     .as_str()
                     .unwrap_or("");
 
-                info!(
-                    "Migration: live-migrating pod {namespace}/{name} to {target_endpoint}"
-                );
+                info!("Migration: live-migrating pod {namespace}/{name} to {target_endpoint}");
                 match self
                     .migration
                     .live_migrate(&sandbox_id, target_endpoint)
@@ -768,6 +881,7 @@ impl Kubelet {
                             .header("content-type", "application/strategic-merge-patch+json")
                             .json(&serde_json::json!({
                                 "metadata": {
+                                    "uid": uid,
                                     "annotations": {
                                         "rustkube.io/migrate-action": "migrate-done",
                                     }
@@ -812,12 +926,9 @@ impl Kubelet {
 
                     match self.migration.restore_pod(&checkpoint_ref, &config).await {
                         Ok(sandbox_id) => {
-                            self.pod_manager.register_restored_pod(
-                                uid,
-                                namespace,
-                                name,
-                                &sandbox_id,
-                            ).await;
+                            self.pod_manager
+                                .register_restored_pod(uid, namespace, name, &sandbox_id)
+                                .await;
                             info!(
                                 "Migration: pod {namespace}/{name} restored (sandbox={sandbox_id})"
                             );
@@ -841,6 +952,7 @@ impl Kubelet {
     async fn report_pod_status(
         &self,
         update: &crate::pod_manager::PodStatusUpdate,
+        source: &Value,
     ) -> anyhow::Result<()> {
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
@@ -994,7 +1106,7 @@ impl Kubelet {
             "containerStatuses": container_statuses,
             "initContainerStatuses": init_container_statuses,
             "hostIP": &self.node_ip,
-            "startTime": &now
+            "startTime": source["status"]["startTime"].as_str().unwrap_or(&now)
         });
 
         // **Publish why.** The kubelet already knows: `start_pod` returns the
@@ -1021,24 +1133,102 @@ impl Kubelet {
             self.config.api_server_url, update.namespace, update.name
         );
 
-        // Through the /status subresource, not a whole-object PUT. A PUT sends
-        // back a spec read a moment ago, so a status write races every spec
-        // change — the same defect that made a Deployment's scale-up lose to a
-        // ReplicaSet's status write.
-        let _ = self
-            .api_client
-            .put(format!("{path}/status"))
+        // Preserve status fields owned by admission/scheduling; use the
+        // source revision so a slow start cannot overwrite a recreated Pod.
+        let mut merged = source["status"].as_object().cloned().unwrap_or_default();
+        if status.get("message").is_none() {
+            merged.remove("message");
+            merged.remove("reason");
+        }
+        merged.extend(status.as_object().unwrap().clone());
+        let status = Value::Object(merged);
+        if status == source["status"] {
+            return Ok(());
+        }
+        // Static manifests have no API identity; their mirror publication is
+        // separate from managing their local runtime state.
+        if source["metadata"]["resourceVersion"].as_str().is_none() {
+            return Ok(());
+        }
+        self.api_client.put(format!("{path}/status"))
+            .timeout(Duration::from_secs(10))
             .json(&serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "Pod",
-                "metadata": { "name": &update.name, "namespace": &update.namespace },
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": &update.name, "namespace": &update.namespace,
+                    "uid": source["metadata"]["uid"], "resourceVersion": source["metadata"]["resourceVersion"]},
                 "status": status
-            }))
-            .send()
-            .await;
+            })).send().await?.error_for_status()?;
 
         Ok(())
     }
+}
+
+#[async_trait::async_trait]
+impl workload::Adapter for Kubelet {
+    async fn reconcile(&self,key:&Key,desired:Option<Value>) -> anyhow::Result<Next> {
+        let retry=self.config.sync_interval.max(Duration::from_millis(100));
+        let deleting=desired.as_ref().map_or(true,|o| !o["metadata"]["deletionTimestamp"].is_null());
+        if deleting {
+            let claims=self.workloads.reservations.claims(key);
+            let Some(_operations)=self.workloads.reservations.try_operations(&claims) else {return Ok(Next::After(Duration::from_millis(100)))};
+            match key.kind {
+                Kind::Pod=> {
+                    self.pod_manager.stop_pod(&key.uid).await?;
+                    if let Some(object)=&desired {
+                        // Never acknowledge deletion of a same-name successor.
+                        let response=self.api_client.delete(format!("{}/api/v1/namespaces/{}/pods/{}",self.config.api_server_url,key.namespace,key.name))
+                            .json(&serde_json::json!({"apiVersion":"v1","kind":"DeleteOptions","gracePeriodSeconds":0,
+                                "preconditions":{"uid":object["metadata"]["uid"]}})).send().await?;
+                        anyhow::ensure!(response.status().is_success() || matches!(response.status().as_u16(),404|409),"Pod deletion acknowledgement failed: {}",response.status());
+                    }
+                }
+                Kind::VirtualMachine=> {
+                    if let Some(vms)=&self.vms { vms.reconcile_one(&key.uid,desired.as_ref()).await?; }
+                }
+            }
+            self.workloads.reservations.release(key);
+            return Ok(Next::AwaitEvent);
+        }
+        let object=desired.unwrap();
+        // Recovery placeholder objects are never launch specifications.
+        if object["spec"].is_null() {return Ok(Next::After(retry))}
+        let static_without_claims=key.kind==Kind::Pod && key.uid.starts_with("static-")
+            && !workload::dependencies(key,&object).iter().any(|d| matches!(d,Dependency::Claim(..)));
+        if !static_without_claims {
+            if !self.pods_synced.load(Ordering::Acquire) || !self.vmis_synced.load(Ordering::Acquire)
+                || self.pod_manager.known_pods().await.iter().any(|p|p.pod.is_null())
+                || match &self.vms {Some(v)=>v.has_unknown_claims().await,None=>false} {
+                return Ok(Next::After(retry));
+            }
+        }
+        let claims=self.claims_for(key,&object).await?;
+        if !self.workloads.reservations.acquire(key,&claims) {return Ok(Next::AwaitEvent)}
+        let Some(_operations)=self.workloads.reservations.try_operations(&claims) else {return Ok(Next::After(Duration::from_millis(100)))};
+        match key.kind {
+            Kind::Pod=> {
+                // Incomplete collection semantics deliberately suppress orphan
+                // sweeping: absence is handled by the deleted UID's own worker.
+                let outcome=self.pod_manager.sync_pods_observed(&[object.clone()],false).await;
+                for update in &outcome.updates {self.report_pod_status(update,&object).await?;}
+                self.handle_migration_annotations(&object).await?;
+            }
+            Kind::VirtualMachine=> {
+                if let Some(vms)=&self.vms {vms.reconcile_one(&key.uid,Some(&object)).await?;}
+            }
+        }
+        // Runtime/probe observation remains a per-UID deadline until #101's
+        // complete event sources replace it. No whole-node runtime pass.
+        Ok(Next::After(retry))
+    }
+}
+
+async fn runtime_changed(receiver: &mut Option<tokio::sync::watch::Receiver<u64>>) {
+    if let Some(rx) = receiver {
+        if rx.changed().await.is_ok() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await;
 }
 
 fn hostname() -> String {
@@ -1095,8 +1285,7 @@ fn system_hostname() -> Option<String> {
 /// differed from the last time you looked.
 static LAST_SEEN: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, (bool, u32)>>,
-> =
-    std::sync::OnceLock::new();
+> = std::sync::OnceLock::new();
 
 async fn mirror_node_services(client: &reqwest::Client, api_url: &str, node: &str) {
     // Its own recorder: this runs on a timer of its own, not through the pod
@@ -1129,7 +1318,11 @@ async fn mirror_node_services(client: &reqwest::Client, api_url: &str, node: &st
     }
 
     // The node's uid, so the mirrors are owned by it and collected with it.
-    let node_uid = match client.get(format!("{api_url}/api/v1/nodes/{node}")).send().await {
+    let node_uid = match client
+        .get(format!("{api_url}/api/v1/nodes/{node}"))
+        .send()
+        .await
+    {
         Ok(r) if r.status().is_success() => r
             .json::<Value>()
             .await
@@ -1175,9 +1368,17 @@ async fn mirror_node_services(client: &reqwest::Client, api_url: &str, node: &st
                                 ),
                             ));
                         } else if was_running && !a.running {
-                            changes.push((a.name.clone(), "Stopped", "the service is no longer running".into()));
+                            changes.push((
+                                a.name.clone(),
+                                "Stopped",
+                                "the service is no longer running".into(),
+                            ));
                         } else if !was_running && a.running {
-                            changes.push((a.name.clone(), "Started", "the service is running".into()));
+                            changes.push((
+                                a.name.clone(),
+                                "Started",
+                                "the service is running".into(),
+                            ));
                         }
                     }
                 }
@@ -1185,7 +1386,11 @@ async fn mirror_node_services(client: &reqwest::Client, api_url: &str, node: &st
             }
         }
         for (name, reason, message) in changes {
-            let etype = if reason == "Started" { "Normal" } else { "Warning" };
+            let etype = if reason == "Started" {
+                "Normal"
+            } else {
+                "Warning"
+            };
             let pod = serde_json::json!({
                 "metadata": { "name": format!("{name}-{node}"), "namespace": "kube-system", "uid": "" }
             });
@@ -1261,8 +1466,7 @@ fn nanos_to_rfc3339(nanos: i64) -> serde_json::Value {
     if nanos <= 0 {
         return serde_json::Value::Null;
     }
-    match chrono::DateTime::from_timestamp(nanos / 1_000_000_000,
-                                           (nanos % 1_000_000_000) as u32) {
+    match chrono::DateTime::from_timestamp(nanos / 1_000_000_000, (nanos % 1_000_000_000) as u32) {
         Some(t) => serde_json::json!(t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
         None => serde_json::Value::Null,
     }
@@ -1291,7 +1495,11 @@ mod init_condition_tests {
             container_id: "abc".into(),
             state: "terminated".into(),
             exit_code: exit,
-            reason: if exit == 0 { "Completed".into() } else { "Error".into() },
+            reason: if exit == 0 {
+                "Completed".into()
+            } else {
+                "Error".into()
+            },
             message: String::new(),
             image: "busybox".into(),
             image_ref: "sha256:x".into(),
@@ -1314,14 +1522,25 @@ mod init_condition_tests {
 
     #[test]
     fn a_pod_part_way_through_is_not_initialized() {
-        assert!(!pod_initialized(6, &[report("config", 0), report("mount-cgroup", 0)]));
+        assert!(!pod_initialized(
+            6,
+            &[report("config", 0), report("mount-cgroup", 0)]
+        ));
     }
 
     #[test]
     fn all_succeeded_is_initialized() {
-        let all: Vec<_> = ["config", "mount-cgroup", "apply-sysctl-overwrites",
-                           "mount-bpf-fs", "clean-cilium-state", "install-cni-binaries"]
-            .iter().map(|n| report(n, 0)).collect();
+        let all: Vec<_> = [
+            "config",
+            "mount-cgroup",
+            "apply-sysctl-overwrites",
+            "mount-bpf-fs",
+            "clean-cilium-state",
+            "install-cni-binaries",
+        ]
+        .iter()
+        .map(|n| report(n, 0))
+        .collect();
         assert!(pod_initialized(6, &all));
     }
 

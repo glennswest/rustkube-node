@@ -3,8 +3,9 @@
 Reviewed 2026-09-29 against main **5bb1a38** and
 `git log --since=2026-09-18`. Version 0.13.0 is the workspace version;
 changes after its tag remain unreleased. This document describes source and
-recorded verification, not a newly tested live node. `turbomode` is a separate
-branch with its own incomplete integration and acceptance (#99–#102).
+recorded verification, not a newly tested live node. The #114 merge integrates turbomode UID workers with the main behaviors
+listed below. Cancellation, complete event sources and live acceptance remain
+open (#99–#102); no release or golden is part of this merge.
 
 ## Changes since September 18
 

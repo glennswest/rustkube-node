@@ -9,7 +9,46 @@ Current code: **main at 5bb1a38, audited 2026-09-29**, workspace version
 heartbeats, runs Pods, and reconciles stormvm VirtualMachineInstances through
 stormpump. This is a partial Kubernetes node implementation; remaining gaps
 and unsupported promises are tracked in [the capability audit](docs/status.md).
-The experimental `turbomode` branch is not merged or released.
+The event-driven UID worker implementation is integrated under #114; acceptance
+and remaining cancellation/event work continue in #100–#102.
+
+## Event-driven reconciliation
+
+The turbomode implementation uses rustkube's pinned reactor dependency. Pod and VMI
+assignment/volume watches enqueue coalesced reconciliation work; Pod and VM
+subscriptions run independently; runtime work now uses one eight-worker Pod/VMI executor with name/claim
+reservations and recovery barriers (#100, validation in progress). Stormpump exits and Linux static-manifest changes
+also wake workers. CSI registrar sockets use filesystem notifications;
+successful registrations wake Pod workers, with deadlines for pending failures. Failed or incomplete Pod/manifest reads cannot stop live
+Pods by treating an unknown desired set as empty. Status publication retains
+startTime, skips unchanged status and uses the observed resourceVersion.
+Pod teardown retains its runtime record until stopping and volume cleanup succeed.
+CSI teardown preserves its retry record through failed unstage calls and refuses
+cleanup from unreadable records or incomplete Pod lists. Pod and VMI adapters share that executor. Failed startup/cleanup records are
+retained, and same-name successors wait for the previous UID to release its resources.
+
+The full workspace build and tests passed on dev at `55d458c`, including
+224 kubelet unit and four integration tests. Cleanup retains refused engine releases, CSI publication and teardown
+serialize by driver/handle, and failed runtime recovery keeps admission closed.
+PV and VolumeAttachment changes route through an inverse claim index; failed
+collection reads retain the index. VM status and migration writes carry UID
+guards. VM cancellation remains blocked on
+[stormpump#63](https://github.com/glennswest/stormpump/issues/63): the shared
+engine client cannot withdraw a deposited tap after a pre-spawn failure.
+Every-boundary cancellation coverage and VM partial-start cleanup are unfinished;
+these remain tracked in #100 after the owner-authorized merge. Subsecond
+startup has not been measured on a live node.
+Active workloads still use an explicit runtime/probe/volume observation
+fallback, and service/volume mirrors and CSI cleanup tasks retain their existing schedules.
+Per-UID concurrency and complete local event sources are tracked in
+[#100](https://github.com/glennswest/rustkube-node/issues/100) and
+[#101](https://github.com/glennswest/rustkube-node/issues/101).
+See [the design and baseline](docs/event-driven-design.md) and
+[#102](https://github.com/glennswest/rustkube-node/issues/102) for validation.
+Builds run on dev only after pushing. Main's tap address pump, snapshot
+reconciler, VM startup backoff and disk-owner sweep remain active. A failed
+VMI LIST retains the last desired set; stopping a VMI detaches its disks,
+while the owner sweep decides when to delete them.
 
 ## Components and runtime selection
 
@@ -127,10 +166,9 @@ the reason says it timed out, and the kubelet keeps retrying. As upstream, a
 mount timeout does not fail the pod, because the volume may still come.
 
 The first claim of a size class mints its blank (one `mkfs`). The mint runs in
-the background and is waited for inline for 2 seconds, so a small class is
-cloned on the pass that asked. A large one (a 1 TiB blank formats for minutes)
-does not hold the sync loop: its claims wait on the template's state until it
-is `ready`.
+the background without an inline wait. Completion signals the Pod and VM
+queues immediately; waiting claims check the template's state and proceed
+when it is `ready`. A large format does not hold the reconciliation pass.
 
 The current ext4 ladder is **1Mi, 16Mi, 64Mi, 256Mi, 1Gi, 4Gi, 16Gi,
 64Gi, 256Gi, 1Ti**; requests round up, and requests above 1Ti are refused.

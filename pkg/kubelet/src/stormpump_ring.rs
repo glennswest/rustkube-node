@@ -185,6 +185,7 @@ pub struct RingClient {
     /// way, and that socket belongs to the ring thread.
     deposits: std::sync::Mutex<mpsc::Sender<Deposit>>,
     exits: std::sync::Mutex<mpsc::Receiver<Exited>>,
+    exit_changes: tokio::sync::watch::Sender<u64>,
 }
 
 impl std::fmt::Debug for RingClient {
@@ -214,6 +215,8 @@ impl RingClient {
         let (tx, rx) = mpsc::channel::<Request>();
         let (dep_tx, dep_rx) = mpsc::channel::<Deposit>();
         let (exit_tx, exits) = mpsc::channel::<Exited>();
+        let (exit_changes, _) = tokio::sync::watch::channel(0_u64);
+        let notify_exits = exit_changes.clone();
         let submit = attached.submit;
         let complete = attached.complete;
         let ring_fd = attached.ring;
@@ -236,7 +239,16 @@ impl RingClient {
                 // closes the connection, and the engine takes that as the
                 // client having gone away.
                 let stream = attached.stream;
-                run(mapping, rx, dep_rx, &stream, exit_tx, submit, complete);
+                run(
+                    mapping,
+                    rx,
+                    dep_rx,
+                    &stream,
+                    exit_tx,
+                    notify_exits,
+                    submit,
+                    complete,
+                );
             })
             .map_err(|e| RingError::Attach(format!("starting the ring thread: {e}")))?;
 
@@ -244,6 +256,7 @@ impl RingClient {
             tx: std::sync::Mutex::new(tx),
             deposits: std::sync::Mutex::new(dep_tx),
             exits: std::sync::Mutex::new(exits),
+            exit_changes,
         })
     }
 
@@ -258,11 +271,22 @@ impl RingClient {
         self.request(sqe, payload, false).map(|r| r.cqe)
     }
 
-    fn request(&self, sqe: Sqe, payload: Option<Vec<u8>>, read_back: bool) -> Result<Reply, RingError> {
+    fn request(
+        &self,
+        sqe: Sqe,
+        payload: Option<Vec<u8>>,
+        read_back: bool,
+    ) -> Result<Reply, RingError> {
         let (reply, answer) = mpsc::channel();
         {
             let tx = self.tx.lock().map_err(|_| RingError::Gone)?;
-            tx.send(Request { sqe, payload, read_back, reply }).map_err(|_| RingError::Gone)?;
+            tx.send(Request {
+                sqe,
+                payload,
+                read_back,
+                reply,
+            })
+            .map_err(|_| RingError::Gone)?;
         }
         // Outside the lock: another caller must be able to submit while this
         // one waits, or the ring serialises on the client rather than on the
@@ -284,8 +308,12 @@ impl RingClient {
         let (reply, answer) = mpsc::channel();
         {
             let tx = self.deposits.lock().map_err(|_| RingError::Gone)?;
-            tx.send(Deposit { name: name.to_string(), fd, reply })
-                .map_err(|_| RingError::Gone)?;
+            tx.send(Deposit {
+                name: name.to_string(),
+                fd,
+                reply,
+            })
+            .map_err(|_| RingError::Gone)?;
         }
         answer.recv().map_err(|_| RingError::Gone)?
     }
@@ -293,7 +321,10 @@ impl RingClient {
     /// Define a spec, returning its handle.
     pub fn spec_define(&self, encoded: Vec<u8>) -> Result<Handle, RingError> {
         let cqe = self.submit(
-            Sqe { opcode: Op::SpecDefine as u8, ..Default::default() },
+            Sqe {
+                opcode: Op::SpecDefine as u8,
+                ..Default::default()
+            },
             Some(encoded),
         )?;
         Ok(cqe.handle())
@@ -302,7 +333,10 @@ impl RingClient {
     /// Register a mounted volume by path, returning its handle.
     pub fn volume_register(&self, mount: &str) -> Result<Handle, RingError> {
         let cqe = self.submit(
-            Sqe { opcode: Op::VolumeRegister as u8, ..Default::default() },
+            Sqe {
+                opcode: Op::VolumeRegister as u8,
+                ..Default::default()
+            },
             Some(mount.as_bytes().to_vec()),
         )?;
         Ok(cqe.handle())
@@ -326,7 +360,10 @@ impl RingClient {
     ) -> Result<Handle, RingError> {
         let payload = format!("{mount}\0{device}\0{fstype}").into_bytes();
         let cqe = self.submit(
-            Sqe { opcode: Op::VolumeRegister as u8, ..Default::default() },
+            Sqe {
+                opcode: Op::VolumeRegister as u8,
+                ..Default::default()
+            },
             Some(payload),
         )?;
         Ok(cqe.handle())
@@ -477,6 +514,11 @@ impl RingClient {
     /// Drained rather than subscribed to: the caller is the runtime's own
     /// status path, which runs when the kubelet asks, and an exit that arrives
     /// between two asks must still be there for the second one.
+    /// Notifications never drain the exit data needed by runtime status.
+    pub fn subscribe_exits(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.exit_changes.subscribe()
+    }
+
     pub fn drain_exits(&self) -> Vec<Exited> {
         let mut out = Vec::new();
         if let Ok(rx) = self.exits.lock() {
@@ -497,7 +539,11 @@ impl RingClient {
         workload: Handle,
     ) -> Result<Option<stormpump_abi::query::Stats>, RingError> {
         let r = self.request(
-            Sqe { opcode: Op::Query as u8, primary: workload, ..Default::default() },
+            Sqe {
+                opcode: Op::Query as u8,
+                primary: workload,
+                ..Default::default()
+            },
             Some(vec![0u8; stormpump_abi::query::STATS_END]),
             true,
         )?;
@@ -522,7 +568,10 @@ impl RingClient {
 fn arena_region(arena: &[u8], region: ArenaRef) -> Vec<u8> {
     let start = region.offset() as usize;
     let end = start.saturating_add(region.len() as usize);
-    arena.get(start..end).map(<[u8]>::to_vec).unwrap_or_default()
+    arena
+        .get(start..end)
+        .map(<[u8]>::to_vec)
+        .unwrap_or_default()
 }
 
 /// How long to wait for one completion.
@@ -538,6 +587,7 @@ fn run(
     deposits: mpsc::Receiver<Deposit>,
     stream: &std::os::unix::net::UnixStream,
     exits: mpsc::Sender<Exited>,
+    exit_changes: tokio::sync::watch::Sender<u64>,
     submit: i32,
     complete: i32,
 ) {
@@ -624,7 +674,11 @@ fn run(
             if cqe.user_data == 0 {
                 // Unsolicited: a workload ended. Nothing asked, and something
                 // still has to hear it.
-                let _ = exits.send(Exited { handle: cqe.handle(), status: cqe.aux });
+                let _ = exits.send(Exited {
+                    handle: cqe.handle(),
+                    status: cqe.aux,
+                });
+                exit_changes.send_modify(|revision| *revision = revision.wrapping_add(1));
                 continue;
             }
             if let Some(reply) = waiting.remove(&cqe.user_data) {
@@ -688,7 +742,11 @@ mod tests {
     #[test]
     fn the_stats_block_decodes_from_a_read_back_region() {
         use stormpump_abi::query;
-        let st = query::Stats { cpu_usage_usec: 7, memory_current: 9, ..Default::default() };
+        let st = query::Stats {
+            cpu_usage_usec: 7,
+            memory_current: 9,
+            ..Default::default()
+        };
         let mut region = vec![0u8; query::STATS_END];
         region[query::REPLY_LEN..query::STATS_END].copy_from_slice(&st.to_bytes());
         assert_eq!(query::stats(query::WROTE_STATS, &region), Some(st));
@@ -719,7 +777,11 @@ mod tests {
         // The opcode matters as much as the errno: a pod start makes several
         // calls in a row, and "errno 22" alone names neither the call nor the
         // argument. This cost an afternoon before the op was carried.
-        let e = RingError::Failed { op: Op::VolumeRegister as u8, errno: 22, step: 4 };
+        let e = RingError::Failed {
+            op: Op::VolumeRegister as u8,
+            errno: 22,
+            step: 4,
+        };
         let text = format!("{e}");
         assert!(text.contains("VolumeRegister"), "{text}");
         // Both halves in words: the step named rather than numbered, and the

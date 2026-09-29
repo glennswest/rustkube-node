@@ -40,3 +40,7 @@ pub use cri_grpc::CriGrpcClient;
 pub use kubelet::{detect_node_name, Kubelet, KubeletConfig};
 pub use runtime::{NativeRuntime, NativeImageService};
 pub use vm_runtime::{VmRuntime, VmConfig, VmmBackend};
+
+mod fs_watch;
+
+pub mod workload;

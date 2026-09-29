@@ -21,8 +21,7 @@ kube-proxy is not started. PVCs use the built-in stormblock driver and sealed
 size-class blanks over ublk, with CSI only for third-party drivers.
 
 Main has VMI adoption, persistent VM-owned disks, accessCredentials, tap address
-reporting and snapshot reconciliation; restore remains #53/#109. Main does not
-contain turbomode's UID workers. Historical work-plan entries below record
+reporting and snapshot reconciliation; restore remains #53/#109. The #114 integration adds turbomode's UID workers. Historical work-plan entries below record
 what was true at each checkpoint; they are not current deployment guarantees.
 Owner decisions are tracked in #106–#110; do not infer answers from recommendations.
 
@@ -52,6 +51,60 @@ owner built the stage golden for v0.12.0: golden-rustkube-node-ce66e97945ad
 not the release path.
 
 ## Work plan
+
+### In progress: #114, merge turbomode into main
+
+2026-09-29: owner instruction in #114 supersedes the earlier no-merge hold.
+Preserve main's #91 address pump, #35 failed-list protection, #53 snapshots
+and #75 VM disk ownership in the UID worker design. Open #100/#101/#102
+work continues on main afterwards; no golden or release is requested here.
+
+1. [x] Read #114, #100, project rules and open issues; checkout is clean.
+2. [x] Merge origin/main into turbomode; preserve address pump, failed-list
+   protection, snapshot maintenance, durable disks, retry policy and credentials.
+3. [x] ec39c2a pushed; full sc-build `cargo build --locked && cargo test --locked`
+   passed: 251 kubelet unit, four integration, 24 CNI, 17 proxy and one doc-test;
+   one doc-test ignored. Remote exit 0 in 107s; drive deleted. Local statistics
+   append was read-only (remote result unaffected).
+4. [ ] Merge turbomode into main with --no-ff, push and repeat full sc-build.
+5. [ ] Record merge/test evidence and remaining work on #114, then close it.
+
+
+### Parked on stormpump#63: #100, common bounded per-UID Pod/VMI workers
+
+Earlier checkpoint: #100 continued at turbomode 9b46886 (211 tests passed).
+#114 now authorizes merging; unfinished cancellation work continues on main.
+
+1. [x] Wire Pod/VMI adapters to one eight-worker executor with name/claim
+   reservations; seed adopted workloads before admission. Static manifests have
+   an independent desired source, so unavailable API reads do not remove them.
+2. [x] Stage image pulls (four-slot shared pull pool), init waits and VM shutdown
+   grace periods. Retain partial Pod starts, refused runtime releases and CSI
+   teardown records. Serialize CSI mutations by driver/handle. Reject unknown
+   runtime recovery and VM exit as proof that cleanup is safe.
+3. [x] Add inverse claim/image/driver indexes and PV/attachment-to-claim routing;
+   UID guards on Pod deletion, VM status/finalizers, migration writes and PV deletion.
+4. [x] Push incremental checkpoints and run sc-build. af1704b passed 223 unit +
+   four integration tests. e504f58 full workspace build passed; test compilation
+   found a missing json macro import. Fixed in 55d458c: full sc-build
+   `cargo build --locked && cargo test --locked` passed (224 kubelet unit,
+   four integration, 24 CNI, 17 proxy; one doc-test passed, one ignored).
+5. [ ] Finish cancellation at every side-effect boundary. External blocker:
+   stormpump#63 has no acknowledged withdrawal for deposited VM tap FDs before
+   spawn. Partial NIC/plan/registration failures can keep a tap alive in the
+   shared engine connection and block same-name recreation. #100 moved behind
+   that issue with stormcentral propose; do not close or release it yet.
+   Resume: wire deposit withdrawal and retain VM partial-start ownership (disk,
+   volume/spec handles, registration, NIC deposits) until each cleanup succeeds;
+   add real adapter cancellation/failure-injection coverage. Audit CNI partial
+   sandbox failures and cancellation of the claim-reclaim HTTP handler too.
+   Existing tests cover shared admission, slow-image/fast-start, staged init
+   resume/delete, failed teardown, same-name replacement and dirty work during
+   an active operation; they do not establish every-boundary cancellation yet.
+6. [x] Main's #91/#35/#53/#75 behavior is integrated under #114. Live target
+   remains the owner's decision under #102/#110. Version stays 0.13.0: this
+   merges unfinished work, without cutting a feature release or golden.
+
 
 ### Done: documentation refresh from code (#54), 2026-09-29
 
@@ -126,9 +179,9 @@ Steps:
 5. [x] Tests, docs (README), CHANGELOG. sc-build at 9149ea1: all pass (kubelet 227). Not run on a node
        (C2NR0Q2). Unreleased. Closed.
 
-### Parked: #100 (turbomode branch, not main), bounded per-UID Pod/VM workers
+### Historical checkpoint: #100 before #114 superseded the merge hold
 
-Work is on `turbomode`, never main; no goldens from it. Read rustkube's `docs/turbomode-handoff.md` (turbomode branch).
+At this checkpoint work was on `turbomode`; #114 supersedes that hold. Read rustkube's `docs/turbomode-handoff.md` (turbomode branch).
 2026-09-29: handoff step 2 done, `sc-build 'cargo test --locked -p kubelet'` at turbomode 9b46886: 211 pass.
 Merging origin/main conflicts in `kubelet.rs` (turbomode's `pod_loop`/`vm_loop` vs main's #91 address pump,
 #35 `watch_for_node`/`list_for_node`, #53 `snapshots.sync()`): aborted, owner asked on #100 (resolve, or leave).

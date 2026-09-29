@@ -58,6 +58,11 @@ fn deregister(namespace: &str, name: &str) {
 /// with nothing in the cluster that showed or controlled it.
 pub const FINALIZER: &str = "storm.io/vm";
 
+/// QUERY reports a wait status only when the low byte is the exited state.
+fn exited(aux: u32) -> bool {
+    aux & 0xff == 2
+}
+
 /// `"true"` on a VMI or its VirtualMachine: its disks get no owner, so the
 /// orphan sweep never deletes them — they outlive even the VM (#75).
 pub const RETAIN_ANNOTATION: &str = "storm.io/retain-disks";
@@ -228,7 +233,7 @@ pub fn finalizer_patch(obj: &Value, present: bool) -> Option<Value> {
     } else {
         list.retain(|f| f != FINALIZER);
     }
-    let mut meta = json!({ "finalizers": list });
+    let mut meta = json!({ "finalizers": list, "uid": obj["metadata"]["uid"] });
     if let Some(rv) = obj["metadata"]["resourceVersion"].as_str() {
         meta["resourceVersion"] = json!(rv);
     }
@@ -572,6 +577,7 @@ pub struct VmManager {
     /// different machines, and treating them as one is how the second finds
     /// the first's disks.
     vms: Mutex<HashMap<String, Vm>>,
+    stopping: Mutex<std::collections::HashSet<String>>,
     /// The VMIs the apiserver last gave this node, by uid.
     ///
     /// **The object is the truth; this is a cache of it.** Metadata is
@@ -585,6 +591,7 @@ pub struct VmManager {
     /// partition, where one maintained by events is correct only if every
     /// event landed.
     desired: Mutex<HashMap<String, Value>>,
+    disk_lifecycle: tokio::sync::RwLock<()>,
     /// What the watch last saw, when there is one.
     ///
     /// The watch maintains this and the reconcile loop reads it, so the two
@@ -707,7 +714,9 @@ impl VmManager {
             claims: None,
             events,
             vms: Mutex::new(HashMap::new()),
+            stopping: Mutex::new(Default::default()),
             desired: Mutex::new(HashMap::new()),
+            disk_lifecycle: tokio::sync::RwLock::new(()),
             watched: Mutex::new(None),
             synced: std::sync::atomic::AtomicBool::new(false),
             snoopers: std::sync::Mutex::new(HashMap::new()),
@@ -968,6 +977,52 @@ impl VmManager {
         *self.watched.lock().await = Some(objs);
     }
 
+    /// Startup adoption records facts only; cleanup belongs to the UID worker.
+    pub async fn adopt_registered(&self) {
+        let mut records = self.vms.lock().await;
+        for reg in stormvm_node::console::list(RUN_ROOT) {
+            if !reg.uid.is_empty() {
+                records.entry(reg.uid.clone()).or_insert_with(|| vm_of(&reg));
+            }
+        }
+    }
+
+    pub async fn cache_specs(&self, objects: &[Value]) {
+        *self.desired.lock().await = objects.iter().filter_map(|o|
+            o["metadata"]["uid"].as_str().map(|uid| (uid.into(), o.clone()))).collect();
+        self.synced.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub async fn has_unknown_claims(&self) -> bool {
+        let keys: Vec<_> = self.vms.lock().await.keys().cloned().collect();
+        let desired = self.desired.lock().await;
+        keys.iter().any(|uid| !desired.contains_key(uid))
+    }
+
+    /// Only this UID is observed or mutated. The common executor protects its
+    /// name/claims, including while a terminating predecessor retains disks.
+    pub async fn reconcile_one(&self, uid: &str, object: Option<&Value>) -> anyhow::Result<bool> {
+        if object.map_or(true, terminating) {
+            let vm = self.vms.lock().await.get(uid).cloned();
+            if let Some(vm) = vm {
+                anyhow::ensure!(self.stop(&vm).await, "VM cleanup pending for {uid}");
+                self.vms.lock().await.remove(uid);
+            }
+            self.retries.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+            if let Some(object) = object { anyhow::ensure!(self.set_finalizer(object, false).await,"VM finalizer cleanup pending"); }
+            return Ok(true);
+        }
+        let object = object.unwrap();
+        self.absorb_ends_for(Some(uid)).await;
+        if !self.vms.lock().await.contains_key(uid) {
+            self.start_with_retry(uid, object).await;
+        }
+        let running = self.vms.lock().await.get(uid).is_some_and(|vm| !vm.phase.terminal());
+        if !running { return Ok(false); }
+        self.set_finalizer(object, true).await;
+        Ok(false)
+    }
+
     pub async fn sync(&self, desired: &[Value]) {
         self.absorb_ends().await;
 
@@ -1009,12 +1064,15 @@ impl VmManager {
             vms.values().filter(|v| !keep.contains(&v.uid)).cloned().collect()
         };
         for vm in gone {
-            self.stop(&vm).await;
-            self.vms.lock().await.remove(&vm.uid);
+            if self.stop(&vm).await {
+                self.vms.lock().await.remove(&vm.uid);
+            }
         }
         // The machine is gone, so its object may go too.
-        for (_, obj) in &going {
-            self.set_finalizer(obj, false).await;
+        for (uid, obj) in &going {
+            if !self.vms.lock().await.contains_key(uid) {
+                self.set_finalizer(obj, false).await;
+            }
         }
 
         // Disks whose VirtualMachine (or VMI) has gone for good (#75). After
@@ -1033,75 +1091,7 @@ impl VmManager {
             if self.vms.lock().await.contains_key(uid) {
                 continue;
             }
-            // Backing off after a failed start (#76), unless the spec changed.
-            let generation = obj["metadata"]["generation"].as_i64().unwrap_or(0);
-            {
-                let mut retries = self.retries.lock().unwrap_or_else(|e| e.into_inner());
-                match retries.get(uid) {
-                    Some(r) if r.generation != generation => {
-                        retries.remove(uid);
-                    }
-                    Some(r) if std::time::Instant::now() < r.next => continue,
-                    _ => {}
-                }
-            }
-            let result = self.start(uid, obj).await;
-            if result.is_ok() {
-                self.retries.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
-            }
-            if let Err(e) = result {
-                let ns = obj["metadata"]["namespace"].as_str().unwrap_or("default");
-                let name = obj["metadata"]["name"].as_str().unwrap_or("");
-                if let StartFail::Waiting(why) = &e {
-                    // Pending, and nothing is recorded in `vms` — which is
-                    // what lets the next sync try again. Recording it is what
-                    // made a missing golden permanent: sync saw the uid and
-                    // skipped it for ever.
-                    info!("{ns}/{name}: {why}");
-                    self.event(obj, "Normal", "Waiting", why).await;
-                    self.patch_pending(ns, name, why).await;
-                    continue;
-                }
-                let e = e.message().to_string();
-                warn!("{ns}/{name}: {e}");
-                // Given up on only when its VirtualMachine says so; otherwise
-                // Pending, with the reason and when it will be tried again.
-                // A failure recorded here used to be skipped for good, so a
-                // stormblock that was down for a moment left the machine dead
-                // until somebody recreated it (#76).
-                let owner = match owner_vm(obj) {
-                    Some(vm) => self.get_vm(ns, vm).await,
-                    None => None,
-                };
-                if gives_up(owner.as_ref()) {
-                    // The reason, where somebody will look for it.
-                    //
-                    // This is the message that said `cloning golden
-                    // fedora-43-x86_64 for disk root: 404 no volume` and went
-                    // only to a log on a node with no shell.
-                    self.event(obj, "Warning", "FailedStart", &e).await;
-                    self.record_failure(uid, obj, &e).await;
-                    continue;
-                }
-                let (attempts, wait) = {
-                    let mut retries = self.retries.lock().unwrap_or_else(|e| e.into_inner());
-                    let r = retries.entry(uid.clone()).or_insert(Retry {
-                        generation,
-                        attempts: 0,
-                        next: std::time::Instant::now(),
-                    });
-                    r.attempts += 1;
-                    let wait = retry_delay(r.attempts);
-                    r.next = std::time::Instant::now() + wait;
-                    (r.attempts, wait)
-                };
-                let why = format!(
-                    "start failed (attempt {attempts}), retrying in {}s: {e}",
-                    wait.as_secs()
-                );
-                self.event(obj, "Warning", "FailedStart", &why).await;
-                self.patch_retrying(ns, name, &why).await;
-            }
+            self.start_with_retry(uid, obj).await;
         }
 
         // Every machine running here holds its object until it is stopped.
@@ -1115,6 +1105,79 @@ impl VmManager {
             if running.contains(uid) {
                 self.set_finalizer(obj, true).await;
             }
+        }
+    }
+
+    /// Main's failed-start policy shared by the UID adapter and legacy tests.
+    async fn start_with_retry(&self, uid: &str, obj: &Value) {
+        // Backing off after a failed start (#76), unless the spec changed.
+        let generation = obj["metadata"]["generation"].as_i64().unwrap_or(0);
+        {
+            let mut retries = self.retries.lock().unwrap_or_else(|e| e.into_inner());
+            match retries.get(uid) {
+                Some(r) if r.generation != generation => {
+                    retries.remove(uid);
+                }
+                Some(r) if std::time::Instant::now() < r.next => return,
+                _ => {}
+            }
+        }
+        let result = self.start(uid, obj).await;
+        if result.is_ok() {
+            self.retries.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+        }
+        if let Err(e) = result {
+            let ns = obj["metadata"]["namespace"].as_str().unwrap_or("default");
+            let name = obj["metadata"]["name"].as_str().unwrap_or("");
+            if let StartFail::Waiting(why) = &e {
+                // Pending, and nothing is recorded in `vms` — which is
+                // what lets the next sync try again. Recording it is what
+                // made a missing golden permanent: sync saw the uid and
+                // skipped it for ever.
+                info!("{ns}/{name}: {why}");
+                self.event(obj, "Normal", "Waiting", why).await;
+                self.patch_pending(ns, name, uid, why).await;
+                return;
+            }
+            let e = e.message().to_string();
+            warn!("{ns}/{name}: {e}");
+            // Given up on only when its VirtualMachine says so; otherwise
+            // Pending, with the reason and when it will be tried again.
+            // A failure recorded here used to be skipped for good, so a
+            // stormblock that was down for a moment left the machine dead
+            // until somebody recreated it (#76).
+            let owner = match owner_vm(obj) {
+                Some(vm) => self.get_vm(ns, vm).await,
+                None => None,
+            };
+            if gives_up(owner.as_ref()) {
+                // The reason, where somebody will look for it.
+                //
+                // This is the message that said `cloning golden
+                // fedora-43-x86_64 for disk root: 404 no volume` and went
+                // only to a log on a node with no shell.
+                self.event(obj, "Warning", "FailedStart", &e).await;
+                self.record_failure(uid, obj, &e).await;
+                return;
+            }
+            let (attempts, wait) = {
+                let mut retries = self.retries.lock().unwrap_or_else(|e| e.into_inner());
+                let r = retries.entry(uid.to_string()).or_insert(Retry {
+                    generation,
+                    attempts: 0,
+                    next: std::time::Instant::now(),
+                });
+                r.attempts += 1;
+                let wait = retry_delay(r.attempts);
+                r.next = std::time::Instant::now() + wait;
+                (r.attempts, wait)
+            };
+            let why = format!(
+                "start failed (attempt {attempts}), retrying in {}s: {e}",
+                wait.as_secs()
+            );
+            self.event(obj, "Warning", "FailedStart", &why).await;
+            self.patch_retrying(ns, name, uid, &why).await;
         }
     }
 
@@ -1195,6 +1258,7 @@ impl VmManager {
     /// found and reused (an `emptyDisk`, a claim, a `volume:`) is not
     /// deleted: that may be the guest's data.
     async fn start(&self, uid: &str, obj: &Value) -> Result<(), StartFail> {
+        let _disks = self.disk_lifecycle.read().await;
         let mut fresh = Vec::new();
         let result = self.start_attempt(uid, obj, &mut fresh).await;
         if result.is_err() {
@@ -1383,11 +1447,13 @@ impl VmManager {
     /// drained by the container runtime, and a shared channel has exactly one
     /// reader. A query per VM per sync is a handful of round trips at ~200 µs
     /// each, which is not worth a second mechanism to avoid.
-    async fn absorb_ends(&self) {
+    async fn absorb_ends(&self) { self.absorb_ends_for(None).await; }
+
+    async fn absorb_ends_for(&self, uid: Option<&str>) {
         let Some(ring) = self.ring.clone() else { return };
         let live: Vec<Vm> = {
             let vms = self.vms.lock().await;
-            vms.values().filter(|v| !v.phase.terminal()).cloned().collect()
+            vms.values().filter(|v| !v.phase.terminal() && uid.map_or(true, |uid| uid == v.uid)).cloned().collect()
         };
         for vm in live {
             // Ask the guest what address it has, and report it when it
@@ -1448,7 +1514,7 @@ impl VmManager {
                 // sign of life, and there is no exit status to read.
                 match stormvm_node::console::find(RUN_ROOT, &vm.namespace, &vm.name) {
                     Some(reg) if control_alive(&reg) => continue,
-                    _ => -1,
+                    _ => continue,
                 }
             } else {
                 let r = ring.clone();
@@ -1486,64 +1552,65 @@ impl VmManager {
                 self.event_of(&done, "Warning", "Failed", &done.message).await;
             }
             self.drop_snoopers(&done.uid);
-            self.release(&done.disks).await;
-            if let Some(r) = self.ring.clone().filter(|_| !done.handle.is_none()) {
-                let h = done.handle;
-                let _ = tokio::task::spawn_blocking(move || r.workload_release(h)).await;
-            }
+            // Retain the handle and disks for checked teardown. Releasing the
+            // handle here loses the authoritative exit record before cleanup.
             self.vms.lock().await.insert(done.uid.clone(), done.clone());
             self.patch_status(&done).await;
         }
     }
 
-    async fn stop(&self, vm: &Vm) {
-        self.drop_snoopers(&vm.uid);
+    /// Keep the record and finalizer until exit and every cleanup operation
+    /// are confirmed. An unavailable query is not evidence of an exit.
+    async fn stop(&self, vm: &Vm) -> bool {
         if vm.handle.is_none() && !vm.phase.terminal() {
+            // Old registrations have no authoritative engine identity. A
+            // missing/unreachable control socket alone cannot prove exit.
             self.stop_by_control(vm).await;
-        } else if let Some(ring) = self.ring.clone() {
-            let handle = vm.handle;
-            // A machine gets a real grace period: ACPI shutdown, then a kill.
-            // Thirty seconds is what a guest needs to flush and unmount, and
-            // the timer is the engine's so it survives this process.
-            let r0 = ring.clone();
-            let _ = tokio::task::spawn_blocking(move || r0.stop(handle, 30)).await;
-            // And the stop is not over until the machine is gone. Removing
-            // the record is what lets a same-name VM start, and its tap
-            // exists while the hypervisor holds the descriptor — returning
-            // early hands the successor EBUSY on a dying tap. The deadline
-            // sits past the engine's own grace, so its kill has fired
-            // before this gives up; exit itself frees the tap, so a reaped
-            // status is not waited for beyond that.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
-            loop {
-                let r = ring.clone();
-                let answer = tokio::task::spawn_blocking(move || r.query(handle)).await;
-                match answer {
-                    Ok(Ok(cqe)) if cqe.aux & 0xff != 2 => {}
-                    // Exited, or the engine no longer knows the handle —
-                    // either way the machine is gone.
-                    _ => break,
-                }
-                if std::time::Instant::now() >= deadline {
-                    warn!(vm = %vm.name, "still running past its grace period; moving on");
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            }
-            // Its pidfd and cgroup, which the engine holds until asked.
-            let _ = tokio::task::spawn_blocking(move || ring.workload_release(handle)).await;
+            warn!(vm = %vm.name, "cannot confirm exit without an engine handle; retaining disks and registration");
+            return false;
         }
-        // The door closes with the machine. A registration that outlives its
-        // VM is a console door onto a socket nothing is bound to, which reads
-        // as "the guest is quiet" rather than "there is no guest" — so this
-        // matters as much as the write (rustkube-node#38).
+        if !vm.handle.is_none() && !vm.phase.terminal() {
+            let Some(ring) = self.ring.clone() else { return false };
+            let handle = vm.handle;
+            let r = ring.clone();
+            let observed = tokio::task::spawn_blocking(move || r.query(handle)).await;
+            let Ok(Ok(cqe)) = observed else { return false };
+            if !exited(cqe.aux) {
+                if self.stopping.lock().await.insert(vm.uid.clone()) {
+                    let r = ring.clone();
+                    if !matches!(tokio::task::spawn_blocking(move || r.stop(handle, 30)).await, Ok(Ok(_))) {
+                        self.stopping.lock().await.remove(&vm.uid);
+                    }
+                }
+                // The engine owns the grace/kill deadline. Yield this worker
+                // while it runs so eight stopping guests do not occupy the pool.
+                return false;
+            }
+        }
+
+        // Do not forget a refused detach (including HTTP 409), or delete its
+        // volume while the engine still holds it. Every operation is retryable.
+        for disk in &vm.disks {
+            let Some(id) = &disk.volume_id else { continue };
+            let url = format!("{}/api/v1/volumes/{id}/attach", self.storage);
+            match self.engine.delete(&url).await {
+                Ok(r) if r.status().is_success() || r.status().as_u16() == 404 => {}
+                _ => return false,
+            }
+        }
+        // Disk lifetime follows the VM owner (#75), not this VMI. The orphan
+        // sweep deletes them only after the owner is confirmed gone.
+        self.drop_snoopers(&vm.uid);
+        if let Some(ring) = self.ring.clone().filter(|_| !vm.handle.is_none()) {
+            let handle = vm.handle;
+            if !matches!(tokio::task::spawn_blocking(move || ring.workload_release(handle)).await, Ok(Ok(_))) {
+                return false;
+            }
+        }
         deregister(&vm.namespace, &vm.name);
-        // Detached, never deleted (#75). A stop is a VirtualMachine restart
-        // as often as it is a deletion, and the disks are the VM's: its root
-        // is what the guest wrote, not the golden it came from. What is
-        // deleted, and when, is the orphan sweep's to decide.
-        self.release(&vm.disks).await;
+        self.stopping.lock().await.remove(&vm.uid);
         info!(vm = %vm.name, "vm stopped");
+        true
     }
 
     /// [`Self::resolve_disks_with_keys`] with no keys: for tests.
@@ -2047,7 +2114,7 @@ impl VmManager {
     ///
     /// Only volumes this kubelet gave an owner to, not in use, and not held
     /// by a machine it knows. An owner that cannot be read keeps its disks.
-    async fn sweep_orphans(&self) {
+    pub(crate) async fn sweep_orphans(&self) {
         if self.api_url.is_empty() {
             return;
         }
@@ -2058,6 +2125,7 @@ impl VmManager {
             }
             *swept = Some(std::time::Instant::now());
         }
+        let _disks = self.disk_lifecycle.write().await;
         let volumes = match self.volumes().await {
             Ok(v) => v,
             Err(e) => {
@@ -2299,21 +2367,16 @@ impl VmManager {
                     self.vms.lock().await.insert(vm.uid.clone(), vm);
                 }
                 (None, Some(_)) => {
-                    let mut done = vm;
-                    done.phase = Phase::Failed;
-                    done.exit_code = -1;
-                    done.message = "the machine was gone when the kubelet restarted".into();
-                    warn!(vm = %id, "{}", done.message);
-                    self.event_of(&done, "Warning", "Failed", &done.message).await;
-                    self.release(&done.disks).await;
-                    self.vms.lock().await.insert(done.uid.clone(), done.clone());
-                    self.patch_status(&done).await;
+                    warn!(vm = %id, "engine state unknown; retaining machine and disks");
+                    self.vms.lock().await.insert(vm.uid.clone(), vm);
                 }
                 (running, None) => {
                     if running == Some(true) {
                         warn!(vm = %id, uid = %vm.uid, "running with no VirtualMachineInstance; stopping it");
                     }
-                    self.stop(&vm).await;
+                    if !self.stop(&vm).await {
+                        self.vms.lock().await.insert(vm.uid.clone(), vm);
+                    }
                 }
             }
         }
@@ -2374,11 +2437,9 @@ impl VmManager {
     /// Add or remove this node's finalizer on a VMI. Guarded by the object's
     /// resourceVersion, so a stale copy loses rather than overwrites; the
     /// next sync has a fresher one.
-    async fn set_finalizer(&self, obj: &Value, present: bool) {
-        if self.api_url.is_empty() {
-            return;
-        }
-        let Some(body) = finalizer_patch(obj, present) else { return };
+    async fn set_finalizer(&self, obj: &Value, present: bool) -> bool {
+        if self.api_url.is_empty() { return true; }
+        let Some(body) = finalizer_patch(obj, present) else { return true };
         let ns = obj["metadata"]["namespace"].as_str().unwrap_or("default");
         let name = obj["metadata"]["name"].as_str().unwrap_or("");
         let url = format!("{}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{name}", self.api_url);
@@ -2391,10 +2452,11 @@ impl VmManager {
             .await
         {
             Ok(r) if r.status().is_success() => {
-                info!("{ns}/{name}: finalizer {FINALIZER} {}", if present { "added" } else { "removed" })
+                info!("{ns}/{name}: finalizer {FINALIZER} {}", if present { "added" } else { "removed" });
+                true
             }
-            Ok(r) => tracing::debug!("{ns}/{name}: finalizer not updated: {}", r.status()),
-            Err(e) => tracing::debug!("{ns}/{name}: finalizer not updated: {e}"),
+            Ok(r) => { tracing::debug!("{ns}/{name}: finalizer not updated: {}", r.status()); !present && r.status().as_u16()==404 },
+            Err(e) => { tracing::debug!("{ns}/{name}: finalizer not updated: {e}"); false },
         }
     }
 
@@ -2461,20 +2523,20 @@ impl VmManager {
     }
 
     /// Pending after a failed start that will be tried again (#76).
-    async fn patch_retrying(&self, ns: &str, name: &str, why: &str) {
-        self.patch_pending_as(ns, name, "FailedStart", why).await;
+    async fn patch_retrying(&self, ns: &str, name: &str, uid: &str, why: &str) {
+        self.patch_pending_as(ns, name, uid, "FailedStart", why).await;
     }
 
-    async fn patch_pending(&self, ns: &str, name: &str, why: &str) {
-        self.patch_pending_as(ns, name, "Waiting", why).await;
+    async fn patch_pending(&self, ns: &str, name: &str, uid: &str, why: &str) {
+        self.patch_pending_as(ns, name, uid, "Waiting", why).await;
     }
 
-    async fn patch_pending_as(&self, ns: &str, name: &str, reason: &str, why: &str) {
+    async fn patch_pending_as(&self, ns: &str, name: &str, uid: &str, reason: &str, why: &str) {
         let url = format!(
             "{}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{name}/status",
             self.api_url
         );
-        let body = json!({ "status": {
+        let body = json!({ "metadata": {"uid": uid}, "status": {
             "phase": "Pending",
             "reason": reason,
             "message": why,
@@ -2560,7 +2622,7 @@ impl VmManager {
                 .unwrap_or(Value::Null);
             status["conditions"] = with_condition(&existing, cond);
         }
-        let body = json!({ "status": status });
+        let body = json!({ "metadata": {"uid": vm.uid}, "status": status });
         if let Err(e) = self
             .api
             .patch(&url)
@@ -2822,6 +2884,43 @@ fn assigned_to(obj: &Value, node: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unknown_vm_exit_retains_record_and_finalizer() {
+        let f = fake().await;
+        let m = manager_for(&f, false);
+        let mut obj = vmi("n1");
+        m.record_failure("u-1", &obj, "fixture").await;
+        {
+            let mut records = m.vms.lock().await;
+            let vm = records.get_mut("u-1").unwrap();
+            vm.phase = Phase::Running;
+            vm.handle = Handle(123);
+        }
+        obj["metadata"]["deletionTimestamp"] = json!("2026-09-29T00:00:00Z");
+        m.sync(&[obj]).await;
+        assert_eq!(m.running().await.len(), 1, "no engine is not proof of exit");
+    }
+
+    #[tokio::test]
+    async fn refused_detach_keeps_vm_cleanup_record() {
+        use axum::{routing::delete, http::StatusCode};
+        let app = axum::Router::new().route("/api/v1/volumes/disk/attach",
+            delete(|| async { StatusCode::CONFLICT }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), "")
+            .with_storage(crate::engine::EngineClient::new(&url, crate::engine::TokenSource::none()));
+        m.record_failure("u-1", &vmi("n1"), "fixture").await;
+        m.vms.lock().await.get_mut("u-1").unwrap().disks.push(ResolvedDisk {
+            name: "root".into(), device: "/dev/test".into(), volume_id: Some("disk".into()),
+            readonly: false, bus: Default::default(),
+        });
+        m.sync(&[]).await;
+        assert_eq!(m.running().await.len(), 1, "HTTP 409 must remain retryable");
+        server.abort();
+}
 
     /// `AccessCredentialsSynchronized`: every problem named, an agent not yet
     /// heard from is a reason, and the transition time holds while the status
@@ -3278,6 +3377,51 @@ mod tests {
         // No longer wanted: forgotten.
         m.sync(&[]).await;
         assert_eq!(attempts(&m), None);
+    }
+
+    #[tokio::test]
+    async fn uid_adapter_preserves_start_backoff_and_forgets_deleted_uid() {
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), "http://127.0.0.1:1");
+        let mut obj = vmi("n1");
+        m.reconcile_one("u-1", Some(&obj)).await.unwrap();
+        m.reconcile_one("u-1", Some(&obj)).await.unwrap();
+        assert_eq!(m.retries.lock().unwrap()["u-1"].attempts, 1);
+        obj["metadata"]["generation"] = json!(2);
+        m.reconcile_one("u-1", Some(&obj)).await.unwrap();
+        assert_eq!(m.retries.lock().unwrap()["u-1"].generation, 2);
+        assert_eq!(m.retries.lock().unwrap()["u-1"].attempts, 1);
+        m.reconcile_one("u-1", None).await.unwrap();
+        assert!(!m.retries.lock().unwrap().contains_key("u-1"));
+    }
+
+    #[tokio::test]
+    async fn uid_teardown_detaches_but_keeps_vm_owned_disks() {
+        use axum::{routing::delete, http::StatusCode};
+        let deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = deleted.clone();
+        let app = axum::Router::new()
+            .route("/api/v1/volumes/disk/attach", delete(|| async { StatusCode::OK }))
+            .route("/api/v1/volumes/disk", delete(move || {
+                let seen = seen.clone();
+                async move { seen.store(true, std::sync::atomic::Ordering::SeqCst); StatusCode::OK }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), "")
+            .with_storage(crate::engine::EngineClient::new(&url, crate::engine::TokenSource::none()));
+        m.record_failure("u-1", &vmi("n1"), "fixture").await;
+        {
+            let mut records = m.vms.lock().await;
+            let vm = records.get_mut("u-1").unwrap();
+            vm.disks.push(ResolvedDisk { name: "root".into(), device: "/dev/test".into(),
+                volume_id: Some("disk".into()), readonly: false, bus: Default::default() });
+            vm.owned_volumes.push("disk".into());
+        }
+        m.reconcile_one("u-1", None).await.unwrap();
+        assert!(m.running().await.is_empty());
+        assert!(!deleted.load(std::sync::atomic::Ordering::SeqCst));
+        server.abort();
     }
 
     /// A VirtualMachine with `runStrategy: Once` asked for no second try: that

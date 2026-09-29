@@ -1,5 +1,72 @@
 # Changelog
 
+## 2026-09-29
+
+- **docs:** Record successful full workspace verification of merged turbomode ec39c2a (#114).
+
+- **feat:** Integrate main into turbomode (#114), preserving tap addresses,
+  snapshots, failed-list safety, durable VM disks, startup retry policy and
+  access credentials within UID reconciliation. Add adapter regression coverage.
+- **docs:** Refresh current architecture and merge status; unfinished #100–#102
+  work continues on main without a release or golden.
+
+- **docs:** Record the owner-authorized #114 merge plan and two-branch workspace validation.
+
+- **docs:** Reconcile the worker design with implemented adapters and record
+  stormpump#63 as the remaining VM cancellation dependency for #100.
+
+- **fix:** Import the JSON macro in the volume-index regression test; the full
+  dev workspace build passed but test compilation exposed the missing import.
+
+- **feat:** Index PV/VolumeAttachment changes back to claim users; retain the
+  previous index when a collection cannot be read. Guard VM status, migration
+  annotations and PV deletion by observed UID; retry panicked UID adapters (#100).
+
+- **fix:** Retain stormpump container/sandbox records on refused cleanup and
+  partial volume registrations on failed startup; serialize CSI publication and
+  teardown by driver/handle. Require successful runtime recovery before starts (#100).
+
+- **feat:** Prepare images in a separate four-slot pool, share in-flight pulls,
+  and wake only image dependents on completion. Claim reclamation now takes an
+  exclusive admission reservation against concurrent starts (#100).
+
+- **feat:** Yield init-container and VM shutdown waits between UID passes;
+  reuse partial startup state and retry finalizer cleanup with UID guards.
+- **test:** Cover staged init resume/delete, deletion during an active operation,
+  same-name UID replacement and per-claim mutation exclusion (#100).
+
+- **feat:** Connect Pod/VMI UID adapters to one eight-worker executor with
+  recovery barriers, shared claim admission, per-claim mutation exclusion and
+  retained partial Pod-start records. Runtime/probe deadlines remain for #101.
+
+- **feat:** Add independent desired-state sources, inverse claim/image/driver
+  indexes and recovery admission seeding to the common executor (#100).
+
+- **fix:** Match the QUERY exit helper to the ABI u32 completion field; dev
+  compilation of 8ebb8b3 caught the mismatch.
+
+- **fix:** Retain VM records/finalizers on unknown exit or refused disk cleanup;
+  acknowledge Pod deletion with the observed UID (#100).
+
+- **docs:** Record #100 restart plan and the decision to defer the main merge.
+
+## Unreleased — turbomode (not yet built or measured)
+
+- Remove the two-second inline template-mint wait; completion notifies Pod
+  and VM queues directly. Completion and slow-mint tests await dev validation.
+
+- CSI registration now wakes on filesystem changes and signals Pod workers;
+  retry deadlines exist only for pending registration/publication failures.
+  Failed directory scans retain registrations. Unbuilt; dev validation pending.
+
+- Watch-driven Pod/VMI work, separate Pod/VM loops, stormpump exit and Linux
+  manifest notifications. Preserve live Pods when desired-state reads fail.
+- Stable startTime, unchanged-status suppression and revision-guarded status
+  writes. Failed terminating-Pod teardown is not acknowledged as complete.
+- Paired architecture/measurement plan in docs/event-driven-design.md;
+  #99–#102 track remaining indexed workers, local events and real-node tests.
+
+
 ## [Unreleased]
 
 ### 2026-09-29

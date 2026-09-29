@@ -21,10 +21,8 @@
 //! When the socket goes, the driver is dropped from this node and from
 //! `CSINode`.
 //!
-//! **Polled, not watched.** A scan of one directory every two seconds costs
-//! nothing, and a driver arriving two seconds late does not matter. A missed
-//! inotify event would leave a driver unregistered until the kubelet restarts,
-//! and nobody would think to look there.
+//! Filesystem changes enqueue a scan. Failed registrations and API publication
+//! receive explicit retry deadlines; an idle registered driver causes no scans.
 
 use crate::csi::{self, CsiDriverClient, NodeCapabilities, NodeInfo};
 use serde_json::{json, Value};
@@ -46,7 +44,7 @@ use registration_proto::registration_client::RegistrationClient;
 pub const PLUGINS_REGISTRY: &str = "/var/lib/kubelet/plugins_registry";
 
 /// How long a socket that failed to register waits before it is tried again.
-const RETRY_FAILED: Duration = Duration::from_secs(30);
+const RETRY_FAILED: Duration = Duration::from_secs(1);
 
 /// Where the kubelet's view of the host root is, when it runs in a container.
 /// Same meaning as in `pod_manager.rs`.
@@ -62,6 +60,7 @@ pub struct Registered {
     /// The registration socket it arrived through. When that goes, so
     /// does the driver.
     pub registration: PathBuf,
+    registration_mtime: std::time::SystemTime,
 }
 
 /// The node's registered CSI drivers, and the loop that keeps them current.
@@ -71,7 +70,7 @@ pub struct CsiPlugins {
     api: Option<(reqwest::Client, String)>,
     drivers: RwLock<HashMap<String, Registered>>,
     /// Sockets that failed, and when, so a broken registrar is retried every
-    /// [`RETRY_FAILED`] and not logged every two seconds. A registrar that
+    /// [`RETRY_FAILED`] while registration remains pending. A registrar that
     /// recreates its socket (a new mtime) is tried at once. The common failure
     /// is a registrar that is up before its driver, and that one has to be
     /// retried: dropping it would leave the driver unregistered until the kubelet restarts.
@@ -79,6 +78,7 @@ pub struct CsiPlugins {
     /// The driver set last written to CSINode, or `None` when that write has
     /// not landed yet. The write is retried until it does.
     published: RwLock<Option<BTreeMap<String, Value>>>,
+    changes: tokio::sync::watch::Sender<u64>,
 }
 
 impl CsiPlugins {
@@ -90,6 +90,7 @@ impl CsiPlugins {
             drivers: RwLock::new(HashMap::new()),
             failed: RwLock::new(HashMap::new()),
             published: RwLock::new(None),
+            changes: tokio::sync::watch::channel(0).0,
         }
     }
 
@@ -118,20 +119,41 @@ impl CsiPlugins {
         v
     }
 
-    /// Scan for ever.
+    pub fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    /// Filesystem events and explicit pending-operation deadlines drive scans.
     pub async fn run(self: Arc<Self>) {
-        info!("CSI plugin registration: watching {}", self.registry_dir.display());
-        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        info!(
+            "CSI plugin registration: watching {}",
+            self.registry_dir.display()
+        );
+        let queue = apimachinery::workqueue::WorkQueue::new();
+        let changed = queue.clone();
+        let path = self.registry_dir.clone();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move { crate::fs_watch::watch(path, move || changed.add(())).await });
+        queue.add(());
         loop {
-            interval.tick().await;
-            self.scan_once().await;
+            let _work = queue.next().await;
+            queue.cancel_deadline(&());
+            if let Some(delay) = self.scan_once().await {
+                queue.add_at((), tokio::time::Instant::now() + delay);
+            }
         }
     }
 
     /// One pass: register new sockets, drop vanished ones, and bring CSINode
     /// up to date.
-    pub async fn scan_once(&self) {
-        let sockets = list_sockets(&self.registry_dir);
+    pub async fn scan_once(&self) -> Option<Duration> {
+        let sockets = match list_sockets(&self.registry_dir) {
+            Ok(sockets) => sockets,
+            Err(error) => {
+                warn!(%error, "CSI registry scan failed; retaining registrations");
+                return Some(RETRY_FAILED);
+            }
+        };
 
         // Gone: the registrar's socket was removed, so the plugin was.
         let gone: Vec<String> = self
@@ -139,17 +161,31 @@ impl CsiPlugins {
             .read()
             .await
             .values()
-            .filter(|r| !sockets.iter().any(|(p, _)| p == &r.registration))
+            .filter(|r| {
+                !sockets
+                    .iter()
+                    .any(|(p, mtime)| p == &r.registration && *mtime == r.registration_mtime)
+            })
             .map(|r| r.name.clone())
             .collect();
         for name in gone {
             info!("CSI driver {name}: registration socket removed, deregistered");
             self.drivers.write().await.remove(&name);
+            self.changes
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
         }
-        self.failed.write().await.retain(|p, _| sockets.iter().any(|(s, _)| s == p));
+        self.failed
+            .write()
+            .await
+            .retain(|p, _| sockets.iter().any(|(s, _)| s == p));
 
         for (sock, mtime) in &sockets {
-            let known = self.drivers.read().await.values().any(|r| &r.registration == sock);
+            let known = self
+                .drivers
+                .read()
+                .await
+                .values()
+                .any(|r| &r.registration == sock);
             let backing_off = self
                 .failed
                 .read()
@@ -159,9 +195,14 @@ impl CsiPlugins {
             if known || backing_off {
                 continue;
             }
-            match self.register(sock).await {
+            let result = tokio::time::timeout(Duration::from_secs(10), self.register(sock, *mtime))
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("registration timed out")));
+            match result {
                 Ok(name) => {
                     self.failed.write().await.remove(sock);
+                    self.changes
+                        .send_modify(|generation| *generation = generation.wrapping_add(1));
                     info!("CSI driver {name} registered from {}", sock.display());
                 }
                 Err(e) => {
@@ -174,12 +215,30 @@ impl CsiPlugins {
             }
         }
 
-        self.publish_csinode().await;
+        let publication_ok = tokio::time::timeout(Duration::from_secs(10), self.publish_csinode())
+            .await
+            .unwrap_or(false);
+        let retry = self
+            .failed
+            .read()
+            .await
+            .values()
+            .map(|(_, at)| {
+                RETRY_FAILED
+                    .saturating_sub(at.elapsed())
+                    .max(Duration::from_millis(1))
+            })
+            .min();
+        if publication_ok {
+            retry
+        } else {
+            Some(retry.unwrap_or(RETRY_FAILED).min(RETRY_FAILED))
+        }
     }
 
     /// Register the plugin behind one registration socket. The driver's name on
     /// success.
-    async fn register(&self, sock: &Path) -> anyhow::Result<String> {
+    async fn register(&self, sock: &Path, mtime: std::time::SystemTime) -> anyhow::Result<String> {
         let mut reg = RegistrationClient::new(csi::unix_channel(sock, Duration::from_secs(10)));
         let info = reg
             .get_info(registration_proto::InfoRequest {})
@@ -192,25 +251,34 @@ impl CsiPlugins {
         // health check, which is where somebody debugging the driver looks.
         let status = registration_proto::RegistrationStatus {
             plugin_registered: result.is_ok(),
-            error: result.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default(),
+            error: result
+                .as_ref()
+                .err()
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_default(),
         };
         if let Err(s) = reg.notify_registration_status(status).await {
-            debug!("NotifyRegistrationStatus to {}: {}", sock.display(), s.message());
+            debug!(
+                "NotifyRegistrationStatus to {}: {}",
+                sock.display(),
+                s.message()
+            );
         }
         let registered = result?;
         let name = registered.name.clone();
         self.drivers.write().await.insert(
             name.clone(),
-            Registered { registration: sock.to_path_buf(), ..registered },
+            Registered {
+                registration: sock.to_path_buf(),
+                registration_mtime: mtime,
+                ..registered
+            },
         );
         Ok(name)
     }
 
     /// Check what the registrar said, and ask the driver about this node.
-    async fn admit(
-        &self,
-        info: &registration_proto::PluginInfo,
-    ) -> anyhow::Result<Registered> {
+    async fn admit(&self, info: &registration_proto::PluginInfo) -> anyhow::Result<Registered> {
         if info.r#type != "CSIPlugin" {
             anyhow::bail!(
                 "plugin type {:?} is not supported here (only CSIPlugin; device plugins are not)",
@@ -222,7 +290,11 @@ impl CsiPlugins {
         }
         // CSI 1.x. Upstream accepts any version with major 1 and so does this.
         // A 0.x driver speaks a different protocol under the same method names.
-        if !info.supported_versions.iter().any(|v| v.trim_start_matches('v').starts_with("1.")) {
+        if !info
+            .supported_versions
+            .iter()
+            .any(|v| v.trim_start_matches('v').starts_with("1."))
+        {
             anyhow::bail!(
                 "driver {} supports CSI {:?}, and this kubelet speaks 1.x",
                 info.name,
@@ -240,14 +312,17 @@ impl CsiPlugins {
             node,
             caps,
             registration: PathBuf::new(),
+            registration_mtime: std::time::UNIX_EPOCH,
         })
     }
 
     /// Make `CSINode` list exactly the drivers registered here, and label
     /// the node with their topology. Retried every scan until it lands, and
     /// written only when the set changed.
-    async fn publish_csinode(&self) {
-        let Some((client, url)) = &self.api else { return };
+    async fn publish_csinode(&self) -> bool {
+        let Some((client, url)) = &self.api else {
+            return true;
+        };
         let want: BTreeMap<String, Value> = self
             .drivers
             .read()
@@ -256,7 +331,7 @@ impl CsiPlugins {
             .map(|r| (r.name.clone(), csinode_driver(r)))
             .collect();
         if self.published.read().await.as_ref() == Some(&want) {
-            return;
+            return true;
         }
 
         // Topology first. A provisioner reading CSINode's topologyKeys
@@ -276,17 +351,35 @@ impl CsiPlugins {
                 .send()
                 .await;
             if !matches!(&r, Ok(r) if r.status().is_success()) {
-                debug!("CSI topology labels not written yet: {:?}", r.map(|r| r.status()));
-                return;
+                debug!(
+                    "CSI topology labels not written yet: {:?}",
+                    r.map(|r| r.status())
+                );
+                return false;
             }
         }
 
-        match write_csinode(client, url, &self.node_name, want.values().cloned().collect()).await {
+        match write_csinode(
+            client,
+            url,
+            &self.node_name,
+            want.values().cloned().collect(),
+        )
+        .await
+        {
             Ok(()) => {
-                info!("CSINode {}: drivers {:?}", self.node_name, want.keys().collect::<Vec<_>>());
+                info!(
+                    "CSINode {}: drivers {:?}",
+                    self.node_name,
+                    want.keys().collect::<Vec<_>>()
+                );
                 *self.published.write().await = Some(want);
+                true
             }
-            Err(e) => debug!("CSINode {} not written yet: {e}", self.node_name),
+            Err(e) => {
+                debug!("CSINode {} not written yet: {e}", self.node_name);
+                false
+            }
         }
     }
 }
@@ -324,14 +417,27 @@ async fn write_csinode(
     if status.is_success() {
         let mut obj: Value = existing.json().await.map_err(|e| e.to_string())?;
         obj["spec"]["drivers"] = json!(drivers);
-        let r = client.put(&path).json(&obj).send().await.map_err(|e| e.to_string())?;
-        return if r.status().is_success() { Ok(()) } else { Err(format!("PUT {}", r.status())) };
+        let r = client
+            .put(&path)
+            .json(&obj)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        return if r.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("PUT {}", r.status()))
+        };
     }
     if status.as_u16() != 404 {
         return Err(format!("GET {status}"));
     }
     // Owned by the Node, as upstream does, so deleting the node deletes it.
-    let owner = match client.get(format!("{url}/api/v1/nodes/{node}")).send().await {
+    let owner = match client
+        .get(format!("{url}/api/v1/nodes/{node}"))
+        .send()
+        .await
+    {
         Ok(r) if r.status().is_success() => r
             .json::<Value>()
             .await
@@ -367,21 +473,26 @@ async fn write_csinode(
 /// Anything that is a socket counts, whatever its name. Upstream skips names
 /// starting with `.`, and so does this. The directory not existing is the
 /// normal state of a node with no drivers.
-fn list_sockets(dir: &Path) -> Vec<(PathBuf, std::time::SystemTime)> {
+fn list_sockets(dir: &Path) -> std::io::Result<Vec<(PathBuf, std::time::SystemTime)>> {
     use std::os::unix::fs::FileTypeExt;
-    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
-    let mut v: Vec<_> = rd
-        .flatten()
-        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
-        .filter_map(|e| {
-            let md = e.metadata().ok()?;
-            md.file_type()
-                .is_socket()
-                .then(|| (e.path(), md.modified().unwrap_or(std::time::UNIX_EPOCH)))
-        })
-        .collect();
-    v.sort();
-    v
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut sockets = Vec::new();
+    for entry in rd {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        if metadata.file_type().is_socket() {
+            sockets.push((entry.path(), metadata.modified()?));
+        }
+    }
+    sockets.sort();
+    Ok(sockets)
 }
 
 /// The driver's endpoint as a path this process can open.
@@ -420,6 +531,7 @@ mod tests {
             },
             caps: NodeCapabilities::default(),
             registration: PathBuf::new(),
+            registration_mtime: std::time::UNIX_EPOCH,
         };
         let d = csinode_driver(&r);
         assert_eq!(d["name"], "hostpath.csi.k8s.io");
@@ -433,9 +545,21 @@ mod tests {
     fn endpoints_accept_the_unix_scheme() {
         assert_eq!(resolve_endpoint(""), None);
         assert_eq!(
-            resolve_endpoint("unix:///var/lib/kubelet/plugins/x/csi.sock").map(|p| p.starts_with("/")),
+            resolve_endpoint("unix:///var/lib/kubelet/plugins/x/csi.sock")
+                .map(|p| p.starts_with("/")),
             Some(true)
         );
+    }
+
+    #[tokio::test]
+    async fn idle_registry_has_no_retry_but_failed_observation_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugins = CsiPlugins::new("test").with_registry_dir(dir.path());
+        assert_eq!(plugins.scan_once().await, None);
+        let file = dir.path().join("not-a-directory");
+        std::fs::write(&file, b"x").unwrap();
+        let plugins = CsiPlugins::new("test").with_registry_dir(file);
+        assert_eq!(plugins.scan_once().await, Some(RETRY_FAILED));
     }
 
     #[test]
@@ -444,9 +568,11 @@ mod tests {
         std::fs::write(dir.path().join("not-a-socket.sock"), b"").unwrap();
         let _l = std::os::unix::net::UnixListener::bind(dir.path().join("d-reg.sock")).unwrap();
         let _h = std::os::unix::net::UnixListener::bind(dir.path().join(".hidden.sock")).unwrap();
-        let found = list_sockets(dir.path());
+        let found = list_sockets(dir.path()).unwrap();
         assert_eq!(found.len(), 1);
         assert!(found[0].0.ends_with("d-reg.sock"));
-        assert!(list_sockets(Path::new("/nonexistent/registry")).is_empty());
+        assert!(list_sockets(Path::new("/nonexistent/registry"))
+            .unwrap()
+            .is_empty());
     }
 }
