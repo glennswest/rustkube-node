@@ -422,11 +422,23 @@ async fn stats_summary(State(pm): State<Arc<PodManager>>) -> impl IntoResponse {
 /// - `503` — the node could not establish that it is unused, or stormblock
 ///   refused. Fails closed, because "I could not check" is not "nothing is
 ///   using it" when the answer destroys data.
+///
+/// The release runs in a task of its own (#100). A client that disconnects
+/// drops the handler's future, and with it the claim's reservation, while a
+/// detach or delete may still be in flight at stormblock: a pod admitted in
+/// that moment could mount a volume being deleted. The task keeps the
+/// reservation until stormblock has answered, whoever is still listening.
 async fn release_volume(
     State(pod_manager): State<Arc<PodManager>>,
     Path((namespace, claim)): Path<(String, String)>,
 ) -> Response {
-    match pod_manager.release_claim_volume(&namespace, &claim).await {
+    let released = {
+        let (namespace, claim) = (namespace.clone(), claim.clone());
+        tokio::spawn(async move { pod_manager.release_claim_volume(&namespace, &claim).await })
+            .await
+            .unwrap_or_else(|e| Err(format!("release task: {e}")))
+    };
+    match released {
         Ok(VolumeRelease::Released) => {
             info!("released the volume for claim {namespace}/{claim}");
             StatusCode::NO_CONTENT.into_response()
@@ -1288,6 +1300,59 @@ mod volume_release_tests {
     #[tokio::test]
     async fn an_unreachable_engine_answers_503_not_204() {
         assert_eq!(release("/volumes/default/data").await, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A client that goes away mid-release does not take the claim's
+    /// reservation with it (#100): the detach and delete finish, and until
+    /// they have, no workload can be admitted to the claim.
+    #[tokio::test]
+    async fn a_dropped_request_keeps_the_claim_reserved_until_stormblock_answers() {
+        use axum::routing::{delete as http_delete, get as http_get};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let deleted = Arc::new(AtomicBool::new(false));
+        let d = deleted.clone();
+        let engine = axum::Router::new()
+            .route("/api/v1/volumes", http_get(|| async {
+                axum::Json(serde_json::json!({"items": [{"id": "vol-1", "name": "pvc-default-data"}]}))
+            }))
+            .route("/api/v1/volumes/{id}/attach", http_delete(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                StatusCode::NO_CONTENT
+            }))
+            .route("/api/v1/volumes/{id}", http_delete(move || {
+                let d = d.clone();
+                async move { d.store(true, Ordering::SeqCst); StatusCode::NO_CONTENT }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, engine).await.unwrap() });
+
+        let executor = crate::workload::Executor::new();
+        let rt = Arc::new(super::tests::NoopRt);
+        let pm = PodManager::new(rt.clone(), rt, "test-node")
+            .with_engine(crate::engine::EngineClient::new(&url, crate::engine::TokenSource::none()))
+            .with_admission(executor.reservations.clone());
+        let req = HttpRequest::builder()
+            .method("DELETE")
+            .uri("/volumes/default/data")
+            .body(Body::empty())
+            .unwrap();
+        // The client gives up while the detach is in flight.
+        let gave_up = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            router(Arc::new(pm)).oneshot(req),
+        )
+        .await;
+        assert!(gave_up.is_err(), "the detach is slower than the client");
+        let claim = crate::workload::Resource::Claim("default".into(), "data".into());
+        assert!(executor.reservations.holder(&claim).is_some(), "released while stormblock was still working");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while executor.reservations.holder(&claim).is_some() {
+            assert!(tokio::time::Instant::now() < deadline, "the release never finished");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(deleted.load(Ordering::SeqCst), "the reservation went before the delete");
     }
 
     /// A GET on the release path is not a release. Destroying data through a

@@ -151,6 +151,19 @@ struct Sandbox {
     ip: String,
 }
 
+/// A sandbox whose CNI ADD failed and whose DEL has not succeeded yet (#100).
+///
+/// A plugin chain can fail half way through ADD with an address allocated or
+/// an endpoint made. The CNI contract is that the runtime then calls DEL; the
+/// namespace holder is kept until it succeeds, because DEL finds the
+/// interface through that namespace.
+struct FailedNetwork {
+    id: String,
+    handle: Option<Handle>,
+    netns: String,
+    config: PodSandboxConfig,
+}
+
 /// The kubelet's view of stormpump.
 pub struct StormpumpRuntime {
     socket: String,
@@ -168,6 +181,8 @@ pub struct StormpumpRuntime {
     cni: Option<cni::CniInvoker>,
     sandboxes: Mutex<HashMap<String, Sandbox>>,
     containers: Mutex<HashMap<String, Container>>,
+    /// Failed ADDs still to be undone, retried before each new sandbox.
+    failed_networks: Mutex<Vec<FailedNetwork>>,
     /// Monotonic, so two containers created in the same millisecond do not
     /// collide the way a timestamp-derived id would.
     next_id: std::sync::atomic::AtomicU64,
@@ -193,6 +208,7 @@ impl StormpumpRuntime {
             cni: None,
             sandboxes: Mutex::new(HashMap::new()),
             containers: Mutex::new(HashMap::new()),
+            failed_networks: Mutex::new(Vec::new()),
             next_id: std::sync::atomic::AtomicU64::new(1),
         })
     }
@@ -207,6 +223,40 @@ impl StormpumpRuntime {
         if let Some(h) = handle {
             let _ = self.on_ring(move |r| r.sandbox_release(h)).await;
         }
+    }
+
+    /// DEL, then give the sandbox back. `false` when DEL failed: the caller
+    /// keeps the record, and the namespace with it.
+    async fn unwind_network(&self, failed: &FailedNetwork) -> bool {
+        if let Some(invoker) = &self.cni {
+            let pod = cni::PodNetwork::new(
+                &failed.id,
+                &failed.netns,
+                &failed.config.namespace,
+                &failed.config.name,
+                &failed.config.uid,
+            );
+            if let Err(e) = invoker.del(&pod).await {
+                tracing::warn!(sandbox = %failed.id, pod = %failed.config.name,
+                    "CNI DEL after a failed ADD did not succeed, retried before the next sandbox: {e}");
+                return false;
+            }
+        }
+        self.release_sandbox(&failed.id, failed.handle).await;
+        true
+    }
+
+    /// Retry every failed ADD's DEL. One at a time, under the lock, so two
+    /// sandboxes starting at once do not both run one.
+    async fn retry_failed_networks(&self) {
+        let mut failed = self.failed_networks.lock().await;
+        let mut kept = Vec::new();
+        for f in failed.drain(..) {
+            if !self.unwind_network(&f).await {
+                kept.push(f);
+            }
+        }
+        *failed = kept;
     }
 
     /// Give this runtime a CNI to call.
@@ -226,6 +276,7 @@ impl StormpumpRuntime {
             cni: None,
             sandboxes: Mutex::new(HashMap::new()),
             containers: Mutex::new(HashMap::new()),
+            failed_networks: Mutex::new(Vec::new()),
             next_id: std::sync::atomic::AtomicU64::new(1),
         }
     }
@@ -526,6 +577,7 @@ impl RuntimeService for StormpumpRuntime {
 
     async fn run_pod_sandbox(&self, config: &PodSandboxConfig) -> Result<String, CriError> {
         self.probe()?;
+        self.retry_failed_networks().await;
         let id = self.mint_id("sb");
         // The namespaces the sandbox is built with come from the pod, and they
         // have to be decided here rather than per container: a container asking
@@ -602,8 +654,21 @@ impl RuntimeService for StormpumpRuntime {
                         // Same reasoning as a missing config: a pod that
                         // asked for a network and did not get one must not
                         // come up looking healthy.
+                        //
+                        // DEL first (#100): a chain that failed half way may
+                        // have allocated an address or made an endpoint, and
+                        // the CNI contract is that the runtime undoes it.
+                        // Kept, namespace and all, until DEL succeeds.
                         Err(e) => {
-                            self.release_sandbox(&id, handle).await;
+                            let failed = FailedNetwork {
+                                id: id.clone(),
+                                handle,
+                                netns: ns.clone(),
+                                config: config.clone(),
+                            };
+                            if !self.unwind_network(&failed).await {
+                                self.failed_networks.lock().await.push(failed);
+                            }
                             return Err(CriError::NetworkNotReady(format!(
                                 "CNI ADD failed: {e}"
                             )));
@@ -1459,6 +1524,50 @@ impl ImageService for StormpumpImages {
 
 #[cfg(test)]
 mod tests {
+
+    /// A failed ADD is followed by DEL, and a DEL that fails keeps the
+    /// sandbox until a later one succeeds (#100).
+    #[tokio::test]
+    async fn a_failed_cni_add_is_deleted_and_kept_until_del_succeeds() {
+        use std::os::unix::fs::PermissionsExt;
+        let conf = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        std::fs::write(
+            conf.path().join("10-net.conflist"),
+            r#"{"cniVersion":"1.0.0","name":"net","plugins":[{"type":"fake"}]}"#,
+        )
+        .unwrap();
+        // DEL fails until `ok` exists; every call is counted.
+        let script = format!(
+            "#!/bin/sh\ncat >/dev/null\necho \"$CNI_COMMAND\" >> {dir}/calls\n[ -e {dir}/ok ] && exit 0\necho '{{\"code\":11,\"msg\":\"busy\"}}'\nexit 1\n",
+            dir = bin.path().display()
+        );
+        let plugin = bin.path().join("fake");
+        std::fs::write(&plugin, script).unwrap();
+        std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let rt = StormpumpRuntime::new("/nonexistent").with_cni(Some(cni::CniInvoker::new(
+            conf.path(),
+            vec![bin.path().to_path_buf()],
+        )));
+        let calls = || std::fs::read_to_string(bin.path().join("calls")).unwrap_or_default();
+
+        let failed = FailedNetwork {
+            id: "sb-1".into(),
+            handle: None,
+            netns: "/proc/1/ns/net".into(),
+            config: PodSandboxConfig { name: "p".into(), namespace: "ns".into(), uid: "u".into(), ..Default::default() },
+        };
+        assert!(!rt.unwind_network(&failed).await, "DEL refused: kept");
+        rt.failed_networks.lock().await.push(failed);
+        rt.retry_failed_networks().await;
+        assert_eq!(rt.failed_networks.lock().await.len(), 1);
+        assert_eq!(calls(), "DEL\nDEL\n");
+
+        std::fs::write(bin.path().join("ok"), "").unwrap();
+        rt.retry_failed_networks().await;
+        assert!(rt.failed_networks.lock().await.is_empty());
+        assert_eq!(calls(), "DEL\nDEL\nDEL\n");
+    }
     use super::*;
 
     fn rt() -> StormpumpRuntime {
