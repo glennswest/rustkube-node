@@ -4,39 +4,36 @@ The **node level** of [rustkube](https://github.com/glennswest/rustkube) — the
 Kubernetes worker components, in Rust. Split into its own repo for parallel
 development; the code stays upstream-shaped and monorepo-mergeable.
 
-> **Status: early / greenfield.** The libraries exist (ported from rustkube),
-> the binaries build, but a node does not yet fully join a cluster or run pods.
-> See the tracking issues.
+Current code: **main at 5bb1a38, audited 2026-09-29**, workspace version
+**0.13.0** plus unreleased changes. The kubelet registers Nodes, maintains
+heartbeats, runs Pods, and reconciles stormvm VirtualMachineInstances through
+stormpump. This is a partial Kubernetes node implementation; remaining gaps
+and unsupported promises are tracked in [the capability audit](docs/status.md).
+The experimental `turbomode` branch is not merged or released.
 
-## Components
+## Components and runtime selection
 
-Upstream-shaped: thin `cmd/<component>` binaries over `pkg/<lib>` libraries
-(same layout as [rustkube](https://github.com/glennswest/rustkube)).
+| Component | Source | Current role |
+|---|---|---|
+| `kubelet` | `cmd/kubelet`, `pkg/kubelet` | Node registration, Pod lifecycle, probes, storage, logs, metrics and stormvm VMIs |
+| `kube-proxy` | `cmd/kube-proxy`, `pkg/proxy` | Optional iptables Services/Endpoints polling implementation; stormcos uses Cilium's service dataplane and does not start it |
+| CNI library | `pkg/cni` | Standard plugin invocation and networking helpers |
 
-| Binary | cmd → pkg | Role |
-|--------|-----------|------|
-| `kubelet` | `cmd/kubelet` → `pkg/kubelet` | Node agent — registration, pod lifecycle, health probes, CRI/native/VM runtime |
-| `kube-proxy` | `cmd/kube-proxy` → `pkg/proxy` | Service dataplane — iptables (today) / eBPF (planned) for ClusterIP/NodePort |
-| — | `pkg/cni` | Standard CNI invoker (libcni-style) + built-in plugins (bridge, host-local IPAM, VXLAN) |
+The executable defaults to **`--runtime native`**. The stormcos stage recipe
+explicitly selects **`--runtime stormpump`**, connecting to the engine ring at
+`/hostrun/stormpump.sock`. `--runtime cri` selects an external CRI v1 runtime
+(CRI-O or containerd); it is optional. `--runtime vm` is the separate, incomplete
+legacy microVM-Pod path, not the stormvm VMI manager.
 
-Binaries and systemd units use **exact upstream names** (`kubelet`,
-`kube-proxy`, `kubelet.service`, `kube-proxy.service`), config under
-`/etc/kubernetes/` — so this is a drop-in node.
+For stormpump Pods, CNI configuration is checked per sandbox: the kubelet
+passes the sandbox network namespace to CNI ADD and invokes DEL at teardown.
+Missing configuration or a failed ADD produces `NetworkNotReady`. Host-network
+Pods bypass this. CRI delegates networking to the external runtime. Node Ready
+is not yet gated on CNI readiness (#3/#32).
 
-## Runtime & networking defaults
-
-- **Container runtime: CRI-O over gRPC** (`--runtime=cri`). The kubelet speaks
-  the CRI v1 protocol over the Unix socket (`/run/crio/crio.sock`) — the same
-  protocol OpenShift uses — via a tonic client generated from the vendored
-  kubernetes/cri-api proto (K8s 1.32, `pkg/kubelet/proto/api.proto`). This
-  gets full OCI image ecosystem compatibility for free. containerd works too.
-- **CNI: standard plugins, default Cilium.** With CRI-O, the runtime invokes
-  CNI itself from `/etc/cni/net.d` (Cilium writes `05-cilium.conflist`).
-  For the native/VM runtimes, the kubelet invokes the standard CNI protocol
-  directly (`pkg/cni/src/invoker.rs`) — any spec-compliant plugin works.
-- The **native runtime** (`--runtime=native`, youki libcontainer, no
-  containerd) and **VM runtime** (`--runtime=vm`) are experimental paths.
-- Test target: **x86_64 Linux**.
+See [configuration and defaults](docs/configuration.md), [ports and APIs](docs/api.md),
+and [build and shipping](docs/BUILD.md). The binaries share upstream names;
+this does **not** establish full upstream compatibility.
 
 ## The kubelet API (`:10250`)
 
@@ -46,13 +43,14 @@ TokenReview); `/healthz`, `/livez` and `/readyz` are open.
 | Route | What it is |
 |---|---|
 | `GET /metrics`, `/metrics/cadvisor` | Prometheus metrics under upstream's names: the kubelet's own, and cAdvisor-shaped container and pod usage. See [docs/metrics.md](docs/metrics.md) |
-| `GET /stats/summary` | The Summary API (`kubectl top`, metrics-server) |
+| `GET /stats/summary` | Partial Summary API: container CPU/memory, their sums as node CPU/memory, and node filesystem usage; not full metrics-server/HPA conformance |
 | `GET /pods` | The pods this kubelet manages, including admitted pods still waiting to start (`Pending`, with the reason) |
 | `GET /containerLogs/{ns}/{pod}/{container}` | What `kubectl logs` reads, by way of the apiserver proxy. A pod waiting to start answers `400 … is waiting to start: ContainerCreating (<reason>)`, as upstream does. A node service's mirror pod (`kube-system/<asset>-<node>`, container `<asset>`) reads the service's stormd log volume, found through the boot unit that mounts it at `/var/log/stormd` and seen under `/hostroot`. The current log covers every process stormd runs there, rotations included, merged in time order and marked `[<proc>]` when there is more than one. `--previous` is the newest `.failed.log`, and tail, since, timestamps, limit and follow all apply. A service not run by stormd (stormblock, registry) has no such volume and answers 404 |
 | `GET /vmConsole/{ns}/{name}/{door}` | A VM's `serial` or `vnc` console, answered by stormvm's console router mounted here |
+| `GET /vmInstance/{address}` | VMI metadata by observed guest address; cold cache returns 503 with Retry-After, absent guest returns 404 |
 | `DELETE /volumes/{ns}/{claim}` | Delete the stormblock clone behind a released claim |
 
-The last two exist here because what they reach is on the node and the
+The console and volume-release routes exist here because what they reach is on the node and the
 control plane cannot get to it. Routing through the kubelet keeps the blast
 radius at one node and reuses a hop the apiserver already authenticates,
 rather than handing a controller credentials to every node's engine.
@@ -89,6 +87,9 @@ data.
 
 ## The node's services as pods
 
+Readiness currently follows the asset's running state rather than a health
+endpoint (#96); lifecycle Events lack full exit detail (#50/#82).
+
 Every 15 s the kubelet reads PID 1's asset table (`/run/stormpump/assets.json`) and mirrors each asset as a
 read-only pod, `kube-system/<asset>-<node>` (labels `storm.io/asset`, `storm.io/component=node-service`).
 A running asset's pod is Running and Ready, and a stopped one is Failed. A mirror whose asset is not in the
@@ -98,7 +99,9 @@ deleted by the kubelet, and `kubectl logs` on them is described above.
 
 ## Storage
 
-Claims of the built-in `stormblock` class are cloned and attached by the
+The **built-in stormblock PVC driver** uses stormblock and sbregistry blanks.
+A claim is a copy-on-write clone of a sealed, preformatted size-class blank:
+no per-claim mkfs, data copy or CSI. Claims are cloned and attached over ublk by the
 node itself (`pkg/kubelet/src/storage.rs`), through the node's stormblock
 engine (`--stormblock`, default `http://127.0.0.1:9090`). The engine requires
 its own token, and the kubelet presents it on every call
@@ -108,13 +111,13 @@ or else from the file at `$STORMBLOCK_TOKEN_FILE` (default
 `/etc/stormblock/api_token`, then `/var/lib/stormblock/api_token`. The engine
 mints the token when it starts, and the kubelet may start first, so while no
 token is found the kubelet looks again on every call. After a 401 it reads the
-token again and retries once. Every other StorageClass goes
+token again and retries once if the token changed. Separate admin-token support is missing (#105). Every other StorageClass goes
 through its CSI driver. The kubelet registers node plugins from
 `/var/lib/kubelet/plugins_registry`, writes `CSINode`, and stages and
 publishes volumes. It will not give a pod a volume whose mount has not reached
-the node. See [docs/csi.md](docs/csi.md). The mounts of external drivers need
-Bidirectional propagation in the engine (stormpump#35), and until that lands
-pods on such claims wait with that reason.
+the node. See [docs/csi.md](docs/csi.md). The engine propagation feature has landed, but this checkout still drops
+`Mount.propagation` in its stormpump adapter (#81, blocked on stormvm#65).
+Real-driver mount/restart/delete acceptance remains #52.
 
 **A pod whose volumes are not ready waits, and says why.** It is `Pending`,
 every container is `waiting: ContainerCreating` with the reason (for example
@@ -128,6 +131,14 @@ the background and is waited for inline for 2 seconds, so a small class is
 cloned on the pass that asked. A large one (a 1 TiB blank formats for minutes)
 does not hold the sync loop: its claims wait on the template's state until it
 is `ready`.
+
+The current ext4 ladder is **1Mi, 16Mi, 64Mi, 256Mi, 1Gi, 4Gi, 16Gi,
+64Gi, 256Gi, 1Ti**; requests round up, and requests above 1Ti are refused.
+The rounded class is the volume ceiling. Capacity reservation/overcommit
+protection is not implemented (#62/#108). Larger classes, per-class filesystems
+and raw block support remain #67; the owner's direction is ext4 first, with
+raw block for single objects past 16TiB, not an assumed XFS switch.
+See [service volume objects](docs/node-volumes.md) for the PV/PVC mirror.
 
 ### Virtual machine disks
 
@@ -164,12 +175,13 @@ VirtualMachine gives its disks no owner. The sweep never deletes them, and a
 VM made again under that name reattaches them. Disks of a machine adopted
 after a kubelet restart are given their owner then.
 
-A claim's disk is never deleted.
+Stopping the VM never deletes a claim's disk; its PVC reclaim policy owns deletion.
 
 A claim's disk waits, with the reason on the VMI, while the claim is unbound,
 belongs to another StorageClass, or is in use by a pod on this node. A pod
 mounts the filesystem and a VM writes the raw device, so the two must not
-share it.
+share it. The reverse check (a Pod starting against a VM-held claim) is still
+missing on main (#80).
 
 ### Virtual machine lifecycle
 
@@ -193,8 +205,8 @@ share it.
   - A missing golden is not a failure: it waits and is tried on every sync.
   - A start gives up, and the VMI goes Failed, only when its VirtualMachine's
     `runStrategy` is `Once` or `Manual`.
-  - A failed start deletes the root clone and seed it made. An `emptyDisk` it
-    found is kept.
+  - A failed start cleans up volumes created in that attempt; reused disks
+    are kept.
 - Restarting a `running: true` VM whose instance ended is the VM controller's
   job (rustkube#104).
 - **A guest's address** goes to `status.interfaces[].ipAddress` / `ipAddresses`
@@ -263,12 +275,16 @@ The same image is the workload pods' program (`/test sized <path> <seed>
 <bytes> <lo> <hi>`), so a run pulls nothing else. Check it builds with
 `sc-build 'cd test && cargo test --locked && cargo build --release --locked'`.
 
+Required test inputs are listed in [configuration](docs/configuration.md#test-container).
+In particular `RUSTKUBE_NODE_TEST_IMAGE` is required; the runner does not yet
+supply it (#97). No successful live medium run is claimed (#64).
+
 ## Relationship to rustkube
 
 - **Control plane** (kube-apiserver, controller-manager, scheduler, fastetcd)
   lives in [rustkube](https://github.com/glennswest/rustkube).
-- **DNS** is external (see [microdns](https://github.com/glennswest/microdns) —
-  the K8s DNS source runs there).
+- Cluster DNS is a platform service. Pod DNS configuration is built in
+  `pod_manager.rs`; this repository does not run a DNS server.
 - Shared types come from rustkube's `apimachinery` crate, as a **git
   dependency pinned to a commit** (`Cargo.toml`, `[workspace.dependencies]`):
   ```toml
@@ -277,45 +293,24 @@ The same image is the workload pods' program (`/test sized <path> <seed>
   This checkout builds on its own. Moving to a newer rustkube means changing
   `rev` and running `cargo update -p apimachinery`.
 
-## Build
+## Build and ship
 
-What ships is a **golden** — a sealed filesystem on the forge that a stormcos
-release composes over. A node installs nothing, so there is no package to
-build and no image file to copy:
+From a clean checkout, commit and push first, then:
 
 ```bash
-scripts/build-golden.sh          # on the build box, as root
+sc-build 'cargo build --locked && cargo test --locked'
 ```
 
-It builds the static binaries, attaches a volume from the forge over NVMe/TCP,
-makes a filesystem on it, copies the binaries in with `install`, and seals it.
-No tar, no loop device, no second copy of anything. See [docs/BUILD.md](docs/BUILD.md).
+The build service fetches the pushed commit into an isolated scratch build on
+dev and deletes it afterwards. Do not build on the session VM or create a
+persistent checkout on dev.
 
-To compile without touching the forge:
-
-```bash
-# requires `protoc` on the build host (CRI/CSI gRPC codegen)
-cargo build --release            # produces target/release/{kubelet,kube-proxy}
-cargo build --release --target x86_64-unknown-linux-musl   # static
-```
-
-`packaging/build-packages.sh` still makes an rpm and a deb. They are kept for
-hosts that are not stormcos nodes, and they are **not** what a node runs — note
-that they package a glibc build, which a node cannot exec.
-
-## The work (greenfield)
-
-The node level is genuinely not finished. Priorities:
-
-1. **kubelet ↔ CRI**: real containerd/CRI-O integration (or the native/VM
-   runtimes), node registration + Lease heartbeats, pod sandbox lifecycle,
-   volume mounts, probes end-to-end so a node goes `Ready` and runs a pod.
-2. **kube-proxy**: iptables service/endpoint programming verified against a live
-   apiserver; eBPF path behind a feature.
-3. **CNI**: pod networking on a real node (bridge + IPAM + overlay), wired to the
-   kubelet pod sandbox.
-4. **Schedulable masters + workers**: once the above works, both a `worker1.g8.lo`
-   node and schedulable masters can run app loads.
+A stormcos release consumes a **stage golden**, containing stormd, its config
+and the binaries. After completed release work passes validation, request it
+through `stormcentral component stage rustkube-node --url http://stormcentral.g8.lo`.
+Do not use `component build` or `scripts/build-golden.sh`: they produce the
+bin-only artifact that cannot start this service. The legacy script still
+exists pending #51. See [BUILD.md](docs/BUILD.md) for the complete workflow.
 
 ## License
 

@@ -3,7 +3,13 @@
 ## [Unreleased]
 
 ### 2026-09-29
-- **docs:** Record the main-branch documentation audit plan (#54), keeping experimental turbomode work separate.
+- **docs:** Refresh README, build/storage/metrics references and planning docs
+  against main 5bb1a38 and history since September 18 (#54). Add complete
+  CLI/environment defaults, ports/routes, shipping workflow and an issue-linked
+  capability audit; preserve the built-in stormblock PVC description. Separate
+  experimental turbomode and unverified live acceptance from main behavior.
+- **docs:** Track uncovered sidecar/backoff/endpoint-precedence gaps as
+  #111/#112/#113; correct no-cni and legacy builder documentation without changing code.
 
 <!-- New unreleased changes go here -->
 

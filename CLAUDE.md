@@ -2,13 +2,29 @@
 
 The node half of rustkube: the kubelet (`pkg/kubelet`, `cmd/kubelet`), kube-proxy
 (`pkg/proxy`, `cmd/kube-proxy`) and the CNI helpers (`pkg/cni`). It ships as a
-golden (`scripts/build-golden.sh`), not a package. The cross-project rules are in
+stage golden through `stormcentral component stage rustkube-node`, not the
+legacy bin-only `scripts/build-golden.sh` or a package. The cross-project rules are in
 `../CLAUDE.md`; this file is the project's own context and work plan.
 
 ## Version
 
 `0.13.0`. There is one version location: `[workspace.package] version` in
 `Cargo.toml` (every crate uses `version.workspace = true`).
+
+## Current implementation reference (2026-09-29)
+
+Main baseline: 5bb1a38. See `docs/status.md` for changes since September 18
+and issue-backed limitations, `docs/configuration.md` for every CLI/env/default,
+and `docs/api.md` for ports and actual routes. CLI runtime defaults to native;
+stormcos explicitly chooses stormpump. Cilium owns Services; the packaged
+kube-proxy is not started. PVCs use the built-in stormblock driver and sealed
+size-class blanks over ublk, with CSI only for third-party drivers.
+
+Main has VMI adoption, persistent VM-owned disks, accessCredentials, tap address
+reporting and snapshot reconciliation; restore remains #53/#109. Main does not
+contain turbomode's UID workers. Historical work-plan entries below record
+what was true at each checkpoint; they are not current deployment guarantees.
+Owner decisions are tracked in #106–#110; do not infer answers from recommendations.
 
 ## Build and test
 
@@ -43,11 +59,14 @@ Scope: current main at 5bb1a38 and `git log --since=2026-09-18`.
 Work on docs/code-refresh-20260929; preserve turbomode separately, with no merge
 or golden from that experimental branch.
 
-1. [ ] Audit README, docs and current configuration/API/runtime code; distinguish
+1. [x] Audit README, docs and current configuration/API/runtime code; distinguish
    implementation from plans and live acceptance.
-2. [ ] Correct shipping instructions, add complete CLI/default/port references,
+2. [x] Correct shipping instructions, add complete CLI/default/port references,
    and link every unsupported promise to its owning issue (file missing ones).
-3. [ ] Update CHANGELOG; review for secrets; commit and push each logical unit.
+3. [x] Update CHANGELOG; review for secrets; commit and push the documentation.
+   New P2 follow-ups: #111 restartable init sidecars, #112 backoff persistence,
+   #113 explicit default-valued apiserver precedence. Existing gaps are linked
+   in docs/status.md; #3 now records the no-cni help/behavior mismatch.
 4. [ ] Validate the pushed documentation head with sc-build and document results.
 
 
