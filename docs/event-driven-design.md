@@ -280,3 +280,28 @@ the next restart, since nothing looks at a healthy container on a clock.
 Verified by unit tests only: probe and backoff deadlines, a settled pod with no
 deadline, the engine watch's follow/reconnect, the sweep's deferral and VM
 start retry deadlines. Not measured on a node (#102).
+
+## Request deadlines (#99)
+
+The ring, CNI and engine I/O named in #99's comments are bounded (see
+[configuration](configuration.md#runtime-details)). The ring's deadline counts
+from when a request is made, not from when it is sent. A timeout never unsends
+an SQE: the request is kept as abandoned until the engine answers, so the
+arena is not reused early, and whatever a late success made is undone by the
+ring thread. Verified by unit tests (deadline bookkeeping, late-success undo,
+a hung CNI plugin killed and reaped, a silent engine timing out), not on a
+node.
+
+### Acceptance status (2026-09-29)
+
+| #99 acceptance item | Where it is covered |
+|---|---|
+| list/watch race, pagination, split frames, 410/reconnect, error Status vs empty list | rustkube `apimachinery::reflector` (rustkube#143, closed), which every kubelet watch and LIST uses |
+| deletion/recreation, event during worker execution, slow Pod/VM not blocking a fast one | `workload.rs` tests (#100) |
+| no-op status echoes | `workload::intent` and the reflector's semantic compare; the mirrors write only what differs (#101) |
+| cancellation during runtime/CSI I/O | #100 (VM partial-start unwind, CNI DEL, reclaim handler, CSI teardown records) |
+| static-pod API outage | `source_replacement_never_deletes_another_sources_work` |
+| container exit / delayed volume readiness without API change | stormpump exit wake and deadlines (#101); `mint_completion_notifies_without_an_api_edit_or_sync_tick` |
+| real-node latency (write → bind → sandbox → process → Ready, p50–max), idle CPU, burst, disconnect recovery | **not done**: #102 on C2NR0Q2 (owner's choice, #110), after the release with this code is installed |
+
+Control-plane halves still open in rustkube: #144, #147 and #149.

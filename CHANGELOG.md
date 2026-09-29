@@ -2,6 +2,14 @@
 
 ## 2026-09-29
 
+- **fix:** Bound every runtime-side request (#99). The stormpump ring's 30 s
+  deadline, previously declared and never applied, now runs from enqueue: a
+  request past it is answered `Timeout`, and its late completion still frees
+  the arena and is undone if it made something. Each CNI plugin exec is limited
+  to 60 s, then killed and reaped. Engine calls get a 5 s connect bound and a
+  60 s request bound (1 h for a mint; none for the volume watch).
+- **docs:** Runtime deadlines in configuration; #99 acceptance status in the
+  event-driven design.
 - **chore:** Stage golden golden-rustkube-node-2f39a07e3c07 at 4b648f4 (#101), release request stormcos#164.
 - **feat:** No global sync tick (#101). Live Pods and VMIs come back only on
   events or their own deadlines: probe `periodSeconds`/`initialDelaySeconds`

@@ -55,6 +55,24 @@ runtime probe. The gRPC client has a 120-second channel timeout and requests
 600 seconds for image pull and the caller's timeout for exec; the synthetic
 `http://[::1]:50051` URI is used with a Unix connector, not a TCP listener.
 
+Every other runtime-side call is bounded too (#99):
+
+- **stormpump ring:** 30 s per request, counted from when it was asked, so a
+  request queued behind a wedged engine times out as well. A request dequeued
+  after its deadline is never submitted. One already on the ring is answered
+  `Timeout` and kept: its late completion still frees the shared arena, and a
+  late success is undone (a spawn is stopped and released on exit; a volume,
+  spec or sandbox is released).
+- **CNI plugins:** 60 s per plugin exec, stdin to exit
+  (`cni::PLUGIN_TIMEOUT`, `CniInvoker::with_timeout`). Past it the plugin is
+  killed and reaped, and the call fails. A failed ADD is followed by DEL
+  (#100).
+- **stormblock engine:** 5 s to connect and 60 s per request. A blank's mint
+  POST is allowed 1 h, since it answers when the format is done: stormblock
+  finishes the format itself and refuses a duplicate name, so a mint that
+  outlives the bound is found again by name. The volume watch stream has no
+  overall bound.
+
 `--runtime stormpump` fails startup if the ring connection fails. It also
 activates the stormvm VMI and snapshot reconcilers. `--runtime vm` detects a
 VMM and falls back to native if none is found; its Pod container lifecycle is

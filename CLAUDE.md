@@ -75,20 +75,20 @@ work continues on main afterwards; no golden or release is requested here.
    changes documentation only after the verified main merge.
 
 
-### In progress: #99, request deadlines; then parked on #102 (live)
+### Parked on #102: #99, event-driven node and subsecond warm startup
 
 2026-09-29, on main. #99 is the umbrella; #100/#101 are done, rustkube#143,
 #145, #146 and #148 are closed, and rustkube#144/#147/#149 are open there.
 Its acceptance measures real nodes (C2NR0Q2, owner's choice on #110), which
-waits on the master installing the release (stormcos#164) = #102. Code left
-here, from the #95/#63 comment mining:
-1. [ ] Ring: enforce `DEADLINE` from enqueue (queued, parked-for-arena and in
-   flight), keep the arena until the real completion, and undo a late
-   success (spawn → stop + release on exit; volume/spec/sandbox → release).
-2. [ ] CNI: bound each plugin exec (stdin + wait), kill and reap on timeout.
-3. [ ] EngineClient: connect + request timeouts; the volume watch stream
-   exempt; check a timed-out mint can be found again, not duplicated.
-4. [ ] Tests, docs, CHANGELOG, sc-build; then `propose --after` #102.
+waits on the master installing the release (stormcos#164) = #102.
+1. [x] Ring: `DEADLINE` from enqueue; abandoned requests keep the arena until
+   they complete; a late success is undone. db9b783.
+2. [x] CNI: plugin exec bounded (60 s), killed and reaped on timeout. db9b783.
+3. [x] EngineClient: 5 s connect, 60 s request, 1 h mint, unbounded watch.
+   A timed-out mint is found again by name (stormblock refuses duplicates).
+4. [x] sc-build db9b783: 269 kubelet unit, 4 integration, 25 CNI, 17 proxy,
+   1 doc-test pass (1 ignored). Acceptance table in docs/event-driven-design.md.
+5. [ ] Real-node measurements = #102; proposed #99 after it. Resume there.
 
 ### Done: #101, events and explicit deadlines instead of sync ticks
 
