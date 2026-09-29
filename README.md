@@ -28,7 +28,11 @@ The wired adapters passed 222 unit and four integration tests on dev at
 serialize by driver/handle, and failed runtime recovery keeps admission closed.
 PV and VolumeAttachment changes route through an inverse claim index; failed
 collection reads retain the index. VM status and migration writes carry UID
-guards. Further cancellation validation is in progress. This is not a measured subsecond release.
+guards. VM cancellation remains blocked on
+[stormpump#63](https://github.com/glennswest/stormpump/issues/63): the shared
+engine client cannot withdraw a deposited tap after a pre-spawn failure.
+Every-boundary cancellation coverage and VM partial-start cleanup are unfinished;
+this branch is not ready to merge or release. This is not a measured subsecond release.
 Active workloads still use an explicit runtime/probe/volume observation
 fallback, and service/volume mirrors and CSI cleanup tasks retain their existing schedules.
 Per-UID concurrency and complete local event sources are tracked in

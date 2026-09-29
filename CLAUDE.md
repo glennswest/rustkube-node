@@ -37,39 +37,40 @@ not the release path.
 
 ## Work plan
 
-### In progress: #100, common bounded per-UID Pod/VMI workers
+### Parked on stormpump#63: #100, common bounded per-UID Pod/VMI workers
 
 2026-09-29: master's decision on #100 authorizes continuing at turbomode 9b46886,
 without merging main yet. Baseline sc-build `cargo test --locked -p kubelet`
 already passed (211 tests). No main merge, golden or live deployment now.
 
-1. [ ] Audit runtime state/locks and recovery; protect claim/name admission before concurrency.
-   Found: VM stop considered query errors/timeouts an exit and ignored detach HTTP errors.
-   First checkpoint retains failed cleanup and guards Pod deletion by UID.
-   sc-build at 5e9148c passed 216 kubelet tests plus four integration tests.
-   Adapters now wired to one eight-worker pool; startup recovery/admission,
-   per-claim mutation exclusion and partial Pod-start state added.
-   sc-build at cdb0a4b passed 216 unit + four integration tests. Init waits now
-   yield with retained sandbox/container state; VM stop yields during engine grace.
-   Added deletion-during-operation/replacement/staged-init tests; sc-build at
-   d501d34 passed 220 unit + four integration tests. Image waits now yield to a
-   four-slot deduplicated pull pool; reclamation takes an admission reservation.
-   Slow-image/fast-start and reclamation exclusion tests passed at f3d868a
-   (222 unit + four integration tests). Runtime cleanup now retains refused
-   releases and partial volume registrations; CSI mutations serialize by handle.
-   Failed runtime recovery keeps admission closed. af1704b passed 223 unit + four
-   integration tests. Added PV/attachment inverse routing and remaining API UID
-   guards; next: cancellation boundary coverage and VM partial-start ownership.
-2. [ ] Wire Pod/VMI adapters to the common executor; retain state across failed cleanup,
-       use observed UID preconditions, and preserve bootstrap through unavailable API reads.
-3. [ ] Add dependency indexes, staged waits and slow/fast/cancellation regression tests.
-   Source-separated snapshots, inverse claim/image/driver indexes and recovery seeding
-   added to workload.rs and wired to adapters; dev tests above passed.
-   Remaining audit: volume events, UID preconditions, side-effect boundary coverage.
-4. [ ] Push each change, validate with sc-build, document evidence and remaining limitations.
-5. [ ] At the end of #100/#101 integrate main's #91 address pump, #35 failed-list
-       protection and #53 snapshots as executor events/adapters before merging main.
-       Live target remains the owner's decision under #102.
+1. [x] Wire Pod/VMI adapters to one eight-worker executor with name/claim
+   reservations; seed adopted workloads before admission. Static manifests have
+   an independent desired source, so unavailable API reads do not remove them.
+2. [x] Stage image pulls (four-slot shared pull pool), init waits and VM shutdown
+   grace periods. Retain partial Pod starts, refused runtime releases and CSI
+   teardown records. Serialize CSI mutations by driver/handle. Reject unknown
+   runtime recovery and VM exit as proof that cleanup is safe.
+3. [x] Add inverse claim/image/driver indexes and PV/attachment-to-claim routing;
+   UID guards on Pod deletion, VM status/finalizers, migration writes and PV deletion.
+4. [x] Push incremental checkpoints and run sc-build. af1704b passed 223 unit +
+   four integration tests. e504f58 full workspace build passed; test compilation
+   found a missing json macro import. Fix committed next; validation pending.
+5. [ ] Finish cancellation at every side-effect boundary. External blocker:
+   stormpump#63 has no acknowledged withdrawal for deposited VM tap FDs before
+   spawn. Partial NIC/plan/registration failures can keep a tap alive in the
+   shared engine connection and block same-name recreation. #100 moved behind
+   that issue with stormcentral propose; do not close or release it yet.
+   Resume: wire deposit withdrawal and retain VM partial-start ownership (disk,
+   volume/spec handles, registration, NIC deposits) until each cleanup succeeds;
+   add real adapter cancellation/failure-injection coverage. Audit CNI partial
+   sandbox failures and cancellation of the claim-reclaim HTTP handler too.
+   Existing tests cover shared admission, slow-image/fast-start, staged init
+   resume/delete, failed teardown, same-name replacement and dirty work during
+   an active operation; they do not establish every-boundary cancellation yet.
+6. [ ] At the end of #100/#101 integrate main's #91 address pump, #35 failed-list
+   protection and #53 snapshots as executor events/adapters before merging main.
+   Live target remains the owner's decision under #102. No version/release while
+   this experimental branch remains incomplete.
 
 
 ### Done: #35, VMs reconciled against VMIs: deletion stops them, orphans found

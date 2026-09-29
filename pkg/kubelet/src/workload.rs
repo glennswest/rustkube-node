@@ -431,6 +431,7 @@ fn intent(object: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     fn key(kind: Kind, uid: &str) -> Key {
         Key {
             kind,

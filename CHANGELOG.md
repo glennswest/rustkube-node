@@ -2,6 +2,9 @@
 
 ## 2026-09-29
 
+- **fix:** Import the JSON macro in the volume-index regression test; the full
+  dev workspace build passed but test compilation exposed the missing import.
+
 - **feat:** Index PV/VolumeAttachment changes back to claim users; retain the
   previous index when a collection cannot be read. Guard VM status, migration
   annotations and PV deletion by observed UID; retry panicked UID adapters (#100).
