@@ -9,7 +9,8 @@
   capability audit; preserve the built-in stormblock PVC description. Separate
   experimental turbomode and unverified live acceptance from main behavior.
 - **docs:** Record passing remote build/tests at ad43ee9 and the CLI/route/link audit;
-  stage-golden follow-up is blocked by platform fetch authentication (stormcentral#161).
+  stage-golden follow-up is blocked by platform fetch authentication (stormcentral#161),
+  with the scheduling dependency proposed and awaiting approval.
 - **docs:** Track uncovered sidecar/backoff/endpoint-precedence gaps as
   #111/#112/#113; correct no-cni and legacy builder documentation without changing code.
 

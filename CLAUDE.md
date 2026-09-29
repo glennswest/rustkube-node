@@ -76,7 +76,8 @@ or golden from that experimental branch.
    onto main at 9c1fe94; turbomode preserved. Requested the standard stage once.
 6. [ ] Artifact follow-up only: stage 131edf1ad026 failed before compilation
    fetching private stormcos be718e09b5f2 (GitHub username unavailable).
-   Added evidence to stormcentral#161 and moved #54 behind it. No golden or
+   Added evidence to stormcentral#161 and proposed #54 after it (proposal
+   663d4471d6a0 awaits approval). No golden or
    release request was produced. Documentation itself is published and verified;
    resume the stage request after the platform authentication fix.
 
