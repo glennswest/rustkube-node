@@ -2,6 +2,7 @@
 
 ## 2026-09-29
 
+- **chore:** Stage golden golden-rustkube-node-2f39a07e3c07 at 4b648f4 (#101), release request stormcos#164.
 - **feat:** No global sync tick (#101). Live Pods and VMIs come back only on
   events or their own deadlines: probe `periodSeconds`/`initialDelaySeconds`
   (upstream timing; previously every probe ran every 2 s), CrashLoopBackOff

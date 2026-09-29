@@ -93,6 +93,7 @@ work continues on main afterwards; no golden or release is requested here.
    test --locked`: 266 kubelet unit, 4 integration, 24 CNI, 17 proxy, 1 doc-test
    pass (1 ignored). Not measured on a node (#102). Follow-up: #115 (route an
    exit to its own UID instead of waking every workload).
+7. [x] Stage golden golden-rustkube-node-2f39a07e3c07 (4b648f4), release request stormcos#164.
 
 ### Done: #100 on main, VM partial-start unwind (stormpump#63 closed)
 
