@@ -93,6 +93,9 @@ pub struct Kubelet {
     /// without it simply does not list VMIs — it does not fail, and it does not
     /// pretend.
     vms: Option<Arc<crate::vm_manager::VmManager>>,
+    /// VirtualMachineSnapshots of the machines this node runs (#53). Present
+    /// exactly when `vms` is.
+    snapshots: Option<Arc<crate::vm_snapshot::Snapshots>>,
     migration: Arc<dyn MigrationService>,
     runtime: Arc<dyn RuntimeService>,
     api_client: reqwest::Client,
@@ -156,6 +159,7 @@ impl Kubelet {
             config,
             pod_manager,
             vms: None,
+            snapshots: None,
             migration,
             runtime,
             api_client,
@@ -183,6 +187,13 @@ impl Kubelet {
             .with_storage(self.config.engine.clone())
             .with_claims(self.pod_manager.clone()),
         ));
+        self.snapshots = Some(Arc::new(crate::vm_snapshot::Snapshots::new(
+            self.api_client.clone(),
+            &self.config.api_server_url,
+            &self.config.node_name,
+            crate::vm_manager::RUN_ROOT,
+            crate::vm_snapshot::stormvm_take(self.config.engine.url().to_string()),
+        )));
         self
     }
 
@@ -552,6 +563,9 @@ impl Kubelet {
             if let Some(want) = want {
                 vms.sync(&want).await;
             }
+        }
+        if let Some(snapshots) = &self.snapshots {
+            snapshots.sync().await;
         }
 
         // Sync pod states
