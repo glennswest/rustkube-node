@@ -48,7 +48,10 @@ already passed (211 tests). No main merge, golden or live deployment now.
    First checkpoint retains failed cleanup and guards Pod deletion by UID.
    sc-build at 5e9148c passed 216 kubelet tests plus four integration tests.
    Adapters now wired to one eight-worker pool; startup recovery/admission,
-   per-claim mutation exclusion and partial Pod-start state added, validation pending.
+   per-claim mutation exclusion and partial Pod-start state added.
+   sc-build at cdb0a4b passed 216 unit + four integration tests. Init waits now
+   yield with retained sandbox/container state; VM stop yields during engine grace.
+   Added deletion-during-operation/replacement/staged-init tests; validation pending.
 2. [ ] Wire Pod/VMI adapters to the common executor; retain state across failed cleanup,
        use observed UID preconditions, and preserve bootstrap through unavailable API reads.
 3. [ ] Add dependency indexes, staged waits and slow/fast/cancellation regression tests.

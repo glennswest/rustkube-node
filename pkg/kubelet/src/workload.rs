@@ -423,6 +423,50 @@ mod tests {
         assert!(!e.reservations.acquire(&key(Kind::Pod,"c"),&[(resource,Access::SharedFilesystem)]));
     }
 
+    struct BarrierAdapter {
+        started: tokio::sync::mpsc::UnboundedSender<bool>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait::async_trait]
+    impl Adapter for BarrierAdapter {
+        async fn reconcile(&self,_:&Key,desired:Option<Value>)->anyhow::Result<Next> {
+            self.started.send(desired.is_some()).unwrap();
+            if desired.is_some() {self.release.notified().await;}
+            Ok(Next::AwaitEvent)
+        }
+    }
+
+    #[tokio::test]
+    async fn deletion_during_side_effect_runs_cleanup_after_completion() {
+        let e=Executor::new(); let runner=e.clone();
+        let (tx,mut rx)=tokio::sync::mpsc::unbounded_channel();
+        let release=Arc::new(tokio::sync::Notify::new());
+        let a=Arc::new(BarrierAdapter{started:tx,release:release.clone()});
+        e.replace(Kind::Pod,&[object("x","data")]).unwrap();
+        let task=tokio::spawn(async move{runner.run(a,2).await});
+        assert_eq!(rx.recv().await,Some(true));
+        e.replace(Kind::Pod,&[]).unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(20),rx.recv()).await.is_err(),"one active operation per UID");
+        release.notify_one();
+        assert_eq!(tokio::time::timeout(Duration::from_secs(1),rx.recv()).await.unwrap(),Some(false));
+        task.abort();
+    }
+
+    #[test]
+    fn same_name_replacement_and_claim_mutations_wait_for_cleanup() {
+        let e=Executor::new(); let old=key(Kind::Pod,"old");
+        let mut new=key(Kind::Pod,"new");new.name=old.name.clone();
+        assert!(e.reservations.acquire(&old,&[]));
+        assert!(!e.reservations.acquire(&new,&[]));
+        e.reservations.release(&old);
+        assert!(e.reservations.acquire(&new,&[]));
+        let claim=(Resource::Claim("ns".into(),"data".into()),Access::SharedFilesystem);
+        let held=e.reservations.try_operations(&[claim.clone()]).unwrap();
+        assert!(e.reservations.try_operations(&[claim.clone()]).is_none());
+        drop(held);
+        assert!(e.reservations.try_operations(&[claim]).is_some());
+    }
+
     struct SlowVm {
         completed: tokio::sync::mpsc::UnboundedSender<Kind>,
     }

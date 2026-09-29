@@ -151,7 +151,7 @@ pub fn finalizer_patch(obj: &Value, present: bool) -> Option<Value> {
     } else {
         list.retain(|f| f != FINALIZER);
     }
-    let mut meta = json!({ "finalizers": list });
+    let mut meta = json!({ "finalizers": list, "uid": obj["metadata"]["uid"] });
     if let Some(rv) = obj["metadata"]["resourceVersion"].as_str() {
         meta["resourceVersion"] = json!(rv);
     }
@@ -425,6 +425,7 @@ pub struct VmManager {
     /// different machines, and treating them as one is how the second finds
     /// the first's disks.
     vms: Mutex<HashMap<String, Vm>>,
+    stopping: Mutex<std::collections::HashSet<String>>,
     /// The VMIs the apiserver last gave this node, by uid.
     ///
     /// **The object is the truth; this is a cache of it.** Metadata is
@@ -474,6 +475,7 @@ impl VmManager {
             claims: None,
             events,
             vms: Mutex::new(HashMap::new()),
+            stopping: Mutex::new(Default::default()),
             desired: Mutex::new(HashMap::new()),
             watched: Mutex::new(None),
             synced: std::sync::atomic::AtomicBool::new(false),
@@ -570,7 +572,7 @@ impl VmManager {
                 anyhow::ensure!(self.stop(&vm).await, "VM cleanup pending for {uid}");
                 self.vms.lock().await.remove(uid);
             }
-            if let Some(object) = object { self.set_finalizer(object, false).await; }
+            if let Some(object) = object { anyhow::ensure!(self.set_finalizer(object, false).await,"VM finalizer cleanup pending"); }
             return Ok(true);
         }
         let object = object.unwrap();
@@ -1038,27 +1040,18 @@ impl VmManager {
             let observed = tokio::task::spawn_blocking(move || r.query(handle)).await;
             let Ok(Ok(cqe)) = observed else { return false };
             if !exited(cqe.aux) {
-                let r = ring.clone();
-                if !matches!(tokio::task::spawn_blocking(move || r.stop(handle, 30)).await, Ok(Ok(_))) {
-                    return false;
+                if self.stopping.lock().await.insert(vm.uid.clone()) {
+                    let r = ring.clone();
+                    if !matches!(tokio::task::spawn_blocking(move || r.stop(handle, 30)).await, Ok(Ok(_))) {
+                        self.stopping.lock().await.remove(&vm.uid);
+                    }
                 }
-            }
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
-            loop {
-                let r = ring.clone();
-                let answer = tokio::task::spawn_blocking(move || r.query(handle)).await;
-                match answer {
-                    Ok(Ok(cqe)) if exited(cqe.aux) => break,
-                    Ok(Ok(_)) => {}
-                    _ => return false,
-                }
-                if std::time::Instant::now() >= deadline {
-                    warn!(vm = %vm.name, "exit not confirmed after grace period; retaining cleanup state");
-                    return false;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                // The engine owns the grace/kill deadline. Yield this worker
+                // while it runs so eight stopping guests do not occupy the pool.
+                return false;
             }
         }
+
         // Do not forget a refused detach (including HTTP 409), or delete its
         // volume while the engine still holds it. Every operation is retryable.
         for disk in &vm.disks {
@@ -1083,6 +1076,7 @@ impl VmManager {
             }
         }
         deregister(&vm.namespace, &vm.name);
+        self.stopping.lock().await.remove(&vm.uid);
         info!(vm = %vm.name, "vm stopped");
         true
     }
@@ -1697,11 +1691,9 @@ impl VmManager {
     /// Add or remove this node's finalizer on a VMI. Guarded by the object's
     /// resourceVersion, so a stale copy loses rather than overwrites; the
     /// next sync has a fresher one.
-    async fn set_finalizer(&self, obj: &Value, present: bool) {
-        if self.api_url.is_empty() {
-            return;
-        }
-        let Some(body) = finalizer_patch(obj, present) else { return };
+    async fn set_finalizer(&self, obj: &Value, present: bool) -> bool {
+        if self.api_url.is_empty() { return true; }
+        let Some(body) = finalizer_patch(obj, present) else { return true };
         let ns = obj["metadata"]["namespace"].as_str().unwrap_or("default");
         let name = obj["metadata"]["name"].as_str().unwrap_or("");
         let url = format!("{}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{name}", self.api_url);
@@ -1714,10 +1706,11 @@ impl VmManager {
             .await
         {
             Ok(r) if r.status().is_success() => {
-                info!("{ns}/{name}: finalizer {FINALIZER} {}", if present { "added" } else { "removed" })
+                info!("{ns}/{name}: finalizer {FINALIZER} {}", if present { "added" } else { "removed" });
+                true
             }
-            Ok(r) => tracing::debug!("{ns}/{name}: finalizer not updated: {}", r.status()),
-            Err(e) => tracing::debug!("{ns}/{name}: finalizer not updated: {e}"),
+            Ok(r) => { tracing::debug!("{ns}/{name}: finalizer not updated: {}", r.status()); !present && r.status().as_u16()==404 },
+            Err(e) => { tracing::debug!("{ns}/{name}: finalizer not updated: {e}"); false },
         }
     }
 

@@ -2,6 +2,11 @@
 
 ## 2026-09-29
 
+- **feat:** Yield init-container and VM shutdown waits between UID passes;
+  reuse partial startup state and retry finalizer cleanup with UID guards.
+- **test:** Cover staged init resume/delete, deletion during an active operation,
+  same-name UID replacement and per-claim mutation exclusion (#100).
+
 - **feat:** Connect Pod/VMI UID adapters to one eight-worker executor with
   recovery barriers, shared claim admission, per-claim mutation exclusion and
   retained partial Pod-start records. Runtime/probe deadlines remain for #101.

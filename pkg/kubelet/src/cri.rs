@@ -423,6 +423,9 @@ pub trait MigrationService: Send + Sync + 'static {
 /// CRI error type.
 #[derive(Debug, thiserror::Error)]
 pub enum CriError {
+    /// A staged operation yielded; its recorded resources remain owned.
+    #[error("startup pending: {0}")]
+    Pending(String),
     #[error("connection error: {0}")]
     Connection(String),
 

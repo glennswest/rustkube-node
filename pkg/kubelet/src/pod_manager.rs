@@ -2078,7 +2078,7 @@ impl PodManager {
                 continue;
             }
 
-            let partial = self.pods.read().await.get(uid).is_some_and(|p| p.phase=="Starting");
+            let partial = self.pods.read().await.get(uid).is_some_and(|p| p.phase=="Cleanup");
             if partial {
                 if let Err(error)=self.stop_pod(uid).await {
                     warn!(%error, %uid, "partial Pod start cleanup pending");
@@ -2088,7 +2088,7 @@ impl PodManager {
 
             let is_known = {
                 let pods = self.pods.read().await;
-                pods.contains_key(uid)
+                pods.get(uid).is_some_and(|p| p.phase != "Starting")
             };
 
             if !is_known {
@@ -2121,6 +2121,9 @@ impl PodManager {
                     // an address waits for one. Marking it Failed left CoreDNS
                     // dead on a node whose network came up ten seconds later,
                     // and nothing retried it.
+                    Err(CriError::Pending(what)) => {
+                        outcome.updates.push(self.waiting_pod(pod,what));
+                    }
                     Err(CriError::NetworkNotReady(what)) => {
                         warn!("Pod {namespace}/{name} waiting on the pod network: {what}");
                         let message = format!("network is not ready: {what}");
@@ -2136,6 +2139,7 @@ impl PodManager {
                         outcome.updates.push(self.waiting_pod(pod, message));
                     }
                     Err(e) => {
+                        if let Some(state)=self.pods.write().await.get_mut(uid) { state.phase="Cleanup".into(); }
                         apimachinery::reactor::failed();
                         error!("Failed to start pod {namespace}/{name}: {e}");
                         self.waiting
@@ -2248,8 +2252,11 @@ impl PodManager {
         let ns = pod["metadata"]["namespace"].as_str().unwrap_or("default");
         let name = pod["metadata"]["name"].as_str().unwrap_or("");
 
+        let uid=pod["metadata"]["uid"].as_str().unwrap_or("");
         for spec in &inits {
             let cname = spec["name"].as_str().unwrap_or("init");
+            if out.iter().any(|r| r.name==cname && r.succeeded()) {continue;}
+            let existing=self.pods.read().await.get(uid).and_then(|p|p.container_ids.get(cname).cloned());
             let image = spec["image"].as_str().unwrap_or("");
             info!("Init container {ns}/{name}/{cname}: ensuring image {image}");
             let image_ref = self.ensure_image(image, spec).await?;
@@ -2261,18 +2268,20 @@ impl PodManager {
             let mut config = build_container_config(spec, &image_ref, envs, mounts);
             apply_pod_namespaces(&mut config, pod);
             ensure_container_log_dir(&sandbox_config.log_directory, &config.name);
-            let cid = self
-                .runtime
-                .create_container(sandbox_id, &config, sandbox_config)
-                .await?;
+            let cid = if let Some(cid)=existing {cid} else {
+            let cid = self.runtime.create_container(sandbox_id, &config, sandbox_config).await?;
             if let Some(state)=self.pods.write().await.get_mut(pod["metadata"]["uid"].as_str().unwrap_or("")) {
                 state.container_ids.insert(cname.into(),cid.clone());
             }
             self.runtime.start_container(&cid).await?;
+            if let Some(state)=self.pods.write().await.get_mut(uid) {state.started.insert(cname.into(),Instant::now());}
+            cid
+            };
             info!("Init container {ns}/{name}/{cname} started, waiting for completion");
 
             // Poll until the init container exits (bounded).
-            let mut waited = 0u64;
+            let mut waited = self.pods.read().await.get(uid).and_then(|p|p.started.get(cname))
+                .map(|t|t.elapsed().as_millis() as u64).unwrap_or(0);
             const POLL_MS: u64 = 500;
             const MAX_WAIT_MS: u64 = 120_000;
             loop {
@@ -2319,6 +2328,7 @@ impl PodManager {
                             started_at: status.started_at,
                             finished_at: status.finished_at,
                         });
+                        if let Some(state)=self.pods.write().await.get_mut(uid) {state.init_statuses=out.clone();}
                         let _ = self.runtime.remove_container(&cid).await;
                         break;
                     }
@@ -2342,6 +2352,9 @@ impl PodManager {
                             let _ = self.runtime.stop_container(&cid, 5).await;
                             let _ = self.runtime.remove_container(&cid).await;
                             return Err(CriError::Timeout);
+                        }
+                        if self.admission.is_some() {
+                            return Err(CriError::Pending(format!("init container {cname} is running")));
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(POLL_MS)).await;
                         waited += POLL_MS;
@@ -2392,6 +2405,8 @@ impl PodManager {
         // carries.
 
         // Create pod sandbox
+        let existing=self.pods.read().await.get(uid).and_then(|p|p.sandbox_id.clone());
+        let sandbox_id=if let Some(existing)=existing {existing} else {
         let sandbox_id = self.runtime.run_pod_sandbox(&sandbox_config).await?;
         // Persist each side effect before the next await. A failed or cancelled
         // start is cleaned by this UID before another sandbox can be created.
@@ -2402,6 +2417,8 @@ impl PodManager {
             restart_counts:HashMap::new(),ready:HashMap::new(),liveness_failures:HashMap::new(),
             startup_passed:HashMap::new(),started:HashMap::new(),terminated:HashMap::new(),init_statuses:Vec::new(),
         });
+        sandbox_id
+        };
         info!("Created sandbox {sandbox_id} for {namespace}/{name}");
 
         // Get sandbox IP
@@ -2424,7 +2441,7 @@ impl PodManager {
         // what says *which* one failed and how far the pod got, and a Result
         // that carried only the error would throw that away at the moment it
         // became useful.
-        let mut init_statuses: Vec<InitContainerStatusReport> = Vec::new();
+        let mut init_statuses=self.pods.read().await.get(uid).map(|p|p.init_statuses.clone()).unwrap_or_default();
         let init_outcome = self
             .run_init_containers(
                 pod,
@@ -5023,6 +5040,44 @@ pub(crate) mod tests {
         assert!(sc.host_network);
         assert!(sc.host_pid);
         assert!(!sc.host_ipc);
+    }
+
+    #[tokio::test]
+    async fn staged_init_yields_reuses_sandbox_and_deletion_cleans_partial_start() {
+        let (rt,mgr)=manager();
+        let executor=crate::workload::Executor::new();
+        let mgr=mgr.with_admission(executor.reservations.clone());
+        let mut p=pod("staged","staged","Always",json!({"name":"app","image":"test"}));
+        p["spec"]["initContainers"]=json!([{"name":"init","image":"test"}]);
+        let result=tokio::time::timeout(std::time::Duration::from_millis(200),mgr.start_pod(&p)).await.unwrap();
+        assert!(matches!(result,Err(CriError::Pending(_))));
+        assert_eq!(rt.sandboxes.lock().unwrap().len(),1);
+        assert_eq!(rt.containers.lock().unwrap().len(),1);
+        let first=mgr.pods.read().await["staged"].clone();
+        let result=mgr.start_pod(&p).await;
+        assert!(matches!(result,Err(CriError::Pending(_))));
+        assert_eq!(mgr.pods.read().await["staged"].sandbox_id,first.sandbox_id);
+        assert_eq!(rt.containers.lock().unwrap().len(),1);
+        mgr.stop_pod("staged").await.unwrap();
+        assert!(rt.sandboxes.lock().unwrap().is_empty());
+        assert!(rt.containers.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn staged_init_completion_advances_to_app_without_restarting_init() {
+        let (rt,mgr)=manager();
+        let executor=crate::workload::Executor::new();
+        let mgr=mgr.with_admission(executor.reservations.clone());
+        let mut p=pod("staged-done","staged-done","Always",json!({"name":"app","image":"test"}));
+        p["spec"]["initContainers"]=json!([{"name":"init","image":"test"}]);
+        assert!(matches!(mgr.start_pod(&p).await,Err(CriError::Pending(_))));
+        let cid=mgr.pods.read().await["staged-done"].container_ids["init"].clone();
+        rt.set_container_state(&cid,ContainerState::Exited,0);
+        let result=mgr.start_pod(&p).await.unwrap();
+        assert_eq!(result.phase,"Running");
+        assert_eq!(result.init_container_statuses.len(),1);
+        assert_eq!(rt.sandboxes.lock().unwrap().len(),1);
+        assert_eq!(mgr.pods.read().await["staged-done"].container_ids.len(),1);
     }
 
     #[tokio::test]

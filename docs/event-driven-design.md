@@ -186,3 +186,10 @@ state even if the supervisor future is dropped. Pod start records the sandbox
 and each container before proceeding, so failed starts clean up before retry.
 Per-UID observation deadlines remain pending #101. This checkpoint is not yet
 validated or a claim of completion of the staged/cancellation acceptance matrix.
+
+Wait-state checkpoint: an init container still running leaves its sandbox and
+container recorded and yields for the next UID observation. Completion resumes
+startup without recreating the sandbox. VM shutdown sends the engine's grace
+request once and yields until QUERY confirms exit. Finalizer cleanup failures
+remain retryable. Deletion during a side effect waits for its completion before
+the UID's cleanup pass; the same-name successor remains admission-blocked.
