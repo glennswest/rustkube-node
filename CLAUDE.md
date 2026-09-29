@@ -75,25 +75,24 @@ work continues on main afterwards; no golden or release is requested here.
    changes documentation only after the verified main merge.
 
 
-### In progress: #101, events and explicit deadlines instead of sync ticks
+### Done: #101, events and explicit deadlines instead of sync ticks
 
-2026-09-29, on main. Remaining timers found: per-UID `Next::After(sync_interval)`
-for every active Pod/VMI; service mirror 15 s; system-claims mirror 30 s;
-reclaim 30 s; CSI sweep 30 s; VM maintenance (snapshots + orphan sweep) on
-sync_interval. Heartbeat stays periodic (it is the node lease). Plan:
-1. [ ] Pod adapter: per-probe deadlines (periodSeconds / initialDelaySeconds;
-   a probe not due keeps its last result), CrashLoopBackOff remaining, pending
-   start states as bounded retries; otherwise AwaitEvent (stormpump exits).
-   A runtime without exit events gets `sync_interval`, counted in a metric.
-2. [ ] VMI adapter: deadline only while something is pending (agent/addresses/
-   access not yet known, stopping); exits wake via the ring.
-3. [ ] Service mirror: inotify on /run/stormpump + mirror-pod watch.
-4. [ ] System claims + VM orphan sweep: stormblock's `/apis/storage.storm.io/v1/
-   volumes?watch=1` stream (fallback to a measured interval if absent) + PV/PVC
-   and VM/VMI watches.
-5. [ ] Reclaim: PV watch; CSI sweep: Pod watch + pending-retry deadlines;
-   snapshots: watch + take-completion wake + failureDeadline.
-6. [ ] Tests (progress without API edits or a global tick), docs, CHANGELOG, sc-build.
+2026-09-29, on main. Heartbeat is the only fixed schedule left.
+1. [x] Pod adapter deadlines (probe periods, CrashLoopBackOff, waiting retry,
+   init limit); AwaitEvent otherwise; CRI runtime without exits keeps
+   `sync_interval`, counted (`kubelet_timed_reconciles_total`). 4320c20.
+2. [x] VMI deadlines: start backoff, waiting retry, guest-agent poll. 4320c20.
+3. [x] Service mirror: inotify on /run/stormpump gated on the parsed table
+   (≤1 read/s while PID 1 rewrites every pass: filed stormpump#67) + mirror-pod
+   watch; skip-when-current writes. 08fc437.
+4. [x] stormblock volume watch (`follow_volumes`, 30 s counted poll without it)
+   → system claims + disk-owner sweep; PV/PVC and VM/VMI watches. 82f00c3.
+5. [x] Reclaim on PV watch (5 s pending retry); CSI sweep on node Pod watch
+   (10 s pending retry); snapshot take completions notify. 82f00c3.
+6. [x] Tests, docs, CHANGELOG. sc-build fbb9676 `cargo build --locked && cargo
+   test --locked`: 266 kubelet unit, 4 integration, 24 CNI, 17 proxy, 1 doc-test
+   pass (1 ignored). Not measured on a node (#102). Follow-up: #115 (route an
+   exit to its own UID instead of waking every workload).
 
 ### Done: #100 on main, VM partial-start unwind (stormpump#63 closed)
 
