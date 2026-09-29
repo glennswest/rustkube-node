@@ -37,6 +37,21 @@ not the release path.
 
 ## Work plan
 
+### In progress: documentation refresh from code (#54), 2026-09-29
+
+Scope: current main at 5bb1a38 and `git log --since=2026-09-18`.
+Work on docs/code-refresh-20260929; preserve turbomode separately, with no merge
+or golden from that experimental branch.
+
+1. [ ] Audit README, docs and current configuration/API/runtime code; distinguish
+   implementation from plans and live acceptance.
+2. [ ] Correct shipping instructions, add complete CLI/default/port references,
+   and link every unsupported promise to its owning issue (file missing ones).
+3. [ ] Update CHANGELOG; review for secrets; commit and push each logical unit.
+4. [ ] Validate the pushed documentation head with sc-build and document results.
+
+
+
 ### Done: #35, VMs reconciled against VMIs: deletion stops them, orphans found
 
 Found, 2026-09-27 (test2's QEMU outlived its VMI on C2NR0Q2): a VM outlives a kubelet restart (the engine

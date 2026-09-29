@@ -1,6 +1,10 @@
 # Changelog
 
 ## [Unreleased]
+
+### 2026-09-29
+- **docs:** Record the main-branch documentation audit plan (#54), keeping experimental turbomode work separate.
+
 <!-- New unreleased changes go here -->
 
 ### 2026-09-29 (a VM's disks outlive its VMI, #75)
