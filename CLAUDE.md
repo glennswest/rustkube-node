@@ -72,9 +72,13 @@ or golden from that experimental branch.
    one doc-test ignored. Remote exit 0 in 74 seconds; scratch drive deleted.
    The local runs.jsonl append failed (read-only filesystem); remote verification
    completed. All 26 CLI flags, 11 routes and local doc links were checked.
-5. [x] Documentation only: no version bump or runtime change. Fast-forward these
-   commits onto main; preserve turbomode. Request the standard stage golden
-   after pushing main, recording release tracking on #54.
+5. [x] Documentation only: no version bump or runtime change. Fast-forwarded
+   onto main at 9c1fe94; turbomode preserved. Requested the standard stage once.
+6. [ ] Artifact follow-up only: stage 131edf1ad026 failed before compilation
+   fetching private stormcos be718e09b5f2 (GitHub username unavailable).
+   Added evidence to stormcentral#161 and moved #54 behind it. No golden or
+   release request was produced. Documentation itself is published and verified;
+   resume the stage request after the platform authentication fix.
 
 
 
