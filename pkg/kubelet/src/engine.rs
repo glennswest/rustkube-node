@@ -248,8 +248,94 @@ impl EngineClient {
     }
 }
 
+/// stormblock's watch on its volumes (stormblock#80): newline-delimited
+/// `{type, object}` events for every volume change.
+pub const VOLUME_WATCH: &str = "/apis/storage.storm.io/v1/volumes?watch=1";
+
+/// How often an engine without the watch is asked instead (#101). Counted as
+/// a fallback, so a node running an older engine is visible in `/metrics`.
+pub const VOLUME_POLL: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl EngineClient {
+    /// Call `changed` whenever the engine's volumes change, for ever (#101).
+    ///
+    /// Follows [`VOLUME_WATCH`]. Once on every (re)connect, because what
+    /// changed while disconnected is not replayed, then once per event line.
+    /// A dropped stream reconnects with a backoff (1 s doubling to 30 s). An
+    /// engine that has no watch (404) is asked every [`VOLUME_POLL`] instead,
+    /// counted in `kubelet_timed_reconciles_total{worker="engine-volumes",
+    /// cause="fallback"}`.
+    pub async fn follow_volumes(&self, changed: impl Fn() + Send + Sync) {
+        let url = format!("{}{VOLUME_WATCH}", self.url());
+        let mut backoff = std::time::Duration::from_secs(1);
+        loop {
+            match self.get(&url).await {
+                Ok(r) if r.status() == StatusCode::NOT_FOUND => {
+                    crate::metrics::observe_timed("engine-volumes", "fallback");
+                    changed();
+                    tokio::time::sleep(VOLUME_POLL).await;
+                    continue;
+                }
+                Ok(mut r) if r.status().is_success() => {
+                    backoff = std::time::Duration::from_secs(1);
+                    changed();
+                    let mut partial = Vec::new();
+                    while let Ok(Some(chunk)) = r.chunk().await {
+                        partial.extend_from_slice(&chunk);
+                        let lines = partial.iter().filter(|b| **b == b'\n').count();
+                        if lines > 0 {
+                            // Everything up to the last newline is whole
+                            // events; any tail is the start of the next.
+                            let cut = partial.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+                            partial.drain(..cut);
+                            changed();
+                        }
+                    }
+                    tracing::debug!("stormblock volume watch ended; reconnecting");
+                }
+                Ok(r) => tracing::debug!("stormblock volume watch refused: {}", r.status()),
+                Err(e) => tracing::debug!("stormblock volume watch: {e}"),
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// Every event line is a change; a connect is one too, and the stream
+    /// ending reconnects (#101).
+    #[tokio::test]
+    async fn volume_events_are_followed_and_reconnected() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let app = axum::Router::new().route(
+            "/apis/storage.storm.io/v1/volumes",
+            axum::routing::get(|| async {
+                "{\"type\":\"ADDED\",\"object\":{}}\n{\"type\":\"MODIFIED\",\"object\":{}}\n"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let engine = EngineClient::new(&url, TokenSource::none());
+        let seen = Arc::new(AtomicUsize::new(0));
+        let s = seen.clone();
+        let follow = tokio::spawn(async move {
+            engine.follow_volumes(move || { s.fetch_add(1, Ordering::SeqCst); }).await
+        });
+        // Connect + the events, then again after the reconnect (1 s).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while seen.load(Ordering::SeqCst) < 3 {
+            assert!(tokio::time::Instant::now() < deadline, "saw {}", seen.load(Ordering::SeqCst));
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let first = seen.load(Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(seen.load(Ordering::SeqCst) > first, "reconnected after the stream ended");
+        follow.abort();
+    }
     use super::*;
     use std::sync::atomic::AtomicUsize;
 

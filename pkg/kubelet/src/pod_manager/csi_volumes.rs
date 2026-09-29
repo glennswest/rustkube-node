@@ -507,22 +507,31 @@ impl PodManager {
     /// finished. The second is what keeps this away from a pod half-way
     /// through its start, which is not in the manager yet. If the apiserver
     /// cannot be asked, nothing is touched.
-    pub async fn sweep_csi_volumes(&self) {
+    ///
+    /// `true` when a gone pod's teardown is still pending after this pass:
+    /// the caller retries it on a deadline (#101). Unreadable records or an
+    /// unreadable Pod list are reported to the reactor, which retries.
+    pub async fn sweep_csi_volumes(&self) -> bool {
         let Ok(records) = csi_records_checked(&self.state_root) else {
-            return;
+            apimachinery::reactor::failed();
+            return false;
         };
         let uids: std::collections::BTreeSet<String> =
             records.into_iter().map(|(uid, _)| uid).collect();
         if uids.is_empty() {
-            return;
+            return false;
         }
         let Ok(pods) = apimachinery::reflector::list(
             &self.api_client,
-            &format!("{}/api/v1/pods", self.api_url),
+            &format!(
+                "{}/api/v1/pods?fieldSelector=spec.nodeName%3D{}",
+                self.api_url, self.node_name
+            ),
         )
         .await
         else {
-            return;
+            apimachinery::reactor::failed();
+            return false;
         };
         let live: std::collections::HashSet<&str> = pods["items"]
             .as_array()
@@ -538,11 +547,18 @@ impl PodManager {
             })
             .filter_map(|p| p["metadata"]["uid"].as_str())
             .collect();
+        let mut gone = Vec::new();
         for uid in uids {
             if live.contains(uid.as_str()) || self.pods.read().await.contains_key(&uid) {
                 continue;
             }
             self.teardown_csi_volumes(&uid).await;
+            gone.push(uid);
+        }
+        // A record left for a pod that is gone is a teardown still to do.
+        match csi_records_checked(&self.state_root) {
+            Ok(left) => left.iter().any(|(uid, _)| gone.contains(uid)),
+            Err(_) => true,
         }
     }
 }

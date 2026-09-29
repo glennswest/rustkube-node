@@ -153,6 +153,9 @@ pub struct Snapshots {
     in_flight: Mutex<HashSet<String>>,
     /// Said once: a cluster without the CRDs is ordinary (stormcos#170).
     absent_said: std::sync::atomic::AtomicBool,
+    /// Told when a take finishes (#101): its status write is an API event
+    /// too, but one that failed is not, and the next pass must still run.
+    completed: Arc<tokio::sync::Notify>,
 }
 
 impl Snapshots {
@@ -175,7 +178,13 @@ impl Snapshots {
             events,
             in_flight: Mutex::new(HashSet::new()),
             absent_said: std::sync::atomic::AtomicBool::new(false),
+            completed: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Notified each time a take finishes (#101).
+    pub fn completions(&self) -> Arc<tokio::sync::Notify> {
+        self.completed.clone()
     }
 
     /// One pass over every snapshot in the cluster.
@@ -223,6 +232,7 @@ impl Snapshots {
             Ok(r) => r,
             Err(e) => {
                 debug!("virtualmachinesnapshots not listed: {e}");
+                apimachinery::reactor::failed();
                 return None;
             }
         };
@@ -234,6 +244,7 @@ impl Snapshots {
         }
         if !r.status().is_success() {
             debug!("virtualmachinesnapshots not listed: {}", r.status());
+            apimachinery::reactor::failed();
             return None;
         }
         let list: Value = r.json().await.ok()?;
@@ -264,6 +275,8 @@ impl Snapshots {
             }
             Err(e) => {
                 debug!("{ns}/{name}: snapshot not claimed: {e}");
+                // Not an answer: no event will follow, so the pass retries.
+                apimachinery::reactor::failed();
                 false
             }
         }
@@ -289,6 +302,7 @@ impl Snapshots {
             let taken = (me.take)(reg, name.to_string()).await;
             me.finish(&obj, source_uid, taken).await;
             me.in_flight.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+            me.completed.notify_one();
         });
     }
 

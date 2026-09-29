@@ -1167,10 +1167,16 @@ impl PodManager {
     /// leave them `Released` with a warning for ever (rustkube#71).
     ///
     /// Never a system volume: those are Retain, and carry the system label.
-    pub async fn reclaim_released(&self) {
+    ///
+    /// `true` when a reclaim is still pending (the claim is in use here, or a
+    /// delete was refused): the caller looks again shortly (#101). An
+    /// unreadable PV list is reported to the reactor, which retries.
+    pub async fn reclaim_released(&self) -> bool {
         let Some(pvs) = self.api_get("/api/v1/persistentvolumes").await else {
-            return;
+            apimachinery::reactor::failed();
+            return false;
         };
+        let mut pending = false;
         for pv in pvs["items"].as_array().cloned().unwrap_or_default() {
             if pv["spec"]["csi"]["driver"].as_str() != Some("stormblock.storm.io")
                 || pv["status"]["phase"].as_str() != Some("Released")
@@ -1217,14 +1223,17 @@ impl PodManager {
                         Ok(r) if r.status().is_success() || r.status().as_u16() == 404 => {
                             info!("reclaimed {pv_name}: the volume for {ns}/{claim} is deleted")
                         }
-                        Ok(r) => debug!("PV {pv_name} not deleted: {}", r.status()),
-                        Err(e) => debug!("PV {pv_name} not deleted: {e}"),
+                        // A changed PV is a watch event of its own.
+                        Ok(r) if r.status().as_u16() == 409 => {}
+                        Ok(r) => { pending = true; debug!("PV {pv_name} not deleted: {}", r.status()) }
+                        Err(e) => { pending = true; debug!("PV {pv_name} not deleted: {e}") }
                     }
                 }
-                Ok(other) => debug!("PV {pv_name} not reclaimed yet: {other:?}"),
-                Err(e) => debug!("PV {pv_name} not reclaimed: {e}"),
+                Ok(other) => { pending = true; debug!("PV {pv_name} not reclaimed yet: {other:?}") }
+                Err(e) => { pending = true; debug!("PV {pv_name} not reclaimed: {e}") }
             }
         }
+        pending
     }
 
     /// Delete the stormblock clone behind a claim, so a `Delete` reclaim

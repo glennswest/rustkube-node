@@ -2452,14 +2452,21 @@ impl VmManager {
     ///
     /// Only volumes this kubelet gave an owner to, not in use, and not held
     /// by a machine it knows. An owner that cannot be read keeps its disks.
-    pub(crate) async fn sweep_orphans(&self) {
+    ///
+    /// Run on events (an owner going, a volume let go) and at most once per
+    /// [`SWEEP_EVERY`]. `Some(wait)` is when to come back without one (#101):
+    /// the rest of the floor after an event it absorbed, or a retry when an
+    /// owner could not be asked or a delete was not confirmed.
+    pub(crate) async fn sweep_orphans(&self) -> Option<std::time::Duration> {
         if self.api_url.is_empty() {
-            return;
+            return None;
         }
         {
             let mut swept = self.swept.lock().unwrap_or_else(|e| e.into_inner());
-            if swept.is_some_and(|t| t.elapsed() < SWEEP_EVERY) {
-                return;
+            if let Some(t) = *swept {
+                if t.elapsed() < SWEEP_EVERY {
+                    return Some(SWEEP_EVERY - t.elapsed());
+                }
             }
             *swept = Some(std::time::Instant::now());
         }
@@ -2468,9 +2475,11 @@ impl VmManager {
             Ok(v) => v,
             Err(e) => {
                 tracing::debug!("orphan sweep skipped: {e}");
-                return;
+                apimachinery::reactor::failed();
+                return None;
             }
         };
+        let mut again = None;
         let held: std::collections::HashSet<String> = {
             let vms = self.vms.lock().await;
             vms.values().flat_map(|v| v.disks.iter().filter_map(|d| d.volume_id.clone())).collect()
@@ -2487,7 +2496,10 @@ impl VmManager {
                     let status = r.status().as_u16();
                     (status, r.json::<Value>().await.ok())
                 }
-                Err(_) => continue,
+                Err(_) => {
+                    again = Some(SWEEP_EVERY);
+                    continue;
+                }
             };
             if !owner_gone(status, obj.as_ref(), owner) {
                 continue;
@@ -2498,7 +2510,11 @@ impl VmManager {
                   owner["namespace"].as_str().unwrap_or(""),
                   owner["name"].as_str().unwrap_or(""));
             self.delete_volumes(owner["name"].as_str().unwrap_or(""), &[id.to_string()]).await;
+            // Confirmed by the engine's volume watch; if it was refused, the
+            // volume is still there for the next sweep.
+            again = Some(SWEEP_EVERY);
         }
+        again
     }
 
     /// Best effort: a start that has already gone wrong must not be made worse

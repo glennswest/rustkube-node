@@ -120,6 +120,9 @@ pub struct Kubelet {
     workloads: Arc<Executor>,
     pods_synced: AtomicBool,
     vmis_synced: AtomicBool,
+    /// Moves whenever stormblock's volumes change (#101): the claims mirror
+    /// and the VM disk-owner sweep follow it instead of a clock.
+    engine_volumes: tokio::sync::watch::Sender<u64>,
 }
 
 impl Kubelet {
@@ -183,6 +186,7 @@ impl Kubelet {
             workloads,
             pods_synced: AtomicBool::new(false),
             vmis_synced: AtomicBool::new(false),
+            engine_volumes: tokio::sync::watch::channel(0).0,
             csi,
         })
     }
@@ -338,48 +342,29 @@ impl Kubelet {
         // table changes, and when a mirror pod is edited or deleted (#101).
         tokio::spawn(self.clone().service_mirror_loop());
 
-        // List the node's own data containers as PVCs (rustkube-node#49): the
-        // same slow cadence as the services mirror, for the same reason.
+        // stormblock's volume changes, for the workers below (#101).
         {
-            let url = self.config.api_server_url.clone();
-            let node = self.config.node_name.clone();
-            let client = self.api_client.clone();
             let engine = self.config.engine.clone();
+            let changes = self.engine_volumes.clone();
             tokio::spawn(async move {
-                let mut interval = time::interval(Duration::from_secs(30));
-                loop {
-                    interval.tick().await;
-                    crate::system_claims::mirror(&client, &url, &engine, &node).await;
-                }
+                engine.follow_volumes(move || changes.send_modify(|v| *v = v.wrapping_add(1))).await
             });
         }
 
-        // Reclaim this node's released claims (reclaimPolicy: Delete).
-        {
-            let pm = self.pod_manager.clone();
-            tokio::spawn(async move {
-                let mut interval = time::interval(Duration::from_secs(30));
-                loop {
-                    interval.tick().await;
-                    pm.reclaim_released().await;
-                }
-            });
-        }
+        // List the node's own data containers as PVCs (rustkube-node#49), on
+        // engine volume and PV/PVC events (#101).
+        tokio::spawn(self.clone().system_claims_loop());
+
+        // Reclaim this node's released claims (reclaimPolicy: Delete), on PV
+        // events (#101).
+        tokio::spawn(self.clone().reclaim_loop());
 
         // External CSI drivers (#52): register what appears in
         // plugins_registry, and undo the volumes of pods that are gone
-        // (deleted while the kubelet was down, or a teardown due a retry).
+        // (deleted while the kubelet was down, or a teardown due a retry),
+        // on Pod events and pending-teardown deadlines (#101).
         tokio::spawn(self.csi.clone().run());
-        {
-            let pm = self.pod_manager.clone();
-            tokio::spawn(async move {
-                let mut interval = time::interval(Duration::from_secs(30));
-                loop {
-                    interval.tick().await;
-                    pm.sweep_csi_volumes().await;
-                }
-            });
-        }
+        tokio::spawn(self.clone().csi_sweep_loop());
 
         if let Some(vms) = &self.vms {
             vms.spawn_address_pump();
@@ -433,24 +418,99 @@ impl Kubelet {
         }
     }
 
-    // Keep main's snapshot and owner-sweep services independent of UID work.
-    // Snapshot watches wake promptly; the deadline retains completion/recovery
-    // and disk-owner checks until #101 supplies all dependency events.
+    // Snapshots and the VM disk-owner sweep, independent of UID work, on
+    // events only (#101): snapshot watches and take completions; VM/VMI
+    // watches (an owner going) and engine volume changes (a disk let go).
     async fn vm_maintenance_loop(&self) -> anyhow::Result<()> {
         let Some(vms) = &self.vms else { return std::future::pending().await; };
         let worker = self.watches.worker("kubelet-vm-maintenance");
-        let mut deadline = time::interval(self.config.sync_interval.max(Duration::from_millis(100)));
+        let completed = self.snapshots.as_ref().map(|s| s.completions());
+        let mut volumes = Some(self.engine_volumes.subscribe());
+        let api = &self.config.api_server_url;
         loop {
             let work = tokio::select! {
-                work = worker.next() => Some(work),
-                _ = deadline.tick() => None,
+                work = worker.next() => work,
+                _ = notified(&completed) => { worker.enqueue(); continue; },
+                _ = runtime_changed(&mut volumes) => { worker.enqueue(); continue; },
             };
             worker.run(async {
-                self.watches.observe(&self.api_client, format!(
-                    "{}/apis/snapshot.kubevirt.io/v1beta1/virtualmachinesnapshots",
-                    self.config.api_server_url));
+                if !api.is_empty() {
+                    for path in [
+                        "/apis/snapshot.kubevirt.io/v1beta1/virtualmachinesnapshots",
+                        "/apis/kubevirt.io/v1/virtualmachines",
+                        "/apis/kubevirt.io/v1/virtualmachineinstances",
+                    ] {
+                        self.watches.observe(&self.api_client, format!("{api}{path}"));
+                    }
+                }
                 if let Some(snapshots) = &self.snapshots { snapshots.sync().await; }
-                vms.sweep_orphans().await;
+                if let Some(after) = vms.sweep_orphans().await {
+                    apimachinery::reactor::requeue_after(after);
+                }
+            }).await;
+            drop(work);
+        }
+    }
+
+    /// The node's volumes as PVs and PVCs (#49), on engine volume changes and
+    /// PV/PVC events (#101). The mirror writes only what differs, so its own
+    /// writes settle after a pass.
+    async fn system_claims_loop(self: Arc<Self>) {
+        let worker = self.watches.worker("kubelet-system-claims");
+        let mut volumes = Some(self.engine_volumes.subscribe());
+        let api = self.config.api_server_url.clone();
+        loop {
+            let work = tokio::select! {
+                work = worker.next() => work,
+                _ = runtime_changed(&mut volumes) => { worker.enqueue(); continue; },
+            };
+            worker.run(async {
+                if !api.is_empty() {
+                    self.watches.observe(&self.api_client, format!(
+                        "{api}/api/v1/namespaces/{}/persistentvolumeclaims", crate::system_claims::NAMESPACE));
+                    self.watches.observe(&self.api_client, format!("{api}/api/v1/persistentvolumes"));
+                }
+                crate::system_claims::mirror(&self.api_client, &api, &self.config.engine, &self.config.node_name).await;
+            }).await;
+            drop(work);
+        }
+    }
+
+    /// `reclaimPolicy: Delete` for this node's released claims, on PV events
+    /// (#101). A claim still in use here is looked at again shortly: the pod
+    /// holding it going is local, not an API change.
+    async fn reclaim_loop(self: Arc<Self>) {
+        let worker = self.watches.worker("kubelet-reclaim");
+        let api = self.config.api_server_url.clone();
+        loop {
+            let work = worker.next().await;
+            worker.run(async {
+                if api.is_empty() { return; }
+                self.watches.observe(&self.api_client, format!("{api}/api/v1/persistentvolumes"));
+                if self.pod_manager.reclaim_released().await {
+                    crate::metrics::observe_timed("reclaim", "deadline");
+                    apimachinery::reactor::requeue_after(RECLAIM_PENDING);
+                }
+            }).await;
+            drop(work);
+        }
+    }
+
+    /// External CSI volumes of pods that are gone, on this node's Pod events
+    /// (#101); a teardown that failed is retried on a deadline.
+    async fn csi_sweep_loop(self: Arc<Self>) {
+        let worker = self.watches.worker("kubelet-csi-sweep");
+        let api = self.config.api_server_url.clone();
+        loop {
+            let work = worker.next().await;
+            worker.run(async {
+                if api.is_empty() { return; }
+                self.watches.observe(&self.api_client, format!(
+                    "{api}/api/v1/pods?fieldSelector=spec.nodeName%3D{}", self.config.node_name));
+                if self.pod_manager.sweep_csi_volumes().await {
+                    crate::metrics::observe_timed("csi-sweep", "deadline");
+                    apimachinery::reactor::requeue_after(CSI_TEARDOWN_PENDING);
+                }
             }).await;
             drop(work);
         }
@@ -1283,6 +1343,20 @@ impl Kubelet {
             }
             None => Next::AwaitEvent,
         }
+    }
+}
+
+/// A claim still mounted here, or a stormblock that refused, is looked at
+/// again after this (#101).
+const RECLAIM_PENDING: Duration = Duration::from_secs(5);
+/// A CSI teardown that did not complete is retried after this (#101).
+const CSI_TEARDOWN_PENDING: Duration = Duration::from_secs(10);
+
+/// A notification, or never when there is nothing to be notified by.
+async fn notified(notify: &Option<Arc<tokio::sync::Notify>>) {
+    match notify {
+        Some(n) => n.notified().await,
+        None => std::future::pending().await,
     }
 }
 

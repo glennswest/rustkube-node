@@ -414,12 +414,14 @@ pub async fn mirror(
     if api_url.is_empty() {
         return;
     }
+    // Failures are reported to the reactor, which retries the pass (#101):
+    // nothing else would bring it back.
     let vols: Value = match engine.get(&format!("{}/api/v1/volumes", engine.url())).await {
         Ok(r) if r.status().is_success() => match r.json().await {
             Ok(v) => v,
-            Err(_) => return,
+            Err(_) => return apimachinery::reactor::failed(),
         },
-        _ => return,
+        _ => return apimachinery::reactor::failed(),
     };
     let items = vols["items"].as_array().cloned().unwrap_or_default();
     let names: HashMap<String, String> = items
@@ -447,8 +449,8 @@ pub async fn mirror(
     // volume.
     let pvc_base = format!("{api_url}/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims");
     let pv_base = format!("{api_url}/api/v1/persistentvolumes");
-    let Some(pvcs) = get_json(client, &pvc_base).await.map(|l| by_name(&l)) else { return };
-    let Some(pvs) = get_json(client, &pv_base).await.map(|l| by_name(&l)) else { return };
+    let Some(pvcs) = get_json(client, &pvc_base).await.map(|l| by_name(&l)) else { return apimachinery::reactor::failed() };
+    let Some(pvs) = get_json(client, &pv_base).await.map(|l| by_name(&l)) else { return apimachinery::reactor::failed() };
 
     for (f, kind, component) in &mirrored {
         let (want_pv, want_pvc) = objects(f, kind, component, node);
