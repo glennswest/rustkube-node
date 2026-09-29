@@ -3445,35 +3445,41 @@ impl PodManager {
 
     /// Stop and remove a pod.
     pub async fn stop_pod(&self, uid: &str) -> Result<(), CriError> {
-        // The pod is going; its backoff goes with it, or a node that churns
-        // pods keeps an entry per container for as long as it runs.
-        self.backoff.forget_pod(uid);
-        let state = {
-            let mut pods = self.pods.write().await;
-            pods.remove(uid)
-        };
-
-        if let Some(state) = state {
-            // Stop containers
-            for (name, cid) in &state.container_ids {
-                info!("Stopping container {name} ({cid})");
-                let _ = self.runtime.stop_container(cid, 30).await;
-                let _ = self.runtime.remove_container(cid).await;
-            }
-
-            // Remove sandbox
-            if let Some(sandbox_id) = &state.sandbox_id {
-                info!("Removing sandbox {sandbox_id}");
-                let _ = self.runtime.stop_pod_sandbox(sandbox_id).await;
-                let _ = self.runtime.remove_pod_sandbox(sandbox_id).await;
+        fn stopped(result: Result<(), CriError>) -> Result<(), CriError> {
+            match result {
+                Err(CriError::NotFound(_)) => Ok(()),
+                result => result,
             }
         }
-
-        // Its CSI volumes, now that nothing binds them. From the records on
-        // disk rather than `state`, so a pod adopted after a restart is
-        // covered. Whatever cannot be undone now is retried by the sweep.
-        self.teardown_csi_volumes(uid).await;
-
+        // Retain the record through every await. Cancellation or RPC failure
+        // must leave enough state to retry rather than forgetting a live Pod.
+        let state = self.pods.read().await.get(uid).cloned();
+        if let Some(state) = state {
+            for (name, cid) in &state.container_ids {
+                info!("Stopping container {name} ({cid})");
+                stopped(self.runtime.stop_container(cid, 30).await)?;
+                stopped(self.runtime.remove_container(cid).await)?;
+            }
+            if let Some(sandbox) = &state.sandbox_id {
+                stopped(self.runtime.stop_pod_sandbox(sandbox).await)?;
+                stopped(self.runtime.remove_pod_sandbox(sandbox).await)?;
+            }
+        }
+        if !self.teardown_csi_volumes(uid).await {
+            return Err(CriError::VolumeNotReady(
+                "Pod volume cleanup is still pending".into(),
+            ));
+        }
+        self.pods.write().await.remove(uid);
+        self.backoff.forget_pod(uid);
+        self.first_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(uid);
+        self.waiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(uid);
         Ok(())
     }
 }
@@ -4274,6 +4280,7 @@ pub(crate) mod tests {
         last_container_config: Mutex<Option<ContainerConfig>>,
         removed_sandboxes: Mutex<Vec<String>>,
         removed_containers: Mutex<Vec<String>>,
+        fail_stop: AtomicBool,
     }
 
     impl FakeRuntime {
@@ -4426,6 +4433,9 @@ pub(crate) mod tests {
         }
 
         async fn stop_container(&self, container_id: &str, _timeout: i64) -> Result<(), CriError> {
+            if self.fail_stop.load(Ordering::SeqCst) {
+                return Err(CriError::Connection("injected outage".into()));
+            }
             if let Some(c) = self.containers.lock().unwrap().get_mut(container_id) {
                 c.state = ContainerState::Exited;
             }
@@ -5422,6 +5432,21 @@ pub(crate) mod tests {
     fn base64_decode_roundtrip() {
         // "hunter2" base64 == "aHVudGVyMg=="
         assert_eq!(base64_decode("aHVudGVyMg==").unwrap(), b"hunter2");
+    }
+
+    #[tokio::test]
+    async fn failed_stop_keeps_runtime_and_local_record_for_retry() {
+        let (rt, mgr) = manager();
+        mgr.sync_pods(&[pod("uid-stop", "web", "Always", simple_container())])
+            .await;
+        rt.fail_stop.store(true, Ordering::SeqCst);
+        assert!(mgr.stop_pod("uid-stop").await.is_err());
+        assert!(mgr.pods.read().await.contains_key("uid-stop"));
+        assert_eq!(rt.live_sandbox_count(), 1);
+        rt.fail_stop.store(false, Ordering::SeqCst);
+        mgr.stop_pod("uid-stop").await.unwrap();
+        assert!(!mgr.pods.read().await.contains_key("uid-stop"));
+        assert_eq!(rt.live_sandbox_count(), 0);
     }
 
     #[tokio::test]

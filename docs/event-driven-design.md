@@ -56,7 +56,12 @@ Sources of local changes:
 * Heartbeat, graceful shutdown, restart backoff and request timeout are real
   deadlines. Service/volume mirrors should follow engine state changes.
 
-Run Pod and VM workers independently. Coalesce status publication by UID and
+Use one workload queue and worker framework for Pods and VMIs. Runtime adapters
+implement their different lifecycle operations; admission, dependency indexes,
+volume reservations, retries, cancellation and status delivery are shared.
+Key work by (kind, namespace, name, UID), with one active worker per key and
+bounded concurrency across both kinds. A slow workload must not delay an
+unrelated workload of either kind. Coalesce status publication by UID and
 avoid unchanged writes; preserve resourceVersion and conflict retries. A
 slow pull or a VM's 30-second graceful shutdown must not delay another Pod.
 The compatibility step wakes current reconcile passes from events and fixes
@@ -152,3 +157,8 @@ CSI registration migration: socket-directory notifications now drive scans;
 registration/publication failures get retry deadlines, and successful local
 registration immediately wakes Pod reconciliation. Cleanup and mirrors remain
 separate pending work. No runtime validation has run yet.
+
+Owner clarification (2026-09-29): keep Pods and VMs as close as possible. The
+existing separate loops are a temporary adapter, not the target design. Both
+will use a common executor and admission/reservation table, with runtime-specific
+operations behind adapters.

@@ -41,3 +41,5 @@ pub use runtime::{NativeRuntime, NativeImageService};
 pub use vm_runtime::{VmRuntime, VmConfig, VmmBackend};
 
 mod fs_watch;
+
+pub mod workload;

@@ -56,8 +56,12 @@ impl PodManager {
     /// `None` for an unbound claim, for the built-in class, and for a PV that
     /// is not CSI. Those go the way they always went.
     pub(super) async fn external_csi_pv(&self, pvc: &Value) -> Option<Value> {
-        let pv_name = pvc["spec"]["volumeName"].as_str().filter(|v| !v.is_empty())?;
-        let pv = self.api_get(&format!("/api/v1/persistentvolumes/{pv_name}")).await?;
+        let pv_name = pvc["spec"]["volumeName"]
+            .as_str()
+            .filter(|v| !v.is_empty())?;
+        let pv = self
+            .api_get(&format!("/api/v1/persistentvolumes/{pv_name}"))
+            .await?;
         let driver = pv["spec"]["csi"]["driver"].as_str()?;
         (driver != BUILTIN_DRIVER).then_some(pv)
     }
@@ -80,14 +84,23 @@ impl PodManager {
     /// A Secret's data, for a `*SecretRef`. An absent ref is no secrets; a
     /// ref to a Secret that cannot be read is an error, because a driver
     /// called without its credentials fails in a way that names neither.
-    async fn csi_secrets(&self, r: &Value, default_ns: &str) -> Result<HashMap<String, String>, ClaimError> {
+    async fn csi_secrets(
+        &self,
+        r: &Value,
+        default_ns: &str,
+    ) -> Result<HashMap<String, String>, ClaimError> {
         let Some(name) = r["name"].as_str().filter(|n| !n.is_empty()) else {
             return Ok(HashMap::new());
         };
-        let ns = r["namespace"].as_str().filter(|n| !n.is_empty()).unwrap_or(default_ns);
-        self.fetch_secret_decoded(ns, name)
-            .await
-            .ok_or_else(|| ClaimError::Failed(format!("secret {ns}/{name} for the CSI driver cannot be read")))
+        let ns = r["namespace"]
+            .as_str()
+            .filter(|n| !n.is_empty())
+            .unwrap_or(default_ns);
+        self.fetch_secret_decoded(ns, name).await.ok_or_else(|| {
+            ClaimError::Failed(format!(
+                "secret {ns}/{name} for the CSI driver cannot be read"
+            ))
+        })
     }
 
     /// Mount a claim bound to an external driver's PV: wait for the attach,
@@ -109,7 +122,9 @@ impl PodManager {
         let handle = src["volumeHandle"].as_str().unwrap_or("");
         let pv_name = pv["metadata"]["name"].as_str().unwrap_or("");
         if handle.is_empty() {
-            return Err(ClaimError::Failed(format!("PV {pv_name} has no csi.volumeHandle")));
+            return Err(ClaimError::Failed(format!(
+                "PV {pv_name} has no csi.volumeHandle"
+            )));
         }
         if pv["spec"]["volumeMode"].as_str() == Some("Block") {
             return Err(ClaimError::NotOurs(format!(
@@ -145,7 +160,9 @@ impl PodManager {
         if policy.attach_required {
             let va_name = csi::attachment_name(handle, driver, &self.node_name);
             let va = self
-                .api_get(&format!("/apis/storage.k8s.io/v1/volumeattachments/{va_name}"))
+                .api_get(&format!(
+                    "/apis/storage.k8s.io/v1/volumeattachments/{va_name}"
+                ))
                 .await
                 .ok_or_else(|| {
                     ClaimError::Failed(format!(
@@ -159,7 +176,9 @@ impl PodManager {
                     .as_str()
                     .map(|m| format!(": {m}"))
                     .unwrap_or_else(|| ": the driver's attacher has not attached it yet".into());
-                return Err(ClaimError::Failed(format!("waiting for VolumeAttachment {va_name}{why}")));
+                return Err(ClaimError::Failed(format!(
+                    "waiting for VolumeAttachment {va_name}{why}"
+                )));
             }
             if let Some(m) = va["status"]["attachmentMetadata"].as_object() {
                 for (k, v) in m {
@@ -172,25 +191,39 @@ impl PodManager {
 
         let mut volume_context: HashMap<String, String> = src["volumeAttributes"]
             .as_object()
-            .map(|m| m.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                    .collect()
+            })
             .unwrap_or_default();
         if policy.pod_info_on_mount {
             volume_context.extend(pod_info(pod, false));
         }
-        let first_mode = pv["spec"]["accessModes"][0].as_str().unwrap_or("ReadWriteOnce");
+        let first_mode = pv["spec"]["accessModes"][0]
+            .as_str()
+            .unwrap_or("ReadWriteOnce");
         let spec = VolumeSpec {
             volume_id: handle.to_string(),
             fs_type: src["fsType"].as_str().unwrap_or("").to_string(),
             mount_flags: pv["spec"]["mountOptions"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|o| o.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|o| o.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default(),
             access_mode: csi::access_mode(first_mode, reg.caps) as i32,
             readonly: readonly || src["readOnly"].as_bool().unwrap_or(false),
             volume_context,
             publish_context,
-            stage_secrets: self.csi_secrets(&src["nodeStageSecretRef"], namespace).await?,
-            publish_secrets: self.csi_secrets(&src["nodePublishSecretRef"], namespace).await?,
+            stage_secrets: self
+                .csi_secrets(&src["nodeStageSecretRef"], namespace)
+                .await?,
+            publish_secrets: self
+                .csi_secrets(&src["nodePublishSecretRef"], namespace)
+                .await?,
         };
         let staging = reg
             .caps
@@ -209,14 +242,20 @@ impl PodManager {
 
     /// Mount an inline `csi:` volume: a volume that lives and dies with the
     /// pod, published without stage or attach, as upstream does.
-    pub(super) async fn mount_csi_inline(&self, pod: &Value, vol: &Value) -> Result<String, ClaimError> {
+    pub(super) async fn mount_csi_inline(
+        &self,
+        pod: &Value,
+        vol: &Value,
+    ) -> Result<String, ClaimError> {
         let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default");
         let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
         let vol_name = vol["name"].as_str().unwrap_or("");
         let src = &vol["csi"];
         let driver = src["driver"].as_str().unwrap_or("");
         let reg = self.csi.get(driver).await.ok_or_else(|| {
-            ClaimError::Failed(format!("CSI driver {driver} is not registered on this node"))
+            ClaimError::Failed(format!(
+                "CSI driver {driver} is not registered on this node"
+            ))
         })?;
         let policy = self.driver_policy(driver).await;
         if !policy.ephemeral_allowed {
@@ -227,7 +266,11 @@ impl PodManager {
         }
         let mut volume_context: HashMap<String, String> = src["volumeAttributes"]
             .as_object()
-            .map(|m| m.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                    .collect()
+            })
             .unwrap_or_default();
         // Upstream always says "ephemeral" for an inline volume, and adds the
         // pod's identity when the driver asks for it.
@@ -247,7 +290,9 @@ impl PodManager {
             volume_context,
             publish_context: HashMap::new(),
             stage_secrets: HashMap::new(),
-            publish_secrets: self.csi_secrets(&src["nodePublishSecretRef"], namespace).await?,
+            publish_secrets: self
+                .csi_secrets(&src["nodePublishSecretRef"], namespace)
+                .await?,
         };
         let data = VolData {
             driver_name: driver.to_string(),
@@ -270,7 +315,10 @@ impl PodManager {
         data: &VolData,
     ) -> Result<String, ClaimError> {
         let target = csi::publish_path(&self.state_root, uid, vol_name);
-        let dir = Path::new(&target).parent().map(Path::to_path_buf).unwrap_or_default();
+        let dir = Path::new(&target)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
         // The record first, so a publish that happens and is then forgotten
         // (the kubelet dies before the pod starts) is still undone.
         std::fs::create_dir_all(&dir)
@@ -323,25 +371,63 @@ impl PodManager {
     /// is not registered right now, or that the driver refuses to unpublish,
     /// keeps its record and is retried by [`Self::sweep_csi_volumes`].
     pub async fn teardown_csi_volumes(&self, uid: &str) -> bool {
-        let base = PathBuf::from(&self.state_root).join("pods").join(uid).join("volumes/kubernetes.io~csi");
-        let Ok(rd) = std::fs::read_dir(&base) else { return true };
+        let base = PathBuf::from(&self.state_root)
+            .join("pods")
+            .join(uid)
+            .join("volumes/kubernetes.io~csi");
+        let rd = match std::fs::read_dir(&base) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(e) => {
+                warn!("cannot inspect CSI teardown {}: {e}", base.display());
+                return false;
+            }
+        };
         let mut clean = true;
-        for entry in rd.flatten() {
+        for entry in rd {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    warn!("CSI directory entry: {e}");
+                    clean = false;
+                    continue;
+                }
+            };
             let dir = entry.path();
-            let Some(data) = read_vol_data(&dir) else {
+            let data = match read_vol_data_checked(&dir) {
+                Ok(data) => data,
+                Err(e) => {
+                    warn!("cannot read CSI record {}: {e}", dir.display());
+                    clean = false;
+                    continue;
+                }
+            };
+            let Some(data) = data else {
                 // No record means nothing was ever asked of a driver here.
-                let _ = std::fs::remove_dir(dir.join("mount"));
-                let _ = std::fs::remove_dir(&dir);
+                for path in [dir.join("mount"), dir.clone()] {
+                    if let Err(e) = std::fs::remove_dir(&path) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            clean = false;
+                        }
+                    }
+                }
                 continue;
             };
             let Some(reg) = self.csi.get(&data.driver_name).await else {
-                debug!("CSI {}: not registered, {} stays published for now", data.driver_name, dir.display());
+                debug!(
+                    "CSI {}: not registered, {} stays published for now",
+                    data.driver_name,
+                    dir.display()
+                );
                 clean = false;
                 continue;
             };
             let target = dir.join("mount").to_string_lossy().into_owned();
             if let Err(e) = reg.client.unpublish(&data.volume_handle, &target).await {
-                warn!("CSI {}: unpublish of {target} failed, will retry: {e:#}", data.driver_name);
+                warn!(
+                    "CSI {}: unpublish of {target} failed, will retry: {e:#}",
+                    data.driver_name
+                );
                 clean = false;
                 continue;
             }
@@ -349,38 +435,60 @@ impl PodManager {
             // still mounted is not empty, and remove_dir refuses it rather than
             // deleting what is in the volume.
             if std::fs::remove_dir(&target).is_err() && Path::new(&target).exists() {
-                warn!("CSI {}: {target} is not empty after unpublish; left in place", data.driver_name);
+                warn!(
+                    "CSI {}: {target} is not empty after unpublish; left in place",
+                    data.driver_name
+                );
                 clean = false;
                 continue;
             }
-            let _ = std::fs::remove_file(dir.join("vol_data.json"));
-            let _ = std::fs::remove_dir(&dir);
-            info!("CSI {} volume {} unpublished from pod {uid}", data.driver_name, data.volume_handle);
-
             if let Some(staging) = &data.staging_path {
-                if self.csi_volume_in_use(&data.driver_name, &data.volume_handle) {
-                    continue;
-                }
-                match reg.client.unstage(&data.volume_handle, staging).await {
-                    Ok(()) => info!("CSI {} volume {} unstaged", data.driver_name, data.volume_handle),
-                    // Not retried from here: the record that would drive a
-                    // retry is gone. The driver treats a later NodeStage as
-                    // idempotent, so a volume left staged is untidy, not wrong.
-                    Err(e) => warn!("CSI {}: unstage of {staging} failed: {e:#}", data.driver_name),
+                // Keep this record until unstage succeeds. Other records are
+                // checked without treating our own retry record as a live user.
+                let in_use = match csi_records_checked(&self.state_root) {
+                    Ok(records) => records.into_iter().any(|(other, d)| {
+                        other != uid
+                            && d.driver_name == data.driver_name
+                            && d.volume_handle == data.volume_handle
+                    }),
+                    Err(e) => {
+                        warn!("cannot establish CSI volume users: {e}");
+                        clean = false;
+                        continue;
+                    }
+                };
+                if !in_use {
+                    if let Err(e) = reg.client.unstage(&data.volume_handle, staging).await {
+                        warn!(
+                            "CSI {}: unstage of {staging} failed, retaining retry record: {e:#}",
+                            data.driver_name
+                        );
+                        clean = false;
+                        continue;
+                    }
                 }
             }
+            if let Err(e) = std::fs::remove_file(dir.join("vol_data.json")) {
+                warn!("CSI {}: cannot remove completed record: {e}", dir.display());
+                clean = false;
+                continue;
+            }
+            if let Err(e) = std::fs::remove_dir(&dir) {
+                warn!(
+                    "CSI {}: cannot remove completed directory: {e}",
+                    dir.display()
+                );
+                clean = false;
+            }
+            info!(
+                "CSI {} volume {} unpublished from pod {uid}",
+                data.driver_name, data.volume_handle
+            );
         }
         if clean {
             let _ = std::fs::remove_dir(&base);
         }
         clean
-    }
-
-    /// Does any pod on this node still have this volume published?
-    fn csi_volume_in_use(&self, driver: &str, handle: &str) -> bool {
-        csi_records(&self.state_root)
-            .into_iter()
-            .any(|(_, d)| d.driver_name == driver && d.volume_handle == handle)
     }
 
     /// Tear down the CSI volumes of pods this node is no longer running.
@@ -393,19 +501,34 @@ impl PodManager {
     /// through its start, which is not in the manager yet. If the apiserver
     /// cannot be asked, nothing is touched.
     pub async fn sweep_csi_volumes(&self) {
+        let Ok(records) = csi_records_checked(&self.state_root) else {
+            return;
+        };
         let uids: std::collections::BTreeSet<String> =
-            csi_records(&self.state_root).into_iter().map(|(uid, _)| uid).collect();
+            records.into_iter().map(|(uid, _)| uid).collect();
         if uids.is_empty() {
             return;
         }
-        let Some(pods) = self.api_get("/api/v1/pods").await else { return };
+        let Ok(pods) = apimachinery::reflector::list(
+            &self.api_client,
+            &format!("{}/api/v1/pods", self.api_url),
+        )
+        .await
+        else {
+            return;
+        };
         let live: std::collections::HashSet<&str> = pods["items"]
             .as_array()
             .map(|a| a.as_slice())
             .unwrap_or(&[])
             .iter()
             .filter(|p| p["spec"]["nodeName"].as_str() == Some(&self.node_name))
-            .filter(|p| !matches!(p["status"]["phase"].as_str(), Some("Succeeded") | Some("Failed")))
+            .filter(|p| {
+                !matches!(
+                    p["status"]["phase"].as_str(),
+                    Some("Succeeded") | Some("Failed")
+                )
+            })
             .filter_map(|p| p["metadata"]["uid"].as_str())
             .collect();
         for uid in uids {
@@ -421,36 +544,67 @@ impl PodManager {
 fn pod_info(pod: &Value, ephemeral: bool) -> HashMap<String, String> {
     let m = &pod["metadata"];
     HashMap::from([
-        ("csi.storage.k8s.io/pod.name".into(), m["name"].as_str().unwrap_or("").into()),
-        ("csi.storage.k8s.io/pod.namespace".into(), m["namespace"].as_str().unwrap_or("").into()),
-        ("csi.storage.k8s.io/pod.uid".into(), m["uid"].as_str().unwrap_or("").into()),
+        (
+            "csi.storage.k8s.io/pod.name".into(),
+            m["name"].as_str().unwrap_or("").into(),
+        ),
+        (
+            "csi.storage.k8s.io/pod.namespace".into(),
+            m["namespace"].as_str().unwrap_or("").into(),
+        ),
+        (
+            "csi.storage.k8s.io/pod.uid".into(),
+            m["uid"].as_str().unwrap_or("").into(),
+        ),
         (
             "csi.storage.k8s.io/serviceAccount.name".into(),
-            pod["spec"]["serviceAccountName"].as_str().unwrap_or("default").into(),
+            pod["spec"]["serviceAccountName"]
+                .as_str()
+                .unwrap_or("default")
+                .into(),
         ),
         ("csi.storage.k8s.io/ephemeral".into(), ephemeral.to_string()),
     ])
 }
 
-fn read_vol_data(dir: &Path) -> Option<VolData> {
-    let bytes = std::fs::read(dir.join("vol_data.json")).ok()?;
-    serde_json::from_slice(&bytes).ok()
+fn read_vol_data_checked(dir: &Path) -> std::io::Result<Option<VolData>> {
+    let bytes = match std::fs::read(dir.join("vol_data.json")) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
-/// Every CSI volume record on this node, with the pod it belongs to.
-pub(super) fn csi_records(state_root: &str) -> Vec<(String, VolData)> {
+/// Every CSI record, failing closed if any directory or record is unreadable.
+fn csi_records_checked(state_root: &str) -> std::io::Result<Vec<(String, VolData)>> {
     let mut out = Vec::new();
-    let Ok(pods) = std::fs::read_dir(Path::new(state_root).join("pods")) else { return out };
-    for pod in pods.flatten() {
+    let pods = match std::fs::read_dir(Path::new(state_root).join("pods")) {
+        Ok(pods) => pods,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e),
+    };
+    for pod in pods {
+        let pod = pod?;
         let uid = pod.file_name().to_string_lossy().into_owned();
-        let Ok(vols) = std::fs::read_dir(pod.path().join("volumes/kubernetes.io~csi")) else { continue };
-        for v in vols.flatten() {
-            if let Some(d) = read_vol_data(&v.path()) {
+        let vols = match std::fs::read_dir(pod.path().join("volumes/kubernetes.io~csi")) {
+            Ok(vols) => vols,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        for v in vols {
+            if let Some(d) = read_vol_data_checked(&v?.path())? {
                 out.push((uid.clone(), d));
             }
         }
     }
-    out
+    Ok(out)
+}
+
+pub(super) fn csi_records(state_root: &str) -> Vec<(String, VolData)> {
+    csi_records_checked(state_root).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -480,6 +634,7 @@ mod tests {
         publish: Arc<Mutex<Option<proto::NodePublishVolumeRequest>>>,
         mountinfo: PathBuf,
         propagates: Arc<std::sync::atomic::AtomicBool>,
+        fail_unstage: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl MockDriver {
@@ -493,7 +648,10 @@ mod tests {
 
     #[tonic::async_trait]
     impl proto::identity_server::Identity for MockDriver {
-        async fn get_plugin_info(&self, _: Request<proto::GetPluginInfoRequest>) -> R<proto::GetPluginInfoResponse> {
+        async fn get_plugin_info(
+            &self,
+            _: Request<proto::GetPluginInfoRequest>,
+        ) -> R<proto::GetPluginInfoResponse> {
             Ok(Response::new(proto::GetPluginInfoResponse {
                 name: DRIVER.into(),
                 vendor_version: "1.0".into(),
@@ -504,7 +662,9 @@ mod tests {
             &self,
             _: Request<proto::GetPluginCapabilitiesRequest>,
         ) -> R<proto::GetPluginCapabilitiesResponse> {
-            Ok(Response::new(proto::GetPluginCapabilitiesResponse { capabilities: vec![] }))
+            Ok(Response::new(proto::GetPluginCapabilitiesResponse {
+                capabilities: vec![],
+            }))
         }
         async fn probe(&self, _: Request<proto::ProbeRequest>) -> R<proto::ProbeResponse> {
             Ok(Response::new(proto::ProbeResponse { ready: Some(true) }))
@@ -513,36 +673,66 @@ mod tests {
 
     #[tonic::async_trait]
     impl proto::node_server::Node for MockDriver {
-        async fn node_stage_volume(&self, r: Request<proto::NodeStageVolumeRequest>) -> R<proto::NodeStageVolumeResponse> {
+        async fn node_stage_volume(
+            &self,
+            r: Request<proto::NodeStageVolumeRequest>,
+        ) -> R<proto::NodeStageVolumeResponse> {
             self.record("stage");
             *self.stage.lock().unwrap() = Some(r.into_inner());
             Ok(Response::new(proto::NodeStageVolumeResponse {}))
         }
-        async fn node_unstage_volume(&self, _: Request<proto::NodeUnstageVolumeRequest>) -> R<proto::NodeUnstageVolumeResponse> {
+        async fn node_unstage_volume(
+            &self,
+            _: Request<proto::NodeUnstageVolumeRequest>,
+        ) -> R<proto::NodeUnstageVolumeResponse> {
             self.record("unstage");
+            if self.fail_unstage.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(Status::unavailable("temporary unstage failure"));
+            }
             Ok(Response::new(proto::NodeUnstageVolumeResponse {}))
         }
-        async fn node_publish_volume(&self, r: Request<proto::NodePublishVolumeRequest>) -> R<proto::NodePublishVolumeResponse> {
+        async fn node_publish_volume(
+            &self,
+            r: Request<proto::NodePublishVolumeRequest>,
+        ) -> R<proto::NodePublishVolumeResponse> {
             self.record("publish");
             let r = r.into_inner();
             std::fs::create_dir_all(&r.target_path).unwrap();
             if self.propagates.load(std::sync::atomic::Ordering::SeqCst) {
                 use std::io::Write;
-                let mut f = std::fs::OpenOptions::new().append(true).create(true).open(&self.mountinfo).unwrap();
-                writeln!(f, "140 22 0:52 / {} rw shared:70 - tmpfs tmpfs rw", r.target_path).unwrap();
+                let mut f = std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(&self.mountinfo)
+                    .unwrap();
+                writeln!(
+                    f,
+                    "140 22 0:52 / {} rw shared:70 - tmpfs tmpfs rw",
+                    r.target_path
+                )
+                .unwrap();
             }
             *self.publish.lock().unwrap() = Some(r);
             Ok(Response::new(proto::NodePublishVolumeResponse {}))
         }
-        async fn node_unpublish_volume(&self, r: Request<proto::NodeUnpublishVolumeRequest>) -> R<proto::NodeUnpublishVolumeResponse> {
+        async fn node_unpublish_volume(
+            &self,
+            r: Request<proto::NodeUnpublishVolumeRequest>,
+        ) -> R<proto::NodeUnpublishVolumeResponse> {
             self.record("unpublish");
             let _ = std::fs::remove_dir(r.into_inner().target_path);
             Ok(Response::new(proto::NodeUnpublishVolumeResponse {}))
         }
-        async fn node_get_volume_stats(&self, _: Request<proto::NodeGetVolumeStatsRequest>) -> R<proto::NodeGetVolumeStatsResponse> {
+        async fn node_get_volume_stats(
+            &self,
+            _: Request<proto::NodeGetVolumeStatsRequest>,
+        ) -> R<proto::NodeGetVolumeStatsResponse> {
             Err(Status::unimplemented("stats"))
         }
-        async fn node_expand_volume(&self, _: Request<proto::NodeExpandVolumeRequest>) -> R<proto::NodeExpandVolumeResponse> {
+        async fn node_expand_volume(
+            &self,
+            _: Request<proto::NodeExpandVolumeRequest>,
+        ) -> R<proto::NodeExpandVolumeResponse> {
             Err(Status::unimplemented("expand"))
         }
         async fn node_get_capabilities(
@@ -552,11 +742,16 @@ mod tests {
             use proto::node_service_capability::{rpc::Type, Rpc, Type as Cap};
             Ok(Response::new(proto::NodeGetCapabilitiesResponse {
                 capabilities: vec![proto::NodeServiceCapability {
-                    r#type: Some(Cap::Rpc(Rpc { r#type: Type::StageUnstageVolume as i32 })),
+                    r#type: Some(Cap::Rpc(Rpc {
+                        r#type: Type::StageUnstageVolume as i32,
+                    })),
                 }],
             }))
         }
-        async fn node_get_info(&self, _: Request<proto::NodeGetInfoRequest>) -> R<proto::NodeGetInfoResponse> {
+        async fn node_get_info(
+            &self,
+            _: Request<proto::NodeGetInfoRequest>,
+        ) -> R<proto::NodeGetInfoResponse> {
             Ok(Response::new(proto::NodeGetInfoResponse {
                 node_id: "driver-id-of-test-node".into(),
                 max_volumes_per_node: 0,
@@ -625,9 +820,12 @@ mod tests {
                                 None => (StatusCode::NOT_FOUND, axum::Json(json!({}))),
                             },
                             Method::POST => {
-                                let name = body["metadata"]["name"].as_str().unwrap_or("").to_string();
+                                let name =
+                                    body["metadata"]["name"].as_str().unwrap_or("").to_string();
                                 let at = format!("{path}/{name}");
-                                if api.strict.load(std::sync::atomic::Ordering::SeqCst) && api.get(&at).is_some() {
+                                if api.strict.load(std::sync::atomic::Ordering::SeqCst)
+                                    && api.get(&at).is_some()
+                                {
                                     return (StatusCode::CONFLICT, axum::Json(json!({})));
                                 }
                                 api.put(&at, body.clone());
@@ -678,6 +876,7 @@ mod tests {
             publish: Default::default(),
             mountinfo: mountinfo.clone(),
             propagates: Arc::new(true.into()),
+            fail_unstage: Arc::new(false.into()),
         };
         let sock = root.join("plugins/test/csi.sock");
         let identity = proto::identity_server::IdentityServer::new(driver.clone());
@@ -697,7 +896,8 @@ mod tests {
             notified: Default::default(),
         };
         let reg_svc = reg::registration_server::RegistrationServer::new(registrar.clone());
-        let listener = tokio::net::UnixListener::bind(registry.join(format!("{DRIVER}-reg.sock"))).unwrap();
+        let listener =
+            tokio::net::UnixListener::bind(registry.join(format!("{DRIVER}-reg.sock"))).unwrap();
         tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(reg_svc)
@@ -708,7 +908,10 @@ mod tests {
 
         let api = FakeApi::default();
         let url = api.serve().await;
-        api.put(&format!("/api/v1/nodes/{NODE}"), json!({"metadata": {"name": NODE, "uid": "node-uid"}}));
+        api.put(
+            &format!("/api/v1/nodes/{NODE}"),
+            json!({"metadata": {"name": NODE, "uid": "node-uid"}}),
+        );
 
         let csi = Arc::new(
             CsiPlugins::new(NODE)
@@ -716,11 +919,26 @@ mod tests {
                 .with_registry_dir(&registry),
         );
         let rt = Arc::new(crate::pod_manager::tests::FakeRuntime::default());
-        let mut mgr = PodManager::with_api(rt.clone(), rt, NODE, &url, "127.0.0.1", reqwest::Client::new())
-            .with_csi(csi.clone());
+        let mut mgr = PodManager::with_api(
+            rt.clone(),
+            rt,
+            NODE,
+            &url,
+            "127.0.0.1",
+            reqwest::Client::new(),
+        )
+        .with_csi(csi.clone());
         mgr.state_root = root.join("kubelet").to_string_lossy().into_owned();
         mgr.csi_mountinfo = mountinfo.to_string_lossy().into_owned();
-        Rig { _dir: dir, root, driver, registrar, api, csi, mgr }
+        Rig {
+            _dir: dir,
+            root,
+            driver,
+            registrar,
+            api,
+            csi,
+            mgr,
+        }
     }
 
     fn claim_pod(uid: &str, name: &str) -> Value {
@@ -765,7 +983,9 @@ mod tests {
         );
     }
 
-    fn not_ready(r: Result<HashMap<String, super::super::ResolvedVolume>, crate::cri::CriError>) -> String {
+    fn not_ready(
+        r: Result<HashMap<String, super::super::ResolvedVolume>, crate::cri::CriError>,
+    ) -> String {
         match r {
             Err(crate::cri::CriError::VolumeNotReady(m)) => m,
             other => panic!("expected VolumeNotReady, got {other:?}"),
@@ -785,20 +1005,32 @@ mod tests {
         assert!(n.plugin_registered, "{}", n.error);
 
         // CSINode lists it, with the driver's node ID, owned by the Node.
-        let cn = rig.api.get(&format!("/apis/storage.k8s.io/v1/csinodes/{NODE}")).unwrap();
+        let cn = rig
+            .api
+            .get(&format!("/apis/storage.k8s.io/v1/csinodes/{NODE}"))
+            .unwrap();
         assert_eq!(cn["spec"]["drivers"][0]["name"], DRIVER);
         assert_eq!(cn["spec"]["drivers"][0]["nodeID"], "driver-id-of-test-node");
-        assert_eq!(cn["spec"]["drivers"][0]["topologyKeys"], json!(["topology.test.csi.io/node"]));
+        assert_eq!(
+            cn["spec"]["drivers"][0]["topologyKeys"],
+            json!(["topology.test.csi.io/node"])
+        );
         assert_eq!(cn["metadata"]["ownerReferences"][0]["uid"], "node-uid");
         // And the topology is on the node.
         let patches = rig.api.patches.lock().unwrap().clone();
-        assert_eq!(patches[0].1["metadata"]["labels"]["topology.test.csi.io/node"], NODE);
+        assert_eq!(
+            patches[0].1["metadata"]["labels"]["topology.test.csi.io/node"],
+            NODE
+        );
 
         // The registrar goes: so does the driver, from here and CSINode.
         std::fs::remove_file(rig.root.join(format!("plugins_registry/{DRIVER}-reg.sock"))).unwrap();
         rig.csi.scan_once().await;
         assert!(rig.csi.names().await.is_empty());
-        let cn = rig.api.get(&format!("/apis/storage.k8s.io/v1/csinodes/{NODE}")).unwrap();
+        let cn = rig
+            .api
+            .get(&format!("/apis/storage.k8s.io/v1/csinodes/{NODE}"))
+            .unwrap();
         assert_eq!(cn["spec"]["drivers"], json!([]));
     }
 
@@ -815,26 +1047,44 @@ mod tests {
         rig.csi.scan_once().await;
         // Registered, not attached: waits on the VolumeAttachment by name.
         let m = not_ready(rig.mgr.resolve_volumes(&pod).await);
-        assert!(m.contains(&csi::attachment_name("vol-1", DRIVER, NODE)), "{m}");
-        assert!(rig.driver.calls().is_empty(), "nothing is staged before the attach");
+        assert!(
+            m.contains(&csi::attachment_name("vol-1", DRIVER, NODE)),
+            "{m}"
+        );
+        assert!(
+            rig.driver.calls().is_empty(),
+            "nothing is staged before the attach"
+        );
 
         attach(&rig.api);
         let vols = rig.mgr.resolve_volumes(&pod).await.unwrap();
         let target = csi::publish_path(&rig.mgr.state_root, "uid-1", "data");
         assert_eq!(vols["data"].path, target);
-        assert_eq!(vols["data"].fstype, None, "the engine binds a published directory");
+        assert_eq!(
+            vols["data"].fstype, None,
+            "the engine binds a published directory"
+        );
         assert_eq!(rig.driver.calls(), vec!["stage", "publish"]);
 
         let stage = rig.driver.stage.lock().unwrap().clone().unwrap();
         assert_eq!(stage.volume_id, "vol-1");
-        assert_eq!(stage.staging_target_path, csi::staging_path(&rig.mgr.state_root, DRIVER, "vol-1"));
+        assert_eq!(
+            stage.staging_target_path,
+            csi::staging_path(&rig.mgr.state_root, DRIVER, "vol-1")
+        );
         assert_eq!(stage.publish_context["devicePath"], "/dev/sdx");
         let publish = rig.driver.publish.lock().unwrap().clone().unwrap();
         assert_eq!(publish.target_path, target);
         assert_eq!(publish.staging_target_path, stage.staging_target_path);
         assert_eq!(publish.volume_context["share"], "a");
-        assert_eq!(publish.volume_context["csi.storage.k8s.io/pod.name"], "app-1");
-        assert_eq!(publish.volume_context["csi.storage.k8s.io/serviceAccount.name"], "app");
+        assert_eq!(
+            publish.volume_context["csi.storage.k8s.io/pod.name"],
+            "app-1"
+        );
+        assert_eq!(
+            publish.volume_context["csi.storage.k8s.io/serviceAccount.name"],
+            "app"
+        );
         let cap = publish.volume_capability.unwrap();
         match cap.access_type.unwrap() {
             proto::volume_capability::AccessType::Mount(m) => {
@@ -855,15 +1105,60 @@ mod tests {
         // The first pod goes: unpublished, and not unstaged, because the
         // second still has it.
         rig.mgr.stop_pod("uid-1").await.unwrap();
-        assert_eq!(rig.driver.calls(), vec!["stage", "publish", "stage", "publish", "unpublish"]);
+        assert_eq!(
+            rig.driver.calls(),
+            vec!["stage", "publish", "stage", "publish", "unpublish"]
+        );
         assert!(!Path::new(&target).exists());
         // The last one goes: unstaged.
         rig.mgr.stop_pod("uid-2").await.unwrap();
         assert_eq!(
             rig.driver.calls(),
-            vec!["stage", "publish", "stage", "publish", "unpublish", "unpublish", "unstage"]
+            vec![
+                "stage",
+                "publish",
+                "stage",
+                "publish",
+                "unpublish",
+                "unpublish",
+                "unstage"
+            ]
         );
         assert!(csi_records(&rig.mgr.state_root).is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_unstage_preserves_record_until_retry_succeeds() {
+        let rig = rig().await;
+        store_claim(&rig.api);
+        attach(&rig.api);
+        rig.csi.scan_once().await;
+        rig.mgr
+            .resolve_volumes(&claim_pod("retry-uid", "retry-pod"))
+            .await
+            .unwrap();
+        rig.driver
+            .fail_unstage
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(!rig.mgr.teardown_csi_volumes("retry-uid").await);
+        assert_eq!(csi_records_checked(&rig.mgr.state_root).unwrap().len(), 1);
+        rig.driver
+            .fail_unstage
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(rig.mgr.teardown_csi_volumes("retry-uid").await);
+        assert!(csi_records_checked(&rig.mgr.state_root).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn corrupt_volume_record_blocks_teardown() {
+        let rig = rig().await;
+        let path =
+            Path::new(&rig.mgr.state_root).join("pods/broken/volumes/kubernetes.io~csi/data");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("vol_data.json"), "broken json").unwrap();
+        assert!(!rig.mgr.teardown_csi_volumes("broken").await);
+        assert!(csi_records_checked(&rig.mgr.state_root).is_err());
+        assert!(path.join("vol_data.json").exists());
     }
 
     #[tokio::test]
@@ -873,15 +1168,23 @@ mod tests {
         attach(&rig.api);
         rig.csi.scan_once().await;
         // The driver mounts in its own namespace and nothing propagates.
-        rig.driver.propagates.store(false, std::sync::atomic::Ordering::SeqCst);
+        rig.driver
+            .propagates
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let m = not_ready(rig.mgr.resolve_volumes(&claim_pod("uid-1", "app-1")).await);
         assert!(m.contains("not visible on the node"), "{m}");
         assert!(m.contains("Bidirectional"), "{m}");
         // The record is there, so the sweep can undo the publish once the pod is gone.
         assert_eq!(csi_records(&rig.mgr.state_root).len(), 1);
-        rig.api.put("/api/v1/pods", json!({"items": []}));
+        rig.api.put(
+            "/api/v1/pods",
+            json!({"metadata": {"resourceVersion": "1"}, "items": []}),
+        );
         rig.mgr.sweep_csi_volumes().await;
-        assert!(rig.driver.calls().ends_with(&["unpublish".to_string(), "unstage".to_string()]));
+        assert!(rig
+            .driver
+            .calls()
+            .ends_with(&["unpublish".to_string(), "unstage".to_string()]));
         assert!(csi_records(&rig.mgr.state_root).is_empty());
     }
 
@@ -894,7 +1197,10 @@ mod tests {
         let pod = claim_pod("uid-1", "app-1");
         rig.mgr.resolve_volumes(&pod).await.unwrap();
         // Bound here and not finished, per the apiserver: a pod mid-start.
-        rig.api.put("/api/v1/pods", json!({"items": [pod]}));
+        rig.api.put(
+            "/api/v1/pods",
+            json!({"metadata": {"resourceVersion": "1"}, "items": [pod]}),
+        );
         rig.mgr.sweep_csi_volumes().await;
         assert_eq!(rig.driver.calls(), vec!["stage", "publish"]);
         assert_eq!(csi_records(&rig.mgr.state_root).len(), 1);
@@ -925,8 +1231,14 @@ mod tests {
         // Publish only: an inline volume is neither attached nor staged.
         assert_eq!(rig.driver.calls(), vec!["publish"]);
         let publish = rig.driver.publish.lock().unwrap().clone().unwrap();
-        assert_eq!(publish.volume_context["csi.storage.k8s.io/ephemeral"], "true");
-        assert_eq!(publish.volume_id, format!("csi-{}", csi::sha256_hex("uid-9scratch")));
+        assert_eq!(
+            publish.volume_context["csi.storage.k8s.io/ephemeral"],
+            "true"
+        );
+        assert_eq!(
+            publish.volume_id,
+            format!("csi-{}", csi::sha256_hex("uid-9scratch"))
+        );
         rig.mgr.stop_pod("uid-9").await.unwrap();
         assert_eq!(rig.driver.calls(), vec!["publish", "unpublish"]);
     }
@@ -950,7 +1262,9 @@ mod tests {
         // the binder binds it before the pod starts here. The node's class is
         // what the volume is, and both objects must say so.
         let rig = rig().await;
-        rig.api.strict.store(true, std::sync::atomic::Ordering::SeqCst);
+        rig.api
+            .strict
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let claim = "/api/v1/namespaces/default/persistentvolumeclaims/db";
         let pv = "/api/v1/persistentvolumes/pvc-default-db";
         rig.api.put(
@@ -968,7 +1282,9 @@ mod tests {
                             "claimRef": {"namespace": "default", "name": "db", "uid": "uid-c"}},
                    "status": {"phase": "Bound"}}),
         );
-        rig.mgr.bind_claim("default", "db", "pvc-default-db", 4 << 30).await;
+        rig.mgr
+            .bind_claim("default", "db", "pvc-default-db", 4 << 30)
+            .await;
         let pv = rig.api.get(pv).unwrap();
         assert_eq!(pv["spec"]["capacity"]["storage"], "4Gi");
         assert_eq!(pv["spec"]["claimRef"]["uid"], "uid-c");

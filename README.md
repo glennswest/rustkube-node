@@ -18,6 +18,11 @@ also wake workers. CSI registrar sockets use filesystem notifications;
 successful registrations wake Pod workers, with deadlines for pending failures. Failed or incomplete Pod/manifest reads cannot stop live
 Pods by treating an unknown desired set as empty. Status publication retains
 startTime, skips unchanged status and uses the observed resourceVersion.
+Pod teardown retains its runtime record until stopping and volume cleanup succeed.
+CSI teardown preserves its retry record through failed unstage calls and refuses
+cleanup from unreadable records or incomplete Pod lists. A common Pod/VMI
+executor and claim-reservation module is drafted, but its runtime adapters are
+not wired yet; the serialized loops still govern production execution.
 
 This is an **unbuilt first migration**, not a measured subsecond release.
 Active workloads still use an explicit runtime/probe/volume observation
