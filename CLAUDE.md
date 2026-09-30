@@ -52,6 +52,14 @@ not the release path.
 
 ## Work plan
 
+### In progress: #117, a golden still importing (409 not sealed) waits, not a failed start
+
+2026-09-30, on main. `resolve_disks` treated only a 404 from `POST /volumes/{g}/clone` as Waiting;
+stormblock's `409 … is not sealed` (vmimages still importing) counted as failed starts with backoff.
+1. [ ] `golden_wait(e)`: 404 → "waiting for golden {g}", 409 + "not sealed" → "… (importing)"; unit test.
+2. [ ] README, CHANGELOG; push; sc-build `cargo build --locked && cargo test --locked`.
+3. [ ] Close #117 with evidence; stage golden.
+
 ### Done: #114, turbomode merged into main
 
 2026-09-29: owner instruction in #114 supersedes the earlier no-merge hold.
