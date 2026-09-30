@@ -56,8 +56,9 @@ not the release path.
 
 2026-09-30, on main. `resolve_disks` treated only a 404 from `POST /volumes/{g}/clone` as Waiting;
 stormblock's `409 … is not sealed` (vmimages still importing) counted as failed starts with backoff.
-1. [ ] `golden_wait(e)`: 404 → "waiting for golden {g}", 409 + "not sealed" → "… (importing)"; unit test.
-2. [ ] README, CHANGELOG; push; sc-build `cargo build --locked && cargo test --locked`.
+1. [x] `golden_wait(e)`: 404 → "waiting for golden {g}", 409 + "not sealed" → "… (importing)"; unit test. c74b589.
+2. [x] README, CHANGELOG. sc-build c74b589 `cargo build --locked && cargo test --locked`: 270 kubelet unit,
+   4 integration, 25 CNI, 17 proxy, 1 doc-test pass (1 ignored); exit 0 in 106 s. Not run on a node.
 3. [ ] Close #117 with evidence; stage golden.
 
 ### Done: #114, turbomode merged into main
