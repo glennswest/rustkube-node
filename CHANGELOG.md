@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-09-30
+
+- **fix:** A VM whose golden is still being imported (stormblock refuses the
+  clone with `409 … is not sealed`) waits, "waiting for golden <g>
+  (importing)", like a golden not yet created, instead of counting failed
+  starts with backoff and FailedStart Warnings (#117).
+
 ## 2026-09-29
 
 - **chore:** Stage golden golden-rustkube-node-e8bca700a793 at bba7d54 (#99), release request stormcos#164.

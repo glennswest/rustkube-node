@@ -252,6 +252,9 @@ missing on main (#80).
     attempt, the wait and the error. Each attempt also has a Warning Event.
   - A new spec (`metadata.generation`) is tried at once.
   - A missing golden is not a failure: it waits and is tried on every sync.
+    So does one still being imported (stormblock answers the clone `409 … not
+    sealed`): "waiting for golden <g> (importing)", a Normal `Waiting` Event,
+    no FailedStart backoff.
   - A start gives up, and the VMI goes Failed, only when its VirtualMachine's
     `runStrategy` is `Once` or `Manual`.
   - A failed start cleans up volumes created in that attempt; reused disks

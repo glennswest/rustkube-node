@@ -124,6 +124,20 @@ fn owner_path(owner: &Value) -> Option<String> {
     Some(format!("/apis/kubevirt.io/v1/namespaces/{ns}/{plural}/{name}"))
 }
 
+/// A clone of golden `g` refused with `e` because the golden is not here
+/// *yet*: the reason to wait, or `None` for a real failure. A 404 is a golden
+/// not created; stormblock's `409 … is not sealed` is one created and still
+/// being imported (vmimages seals it when the image has landed, #117).
+fn golden_wait(g: &str, e: &str) -> Option<String> {
+    if e.starts_with("404") {
+        Some(format!("waiting for golden {g}"))
+    } else if e.starts_with("409") && e.contains("not sealed") {
+        Some(format!("waiting for golden {g} (importing)"))
+    } else {
+        None
+    }
+}
+
 /// Has a disk's owner gone for good, from the apiserver's answer to a GET of
 /// it? Only a 404, another uid (a new object under the old name) or a
 /// deletionTimestamp say so. Anything else — a 5xx, a 403, no answer — keeps
@@ -2021,10 +2035,8 @@ impl VmManager {
                             //
                             // A pod scheduled before its image is pulled
                             // waits. So does this.
-                            if e.starts_with("404") {
-                                return Err(StartFail::Waiting(format!(
-                                    "waiting for golden {g}"
-                                )));
+                            if let Some(why) = golden_wait(g, &e) {
+                                return Err(StartFail::Waiting(why));
                             }
                             return Err(StartFail::Failed(format!(
                                 "cloning golden {g} for disk {}: {e}",
@@ -4024,6 +4036,15 @@ mod tests {
         assert!(disk_owner(&kept, None).is_null());
         let vm = json!({"metadata": {"annotations": { RETAIN_ANNOTATION: "true" }}});
         assert!(disk_owner(&obj, Some(&vm)).is_null());
+    }
+
+    #[test]
+    fn a_golden_missing_or_still_importing_is_a_wait() {
+        assert_eq!(golden_wait("f44", "404 Not Found: no volume").as_deref(), Some("waiting for golden f44"));
+        let unsealed = r#"409 Conflict: {"error":"volume 6958da9b is not sealed — seal it before cloning","code":409}"#;
+        assert_eq!(golden_wait("f44", unsealed).as_deref(), Some("waiting for golden f44 (importing)"));
+        assert_eq!(golden_wait("f44", r#"409 Conflict: {"error":"name exists"}"#), None);
+        assert_eq!(golden_wait("f44", "500 Internal Server Error: disk"), None);
     }
 
     #[test]
