@@ -52,14 +52,14 @@ not the release path.
 
 ## Work plan
 
-### In progress: #117, a golden still importing (409 not sealed) waits, not a failed start
+### Done: #117, a golden still importing (409 not sealed) waits, not a failed start
 
 2026-09-30, on main. `resolve_disks` treated only a 404 from `POST /volumes/{g}/clone` as Waiting;
 stormblock's `409 … is not sealed` (vmimages still importing) counted as failed starts with backoff.
 1. [x] `golden_wait(e)`: 404 → "waiting for golden {g}", 409 + "not sealed" → "… (importing)"; unit test. c74b589.
 2. [x] README, CHANGELOG. sc-build c74b589 `cargo build --locked && cargo test --locked`: 270 kubelet unit,
    4 integration, 25 CNI, 17 proxy, 1 doc-test pass (1 ignored); exit 0 in 106 s. Not run on a node.
-3. [ ] Close #117 with evidence; stage golden.
+3. [x] #117 closed with evidence. Stage golden golden-rustkube-node-e5db6ac32831 (9c2f738), release request stormcos#164.
 
 ### Done: #114, turbomode merged into main
 

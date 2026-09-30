@@ -2,6 +2,7 @@
 
 ## 2026-09-30
 
+- **chore:** Stage golden golden-rustkube-node-e5db6ac32831 at 9c2f738 (#117), release request stormcos#164.
 - **fix:** A VM whose golden is still being imported (stormblock refuses the
   clone with `409 … is not sealed`) waits, "waiting for golden <g>
   (importing)", like a golden not yet created, instead of counting failed
