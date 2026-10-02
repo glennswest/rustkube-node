@@ -2,6 +2,10 @@
 
 ## 2026-10-02
 
+- **fix:** CNI: a plugin exec refused with ETXTBSY ("Text file busy") is retried up to five
+  times (40 ms doubling), as libcni does (#128). A binary just written can still be open for
+  writing in a process forked before the writer closed it; `del_runs_chain_in_reverse` failed
+  that way in sc-build.
 - **fix:** A pulled (non-golden) image now starts under the stormpump runtime (#103).
   `create_container` is handed the path `pull_image` returned, `/run/stormpump/images/<volume>`,
   and resolved it as if it named a pallet (`/pallets/<volume>`), so every pulled image, every

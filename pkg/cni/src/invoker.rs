@@ -257,18 +257,35 @@ impl CniInvoker {
 
         debug!("exec CNI plugin {binary:?} {command} for {}", pod.container_id);
 
-        let mut child = tokio::process::Command::new(&binary)
-            .env("CNI_COMMAND", command)
-            .env("CNI_CONTAINERID", &pod.container_id)
-            .env("CNI_NETNS", &pod.netns_path)
-            .env("CNI_IFNAME", &pod.ifname)
-            .env("CNI_ARGS", pod.cni_args())
-            .env("CNI_PATH", &cni_path)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| CniError::NetnsError(format!("spawn {binary:?}: {e}")))?;
+        // **ETXTBSY is retried** (#128), as libcni does: a plugin binary that
+        // was just written (an installer copying it in, or a test) can still be
+        // open for writing in a process forked before the writer closed it, and
+        // exec refuses it until that child execs or exits. It clears in
+        // milliseconds; it is not a missing or broken plugin.
+        let mut attempt = 0u32;
+        let mut child = loop {
+            let spawned = tokio::process::Command::new(&binary)
+                .env("CNI_COMMAND", command)
+                .env("CNI_CONTAINERID", &pod.container_id)
+                .env("CNI_NETNS", &pod.netns_path)
+                .env("CNI_IFNAME", &pod.ifname)
+                .env("CNI_ARGS", pod.cni_args())
+                .env("CNI_PATH", &cni_path)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn();
+            match spawned {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 5 => {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(20 << attempt)).await;
+                }
+                other => {
+                    break other
+                        .map_err(|e| CniError::NetnsError(format!("spawn {binary:?}: {e}")))?
+                }
+            }
+        };
 
         // Bounded, stdin to exit (#99). The child is kept rather than handed
         // to `wait_with_output`, so a plugin past its time can be killed and
