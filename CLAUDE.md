@@ -70,7 +70,8 @@ the dead incarnation's last 20 lines of its `w<id>.log` as `last_output` in asse
        else `last_output`. Nothing: 404/400 naming what was looked at (and the exit/refusal), never "not found".
 3. [x] Tests, docs (README, api.md, status.md), CHANGELOG. fc867c1; sc-build `cargo build --locked && cargo test --locked`:
        272 kubelet unit, 4 integration, 25 CNI, 17 proxy, 1 doc-test pass (1 ignored); exit 0 in 89 s. Not run on a node.
-4. [ ] Close with evidence; stage golden; the live check is the next release on server1 (stormcos#217).
+4. [x] Stage golden golden-rustkube-node-58e64be5aba3 (46ee39f), release request stormcos#164; #124 closed.
+       The live check is the next release on server1 (stormcos#217).
 
 ### Done: documentation refresh from code since 2026-09-25 (#54, #120, #121)
 
