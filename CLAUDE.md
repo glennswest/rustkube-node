@@ -57,6 +57,20 @@ not the release path.
 
 ## Work plan
 
+### In progress: #129 (P0), after a reboot every new pod fails: its own dirs "do not exist"
+
+2026-10-02. Found on server3 (11.65, storm-8486f0) from the live kubelet log: not a namespace mismatch. The
+filesystem under `/var/lib/kubelet` and `/var/log/pods` is full after the reboot (ephemeral-storage capacity
+61396Ki, DiskPressure True since 22:52:35, `could not create container log dir …: No space left on device`).
+The kubelet discarded the emptyDir/projected/SA `create_dir_all` errors (so ENOSPC read as "does not exist") and
+the log-dir ENOSPC was a generic start error, so the pod went `Failed` and the DaemonSet burned its backoff.
+1. [ ] Per-pod dirs (emptyDir, configMap, secret, projected, SA token, resolv.conf) and the container log dirs
+       created before the sandbox; a failure is a wait (Pending, FailedMount / Failed Event naming the errno),
+       retried, never `Failed`.
+2. [ ] Tests, docs (status.md), CHANGELOG; sc-build.
+3. [ ] File the full filesystem on stormcos (what fills a 60 MiB /var after the reboot is the host's).
+4. [ ] Stage golden, release request, close #129.
+
 ### Done: #103 (P0), a pulled non-golden image cannot be resolved by create_container
 
 2026-10-02. The pod manager passes `create_container` the reference `pull_image` returned: for a pull that is the
