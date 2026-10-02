@@ -914,26 +914,30 @@ impl PodManager {
                     .fetch_configmap(namespace, cm)
                     .await
                     .and_then(|o| o["data"].as_object().cloned());
-                materialize_files(&dir, data.as_ref(), false);
+                materialize_files(&dir, data.as_ref(), false)
+                    .map_err(|e| pod_dir_error(&name, &dir, e))?;
                 dir
             } else if !vol["secret"].is_null() {
                 let sec = vol["secret"]["secretName"].as_str().unwrap_or("");
                 let dir = pod_volume_dir(&self.state_root, uid, "secret", &name);
                 let decoded = self.fetch_secret_decoded(namespace, sec).await;
-                materialize_secret_files(&dir, decoded.as_ref());
+                materialize_secret_files(&dir, decoded.as_ref())
+                    .map_err(|e| pod_dir_error(&name, &dir, e))?;
                 dir
             } else if let Some(sources) = vol["projected"]["sources"].as_array() {
                 // Projected volume (e.g. kube-api-access: SA token + CA + downward API).
                 let dir = pod_volume_dir(&self.state_root, uid, "projected", &name);
-                let _ = std::fs::create_dir_all(&dir);
+                std::fs::create_dir_all(&dir).map_err(|e| pod_dir_error(&name, &dir, e))?;
                 self.materialize_projected(pod, namespace, &dir, sources)
-                    .await;
+                    .await
+                    .map_err(|e| pod_dir_error(&name, &dir, e))?;
                 // Ensure the SA volume has a usable ca.crt even if the cluster
                 // has no kube-root-ca.crt configMap to source it from.
                 if let Some(ca) = &self.ca_pem {
                     let has_sat = sources.iter().any(|s| !s["serviceAccountToken"].is_null());
                     if has_sat {
-                        let _ = std::fs::write(format!("{dir}/ca.crt"), ca);
+                        std::fs::write(format!("{dir}/ca.crt"), ca)
+                            .map_err(|e| pod_dir_error(&name, &dir, e))?;
                     }
                 }
                 dir
@@ -1051,7 +1055,7 @@ impl PodManager {
             } else if vol.get("emptyDir").is_some() {
                 // What emptyDir means: per-pod scratch.
                 let dir = pod_volume_dir(&self.state_root, uid, "empty-dir", &name);
-                let _ = std::fs::create_dir_all(&dir);
+                std::fs::create_dir_all(&dir).map_err(|e| pod_dir_error(&name, &dir, e))?;
                 dir
             } else {
                 // Any other volume type (in-tree nfs, iscsi, and the rest)
@@ -1880,7 +1884,7 @@ impl PodManager {
         namespace: &str,
         dir: &str,
         sources: &[Value],
-    ) {
+    ) -> std::io::Result<()> {
         for src in sources {
             if let Some(sat) = src.get("serviceAccountToken").filter(|v| !v.is_null()) {
                 let path = sat["path"].as_str().unwrap_or("token");
@@ -1889,7 +1893,7 @@ impl PodManager {
                     .unwrap_or("default");
                 let aud = sat["audience"].as_str();
                 if let Some(token) = self.request_sa_token(namespace, sa, aud).await {
-                    let _ = std::fs::write(format!("{dir}/{path}"), token);
+                    std::fs::write(format!("{dir}/{path}"), token)?;
                 }
             } else if let Some(cm) = src.get("configMap").filter(|v| !v.is_null()) {
                 let name = cm["name"].as_str().unwrap_or("");
@@ -1897,7 +1901,7 @@ impl PodManager {
                     .fetch_configmap(namespace, name)
                     .await
                     .and_then(|o| o["data"].as_object().cloned());
-                write_projected_items(dir, cm["items"].as_array(), data.as_ref());
+                write_projected_items(dir, cm["items"].as_array(), data.as_ref())?;
             } else if let Some(sec) = src.get("secret").filter(|v| !v.is_null()) {
                 let name = sec["name"].as_str().unwrap_or("");
                 let decoded = self.fetch_secret_decoded(namespace, name).await;
@@ -1906,7 +1910,7 @@ impl PodManager {
                         .into_iter()
                         .map(|(k, v)| (k, Value::String(v)))
                         .collect();
-                    write_projected_items(dir, sec["items"].as_array(), Some(&asmap));
+                    write_projected_items(dir, sec["items"].as_array(), Some(&asmap))?;
                 }
             } else if let Some(dw) = src.get("downwardAPI").filter(|v| !v.is_null()) {
                 if let Some(items) = dw["items"].as_array() {
@@ -1914,13 +1918,14 @@ impl PodManager {
                         let path = it["path"].as_str().unwrap_or("");
                         if let Some(fp) = it["fieldRef"]["fieldPath"].as_str() {
                             if let Some(val) = self.downward_field(pod, fp, None) {
-                                let _ = std::fs::write(format!("{dir}/{path}"), val);
+                                std::fs::write(format!("{dir}/{path}"), val)?;
                             }
                         }
                     }
                 }
             }
         }
+        Ok(())
     }
 
     /// Request a ServiceAccount token via the TokenRequest API (best-effort;
@@ -1977,7 +1982,10 @@ impl PodManager {
     /// Written under the pod's own directory and bind-mounted, the same shape
     /// as the ServiceAccount token: one path, visible to the kubelet that
     /// writes it and to the engine that mounts it.
-    fn resolv_conf_mount(&self, pod: &Value) -> Option<Mount> {
+    ///
+    /// `Err` when the file cannot be written (a full node, #129): starting the
+    /// pod with the image's resolver instead would be a silent wrong answer.
+    fn resolv_conf_mount(&self, pod: &Value) -> Result<Option<Mount>, CriError> {
         // A pod that mounts its own resolv.conf means it.
         if pod["spec"]["containers"].as_array().is_some_and(|cs| {
             cs.iter().any(|c| {
@@ -1987,7 +1995,7 @@ impl PodManager {
                 })
             })
         }) {
-            return None;
+            return Ok(None);
         }
 
         let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
@@ -2004,27 +2012,22 @@ impl PodManager {
             &node_resolv,
         );
         if content.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         let dir = format!("{}/pods/{uid}/etc", self.state_root);
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            warn!("could not create {dir} for resolv.conf: {e}");
-            return None;
-        }
         let path = format!("{dir}/resolv.conf");
-        if let Err(e) = std::fs::write(&path, &content) {
-            warn!("could not write {path}: {e}");
-            return None;
-        }
-        Some(Mount {
+        std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::write(&path, &content))
+            .map_err(|e| pod_dir_error("/etc/resolv.conf", &path, e))?;
+        Ok(Some(Mount {
             container_path: "/etc/resolv.conf".to_string(),
             host_path: path,
             readonly: true,
             propagation: MountPropagation::Private,
             selinux_relabel: true,
             fstype: None,
-        })
+        }))
     }
 
     /// Point pods at a different cluster DNS, or a different domain.
@@ -2038,12 +2041,15 @@ impl PodManager {
         self
     }
 
-    async fn service_account_mount(&self, pod: &Value) -> Option<Mount> {
+    /// `Err` when the directory or its files cannot be written (a full node,
+    /// #129): binding a missing or half-written token is a container that
+    /// fails at spawn or cannot reach the apiserver.
+    async fn service_account_mount(&self, pod: &Value) -> Result<Option<Mount>, CriError> {
         if pod["spec"]["automountServiceAccountToken"].as_bool() == Some(false) {
-            return None;
+            return Ok(None);
         }
         if pod_mounts_sa_path(pod) {
-            return None; // SA admission already provided it — don't double-mount.
+            return Ok(None); // SA admission already provided it — don't double-mount.
         }
         let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
         let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default");
@@ -2052,23 +2058,28 @@ impl PodManager {
             .unwrap_or("default");
 
         let dir = pod_volume_dir(&self.state_root, uid, "secret", "kube-api-access");
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = std::fs::write(format!("{dir}/namespace"), namespace);
-        if let Some(token) = self.request_sa_token(namespace, sa, None).await {
-            let _ = std::fs::write(format!("{dir}/token"), token);
-        }
-        if let Some(ca) = &self.ca_pem {
-            let _ = std::fs::write(format!("{dir}/ca.crt"), ca);
-        }
+        let token = self.request_sa_token(namespace, sa, None).await;
+        let written = (|| -> std::io::Result<()> {
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(format!("{dir}/namespace"), namespace)?;
+            if let Some(token) = &token {
+                std::fs::write(format!("{dir}/token"), token)?;
+            }
+            if let Some(ca) = &self.ca_pem {
+                std::fs::write(format!("{dir}/ca.crt"), ca)?;
+            }
+            Ok(())
+        })();
+        written.map_err(|e| pod_dir_error("kube-api-access", &dir, e))?;
 
-        Some(Mount {
+        Ok(Some(Mount {
             container_path: SA_MOUNT_PATH.to_string(),
             host_path: dir,
             readonly: true,
             propagation: MountPropagation::Private,
             selinux_relabel: true, // kubelet-materialized — must relabel for SELinux
             fstype: None,          // a directory to bind, not a device
-        })
+        }))
     }
 
     /// Reconcile the in-memory pod map with sandboxes already running in the
@@ -2264,6 +2275,15 @@ impl PodManager {
                     // Admitted and waiting, not missing (#63): the pod is
                     // recorded, its containers are `ContainerCreating` with
                     // the reason, and `describe` has a FailedMount Event.
+                    // A full node (#129): waiting, with the errno, until
+                    // something frees space. Failed would hand the pod back to
+                    // its controller, which recreates it into the same disk.
+                    Err(CriError::NodeStorage(what)) => {
+                        warn!("Pod {namespace}/{name} waiting on node storage: {what}");
+                        self.retry_wait(uid, seen.elapsed());
+                        self.event(pod, "Warning", "Failed", &what).await;
+                        outcome.updates.push(self.waiting_pod(pod, what));
+                    }
                     Err(CriError::VolumeNotReady(what)) => {
                         warn!("Pod {namespace}/{name} waiting on volumes: {what}");
                         self.retry_wait(uid, seen.elapsed());
@@ -2533,6 +2553,14 @@ impl PodManager {
 
         let sandbox_config = build_sandbox_config(pod);
         let volumes = self.resolve_volumes(pod).await?;
+        // Everything the kubelet writes for the pod is written before the
+        // sandbox exists, so a node that cannot hold it (a full disk, #129)
+        // leaves the pod waiting with the errno and nothing to undo.
+        // Default ServiceAccount credential mount (token/ca/namespace),
+        // computed once per pod and injected into every container.
+        let sa_mount = self.service_account_mount(pod).await?;
+        let dns_mount = self.resolv_conf_mount(pod)?;
+        prepare_log_dirs(pod, &sandbox_config.log_directory)?;
 
         // **The kubelet cannot check host paths from here.** It runs in a
         // container; the mounts happen in the engine's namespace, which is the
@@ -2569,11 +2597,6 @@ impl PodManager {
         } else {
             Some(sandbox_status.ip.clone())
         };
-
-        // Default ServiceAccount credential mount (token/ca/namespace),
-        // computed once per pod and injected into every container.
-        let sa_mount = self.service_account_mount(pod).await;
-        let dns_mount = self.resolv_conf_mount(pod);
 
         // Run init containers to completion (in order) before the app
         // containers — each must exit 0. A failure aborts pod start.
@@ -3432,7 +3455,14 @@ impl PodManager {
             .await;
         merge_env(&mut envs, self.service_account_env());
         let mut mounts = resolve_mounts(spec, &volumes);
-        push_mount(&mut mounts, self.service_account_mount(&state.pod).await);
+        match self.service_account_mount(&state.pod).await {
+            Ok(m) => push_mount(&mut mounts, m),
+            Err(e) => {
+                warn!("Container {}/{}/{name}: {e}", state.namespace, state.name);
+                self.due_in(&state.uid, deadlines::RECHECK);
+                return false;
+            }
+        }
         // Capture the pod's namespace-sharing flags before `state` is borrowed
         // by the async block below (which also mutably borrows `state` later).
         let pod_for_ns = state.pod.clone();
@@ -4084,10 +4114,10 @@ fn write_projected_items(
     dir: &str,
     items: Option<&Vec<Value>>,
     data: Option<&serde_json::Map<String, Value>>,
-) {
+) -> std::io::Result<()> {
     let data = match data {
         Some(d) => d,
-        None => return,
+        None => return Ok(()),
     };
     match items {
         Some(items) => {
@@ -4095,39 +4125,45 @@ fn write_projected_items(
                 let key = it["key"].as_str().unwrap_or("");
                 let path = it["path"].as_str().unwrap_or(key);
                 if let Some(s) = data.get(key).and_then(|v| v.as_str()) {
-                    let _ = std::fs::write(format!("{dir}/{path}"), s);
+                    std::fs::write(format!("{dir}/{path}"), s)?;
                 }
             }
         }
         None => {
             for (key, val) in data {
                 if let Some(s) = val.as_str() {
-                    let _ = std::fs::write(format!("{dir}/{key}"), s);
+                    std::fs::write(format!("{dir}/{key}"), s)?;
                 }
             }
         }
     }
+    Ok(())
 }
 
 /// Write each ConfigMap data entry as a file `<dir>/<key>` (0644).
-fn materialize_files(dir: &str, data: Option<&serde_json::Map<String, Value>>, _binary: bool) {
-    let _ = std::fs::create_dir_all(dir);
+fn materialize_files(
+    dir: &str,
+    data: Option<&serde_json::Map<String, Value>>,
+    _binary: bool,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
     if let Some(data) = data {
         for (key, val) in data {
             if let Some(s) = val.as_str() {
-                let _ = std::fs::write(format!("{dir}/{key}"), s);
+                std::fs::write(format!("{dir}/{key}"), s)?;
             }
         }
     }
+    Ok(())
 }
 
 /// Write decoded Secret entries as files `<dir>/<key>` (0600 best-effort).
-fn materialize_secret_files(dir: &str, data: Option<&HashMap<String, String>>) {
-    let _ = std::fs::create_dir_all(dir);
+fn materialize_secret_files(dir: &str, data: Option<&HashMap<String, String>>) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
     if let Some(data) = data {
         for (key, val) in data {
             let path = format!("{dir}/{key}");
-            let _ = std::fs::write(&path, val);
+            std::fs::write(&path, val)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -4135,6 +4171,7 @@ fn materialize_secret_files(dir: &str, data: Option<&HashMap<String, String>>) {
             }
         }
     }
+    Ok(())
 }
 
 /// Minimal standard base64 decode (Secret data is standard-alphabet base64).
@@ -4250,6 +4287,50 @@ fn extract_labels(pod: &Value) -> HashMap<String, String> {
 /// conmon opens each container's log at `<sandbox log_directory>/<name>/<attempt>.log`
 /// but does not create the `<name>` subdirectory — so container creation fails
 /// with "conmon: Failed to open log file" unless the kubelet makes it first.
+/// A per-pod directory the kubelet owns could not be made or written (#129).
+///
+/// The errno is the diagnosis: on server3 every one of these was ENOSPC, and
+/// it reached `describe` as "does not exist on this node" because the error
+/// was discarded and only the absence was checked afterwards. A wait, not a
+/// failure: the pod is retried and starts once the node has room.
+fn pod_dir_error(volume: &str, dir: &str, e: std::io::Error) -> CriError {
+    CriError::VolumeNotReady(format!("{volume}: cannot write {dir}: {e}"))
+}
+
+/// The node is out of room for what it was asked to write: ENOSPC, EDQUOT,
+/// or a read-only filesystem.
+fn storage_refused(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ENOSPC) | Some(libc::EDQUOT) | Some(libc::EROFS)
+    )
+}
+
+/// Create every container's log directory before the sandbox (#129).
+///
+/// A full node failed here as a generic start error after the sandbox and the
+/// first container were made, so the pod went Failed. Out of space is a wait
+/// ([`CriError::NodeStorage`]); anything else is left to the runtime, which
+/// creates the directory again and names its own failure.
+fn prepare_log_dirs(pod: &Value, log_directory: &str) -> Result<(), CriError> {
+    for spec in ["initContainers", "containers"]
+        .iter()
+        .flat_map(|f| pod["spec"][*f].as_array().into_iter().flatten())
+    {
+        let dir = format!("{log_directory}/{}", spec["name"].as_str().unwrap_or("unnamed"));
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => {}
+            Err(e) if storage_refused(&e) => {
+                return Err(CriError::NodeStorage(format!(
+                    "cannot create the container log directory {dir}: {e}"
+                )))
+            }
+            Err(e) => warn!("could not create container log dir {dir}: {e}"),
+        }
+    }
+    Ok(())
+}
+
 fn ensure_container_log_dir(log_directory: &str, container_name: &str) {
     let dir = format!("{log_directory}/{container_name}");
     if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -4985,6 +5066,81 @@ pub(crate) mod tests {
         assert_eq!(mgr.pods_json().await["items"].as_array().unwrap().len(), 0);
     }
 
+    /// A state root the kubelet cannot write under: a regular file, so every
+    /// `create_dir_all` beneath it fails (ENOTDIR), as ENOSPC did on server3.
+    fn unwritable_root(mgr: &mut PodManager, tag: &str) {
+        let f = std::env::temp_dir().join(format!("rk-kubelet-full-{}-{tag}", std::process::id()));
+        std::fs::write(&f, b"not a directory").unwrap();
+        mgr.state_root = f.to_string_lossy().into_owned();
+    }
+
+    #[tokio::test]
+    async fn a_pod_dir_that_cannot_be_written_waits_with_the_errno() {
+        // #129: the emptyDir's create_dir_all failed (ENOSPC) and was
+        // discarded, the check then said "does not exist on this node", and
+        // the pod went Failed. It waits, says why, and has nothing to undo.
+        let (rt, mut mgr) = manager();
+        unwritable_root(&mut mgr, "emptydir");
+        let mut p = pod("uid-full", "agent", "Always", simple_container());
+        p["spec"]["volumes"] = json!([{"name": "tmp", "emptyDir": {}}]);
+
+        let outcome = mgr.sync_pods(&[p.clone()]).await;
+        let u = &outcome.updates[0];
+        assert_eq!(u.phase, "Pending", "{}", u.message);
+        let c = &u.container_statuses[0];
+        assert_eq!(c.reason, "ContainerCreating");
+        assert!(c.message.contains("tmp: cannot write"), "{}", c.message);
+        assert!(c.message.contains("kubernetes.io~empty-dir/tmp"), "{}", c.message);
+        assert!(!c.message.contains("does not exist"), "{}", c.message);
+        assert!(rt.sandboxes.lock().unwrap().is_empty());
+        assert!(rt.created_names().is_empty());
+
+        // Space back: the next pass starts it.
+        let (_, ok) = manager();
+        mgr.state_root = ok.state_root.clone();
+        let outcome = mgr.sync_pods(&[p]).await;
+        assert_eq!(outcome.updates[0].phase, "Running", "{}", outcome.updates[0].message);
+        assert_eq!(rt.created_names(), vec!["app".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn an_unwritable_service_account_token_waits_before_the_sandbox() {
+        // No volumes of its own: the default kube-api-access dir is the one
+        // that cannot be written. Before #129 it was written after the
+        // sandbox, errors ignored, and the container bound a missing path.
+        let (rt, mut mgr) = manager();
+        unwritable_root(&mut mgr, "sa");
+        let p = pod("uid-sa", "web", "Always", simple_container());
+        let outcome = mgr.sync_pods(&[p]).await;
+        let u = &outcome.updates[0];
+        assert_eq!(u.phase, "Pending", "{}", u.message);
+        assert!(
+            u.container_statuses[0].message.contains("kube-api-access: cannot write"),
+            "{}",
+            u.container_statuses[0].message
+        );
+        assert!(rt.sandboxes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_full_disk_is_a_storage_wait_and_log_dirs_are_made_per_container() {
+        for errno in [libc::ENOSPC, libc::EDQUOT, libc::EROFS] {
+            assert!(storage_refused(&std::io::Error::from_raw_os_error(errno)));
+        }
+        assert!(!storage_refused(&std::io::Error::from_raw_os_error(libc::EACCES)));
+
+        let root = tempfile::tempdir().unwrap();
+        let logs = root.path().join("default_web_u").to_string_lossy().into_owned();
+        let p = json!({"spec": {
+            "initContainers": [{"name": "init"}],
+            "containers": [{"name": "app"}, {"name": "side"}]
+        }});
+        prepare_log_dirs(&p, &logs).unwrap();
+        for c in ["init", "app", "side"] {
+            assert!(std::path::Path::new(&logs).join(c).is_dir(), "{c}");
+        }
+    }
+
     #[test]
     fn a_long_volume_wait_says_it_timed_out_and_stays_stable() {
         let short = volume_wait_message(
@@ -5412,7 +5568,7 @@ pub(crate) mod tests {
         let (_rt, mgr) = manager(); // no apiserver → token skipped, but ns written
                                     // Default pod: gets an SA mount at the standard path.
         let p = pod("uid-2", "web", "Always", simple_container());
-        let m = mgr.service_account_mount(&p).await.expect("sa mount");
+        let m = mgr.service_account_mount(&p).await.unwrap().expect("sa mount");
         assert_eq!(m.container_path, SA_MOUNT_PATH);
         assert!(m.readonly);
         assert_eq!(
@@ -5422,7 +5578,7 @@ pub(crate) mod tests {
         // automountServiceAccountToken: false → no mount.
         let mut off = pod("uid-3", "web", "Always", simple_container());
         off["spec"]["automountServiceAccountToken"] = json!(false);
-        assert!(mgr.service_account_mount(&off).await.is_none());
+        assert!(mgr.service_account_mount(&off).await.unwrap().is_none());
     }
 
     #[tokio::test]

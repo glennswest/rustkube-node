@@ -26,6 +26,7 @@ below has been measured on a node yet (#102, target C2NR0Q2 per #110).
 | Partial-start unwind (#100) | VM taps withdrawn with stormpump `DEPOSIT_WITHDRAW` and handles released after a failed start (`6c49fbc`); CNI DEL after a failed ADD; reclaim outlives its HTTP client (`077ad5c`) |
 | No sync tick (#101) | Per-probe and backoff deadlines (`4320c20`); service mirror on `/run/stormpump` inotify (`08fc437`); claims mirror, reclaim, CSI sweep and VM maintenance on watches (`82f00c3`); `kubelet_timed_reconciles_total` |
 | Bounded calls (#99) | Ring requests 30 s from enqueue, CNI plugin exec 60 s, engine 5 s connect / 60 s request / 1 h mint (`db9b783`) |
+| Full node filesystem (#129) | Per-pod dirs, ServiceAccount token, resolv.conf and container log dirs written before the sandbox; a failed write (ENOSPC…) keeps the pod Pending with the errno instead of "does not exist" and `Failed` |
 | Tests | PVC medium-suite container and remote static-binary staging (`f63d8c2`, `38dba5a`); latest full sc-build at `c74b589`: 270 kubelet unit, 4 integration, 25 CNI, 17 proxy tests; live acceptance remains open |
 
 ## Owner decisions recorded, implementation pending

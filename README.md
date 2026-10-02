@@ -177,6 +177,11 @@ every container is `waiting: ContainerCreating` with the reason (for example
 awaiting_format`), and `describe` shows a `FailedMount` Event. After 5 minutes
 the reason says it timed out, and the kubelet keeps retrying. As upstream, a
 mount timeout does not fail the pod, because the volume may still come.
+The same holds for the files the kubelet writes for a pod (emptyDir, configMap,
+secret and projected directories, the ServiceAccount token, resolv.conf and the
+container log directories): they are written before the sandbox, and a write the
+node refuses (a full disk, ENOSPC) leaves the pod waiting with the path and the
+errno, retried until there is room (#129).
 
 The image ships sealed blanks for the common classes (`pvc-ext4j-<MiB>m`,
 sbregistry's naming). A class with no blank is minted on its first claim:

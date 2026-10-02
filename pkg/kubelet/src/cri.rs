@@ -451,6 +451,14 @@ pub enum CriError {
     /// of every pod scheduled in the window before the network agent is ready.
     #[error("network not ready: {0}")]
     NetworkNotReady(String),
+    /// The node's filesystem refused something the pod needs before it can
+    /// start (ENOSPC, EDQUOT, EROFS on the container log directory), #129.
+    ///
+    /// Retryable: space comes back when something is cleaned up, and a pod
+    /// marked Failed for a full disk is deleted and recreated by its
+    /// controller into the same full disk, burning its backoff.
+    #[error("node storage: {0}")]
+    NodeStorage(String),
 
     #[error("timeout")]
     Timeout,

@@ -2,6 +2,15 @@
 
 ## 2026-10-02
 
+- **fix:** A node whose filesystem is full no longer fails every new pod (#129). The kubelet
+  discarded the errors from creating a pod's emptyDir, configMap, secret, projected and
+  ServiceAccount-token directories and resolv.conf, so ENOSPC reached `describe` as "… does not
+  exist on this node", and the ENOSPC creating the container log directory was a generic start
+  error that marked the pod `Failed` (server3, 11.65: 32 cilium pods in 30 minutes, each deleted
+  and recreated by the DaemonSet into the same full disk). All of these are now written before
+  the sandbox is created; a write that fails keeps the pod Pending (`ContainerCreating`) with the
+  path and errno in a FailedMount Event (a `Failed` Event for an out-of-space log directory), and
+  it is retried until it succeeds.
 - **fix:** CNI: a plugin exec refused with ETXTBSY ("Text file busy") is retried up to five
   times (40 ms doubling), as libcni does (#128). A binary just written can still be open for
   writing in a process forked before the writer closed it; `del_runs_chain_in_reverse` failed
