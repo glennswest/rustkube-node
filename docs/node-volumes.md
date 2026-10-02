@@ -57,11 +57,12 @@ the same name from another node is left alone.
 
 ## Remaining limitations
 
-Names are not node-qualified. When two nodes both have `fastetcd-data`, the
-cluster-scoped PV and kube-system PVC can represent only the first node;
-other nodes warn and leave the objects alone (#59). Naming/migration requires
-the owner's decision (#107). Therefore this is not yet an inventory of every
-node volume in a multi-node cluster.
+Names are not node-qualified yet. When two nodes both have `fastetcd-data`,
+the cluster-scoped PV and kube-system PVC can represent only the first node;
+other nodes warn and leave the objects alone. The owner has decided the
+naming (#107): `<volume>-<node>` (for example `fastetcd-data-<node>`), with no
+migration of the existing objects. Implementing it is #59. Until then this is
+not an inventory of every node volume in a multi-node cluster.
 
 Drive/shelf/bay/RAID placement joins are not published here (#60). The engine
 and stormdrive placement APIs are prerequisites, not proof that this mirror

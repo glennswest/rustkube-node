@@ -1,9 +1,11 @@
 //! kubelet — Kubernetes node agent: registers the node, runs the pod lifecycle
-//! against a container runtime (native/VM/CRI), and reports status/heartbeats.
+//! against a container runtime, and reports status/heartbeats.
 //!
-//! NOTE: this wires the existing `kubelet` library entrypoints. The node level
-//! is early — CRI runtime integration, node registration, and networking still
-//! need real work (see the repo README + issues).
+//! The runtime is `--runtime`: `native` (the default), `stormpump` (what
+//! stormcos selects: PID 1's engine over its ring, plus stormvm VMIs and
+//! snapshots), `cri` (an external CRI v1 runtime) or `vm` (the legacy microVM
+//! path). What is implemented and what is not is in the repo's
+//! `docs/status.md`; every flag and default is in `docs/configuration.md`.
 
 use clap::Parser;
 use kubelet::{

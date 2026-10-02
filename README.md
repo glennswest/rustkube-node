@@ -4,20 +4,22 @@ The **node level** of [rustkube](https://github.com/glennswest/rustkube) — the
 Kubernetes worker components, in Rust. Split into its own repo for parallel
 development; the code stays upstream-shaped and monorepo-mergeable.
 
-Current code: **main at 5bb1a38, audited 2026-09-29**, workspace version
-**0.13.0** plus unreleased changes. The kubelet registers Nodes, maintains
+Current code: **main at fecb331, audited 2026-10-02**, workspace version
+**0.13.0** plus unreleased changes (shipped to stormcos as stage goldens of
+main; latest golden-rustkube-node-e5db6ac32831, release request stormcos#164). The kubelet registers Nodes, maintains
 heartbeats, runs Pods, and reconciles stormvm VirtualMachineInstances through
 stormpump. This is a partial Kubernetes node implementation; remaining gaps
 and unsupported promises are tracked in [the capability audit](docs/status.md).
-The event-driven UID worker implementation is integrated under #114; acceptance
-and remaining cancellation/event work continue in #100–#102.
+The event-driven UID worker implementation is merged (#114), with partial-start
+unwind (#100), event-driven reconciliation (#101) and bounded runtime calls
+(#99). Live measurement on a node is #102 (C2NR0Q2, owner's choice on #110).
 
 ## Event-driven reconciliation
 
 The turbomode implementation uses rustkube's pinned reactor dependency. Pod and VMI
 assignment/volume watches enqueue coalesced reconciliation work; Pod and VM
-subscriptions run independently; runtime work now uses one eight-worker Pod/VMI executor with name/claim
-reservations and recovery barriers (#100, validation in progress). Stormpump exits and Linux static-manifest changes
+subscriptions run independently; runtime work uses one eight-worker Pod/VMI executor with name/claim
+reservations and recovery barriers (#100). Stormpump exits and Linux static-manifest changes
 also wake workers. CSI registrar sockets use filesystem notifications;
 successful registrations wake Pod workers, with deadlines for pending failures. Failed or incomplete Pod/manifest reads cannot stop live
 Pods by treating an unknown desired set as empty. Status publication retains
@@ -27,8 +29,8 @@ CSI teardown preserves its retry record through failed unstage calls and refuses
 cleanup from unreadable records or incomplete Pod lists. Pod and VMI adapters share that executor. Failed startup/cleanup records are
 retained, and same-name successors wait for the previous UID to release its resources.
 
-The full workspace build and tests passed on dev at `55d458c`, including
-224 kubelet unit and four integration tests. Cleanup retains refused engine releases, CSI publication and teardown
+The full workspace build and tests last passed on dev at `c74b589` (270
+kubelet unit, four integration, 25 CNI and 17 proxy tests). Cleanup retains refused engine releases, CSI publication and teardown
 serialize by driver/handle, and failed runtime recovery keeps admission closed.
 PV and VolumeAttachment changes route through an inverse claim index; failed
 collection reads retain the index. VM status and migration writes carry UID
@@ -49,10 +51,10 @@ only on an event or its own deadline (a probe period, a backoff, a pending
 retry, a guest-agent poll), and the service mirror, system claims, reclaim,
 CSI sweep and VM maintenance run on file, API-watch and stormblock volume-watch
 events. What still polls is counted in `kubelet_timed_reconciles_total`
-(see [configuration](docs/configuration.md)).
-Per-UID concurrency and complete local event sources are tracked in
-[#100](https://github.com/glennswest/rustkube-node/issues/100) and
-[#101](https://github.com/glennswest/rustkube-node/issues/101).
+(see [configuration](docs/configuration.md)). Still open: a stormpump exit
+wakes every workload rather than its own UID (#115), and the CRI backend keeps
+the counted `sync_interval` fallback instead of following container events
+(#116).
 See [the design and baseline](docs/event-driven-design.md) and
 [#102](https://github.com/glennswest/rustkube-node/issues/102) for validation.
 Builds run on dev only after pushing. Main's tap address pump, snapshot
@@ -96,7 +98,7 @@ TokenReview); `/healthz`, `/livez` and `/readyz` are open.
 | `GET /pods` | The pods this kubelet manages, including admitted pods still waiting to start (`Pending`, with the reason) |
 | `GET /containerLogs/{ns}/{pod}/{container}` | What `kubectl logs` reads, by way of the apiserver proxy. A pod waiting to start answers `400 … is waiting to start: ContainerCreating (<reason>)`, as upstream does. A node service's mirror pod (`kube-system/<asset>-<node>`, container `<asset>`) reads the service's stormd log volume, found through the boot unit that mounts it at `/var/log/stormd` and seen under `/hostroot`. The current log covers every process stormd runs there, rotations included, merged in time order and marked `[<proc>]` when there is more than one. `--previous` is the newest `.failed.log`, and tail, since, timestamps, limit and follow all apply. A service not run by stormd (stormblock, registry) has no such volume and answers 404 |
 | `GET /vmConsole/{ns}/{name}/{door}` | A VM's `serial` or `vnc` console, answered by stormvm's console router mounted here |
-| `GET /vmInstance/{address}` | VMI metadata by observed guest address; cold cache returns 503 with Retry-After, absent guest returns 404 |
+| `GET /vmInstance/{address}` | VMI metadata by observed guest address; cold cache returns 503 with Retry-After, absent guest returns 404. stormimds keeps its own store today; which design wins is stormimds#12 |
 | `DELETE /volumes/{ns}/{claim}` | Delete the stormblock clone behind a released claim |
 
 The console and volume-release routes exist here because what they reach is on the node and the
@@ -176,7 +178,9 @@ awaiting_format`), and `describe` shows a `FailedMount` Event. After 5 minutes
 the reason says it timed out, and the kubelet keeps retrying. As upstream, a
 mount timeout does not fail the pod, because the volume may still come.
 
-The first claim of a size class mints its blank (one `mkfs`). The mint runs in
+The image ships sealed blanks for the common classes (`pvc-ext4j-<MiB>m`,
+sbregistry's naming). A class with no blank is minted on its first claim:
+stormblock formats and seals it once (`role: data`). The mint runs in
 the background without an inline wait. Completion signals the Pod and VM
 queues immediately; waiting claims check the template's state and proceed
 when it is `ready`. A large format does not hold the reconciliation pass.
@@ -184,7 +188,8 @@ when it is `ready`. A large format does not hold the reconciliation pass.
 The current ext4 ladder is **1Mi, 16Mi, 64Mi, 256Mi, 1Gi, 4Gi, 16Gi,
 64Gi, 256Gi, 1Ti**; requests round up, and requests above 1Ti are refused.
 The rounded class is the volume ceiling. Capacity reservation/overcommit
-protection is not implemented (#62/#108). Larger classes, per-class filesystems
+protection is not implemented (#62); the owner has decided its policy (#108:
+the class size counts at bind, overcommit ratio 1.0, class-sized clones). Larger classes, per-class filesystems
 and raw block support remain #67; the owner's direction is ext4 first, with
 raw block for single objects past 16TiB, not an assumed XFS switch.
 See [service volume objects](docs/node-volumes.md) for the PV/PVC mirror.
@@ -210,7 +215,9 @@ needed only the first time. A listing that fails is a failed start, never
 **"The VM" is the VirtualMachine.** Each disk the machine makes carries a
 stormblock owner (`owner {kind, namespace, name, uid}`, stormblock#115). The
 owner is the VMI's VirtualMachine, or the VMI itself when there is none.
-Once a minute the kubelet sweeps the engine's volumes. A disk is deleted when
+The kubelet sweeps the engine's volumes when stormblock's volume watch or a
+VM/VMI watch reports a change, at most once a minute (events inside that are
+deferred, not dropped). A disk is deleted when
 its owner is gone for good: a 404, a new object under the same name (another
 uid), or a `deletionTimestamp`. Any other answer keeps it, and so does a disk
 in use or attached to a machine here.
@@ -241,8 +248,9 @@ missing on main (#80).
 - **A VM outlives a kubelet restart** (the engine supervises it), so the kubelet
   records each one where a restarted kubelet finds it: the machine's
   registration, `/run/stormvm/<ns>/<name>/vm.json`, with the engine's workload
-  handle and its disks. On every sync, a registered machine the kubelet does
-  not know is adopted when its VMI still wants it, and stopped when not.
+  handle and its disks. Whenever the VMI set is read (the watch's LIST and
+  each change), a registered machine the kubelet does not know is adopted
+  when its VMI still wants it, and stopped when not.
 - A machine started by an older kubelet has no handle recorded. If its VMI is
   gone, it is stopped through its own control socket: ACPI, then `quit`.
 - A failed VMI list is skipped, not read as "no machines". Reading it that way
@@ -251,7 +259,8 @@ missing on main (#80).
   - The VMI stays Pending with reason `FailedStart` and a message giving the
     attempt, the wait and the error. Each attempt also has a Warning Event.
   - A new spec (`metadata.generation`) is tried at once.
-  - A missing golden is not a failure: it waits and is tried on every sync.
+  - A missing golden is not a failure: it waits, and is tried again on the
+    waiting-start deadline (a quarter of the wait so far, 1–30 s).
     So does one still being imported (stormblock answers the clone `409 … not
     sealed`): "waiting for golden <g> (importing)", a Normal `Waiting` Event,
     no FailedStart backoff.
@@ -298,7 +307,9 @@ missing on main (#80).
     has left the node is Failed.
   - **Needs the CRDs** (stormcos#170): without them the list is a 404 and the
     kubelet does nothing.
-  - `VirtualMachineRestore` is not served yet (#53).
+  - `VirtualMachineRestore` is not served yet (#53). Its design is decided
+    (#109, option A): a restore rewrites the VirtualMachine's disks to the
+    restored PVCs.
 
 ## Tests on a node
 

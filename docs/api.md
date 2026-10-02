@@ -1,13 +1,13 @@
 # Ports and kubelet API
 
-Audited from `pkg/kubelet/src/server.rs` and the CLI at main 5bb1a38.
+Audited from `pkg/kubelet/src/server.rs` and the CLI at main fecb331 (2026-10-02).
 
 | Endpoint | Ownership / default |
 |---|---|
 | `0.0.0.0:10250` HTTPS | Kubelet listener, configurable with `--kubelet-port` |
 | `127.0.0.1:6443` HTTP | CLI's outbound apiserver default; stormcos overrides to node HTTPS |
 | `127.0.0.1:9090` HTTP | Outbound stormblock management API, `--stormblock` |
-| `127.0.0.1:5100` HTTP | Outbound registry API, `--registry` |
+| `127.0.0.1:5100` HTTP | Outbound sbregistry (stormblock-registry, the registry that mints image clones), `--registry` |
 | `/run/stormpump.sock` Unix socket | Default stormpump ring bootstrap; stormcos uses `/hostrun/stormpump.sock` |
 | `/var/lib/kubelet/plugins_registry/*` Unix sockets | CSI registrar discovery, then node-plugin Unix endpoints |
 | `0.0.0.0:9085` | stormd management listener from stormcos's stage config, not a kubelet route |
@@ -34,7 +34,7 @@ anonymous auth. See [credential behavior](configuration.md).
 | GET | `/pods` | Locally managed Pods, including recorded waiting Pods |
 | GET | `/containerLogs/{namespace}/{pod}/{container}` | Runtime logs or eligible stormd service-mirror logs |
 | GET | `/vmConsole/{namespace}/{name}/{door}` | `serial` or `vnc` through stormvm's router, with WebSocket upgrade |
-| GET | `/vmInstance/{address}` | Guest metadata from local VMI/address state; 404 when absent, 503 + `Retry-After: 2` while cold |
+| GET | `/vmInstance/{address}` | Guest metadata from local VMI/address state; 404 when absent, 503 + `Retry-After: 2` while cold. Whether the metadata service (stormimds) asks this or keeps its own store is undecided (stormimds#12) |
 | DELETE | `/volumes/{namespace}/{claim}` | Built-in claim clone reclamation: 204 absent/deleted, 409 in use, 503 when safe release cannot be established |
 
 Log query options: `follow`, `previous`, `tailLines`, `sinceSeconds`,
@@ -50,5 +50,7 @@ exposed by the kubelet route table.
 
 VirtualMachineSnapshot is reconciled as a Kubernetes resource through the
 apiserver, not a new kubelet HTTP route. It requires the snapshot CRDs,
-`--runtime stormpump`, a locally owned VM and its local storage. Restore is
-unimplemented (#53/#109). Stormvm VMI migration is also unimplemented (#40).
+`--runtime stormpump`, a locally owned VM and its local storage.
+VirtualMachineRestore is not implemented (#53); its design is decided (#109,
+option A: a restore rewrites the VirtualMachine's disks to the restored
+PVCs). Stormvm VMI migration is also unimplemented (#40).

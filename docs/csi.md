@@ -21,8 +21,10 @@ and a generic `ephemeral:` volume whose claim is of such a class (#52).
 ## Registration
 
 The driver's node plugin runs as a DaemonSet with `node-driver-registrar`,
-which puts a socket in `/var/lib/kubelet/plugins_registry`. Every two seconds
-the kubelet looks for new sockets. For each one it:
+which puts a socket in `/var/lib/kubelet/plugins_registry`. The kubelet
+watches that directory (filesystem notifications, `fs_watch.rs`); a change
+queues a scan, and an idle registry with every driver registered causes no
+scans at all (#101). For each new socket it:
 
 1. calls `GetInfo`, and accepts `type: CSIPlugin` with a 1.x version;
 2. calls the driver's `NodeGetInfo` and `NodeGetCapabilities` at the endpoint
@@ -34,9 +36,11 @@ the kubelet looks for new sockets. For each one it:
 4. calls `NotifyRegistrationStatus` either way, so the registrar's own
    health check reports the outcome.
 
-A socket that goes away deregisters its driver. One that fails is retried
-every 30 s, or at once if its socket is recreated. The usual cause is a
-registrar that is up before its driver.
+A socket that goes away deregisters its driver. Each registration (and each
+`CSINode` write) is bounded at 10 s. One that fails is retried after 1 s, or
+at once if its socket is recreated; a failed `CSINode` write is retried on
+the same 1 s deadline. The usual cause is a registrar that is up before its
+driver. A successful registration wakes the Pods waiting on that driver.
 
 ## Mounting a volume
 

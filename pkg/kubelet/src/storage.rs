@@ -1,32 +1,32 @@
 //! PersistentVolumeClaims, backed by stormblock.
 //!
-//! A claim becomes a **CoW clone of a blank filesystem template**, and the
-//! template is minted the first time a size class is asked for — not baked into
-//! the image. Baking would spend image space on classes a node may never use
-//! and would decide at build time a question only run time can answer, which is
-//! which sizes are actually claimed. The first claim of a class pays one
-//! `mkfs`; every claim after it is a clone that occupies no space until written.
+//! A claim becomes a **CoW clone of a sealed, pre-formatted blank** of its size
+//! class. The image ships blanks for the common classes; a class with no blank
+//! is minted the first time it is asked for, and stormblock formats and seals
+//! it once. Every claim after that is a clone that occupies no space until
+//! written: no `mkfs`, no copy, no CSI on the claim's path.
 //!
 //! This is the mechanism stormblock already has for exactly this — templates
 //! are created, sealed, and cloned, and sbregistry mints its own the same way.
 //!
-//! **The mount used to be the hard part and is not any more.** A block device
-//! has to be mounted by something in the right mount namespace, and making a
-//! host-side mount visible inside a container means mount propagation — which
+//! **The mount avoids mount propagation.** A block device has to be mounted by
+//! something in the right mount namespace, and making a host-side mount
+//! visible inside a container means propagation — which
 //! `stormpump/docs/pvc.md` calls the constraint that decides everything, and
-//! which fails looking like a missing file. It is avoided rather than solved:
-//! the container's own child mounts the device, in its own namespace, in the
-//! same loop that already mounts its root and its binds. A container already
-//! has a mount; this is one more.
+//! which fails looking like a missing file. PID 1 mounts the device on the node
+//! under `/run/stormpump/pvc/<device>` (`volume_register_device`, idempotent, so
+//! two pods sharing a ReadWriteOnce claim get one mount), and the container
+//! binds that directory like any other bind (`stormpump_runtime.rs`).
 //!
 //! The path, end to end:
 //!
 //! 1. round the claim up to a size class
-//! 2. get or mint the template for that class (`mkfs` once, ever)
+//! 2. get the sealed blank for that class, or mint it (formatted once, ever)
 //! 3. clone it — instant, copy-on-write
 //! 4. attach it; the local ublk fast path answers with a `/dev/ublkbN` on this
 //!    node, with no NVMe round trip
-//! 5. hand stormpump that device with `fstype: ext4`, to mount in the container
+//! 5. hand stormpump that device with `fstype: ext4`: PID 1 mounts it on the
+//!    node and the container binds the mount
 
 use serde_json::Value;
 

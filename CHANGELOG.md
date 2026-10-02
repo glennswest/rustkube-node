@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-10-02
+
+- **docs:** Documentation refreshed from the code for changes since
+  2026-09-25 (#54, #120, #121). `docs/status.md` is re-audited at fecb331,
+  with a table of everything since 09-25 (UID workers, #100 unwind, #101 no
+  sync tick, #99 bounded calls, #117) and a table of the owner's answered
+  decisions #106–#110 with the issue implementing each. Docs that still called
+  them open (status, node-volumes, api, README, CLAUDE.md work plan) now give
+  the decision and what is left. New limitation rows: #115, #116, #118,
+  #119, #122, stormimds#12.
+- **docs:** `--registry`/:5100 is sbregistry, not a stormpump image service
+  (#120); `/vmInstance` notes that stormimds keeps its own store, which design
+  wins is stormimds#12.
+- **docs:** `docs/csi.md`: the plugin registry is followed by filesystem
+  notifications (no 2 s scan), a failed registration is retried after 1 s (not
+  30 s), each registration and `CSINode` write is bounded at 10 s.
+- **docs:** README: the VM disk-owner sweep runs on volume/VM watch events, at
+  most once a minute; a waiting golden is retried on its waiting deadline;
+  registered machines are reconciled whenever the VMI set is read; blanks are
+  shipped sealed and only a missing class is minted.
+- **docs:** Module comments (#54): `cmd/kubelet` names the runtimes as they
+  are (native default, stormpump on stormcos); `storage.rs` describes PID 1
+  mounting a claim's device under `/run/stormpump/pvc` and the container
+  binding it, not a child-side mount.
+
 ## 2026-09-30
 
 - **chore:** Stage golden golden-rustkube-node-e5db6ac32831 at 9c2f738 (#117), release request stormcos#164.

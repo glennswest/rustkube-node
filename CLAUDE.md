@@ -11,19 +11,24 @@ legacy bin-only `scripts/build-golden.sh` or a package. The cross-project rules 
 `0.13.0`. There is one version location: `[workspace.package] version` in
 `Cargo.toml` (every crate uses `version.workspace = true`).
 
-## Current implementation reference (2026-09-29)
+## Current implementation reference (2026-10-02)
 
-Main baseline: 5bb1a38. See `docs/status.md` for changes since September 18
-and issue-backed limitations, `docs/configuration.md` for every CLI/env/default,
+Main baseline: fecb331. See `docs/status.md` for changes since September 25,
+the owner's recorded decisions and issue-backed limitations, `docs/configuration.md` for every CLI/env/default,
 and `docs/api.md` for ports and actual routes. CLI runtime defaults to native;
 stormcos explicitly chooses stormpump. Cilium owns Services; the packaged
 kube-proxy is not started. PVCs use the built-in stormblock driver and sealed
 size-class blanks over ublk, with CSI only for third-party drivers.
 
 Main has VMI adoption, persistent VM-owned disks, accessCredentials, tap address
-reporting and snapshot reconciliation; restore remains #53/#109. The #114 integration adds turbomode's UID workers. Historical work-plan entries below record
-what was true at each checkpoint; they are not current deployment guarantees.
-Owner decisions are tracked in #106–#110; do not infer answers from recommendations.
+reporting and snapshot reconciliation; restore is #53. The #114 merge added turbomode's
+UID workers; #100 (partial-start unwind), #101 (no sync tick) and #99 (bounded calls)
+followed. Historical work-plan entries below record what was true at each checkpoint;
+they are not current deployment guarantees.
+Owner decisions (#106–#110) are answered: #106 Pods under one parent cgroup, OpenShift's
+shape (stormpump#68, then #57); #107 `<volume>-<node>` names, no migration (#59); #108
+class size at bind, ratio 1.0, class-sized clones (#62); #109 option A, restore rewrites the
+VM's disks to restored PVCs (#53); #110 C2NR0Q2 first (#102).
 
 ## Build and test
 
@@ -51,6 +56,17 @@ owner built the stage golden for v0.12.0: golden-rustkube-node-ce66e97945ad
 not the release path.
 
 ## Work plan
+
+### Done: documentation refresh from code since 2026-09-25 (#54, #120, #121)
+
+2026-10-02, on main at fecb331.
+1. [x] Audit README, docs/, CLAUDE.md against code and `git log --since=2026-09-25`.
+2. [x] status.md: changes since 09-25, decided-not-implemented table (#106–#110), new gap rows
+   (#115, #116, #118, #119, #122, stormimds#12). README, api.md, configuration.md, BUILD.md,
+   csi.md (inotify registry, 1 s retry), node-volumes.md updated. :5100 is sbregistry (#120).
+3. [x] Module comments (#54): cmd/kubelet main.rs, storage.rs (PID 1 mounts, container binds),
+   server.rs `/vmInstance` (stormimds#12 undecided).
+4. [ ] CHANGELOG; commit, push, sc-build; comment on #54/#120/#121.
 
 ### Done: #117, a golden still importing (409 not sealed) waits, not a failed start
 
@@ -258,7 +274,10 @@ At this checkpoint work was on `turbomode`; #114 supersedes that hold. Read rust
 Merging origin/main conflicts in `kubelet.rs` (turbomode's `pod_loop`/`vm_loop` vs main's #91 address pump,
 #35 `watch_for_node`/`list_for_node`, #53 `snapshots.sync()`): aborted, owner asked on #100 (resolve, or leave).
 
-### Blocked on #109: #53, VirtualMachineSnapshot / VirtualMachineRestore
+### Decided (#109, option A), restore not started: #53, VirtualMachineSnapshot / VirtualMachineRestore
+
+2026-09-30: owner chose A (a restore rewrites the VirtualMachine's disks to the restored PVCs).
+The text below predates the answer.
 
 2026-09-29 recheck: read #53 and #109, including comments. Snapshot support is
 already on main; #109 remains unanswered and labeled needs-owner. Stop restore
@@ -431,8 +450,10 @@ Steps:
 4. [x] Tests, docs (README), CHANGELOG. sc-build at c78baf0: all pass (kubelet 193). Closed; noted on #70
        (wait-for-ready done here, Event on the claim still open). Not run on a node. Unreleased.
 
-### Blocked on owner decision: #62, CSIStorageCapacity for the built-in class (findings only, not started)
+### Decided, not started: #62, CSIStorageCapacity for the built-in class
 
+Recorded 2026-10-02: the owner answered on #108 ("take the recommendation"): the class size counts
+at bind, overcommit ratio 1.0, clones sized to the class. Resume from the findings below.
 2026-09-28: stopped before code. What a node publishes, and when the kubelet refuses a claim, both depend on
 how a claim counts against the slab, and the issue leaves that open. Questions posted on #62; resume from the answer.
 
@@ -467,7 +488,7 @@ Steps:
 3. [x] `bind_claim` (built-in driver claims) uses the same builder.
 4. [x] (b) A vanished volume: the mirror deletes its claim, the binder makes the PV Released, the PV is never
        deleted (the issue's stated outcome). Not on a listing with none of the node's volumes.
-5. [ ] **Owner decision (a), open:** names collide across nodes. `kube-system/fastetcd-data` and PV
+5. [ ] **Decided (#107): `<volume>-<node>`, no migration; not implemented.** Names collide across nodes. `kube-system/fastetcd-data` and PV
        `storm-fastetcd-data` exist once per cluster, so only the first node's volumes are represented; the
        others log a warning. Asked on the issue.
 6. [x] Tests (fake apiserver + engine end to end), docs (`docs/node-volumes.md`), CHANGELOG. sc-build at 30bb887: all pass (kubelet 185).
@@ -480,7 +501,7 @@ Steps:
 2. [x] Ring client: one request owns the arena at a time (payloads all go at offset 0), and a request can
        have its region copied back after completion. `query_stats`.
 3. [x] `list_container_stats`: `QUERY` stats → CPU (exact) and memory (`memory_current`, includes page cache).
-4. [ ] **Decision (owner):** `cpu_shares` → `cpu_weight`. stormpump workloads are flat siblings, node services
+4. [ ] **Decided (#106): Pods under one parent cgroup (OpenShift), engine side stormpump#68.** `cpu_shares` → `cpu_weight`. stormpump workloads are flat siblings, node services
        included (default weight 100). Upstream's conversion puts every pod below them (1 CPU → 39, no request → 1).
 5. [x] Tests, docs, CHANGELOG. sc-build at 4245b8f: all pass (kubelet 177). Issue stays open on step 4.
 

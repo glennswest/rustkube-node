@@ -146,12 +146,12 @@ fn router_with_console(
         .route("/vmConsole/{namespace}/{name}/{door}", get(vm_console))
         // Who is at this address.
         //
-        // The metadata service asks this; it does not keep a registry of its
-        // own. The kubelet already holds the VMI, the MAC it generated, the
-        // addresses the guest was given and the whole lifecycle, so a second
-        // copy anywhere else is a copy that can be wrong — and the ways it
-        // goes wrong all end with a guest being told something false about
-        // itself.
+        // Meant for the metadata service. The kubelet already holds the VMI,
+        // the MAC it generated, the addresses the guest was given and the
+        // whole lifecycle, so a second copy anywhere else is a copy that can
+        // be wrong. stormimds does keep its own store today
+        // (`/admin/instances`); which design wins is undecided
+        // (stormimds#12).
         .route("/vmInstance/{address}", get(vm_instance))
         // Release the stormblock clone behind a claim, so a `Delete` reclaim
         // policy finishes (rustkube-node#46). Same shape as the VM console:

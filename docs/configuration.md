@@ -1,8 +1,8 @@
 # Configuration and defaults
 
 Source: `cmd/kubelet/src/main.rs`, `pkg/kubelet/src/kubelet.rs`,
-`engine.rs`, `cri_client.rs`, and `cmd/kube-proxy/src/main.rs`, main 5bb1a38
-(2026-09-29). These are executable defaults, not the stormcos launch arguments.
+`engine.rs`, `cri_client.rs`, and `cmd/kube-proxy/src/main.rs`, main fecb331
+(2026-10-02). These are executable defaults, not the stormcos launch arguments.
 There is no general kubelet YAML/TOML config-file flag; kubeconfig supplies API
 connection credentials. Flags take precedence over their Clap environment
 variables. `RUST_LOG` configures tracing (default `info`).
@@ -22,7 +22,7 @@ An em dash means there is no environment binding or the value is unset.
 | `--pod-manifest-path` | `POD_MANIFEST_PATH` | `/etc/kubernetes/manifests`; empty string disables static Pods |
 | `--runtime` | — | `native`; choices `native`, `cri`, `vm`, `stormpump` |
 | `--vmm` | — | `auto`; choices `auto`, `cloud-hypervisor`, `qemu`, `firecracker`; for legacy `vm` runtime |
-| `--registry` | — | `http://127.0.0.1:5100`; stormpump image service |
+| `--registry` | — | `http://127.0.0.1:5100`; sbregistry (stormblock-registry), which mints image clones, with `--runtime stormpump` |
 | `--stormblock` | `STORMBLOCK_URL` | `http://127.0.0.1:9090`; engine for claims, VM disks and images |
 | `--cri-socket` | `CRI_SOCKET` | CRI auto-detection, or `/run/stormpump.sock` for stormpump |
 | `--cni-conf-dir` | `CNI_CONF_DIR` | `/etc/cni/net.d` |
@@ -141,7 +141,7 @@ configuration must provide those mounts.
 
 The authoritative stormcos stage recipe selects `--runtime stormpump`,
 `--cri-socket /hostrun/stormpump.sock`, `--apiserver https://${NODE_IP}:6443`,
-`--node-name ${NODE_NAME}`, local registry port 5100, and these certificates:
+`--node-name ${NODE_NAME}`, the local sbregistry on port 5100, and these certificates:
 
 - CA: `/data/stormcert/ca.crt`
 - client: `/data/stormcert/kubelet.crt` and `kubelet.key`

@@ -1,6 +1,6 @@
 # Build, test and ship
 
-Audited against main 5bb1a38 on 2026-09-29. Workspace version: 0.13.0;
+Audited against main fecb331 on 2026-10-02. Workspace version: 0.13.0;
 subsequent changes are unreleased, not proof of an installed node version.
 
 ## Build from a pushed commit
@@ -74,6 +74,6 @@ Run Jobs through stormcentral on capability-matched test machines; never infer
 live behavior from unit tests or hardcode a machine. See README and
 [status](status.md) for outstanding acceptance.
 
-The `turbomode` branch remains separate under #99–#102. Do not merge it or
-request its golden as part of this documentation refresh. Its live target
-requires the owner's decision (#110).
+The `turbomode` UID-worker work was merged into main under #114 (600b58a);
+main's stage goldens include it. Its live validation runs on C2NR0Q2 first
+(owner's decision on #110) and is tracked in #102.
