@@ -57,16 +57,22 @@ not the release path.
 
 ## Work plan
 
-### In progress: #103 (P0), a pulled non-golden image cannot be resolved by create_container
+### Done: #103 (P0), a pulled non-golden image cannot be resolved by create_container
 
 2026-10-02. The pod manager passes `create_container` the reference `pull_image` returned: for a pull that is the
 mount `/run/stormpump/images/<volume>`. `create_container` and `spec_for` resolved it with `local_path`, which maps
 the last path component to `/pallets/<name>`, so every pulled image failed at start "was never pulled" (C2NR0Q2,
 11.56, stormcos_qa test Jobs).
-1. [ ] `image_root`: an absolute path under `/run/stormpump/images/` (what a pull returns) is the root as given;
-       a `/pallets/` path or a ref naming a golden as before. Used by `create_container` and `spec_for`.
-2. [ ] Tests: pull-returned path → create → start gets past "never pulled"; golden unchanged; retry with the same ref.
-3. [ ] Docs, CHANGELOG, sc-build, golden (stage), close.
+1. [x] `image_root`: a path one volume below `/run/stormpump/images/` (what a pull returns) is the root as given
+       (not checked from here: PID 1 mounted it in the node's namespace); otherwise `local_path` as before. Used by
+       `create_container` and `spec_for`. 7d28509.
+2. [x] Tests: the live repro's volume resolves to its mount, repeatably; malformed paths refused; goldens by ref and
+       by pallet path. create/start themselves need an engine (not unit-testable here).
+3. [x] Docs (configuration.md, status.md), CHANGELOG. sc-build 4263d80 `cargo build --locked && cargo test --locked`:
+       274 kubelet unit, 4 integration, 25 CNI, 17 proxy, 1 doc-test pass (1 ignored); exit 0 in 94 s. The first run
+       hit an ETXTBSY CNI test race, filed by sc-build as #128 and fixed in 4263d80 (retry, as libcni).
+4. [x] Stage golden golden-rustkube-node-b064bfdcc9fb (4263d80), release request stormcos#164. Live check after the
+       release: `stormcentral test run stormcos_qa short` reaches the pod log.
 
 ### Done: #124, `logs` on a stormpump:// mirror pod answers "not found on this node"
 
