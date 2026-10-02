@@ -31,7 +31,14 @@
 //!
 //! A service not run by stormd (stormblock, the registry) has no such volume.
 //! Its output is stormpump's `w<id>.log`, and `assets.json` does not say which
-//! id is whose, so it cannot be served from here yet.
+//! id is whose (stormpump#55), so its live log cannot be served from here yet.
+//!
+//! What `assets.json` does carry (stormpump#51) is the end of the last
+//! incarnation that exited: `last_output`, its last lines of `w<id>.log`, with
+//! `last_exit` and, for a refused start, `last_error` (#124). That is the only
+//! log a service has when it died before stormd wrote its volume (a bad
+//! config, a missing root), and the only one at all for a service not run by
+//! stormd, so it answers when the volume has nothing.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -250,6 +257,40 @@ pub fn read_current(dir: &Path) -> (String, HashMap<PathBuf, u64>) {
     (merge(&texts), offsets)
 }
 
+/// Where PID 1 reports its assets, as the kubelet sees it (the host's `/run`).
+pub const ASSETS_JSON: &str = "/run/stormpump/assets.json";
+
+/// What PID 1 recorded about an asset's last exit (stormpump#51).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Record {
+    pub running: bool,
+    /// How the last incarnation ended: "exited 1", "killed by signal 9".
+    pub last_exit: Option<String>,
+    /// Why its last start was refused, while it is not running.
+    pub last_error: Option<String>,
+    /// Its last lines of output (stormpump's `w<id>.log`), oldest first.
+    pub last_output: Vec<String>,
+}
+
+/// `asset`'s entry in the asset table; `None` when it is not listed or the
+/// table does not parse.
+pub fn record(assets_json: &str, asset: &str) -> Option<Record> {
+    let v: serde_json::Value = serde_json::from_str(assets_json).ok()?;
+    let a = v["assets"].as_array()?.iter().find(|a| a["name"] == asset)?;
+    let text = |k: &str| a[k].as_str().filter(|s| !s.is_empty()).map(str::to_string);
+    Some(Record {
+        running: a["running"].as_bool().unwrap_or(false),
+        last_exit: text("last_exit"),
+        last_error: text("last_error"),
+        last_output: a["last_output"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|l| l.as_str().map(str::to_string))
+            .collect(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,5 +396,25 @@ spec    rustkube-node
         std::fs::write(d.join("etcd.20260829T000000.exited.log"), "clean\n").unwrap();
         std::fs::write(d.join("etcd.log"), "live\n").unwrap();
         assert_eq!(previous_failed(d), Some(d.join("etcd.20260828T000000.failed.log")));
+    }
+
+    /// The table as stormpump#51 writes it: the exit, the refusal and the
+    /// output only once there is one (#124).
+    #[test]
+    fn an_assets_record_carries_the_last_exit_and_output() {
+        let table = r#"{"assets":[
+            {"name":"stormblock","running":true,"restarts":0,"age_secs":9,"domain":1},
+            {"name":"stormcluster","running":false,"restarts":1,"age_secs":3,"domain":2,
+             "last_exit_code":1,"last_exit":"exited 1","last_output":["config: no such file","bye"]},
+            {"name":"stormrdp","running":false,"restarts":0,"age_secs":0,"domain":2,
+             "last_error":"CheckLogVolume: ENOENT"}]}"#;
+        assert_eq!(record(table, "stormblock"), Some(Record { running: true, ..Default::default() }));
+        let c = record(table, "stormcluster").unwrap();
+        assert_eq!(c.last_exit.as_deref(), Some("exited 1"));
+        assert_eq!(c.last_output, ["config: no such file", "bye"]);
+        assert!(!c.running);
+        assert_eq!(record(table, "stormrdp").unwrap().last_error.as_deref(), Some("CheckLogVolume: ENOENT"));
+        assert_eq!(record(table, "absent"), None);
+        assert_eq!(record("{", "stormblock"), None);
     }
 }

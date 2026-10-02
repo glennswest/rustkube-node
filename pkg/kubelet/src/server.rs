@@ -640,7 +640,11 @@ mod tests {
             .unwrap();
 
         let rt = Arc::new(NoopRt);
-        let pm = Arc::new(PodManager::new(rt.clone(), rt, "n1").with_host_root(root.path()));
+        let pm = Arc::new(
+            PodManager::new(rt.clone(), rt, "n1")
+                .with_host_root(root.path())
+                .with_assets_json(root.path().join("run/stormpump/assets.json")),
+        );
         let get = |uri: &str| {
             let app = router(pm.clone());
             let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
@@ -670,6 +674,94 @@ mod tests {
             assert_eq!(get(uri).await.0, StatusCode::NOT_FOUND, "{uri}");
         }
     }
+
+    /// A node service that died before stormd wrote its volume (stormcluster
+    /// and stormrdp on 11.61) answers with what PID 1 kept of its last exit,
+    /// not "not found on this node" (#124). So does one not run by stormd.
+    #[tokio::test]
+    async fn a_dead_node_service_answers_with_stormpumps_last_output() {
+        let root = tempfile::tempdir().unwrap();
+        let bd = root.path().join("etc/stormpump/boot.d");
+        std::fs::create_dir_all(&bd).unwrap();
+        std::fs::write(
+            bd.join("40-services"),
+            "volume sclogs /logs/stormcluster\nspec stormcluster\n  mount sclogs /var/log/stormd\n\
+             volume rdlogs /logs/stormrdp\nspec stormrdp\n  mount rdlogs /var/log/stormd\n\
+             volume fd /logs/stormdrive\nspec stormdrive\n  mount fd /var/log/stormd\n",
+        )
+        .unwrap();
+        // The volume exists and is empty: stormd never got that far.
+        std::fs::create_dir_all(root.path().join("logs/stormcluster")).unwrap();
+        let run = root.path().join("run/stormpump");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(
+            run.join("assets.json"),
+            r#"{"assets":[
+              {"name":"stormcluster","running":false,"restarts":1,"age_secs":3,"domain":2,
+               "last_exit_code":1,"last_exit":"exited 1",
+               "last_output":["stormd: starting stormcluster","stormcluster: /etc/stormcos/release: is a directory"]},
+              {"name":"stormrdp","running":false,"restarts":1,"age_secs":3,"domain":2,"last_exit":"exited 78"},
+              {"name":"stormdrive","running":true,"restarts":0,"age_secs":3,"domain":2},
+              {"name":"registry","running":false,"restarts":4,"age_secs":3,"domain":1,
+               "last_exit":"killed by signal 9","last_output":["registry: out of memory"]}]}"#,
+        )
+        .unwrap();
+
+        let rt = Arc::new(NoopRt);
+        let pm = Arc::new(
+            PodManager::new(rt.clone(), rt, "n1")
+                .with_host_root(root.path())
+                .with_assets_json(run.join("assets.json")),
+        );
+        let get = |uri: &str| {
+            let app = router(pm.clone());
+            let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            async move {
+                let resp = app.oneshot(req).await.unwrap();
+                let status = resp.status();
+                let body = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+                (status, String::from_utf8_lossy(&body).into_owned())
+            }
+        };
+
+        let why = "stormd: starting stormcluster\nstormcluster: /etc/stormcos/release: is a directory\n";
+        for uri in [
+            "/containerLogs/kube-system/stormcluster-n1/stormcluster",
+            "/containerLogs/kube-system/stormcluster-n1/stormcluster?previous=true",
+            // Nothing to follow: the record is all there is.
+            "/containerLogs/kube-system/stormcluster-n1/stormcluster?follow=true",
+        ] {
+            assert_eq!(get(uri).await, (StatusCode::OK, why.to_string()), "{uri}");
+        }
+        let (_, body) = get("/containerLogs/kube-system/stormcluster-n1/stormcluster?tailLines=1").await;
+        assert_eq!(body, "stormcluster: /etc/stormcos/release: is a directory\n");
+        let (_, body) = get("/containerLogs/kube-system/stormcluster-n1/stormcluster?limitBytes=7").await;
+        assert_eq!(body, "stormd:");
+
+        // Not run by stormd: the record is its only log.
+        let (st, body) = get("/containerLogs/kube-system/registry-n1/registry").await;
+        assert_eq!((st, body.as_str()), (StatusCode::OK, "registry: out of memory\n"));
+
+        // Nothing recorded: a 404 that says what was looked at and how it
+        // ended, never "not found on this node".
+        let (st, body) = get("/containerLogs/kube-system/stormrdp-n1/stormrdp").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert!(body.contains("logs/stormrdp") && body.contains("last exit: exited 78"), "{body}");
+        assert!(!body.contains("not found on this node"), "{body}");
+        let (st, body) = get("/containerLogs/kube-system/stormrdp-n1/stormrdp?previous=true").await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(body.contains("exited 78"), "{body}");
+
+        // Running with an empty volume: the record is an earlier run's, not
+        // this one's, so it is not served as the current log.
+        let (st, body) = get("/containerLogs/kube-system/stormdrive-n1/stormdrive").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert!(body.contains("stormpump: running"), "{body}");
+
+        // Not a node service of this node.
+        let (_, body) = get("/containerLogs/kube-system/stormcluster-n2/stormcluster").await;
+        assert!(body.contains("not found on this node"), "{body}");
+    }
 }
 
 
@@ -697,10 +789,11 @@ async fn container_logs(
     Query(opts): Query<LogOptions>,
 ) -> Response {
     // A node service's mirror pod is no pod this kubelet runs (#72): its log
-    // is on the service's stormd log volume.
+    // is on the service's stormd log volume, or in PID 1's record of its last
+    // exit (#124).
     if pm.pod_uid(&namespace, &pod).await.is_none() && pm.waiting_reason(&namespace, &pod).is_none() {
-        if let Some(dir) = pm.node_service_log_dir(&namespace, &pod, &container) {
-            return node_service_logs(dir, &namespace, &pod, &container, opts).await;
+        if let Some(svc) = pm.node_service(&namespace, &pod, &container) {
+            return node_service_logs(svc, &namespace, &pod, &container, opts).await;
         }
     }
     let path = match log_file(&pm, &namespace, &pod, &container, &opts).await {
@@ -777,14 +870,21 @@ async fn container_logs(
 }
 
 /// `containerLogs` for a node service's mirror pod: its stormd log volume
-/// ([`crate::node_logs`]).
+/// ([`crate::node_logs`]), else what PID 1 kept of its last exit (#124).
 ///
 /// The current run is every process stormd runs there, rotations included,
 /// merged in time order. `previous` is the newest failed run. `follow` polls
 /// the live files, as for a pod, until the directory goes or the client hangs
 /// up; a line written in the instant between a poll and a rotation is missed.
+///
+/// A service that died before stormd wrote anything (a bad config, a missing
+/// root: stormcluster and stormrdp on 11.61), or one not run by stormd at all,
+/// has only stormpump's `last_output`: the last lines its incarnation wrote to
+/// PID 1's log. It is the current log of a service that is not running, and
+/// the previous one when stormd kept no failed run. It has no timestamps, so
+/// only `tailLines` and `limitBytes` apply, and there is nothing to follow.
 async fn node_service_logs(
-    dir: std::path::PathBuf,
+    svc: crate::pod_manager::NodeService,
     namespace: &str,
     pod: &str,
     container: &str,
@@ -792,31 +892,48 @@ async fn node_service_logs(
 ) -> Response {
     use crate::node_logs;
     let mut budget = opts.limit_bytes;
+    let crate::pod_manager::NodeService { log_dir, record } = svc;
+    let last_output = record.as_ref().map(|r| r.last_output.as_slice()).filter(|o| !o.is_empty());
 
     if opts.previous.unwrap_or(false) {
-        let Some(file) = node_logs::previous_failed(&dir) else {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("container {container} has no previous failed run in {}\n", dir.display()),
-            )
-                .into_response();
-        };
-        return match std::fs::read_to_string(&file) {
-            Ok(t) => (StatusCode::OK, cap(filter_log(&t, &opts), &mut budget)).into_response(),
-            Err(e) => (StatusCode::NOT_FOUND, format!("cannot read {}: {e}\n", file.display()))
-                .into_response(),
-        };
-    }
-
-    if node_logs::current_files(&dir).is_empty() {
-        // Named, because the likely cause is the volume not being visible
-        // here rather than the service writing nothing.
+        if let Some(file) = log_dir.as_deref().and_then(node_logs::previous_failed) {
+            return match std::fs::read_to_string(&file) {
+                Ok(t) => (StatusCode::OK, cap(filter_log(&t, &opts), &mut budget)).into_response(),
+                Err(e) => (StatusCode::NOT_FOUND, format!("cannot read {}: {e}\n", file.display()))
+                    .into_response(),
+            };
+        }
+        if let Some(lines) = last_output {
+            return (StatusCode::OK, cap(plain_log(lines, &opts), &mut budget)).into_response();
+        }
         return (
-            StatusCode::NOT_FOUND,
-            format!("no logs for container {container} in {namespace}/{pod}: nothing in {}\n", dir.display()),
+            StatusCode::BAD_REQUEST,
+            format!(
+                "container {container} has no previous failed run: {}\n",
+                node_service_sources(log_dir.as_deref(), record.as_ref())
+            ),
         )
             .into_response();
     }
+
+    let dir = match log_dir {
+        Some(d) if !node_logs::current_files(&d).is_empty() => d,
+        log_dir => {
+            if let (Some(lines), Some(false)) = (last_output, record.as_ref().map(|r| r.running)) {
+                return (StatusCode::OK, cap(plain_log(lines, &opts), &mut budget)).into_response();
+            }
+            // Named, because the likely cause is the volume not being visible
+            // here rather than the service writing nothing.
+            return (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "no logs for container {container} in {namespace}/{pod}: {}\n",
+                    node_service_sources(log_dir.as_deref(), record.as_ref())
+                ),
+            )
+                .into_response();
+        }
+    };
     let (text, mut offsets) = node_logs::read_current(&dir);
     let head = cap(filter_log(&text, &opts), &mut budget);
     if !opts.follow.unwrap_or(false) || budget == Some(0) {
@@ -858,6 +975,42 @@ async fn node_service_logs(
         .unwrap_or_else(|e| {
             (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response()
         })
+}
+
+/// What was looked at for a node service's log and found empty, and what PID
+/// 1 says about it: the body of a 404 or 400 that has to say why (#124).
+fn node_service_sources(
+    log_dir: Option<&std::path::Path>,
+    record: Option<&crate::node_logs::Record>,
+) -> String {
+    let mut why = vec![match log_dir {
+        Some(d) => format!("nothing in {}", d.display()),
+        None => "no stormd log volume in its boot unit".to_string(),
+    }];
+    match record {
+        None => why.push("not in PID 1's asset table".to_string()),
+        Some(r) => {
+            why.push(format!(
+                "stormpump: {}{}",
+                if r.running { "running" } else { "not running" },
+                if r.last_output.is_empty() { ", no output recorded" } else { "" }
+            ));
+            if let Some(e) = &r.last_exit {
+                why.push(format!("last exit: {e}"));
+            }
+            if let Some(e) = &r.last_error {
+                why.push(format!("last start refused: {e}"));
+            }
+        }
+    }
+    why.join("; ")
+}
+
+/// Lines with no CRI prefix (stormpump's `last_output`): `tailLines` applies;
+/// the time filters and `timestamps` have no timestamp to act on.
+fn plain_log(lines: &[String], opts: &LogOptions) -> String {
+    let from = opts.tail_lines.map_or(0, |n| lines.len().saturating_sub(n));
+    lines[from..].iter().map(|l| format!("{l}\n")).collect()
 }
 
 /// Upstream's answer to `logs` on a container that has not started.

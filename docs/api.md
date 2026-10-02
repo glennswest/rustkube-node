@@ -32,7 +32,7 @@ anonymous auth. See [credential behavior](configuration.md).
 | GET | `/metrics/cadvisor` | Runtime-supplied container/pod metric subset |
 | GET | `/stats/summary` | Partial CPU/memory and filesystem summary; node CPU/memory are container sums |
 | GET | `/pods` | Locally managed Pods, including recorded waiting Pods |
-| GET | `/containerLogs/{namespace}/{pod}/{container}` | Runtime logs or eligible stormd service-mirror logs |
+| GET | `/containerLogs/{namespace}/{pod}/{container}` | Runtime logs; a node service's mirror pod reads its stormd log volume, else PID 1's `last_output` for it (#124) |
 | GET | `/vmConsole/{namespace}/{name}/{door}` | `serial` or `vnc` through stormvm's router, with WebSocket upgrade |
 | GET | `/vmInstance/{address}` | Guest metadata from local VMI/address state; 404 when absent, 503 + `Retry-After: 2` while cold. Whether the metadata service (stormimds) asks this or keeps its own store is undecided (stormimds#12) |
 | DELETE | `/volumes/{namespace}/{claim}` | Built-in claim clone reclamation: 204 absent/deleted, 409 in use, 503 when safe release cannot be established |

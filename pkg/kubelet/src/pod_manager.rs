@@ -238,6 +238,14 @@ pub struct ResolvedVolume {
     pub fstype: Option<String>,
 }
 
+/// Where a node service's logs are (#72, #124): its stormd log volume, and
+/// what PID 1 recorded about its last exit. At least one is present.
+#[derive(Debug, Clone)]
+pub struct NodeService {
+    pub log_dir: Option<std::path::PathBuf>,
+    pub record: Option<crate::node_logs::Record>,
+}
+
 pub struct PodManager {
     runtime: Arc<dyn RuntimeService>,
     images: Arc<dyn ImageService>,
@@ -291,6 +299,8 @@ pub struct PodManager {
     volume_changes: tokio::sync::watch::Sender<u64>,
     /// Where the host's root is seen, for the node services' logs (#72).
     host_root: std::path::PathBuf,
+    /// PID 1's asset table, for a node service's last exit and output (#124).
+    assets_json: std::path::PathBuf,
     admission: Option<Arc<crate::workload::Reservations>>,
     start_images: std::sync::Mutex<HashMap<String,HashMap<ImageKey,ImageResult>>>,
     image_inflight: Arc<std::sync::Mutex<HashMap<ImageKey,ImageResult>>>,
@@ -388,6 +398,7 @@ impl PodManager {
             minting: Arc::new(std::sync::Mutex::new(HashMap::new())),
             volume_changes: tokio::sync::watch::channel(0).0,
             host_root: crate::node_logs::HOST_ROOT.into(),
+            assets_json: crate::node_logs::ASSETS_JSON.into(),
         }
     }
 
@@ -484,16 +495,17 @@ impl PodManager {
         self
     }
 
-    /// The stormd log directory behind a node service's mirror pod (#72):
-    /// `kube-system/<asset>-<node>`, container `<asset>`, and a boot unit that
-    /// mounts a volume at the asset's `/var/log/stormd`. `None` for anything
-    /// else, including a service not run by stormd.
-    pub fn node_service_log_dir(
-        &self,
-        namespace: &str,
-        pod: &str,
-        container: &str,
-    ) -> Option<std::path::PathBuf> {
+    /// Read PID 1's asset table from here rather than the host's `/run`: for tests.
+    pub fn with_assets_json(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.assets_json = path.into();
+        self
+    }
+
+    /// The node service behind a mirror pod (#72, #124):
+    /// `kube-system/<asset>-<node>`, container `<asset>`, and either a boot
+    /// unit that mounts a volume at the asset's `/var/log/stormd` or an entry
+    /// in PID 1's asset table. `None` for anything else.
+    pub fn node_service(&self, namespace: &str, pod: &str, container: &str) -> Option<NodeService> {
         if namespace != "kube-system" {
             return None;
         }
@@ -501,7 +513,14 @@ impl PodManager {
         if asset.is_empty() || asset != container {
             return None;
         }
-        crate::node_logs::log_dir(&self.host_root, asset)
+        let log_dir = crate::node_logs::log_dir(&self.host_root, asset);
+        let record = std::fs::read_to_string(&self.assets_json)
+            .ok()
+            .and_then(|t| crate::node_logs::record(&t, asset));
+        if log_dir.is_none() && record.is_none() {
+            return None;
+        }
+        Some(NodeService { log_dir, record })
     }
 
     /// Use this registry of CSI drivers: the one the kubelet's registration

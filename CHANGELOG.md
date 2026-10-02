@@ -2,6 +2,14 @@
 
 ## 2026-10-02
 
+- **fix:** `kubectl logs` on a node service's mirror pod (`kube-system/<asset>-<node>`)
+  no longer answers "pod not found on this node" when the service has nothing in its
+  stormd log volume (#124). A service that died before stormd wrote anything (stormcluster
+  and stormrdp on 11.61), or one not run by stormd (stormblock, registry), is served PID 1's
+  record of its last exit: `last_output` from `/run/stormpump/assets.json` (stormpump#51).
+  `--previous` falls back to it when stormd kept no `.failed.log`. With nothing recorded,
+  the 404/400 names the volume looked in, the last exit and any refused start. (11.61
+  itself carries the v0.12.0 kubelet, which predates #72's stormd-volume path.)
 - **docs:** Documentation refreshed from the code for changes since
   2026-09-25 (#54, #120, #121). `docs/status.md` is re-audited at fecb331,
   with a table of everything since 09-25 (UID workers, #100 unwind, #101 no
