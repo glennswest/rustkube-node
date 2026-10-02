@@ -70,7 +70,8 @@ the log-dir ENOSPC was a generic start error, so the pod went `Failed` and the D
 2. [x] Tests, docs (README, status.md), CHANGELOG. sc-build a72d4a1 `cargo build --locked && cargo test --locked`:
        277 kubelet unit, 4 integration, 25 CNI, 17 proxy, 1 doc-test pass (1 ignored); exit 0 in 97 s. Not run on a node.
 3. [x] Full filesystem filed as stormcos#231 (P0): server3 runs no new pod until the host has room.
-4. [ ] Stage golden, release request, close #129.
+4. [x] Stage golden golden-rustkube-node-cb302b196e29 (644d4ca), release request stormcos#164; #129 closed.
+       Live check after stormcos#231 and the release: the issue's SNO hard-power-off test on server3.
 
 ### Done: #103 (P0), a pulled non-golden image cannot be resolved by create_container
 
