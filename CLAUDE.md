@@ -66,7 +66,8 @@ not the release path.
    csi.md (inotify registry, 1 s retry), node-volumes.md updated. :5100 is sbregistry (#120).
 3. [x] Module comments (#54): cmd/kubelet main.rs, storage.rs (PID 1 mounts, container binds),
    server.rs `/vmInstance` (stormimds#12 undecided).
-4. [ ] CHANGELOG; commit, push, sc-build; comment on #54/#120/#121.
+4. [x] CHANGELOG; pushed 13517fb; sc-build `cargo build --locked && cargo test --locked` exit 0 in 91 s
+   (270 kubelet unit pass). Comments on #54/#120/#121; #106–#109 closed with pointers. Docs/comments only: no golden.
 
 ### Done: #117, a golden still importing (409 not sealed) waits, not a failed start
 
