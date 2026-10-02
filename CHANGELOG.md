@@ -2,6 +2,11 @@
 
 ## 2026-10-02
 
+- **fix:** A pulled (non-golden) image now starts under the stormpump runtime (#103).
+  `create_container` is handed the path `pull_image` returned, `/run/stormpump/images/<volume>`,
+  and resolved it as if it named a pallet (`/pallets/<volume>`), so every pulled image, every
+  component `/test` image among them, failed at start: "has no root — image … was never pulled".
+  That path is now the container's root as given (argv[0] lookup too); goldens resolve as before.
 - **fix:** `kubectl logs` on a node service's mirror pod (`kube-system/<asset>-<node>`)
   no longer answers "pod not found on this node" when the service has nothing in its
   stormd log volume (#124). A service that died before stormd wrote anything (stormcluster

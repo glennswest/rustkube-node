@@ -410,7 +410,7 @@ fn spec_for(config: &ContainerConfig, sandbox: &PodSandboxConfig) -> stormpump::
     // the engine still receives an absolute path.
     if let Some(first) = argv.first().cloned() {
         if !first.starts_with('/') {
-            match StormpumpImages::local_path(&config.image) {
+            match image_root(&config.image) {
                 Some(root) => match resolve_in_image(&root, &first) {
                     Some(abs) => argv[0] = abs,
                     None => tracing::warn!(
@@ -854,9 +854,11 @@ impl RuntimeService for StormpumpRuntime {
             volume_handles: Vec::new(),
             root_handle: None,
             // The image ref is the mounted path, which is what pull_image
-            // returned. A pod whose image was never pulled has none, and
-            // start_container says so rather than spawning onto nothing.
-            root_path: StormpumpImages::local_path(&config.image)
+            // returned: `/pallets/<name>` for a golden, `/run/stormpump/
+            // images/<volume>` for a pull (#103). A pod whose image was never
+            // pulled has none, and start_container says so rather than
+            // spawning onto nothing.
+            root_path: image_root(&config.image)
                 .map(|p| p.to_string_lossy().into_owned()),
             state: ContainerState::Created,
             created_at: now_nanos(),
@@ -1284,6 +1286,40 @@ const IMAGE_ROOT: &str = "/run/stormpump/images";
 /// Where the engine mounts a claim's block device for its pods to bind.
 const PVC_ROOT: &str = "/run/stormpump/pvc";
 
+/// The root a container of `image` runs on, or `None` when this node has none.
+///
+/// `image` is what the kubelet hands `create_container`: the reference
+/// [`StormpumpImages::pull_image`] returned, which is the mounted path. A
+/// golden's is `/pallets/<name>`; a pull's is `/run/stormpump/images/<volume>`,
+/// and that one is taken as given (#103). Mapping it through
+/// [`StormpumpImages::local_path`] as well made every pulled image look for
+/// `/pallets/<volume>`, and fail at start as "never pulled".
+///
+/// The pulled path is not checked for content from here: PID 1 mounted it in
+/// the node's namespace, which is where the engine resolves the root at spawn,
+/// and this process may not see that mount. A path that is not mounted fails
+/// there, with the engine's own error.
+/// Where [`StormpumpImages::pull_image`] mounts a pulled clone, and so the
+/// reference it returns for it.
+fn pulled_mount(volume: &str) -> String {
+    format!("{IMAGE_ROOT}/{volume}")
+}
+
+fn image_root(image: &str) -> Option<std::path::PathBuf> {
+    image_root_in(image, std::path::Path::new(PALLET_ROOT))
+}
+
+fn image_root_in(image: &str, pallets: &std::path::Path) -> Option<std::path::PathBuf> {
+    if let Some(rest) = image.strip_prefix(IMAGE_ROOT) {
+        // Exactly one component below the image root, which is what a pull
+        // makes: nothing above it, nothing beside it.
+        let volume = rest.strip_prefix('/')?;
+        let plain = !volume.is_empty() && !volume.contains('/') && volume != "." && volume != "..";
+        return plain.then(|| std::path::PathBuf::from(image));
+    }
+    StormpumpImages::local_path_in(image, pallets)
+}
+
 impl StormpumpImages {
     pub fn new(registry: impl Into<String>) -> StormpumpImages {
         StormpumpImages {
@@ -1382,12 +1418,16 @@ impl StormpumpImages {
     /// deliberately: a golden is one sealed filesystem and its version is the
     /// pallet's, not a string in a pod spec.
     fn local_path(image: &str) -> Option<std::path::PathBuf> {
+        Self::local_path_in(image, std::path::Path::new(PALLET_ROOT))
+    }
+
+    fn local_path_in(image: &str, pallets: &std::path::Path) -> Option<std::path::PathBuf> {
         let last = image.rsplit('/').next().unwrap_or(image);
         let name = last.split(['@', ':']).next().unwrap_or(last);
         if name.is_empty() {
             return None;
         }
-        let p = std::path::Path::new(PALLET_ROOT).join(name);
+        let p = pallets.join(name);
         // A directory that exists but is not a mount is an empty mount point —
         // the initramfs makes those for volumes it could not attach. Running a
         // container on one gives an empty root and a confusing failure, so it
@@ -1471,7 +1511,7 @@ impl ImageService for StormpumpImages {
 
         // 3. The engine mounts it, in the node's mount namespace rather than
         //    this container's.
-        let mount = format!("{IMAGE_ROOT}/{volume}");
+        let mount = pulled_mount(volume);
         ring.volume_register_device(&mount, device, "ext4").map_err(|e| {
             CriError::ImagePull(format!("stormpump would not mount {device} at {mount}: {e}"))
         })?;
@@ -1915,6 +1955,47 @@ mod tests {
         // whatever execve does with it.
         assert_eq!(env.iter().filter(|e| e.starts_with("HOME=")).count(), 1);
         assert_eq!(env.iter().filter(|e| e.starts_with("PATH=")).count(), 1);
+    }
+
+    /// #103: what a pull returns is what create_container is handed, and it
+    /// must resolve to that mount — not to `/pallets/<volume>`. The volume is
+    /// the one from the live repro on C2NR0Q2.
+    #[test]
+    fn a_pulled_image_resolves_to_its_mount() {
+        let pallets = tempfile::tempdir().unwrap();
+        let pulled = pulled_mount("clone-test-stormcos-qa-short-bf7012f9fe4b-18dad12e8a816346");
+        assert_eq!(
+            image_root_in(&pulled, pallets.path()),
+            Some(std::path::PathBuf::from(&pulled))
+        );
+        // The same reference again (a retry, or the second container of the
+        // image) resolves the same way: nothing is remembered between calls.
+        assert_eq!(image_root(&pulled), Some(std::path::PathBuf::from(&pulled)));
+        // Only a single volume directly below the image root.
+        for bad in [
+            IMAGE_ROOT.to_string(),
+            format!("{IMAGE_ROOT}/"),
+            format!("{IMAGE_ROOT}/.."),
+            format!("{IMAGE_ROOT}/a/b"),
+            format!("{IMAGE_ROOT}x/v"),
+        ] {
+            assert_eq!(image_root_in(&bad, pallets.path()), None, "{bad}");
+        }
+    }
+
+    /// A golden still resolves, by its ref or by the pallet path a pull of it
+    /// returns; a name with no pallet behind it (or an empty one) does not.
+    #[test]
+    fn a_golden_resolves_by_ref_or_by_pallet_path() {
+        let pallets = tempfile::tempdir().unwrap();
+        let busybox = pallets.path().join("busybox");
+        std::fs::create_dir_all(busybox.join("bin")).unwrap();
+        std::fs::create_dir_all(pallets.path().join("empty")).unwrap();
+        for image in ["busybox", "docker.io/library/busybox:latest", busybox.to_str().unwrap()] {
+            assert_eq!(image_root_in(image, pallets.path()), Some(busybox.clone()), "{image}");
+        }
+        assert_eq!(image_root_in("empty", pallets.path()), None);
+        assert_eq!(image_root_in("quay.io/x/nonesuch:1", pallets.path()), None);
     }
 
     /// The engine refuses a relative argv[0], and every real manifest writes
