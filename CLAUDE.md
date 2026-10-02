@@ -57,18 +57,19 @@ not the release path.
 
 ## Work plan
 
-### In progress: #124, `logs` on a stormpump:// mirror pod answers "not found on this node"
+### Done: #124, `logs` on a stormpump:// mirror pod answers "not found on this node"
 
 2026-10-02. Found: 11.61 (server1, stormcos#217) carries rustkube-node d5c0d2c (v0.12.0, base 11.50), which
 predates #72's stormd-volume path, so every mirror pod answered "not found". On main, #72 serves the stormd
 volume, but a service that dies before stormd writes it (stormcluster, stormrdp on 11.61), `--previous` with no
 `.failed.log`, and a service not run by stormd still had nothing. stormpump (#51, in 11.61's 95dbea4) records
 the dead incarnation's last 20 lines of its `w<id>.log` as `last_output` in assets.json.
-1. [ ] `node_logs::Record` from assets.json (`last_output`, `last_exit`, `last_error`); the mirror path resolves
+1. [x] `node_logs::Record` from assets.json (`last_output`, `last_exit`, `last_error`); the mirror path resolves
        the asset when assets.json lists it or a boot unit gives it a stormd volume.
-2. [ ] Current: stormd volume; else, asset not running, stormpump's `last_output`. Previous: newest `.failed.log`,
+2. [x] Current: stormd volume; else, asset not running, stormpump's `last_output`. Previous: newest `.failed.log`,
        else `last_output`. Nothing: 404/400 naming what was looked at (and the exit/refusal), never "not found".
-3. [ ] Tests, docs (README, api.md, status.md), CHANGELOG; push; sc-build.
+3. [x] Tests, docs (README, api.md, status.md), CHANGELOG. fc867c1; sc-build `cargo build --locked && cargo test --locked`:
+       272 kubelet unit, 4 integration, 25 CNI, 17 proxy, 1 doc-test pass (1 ignored); exit 0 in 89 s. Not run on a node.
 4. [ ] Close with evidence; stage golden; the live check is the next release on server1 (stormcos#217).
 
 ### Done: documentation refresh from code since 2026-09-25 (#54, #120, #121)
