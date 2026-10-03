@@ -57,6 +57,21 @@ not the release path.
 
 ## Work plan
 
+### In progress: #134 (P1), every start attempts=2; report outlier; serial work in sandbox/containers
+
+2026-10-02. pvetest1 (11.71): five busybox pods, all `attempts=2`, one `report=729ms`.
+Found: `prepare_images` spawns the image resolution and reads its result in the same call, before the
+task has run, so attempt 1 always returns `Pending("waiting for image …")` (a golden resolves in 0.1 ms) and
+the pod writes a ContainerCreating status PUT before the real one. `report` is exactly one status PUT (no GET,
+no tick): 729 ms is the apiserver's write. In `containers`, each container awaits three Event POSTs
+(Pulled, Created, Started) to the apiserver, serially, inside the timed step.
+1. [ ] Image grace: a just-asked image is waited for up to 100 ms (subscribed before the spawn), so a local
+       image starts on attempt 1 with no Pending write; a real pull still yields the worker.
+2. [ ] Events: Normal lifecycle Events on the start path go through one ordered background sender
+       (timestamps taken when recorded); Warnings stay inline.
+3. [ ] Tests, docs (README/status.md/metrics.md), CHANGELOG; sc-build; file the PUT latency on rustkube.
+4. [ ] Stage golden, release request, close #134 with what was verified.
+
 ### Done: #132 (P1), per-pod start timing (annotation, Event, histograms, one INFO line)
 
 2026-10-02. Owner: "Why 1 second? What's holding us up?" Nothing times the phases (#95 item 1).
