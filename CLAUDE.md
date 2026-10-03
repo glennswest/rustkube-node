@@ -57,7 +57,7 @@ not the release path.
 
 ## Work plan
 
-### In progress: #137 (P1), a finished Pod keeps its pod IP (Cilium range full at ~250)
+### Done: #137 (P1), a finished Pod keeps its pod IP (Cilium range full at ~250)
 
 2026-10-03. pvetest1 (11.72): 1,000 `restartPolicy: Never` sleep pods, 250 reach Succeeded, the rest wait on
 `range is full`. Found: nothing stops a terminal Pod's sandbox until the Pod object is deleted (the sync skips
@@ -70,7 +70,8 @@ Succeeded/Failed pods), and the stormpump runtime's `stop_pod_sandbox` only flip
 3. [x] Tests, docs (README, status.md), CHANGELOG (227fbfe, e9bbcb9). sc-build 227fbfe `cargo build --locked &&
        cargo test --locked`: 287 kubelet unit (2 new), 4 integration, 25 CNI, 17 proxy, 1 doc-test pass (1 ignored);
        exit 0 in 123 s. Not run on a node.
-4. [ ] Stage golden, release request, close. Live check after the release: stormcos_qa turbomode on pvetest1.
+4. [x] Stage golden golden-rustkube-node-9c5a14b04400 (3e4446b), release request stormcos#164; #137 closed.
+       Live check after the release: stormcos_qa turbomode on pvetest1 reaches 1,000 Succeeded.
 
 ### Done: #134 (P1), every start attempts=2; report outlier; serial work in sandbox/containers
 
