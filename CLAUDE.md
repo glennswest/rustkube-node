@@ -57,18 +57,22 @@ not the release path.
 
 ## Work plan
 
-### In progress: #138, starts queue under a burst (wait p50 2.4 s, max 9.3 s over 173 pods)
+### Done: #138, starts queue under a burst (wait p50 2.4 s, max 9.3 s over 173 pods)
 
 2026-10-03. pvetest1 (11.72), stormcos_qa turbomode. Found: every Pod/VMI pass runs on one executor with a
 fixed 8 workers (`workloads.run(self, 8)`). A start pass holds its worker through the sandbox (~200 ms), the
 status PUT and the start-timing annotation PATCH; each pod also gets a second pass 1 s later (its probes), with
 another status PUT. 173 pods in ~9.3 s is ~18/s, i.e. ~430 ms per pass across 8 workers: the pool is the
 queue. The ring (non-payload requests pipelined), CNI (no lock) and image pool are not.
-1. [ ] Worker pool: `--pod-workers` / `POD_WORKERS`, default 16 × CPUs clamped to [32, 256].
-2. [ ] The start-timing annotation PATCH off the worker (spawned, like the queued Events).
-3. [ ] Annotation: `workers=<busy>/<limit>` and `pending=<pods seen here, not yet started>` at the attempt's begin.
-4. [ ] The pass's "any adopted pod without its spec" guard reads under the lock instead of cloning every PodState.
-5. [ ] Tests, docs (README, configuration.md, status.md), CHANGELOG; sc-build; stage golden; close.
+1. [x] Worker pool: `--pod-workers` / `POD_WORKERS`, default 16 × CPUs clamped to [32, 256].
+2. [x] The start-timing annotation PATCH off the worker (spawned, like the queued Events).
+3. [x] Annotation: `workers=<busy>/<limit>` and `pending=<pods seen here, not yet started>` at the attempt's begin.
+4. [x] The pass's "any adopted pod without its spec" guard reads under the lock instead of cloning every PodState.
+5. [x] Tests, docs (README, configuration.md, status.md), CHANGELOG (20e95fc, b5f21c5). sc-build 20e95fc
+       `cargo build --locked && cargo test --locked`: 289 kubelet unit (2 new), 4 integration, 25 CNI, 17 proxy,
+       1 doc-test pass (1 ignored); exit 0 in 122 s. Not run on a node.
+6. [ ] Stage golden, release request, close. Live check after the release: turbomode on pvetest1, 50 pods,
+       wait p90 < 100 ms, total p90 < 500 ms; `workers=` says whether the pool is still the limit.
 
 ### Done: #137 (P1), a finished Pod keeps its pod IP (Cilium range full at ~250)
 
