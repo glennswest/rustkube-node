@@ -57,6 +57,21 @@ not the release path.
 
 ## Work plan
 
+### In progress: #140 (P0), every new claim on the Dell (11.76): "stormblock would not clone pvc-ext4j-64m"
+
+2026-10-03. C2NR0Q2 (Dell R230, 11.76: this repo at ac07686, stormblock v20.0.0); pvetest1 fine with the same
+release. The node's stormblock needs its token, so the refusal cannot be read from here. Found: `storage_post`
+answers `None` for a transport error (60 s request bound, no log at all) and for a 2xx that is not JSON, and the
+claim message never carries stormblock's answer. stormblock refuses a clone of a `ready` template whose sealed
+volume is missing (404 "volume … not found"), not sealed (409) or absent (500 "has no sealed snapshot"); nothing
+here rebuilds such a template, so every retry meets the same refusal.
+1. [ ] Engine POSTs (template clone, attach, snapshot clone) answer `Result` with stormblock's status and body, or
+       the transport error (timeout named); the claim's waiting message and FailedMount carry it.
+2. [ ] A clone refused because the template itself is broken: DELETE the template and mint it again (one mkfs);
+       the claim waits on the mint. A template still formatting, or a refusal about the clone, is not "broken".
+3. [ ] Tests (fake stormblock), docs (README, status.md), CHANGELOG; sc-build; stage golden; ask for the Dell
+       run to report the reason it now names.
+
 ### Done: #138, starts queue under a burst (wait p50 2.4 s, max 9.3 s over 173 pods)
 
 2026-10-03. pvetest1 (11.72), stormcos_qa turbomode. Found: every Pod/VMI pass runs on one executor with a
