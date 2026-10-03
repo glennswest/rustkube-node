@@ -63,11 +63,14 @@ not the release path.
 `range is full`. Found: nothing stops a terminal Pod's sandbox until the Pod object is deleted (the sync skips
 Succeeded/Failed pods), and the stormpump runtime's `stop_pod_sandbox` only flipped a state: CNI DEL ran in
 `remove_pod_sandbox`, which waits for every container record to go.
-1. [ ] stormpump `stop_pod_sandbox`: CNI DEL (an error keeps it Ready, retried) and the netns holder released,
+1. [x] stormpump `stop_pod_sandbox`: CNI DEL (an error keeps it Ready, retried) and the netns holder released,
        idempotent; `remove_pod_sandbox` does not DEL again.
-2. [ ] Pod manager: the pass that makes a pod Succeeded/Failed stops its sandbox (containers, status, logs kept);
+2. [x] Pod manager: the pass that makes a pod Succeeded/Failed stops its sandbox (containers, status, logs kept);
        a failed stop is retried on RECHECK from the terminal-skip branch (`PodState.sandbox_stopped`).
-3. [ ] Tests, docs (README, status.md), CHANGELOG; sc-build; stage golden; close.
+3. [x] Tests, docs (README, status.md), CHANGELOG (227fbfe, e9bbcb9). sc-build 227fbfe `cargo build --locked &&
+       cargo test --locked`: 287 kubelet unit (2 new), 4 integration, 25 CNI, 17 proxy, 1 doc-test pass (1 ignored);
+       exit 0 in 123 s. Not run on a node.
+4. [ ] Stage golden, release request, close. Live check after the release: stormcos_qa turbomode on pvetest1.
 
 ### Done: #134 (P1), every start attempts=2; report outlier; serial work in sandbox/containers
 
