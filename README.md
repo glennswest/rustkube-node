@@ -62,6 +62,35 @@ reconciler, VM startup backoff and disk-owner sweep remain active. A failed
 VMI LIST retains the last desired set; stopping a VMI detaches its disks,
 while the owner sweep decides when to delete them.
 
+## Pod start timing
+
+Every pod start says where its time went (#132). The kubelet keeps one record per pod
+UID from the moment its pod list (a watch event, or a static manifest read) delivers the
+pod, across every retry, to the moment the apiserver acknowledges `Running`, and then
+writes it once, as the annotation `storm.io/start-timing`, a `StartTiming` Event, the
+histogram `kubelet_pod_start_phase_duration_seconds{phase}` and one INFO log line:
+
+    storm.io/start-timing: scheduled=850ms wait=1.2ms image=0.3ms volumes=4.4ms sandbox=40ms
+      init=0.0ms containers=180ms report=8.1ms total=236ms attempts=1
+      volume/data=3.9ms volume/(serviceaccount)=0.4ms container/app=180ms
+
+| phase | from → to |
+|---|---|
+| `scheduled` | the pod's `PodScheduled` transition (else its `creationTimestamp`) → seen here. Wall clocks of two machines: negative when they disagree by more than the gap |
+| `wait` | seen → the start attempt that succeeded began: admission, image and volume waits, earlier attempts |
+| `image` | the pod's images first asked for → the last resolved. A golden is ~0; a pull is the registry's clone of the golden, its attach and its mount |
+| `volumes` | the pod's volumes in that attempt: claims cloned and attached, configMaps, secrets, projected, the ServiceAccount token, resolv.conf and log dirs. Each spec volume also as `volume/<name>` |
+| `sandbox` | the sandbox made, its network (CNI) included, → its address read |
+| `init` | init containers run to completion |
+| `containers` | every app container created and started; each also as `container/<name>` |
+| `report` | the `Running` status write sent → acknowledged |
+| `total` | seen → `Running` acknowledged |
+
+`image` overlaps `wait` (images resolve off the worker while the pod waits). A static pod
+has no API object, so it gets the log line and the histograms only. The annotation's merge
+patch changes the pod's resourceVersion; a status write racing it gets a 409 and is retried
+on the newer object.
+
 ## Components and runtime selection
 
 | Component | Source | Current role |

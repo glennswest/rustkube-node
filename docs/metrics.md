@@ -14,7 +14,8 @@ Code: `pkg/kubelet/src/metrics.rs`, and the handlers in `server.rs`.
 |---|---|---|
 | `kubelet_running_pods` | gauge | Pods with a sandbox |
 | `kubelet_running_containers{container_state}` | gauge | Containers the runtime lists, by state: `created`, `running`, `exited`, `unknown`. Every state is always present, 0 included |
-| `kubelet_pod_start_duration_seconds` | histogram | From the kubelet first seeing a pod to the pod started. Upstream's buckets, 0.5 s to 1 h |
+| `kubelet_pod_start_duration_seconds` | histogram | From the kubelet first seeing a pod (the pod list/watch delivering it) to the pod started. Upstream's buckets, 0.5 s to 1 h |
+| `kubelet_pod_start_phase_duration_seconds{phase}` | histogram | One phase of a pod start (#132): `scheduled`, `wait`, `image`, `volumes`, `sandbox`, `init`, `containers`, `report`, `total`, as in the `storm.io/start-timing` annotation ([README](../README.md#pod-start-timing)). Observed once per start, when `Running` is acknowledged; `scheduled` only when the two clocks give a non-negative gap. Buckets 0.5 ms to 300 s |
 | `kubelet_pleg_relist_duration_seconds` | histogram | One sync pass over the pods the kubelet already runs, re-reading their state from the runtime. This kubelet has no separate PLEG, so the pass is its relist, and it includes probes. Prometheus's default buckets |
 | `kubelet_timed_reconciles_total{worker,cause}` | counter | Work scheduled on a clock rather than by an event (#101). `cause="deadline"`: due work (a probe period, a backoff, a pending retry). `cause="fallback"`: a source with no event feed, polled (`pod`/`vmi` on a runtime without exit events, `engine-volumes` on a stormblock without its volume watch) |
 | `process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_virtual_memory_bytes`, `process_start_time_seconds`, `process_open_fds`, `process_max_fds` | gauge | Read from `/proc/self` on each scrape, by rustkube's `apimachinery::metrics` collector |

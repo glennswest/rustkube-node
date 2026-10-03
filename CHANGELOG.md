@@ -2,6 +2,16 @@
 
 ## 2026-10-02
 
+- **feat:** Per-pod start timing (#132). Each pod start is timed from the moment the pod list/watch
+  delivers it to the moment the apiserver acknowledges `Running`, across retries: `scheduled`
+  (PodScheduled → seen, wall clock), `wait`, `image` (a pull is the registry clone + attach + mount),
+  `volumes` (and each volume, the ServiceAccount token as `(serviceaccount)`), `sandbox` (network
+  included), `init`, `containers` (and each create+start), `report` (status PUT sent →
+  acknowledged), `total`, `attempts`. Published once per start as the pod annotation
+  `storm.io/start-timing`, a `StartTiming` Event, the histogram
+  `kubelet_pod_start_phase_duration_seconds{phase}` and one INFO log line. A static pod gets the
+  log line and histograms only. `kubelet_pod_start_duration_seconds` now counts from the same
+  seen moment (the list delivering the pod), not from a worker reaching it.
 - **fix:** A node whose filesystem is full no longer fails every new pod (#129). The kubelet
   discarded the errors from creating a pod's emptyDir, configMap, secret, projected and
   ServiceAccount-token directories and resolv.conf, so ENOSPC reached `describe` as "… does not

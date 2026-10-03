@@ -27,6 +27,7 @@ below has been measured on a node yet (#102, target C2NR0Q2 per #110).
 | No sync tick (#101) | Per-probe and backoff deadlines (`4320c20`); service mirror on `/run/stormpump` inotify (`08fc437`); claims mirror, reclaim, CSI sweep and VM maintenance on watches (`82f00c3`); `kubelet_timed_reconciles_total` |
 | Bounded calls (#99) | Ring requests 30 s from enqueue, CNI plugin exec 60 s, engine 5 s connect / 60 s request / 1 h mint (`db9b783`) |
 | Full node filesystem (#129) | Per-pod dirs, ServiceAccount token, resolv.conf and container log dirs written before the sandbox; a failed write (ENOSPC…) keeps the pod Pending with the errno instead of "does not exist" and `Failed` |
+| Pod start timing (#132) | Phases of each start (seen → images → volumes → sandbox → init → containers → Running acknowledged) as `storm.io/start-timing`, a `StartTiming` Event, `kubelet_pod_start_phase_duration_seconds{phase}` and one INFO line (`8009bd4`); not yet read on a node |
 | Tests | PVC medium-suite container and remote static-binary staging (`f63d8c2`, `38dba5a`); latest full sc-build at `c74b589`: 270 kubelet unit, 4 integration, 25 CNI, 17 proxy tests; live acceptance remains open |
 
 ## Owner decisions recorded, implementation pending
