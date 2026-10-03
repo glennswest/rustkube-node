@@ -65,12 +65,14 @@ answers `None` for a transport error (60 s request bound, no log at all) and for
 claim message never carries stormblock's answer. stormblock refuses a clone of a `ready` template whose sealed
 volume is missing (404 "volume … not found"), not sealed (409) or absent (500 "has no sealed snapshot"); nothing
 here rebuilds such a template, so every retry meets the same refusal.
-1. [ ] Engine POSTs (template clone, attach, snapshot clone) answer `Result` with stormblock's status and body, or
+1. [x] Engine POSTs (template clone, attach, snapshot clone) answer `Result` with stormblock's status and body, or
        the transport error (timeout named); the claim's waiting message and FailedMount carry it.
-2. [ ] A clone refused because the template itself is broken: DELETE the template and mint it again (one mkfs);
+2. [x] A clone refused because the template itself is broken: DELETE the template and mint it again (one mkfs);
        the claim waits on the mint. A template still formatting, or a refusal about the clone, is not "broken".
-3. [ ] Tests (fake stormblock), docs (README, status.md), CHANGELOG; sc-build; stage golden; ask for the Dell
-       run to report the reason it now names.
+3. [x] Tests (fake stormblock), docs (README, status.md), CHANGELOG (e3ca68d, de10176). sc-build de10176
+       `cargo build --locked && cargo test --locked`: 293 kubelet unit (4 new) and the other suites pass; exit 0
+       in 82 s. Not run on a node.
+4. [ ] Stage golden, release request; the Dell run names stormblock's reason (or heals a broken template).
 
 ### Done: #138, starts queue under a burst (wait p50 2.4 s, max 9.3 s over 173 pods)
 
