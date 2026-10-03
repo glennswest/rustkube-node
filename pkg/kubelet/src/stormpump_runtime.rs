@@ -714,10 +714,49 @@ impl RuntimeService for StormpumpRuntime {
         Ok(id)
     }
 
+    /// The network goes at stop, as CRI has it (#137): CNI DEL gives the
+    /// pod's address back and the namespace's holder is released. A finished
+    /// Pod is stopped long before it is removed (its container records and
+    /// logs stay until the Pod object goes), and DEL only at removal kept
+    /// every finished Pod's address until then: Cilium's range filled at
+    /// ~250 and every later Pod waited on "range is full".
+    ///
+    /// Idempotent. A failed DEL leaves the sandbox as it was, so the next
+    /// stop (or the removal) runs it again; a failed release keeps the handle
+    /// for the removal to retry.
     async fn stop_pod_sandbox(&self, sandbox_id: &str) -> Result<(), CriError> {
-        let mut sandboxes = self.sandboxes.lock().await;
-        if let Some(sb) = sandboxes.get_mut(sandbox_id) {
+        let existing = self.sandboxes.lock().await.get(sandbox_id).cloned();
+        let Some(sb) = existing else { return Ok(()) };
+        if let (Some(invoker), Some(ns)) = (&self.cni, &sb.netns) {
+            let pod = cni::PodNetwork::new(
+                sandbox_id,
+                ns,
+                &sb.config.namespace,
+                &sb.config.name,
+                &sb.config.uid,
+            );
+            invoker
+                .del(&pod)
+                .await
+                .map_err(|e| CriError::NetworkNotReady(format!("CNI DEL: {e}")))?;
+            tracing::info!(sandbox = %sandbox_id, pod = %sb.config.name, "CNI released the pod network");
+        }
+        let released = match sb.handle {
+            Some(h) => match self.on_ring(move |r| r.sandbox_release(h)).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(sandbox = %sandbox_id, "sandbox release at stop refused, retried at removal: {e}");
+                    false
+                }
+            },
+            None => true,
+        };
+        if let Some(sb) = self.sandboxes.lock().await.get_mut(sandbox_id) {
             sb.state = PodSandboxState::NotReady;
+            sb.netns = None;
+            if released {
+                sb.handle = None;
+            }
         }
         Ok(())
     }
@@ -726,12 +765,11 @@ impl RuntimeService for StormpumpRuntime {
         if self.containers.lock().await.values().any(|c|c.sandbox_id==sandbox_id) {
             return Err(CriError::Pending("sandbox still has container cleanup records".into()));
         }
+        // Whatever stop did not finish (a sandbox never stopped, a refused
+        // release) is done here; stop is idempotent.
+        self.stop_pod_sandbox(sandbox_id).await?;
         let existing=self.sandboxes.lock().await.get(sandbox_id).cloned();
         if let Some(sb)=existing {
-            if let (Some(invoker),Some(ns))=(&self.cni,&sb.netns) {
-                let pod=cni::PodNetwork::new(sandbox_id,ns,&sb.config.namespace,&sb.config.name,&sb.config.uid);
-                invoker.del(&pod).await.map_err(|e|CriError::NetworkNotReady(format!("CNI DEL: {e}")))?;
-            }
             if let Some(handle)=sb.handle {self.on_ring(move |r|r.sandbox_release(handle)).await?;}
         }
         self.sandboxes.lock().await.remove(sandbox_id);

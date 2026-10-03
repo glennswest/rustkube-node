@@ -61,6 +61,10 @@ pub struct PodState {
     /// each cycle, and an init report that existed only at start would appear
     /// once and then vanish, which is worse than never reporting it.
     pub init_statuses: Vec<InitContainerStatusReport>,
+    /// The sandbox was stopped once the pod finished (#137): its network
+    /// (and pod IP) given back, its containers' records and logs kept until
+    /// the Pod object goes.
+    pub sandbox_stopped: bool,
 }
 
 /// What one init container did.
@@ -2206,6 +2210,7 @@ impl PodManager {
                     started: HashMap::new(),
                     terminated: HashMap::new(),
                     init_statuses: Vec::new(),
+                    sandbox_stopped: false,
                 },
             );
             recovered += 1;
@@ -2280,6 +2285,10 @@ impl PodManager {
             // other, and its phase is corrected on the next status write.
             let restart_policy = pod["spec"]["restartPolicy"].as_str().unwrap_or("Always");
             if (phase == "Succeeded" || phase == "Failed") && restart_policy != "Always" {
+                // Its sandbox may still hold the network: the stop at the
+                // terminal pass failed, or this is that pass's own write
+                // coming back (#137). Retried until it is given back.
+                self.stop_finished_sandbox(uid).await;
                 continue;
             }
 
@@ -2672,7 +2681,7 @@ impl PodManager {
             sandbox_id:Some(sandbox_id.clone()),container_ids:HashMap::new(),
             phase:"Starting".into(),pod:pod.clone(),pod_ip:None,
             restart_counts:HashMap::new(),ready:HashMap::new(),liveness_failures:HashMap::new(),
-            startup_passed:HashMap::new(),started:HashMap::new(),terminated:HashMap::new(),init_statuses:Vec::new(),
+            startup_passed:HashMap::new(),started:HashMap::new(),terminated:HashMap::new(),init_statuses:Vec::new(),sandbox_stopped:false,
         });
         sandbox_id
         };
@@ -2907,6 +2916,7 @@ impl PodManager {
                     started: started_map,
                     terminated: HashMap::new(),
                     init_statuses: init_statuses.clone(),
+                    sandbox_stopped: false,
                 },
             );
         }
@@ -3468,6 +3478,7 @@ impl PodManager {
             "Running"
         };
         state.phase = phase.to_string();
+        let finished = phase != "Running";
 
         let update = PodStatusUpdate {
             namespace: state.namespace.clone(),
@@ -3489,8 +3500,50 @@ impl PodManager {
             let mut pods = self.pods.write().await;
             pods.insert(uid.to_string(), state);
         }
+        if finished {
+            self.stop_finished_sandbox(uid).await;
+        }
 
         Ok(update)
+    }
+
+    /// A finished pod (Succeeded or Failed: every container terminated for
+    /// good) gives its sandbox's network back now, not when the Pod object is
+    /// deleted (#137). Upstream's kubelet does the same: the sandbox of a pod
+    /// that will not run again is stopped, CNI DEL frees its address, and the
+    /// containers' records, status and logs stay until the Pod goes.
+    ///
+    /// Without this a `restartPolicy: Never` Job pod held its address until
+    /// something deleted it: 1,000 sleep pods on pvetest1 filled Cilium's
+    /// range at ~250 and the rest waited on "range is full".
+    ///
+    /// Once per pod; a failure is retried on RECHECK (the worker's next pass
+    /// reaches the terminal branch of the sync, which calls this again).
+    async fn stop_finished_sandbox(&self, uid: &str) {
+        let (sandbox, namespace, name) = {
+            let pods = self.pods.read().await;
+            let Some(state) = pods.get(uid) else { return };
+            if state.sandbox_stopped {
+                return;
+            }
+            (state.sandbox_id.clone(), state.namespace.clone(), state.name.clone())
+        };
+        if let Some(sandbox) = &sandbox {
+            match self.runtime.stop_pod_sandbox(sandbox).await {
+                Ok(()) | Err(CriError::NotFound(_)) => {
+                    info!("Pod {namespace}/{name} finished: sandbox {sandbox} stopped, network released");
+                }
+                Err(e) => {
+                    apimachinery::reactor::failed();
+                    warn!("Pod {namespace}/{name} finished but its sandbox did not stop (retried): {e}");
+                    self.due_in(uid, deadlines::RECHECK);
+                    return;
+                }
+            }
+        }
+        if let Some(state) = self.pods.write().await.get_mut(uid) {
+            state.sandbox_stopped = true;
+        }
     }
 
     /// Stop, remove, and recreate a container. Returns true on success;
@@ -3884,6 +3937,7 @@ impl PodManager {
                 started: HashMap::new(),
                 terminated: HashMap::new(),
                 init_statuses: Vec::new(),
+                sandbox_stopped: false,
             },
         );
         info!("Registered restored pod {namespace}/{name} with sandbox {sandbox_id}");
@@ -4786,6 +4840,9 @@ pub(crate) mod tests {
         removed_sandboxes: Mutex<Vec<String>>,
         removed_containers: Mutex<Vec<String>>,
         fail_stop: AtomicBool,
+        /// stop_pod_sandbox fails while set (#137).
+        fail_sandbox_stop: AtomicBool,
+        stopped_sandboxes: Mutex<Vec<String>>,
         slow_image: Mutex<Option<Arc<tokio::sync::Notify>>>,
         image_pulls: AtomicU32,
     }
@@ -4855,6 +4912,10 @@ pub(crate) mod tests {
         }
 
         async fn stop_pod_sandbox(&self, sandbox_id: &str) -> Result<(), CriError> {
+            if self.fail_sandbox_stop.load(Ordering::SeqCst) {
+                return Err(CriError::NetworkNotReady("CNI DEL: injected".into()));
+            }
+            self.stopped_sandboxes.lock().unwrap().push(sandbox_id.to_string());
             if let Some(entry) = self.sandboxes.lock().unwrap().get_mut(sandbox_id) {
                 entry.0 = PodSandboxState::NotReady;
             }
@@ -5074,6 +5135,7 @@ pub(crate) mod tests {
             started: HashMap::new(),
             terminated: HashMap::new(),
             init_statuses: Vec::new(),
+            sandbox_stopped: false,
         }
     }
 
@@ -6328,6 +6390,61 @@ pub(crate) mod tests {
         let u = &outcome.updates[0];
         assert_eq!(u.phase, "Failed");
         assert_eq!(u.container_statuses[0].exit_code, 2);
+    }
+
+    // #137: a finished pod's sandbox (and so its pod IP) is given back when
+    // it finishes, not when the Pod object is deleted. Its container records
+    // stay, for status and logs.
+    #[tokio::test]
+    async fn finished_never_pod_stops_its_sandbox_and_keeps_its_containers() {
+        let (rt, mgr) = manager();
+        let p = pod("uid-1", "job", "Never", simple_container());
+        mgr.sync_pods(&[p.clone()]).await;
+        let sandbox = mgr.get_sandbox_id("uid-1").await.unwrap();
+        assert!(rt.stopped_sandboxes.lock().unwrap().is_empty(), "running: not stopped");
+
+        let cid = rt.container_ids().pop().unwrap();
+        rt.set_container_state(&cid, ContainerState::Exited, 0);
+        let outcome = mgr.sync_pods(&[p.clone()]).await;
+        assert_eq!(outcome.updates[0].phase, "Succeeded");
+        assert_eq!(*rt.stopped_sandboxes.lock().unwrap(), vec![sandbox.clone()]);
+        assert_eq!(rt.sandboxes.lock().unwrap()[&sandbox].0, PodSandboxState::NotReady);
+        assert!(rt.removed_sandboxes.lock().unwrap().is_empty(), "removed only with the Pod");
+        assert_eq!(rt.container_ids(), vec![cid], "container record kept for logs");
+
+        // The apiserver now says Succeeded: nothing is stopped again.
+        let mut done = p.clone();
+        done["status"] = json!({"phase": "Succeeded"});
+        mgr.sync_pods(&[done.clone()]).await;
+        assert_eq!(rt.stopped_sandboxes.lock().unwrap().len(), 1);
+
+        // Deleting the Pod removes the rest.
+        mgr.sync_pods(&[]).await;
+        assert_eq!(*rt.removed_sandboxes.lock().unwrap(), vec![sandbox]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_sandbox_stop_of_a_finished_pod_is_retried() {
+        let (rt, mgr) = manager();
+        let p = pod("uid-1", "job", "Never", simple_container());
+        mgr.sync_pods(&[p.clone()]).await;
+        let cid = rt.container_ids().pop().unwrap();
+        rt.set_container_state(&cid, ContainerState::Exited, 2);
+        rt.fail_sandbox_stop.store(true, Ordering::SeqCst);
+        let outcome = mgr.sync_pods(&[p.clone()]).await;
+        assert_eq!(outcome.updates[0].phase, "Failed", "status still reported");
+        assert!(rt.stopped_sandboxes.lock().unwrap().is_empty());
+        assert!(mgr.take_due("uid-1").is_some_and(|d| d <= deadlines::RECHECK), "retried");
+
+        // The retry comes through the terminal branch: the pod reads Failed.
+        rt.fail_sandbox_stop.store(false, Ordering::SeqCst);
+        let mut done = p.clone();
+        done["status"] = json!({"phase": "Failed"});
+        let outcome = mgr.sync_pods(&[done.clone()]).await;
+        assert!(outcome.updates.is_empty());
+        assert_eq!(rt.stopped_sandboxes.lock().unwrap().len(), 1);
+        mgr.sync_pods(&[done]).await;
+        assert_eq!(rt.stopped_sandboxes.lock().unwrap().len(), 1, "once");
     }
 
     #[tokio::test]
