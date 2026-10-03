@@ -342,6 +342,12 @@ enum Mint {
 /// still come (a 1 TiB blank formatting, an engine restarting).
 pub const VOLUME_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+
+/// How long a start waits for an image it has just asked for before it
+/// yields the worker (#134): far above a local resolution (0.1 ms on
+/// pvetest1), far below a registry pull.
+const IMAGE_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+
 impl PodManager {
     pub fn subscribe_volume_changes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.volume_changes.subscribe()
@@ -467,6 +473,31 @@ impl PodManager {
         Ok(())
     }
 
+    /// [`Self::prepare_images`], waiting up to [`IMAGE_GRACE`] for an image
+    /// it has only just asked for (#134). The resolution runs in a task, so
+    /// the first look always found it unanswered: every pod's first attempt
+    /// returned "waiting for image", wrote a ContainerCreating status, and was
+    /// started by a second attempt, for a golden that resolves in 0.1 ms. A
+    /// pull that takes longer than the grace still yields the worker, and the
+    /// image's completion wakes the pod as before.
+    async fn ready_images(&self,pod:&Value)->Result<(),CriError> {
+        // Subscribed before the first look: a resolution that finishes
+        // between the look and the wait is not missed.
+        let mut changed=self.image_changes.subscribe();
+        let deadline=tokio::time::Instant::now()+IMAGE_GRACE;
+        loop {
+            match self.prepare_images(pod) {
+                Err(CriError::Pending(what))=>{
+                    match tokio::time::timeout_at(deadline,changed.recv()).await {
+                        Err(_)|Ok(Err(tokio::sync::broadcast::error::RecvError::Closed))=>return Err(CriError::Pending(what)),
+                        Ok(_)=>{}
+                    }
+                }
+                other=>return other,
+            }
+        }
+    }
+
     async fn startup_image(&self,pod:&Value,image:&str,spec:&Value)->Result<String,CriError> {
         if self.admission.is_none() {return self.ensure_image(image,spec).await;}
         let key=(image.to_string(),effective_pull_policy(spec,image).to_string());
@@ -580,6 +611,14 @@ impl PodManager {
     async fn event(&self, pod: &Value, etype: &str, reason: &str, message: &str) {
         if let Some(r) = &self.events {
             r.pod_event(pod, etype, reason, message).await;
+        }
+    }
+
+    /// An ordinary lifecycle event, queued rather than awaited (#134): see
+    /// [`crate::events::EventRecorder::pod_event_later`].
+    async fn event_later(&self, pod: &Value, reason: &str, message: &str) {
+        if let Some(r) = &self.events {
+            r.pod_event_later(pod, "Normal", reason, message).await;
         }
     }
 
@@ -2587,7 +2626,7 @@ impl PodManager {
 
         info!("Starting pod {namespace}/{name}");
         let mut attempt = crate::start_timing::Attempt::begin();
-        if self.admission.is_some() {self.prepare_images(pod)?;}
+        if self.admission.is_some() {self.ready_images(pod).await?;}
 
         let sandbox_config = build_sandbox_config(pod);
         let step = Instant::now();
@@ -2717,9 +2756,8 @@ impl PodManager {
                 .flatten()
                 .is_some();
             if !present {
-                self.event(
+                self.event_later(
                     pod,
-                    "Normal",
                     "Pulling",
                     &format!("Pulling image \"{image}\""),
                 )
@@ -2730,17 +2768,15 @@ impl PodManager {
                     if present {
                         // Upstream's word for an image that was already
                         // there, and the one `describe` readers expect.
-                        self.event(
+                        self.event_later(
                             pod,
-                            "Normal",
                             "Pulled",
                             &format!("Container image \"{image}\" already present on machine"),
                         )
                         .await;
                     } else {
-                        self.event(
+                        self.event_later(
                             pod,
-                            "Normal",
                             "Pulled",
                             &format!("Successfully pulled image \"{image}\""),
                         )
@@ -2784,9 +2820,8 @@ impl PodManager {
                 .await
             {
                 Ok(id) => {
-                    self.event(
+                    self.event_later(
                         pod,
-                        "Normal",
                         "Created",
                         &format!("Created container {container_name}"),
                     )
@@ -2819,9 +2854,8 @@ impl PodManager {
                 .await;
                 return Err(e);
             }
-            self.event(
+            self.event_later(
                 pod,
-                "Normal",
                 "Started",
                 &format!("Started container {container_name}"),
             )
@@ -3709,7 +3743,7 @@ impl PodManager {
         if self.api_url.is_empty() || pod["metadata"]["resourceVersion"].as_str().is_none() {
             return;
         }
-        self.event(pod, "Normal", crate::start_timing::REASON, &finished.text).await;
+        self.event_later(pod, crate::start_timing::REASON, &finished.text).await;
         let patch = serde_json::json!({"metadata": {"uid": uid, "annotations": {
             crate::start_timing::ANNOTATION: finished.text}}});
         let sent = self
@@ -5557,6 +5591,20 @@ pub(crate) mod tests {
         let mut changed=mgr.subscribe_image_changes();
         gate.notify_one();changed.recv().await.unwrap();
         assert_eq!(mgr.start_pod(&slow).await.unwrap().phase,"Running");
+    }
+
+    /// #134: an image resolved off the worker in well under the grace is
+    /// waited for, so the first attempt starts the pod (it took two).
+    #[tokio::test]
+    async fn a_local_image_starts_the_pod_on_the_first_attempt() {
+        let (rt,mgr)=manager();let e=crate::workload::Executor::new();
+        let mgr=mgr.with_admission(e.reservations.clone());
+        let p=pod("first","first","Always",json!({"name":"app","image":"fast"}));
+        assert_eq!(mgr.start_pod(&p).await.unwrap().phase,"Running");
+        assert_eq!(rt.image_pulls.load(Ordering::SeqCst),1);
+        let t=mgr.timings.lock().unwrap()["first"].clone();
+        let text=t.finish(std::time::Duration::ZERO,Instant::now()).text;
+        assert!(text.contains("attempts=1"),"{text}");
     }
 
     #[tokio::test]
