@@ -57,7 +57,7 @@ not the release path.
 
 ## Work plan
 
-### In progress: #134 (P1), every start attempts=2; report outlier; serial work in sandbox/containers
+### Done: #134 (P1), every start attempts=2; report outlier; serial work in sandbox/containers
 
 2026-10-02. pvetest1 (11.71): five busybox pods, all `attempts=2`, one `report=729ms`.
 Found: `prepare_images` spawns the image resolution and reads its result in the same call, before the
@@ -72,7 +72,8 @@ no tick): 729 ms is the apiserver's write. In `containers`, each container await
 3. [x] Tests, docs (README, status.md), CHANGELOG (5f6af4f, 23d33f3). sc-build 5f6af4f `cargo build --locked &&
        cargo test --locked`: 285 kubelet unit (2 new), 25 CNI, 17 proxy, 1 doc-test pass (1 ignored); exit 0.
        Not run on a node. PUT outlier filed as rustkube#191. Remaining sandbox/containers time is stormpump work.
-4. [ ] Stage golden, release request, close #134 with what was verified.
+4. [x] Stage golden golden-rustkube-node-31c042c9e59a (1d2d711), release request stormcos#164; #134 closed.
+       Live check after the release: five busybox pods on pvetest1 read `attempts=1`.
 
 ### Done: #132 (P1), per-pod start timing (annotation, Event, histograms, one INFO line)
 
