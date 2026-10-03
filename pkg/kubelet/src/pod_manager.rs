@@ -310,6 +310,8 @@ pub struct PodManager {
     /// PID 1's asset table, for a node service's last exit and output (#124).
     assets_json: std::path::PathBuf,
     admission: Option<Arc<crate::workload::Reservations>>,
+    /// The executor's pool, for the start-timing annotation (#138).
+    load: Option<Arc<crate::workload::Load>>,
     start_images: std::sync::Mutex<HashMap<String,HashMap<ImageKey,ImageResult>>>,
     image_inflight: Arc<std::sync::Mutex<HashMap<ImageKey,ImageResult>>>,
     image_slots: Arc<tokio::sync::Semaphore>,
@@ -385,6 +387,7 @@ impl PodManager {
             images,
             pods: RwLock::new(HashMap::new()),
             admission: None,
+            load: None,
             start_images: Default::default(),
             image_inflight: Default::default(),
             image_slots: Arc::new(tokio::sync::Semaphore::new(4)),
@@ -519,6 +522,18 @@ impl PodManager {
     pub fn with_admission(mut self, admission: Arc<crate::workload::Reservations>) -> Self {
         self.admission = Some(admission);
         self
+    }
+
+    pub fn with_load(mut self, load: Arc<crate::workload::Load>) -> Self {
+        self.load = Some(load);
+        self
+    }
+
+    /// A pod adopted from the runtime whose spec no list has given yet. Read
+    /// under the lock: every pass asks, and cloning every pod's state for it
+    /// was O(pods) per pass (#138).
+    pub async fn has_unspecified(&self) -> bool {
+        self.pods.read().await.values().any(|p| p.pod.is_null())
     }
 
     pub async fn known_pods(&self) -> Vec<PodState> {
@@ -2635,6 +2650,15 @@ impl PodManager {
 
         info!("Starting pod {namespace}/{name}");
         let mut attempt = crate::start_timing::Attempt::begin();
+        let pending = self
+            .timings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|t| !t.is_started())
+            .count()
+            .max(1);
+        attempt.queue(self.load.as_ref().map(|l| l.text()), pending);
         if self.admission.is_some() {self.ready_images(pod).await?;}
 
         let sandbox_config = build_sandbox_config(pod);
@@ -3799,18 +3823,21 @@ impl PodManager {
         self.event_later(pod, crate::start_timing::REASON, &finished.text).await;
         let patch = serde_json::json!({"metadata": {"uid": uid, "annotations": {
             crate::start_timing::ANNOTATION: finished.text}}});
-        let sent = self
+        // Off the worker (#138): the pod is running and reported, and its
+        // pass held a worker another pod's start was queued for while this
+        // write went to the apiserver.
+        let request = self
             .api_client
             .patch(format!("{}/api/v1/namespaces/{namespace}/pods/{name}", self.api_url))
             .header("content-type", "application/merge-patch+json")
             .timeout(std::time::Duration::from_secs(10))
-            .json(&patch)
-            .send()
-            .await
-            .and_then(|r| r.error_for_status());
-        if let Err(error) = sent {
-            warn!(%error, "Pod {namespace}/{name}: start timing annotation not written");
-        }
+            .json(&patch);
+        let pod_name = format!("{namespace}/{name}");
+        tokio::spawn(async move {
+            if let Err(error) = request.send().await.and_then(|r| r.error_for_status()) {
+                warn!(%error, "Pod {pod_name}: start timing annotation not written");
+            }
+        });
     }
 
     fn retry_wait(&self, uid: &str, waited: std::time::Duration) {
@@ -6625,7 +6652,7 @@ pub(crate) mod tests {
         assert!(t.is_started());
         let text = t.finish(std::time::Duration::from_millis(3), Instant::now()).text;
         for part in ["wait=", "image=", "volumes=", "sandbox=", "init=", "containers=",
-            "report=3.0ms", "total=", "attempts=1", "volume/scratch=", "container/app="] {
+            "report=3.0ms", "total=", "attempts=1", "pending=1", "volume/scratch=", "container/app="] {
             assert!(text.contains(part), "{part} in {text}");
         }
 
@@ -6637,6 +6664,26 @@ pub(crate) mod tests {
         assert!(!mgr.timings.lock().unwrap().contains_key("uid-timed"));
         // A later Running report (a check, not a start) publishes nothing.
         mgr.start_reported(&p, std::time::Duration::ZERO).await;
+    }
+
+    /// #138: a start says what it queued behind, the executor's pool and the
+    /// pods seen here and not yet started.
+    #[tokio::test]
+    async fn a_start_says_what_it_queued_behind() {
+        let (_rt, mgr) = manager();
+        let load = Arc::new(crate::workload::Load::default());
+        load.busy.store(5, Ordering::Relaxed);
+        load.limit.store(32, Ordering::Relaxed);
+        let mgr = mgr.with_load(load);
+        let a = pod("uid-a", "a", "Always", simple_container());
+        let b = pod("uid-b", "b", "Always", simple_container());
+        mgr.note_seen(&[a.clone(), b.clone()]).await;
+        mgr.sync_pods_observed(&[a], false).await;
+        let text = mgr.timings.lock().unwrap()["uid-a"]
+            .finish(std::time::Duration::ZERO, Instant::now())
+            .text;
+        assert!(text.contains("workers=5/32"), "{text}");
+        assert!(text.contains("pending=2"), "{text}");
     }
 
     /// #132: a pod that waited counts its attempts, and the wait is the

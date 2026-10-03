@@ -91,6 +91,11 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     no_cni: bool,
 
+    /// Pod and VMI passes (starts, status checks, teardowns) run at once.
+    /// Default: 16 per CPU, at least 32, at most 256.
+    #[arg(long, env = "POD_WORKERS")]
+    pod_workers: Option<usize>,
+
     /// Port for the kubelet's inbound HTTP server (/healthz, /metrics, /pods).
     #[arg(long, env = "KUBELET_PORT", default_value_t = 10250)]
     kubelet_port: u16,
@@ -485,6 +490,7 @@ async fn main() -> anyhow::Result<()> {
         server_auth_token,
         anonymous_auth: cli.anonymous_auth,
         engine: engine.clone(),
+        pod_workers: cli.pod_workers.unwrap_or_else(kubelet::workload::default_workers).max(1),
         ..Default::default()
     };
     let mut kubelet = Kubelet::new(config, runtime, images, migration)?;

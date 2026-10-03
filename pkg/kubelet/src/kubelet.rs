@@ -29,6 +29,8 @@ pub struct KubeletConfig {
     pub register_with_taints: Vec<serde_json::Value>,
     pub heartbeat_interval: Duration,
     pub sync_interval: Duration,
+    /// Pod/VMI passes run at once, in the one executor (`--pod-workers`, #138).
+    pub pod_workers: usize,
     /// Port for the kubelet's inbound HTTP server (upstream 10250).
     pub kubelet_port: u16,
     /// Cluster CA (PEM) to trust for an HTTPS apiserver. None → no custom root.
@@ -68,6 +70,7 @@ impl Default for KubeletConfig {
             register_with_taints: Vec::new(),
             heartbeat_interval: Duration::from_secs(10),
             sync_interval: Duration::from_secs(2),
+            pod_workers: crate::workload::default_workers(),
             kubelet_port: 10250,
             apiserver_ca: None,
             bearer_token: None,
@@ -166,7 +169,8 @@ impl Kubelet {
             .with_ca_pem(config.apiserver_ca.clone())
             .with_engine(config.engine.clone())
             .with_csi(csi.clone())
-            .with_admission(workloads.reservations.clone()),
+            .with_admission(workloads.reservations.clone())
+            .with_load(workloads.load.clone()),
         );
 
         Ok(Self {
@@ -372,7 +376,7 @@ impl Kubelet {
 
         // One bounded executor for both kinds; producers never perform runtime I/O.
         tokio::try_join!(self.pod_loop(), self.vm_loop(), self.vm_maintenance_loop(), async {
-            self.workloads.run(self.clone(), 8).await;
+            self.workloads.run(self.clone(), self.config.pod_workers).await;
             Ok::<(), anyhow::Error>(())
         })?;
         Ok(())
@@ -1245,7 +1249,7 @@ impl workload::Adapter for Kubelet {
             && !workload::dependencies(key,&object).iter().any(|d| matches!(d,Dependency::Claim(..)));
         if !static_without_claims {
             if !self.pods_synced.load(Ordering::Acquire) || !self.vmis_synced.load(Ordering::Acquire)
-                || self.pod_manager.known_pods().await.iter().any(|p|p.pod.is_null())
+                || self.pod_manager.has_unspecified().await
                 || match &self.vms {Some(v)=>v.has_unknown_claims().await,None=>false} {
                 return Ok(Next::After(retry));
             }

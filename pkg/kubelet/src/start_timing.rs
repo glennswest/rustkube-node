@@ -21,6 +21,11 @@
 //! | `report`     | the `Running` status sent → acknowledged |
 //! | `total`      | seen → `Running` acknowledged |
 //!
+//! Two counts say what the attempt queued behind (#138): `workers=<busy>/<limit>`,
+//! the executor's passes running when it began (this one included) out of
+//! `--pod-workers`, and `pending=<n>`, the pods seen here and not yet started
+//! (this one included).
+//!
 //! `image` overlaps `wait` (an image is resolved off the worker while the pod
 //! waits); the rest follow one another, so `wait + volumes + sandbox + init +
 //! containers + report` is `total` less the gaps between steps.
@@ -64,11 +69,17 @@ pub struct Attempt {
     init: Duration,
     containers: Duration,
     per_container: Vec<(String, Duration)>,
+    /// The executor's pool when the attempt began, `busy/limit` (#138).
+    workers: Option<String>,
+    /// Pods seen here and not yet started when it began, this one included.
+    pending: Option<usize>,
 }
 
 impl Attempt {
     pub fn begin() -> Self {
         Self {
+            workers: None,
+            pending: None,
             began: Instant::now(),
             volumes: Duration::ZERO,
             per_volume: Vec::new(),
@@ -77,6 +88,11 @@ impl Attempt {
             containers: Duration::ZERO,
             per_container: Vec::new(),
         }
+    }
+    /// What the attempt queued behind: the pool, and the pods still waiting.
+    pub fn queue(&mut self, workers: Option<String>, pending: usize) {
+        self.workers = workers;
+        self.pending = Some(pending);
     }
     pub fn volume(&mut self, name: &str, took: Duration) {
         self.per_volume.push((name.to_string(), took));
@@ -170,6 +186,12 @@ impl StartTiming {
         put("report", report);
         put("total", total);
         text.push(format!("attempts={}", self.attempts.max(1)));
+        if let Some(w) = a.and_then(|a| a.workers.as_deref()) {
+            text.push(format!("workers={w}"));
+        }
+        if let Some(p) = a.and_then(|a| a.pending) {
+            text.push(format!("pending={p}"));
+        }
         if let Some(a) = a {
             for (name, d) in &a.per_volume {
                 text.push(format!("volume/{name}={}", ms(*d)));

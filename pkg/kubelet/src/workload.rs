@@ -3,6 +3,7 @@ use apimachinery::workqueue::WorkQueue;
 use futures::{stream::FuturesUnordered, StreamExt, FutureExt};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -307,12 +308,40 @@ pub trait Adapter: Send + Sync {
     async fn reconcile(&self, key: &Key, desired: Option<Value>) -> anyhow::Result<Next>;
 }
 
+/// How busy the executor's pool is, read by a start to say where its wait
+/// went (#138).
+#[derive(Debug, Default)]
+pub struct Load {
+    /// Passes running now.
+    pub busy: AtomicUsize,
+    /// The pool's size (`--pod-workers`).
+    pub limit: AtomicUsize,
+}
+
+impl Load {
+    /// `busy/limit`, as the start-timing annotation writes it.
+    pub fn text(&self) -> String {
+        format!("{}/{}", self.busy.load(Ordering::Relaxed), self.limit.load(Ordering::Relaxed))
+    }
+}
+
+/// The pool's size when `--pod-workers` is not given (#138): 16 per CPU,
+/// at least 32 and at most 256. A pass is mostly waiting (CNI, the engine,
+/// the apiserver), not computing, so a pool sized to the CPUs alone queues
+/// starts behind each other's waits; 8 fixed workers held 173 pods up to
+/// 9.3 s on pvetest1.
+pub fn default_workers() -> usize {
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    (cpus * 16).clamp(32, 256)
+}
+
 /// Producers publish desired state before enqueueing. All runtime kinds share
 /// the same bounded pool; WorkQueue guarantees one active pass per UID.
 pub struct Executor {
     pub ready: Arc<WorkQueue<Key>>,
     desired: Mutex<Desired>,
     pub reservations: Arc<Reservations>,
+    pub load: Arc<Load>,
 }
 impl Executor {
     pub fn new() -> Arc<Self> {
@@ -321,6 +350,7 @@ impl Executor {
             reservations: Arc::new(Reservations::new(ready.clone())),
             ready,
             desired: Mutex::new(Desired::default()),
+            load: Arc::new(Load::default()),
         })
     }
 
@@ -378,7 +408,10 @@ impl Executor {
     pub async fn run(&self, adapter: Arc<dyn Adapter>, concurrency: usize) {
         let mut active = FuturesUnordered::new();
         let mut failures = HashMap::<Key, u32>::new();
+        self.load.limit.store(concurrency.max(1), Ordering::Relaxed);
+        tracing::info!(workers = concurrency.max(1), "workload executor running");
         loop {
+            self.load.busy.store(active.len(), Ordering::Relaxed);
             tokio::select! {
                 work = self.ready.next(), if active.len() < concurrency.max(1) => {
                     self.ready.cancel_deadline(work.key());
@@ -392,6 +425,7 @@ impl Executor {
                             .catch_unwind().await.unwrap_or_else(|_|Err(anyhow::anyhow!("workload adapter panicked")));
                         (work,result)
                     }));
+                    self.load.busy.store(active.len(), Ordering::Relaxed);
                 }
                 Some(completed) = active.next(), if !active.is_empty() => {
                     let (work,result)=match completed {
@@ -443,6 +477,16 @@ mod tests {
     fn object(uid: &str, claim: &str) -> Value {
         serde_json::json!({"metadata":{"name":uid,"uid":uid,"namespace":"ns"},
             "spec":{"volumes":[{"name":"disk","persistentVolumeClaim":{"claimName":claim}}]}})
+    }
+
+    #[test]
+    fn the_default_pool_scales_with_cpus_within_bounds() {
+        let n = default_workers();
+        assert!((32..=256).contains(&n), "{n}");
+        let load = Load::default();
+        load.busy.store(3, Ordering::Relaxed);
+        load.limit.store(n, Ordering::Relaxed);
+        assert_eq!(load.text(), format!("3/{n}"));
     }
 
     #[tokio::test]
