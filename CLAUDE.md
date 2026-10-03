@@ -57,6 +57,19 @@ not the release path.
 
 ## Work plan
 
+### In progress: #132 (P1), per-pod start timing (annotation, Event, histograms, one INFO line)
+
+2026-10-02. Owner: "Why 1 second? What's holding us up?" Nothing times the phases (#95 item 1).
+One `StartTiming` per pod UID, kept across Pending retries, published once the apiserver acknowledges Running.
+Phases: `scheduled` (PodScheduled/creation → seen, wall clock), `wait` (seen → the attempt that started it),
+`image` (images asked for → resolved; a pull is the registry clone + attach + mount), `volumes` (+ each volume),
+`sandbox` (incl. CNI), `init`, `containers` (+ each create+start), `report` (status PUT sent → acknowledged), `total`.
+1. [ ] `start_timing.rs`; seen noted when the pod list/watch delivers it; start_pod times its steps.
+2. [ ] Publish: `storm.io/start-timing` annotation (merge patch), `StartTiming` Event, histogram
+       `kubelet_pod_start_phase_duration_seconds{phase}`, one INFO log line.
+3. [ ] Tests, docs (README, metrics.md, status.md, api.md), CHANGELOG; sc-build.
+4. [ ] Stage golden; close with evidence. The blade/stormconsole/stormcentral#301 checks follow the release.
+
 ### Done: #129 (P0), after a reboot every new pod fails: its own dirs "do not exist"
 
 2026-10-02. Found on server3 (11.65, storm-8486f0) from the live kubelet log: not a namespace mismatch. The
