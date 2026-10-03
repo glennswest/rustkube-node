@@ -71,7 +71,8 @@ queue. The ring (non-payload requests pipelined), CNI (no lock) and image pool a
 5. [x] Tests, docs (README, configuration.md, status.md), CHANGELOG (20e95fc, b5f21c5). sc-build 20e95fc
        `cargo build --locked && cargo test --locked`: 289 kubelet unit (2 new), 4 integration, 25 CNI, 17 proxy,
        1 doc-test pass (1 ignored); exit 0 in 122 s. Not run on a node.
-6. [ ] Stage golden, release request, close. Live check after the release: turbomode on pvetest1, 50 pods,
+6. [x] Stage golden golden-rustkube-node-317e2624c20e (ac07686), release request stormcos#164; #138 closed.
+       Live check after the release: turbomode on pvetest1, 50 pods,
        wait p90 < 100 ms, total p90 < 500 ms; `workers=` says whether the pool is still the limit.
 
 ### Done: #137 (P1), a finished Pod keeps its pod IP (Cilium range full at ~250)
