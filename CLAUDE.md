@@ -57,7 +57,7 @@ not the release path.
 
 ## Work plan
 
-### In progress: #132 (P1), per-pod start timing (annotation, Event, histograms, one INFO line)
+### Done: #132 (P1), per-pod start timing (annotation, Event, histograms, one INFO line)
 
 2026-10-02. Owner: "Why 1 second? What's holding us up?" Nothing times the phases (#95 item 1).
 One `StartTiming` per pod UID, kept across Pending retries, published once the apiserver acknowledges Running.
@@ -69,7 +69,8 @@ Phases: `scheduled` (PodScheduled/creation â†’ seen, wall clock), `wait` (seen â
        `kubelet_pod_start_phase_duration_seconds{phase}`, one INFO log line.
 3. [x] Tests, docs (README, metrics.md, status.md), CHANGELOG. sc-build f10e8f3 `cargo build --locked && cargo test --locked`:
        283 kubelet unit (6 new), 4 integration, 25 CNI, 17 proxy, 1 doc-test pass (1 ignored); exit 0 in 106 s. Not run on a node.
-4. [ ] Stage golden; close with evidence. The blade/stormconsole/stormcentral#301 checks follow the release.
+4. [x] Stage golden golden-rustkube-node-70fe65e86c27 (59f0a05), release request stormcos#164; #132 closed.
+       Live check after the release: a pod on a blade shows the annotation; stormconsole#69 and stormcentral#301 read it.
 
 ### Done: #129 (P0), after a reboot every new pod fails: its own dirs "do not exist"
 
