@@ -57,6 +57,18 @@ not the release path.
 
 ## Work plan
 
+### In progress: #137 (P1), a finished Pod keeps its pod IP (Cilium range full at ~250)
+
+2026-10-03. pvetest1 (11.72): 1,000 `restartPolicy: Never` sleep pods, 250 reach Succeeded, the rest wait on
+`range is full`. Found: nothing stops a terminal Pod's sandbox until the Pod object is deleted (the sync skips
+Succeeded/Failed pods), and the stormpump runtime's `stop_pod_sandbox` only flipped a state: CNI DEL ran in
+`remove_pod_sandbox`, which waits for every container record to go.
+1. [ ] stormpump `stop_pod_sandbox`: CNI DEL (an error keeps it Ready, retried) and the netns holder released,
+       idempotent; `remove_pod_sandbox` does not DEL again.
+2. [ ] Pod manager: the pass that makes a pod Succeeded/Failed stops its sandbox (containers, status, logs kept);
+       a failed stop is retried on RECHECK from the terminal-skip branch (`PodState.sandbox_stopped`).
+3. [ ] Tests, docs (README, status.md), CHANGELOG; sc-build; stage golden; close.
+
 ### Done: #134 (P1), every start attempts=2; report outlier; serial work in sandbox/containers
 
 2026-10-02. pvetest1 (11.71): five busybox pods, all `attempts=2`, one `report=729ms`.
