@@ -2,6 +2,14 @@
 
 ## 2026-10-03
 
+- **fix:** A claim stormblock will not clone says why (#140, Dell C2NR0Q2 on 11.76: every claim
+  waited forever on "stormblock would not clone pvc-ext4j-64m to pvc-…", which could not be
+  debugged without the node's engine token). The template clone, attach and snapshot-clone POSTs
+  carry stormblock's status and `error`, or the transport error ("no answer within 60 s"), into the
+  pod's wait and FailedMount Event; a transport error was not logged at all before. A clone refused
+  because the template itself is broken (its sealed volume missing or not sealed, no sealed
+  snapshot) deletes the template and mints it again instead of meeting the same refusal on every
+  retry.
 - **perf:** Pod starts no longer queue behind 8 workers (#138, pvetest1 on 11.72: over 173
   pods `wait` was 2.4 s p50, 3.6 s p90, 9.3 s max, for ~250 ms of work). The one Pod/VMI executor
   ran a fixed 8 passes at once, and a start pass held its worker through the sandbox, the status

@@ -238,6 +238,12 @@ stormblock formats and seals it once (`role: data`). The mint runs in
 the background without an inline wait. Completion signals the Pod and VM
 queues immediately; waiting claims check the template's state and proceed
 when it is `ready`. A large format does not hold the reconciliation pass.
+A clone stormblock refuses leaves the claim waiting with stormblock's own
+answer (status and `error`, or "no answer within 60 s") in the pod's
+FailedMount Event and container message. A refusal that means the template
+itself is broken (its sealed volume missing or not sealed, or no sealed
+snapshot recorded) deletes the template and mints it again, so the next
+claim clones a sound one rather than meeting the same refusal forever (#140).
 
 The current ext4 ladder is **1Mi, 16Mi, 64Mi, 256Mi, 1Gi, 4Gi, 16Gi,
 64Gi, 256Gi, 1Ti**; requests round up, and requests above 1Ti are refused.
