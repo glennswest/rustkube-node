@@ -67,7 +67,8 @@ Phases: `scheduled` (PodScheduled/creation â†’ seen, wall clock), `wait` (seen â
 1. [x] `start_timing.rs`; seen noted when the pod list/watch delivers it; start_pod times its steps.
 2. [x] Publish (8009bd4): `storm.io/start-timing` annotation (merge patch), `StartTiming` Event, histogram
        `kubelet_pod_start_phase_duration_seconds{phase}`, one INFO log line.
-3. [ ] Tests, docs (README, metrics.md, status.md), CHANGELOG; sc-build.
+3. [x] Tests, docs (README, metrics.md, status.md), CHANGELOG. sc-build f10e8f3 `cargo build --locked && cargo test --locked`:
+       283 kubelet unit (6 new), 4 integration, 25 CNI, 17 proxy, 1 doc-test pass (1 ignored); exit 0 in 106 s. Not run on a node.
 4. [ ] Stage golden; close with evidence. The blade/stormconsole/stormcentral#301 checks follow the release.
 
 ### Done: #129 (P0), after a reboot every new pod fails: its own dirs "do not exist"
