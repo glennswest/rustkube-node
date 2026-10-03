@@ -28,6 +28,7 @@ An em dash means there is no environment binding or the value is unset.
 | `--cni-conf-dir` | `CNI_CONF_DIR` | `/etc/cni/net.d` |
 | `--cni-bin-dir` | `CNI_BIN_DIR` | `/opt/cni/bin` |
 | `--no-cni` | — | `false`; disables the kubelet CNI invoker; see runtime caveat below |
+| `--pod-workers` | `POD_WORKERS` | 16 per CPU, at least 32, at most 256: Pod/VMI passes (starts, checks, teardowns) run at once (#138) |
 | `--kubelet-port` | `KUBELET_PORT` | `10250`; HTTPS on `0.0.0.0` |
 | `--apiserver-ca` | `APISERVER_CA` | Unset; PEM trust anchor, otherwise kubeconfig CA |
 | `--token-file` | `KUBELET_TOKEN_FILE` | Unset; outbound bearer token file, otherwise kubeconfig token |
@@ -112,7 +113,7 @@ retrying once only if changed. No separate admin-token source exists (#105).
 `KubeletConfig::default()` has `heartbeat_interval = 10s`, `sync_interval = 2s`,
 and API URL `http://localhost:6443` (the CLI overrides that URL). These intervals
 are not CLI keys. The heartbeat is the only fixed schedule. Pods and VMIs share
-eight UID workers driven by watches and stormpump exits; a worker comes back
+one pool of UID workers (`--pod-workers`) driven by watches and stormpump exits; a worker comes back
 without an event only for its own deadlines (#101): a probe's `periodSeconds`
 from its `initialDelaySeconds`, a CrashLoopBackOff's end, a waiting start
 (backoff of a quarter of the wait, 1–10 s for Pods, 1–30 s for VMIs), an init

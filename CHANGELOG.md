@@ -2,6 +2,14 @@
 
 ## 2026-10-03
 
+- **perf:** Pod starts no longer queue behind 8 workers (#138, pvetest1 on 11.72: over 173
+  pods `wait` was 2.4 s p50, 3.6 s p90, 9.3 s max, for ~250 ms of work). The one Pod/VMI executor
+  ran a fixed 8 passes at once, and a start pass held its worker through the sandbox, the status
+  PUT and the start-timing annotation PATCH. New `--pod-workers` / `POD_WORKERS`, default 16 per
+  CPU, at least 32 and at most 256. The annotation PATCH is written off the worker. Each pass no
+  longer clones every pod's state to look for an adopted pod without its spec.
+- **feat:** `storm.io/start-timing` adds `workers=<busy>/<limit>` (the executor's passes running
+  when the start began) and `pending=<n>` (pods seen here and not yet started) (#138).
 - **fix:** A finished Pod gives its pod IP back (#137, pvetest1 on 11.72: of 1,000
   `restartPolicy: Never` pods, 250 reached `Succeeded` and the rest waited on Cilium's
   "range is full"). Nothing stopped a Succeeded/Failed Pod's sandbox until the Pod object was

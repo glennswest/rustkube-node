@@ -18,7 +18,7 @@ unwind (#100), event-driven reconciliation (#101) and bounded runtime calls
 
 The turbomode implementation uses rustkube's pinned reactor dependency. Pod and VMI
 assignment/volume watches enqueue coalesced reconciliation work; Pod and VM
-subscriptions run independently; runtime work uses one eight-worker Pod/VMI executor with name/claim
+subscriptions run independently; runtime work uses one Pod/VMI executor (`--pod-workers` passes at once, default 16 per CPU within 32–256, #138) with name/claim
 reservations and recovery barriers (#100). Stormpump exits and Linux static-manifest changes
 also wake workers. CSI registrar sockets use filesystem notifications;
 successful registrations wake Pod workers, with deadlines for pending failures. Failed or incomplete Pod/manifest reads cannot stop live
@@ -71,7 +71,7 @@ writes it once, as the annotation `storm.io/start-timing`, a `StartTiming` Event
 histogram `kubelet_pod_start_phase_duration_seconds{phase}` and one INFO log line:
 
     storm.io/start-timing: scheduled=850ms wait=1.2ms image=0.3ms volumes=4.4ms sandbox=40ms
-      init=0.0ms containers=180ms report=8.1ms total=236ms attempts=1
+      init=0.0ms containers=180ms report=8.1ms total=236ms attempts=1 workers=3/64 pending=1
       volume/data=3.9ms volume/(serviceaccount)=0.4ms container/app=180ms
 
 | phase | from → to |
@@ -90,6 +90,12 @@ histogram `kubelet_pod_start_phase_duration_seconds{phase}` and one INFO log lin
 has no API object, so it gets the log line and the histograms only. The annotation's merge
 patch changes the pod's resourceVersion; a status write racing it gets a 409 and is retried
 on the newer object.
+
+`workers=<busy>/<limit>` is the executor's passes running when the start attempt began, this
+one included, out of `--pod-workers`, and `pending=<n>` the pods seen here and not yet started,
+this one included (#138). A large `wait` with `workers` at its limit is the pool; with
+`workers` below it, the wait was the pod's own (an image, a volume, the network). The
+annotation's patch is written off the worker, after `Running` is acknowledged.
 
 `attempts` is 1 for a pod with nothing to wait for (#134). A start waits up to 100 ms for an
 image it has just asked for, which covers a golden or a present image; a pull that takes
