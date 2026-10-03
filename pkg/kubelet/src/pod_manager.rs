@@ -798,22 +798,32 @@ impl PodManager {
     /// Loopback by default: the storage engine runs on the node whose volumes
     /// it serves, and a kubelet asking another node's stormblock for a local
     /// device would get an answer that is true somewhere else.
-    async fn storage_post(&self, path: &str, body: &Value) -> Option<Value> {
+    ///
+    /// `Err` is stormblock's own answer — its status and body — or why there
+    /// was none, never a bare "would not" (#140): a claim that waits on a
+    /// refusal has to say which one, because the engine's API needs the
+    /// node's token and nobody debugging the claim from outside has it.
+    async fn storage_post(&self, path: &str, body: &Value) -> Result<Value, EngineRefusal> {
         let resp = self
             .engine
             .post(&format!("{}{path}", self.storage_url), body)
             .await
-            .ok()?;
+            .map_err(|e| EngineRefusal::unanswered(path, &e))?;
         let status = resp.status();
-        let text = resp.text().await.ok()?;
+        let text = resp.text().await.map_err(|e| EngineRefusal::unanswered(path, &e))?;
         if !status.is_success() {
-            warn!(
-                "stormblock {path} -> {status}: {}",
-                text.chars().take(200).collect::<String>()
-            );
-            return None;
+            let r = EngineRefusal::refused(path, status.as_u16(), &text);
+            warn!("{r}");
+            return Err(r);
         }
-        serde_json::from_str(&text).ok()
+        serde_json::from_str(&text).map_err(|e| EngineRefusal {
+            status: Some(status.as_u16()),
+            body: text.clone(),
+            message: format!(
+                "stormblock POST {path} -> {status} but not JSON ({e}): {}",
+                excerpt(&text)
+            ),
+        })
     }
 
     async fn fetch_configmap(&self, namespace: &str, name: &str) -> Option<Value> {
@@ -1614,58 +1624,7 @@ impl PodManager {
                 // it descends from a sealed volume, records lineage, and
                 // stamps the clone with its own filesystem UUID — two live
                 // filesystems must never claim one identity (stormblock#76).
-                let blank = crate::storage::template_name(class);
-                let template = match self.storage_template_state(&blank).await {
-                    // A blank not sealed yet cannot be cloned. Formatting a
-                    // 1 TiB class takes minutes (stormblock#141), and the claim
-                    // waits with the state named rather than failing a clone.
-                    Some((id, state)) if state == "ready" => id,
-                    Some((_, state)) => {
-                        return Err(ClaimError::Failed(format!(
-                            "waiting for volume {name}: template {blank} {state}"
-                        )))
-                    }
-                    // Mint it, rather than refusing the claim (#45).
-                    //
-                    // The alternative — which this replaces — capped the class
-                    // ladder at whatever the image happened to carry: a claim
-                    // above the largest shipped blank was refused outright,
-                    // and adding a class meant rebuilding an image. Baking
-                    // them in also decides at build time a question only run
-                    // time can answer, which is which sizes are actually
-                    // claimed, and spends image space on classes a node may
-                    // never use.
-                    //
-                    // One `mkfs` ever, per class, per node: the first claim of
-                    // a class pays for it and every claim after is a clone.
-                    //
-                    // In the background (#63): the POST answers when the
-                    // format is done, and a 1 TiB class held the whole sync
-                    // loop for it. Every pod on the node stopped being
-                    // reconciled, and the waiting pod was nowhere.
-                    None => self.mint_template(&blank, class).await.map_err(|e| {
-                        ClaimError::Failed(format!("waiting for volume {name}: {e}"))
-                    })?,
-                };
-
-                // Through the template, not the volume: `fstemplates/{id}/clone`
-                // gives the clone its own filesystem UUID and verifies it, so
-                // two claims never present one identity (stormblock#76).
-                let body = serde_json::json!({ "name": name, "verify": true });
-                let created: Value = self
-                    .storage_post(&format!("/api/v1/fstemplates/{template}/clone"), &body)
-                    .await
-                    .ok_or_else(|| {
-                        ClaimError::Failed(format!("stormblock would not clone {blank} to {name}"))
-                    })?;
-                created["volume_id"]
-                    .as_str()
-                    .ok_or_else(|| {
-                        ClaimError::Failed(format!(
-                            "clone of {blank} returned no volume: {created}"
-                        ))
-                    })?
-                    .to_string()
+                self.clone_blank(class, &name).await?
             }
         };
 
@@ -1681,9 +1640,9 @@ impl PodManager {
         let info: Value = self
             .storage_post(&format!("/api/v1/volumes/{vol_id}/attach"), &attach)
             .await
-            .ok_or_else(|| {
+            .map_err(|r| {
                 ClaimError::Failed(format!(
-                    "stormblock would not attach {name} as a local device"
+                    "stormblock would not attach {name} as a local device: {r}"
                 ))
             })?;
         if let Some(dev) = info["device_hint"].as_str() {
@@ -1700,6 +1659,86 @@ impl PodManager {
             "volume {name} did not attach locally: {info} — an NVMe-oF attach needs a \
              connect this node does not do yet"
         )))
+    }
+
+    /// Clone the blank of a size class into the claim's volume `name`,
+    /// minting the blank first when this node has none.
+    ///
+    /// A clone stormblock refuses because the template itself is broken
+    /// ([`EngineRefusal::template_broken`]) deletes the template and mints it
+    /// again: the refusal is the same on every retry, so a claim that only
+    /// retried the clone waited forever (#140). Any other refusal is the
+    /// claim's wait, with stormblock's answer in it.
+    async fn clone_blank(&self, class: &str, name: &str) -> Result<String, ClaimError> {
+        let blank = crate::storage::template_name(class);
+        let template = match self.storage_template_state(&blank).await {
+            // A blank not sealed yet cannot be cloned. Formatting a
+            // 1 TiB class takes minutes (stormblock#141), and the claim
+            // waits with the state named rather than failing a clone.
+            Some((id, state)) if state == "ready" => id,
+            Some((_, state)) => {
+                return Err(ClaimError::Failed(format!(
+                    "waiting for volume {name}: template {blank} {state}"
+                )))
+            }
+            // Mint it, rather than refusing the claim (#45).
+            //
+            // The alternative — which this replaces — capped the class
+            // ladder at whatever the image happened to carry: a claim
+            // above the largest shipped blank was refused outright,
+            // and adding a class meant rebuilding an image. Baking
+            // them in also decides at build time a question only run
+            // time can answer, which is which sizes are actually
+            // claimed, and spends image space on classes a node may
+            // never use.
+            //
+            // One `mkfs` ever, per class, per node: the first claim of
+            // a class pays for it and every claim after is a clone.
+            //
+            // In the background (#63): the POST answers when the
+            // format is done, and a 1 TiB class held the whole sync
+            // loop for it. Every pod on the node stopped being
+            // reconciled, and the waiting pod was nowhere.
+            None => self.mint_template(&blank, class).await.map_err(|e| {
+                ClaimError::Failed(format!("waiting for volume {name}: {e}"))
+            })?,
+        };
+
+        // Through the template, not the volume: `fstemplates/{id}/clone`
+        // gives the clone its own filesystem UUID and verifies it, so
+        // two claims never present one identity (stormblock#76).
+        let body = serde_json::json!({ "name": name, "verify": true });
+        let created = match self
+            .storage_post(&format!("/api/v1/fstemplates/{template}/clone"), &body)
+            .await
+        {
+            Ok(v) => v,
+            Err(r) if r.template_broken() => {
+                warn!("template {blank} is broken ({r}); deleting it to mint it again");
+                let path = format!("/api/v1/fstemplates/{template}");
+                let again = match self.storage_delete(&path).await {
+                    Ok(()) => match self.mint_template(&blank, class).await {
+                        Ok(_) => "deleted; minted again, cloning on the next try".to_string(),
+                        Err(e) => format!("deleted; {e}"),
+                    },
+                    Err(e) => format!("could not delete it: {e}"),
+                };
+                return Err(ClaimError::Failed(format!(
+                    "waiting for volume {name}: template {blank} is broken ({r}); {again}"
+                )));
+            }
+            Err(r) => {
+                return Err(ClaimError::Failed(format!(
+                    "stormblock would not clone {blank} to {name}: {r}"
+                )))
+            }
+        };
+        created["volume_id"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| {
+                ClaimError::Failed(format!("clone of {blank} returned no volume: {created}"))
+            })
     }
 
     /// A volume's id by name, or `None` when this node has no such volume.
@@ -1890,8 +1929,8 @@ impl PodManager {
         let made: Value = self
             .storage_post("/api/v1/volumes/snapshots", &body)
             .await
-            .ok_or_else(|| {
-                ClaimError::Failed(format!("stormblock would not clone {src_name} to {name}"))
+            .map_err(|r| {
+                ClaimError::Failed(format!("stormblock would not clone {src_name} to {name}: {r}"))
             })?;
         info!("claim {namespace}/{name}: cloned from {src_name}");
         made["id"].as_str().map(String::from).ok_or_else(|| {
@@ -4084,6 +4123,86 @@ impl std::fmt::Display for ClaimError {
     }
 }
 
+/// What stormblock said instead of doing a POST, or why it said nothing
+/// (#140). `status` is `None` when no answer came: the request bound ran out,
+/// or the engine was not there.
+#[derive(Debug, Clone)]
+struct EngineRefusal {
+    status: Option<u16>,
+    /// The engine's body as sent: the `error` text is what tells a broken
+    /// template from a refused clone.
+    body: String,
+    message: String,
+}
+
+impl EngineRefusal {
+    fn refused(path: &str, status: u16, body: &str) -> EngineRefusal {
+        let reason = serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|v| v["error"].as_str().map(String::from))
+            .unwrap_or_else(|| body.to_string());
+        EngineRefusal {
+            status: Some(status),
+            body: body.to_string(),
+            message: format!("stormblock POST {path} -> {status}: {}", excerpt(&reason)),
+        }
+    }
+
+    fn unanswered(path: &str, e: &reqwest::Error) -> EngineRefusal {
+        // reqwest's own Display is "error sending request for url (…)"; the
+        // cause is further down the chain.
+        let mut why = e.to_string();
+        let mut src = std::error::Error::source(e);
+        while let Some(s) = src {
+            why = format!("{why}: {s}");
+            src = s.source();
+        }
+        let message = if e.is_timeout() {
+            format!(
+                "stormblock POST {path}: no answer within {} s ({why})",
+                crate::engine::REQUEST_TIMEOUT.as_secs()
+            )
+        } else {
+            format!("stormblock POST {path}: no answer ({why})")
+        };
+        EngineRefusal { status: None, body: String::new(), message }
+    }
+
+    /// A clone refused because of the *template*, not the clone: its sealed
+    /// volume is gone, not sealed, or was never recorded. stormblock answers
+    /// that the same way every time, so retrying the clone never gets past
+    /// it; the template has to be made again. A template that is not `ready`
+    /// yet ("fstemplate … is awaiting_format — seal it before cloning") is
+    /// still being made, and is not broken.
+    fn template_broken(&self) -> bool {
+        let body = self.body.as_str();
+        match self.status {
+            // `volume <id> not found`: the template names a volume the engine
+            // does not have. `fstemplate … not found` is the template itself
+            // gone, which the next pass mints anyway.
+            Some(404) => body.contains("volume") && !body.contains("fstemplate"),
+            Some(409) => body.contains("is not sealed"),
+            Some(500) => body.contains("has no sealed snapshot"),
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Display for EngineRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// The first 300 characters of an engine answer, for a log line or a status.
+fn excerpt(text: &str) -> String {
+    let t = text.trim();
+    if t.chars().count() <= 300 {
+        return t.to_string();
+    }
+    format!("{}…", t.chars().take(300).collect::<String>())
+}
+
 /// Status update to send back to the API server.
 #[derive(Debug)]
 pub struct PodStatusUpdate {
@@ -5512,6 +5631,136 @@ pub(crate) mod tests {
             .unwrap_err();
         assert_eq!(e, "template pvc-ext4j-1048576m awaiting_format");
         assert_eq!(posts.load(Ordering::SeqCst), 1);
+    }
+
+    /// A stormblock whose `pvc-ext4j-64m` template is `ready` until deleted
+    /// and whose clone answers `refusal` (#140). Counts DELETEs and mints.
+    async fn refusing_stormblock(
+        refusal: (u16, &'static str),
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::routing::{get as http_get, post as http_post};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let deleted = Arc::new(AtomicBool::new(false));
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let mints = Arc::new(AtomicUsize::new(0));
+        let (d1, d2, dels, ms) = (deleted.clone(), deleted.clone(), deletes.clone(), mints.clone());
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/fstemplates/{name}",
+                http_get(move || {
+                    let d = d1.clone();
+                    async move {
+                        if d.load(Ordering::SeqCst) {
+                            Err(axum::http::StatusCode::NOT_FOUND)
+                        } else {
+                            Ok(axum::Json(json!({"id": "tpl-1", "state": "ready"})))
+                        }
+                    }
+                })
+                .delete(move || {
+                    let (d, n) = (d2.clone(), dels.clone());
+                    async move {
+                        n.fetch_add(1, Ordering::SeqCst);
+                        d.store(true, Ordering::SeqCst);
+                        axum::Json(json!({"deleted": "tpl-1"}))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/fstemplates/{id}/clone",
+                http_post(move || async move {
+                    let (code, error) = refusal;
+                    (
+                        axum::http::StatusCode::from_u16(code).unwrap(),
+                        axum::Json(json!({"error": error, "code": code})),
+                    )
+                }),
+            )
+            .route(
+                "/api/v1/fstemplates",
+                http_post(move || {
+                    let n = ms.clone();
+                    async move {
+                        n.fetch_add(1, Ordering::SeqCst);
+                        (axum::http::StatusCode::CREATED, axum::Json(json!({})))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), deletes, mints)
+    }
+
+    #[tokio::test]
+    async fn a_template_whose_volume_is_gone_is_minted_again() {
+        // #140: a `ready` template whose sealed volume the engine no longer
+        // has refuses every clone the same way; retrying the clone looped
+        // forever on "would not clone".
+        use std::sync::atomic::Ordering;
+        let (url, deletes, mints) =
+            refusing_stormblock((404, "volume 5c1e0b7a-0000-4000-8000-000000000001 not found")).await;
+        let (_rt, mgr) = manager();
+        let mgr = with_stormblock(mgr, &url);
+        let e = mgr.clone_blank("64M", "pvc-ns-d").await.unwrap_err().to_string();
+        assert!(e.contains("template pvc-ext4j-64m is broken"), "{e}");
+        assert!(e.contains("404"), "{e}");
+        assert!(e.contains("volume 5c1e0b7a-0000-4000-8000-000000000001 not found"), "{e}");
+        assert_eq!(deletes.load(Ordering::SeqCst), 1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while mints.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the blank is minted again");
+    }
+
+    #[tokio::test]
+    async fn a_refused_clone_names_stormblocks_reason_and_keeps_the_template() {
+        use std::sync::atomic::Ordering;
+        let (url, deletes, mints) =
+            refusing_stormblock((500, "cloning volume: no free slots in the data half")).await;
+        let (_rt, mgr) = manager();
+        let mgr = with_stormblock(mgr, &url);
+        let e = mgr.clone_blank("64M", "pvc-ns-d").await.unwrap_err().to_string();
+        assert!(e.starts_with("stormblock would not clone pvc-ext4j-64m to pvc-ns-d: "), "{e}");
+        assert!(e.contains("-> 500: cloning volume: no free slots in the data half"), "{e}");
+        assert_eq!(deletes.load(Ordering::SeqCst), 0);
+        assert_eq!(mints.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn no_answer_from_stormblock_is_named_not_silent() {
+        // Before #140 a transport error answered `None` with no log line.
+        let (_rt, mgr) = manager();
+        let mgr = with_stormblock(mgr, "http://127.0.0.1:1");
+        let e = mgr
+            .storage_post("/api/v1/fstemplates/t/clone", &json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(e.status, None);
+        assert!(e.to_string().starts_with("stormblock POST /api/v1/fstemplates/t/clone: no answer"), "{e}");
+    }
+
+    #[test]
+    fn which_clone_refusals_mean_a_broken_template() {
+        let r = |code, error: &str| {
+            EngineRefusal::refused("/p", code, &json!({"error": error, "code": code}).to_string())
+        };
+        assert!(r(404, "volume 1 not found").template_broken());
+        assert!(r(409, "volume 1 is not sealed — seal it before cloning").template_broken());
+        assert!(r(500, "fstemplate pvc-ext4j-64m has no sealed snapshot").template_broken());
+        // The template itself gone: the next pass mints it, nothing to delete.
+        assert!(!r(404, "fstemplate pvc-ext4j-64m not found").template_broken());
+        // Still being made.
+        assert!(!r(409, "fstemplate pvc-ext4j-64m is awaiting_format — seal it before cloning")
+            .template_broken());
+        assert!(!r(500, "cloning volume: out of space").template_broken());
+        assert!(!r(401, "auth: required").template_broken());
+        assert_eq!(r(401, "auth: required").to_string(), "stormblock POST /p -> 401: auth: required");
     }
 
     #[tokio::test]
