@@ -57,7 +57,7 @@ not the release path.
 
 ## Work plan
 
-### In progress: #140 (P0), every new claim on the Dell (11.76): "stormblock would not clone pvc-ext4j-64m"
+### Done from this side: #140 (P0), every new claim on the Dell (11.76): "stormblock would not clone pvc-ext4j-64m"
 
 2026-10-03. C2NR0Q2 (Dell R230, 11.76: this repo at ac07686, stormblock v20.0.0); pvetest1 fine with the same
 release. The node's stormblock needs its token, so the refusal cannot be read from here. Found: `storage_post`
@@ -72,7 +72,9 @@ here rebuilds such a template, so every retry meets the same refusal.
 3. [x] Tests (fake stormblock), docs (README, status.md), CHANGELOG (e3ca68d, de10176). sc-build de10176
        `cargo build --locked && cargo test --locked`: 293 kubelet unit (4 new) and the other suites pass; exit 0
        in 82 s. Not run on a node.
-4. [ ] Stage golden, release request; the Dell run names stormblock's reason (or heals a broken template).
+4. [x] Stage golden golden-rustkube-node-945e83c78007 (c248063), release request stormcos#164; `stormcentral
+       shipped`. Live check after the release: the Dell's claim heals (broken template) or its FailedMount names
+       stormblock's refusal; a refusal that is stormblock's goes to stormblock as its own issue.
 
 ### Done: #138, starts queue under a burst (wait p50 2.4 s, max 9.3 s over 173 pods)
 
