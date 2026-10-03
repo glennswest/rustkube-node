@@ -3702,7 +3702,7 @@ impl PodManager {
         let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default");
         let name = pod["metadata"]["name"].as_str().unwrap_or("");
         info!("Pod {namespace}/{name} started: {}", finished.text);
-        for (phase, took) in &finished.phases {
+        for &(phase, took) in &finished.phases {
             crate::metrics::observe_start_phase(phase, took.as_secs_f64());
         }
         // A static pod has no object to annotate.
