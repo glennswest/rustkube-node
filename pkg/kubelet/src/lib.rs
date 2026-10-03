@@ -10,6 +10,7 @@ pub mod events;
 pub mod metrics;
 pub mod mirror;
 pub mod node_logs;
+pub mod start_timing;
 pub mod storage;
 pub mod system_claims;
 pub mod stormpump_ring;

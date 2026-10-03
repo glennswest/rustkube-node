@@ -5,6 +5,7 @@
 //! - **`/metrics`**: the kubelet's own. `kubelet_running_pods`,
 //!   `kubelet_running_containers{container_state}`,
 //!   `kubelet_pod_start_duration_seconds`,
+//!   `kubelet_pod_start_phase_duration_seconds{phase}` (#132),
 //!   `kubelet_pleg_relist_duration_seconds`, the `process_*` family and
 //!   `kubernetes_build_info`. Rendered by the Prometheus recorder, which this
 //!   module installs once for the process.
@@ -43,7 +44,15 @@ const POD_START_BUCKETS: &[f64] = &[
 /// `kubelet_pleg_relist_duration_seconds`'s: Prometheus's default buckets.
 const RELIST_BUCKETS: &[f64] = &[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
 
+/// `kubelet_pod_start_phase_duration_seconds`'s (#132): a phase of a
+/// subsecond start is milliseconds, and a slow one minutes.
+const PHASE_BUCKETS: &[f64] = &[
+    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+    60.0, 120.0, 300.0,
+];
+
 const POD_START: &str = "kubelet_pod_start_duration_seconds";
+const START_PHASE: &str = "kubelet_pod_start_phase_duration_seconds";
 const RELIST: &str = "kubelet_pleg_relist_duration_seconds";
 
 static HANDLE: OnceLock<Option<PrometheusHandle>> = OnceLock::new();
@@ -61,7 +70,8 @@ pub fn handle() -> Option<&'static PrometheusHandle> {
         .get_or_init(|| {
             let builder = PrometheusBuilder::new()
                 .set_buckets_for_metric(Matcher::Full(POD_START.into()), POD_START_BUCKETS)
-                .and_then(|b| b.set_buckets_for_metric(Matcher::Full(RELIST.into()), RELIST_BUCKETS));
+                .and_then(|b| b.set_buckets_for_metric(Matcher::Full(RELIST.into()), RELIST_BUCKETS))
+                .and_then(|b| b.set_buckets_for_metric(Matcher::Full(START_PHASE.into()), PHASE_BUCKETS));
             let handle = match builder.and_then(|b| b.install_recorder()) {
                 Ok(h) => h,
                 Err(e) => {
@@ -93,6 +103,11 @@ fn describe() {
         metrics::Unit::Seconds,
         "Duration in seconds from kubelet seeing a pod for the first time to the pod starting to run"
     );
+    metrics::describe_histogram!(
+        START_PHASE,
+        metrics::Unit::Seconds,
+        "Duration in seconds of each phase of a pod start, by phase (storm.io/start-timing)"
+    );
     metrics::describe_counter!(
         TIMED,
         "Reconciles scheduled by a deadline or a polling fallback rather than an event"
@@ -108,6 +123,14 @@ fn describe() {
 pub fn observe_pod_start(seconds: f64) {
     if handle().is_some() {
         metrics::histogram!(POD_START).record(seconds);
+    }
+}
+
+/// One phase of a pod's start (#132): `phase` is one of
+/// [`crate::start_timing::PHASES`].
+pub fn observe_start_phase(phase: &'static str, seconds: f64) {
+    if handle().is_some() {
+        metrics::histogram!(START_PHASE, "phase" => phase).record(seconds);
     }
 }
 

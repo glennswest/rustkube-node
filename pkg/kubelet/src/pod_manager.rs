@@ -22,7 +22,8 @@ use tracing::{debug, error, info, warn};
 mod csi_volumes;
 mod deadlines;
 
-type ImageResult = Arc<std::sync::Mutex<Option<Result<String, String>>>>;
+/// An image's resolution and when it finished (#132).
+type ImageResult = Arc<std::sync::Mutex<Option<(Result<String, String>, Instant)>>>;
 type ImageKey = (String, String);
 
 /// State of a managed pod on this node.
@@ -289,6 +290,9 @@ pub struct PodManager {
     /// When each pod (by uid) was first seen and not yet started, for
     /// `kubelet_pod_start_duration_seconds` (#36).
     first_seen: std::sync::Mutex<HashMap<String, Instant>>,
+    /// Each starting pod's phases (by uid), from seen to `Running`
+    /// acknowledged (#132).
+    timings: std::sync::Mutex<HashMap<String, crate::start_timing::StartTiming>>,
     /// Pods (by uid) that are this node's but not started, and what they wait
     /// on (#63). Without this a pod waiting on its claim was known to nobody:
     /// `logs` said "not found on this node" and it had no container statuses.
@@ -392,6 +396,7 @@ impl PodManager {
             csi: Arc::new(crate::csi_plugins::CsiPlugins::new(node_name)),
             csi_mountinfo: "/proc/1/mountinfo".to_string(),
             first_seen: std::sync::Mutex::new(HashMap::new()),
+            timings: Default::default(),
             deadlines: Default::default(),
             event_waits: Default::default(),
             waiting: std::sync::Mutex::new(HashMap::new()),
@@ -413,6 +418,7 @@ impl PodManager {
     fn prepare_images(&self,pod:&Value)->Result<(),CriError> {
         let uid=pod["metadata"]["uid"].as_str().unwrap_or("");
         let mut starts=self.start_images.lock().unwrap();
+        if !starts.contains_key(uid) {self.timing(pod,|t|t.image_asked(Instant::now()));}
         let results=starts.entry(uid.into()).or_default();
         for spec in ["initContainers","containers"].iter().flat_map(|field|
             pod["spec"][*field].as_array().into_iter().flatten()) {
@@ -441,20 +447,23 @@ impl PodManager {
                         },
                         _=>images.pull_image(image).await,
                     };
-                    *state.lock().unwrap()=Some(answer.map_err(|e|e.to_string()));
+                    *state.lock().unwrap()=Some((answer.map_err(|e|e.to_string()),Instant::now()));
                     all.lock().unwrap().remove(&key);
                     let _=changed.send(image.clone());
                 });
                 result
             });
         }
+        let mut resolved=None::<Instant>;
         for (key,result) in results.iter() {
             match result.lock().unwrap().as_ref() {
                 None=>return Err(CriError::Pending(format!("waiting for image {}",key.0))),
-                Some(Err(error))=>return Err(CriError::ImagePull(error.clone())),
-                Some(Ok(_))=>{}
+                Some((Err(error),_))=>return Err(CriError::ImagePull(error.clone())),
+                Some((Ok(_),done))=>resolved=Some(resolved.map_or(*done,|r|r.max(*done))),
             }
         }
+        drop(starts);
+        if let Some(done)=resolved {self.timing(pod,|t|t.image_resolved(done));}
         Ok(())
     }
 
@@ -464,7 +473,7 @@ impl PodManager {
         let starts=self.start_images.lock().unwrap();
         let result=starts.get(pod["metadata"]["uid"].as_str().unwrap_or(""))
             .and_then(|images|images.get(&key)).ok_or_else(||CriError::Pending(format!("waiting for image {image}")))?;
-        let value=result.lock().unwrap().clone();
+        let value=result.lock().unwrap().clone().map(|(r,_)|r);
         match value {
             Some(Ok(reference))=>Ok(reference),
             Some(Err(error))=>Err(CriError::ImagePull(error)),
@@ -892,9 +901,20 @@ impl PodManager {
         &self,
         pod: &Value,
     ) -> Result<HashMap<String, ResolvedVolume>, CriError> {
+        self.resolve_volumes_timed(pod, &mut Vec::new()).await
+    }
+
+    /// [`resolve_volumes`](Self::resolve_volumes), with how long each volume
+    /// took (#132).
+    async fn resolve_volumes_timed(
+        &self,
+        pod: &Value,
+        times: &mut Vec<(String, std::time::Duration)>,
+    ) -> Result<HashMap<String, ResolvedVolume>, CriError> {
         let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
         let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default");
         let mut map = HashMap::new();
+        let mut current: Option<(String, Instant)> = None;
         let volumes = match pod["spec"]["volumes"].as_array() {
             Some(v) => v,
             None => return Ok(map),
@@ -904,6 +924,12 @@ impl PodManager {
                 Some(n) => n.to_string(),
                 None => continue,
             };
+            // Each volume's time ends where the next begins (its arms
+            // `continue` from many places).
+            if let Some((n, t)) = current.take() {
+                times.push((n, t.elapsed()));
+            }
+            current = Some((name.clone(), Instant::now()));
             let host_path = if let Some(hp) = vol["hostPath"]["path"].as_str() {
                 ensure_host_path(hp, vol["hostPath"]["type"].as_str().unwrap_or(""));
                 hp.to_string()
@@ -1149,6 +1175,9 @@ impl PodManager {
                     fstype: None,
                 },
             );
+        }
+        if let Some((n, t)) = current.take() {
+            times.push((n, t.elapsed()));
         }
         Ok(map)
     }
@@ -2237,7 +2266,11 @@ impl PodManager {
                     .unwrap_or_else(|e| e.into_inner())
                     .entry(uid.to_string())
                     .or_insert_with(Instant::now);
-                match self.start_pod(pod).await {
+                let started = self.start_pod(pod).await;
+                if started.is_err() {
+                    self.timing(pod, |t| t.attempt_failed());
+                }
+                match started {
                     Ok(status) => {
                         self.first_seen
                             .lock()
@@ -2345,6 +2378,10 @@ impl PodManager {
             return outcome;
         }
         self.first_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|uid, _| desired_uids.contains(uid));
+        self.timings
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|uid, _| desired_uids.contains(uid));
@@ -2549,18 +2586,29 @@ impl PodManager {
         let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
 
         info!("Starting pod {namespace}/{name}");
+        let mut attempt = crate::start_timing::Attempt::begin();
         if self.admission.is_some() {self.prepare_images(pod)?;}
 
         let sandbox_config = build_sandbox_config(pod);
-        let volumes = self.resolve_volumes(pod).await?;
+        let step = Instant::now();
+        let mut volume_times = Vec::new();
+        let volumes = self.resolve_volumes_timed(pod, &mut volume_times).await?;
         // Everything the kubelet writes for the pod is written before the
         // sandbox exists, so a node that cannot hold it (a full disk, #129)
         // leaves the pod waiting with the errno and nothing to undo.
         // Default ServiceAccount credential mount (token/ca/namespace),
         // computed once per pod and injected into every container.
+        let token = Instant::now();
         let sa_mount = self.service_account_mount(pod).await?;
+        if sa_mount.is_some() {
+            volume_times.push(("(serviceaccount)".into(), token.elapsed()));
+        }
         let dns_mount = self.resolv_conf_mount(pod)?;
         prepare_log_dirs(pod, &sandbox_config.log_directory)?;
+        for (volume, took) in &volume_times {
+            attempt.volume(volume, *took);
+        }
+        attempt.volumes(step.elapsed());
 
         // **The kubelet cannot check host paths from here.** It runs in a
         // container; the mounts happen in the engine's namespace, which is the
@@ -2574,6 +2622,7 @@ impl PodManager {
         // carries.
 
         // Create pod sandbox
+        let step = Instant::now();
         let existing=self.pods.read().await.get(uid).and_then(|p|p.sandbox_id.clone());
         let sandbox_id=if let Some(existing)=existing {existing} else {
         let sandbox_id = self.runtime.run_pod_sandbox(&sandbox_config).await?;
@@ -2597,6 +2646,7 @@ impl PodManager {
         } else {
             Some(sandbox_status.ip.clone())
         };
+        attempt.sandbox(step.elapsed());
 
         // Run init containers to completion (in order) before the app
         // containers — each must exit 0. A failure aborts pod start.
@@ -2606,6 +2656,7 @@ impl PodManager {
         // that carried only the error would throw that away at the moment it
         // became useful.
         let mut init_statuses=self.pods.read().await.get(uid).map(|p|p.init_statuses.clone()).unwrap_or_default();
+        let step = Instant::now();
         let init_outcome = self
             .run_init_containers(
                 pod,
@@ -2627,6 +2678,7 @@ impl PodManager {
             }
             return Err(e);
         }
+        attempt.init(step.elapsed());
 
         // Process containers
         let containers = pod["spec"]["containers"]
@@ -2642,6 +2694,7 @@ impl PodManager {
         for container_spec in &containers {
             let container_name = container_spec["name"].as_str().unwrap_or("unnamed");
             let image = container_spec["image"].as_str().unwrap_or("");
+            let step = Instant::now();
 
             // Ensure image per imagePullPolicy
             info!("Ensuring image {image} for {namespace}/{name}/{container_name}");
@@ -2774,6 +2827,7 @@ impl PodManager {
             )
             .await;
             info!("Started container {container_name} ({container_id}) in {namespace}/{name}");
+            attempt.container(container_name, step.elapsed());
 
             // A container with a readiness probe starts not-ready until the
             // first probe succeeds; without one it is ready immediately.
@@ -2823,6 +2877,7 @@ impl PodManager {
             );
         }
 
+        self.timing(pod, |t| t.started(attempt));
         Ok(PodStatusUpdate {
             namespace: namespace.to_string(),
             name: name.to_string(),
@@ -3589,6 +3644,88 @@ impl PodManager {
 
     /// A start that is waiting is tried again with a backoff growing with
     /// the wait, unless what it waits on is an event (#101).
+    /// This pod's start record, made now if the pod list has not noted it
+    /// (#132). Seen is the same instant as `first_seen`.
+    fn timing(&self, pod: &Value, f: impl FnOnce(&mut crate::start_timing::StartTiming)) {
+        let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
+        if uid.is_empty() {
+            return;
+        }
+        let seen = *self
+            .first_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(uid.to_string())
+            .or_insert_with(Instant::now);
+        let mut timings = self.timings.lock().unwrap_or_else(|e| e.into_inner());
+        f(timings
+            .entry(uid.to_string())
+            .or_insert_with(|| crate::start_timing::StartTiming::new(pod, seen)));
+    }
+
+    /// The pods a list or watch (or a manifest read) just delivered: a pod
+    /// not started here is seen now, if it was not already (#132).
+    pub async fn note_seen(&self, pods: &[Value]) {
+        let known = self.pods.read().await;
+        for pod in pods {
+            let Some(uid) = pod["metadata"]["uid"].as_str() else { continue };
+            let started = known.get(uid).is_some_and(|p| p.phase != "Starting" && p.phase != "Cleanup");
+            let terminal = matches!(pod["status"]["phase"].as_str(), Some("Succeeded" | "Failed"));
+            if started || terminal || !pod["metadata"]["deletionTimestamp"].is_null()
+                || self.timings.lock().unwrap_or_else(|e| e.into_inner()).contains_key(uid)
+            {
+                continue;
+            }
+            self.timing(pod, |_| {});
+        }
+    }
+
+    /// `Running` was acknowledged by the apiserver (or needed no write), the
+    /// write taking `report`. The first time after a start, publish where the
+    /// start went (#132): one INFO line, the histograms, and, for a pod the
+    /// apiserver has, the `storm.io/start-timing` annotation and a
+    /// `StartTiming` Event. Anything else: nothing.
+    pub async fn start_reported(&self, pod: &Value, report: std::time::Duration) {
+        let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
+        let acked = Instant::now();
+        let finished = {
+            let mut timings = self.timings.lock().unwrap_or_else(|e| e.into_inner());
+            match timings.get(uid) {
+                Some(t) if t.is_started() => {
+                    let f = t.finish(report, acked);
+                    timings.remove(uid);
+                    f
+                }
+                _ => return,
+            }
+        };
+        let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default");
+        let name = pod["metadata"]["name"].as_str().unwrap_or("");
+        info!("Pod {namespace}/{name} started: {}", finished.text);
+        for (phase, took) in &finished.phases {
+            crate::metrics::observe_start_phase(phase, took.as_secs_f64());
+        }
+        // A static pod has no object to annotate.
+        if self.api_url.is_empty() || pod["metadata"]["resourceVersion"].as_str().is_none() {
+            return;
+        }
+        self.event(pod, "Normal", crate::start_timing::REASON, &finished.text).await;
+        let patch = serde_json::json!({"metadata": {"uid": uid, "annotations": {
+            crate::start_timing::ANNOTATION: finished.text}}});
+        let sent = self
+            .api_client
+            .patch(format!("{}/api/v1/namespaces/{namespace}/pods/{name}", self.api_url))
+            .header("content-type", "application/merge-patch+json")
+            .timeout(std::time::Duration::from_secs(10))
+            .json(&patch)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status());
+        if let Err(error) = sent {
+            warn!(%error, "Pod {namespace}/{name}: start timing annotation not written");
+        }
+    }
+
     fn retry_wait(&self, uid: &str, waited: std::time::Duration) {
         if self.event_waits.lock().unwrap_or_else(|e| e.into_inner()).remove(uid) {
             return;
@@ -3750,6 +3887,10 @@ impl PodManager {
         self.backoff.forget_pod(uid);
         self.forget_deadlines(uid);
         self.first_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(uid);
+        self.timings
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(uid);
@@ -6300,5 +6441,58 @@ pub(crate) mod tests {
         assert!(!none.exists(), "an unset type creates nothing");
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// #132: a pod's start is timed from when the list delivered it, its
+    /// volumes and containers by name, and the record is published once.
+    #[tokio::test]
+    async fn a_start_is_timed_from_seen_and_published_once() {
+        let (_rt, mgr) = manager();
+        let mut p = pod("uid-timed", "timed", "Always", simple_container());
+        p["spec"]["volumes"] = json!([{"name": "scratch", "emptyDir": {}}]);
+        mgr.note_seen(&[p.clone()]).await;
+        let seen = mgr.timings.lock().unwrap()["uid-timed"].clone();
+        assert!(!seen.is_started());
+
+        let outcome = mgr.sync_pods(&[p.clone()]).await;
+        assert_eq!(outcome.updates[0].phase, "Running");
+        let t = mgr.timings.lock().unwrap()["uid-timed"].clone();
+        assert!(t.is_started());
+        let text = t.finish(std::time::Duration::from_millis(3), Instant::now()).text;
+        for part in ["wait=", "image=", "volumes=", "sandbox=", "init=", "containers=",
+            "report=3.0ms", "total=", "attempts=1", "volume/scratch=", "container/app="] {
+            assert!(text.contains(part), "{part} in {text}");
+        }
+
+        // Noted again by the next list: a started pod is not seen anew.
+        mgr.note_seen(&[p.clone()]).await;
+        mgr.start_reported(&p, std::time::Duration::from_millis(3)).await;
+        assert!(!mgr.timings.lock().unwrap().contains_key("uid-timed"));
+        mgr.note_seen(&[p.clone()]).await;
+        assert!(!mgr.timings.lock().unwrap().contains_key("uid-timed"));
+        // A later Running report (a check, not a start) publishes nothing.
+        mgr.start_reported(&p, std::time::Duration::ZERO).await;
+    }
+
+    /// #132: a pod that waited counts its attempts, and the wait is the
+    /// time before the attempt that started it.
+    #[tokio::test]
+    async fn a_start_after_a_wait_counts_its_attempts() {
+        let (_rt, mgr) = manager();
+        let mut p = pod("uid-waited", "waited", "Always", simple_container());
+        p["spec"]["volumes"] = json!([{"name": "data", "nfs": {"server": "x", "path": "/"}}]);
+        mgr.note_seen(&[p.clone()]).await;
+        assert_eq!(mgr.sync_pods(&[p.clone()]).await.updates[0].phase, "Pending");
+        assert!(!mgr.timings.lock().unwrap()["uid-waited"].is_started());
+
+        p["spec"]["volumes"] = json!([]);
+        assert_eq!(mgr.sync_pods(&[p.clone()]).await.updates[0].phase, "Running");
+        let t = mgr.timings.lock().unwrap()["uid-waited"].clone();
+        let text = t.finish(std::time::Duration::ZERO, Instant::now()).text;
+        assert!(text.contains("attempts=2"), "{text}");
+
+        // Gone before it was reported: the record goes with it.
+        mgr.sync_pods(&[]).await;
+        assert!(!mgr.timings.lock().unwrap().contains_key("uid-waited"));
     }
 }

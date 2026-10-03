@@ -696,6 +696,7 @@ impl Kubelet {
         let static_pods = self.load_static_pods();
         if self.static_read_complete.load(Ordering::Acquire) {
             self.pod_manager.cache_specs(&static_pods).await;
+            self.pod_manager.note_seen(&static_pods).await;
             self.seed_claims(Kind::Pod, &static_pods).await?;
             self.workloads.replace_source("static",Kind::Pod,&static_pods)?;
         } else { apimachinery::reactor::failed(); }
@@ -709,6 +710,8 @@ impl Kubelet {
             && !p["metadata"]["uid"].as_str().unwrap_or("").starts_with("static-"))
             .cloned().collect();
         self.pod_manager.cache_specs(&want).await;
+        // Seen here, as the watch delivers it: not when a worker reaches it (#132).
+        self.pod_manager.note_seen(&want).await;
         self.seed_claims(Kind::Pod,&want).await?;
         self.workloads.replace_source("api-pods",Kind::Pod,&want)?;
         self.pods_synced.store(true,Ordering::Release);
@@ -1255,7 +1258,11 @@ impl workload::Adapter for Kubelet {
                 // Incomplete collection semantics deliberately suppress orphan
                 // sweeping: absence is handled by the deleted UID's own worker.
                 let outcome=self.pod_manager.sync_pods_observed(&[object.clone()],false).await;
-                for update in &outcome.updates {self.report_pod_status(update,&object).await?;}
+                for update in &outcome.updates {
+                    let sent=std::time::Instant::now();
+                    self.report_pod_status(update,&object).await?;
+                    if update.phase=="Running" {self.pod_manager.start_reported(&object,sent.elapsed()).await;}
+                }
                 self.handle_migration_annotations(&object).await?;
             }
             Kind::VirtualMachine=> {
