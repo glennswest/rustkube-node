@@ -65,11 +65,13 @@ task has run, so attempt 1 always returns `Pending("waiting for image …")` (a 
 the pod writes a ContainerCreating status PUT before the real one. `report` is exactly one status PUT (no GET,
 no tick): 729 ms is the apiserver's write. In `containers`, each container awaits three Event POSTs
 (Pulled, Created, Started) to the apiserver, serially, inside the timed step.
-1. [ ] Image grace: a just-asked image is waited for up to 100 ms (subscribed before the spawn), so a local
+1. [x] Image grace: a just-asked image is waited for up to 100 ms (subscribed before the spawn), so a local
        image starts on attempt 1 with no Pending write; a real pull still yields the worker.
-2. [ ] Events: Normal lifecycle Events on the start path go through one ordered background sender
+2. [x] Events: Normal lifecycle Events on the start path go through one ordered background sender
        (timestamps taken when recorded); Warnings stay inline.
-3. [ ] Tests, docs (README/status.md/metrics.md), CHANGELOG; sc-build; file the PUT latency on rustkube.
+3. [x] Tests, docs (README, status.md), CHANGELOG (5f6af4f, 23d33f3). sc-build 5f6af4f `cargo build --locked &&
+       cargo test --locked`: 285 kubelet unit (2 new), 25 CNI, 17 proxy, 1 doc-test pass (1 ignored); exit 0.
+       Not run on a node. PUT outlier filed as rustkube#191. Remaining sandbox/containers time is stormpump work.
 4. [ ] Stage golden, release request, close #134 with what was verified.
 
 ### Done: #132 (P1), per-pod start timing (annotation, Event, histograms, one INFO line)
