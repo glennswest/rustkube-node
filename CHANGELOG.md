@@ -2,6 +2,17 @@
 
 ## 2026-10-02
 
+- **fix:** Every pod start took two attempts (#134, pvetest1 on 11.71: `attempts=2` on all five
+  pods). `prepare_images` spawned the image resolution and read its result in the same call,
+  before the task had run, so the first attempt always returned "waiting for image", wrote a
+  `ContainerCreating` status to the apiserver, and a second attempt started the pod, for a
+  golden that resolves in 0.1 ms. A start now waits up to 100 ms for an image it has just
+  asked for; a longer pull still yields the worker and wakes the pod when it completes.
+- **perf:** The ordinary lifecycle Events of a start (`Pulling`, `Pulled`, `Created`,
+  `Started`, `StartTiming`) are queued and written in order by one background sender instead
+  of being awaited: a start waited on three apiserver POSTs per container, between one
+  container and the next. Warning Events are still written before the start moves on.
+
 - **feat:** Per-pod start timing (#132). Each pod start is timed from the moment the pod list/watch
   delivers it to the moment the apiserver acknowledges `Running`, across retries: `scheduled`
   (PodScheduled → seen, wall clock), `wait`, `image` (a pull is the registry clone + attach + mount),

@@ -91,6 +91,16 @@ has no API object, so it gets the log line and the histograms only. The annotati
 patch changes the pod's resourceVersion; a status write racing it gets a 409 and is retried
 on the newer object.
 
+`attempts` is 1 for a pod with nothing to wait for (#134). A start waits up to 100 ms for an
+image it has just asked for, which covers a golden or a present image; a pull that takes
+longer leaves the pod `ContainerCreating` ("waiting for image …") and its completion starts
+the next attempt. More than one attempt means the pod waited on something: an image pull,
+a volume, the network or storage, named in its waiting reason and Events. `report` is the
+one status PUT and nothing else, so a long `report` is the apiserver's write. The ordinary
+lifecycle Events (`Pulling`, `Pulled`, `Created`, `Started`, `StartTiming`) are queued and
+written in order by one background sender, so `containers` does not include their POSTs;
+Warnings are written before the start moves on.
+
 ## Components and runtime selection
 
 | Component | Source | Current role |
