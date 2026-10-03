@@ -116,7 +116,11 @@ explicitly selects **`--runtime stormpump`**, connecting to the engine ring at
 legacy microVM-Pod path, not the stormvm VMI manager.
 
 For stormpump Pods, CNI configuration is checked per sandbox: the kubelet
-passes the sandbox network namespace to CNI ADD and invokes DEL at teardown.
+passes the sandbox network namespace to CNI ADD and invokes DEL when the
+sandbox stops. A Pod that finishes (`restartPolicy` Never or OnFailure, every
+container terminated for good, Succeeded or Failed) has its sandbox stopped in
+that pass, so its address goes back to the CNI at once; its container records,
+status and logs stay until the Pod object is deleted (#137).
 Missing configuration or a failed ADD produces `NetworkNotReady`. Host-network
 Pods bypass this. CRI delegates networking to the external runtime. Node Ready
 is not yet gated on CNI readiness (#3/#32).

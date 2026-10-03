@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-10-03
+
+- **fix:** A finished Pod gives its pod IP back (#137, pvetest1 on 11.72: of 1,000
+  `restartPolicy: Never` pods, 250 reached `Succeeded` and the rest waited on Cilium's
+  "range is full"). Nothing stopped a Succeeded/Failed Pod's sandbox until the Pod object was
+  deleted, and the stormpump runtime ran CNI DEL only at sandbox removal. The pass that makes a
+  Pod Succeeded or Failed now stops its sandbox: CNI DEL and the netns holder released, the
+  container records, status and logs kept until deletion. A failed DEL is retried.
+
 ## 2026-10-02
 
 - **fix:** Every pod start took two attempts (#134, pvetest1 on 11.71: `attempts=2` on all five

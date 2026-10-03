@@ -29,6 +29,7 @@ below has been measured on a node yet (#102, target C2NR0Q2 per #110).
 | Full node filesystem (#129) | Per-pod dirs, ServiceAccount token, resolv.conf and container log dirs written before the sandbox; a failed write (ENOSPC…) keeps the pod Pending with the errno instead of "does not exist" and `Failed` |
 | Pod start timing (#132) | Phases of each start (seen → images → volumes → sandbox → init → containers → Running acknowledged) as `storm.io/start-timing`, a `StartTiming` Event, `kubelet_pod_start_phase_duration_seconds{phase}` and one INFO line (`8009bd4`); not yet read on a node |
 | First-attempt starts (#134) | A start waits up to 100 ms for an image it just asked for, so a local image starts on attempt 1 with no `ContainerCreating` status write first (every start took 2 on pvetest1); lifecycle Normal Events are queued, written in order off the start path (`5f6af4f`); not yet measured on a node |
+| Finished Pods release their IP (#137) | A Succeeded/Failed Pod's sandbox is stopped when it finishes: CNI DEL (stormpump runtime, at stop rather than removal) and the netns holder released; records and logs kept until deletion; a failed DEL retried (`227fbfe`). 1,000 Never pods on pvetest1 filled Cilium's range at ~250 before; not yet measured on a node |
 | Tests | PVC medium-suite container and remote static-binary staging (`f63d8c2`, `38dba5a`); latest full sc-build at `c74b589`: 270 kubelet unit, 4 integration, 25 CNI, 17 proxy tests; live acceptance remains open |
 
 ## Owner decisions recorded, implementation pending
