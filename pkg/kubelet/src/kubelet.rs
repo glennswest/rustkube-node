@@ -597,6 +597,9 @@ impl Kubelet {
                             if vms.running().await.is_empty() {
                                 if let Ok(response)=self.api_client.get(url.clone()).send().await {
                                     if response.status().as_u16()==404 {
+                                        // No VMIs can exist: metadata answers
+                                        // "no such machine", not "cold" (#119).
+                                        vms.cache_specs(&[]).await;
                                         self.vmis_synced.store(true,Ordering::Release);
                                     }
                                 }

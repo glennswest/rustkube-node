@@ -672,6 +672,116 @@ impl Drop for Watchers {
     }
 }
 
+/// The machines this node runs, by uid, and who holds each address (#119).
+///
+/// Metadata is asked on a guest's boot path, by source address. A scan of
+/// every machine and every NIC under the lock is fine at ten and not at a
+/// thousand, so the address is an index, kept here beside the records so the
+/// two cannot drift: every change to a machine goes through `insert`,
+/// `remove` or `update`, and each re-indexes that one machine. Reads go
+/// through `Deref`; there is no `DerefMut`, so nothing can change a NIC's
+/// addresses behind the index.
+///
+/// Only machines that are not terminal are indexed: an ended machine's
+/// address may already be its successor's.
+#[derive(Debug, Default)]
+pub(crate) struct Machines {
+    by_uid: HashMap<String, Vm>,
+    by_address: HashMap<String, std::collections::BTreeSet<String>>,
+}
+
+impl std::ops::Deref for Machines {
+    type Target = HashMap<String, Vm>;
+    fn deref(&self) -> &Self::Target {
+        &self.by_uid
+    }
+}
+
+impl Machines {
+    fn addresses(vm: &Vm) -> impl Iterator<Item = &String> {
+        vm.nics.iter().flat_map(|n| n.addresses.iter()).filter(move |_| !vm.phase.terminal())
+    }
+
+    fn unindex(&mut self, uid: &str) {
+        let Some(vm) = self.by_uid.get(uid) else { return };
+        for a in Self::addresses(vm) {
+            if let Some(holders) = self.by_address.get_mut(a) {
+                holders.remove(uid);
+                if holders.is_empty() {
+                    self.by_address.remove(a);
+                }
+            }
+        }
+    }
+
+    fn index(&mut self, uid: &str) {
+        let Some(vm) = self.by_uid.get(uid) else { return };
+        for a in Self::addresses(vm) {
+            self.by_address.entry(a.clone()).or_default().insert(uid.to_string());
+        }
+    }
+
+    pub(crate) fn insert(&mut self, uid: String, vm: Vm) -> Option<Vm> {
+        self.unindex(&uid);
+        let old = self.by_uid.insert(uid.clone(), vm);
+        self.index(&uid);
+        old
+    }
+
+    pub(crate) fn remove(&mut self, uid: &str) -> Option<Vm> {
+        self.unindex(uid);
+        self.by_uid.remove(uid)
+    }
+
+    /// Change one machine in place, and re-index it.
+    pub(crate) fn update<R>(&mut self, uid: &str, f: impl FnOnce(&mut Vm) -> R) -> Option<R> {
+        self.unindex(uid);
+        let out = self.by_uid.get_mut(uid).map(f);
+        self.index(uid);
+        out
+    }
+
+    /// The one live machine holding `ip`. Two machines here claiming one
+    /// address (a lease moved between guests before the old one's record
+    /// caught up) is no answer: guessing hands one guest the other's identity.
+    pub(crate) fn at(&self, ip: &str) -> Option<&Vm> {
+        let holders = self.by_address.get(ip)?;
+        if holders.len() != 1 {
+            return None;
+        }
+        self.by_uid.get(holders.iter().next()?)
+    }
+}
+
+/// Is the machine this object describes this node's to answer for (#119)?
+///
+/// The object places a machine; the local record only says a hypervisor is
+/// running here. They disagree after a move (live migration), across a
+/// partition, or while two nodes both still believe they run it, and then
+/// only the node the object names may answer. Checked against the object
+/// itself, so an address released on one node and leased to a machine on
+/// another resolves only where the object for its current holder points.
+fn placed_here(obj: &Value, uid: &str, node: &str) -> bool {
+    if obj["metadata"]["uid"].as_str() != Some(uid) || terminating(obj) {
+        return false;
+    }
+    if obj["status"]["nodeName"].as_str() != Some(node) {
+        return false;
+    }
+    // KubeVirt's migration state: once a migration has completed to another
+    // node the machine is that node's, whatever nodeName still says. A
+    // migration in flight leaves it with its source until it completes.
+    let m = &obj["status"]["migrationState"];
+    if m["completed"].as_bool() == Some(true) && !m["failed"].as_bool().unwrap_or(false) {
+        if let Some(target) = m["targetNode"].as_str() {
+            if target != node {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 pub struct VmManager {
     ring: Option<Arc<RingClient>>,
     /// stormblock's management API on this node.
@@ -695,7 +805,7 @@ pub struct VmManager {
     /// Keyed by uid: a VM deleted and recreated under one name is two
     /// different machines, and treating them as one is how the second finds
     /// the first's disks.
-    vms: Mutex<HashMap<String, Vm>>,
+    vms: Mutex<Machines>,
     stopping: Mutex<std::collections::HashSet<String>>,
     /// The VMIs the apiserver last gave this node, by uid.
     ///
@@ -866,7 +976,7 @@ impl VmManager {
             engine: crate::engine::EngineClient::default(),
             claims: None,
             events,
-            vms: Mutex::new(HashMap::new()),
+            vms: Mutex::new(Machines::default()),
             stopping: Mutex::new(Default::default()),
             desired: Mutex::new(HashMap::new()),
             disk_lifecycle: tokio::sync::RwLock::new(()),
@@ -1011,20 +1121,23 @@ impl VmManager {
         }
         let updated = {
             let mut vms = self.vms.lock().await;
-            let Some(vm) = vms.get_mut(&news.uid) else { return };
+            let Some(vm) = vms.get(&news.uid) else { return };
             if vm.phase.terminal() {
                 return;
             }
-            let Some(nic) = vm.nics.get_mut(news.nic) else { return };
+            let Some(nic) = vm.nics.get(news.nic) else { return };
             if nic.addresses == news.addresses {
                 return;
             }
             info!(vm = %vm.name, nic = %nic.name, addresses = ?news.addresses, "guest address seen on its tap");
-            nic.addresses = news.addresses;
-            if vm.ready_unix.is_none() {
-                vm.ready_unix = Some(now_unix());
-            }
-            vm.clone()
+            vms.update(&news.uid, |vm| {
+                vm.nics[news.nic].addresses = news.addresses;
+                if vm.ready_unix.is_none() {
+                    vm.ready_unix = Some(now_unix());
+                }
+                vm.clone()
+            })
+            .expect("checked above")
         };
         self.patch_status(&updated).await;
     }
@@ -1161,9 +1274,13 @@ impl VmManager {
         }
         let updated = {
             let mut vms = self.vms.lock().await;
-            let Some(cur) = vms.get_mut(uid) else { return };
-            cur.access = access;
-            cur.clone()
+            let Some(cur) = vms.update(uid, |cur| {
+                cur.access = access;
+                cur.clone()
+            }) else {
+                return;
+            };
+            cur
         };
         self.patch_status(&updated).await;
     }
@@ -1241,7 +1358,9 @@ impl VmManager {
         let mut records = self.vms.lock().await;
         for reg in stormvm_node::console::list(RUN_ROOT) {
             if !reg.uid.is_empty() {
-                records.entry(reg.uid.clone()).or_insert_with(|| vm_of(&reg));
+                if !records.contains_key(&reg.uid) {
+                    records.insert(reg.uid.clone(), vm_of(&reg));
+                }
             }
         }
     }
@@ -1261,6 +1380,16 @@ impl VmManager {
     /// Only this UID is observed or mutated. The common executor protects its
     /// name/claims, including while a terminating predecessor retains disks.
     pub async fn reconcile_one(&self, uid: &str, object: Option<&Value>) -> anyhow::Result<bool> {
+        // This machine's cached object, from what its worker was handed (#119):
+        // the metadata answer follows one machine's change without waiting for
+        // the next full list, and nothing else is rebuilt for it.
+        {
+            let mut desired = self.desired.lock().await;
+            match object {
+                Some(o) => { desired.insert(uid.to_string(), o.clone()); }
+                None => { desired.remove(uid); }
+            }
+        }
         if object.map_or(true, terminating) {
             let vm = self.vms.lock().await.get(uid).cloned();
             if let Some(vm) = vm {
@@ -2595,22 +2724,30 @@ impl VmManager {
         if self.node_ip_holds(ip).await {
             return None;
         }
+        self.machine_at(ip).await
+    }
+
+    /// [`Self::instance_at`] past the node's own addresses.
+    async fn machine_at(&self, ip: &str) -> Option<Value> {
         if !self.synced.load(std::sync::atomic::Ordering::Relaxed) {
             // Cold. Saying "no such machine" here would have a guest
             // configure itself as nobody on a kubelet that simply has not
             // caught up yet; the caller turns this into "ask again".
             return Some(json!({ "storm.io/cold": true }));
         }
-        let vms = self.vms.lock().await;
         // Several machines can share a pod, so this matches the *machine* by
-        // its own address rather than resolving a pod and assuming one.
-        let vm = vms.values().find(|v| {
-            !v.phase.terminal() && v.nics.iter().any(|n| n.addresses.iter().any(|a| a == ip))
-        })?;
+        // its own address rather than resolving a pod and assuming one: one
+        // lookup in the address index, not a scan (#119).
+        let vm = self.vms.lock().await.at(ip)?.clone();
         // The object, which is the truth. The local record only said which
-        // machine holds this address; everything a guest is told about itself
-        // comes from what the apiserver says it should be.
+        // machine holds this address; whether this node may answer for it,
+        // and everything a guest is told about itself, comes from what the
+        // apiserver says. No object, or one that places the machine on
+        // another node, is no answer (#119).
         let obj = self.desired.lock().await.get(&vm.uid).cloned();
+        if !obj.as_ref().is_some_and(|o| placed_here(o, &vm.uid, &self.node_name)) {
+            return None;
+        }
         let interfaces: Vec<Value> = vm
             .nics
             .iter()
@@ -3258,10 +3395,10 @@ mod tests {
         let mut obj = vmi("n1");
         m.record_failure("u-1", &obj, "fixture").await;
         {
-            let mut records = m.vms.lock().await;
-            let vm = records.get_mut("u-1").unwrap();
-            vm.phase = Phase::Running;
-            vm.handle = Handle(123);
+            m.vms.lock().await.update("u-1", |vm| {
+                vm.phase = Phase::Running;
+                vm.handle = Handle(123);
+            }).unwrap();
         }
         obj["metadata"]["deletionTimestamp"] = json!("2026-09-29T00:00:00Z");
         m.sync(&[obj]).await;
@@ -3279,10 +3416,10 @@ mod tests {
         let m = VmManager::new(None, "n1", reqwest::Client::new(), "")
             .with_storage(crate::engine::EngineClient::new(&url, crate::engine::TokenSource::none()));
         m.record_failure("u-1", &vmi("n1"), "fixture").await;
-        m.vms.lock().await.get_mut("u-1").unwrap().disks.push(ResolvedDisk {
+        m.vms.lock().await.update("u-1", |vm| vm.disks.push(ResolvedDisk {
             name: "root".into(), device: "/dev/test".into(), volume_id: Some("disk".into()),
             readonly: false, bus: Default::default(),
-        });
+        })).unwrap();
         m.sync(&[]).await;
         assert_eq!(m.running().await.len(), 1, "HTTP 409 must remain retryable");
         server.abort();
@@ -3433,6 +3570,117 @@ mod tests {
         assert!(vm.nics[0].addresses.is_empty());
         assert_eq!(vm.nics[1].addresses, vec!["192.168.30.4".to_string()]);
         assert!(vm.ready_unix.is_some());
+    }
+
+    fn vm_at(uid: &str, addresses: &[&str], phase: Phase) -> Vm {
+        Vm {
+            namespace: "default".into(),
+            name: format!("vm-{uid}"),
+            uid: uid.into(),
+            log_dir: String::new(),
+            handle: Handle::NONE,
+            disks: vec![],
+            phase,
+            exit_code: 0,
+            message: String::new(),
+            started_unix: 1,
+            ready_unix: None,
+            owned_volumes: vec![],
+            nics: vec![NicReport {
+                name: "default".into(),
+                mac: "02:00:00:00:00:01".into(),
+                addresses: addresses.iter().map(|a| a.to_string()).collect(),
+                binding: "bridge".into(),
+            }],
+            access: Access::default(),
+        }
+    }
+
+    fn placed(uid: &str, node: &str) -> Value {
+        json!({
+            "kind": "VirtualMachineInstance",
+            "metadata": { "name": format!("vm-{uid}"), "namespace": "default", "uid": uid },
+            "status": { "nodeName": node }
+        })
+    }
+
+    #[test]
+    fn the_address_index_follows_every_change_to_a_machine() {
+        let mut m = Machines::default();
+        m.insert("a".into(), vm_at("a", &["10.0.0.5"], Phase::Running));
+        assert_eq!(m.at("10.0.0.5").map(|v| v.uid.as_str()), Some("a"));
+        // A new lease, applied in place: the old address resolves to nobody.
+        m.update("a", |v| v.nics[0].addresses = vec!["10.0.0.6".into()]).unwrap();
+        assert!(m.at("10.0.0.5").is_none());
+        assert_eq!(m.at("10.0.0.6").map(|v| v.uid.as_str()), Some("a"));
+        // Re-recorded as ended: an ended machine's address is nobody's.
+        m.insert("a".into(), vm_at("a", &["10.0.0.6"], Phase::Failed));
+        assert!(m.at("10.0.0.6").is_none());
+        m.insert("a".into(), vm_at("a", &["10.0.0.6"], Phase::Running));
+        m.remove("a");
+        assert!(m.at("10.0.0.6").is_none());
+        assert!(m.by_address.is_empty(), "nothing left behind: {:?}", m.by_address);
+    }
+
+    #[test]
+    fn an_address_two_machines_here_claim_is_nobodys() {
+        let mut m = Machines::default();
+        m.insert("a".into(), vm_at("a", &["10.0.0.5"], Phase::Running));
+        m.insert("b".into(), vm_at("b", &["10.0.0.5"], Phase::Running));
+        assert!(m.at("10.0.0.5").is_none());
+        m.update("a", |v| v.nics[0].addresses.clear()).unwrap();
+        assert_eq!(m.at("10.0.0.5").map(|v| v.uid.as_str()), Some("b"));
+    }
+
+    #[test]
+    fn only_the_node_the_object_places_a_machine_on_answers() {
+        assert!(placed_here(&placed("a", "n1"), "a", "n1"));
+        assert!(!placed_here(&placed("a", "n2"), "a", "n1"), "moved");
+        assert!(!placed_here(&placed("b", "n1"), "a", "n1"), "another machine's object");
+        let mut going = placed("a", "n1");
+        going["metadata"]["deletionTimestamp"] = json!("2026-10-05T00:00:00Z");
+        assert!(!placed_here(&going, "a", "n1"));
+        let mut migrating = placed("a", "n1");
+        migrating["status"]["migrationState"] = json!({ "sourceNode": "n1", "targetNode": "n2" });
+        assert!(placed_here(&migrating, "a", "n1"), "in flight: still the source's");
+        migrating["status"]["migrationState"]["completed"] = json!(true);
+        assert!(!placed_here(&migrating, "a", "n1"), "completed: the target's");
+        migrating["status"]["migrationState"]["failed"] = json!(true);
+        assert!(placed_here(&migrating, "a", "n1"), "failed: it never left");
+    }
+
+    #[tokio::test]
+    async fn metadata_is_answered_from_the_object_that_places_the_machine_here() {
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), "");
+        m.vms.lock().await.insert("a".into(), vm_at("a", &["10.0.0.5"], Phase::Running));
+        assert!(m.machine_at("10.0.0.5").await.unwrap().get("storm.io/cold").is_some(), "cold before a sync");
+
+        m.cache_specs(&[]).await;
+        assert!(m.machine_at("10.0.0.5").await.is_none(), "no object: no answer");
+
+        m.cache_specs(&[placed("a", "n1")]).await;
+        let md = m.machine_at("10.0.0.5").await.unwrap();
+        assert_eq!(md["instance_id"], "a");
+        assert_eq!(md["zone"], "n1");
+        assert!(m.machine_at("10.0.0.9").await.is_none());
+
+        // The object moves (a migration, a split brain): this node stops
+        // answering at once, from that machine's own reconcile.
+        m.reconcile_one("a", Some(&placed("a", "n2"))).await.ok();
+        assert!(m.machine_at("10.0.0.5").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_address_reused_by_another_machine_never_resolves_to_its_predecessor() {
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), "");
+        // The predecessor ended here; the address went to a machine elsewhere.
+        m.vms.lock().await.insert("old".into(), vm_at("old", &["10.0.0.5"], Phase::Succeeded));
+        m.cache_specs(&[placed("old", "n1")]).await;
+        assert!(m.machine_at("10.0.0.5").await.is_none());
+        // A stale running record whose object is gone also answers nothing.
+        m.vms.lock().await.insert("old".into(), vm_at("old", &["10.0.0.5"], Phase::Running));
+        m.cache_specs(&[placed("new", "n2")]).await;
+        assert!(m.machine_at("10.0.0.5").await.is_none());
     }
 
     fn vmi(node: &str) -> Value {
@@ -3907,11 +4155,11 @@ mod tests {
             .with_storage(crate::engine::EngineClient::new(&url, crate::engine::TokenSource::none()));
         m.record_failure("u-1", &vmi("n1"), "fixture").await;
         {
-            let mut records = m.vms.lock().await;
-            let vm = records.get_mut("u-1").unwrap();
-            vm.disks.push(ResolvedDisk { name: "root".into(), device: "/dev/test".into(),
-                volume_id: Some("disk".into()), readonly: false, bus: Default::default() });
-            vm.owned_volumes.push("disk".into());
+            m.vms.lock().await.update("u-1", |vm| {
+                vm.disks.push(ResolvedDisk { name: "root".into(), device: "/dev/test".into(),
+                    volume_id: Some("disk".into()), readonly: false, bus: Default::default() });
+                vm.owned_volumes.push("disk".into());
+            }).unwrap();
         }
         m.reconcile_one("u-1", None).await.unwrap();
         assert!(m.running().await.is_empty());

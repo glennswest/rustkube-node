@@ -2,6 +2,16 @@
 
 ## 2026-10-05
 
+- **fix:** Guest metadata (`/vmInstance/{address}`) answers only for a machine whose VMI places it on this
+  node (#119, stormcos#54): the cached object must exist, not be terminating, carry the machine's uid, name
+  this node in `status.nodeName`, and not have completed a migration to another node. Before, the local
+  record alone decided, so a machine that moved, or a stale record whose object was gone, still answered,
+  and an address reused elsewhere could resolve to its predecessor. Each machine's cached object is
+  refreshed by its own reconcile, not only by the next full list. A cluster without the VMI CRD is no
+  longer "cold" for ever (404, not 503).
+- **perf:** `/vmInstance` finds the machine through an address → uid index kept with the machine records
+  (re-indexed on every change to a machine), not by scanning every machine and NIC under the lock. An
+  address two live machines here both claim answers 404 rather than either of them.
 - **perf:** A pod scheduled before the CNI agent is up starts as soon as its config appears (#148, Dell
   on 11.79: coredns 16 attempts over 27 s, CNI → all pods 20–27 s per boot). With no conflist the stormpump
   runtime no longer acquires and releases a sandbox per attempt (the config is checked first), and the pod
