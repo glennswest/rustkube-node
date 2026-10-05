@@ -626,6 +626,11 @@ Steps:
        status.interfaces[]"); running it there. Found on the way: stormcentral builds the Job itself (no
        `test/rustkube-node-test.yaml`, no `RUSTKUBE_NODE_TEST_IMAGE` = #97), grants cluster reads only through
        `test/requires.toml` (none here), and `STORM_NODE` is an address: the #59/#62 medium cases need fixing.
+       Run a844d807fe: C2NR0Q2's sbregistry answers 507 on the push (stormcentral#376, commented). #91 proposed
+       after stormcentral#376; rerun `stormcentral test run stormcos_qa vm-waves --tag C2NR0Q2` then.
+       Test container fixed for the real runner (fb7fc66, 8d65920: own image #97, node name, requires.toml,
+       node-volumes restore → skip); sc-build `cd test && cargo test --locked && cargo build --release
+       --locked`: 19 pass. #97 also proposed after stormcentral#376 for its live run.
 
 ### In progress: #87, static (mirror) pods: logs and stale status
 
