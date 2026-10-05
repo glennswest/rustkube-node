@@ -616,7 +616,8 @@ Steps:
        the status holds.
 4. [x] Tests, docs (README), CHANGELOG. sc-build at 1f5409a: build clean, all pass (kubelet 207).
 5. [ ] The issue's done-when on the test host: console-created VM, ssh in with the key; "Add my keys" live.
-       Waits on C2NR0Q2 (unreachable) and a release. Then close.
+       2026-10-05: half 1 is stormcos_qa `vm-waves` (noCloud key, ssh); half 2 filed as stormcos_qa#52. Runs on
+       C2NR0Q2 get 507 on the image push (stormcentral#376); #92 proposed after it. Then run vm-waves, close.
 
 ### In progress: #91, a bridged VM's IP from its tap (stormvm_net::snoop_tap)
 
