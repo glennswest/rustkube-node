@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-10-05
+
+- **feat:** kube-proxy talks to a TLS apiserver with a token (#145, for stormcos#265: the flowsdn
+  edition has no Service datapath and runs this kube-proxy as a DaemonSet). `--ca-file` /
+  `KUBE_PROXY_CA_FILE` and `--token-file` / `KUBE_PROXY_TOKEN_FILE` default to the pod's
+  ServiceAccount (`/var/run/secrets/kubernetes.io/serviceaccount/{ca.crt,token}`) when present;
+  the token is re-read on every request (projected tokens rotate). New optional `--cluster-cidr` /
+  `KUBE_PROXY_CLUSTER_CIDR`: ClusterIP traffic from outside the pod CIDR is masqueraded.
+- **fix:** kube-proxy's rules are entered: `PREROUTING` and `OUTPUT` jump to `KUBE-SERVICES` and
+  `POSTROUTING` to `KUBE-POSTROUTING`, checked after every restore and inserted when missing
+  (before, nothing reached the chains it wrote). `iptables`/`iptables-restore` wait for the
+  xtables lock (`-w 5`).
+- **fix:** kube-proxy no longer removes every rule when the apiserver refuses it: a non-2xx answer
+  or a body with no `items` is an error, and the rules on the node stay as they were.
+- **fix:** kube-proxy rewrites the rules when a backend changes at the same count (a replaced pod at
+  a new IP kept the old DNAT), and applies them again every 60 s; unchanged rules are not rewritten
+  every 5 s.
+- **fix:** kube-proxy keeps both halves of a port served on two protocols (kube-dns 53/UDP and
+  53/TCP collided, so one had no rules), matches Endpoints ports to Service ports by name (a
+  multi-port Service got one target port for all), takes every subset, and drops backends whose
+  Endpoints are gone.
+
 ## 2026-10-03
 
 - **fix:** A claim stormblock will not clone says why (#140, Dell C2NR0Q2 on 11.76: every claim

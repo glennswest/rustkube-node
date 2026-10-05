@@ -63,11 +63,13 @@ not the release path.
 so a 401 reads as "no Services" and wipes every rule. Its rules are never entered: nothing jumps from
 PREROUTING/OUTPUT to `KUBE-SERVICES` or from POSTROUTING to `KUBE-POSTROUTING`. A change is detected only by
 counts, so a pod replaced at a new IP keeps the old DNAT.
-1. [ ] `--ca-file`/`--token-file` (`KUBE_PROXY_CA_FILE`/`KUBE_PROXY_TOKEN_FILE`), defaulting to the in-cluster
+1. [x] `--ca-file`/`--token-file` (`KUBE_PROXY_CA_FILE`/`KUBE_PROXY_TOKEN_FILE`), defaulting to the in-cluster
        ServiceAccount paths when present; token re-read each pass (projected tokens rotate). Non-2xx is an error.
-2. [ ] Jumps ensured (`-C`, else `-I`) for PREROUTING, OUTPUT → KUBE-SERVICES, POSTROUTING → KUBE-POSTROUTING.
-3. [ ] Apply when the generated rules differ from the last applied set, or 60 s after it (resync).
-4. [ ] `--cluster-cidr` (optional): ClusterIP traffic from outside it is marked for masquerade.
+2. [x] Jumps ensured (`-C`, else `-I`) for PREROUTING, OUTPUT → KUBE-SERVICES, POSTROUTING → KUBE-POSTROUTING.
+3. [x] Apply when the generated rules differ from the last applied set, or 60 s after it (resync).
+4. [x] `--cluster-cidr` (optional): ClusterIP traffic from outside it is marked for masquerade. Also found and
+       fixed: service ports keyed without protocol (kube-dns 53/UDP vs 53/TCP collided), Endpoints matched by
+       number not name, stale backends never cleared. 3243b77; sc-build eb0afdb: 30 proxy tests (13 new) pass.
 5. [ ] Tests, docs (configuration.md, README, status.md), CHANGELOG; sc-build; stage golden; answer the node
        requirements on the issue.
 

@@ -155,11 +155,28 @@ syntax in flag values. The generated stormd config sets
 
 ## Kube-proxy
 
-Only `--apiserver` (`APISERVER_URL`, `http://127.0.0.1:6443`) and `--node-name`
-(`NODE_NAME`, then HOSTNAME/NODE_NAME/localhost fallback) are exposed, plus help.
-The library polls Services/Endpoints every five seconds and invokes
-iptables-restore on Linux. It has no serving port, kubeconfig flag or TLS/token
-credential flags. No eBPF backend is implemented; stormcos uses Cilium instead.
+Source: `cmd/kube-proxy/src/main.rs`, `pkg/proxy`.
+
+| Flag | Env | Default / purpose |
+|---|---|---|
+| `--apiserver` | `APISERVER_URL` | `http://127.0.0.1:6443`. In a DaemonSet, `https://$(NODE_IP):6443`: not the `kubernetes` ClusterIP, which is what kube-proxy makes routable |
+| `--ca-file` | `KUBE_PROXY_CA_FILE` | `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` if present, else none. PEM CA trusted for the apiserver |
+| `--token-file` | `KUBE_PROXY_TOKEN_FILE` | `/var/run/secrets/kubernetes.io/serviceaccount/token` if present, else none. Bearer token, re-read on every request |
+| `--cluster-cidr` | `KUBE_PROXY_CLUSTER_CIDR` | None. Pod CIDR: ClusterIP traffic from outside it is marked for masquerade |
+| `--node-name` | `NODE_NAME` | HOSTNAME, then NODE_NAME, then `localhost` |
+
+An explicit CA or token file that does not exist, an unusable CA or an empty
+token stops kube-proxy at start. Every five seconds it lists `/api/v1/services`
+and `/api/v1/endpoints` (RBAC: get/list/watch on services and endpoints); a
+refused or malformed answer leaves the node's rules alone. Rules go through
+`iptables-restore -w 5 --noflush` (nat table) when they differ from the last
+applied set, and again every 60 s; after each restore, the jumps
+PREROUTING/OUTPUT → `KUBE-SERVICES` and POSTROUTING → `KUBE-POSTROUTING` are
+checked (`iptables -C`) and inserted when missing. It needs `iptables` and
+`iptables-restore` on PATH, hostNetwork and NET_ADMIN (privileged). It does not
+flush conntrack entries, and leaves the chains of a deleted Service in place
+(empty of jumps). No serving port, no kubeconfig flag, no EndpointSlices and no
+eBPF backend.
 
 ## Test container
 
