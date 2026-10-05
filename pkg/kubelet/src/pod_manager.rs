@@ -237,10 +237,14 @@ fn ensure_host_path(path: &str, typ: &str) {
 /// has. Keeping that explicit rather than sniffing a `/dev/` prefix: the
 /// difference between a bind and a mount decides whether a wrong answer is a
 /// missing file or a corrupted one.
-#[derive(Debug, Clone)]
+///
+/// `block` is a claim of `volumeMode: Block` (#67): `path` is its device, bound
+/// as it is at a container's `volumeDevices[].devicePath`, with no filesystem.
+#[derive(Debug, Clone, Default)]
 pub struct ResolvedVolume {
     pub path: String,
     pub fstype: Option<String>,
+    pub block: bool,
 }
 
 /// Where a node service's logs are (#72, #124): its stormd log volume, and
@@ -741,6 +745,7 @@ impl PodManager {
         let Some(mut pvc) = self.api_get(&path).await else {
             return;
         };
+        facts.block = crate::storage::is_block(&pvc);
 
         let mut pv = crate::system_claims::stormblock_pv(
             &facts,
@@ -1048,7 +1053,25 @@ impl PodManager {
                     format!("/api/v1/namespaces/{namespace}/persistentvolumeclaims/{claim}");
                 match self.api_get(&pvc_path).await {
                     Some(pvc) => {
+                        // A raw device where a filesystem is mounted, or the
+                        // other way round, is refused as upstream refuses it:
+                        // the pod waits with the reason (#67).
+                        if let Some(why) =
+                            volume_mode_misuse(pod, &name, crate::storage::is_block(&pvc))
+                        {
+                            return Err(CriError::VolumeNotReady(format!(
+                                "PVC {namespace}/{claim}: {why}"
+                            )));
+                        }
                         if let Some(pv) = self.external_csi_pv(&pvc).await {
+                            if crate::storage::is_block(&pvc) {
+                                return Err(CriError::VolumeNotReady(format!(
+                                    "PVC {namespace}/{claim}: volumeMode: Block from CSI driver {} \
+                                     is not supported on this node (only the built-in stormblock \
+                                     class serves raw block claims)",
+                                    pv["spec"]["csi"]["driver"].as_str().unwrap_or("?")
+                                )));
+                            }
                             let readonly = vol["persistentVolumeClaim"]["readOnly"]
                                 .as_bool()
                                 .unwrap_or(false);
@@ -1059,6 +1082,7 @@ impl PodManager {
                                         ResolvedVolume {
                                             path: dir,
                                             fstype: None,
+                                            block: false,
                                         },
                                     );
                                     continue;
@@ -1094,12 +1118,13 @@ impl PodManager {
                 // on a node whose storage is briefly unreachable. The fallback
                 // is loud, and `kubectl describe` shows the reason.
                 match self.provision_claim(namespace, claim, uid).await {
-                    Ok(device) => {
+                    Ok((device, fstype)) => {
                         map.insert(
                             name,
                             ResolvedVolume {
                                 path: device,
-                                fstype: Some("ext4".to_string()),
+                                block: fstype.is_none(),
+                                fstype: fstype.map(String::from),
                             },
                         );
                         continue;
@@ -1145,6 +1170,7 @@ impl PodManager {
                             ResolvedVolume {
                                 path: dir,
                                 fstype: None,
+                                block: false,
                             },
                         );
                         continue;
@@ -1246,6 +1272,7 @@ impl PodManager {
                 ResolvedVolume {
                     path: host_path,
                     fstype: None,
+                    block: false,
                 },
             );
         }
@@ -1484,10 +1511,10 @@ impl PodManager {
         namespace: &str,
         claim: &str,
         pod_uid: &str,
-    ) -> Result<String, ClaimError> {
+    ) -> Result<(String, Option<&'static str>), ClaimError> {
         self.provision_claim_volume(namespace, claim, pod_uid)
             .await
-            .map(|(_, dev)| dev)
+            .map(|(_, dev, fs)| (dev, fs))
     }
 
     /// A claim as a block device on this node, for a virtual machine's disk
@@ -1517,6 +1544,7 @@ impl PodManager {
         }
         self.provision_claim_volume(namespace, claim, "")
             .await
+            .map(|(id, dev, _)| (id, dev))
             .map_err(|e| match e {
                 ClaimError::NotOurs(why) => format!("waiting for claim {claim} to bind: {why}"),
                 ClaimError::InUse(why) => why,
@@ -1524,13 +1552,14 @@ impl PodManager {
             })
     }
 
-    /// [`Self::provision_claim`], answering the volume id too.
+    /// [`Self::provision_claim`], answering the volume id too, and the
+    /// filesystem the device carries: `None` for a raw block claim (#67).
     async fn provision_claim_volume(
         &self,
         namespace: &str,
         claim: &str,
         pod_uid: &str,
-    ) -> Result<(String, String), ClaimError> {
+    ) -> Result<(String, String, Option<&'static str>), ClaimError> {
         let name = crate::storage::volume_name(namespace, claim);
 
         // What the claim asked for, rounded up to a class. The class is also
@@ -1583,6 +1612,10 @@ impl PodManager {
                 "claim asks for {want} bytes, larger than the largest size class"
             ))
         })?;
+        // A raw block claim has no filesystem; a filesystem claim has its
+        // class's (#67).
+        let block = crate::storage::is_block(&pvc);
+        let fstype = if block { None } else { crate::storage::class_fs(class).ok() };
 
         // Already provisioned? A claim is keyed on namespace and name, so a
         // restarted pod is reunited with its data rather than given a fresh
@@ -1624,7 +1657,19 @@ impl PodManager {
             None if crate::storage::claim_source(&pvc).is_some() => {
                 self.clone_claim_source(namespace, &pvc, &name).await?
             }
+            // **A raw block claim is a plain volume** (#67): nothing to
+            // format and nothing to clone, so every class is offered, up to
+            // the pebibyte classes no filesystem blank exists for yet.
+            None if block => self.raw_volume(&name, class, class_bytes).await?,
             None => {
+                // A class with no filesystem blank yet: the claim waits, and
+                // says what would serve it now.
+                if let Err(why) = crate::storage::class_fs(class) {
+                    return Err(ClaimError::Failed(format!(
+                        "claim {namespace}/{claim} rounds up to the {class} class, which has no \
+                         filesystem yet: {why}"
+                    )));
+                }
                 // Clone the blank for this class. `clone` is the one door:
                 // it descends from a sealed volume, records lineage, and
                 // stamps the clone with its own filesystem UUID — two live
@@ -1658,12 +1703,38 @@ impl PodManager {
             // that was not made, and after the attach so a bound claim means
             // storage a pod can actually use.
             self.bind_claim(namespace, claim, &name, class_bytes).await;
-            return Ok((vol_id, dev.to_string()));
+            return Ok((vol_id, dev.to_string(), fstype));
         }
         Err(ClaimError::Failed(format!(
             "volume {name} did not attach locally: {info} — an NVMe-oF attach needs a \
              connect this node does not do yet"
         )))
+    }
+
+    /// A raw block claim's volume (#67): a plain stormblock volume of the
+    /// class's size, in the data half like every claim, with no filesystem.
+    /// Thin, so a pebibyte class costs nothing until it is written.
+    async fn raw_volume(&self, name: &str, class: &str, bytes: u64) -> Result<String, ClaimError> {
+        let body = serde_json::json!({
+            "name": name,
+            "size": crate::storage::engine_size(bytes),
+            "role": "data",
+        });
+        let created = self
+            .storage_post("/api/v1/volumes", &body)
+            .await
+            .map_err(|r| {
+                ClaimError::Failed(format!(
+                    "stormblock would not create the raw volume {name} ({class}): {r}"
+                ))
+            })?;
+        created["id"]
+            .as_str()
+            .or_else(|| created["volume_id"].as_str())
+            .map(String::from)
+            .ok_or_else(|| {
+                ClaimError::Failed(format!("stormblock created {name} but named no volume: {created}"))
+            })
     }
 
     /// Clone the blank of a size class into the claim's volume `name`,
@@ -4146,7 +4217,19 @@ async fn mint_blank(
     blank: &str,
     class: &str,
 ) -> Result<(), String> {
-    let body = serde_json::json!({ "name": blank, "size": class, "fs": "ext4", "role": "data" });
+    // The class's filesystem and its size in MiB (stormblock has no `P`).
+    let fs = crate::storage::class_fs(class)?;
+    let bytes = crate::storage::SIZE_CLASSES
+        .iter()
+        .find(|(c, _, _)| *c == class)
+        .map(|(_, b, _)| *b)
+        .ok_or_else(|| format!("no size class {class}"))?;
+    let body = serde_json::json!({
+        "name": blank,
+        "size": crate::storage::engine_size(bytes),
+        "fs": fs,
+        "role": "data",
+    });
     // Bounded by MINT_TIMEOUT, not the ordinary request bound: the answer
     // comes when the format is done (#99).
     let resp = engine
@@ -4640,9 +4723,71 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
     Ok(out)
 }
 
-/// Resolve a container's `volumeMounts` to CRI mounts using the pod's resolved
-/// volumes. Mounts whose volume didn't resolve are dropped.
+/// Does the pod use volume `name` against its claim's mode (#67)? A Block
+/// claim named in some container's `volumeMounts`, or a Filesystem one in
+/// `volumeDevices`, is refused, as upstream refuses it.
+fn volume_mode_misuse(pod: &Value, name: &str, block: bool) -> Option<String> {
+    let (wrong, want) = if block {
+        ("volumeMounts", "volumeDevices")
+    } else {
+        ("volumeDevices", "volumeMounts")
+    };
+    let mode = if block { "Block" } else { "Filesystem" };
+    ["initContainers", "containers"]
+        .iter()
+        .filter_map(|k| pod["spec"][*k].as_array())
+        .flatten()
+        .find(|c| {
+            c[wrong]
+                .as_array()
+                .is_some_and(|l| l.iter().any(|m| m["name"].as_str() == Some(name)))
+        })
+        .map(|c| {
+            format!(
+                "volume {name} is volumeMode: {mode}, and container {} names it in {wrong}; \
+                 use {want}",
+                c["name"].as_str().unwrap_or("?")
+            )
+        })
+}
+
+/// Resolve a container's `volumeMounts` (and `volumeDevices`, #67) to CRI
+/// mounts using the pod's resolved volumes. Mounts whose volume didn't
+/// resolve are dropped.
 fn resolve_mounts(spec: &Value, volumes: &HashMap<String, ResolvedVolume>) -> Vec<Mount> {
+    let mut mounts = resolve_volume_mounts(spec, volumes);
+    mounts.extend(resolve_volume_devices(spec, volumes));
+    mounts
+}
+
+/// A container's `volumeDevices`: a raw block claim's device, bound as it is
+/// at `devicePath` (stormpump binds a device node onto a file placeholder).
+/// No filesystem, no relabel, and no propagation: it is a device, not a tree.
+fn resolve_volume_devices(spec: &Value, volumes: &HashMap<String, ResolvedVolume>) -> Vec<Mount> {
+    spec["volumeDevices"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|d| {
+                    let resolved = volumes.get(d["name"].as_str()?)?;
+                    if !resolved.block {
+                        return None;
+                    }
+                    Some(Mount {
+                        container_path: d["devicePath"].as_str()?.to_string(),
+                        host_path: resolved.path.clone(),
+                        readonly: false,
+                        propagation: MountPropagation::Private,
+                        selinux_relabel: false,
+                        fstype: None,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn resolve_volume_mounts(spec: &Value, volumes: &HashMap<String, ResolvedVolume>) -> Vec<Mount> {
     spec["volumeMounts"]
         .as_array()
         .map(|a| {
@@ -5896,6 +6041,137 @@ pub(crate) mod tests {
         assert!(!sb.deleted.load(Ordering::SeqCst));
     }
 
+    /// One loopback server standing in for both the apiserver and stormblock
+    /// (#67): it serves the claim, records every request, keeps the volumes
+    /// created, and attaches anything at `/dev/ublkb7`.
+    struct ClaimWorld {
+        url: String,
+        calls: Arc<Mutex<Vec<(String, String, Value)>>>,
+    }
+
+    async fn claim_world(pvc: Value) -> ClaimWorld {
+        let calls: Arc<Mutex<Vec<(String, String, Value)>>> = Arc::default();
+        let volumes: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let log = calls.clone();
+        let app = axum::Router::new().fallback(
+            move |method: axum::http::Method, uri: axum::http::Uri, body: axum::body::Bytes| {
+                let (log, volumes, pvc) = (log.clone(), volumes.clone(), pvc.clone());
+                async move {
+                    use axum::http::StatusCode;
+                    let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    let path = uri.path().to_string();
+                    log.lock().unwrap().push((method.to_string(), path.clone(), body.clone()));
+                    let ok = |v: Value| (StatusCode::OK, axum::Json(v));
+                    match (method.as_str(), path.as_str()) {
+                        ("GET", p) if p.contains("/persistentvolumeclaims/") => ok(pvc),
+                        ("PUT", p) if p.contains("/persistentvolumeclaims/") => ok(body),
+                        ("POST", "/api/v1/persistentvolumes") => (StatusCode::CREATED, axum::Json(body)),
+                        ("GET", "/api/v1/volumes") => {
+                            ok(json!({ "items": volumes.lock().unwrap().clone() }))
+                        }
+                        ("POST", "/api/v1/volumes") => {
+                            let v = json!({ "id": "vol-raw", "name": body["name"] });
+                            volumes.lock().unwrap().push(v.clone());
+                            (StatusCode::CREATED, axum::Json(v))
+                        }
+                        ("POST", p) if p.ends_with("/attach") => {
+                            ok(json!({ "device_hint": "/dev/ublkb7" }))
+                        }
+                        _ => (StatusCode::NOT_FOUND, axum::Json(json!({}))),
+                    }
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        ClaimWorld { url, calls }
+    }
+
+    fn claim_manager(w: &ClaimWorld) -> PodManager {
+        let rt = Arc::new(FakeRuntime::default());
+        PodManager::with_api(rt.clone(), rt, NODE, &w.url, "127.0.0.1", reqwest::Client::new())
+            .with_engine(crate::engine::EngineClient::new(&w.url, crate::engine::TokenSource::none()))
+    }
+
+    fn raw_claim(size: &str, mode: &str) -> Value {
+        json!({
+            "metadata": { "name": "raw", "namespace": "default", "uid": "c-1" },
+            "spec": {
+                "storageClassName": "stormblock",
+                "volumeMode": mode,
+                "accessModes": ["ReadWriteOnce"],
+                "resources": { "requests": { "storage": size } },
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn a_block_claim_is_a_raw_volume_up_to_a_pebibyte() {
+        let w = claim_world(raw_claim("600Ti", "Block")).await;
+        let mgr = claim_manager(&w);
+        let (dev, fs) = mgr.provision_claim("default", "raw", "uid-1").await.unwrap();
+        assert_eq!((dev.as_str(), fs), ("/dev/ublkb7", None));
+
+        let calls = w.calls.lock().unwrap().clone();
+        // A plain volume of the 1P class, said in MiB; no template, no mkfs.
+        let made = calls.iter().find(|(m, p, _)| m == "POST" && p == "/api/v1/volumes").unwrap();
+        assert_eq!(made.2["name"], "pvc-default-raw");
+        assert_eq!(made.2["size"], "1073741824M");
+        assert_eq!(made.2["role"], "data");
+        assert!(!calls.iter().any(|(_, p, _)| p.contains("fstemplates")), "{calls:?}");
+        // Its PV says Block, with the class's capacity.
+        let pv = calls.iter().find(|(m, p, _)| m == "POST" && p == "/api/v1/persistentvolumes").unwrap();
+        assert_eq!(pv.2["spec"]["volumeMode"], "Block");
+        assert_eq!(pv.2["spec"]["capacity"]["storage"], "1Pi");
+    }
+
+    #[tokio::test]
+    async fn a_filesystem_claim_past_the_formatted_classes_waits_and_says_use_block() {
+        let w = claim_world(raw_claim("20Ti", "Filesystem")).await;
+        let mgr = claim_manager(&w);
+        match mgr.provision_claim("default", "raw", "uid-1").await {
+            Err(ClaimError::Failed(why)) => {
+                assert!(why.contains("64T class") && why.contains("volumeMode: Block"), "{why}")
+            }
+            other => panic!("{other:?}"),
+        }
+        let calls = w.calls.lock().unwrap().clone();
+        assert!(!calls.iter().any(|(m, _, _)| m == "POST"), "nothing made: {calls:?}");
+    }
+
+    #[test]
+    fn a_volumes_mode_must_match_how_the_pod_uses_it() {
+        let pod = json!({"spec": {
+            "initContainers": [{"name": "init", "volumeMounts": [{"name": "fs", "mountPath": "/d"}]}],
+            "containers": [{"name": "db", "volumeDevices": [{"name": "raw", "devicePath": "/dev/xvda"}]}],
+        }});
+        assert!(volume_mode_misuse(&pod, "raw", true).is_none());
+        assert!(volume_mode_misuse(&pod, "fs", false).is_none());
+        let why = volume_mode_misuse(&pod, "raw", false).unwrap();
+        assert!(why.contains("container db names it in volumeDevices; use volumeMounts"), "{why}");
+        let why = volume_mode_misuse(&pod, "fs", true).unwrap();
+        assert!(why.contains("Block") && why.contains("container init") && why.contains("use volumeDevices"), "{why}");
+    }
+
+    #[test]
+    fn a_block_volume_is_bound_at_its_device_path_with_no_filesystem() {
+        let mut vols = HashMap::new();
+        vols.insert("raw".to_string(), ResolvedVolume { path: "/dev/ublkb7".into(), fstype: None, block: true });
+        vols.insert("fs".to_string(), ResolvedVolume {
+            path: "/dev/ublkb8".into(), fstype: Some("ext4".into()), block: false,
+        });
+        let spec = json!({
+            "volumeMounts": [{"name": "fs", "mountPath": "/data"}],
+            "volumeDevices": [{"name": "raw", "devicePath": "/dev/xvda"}, {"name": "fs", "devicePath": "/dev/no"}],
+        });
+        let m = resolve_mounts(&spec, &vols);
+        assert_eq!(m.len(), 2, "a filesystem volume is never bound as a device");
+        assert_eq!((m[0].container_path.as_str(), m[0].fstype.as_deref()), ("/data", Some("ext4")));
+        assert_eq!((m[1].container_path.as_str(), m[1].host_path.as_str()), ("/dev/xvda", "/dev/ublkb7"));
+        assert!(m[1].fstype.is_none() && !m[1].readonly && !m[1].selinux_relabel);
+    }
+
     #[tokio::test]
     async fn claims_reach_the_engine_with_its_token_not_the_apiservers() {
         // The engine refuses anything but its own token (#66, stormblock#107).
@@ -6225,6 +6501,7 @@ pub(crate) mod tests {
             ResolvedVolume {
                 path: "/sys/fs/bpf".to_string(),
                 fstype: None,
+                block: false,
             },
         );
         let spec = json!({
@@ -6260,6 +6537,7 @@ pub(crate) mod tests {
             ResolvedVolume {
                 path: "/var/lib/kubelet".to_string(),
                 fstype: None,
+                block: false,
             },
         );
         let spec = |privileged: bool| {

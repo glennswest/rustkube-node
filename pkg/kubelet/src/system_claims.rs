@@ -89,8 +89,8 @@ pub fn is_data_container(v: &Value) -> bool {
 
 /// Bytes as a Kubernetes quantity: `1Gi` rather than `1073741824`.
 pub fn quantity(bytes: u64) -> String {
-    const UNITS: [(&str, u64); 4] =
-        [("Ti", 1 << 40), ("Gi", 1 << 30), ("Mi", 1 << 20), ("Ki", 1 << 10)];
+    const UNITS: [(&str, u64); 5] =
+        [("Pi", 1 << 50), ("Ti", 1 << 40), ("Gi", 1 << 30), ("Mi", 1 << 20), ("Ki", 1 << 10)];
     for (u, n) in UNITS {
         if bytes >= n && bytes % n == 0 {
             return format!("{}{u}", bytes / n);
@@ -118,6 +118,10 @@ pub struct VolumeFacts {
     pub access: Option<String>,
     /// The slab half: `system` or `data`.
     pub role: Option<String>,
+    /// A raw block volume (`volumeMode: Block`, #67): what its claim asked
+    /// for, since the engine's record of a plain volume and of an unformatted
+    /// one look alike. The node's own volumes are filesystems.
+    pub block: bool,
 }
 
 impl VolumeFacts {
@@ -137,6 +141,7 @@ impl VolumeFacts {
             health: s("health"),
             access: s("access"),
             role: s("role"),
+            block: false,
         }
     }
 }
@@ -223,7 +228,7 @@ pub fn stormblock_pv(f: &VolumeFacts, pv_name: &str, node: &str, claim_ref: Valu
             "accessModes": ["ReadWriteOnce"],
             "persistentVolumeReclaimPolicy": reclaim,
             "storageClassName": crate::storage::STORAGE_CLASS,
-            "volumeMode": "Filesystem",
+            "volumeMode": if f.block { "Block" } else { "Filesystem" },
             "claimRef": claim_ref,
             "csi": csi_source(f),
             "nodeAffinity": node_affinity(node),
@@ -563,6 +568,7 @@ mod tests {
             health: Some("healthy".into()),
             access: Some("rw".into()),
             role: Some("data".into()),
+            block: false,
         }
     }
 
@@ -694,6 +700,8 @@ mod tests {
         assert_eq!(quantity(1 << 30), "1Gi");
         assert_eq!(quantity(64 << 20), "64Mi");
         assert_eq!(quantity(3 << 40), "3Ti");
+        assert_eq!(quantity(1 << 50), "1Pi");
+        assert_eq!(quantity(4 << 40), "4Ti");
         assert_eq!(quantity(1000), "1000");
     }
 
@@ -897,5 +905,16 @@ mod tests {
             tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             crate::engine::EngineClient::new(&url, crate::engine::TokenSource::none())
         }
+    }
+
+    #[test]
+    fn a_block_claims_volume_is_a_block_pv() {
+        let mut f = VolumeFacts { name: "pvc-ns-raw".into(), bytes: 1 << 40, ..Default::default() };
+        let pv = stormblock_pv(&f, "pvc-ns-raw", "n1", json!({}), "Delete");
+        assert_eq!(pv["spec"]["volumeMode"], "Filesystem");
+        f.block = true;
+        let pv = stormblock_pv(&f, "pvc-ns-raw", "n1", json!({}), "Delete");
+        assert_eq!(pv["spec"]["volumeMode"], "Block");
+        assert!(pv["spec"]["csi"].get("fsType").is_none());
     }
 }

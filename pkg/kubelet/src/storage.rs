@@ -25,8 +25,14 @@
 //! 3. clone it — instant, copy-on-write
 //! 4. attach it; the local ublk fast path answers with a `/dev/ublkbN` on this
 //!    node, with no NVMe round trip
-//! 5. hand stormpump that device with `fstype: ext4`: PID 1 mounts it on the
-//!    node and the container binds the mount
+//! 5. hand stormpump that device with the class's filesystem (`fstype: ext4`):
+//!    PID 1 mounts it on the node and the container binds the mount
+//!
+//! **A raw block claim** (`volumeMode: Block`, #67) skips 2 and 3: it is a plain
+//! thin volume of its class's size, attached the same way, and the device
+//! itself is bound at the container's `volumeDevices[].devicePath`. Every class
+//! up to 1 PiB serves block claims; a filesystem past the largest ext4 class
+//! is a raw volume with the application's own layout, or nothing.
 
 use serde_json::Value;
 
@@ -50,28 +56,85 @@ use serde_json::Value;
 /// common classes saves the first claim one `mkfs`; one that carries none
 /// still works.
 ///
-/// **Up to a terabyte.** The ladder stopped at 1 GiB, so a database asking for
-/// 20Gi was refused and an ordinary application could not get a volume at all.
-/// A blank is sparse and stormblock's mkfs does not write out inode tables, so
-/// a large class costs its metadata and nothing else until a claim writes.
-/// The steps are x4: a claim never gets more than four times what it asked for.
-pub const SIZE_CLASSES: &[(&str, u64)] = &[
-    ("1M", MIB),
-    ("16M", 16 * MIB),
-    ("64M", 64 * MIB),
-    ("256M", 256 * MIB),
-    ("1G", 1024 * MIB),
-    ("4G", 4 * 1024 * MIB),
-    ("16G", 16 * 1024 * MIB),
-    ("64G", 64 * 1024 * MIB),
-    ("256G", 256 * 1024 * MIB),
-    ("1T", 1024 * 1024 * MIB),
+/// **Up to a pebibyte** (#67). The ladder stopped at 1 GiB, so a database
+/// asking for 20Gi was refused and an ordinary application could not get a
+/// volume at all; then at 1 TiB. A blank is sparse and stormblock's mkfs does
+/// not write out inode tables, so a large class costs its metadata and nothing
+/// else until a claim writes. The steps are x4: a claim never gets more than
+/// four times what it asked for.
+///
+/// **Each class names its filesystem** ([`ClassFs`]). Every one is ext4 (owner,
+/// #67: "ext4 might work"; stormcos#91's measurements found nothing that forces
+/// XFS). The largest classes are offered as raw block volumes only, until the
+/// formatter stormblock carries can lay them down — see [`ClassFs::BlockOnly`].
+pub const SIZE_CLASSES: &[(&str, u64, ClassFs)] = &[
+    ("1M", MIB, ClassFs::Ext4),
+    ("16M", 16 * MIB, ClassFs::Ext4),
+    ("64M", 64 * MIB, ClassFs::Ext4),
+    ("256M", 256 * MIB, ClassFs::Ext4),
+    ("1G", GIB, ClassFs::Ext4),
+    ("4G", 4 * GIB, ClassFs::Ext4),
+    ("16G", 16 * GIB, ClassFs::Ext4),
+    ("64G", 64 * GIB, ClassFs::Ext4),
+    ("256G", 256 * GIB, ClassFs::Ext4),
+    ("1T", TIB, ClassFs::Ext4),
+    ("4T", 4 * TIB, ClassFs::Ext4),
+    ("16T", 16 * TIB, ClassFs::Ext4),
+    ("64T", 64 * TIB, ClassFs::BlockOnly(FORMAT_MEMORY)),
+    ("256T", 256 * TIB, ClassFs::BlockOnly(INODE_WRAP)),
+    ("1P", 1024 * TIB, ClassFs::BlockOnly(INODE_WRAP)),
 ];
 
+/// What a size class's blank is formatted as.
+///
+/// A raw block claim (`volumeMode: Block`) of any class is a plain volume and
+/// needs no filesystem, so every class is offered for those. A filesystem
+/// claim needs the class's blank, which stormblock formats once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClassFs {
+    Ext4,
+    /// No filesystem blank yet, with why. A filesystem claim of the class
+    /// waits with this reason; a block claim is served.
+    BlockOnly(&'static str),
+}
+
+/// stormblock pins mkfs-ext4 v3.0.0, whose format holds about 8 KiB per block
+/// group: 1.3 GiB at 16 TiB, 5.1 GiB at 64 TiB (stormcos#91), in the storage
+/// engine every pod on the node depends on. Fixed by mkfs.ext4.rs#10, not
+/// yet tagged or carried by stormblock.
+const FORMAT_MEMORY: &str = "an ext4 blank this large needs about 5 GiB of stormblock's memory to      format until stormblock carries mkfs.ext4.rs#10; ask for volumeMode: Block, or a smaller claim";
+/// mkfs.ext4.rs#9: at 256 TiB and over, the default inode count wraps and the
+/// filesystem is not clean, and stormblock's template API has no inode ratio.
+const INODE_WRAP: &str = "an ext4 blank this large is laid down with a wrapped inode count      (mkfs.ext4.rs#9) and needs mkfs.ext4.rs#10's memory fix; ask for volumeMode: Block";
+
 const MIB: u64 = 1024 * 1024;
+const GIB: u64 = 1024 * MIB;
+const TIB: u64 = 1024 * GIB;
+
+/// The filesystem a class's blank is made with, or why it has none.
+pub fn class_fs(class: &str) -> Result<&'static str, &'static str> {
+    match SIZE_CLASSES.iter().find(|(c, _, _)| *c == class).map(|(_, _, f)| *f) {
+        Some(ClassFs::BlockOnly(why)) => Err(why),
+        Some(ClassFs::Ext4) | None => Ok("ext4"),
+    }
+}
+
+/// A size for stormblock, which parses `K`/`M`/`G`/`T` (base 1024) and not
+/// `P`: every class is a whole number of MiB, so `<MiB>M` says any of them.
+pub fn engine_size(bytes: u64) -> String {
+    format!("{}M", bytes / MIB)
+}
+
+/// Does this claim ask for a raw block device (`volumeMode: Block`)?
+///
+/// Absent is `Filesystem`, as upstream defaults it.
+pub fn is_block(pvc: &Value) -> bool {
+    pvc["spec"]["volumeMode"].as_str() == Some("Block")
+}
 
 /// The template name for a size class — the key a claim looks up and, on a
-/// miss, mints: `pvc-ext4j-<MiB>m`.
+/// miss, mints: `pvc-ext4j-<MiB>m` for an ext4 class (`ext4j`: ext4 with a
+/// journal), `pvc-<fs>-<MiB>m` for any other filesystem a class names.
 ///
 /// **The image's name, and sbregistry's.** The image ships its blanks as
 /// `pvc-ext4j-1m` … `pvc-ext4j-1024m` (stormcos `deploy/image.toml`), named by
@@ -82,10 +145,13 @@ const MIB: u64 = 1024 * 1024;
 pub fn template_name(class: &str) -> String {
     let bytes = SIZE_CLASSES
         .iter()
-        .find(|(c, _)| *c == class)
-        .map(|(_, b)| *b)
+        .find(|(c, _, _)| *c == class)
+        .map(|(_, b, _)| *b)
         .unwrap_or(MIB);
-    format!("pvc-ext4j-{}m", bytes / MIB)
+    match class_fs(class) {
+        Ok("ext4") | Err(_) => format!("pvc-ext4j-{}m", bytes / MIB),
+        Ok(fs) => format!("pvc-{fs}-{}m", bytes / MIB),
+    }
 }
 
 /// The smallest class that holds `want` bytes.
@@ -94,7 +160,7 @@ pub fn template_name(class: &str) -> String {
 /// down: a volume smaller than the claim is a filesystem that fills up
 /// unexpectedly, a long way from here.
 pub fn class_for(want: u64) -> Option<(&'static str, u64)> {
-    SIZE_CLASSES.iter().copied().find(|(_, size)| *size >= want)
+    SIZE_CLASSES.iter().find(|(_, size, _)| *size >= want).map(|(c, b, _)| (*c, *b))
 }
 
 /// Parse a Kubernetes quantity (`"1Gi"`, `"512Mi"`, `"3.5Gi"`, `"1000000"`) into bytes.
@@ -275,7 +341,7 @@ mod tests {
         // called it `pvc-1M`, and neither side could see the other's name —
         // so both sides going through this one function is the fix, and this
         // asserts the shape the minting body sends as `size`.
-        for (class, bytes) in SIZE_CLASSES {
+        for (class, bytes, _) in SIZE_CLASSES {
             assert_eq!(template_name(class), format!("pvc-ext4j-{}m", bytes / MIB));
         }
         // The names the image ships, exactly.
@@ -286,7 +352,8 @@ mod tests {
         assert_eq!(class_for(1024 * 1024).unwrap().0, "1M");
         assert_eq!(class_for(100 * 1024 * 1024).unwrap().0, "256M");
         // A claim above the ladder is refused rather than rounded down.
-        assert!(class_for(2 * 1024 * 1024 * MIB).is_none());
+        assert_eq!(class_for(2 * TIB).unwrap().0, "4T");
+        assert!(class_for(1024 * TIB + 1).is_none());
     }
 
     #[test]
@@ -343,7 +410,7 @@ mod tests {
 
     #[test]
     fn a_claim_larger_than_the_largest_class_is_refused() {
-        assert_eq!(class_for(1024 * 1024 * MIB + 1), None);
+        assert_eq!(class_for(1024 * TIB + 1), None);
     }
 
     #[test]
@@ -402,5 +469,42 @@ mod tests {
         // must find the same data, which is what makes the claim persistent.
         assert_eq!(volume_name("app-one", "data"), "pvc-app-one-data");
         assert_eq!(template_name("256M"), "pvc-ext4j-256m");
+    }
+
+    #[test]
+    fn the_ladder_reaches_a_pebibyte_in_steps_of_four() {
+        let sizes: Vec<u64> = SIZE_CLASSES.iter().map(|(_, b, _)| *b).collect();
+        assert!(sizes.windows(2).all(|w| w[1] == 4 * w[0] || (w[0] == MIB && w[1] == 16 * MIB)));
+        assert_eq!(class_for(parse_quantity("2Ti").unwrap()).map(|c| c.0), Some("4T"));
+        assert_eq!(class_for(parse_quantity("10Ti").unwrap()).map(|c| c.0), Some("16T"));
+        assert_eq!(class_for(parse_quantity("17Ti").unwrap()).map(|c| c.0), Some("64T"));
+        assert_eq!(class_for(parse_quantity("1Pi").unwrap()).map(|c| c.0), Some("1P"));
+        assert_eq!(class_for(parse_quantity("1Pi").unwrap() + 1), None);
+    }
+
+    #[test]
+    fn each_class_names_its_filesystem_and_the_largest_are_block_only() {
+        for c in ["1M", "1T", "4T", "16T"] {
+            assert_eq!(class_fs(c), Ok("ext4"), "{c}");
+        }
+        assert_eq!(template_name("4T"), "pvc-ext4j-4194304m");
+        assert_eq!(template_name("16T"), "pvc-ext4j-16777216m");
+        for c in ["64T", "256T", "1P"] {
+            let why = class_fs(c).unwrap_err();
+            assert!(why.contains("mkfs.ext4.rs#") && why.contains("volumeMode: Block"), "{c}: {why}");
+        }
+    }
+
+    #[test]
+    fn sizes_are_said_in_mebibytes_because_stormblock_has_no_p() {
+        assert_eq!(engine_size(MIB), "1M");
+        assert_eq!(engine_size(1024 * TIB), "1073741824M");
+    }
+
+    #[test]
+    fn block_is_asked_for_and_filesystem_is_the_default() {
+        assert!(is_block(&json!({"spec": {"volumeMode": "Block"}})));
+        assert!(!is_block(&json!({"spec": {"volumeMode": "Filesystem"}})));
+        assert!(!is_block(&json!({"spec": {}})));
     }
 }
