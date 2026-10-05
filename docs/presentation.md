@@ -44,16 +44,16 @@ It speaks the upstream API shapes (`kubectl logs`, `describe`, metrics under ups
 
 ## Where it sits in stormcos
 
-```mermaid
-flowchart LR
-  rustkube["rustkube<br/>apiserver · scheduler · controllers"] --> node
-  node["rustkube-node<br/>kubelet"] --> stormpump["stormpump<br/>PID 1, ring engine"]
-  node --> stormvm["stormvm<br/>VM plans, console, net"]
-  node --> stormblock["stormblock<br/>volumes, goldens"]
-  node --> sbregistry["stormblock-registry<br/>image clones"]
-  node --> cni["CNI (Cilium)"]
-  stormcos["stormcos<br/>(the product)"] --> node
-  flowsdn["flowsdn<br/>(runs kube-proxy)"] --> node
+```
+        stormcos (the product)        flowsdn (runs kube-proxy)
+                    \                    /
+                     v                  v
+ rustkube  ----->  [ rustkube-node: kubelet ]
+ apiserver,          |      |       |       |        |
+ scheduler,          v      v       v       v        v
+ controllers    stormpump stormvm stormblock sbregistry CNI
+                (PID 1,  (plans,  (volumes, (image    (Cilium)
+                 ring)   console)  goldens)  clones)
 ```
 
 stormcentral's relationships: **rustkube-node → rustkube, stormpump, stormvm**; depended on by
@@ -64,18 +64,22 @@ stormcentral's relationships: **rustkube-node → rustkube, stormpump, stormvm**
 
 ## How it works
 
-```mermaid
-flowchart TB
-  w["API watches: Pods, VMIs, PV/PVC, Secrets…<br/>+ engine volume watch, CNI conf inotify"] --> q
-  q["workload executor<br/>one worker per UID, name/claim reservations<br/>(--pod-workers, 32–256)"] --> pm["pod manager<br/>sandbox · volumes · containers · probes"]
-  q --> vm["VM manager<br/>disks · NICs · pod-network sandbox · spawn"]
-  pm --> ring["stormpump ring"]
-  vm --> ring
-  pm --> sb["stormblock API"]
-  vm --> sb
-  pm --> cni["CNI ADD/DEL"]
-  vm --> cni
-  m["mirrors: node services as Pods,<br/>node volumes as PV+PVC, CSIStorageCapacity"] --> api["apiserver"]
+```
+ API watches (Pods, VMIs, PV/PVC, Secrets) + engine volume watch + CNI conf inotify
+                                   |
+                                   v
+            workload executor: one worker per UID, name/claim reservations
+                          (--pod-workers, 32-256)
+                     |                                  |
+                     v                                  v
+      pod manager: sandbox, volumes,      VM manager: disks, NICs, pod-network
+      containers, probes                  sandbox, spawn
+                     |                                  |
+                     +------> stormpump ring <----------+
+                     +------> stormblock API <----------+
+                     +------> CNI ADD / DEL  <----------+
+
+ mirrors -> apiserver: node services as Pods, node volumes as PV+PVC, CSIStorageCapacity
 ```
 
 - **Event-driven:** no sync tick. A worker runs on a change or on its own deadline (a probe period, a

@@ -2,7 +2,7 @@
 
 ## 2026-10-05
 
-- **docs:** `docs/presentation.md`, a 13-slide Marp deck on rustkube-node's purpose and functionality (#55):
+- **docs:** `docs/presentation.md`, a 12-slide Marp deck on rustkube-node's purpose and functionality (#55):
   what it is, where it sits in stormcos (stormcentral's relationships), how it works, what it does today
   (Pods, storage, VMs, node services), interfaces, shipping, planned work on its own slide, and status.
 - **feat:** ServiceAccount tokens are bound to their pod (#122, rustkube#182): kube-api-access asks
