@@ -51,6 +51,6 @@ exposed by the kubelet route table.
 VirtualMachineSnapshot is reconciled as a Kubernetes resource through the
 apiserver, not a new kubelet HTTP route. It requires the snapshot CRDs,
 `--runtime stormpump`, a locally owned VM and its local storage.
-VirtualMachineRestore is not implemented (#53); its design is decided (#109,
-option A: a restore rewrites the VirtualMachine's disks to the restored
-PVCs). Stormvm VMI migration is also unimplemented (#40).
+VirtualMachineRestore is served the same way, by the node that took the
+snapshot (#53, option A of #109: the VM's disks are rewritten to restored
+PVCs; README, "Restores"). Stormvm VMI migration is also unimplemented (#40).

@@ -446,9 +446,29 @@ missing on main (#80).
     has left the node is Failed.
   - **Needs the CRDs** (stormcos#170): without them the list is a 404 and the
     kubelet does nothing.
-  - `VirtualMachineRestore` is not served yet (#53). Its design is decided
-    (#109, option A): a restore rewrites the VirtualMachine's disks to the
-    restored PVCs.
+  - A taken snapshot also records its disks (`storm.io/snapshot-disks`,
+    `{"<disk>": "<volume id>"}`, from the registration, written with the claim).
+- **Restores: `VirtualMachineRestore`** (#53; owner's option A, #109;
+  `pkg/kubelet/src/vm_restore.rs`). Served by the node that took the snapshot
+  (its stormblock holds the group):
+  - waits for the snapshot to be `Succeeded` and the VM stopped (no VMI),
+    saying so in the `Progressing` condition;
+  - for every disk in the snapshot's disk map except a cloud-init one (made
+    again at every start), a **new** volume from that disk's member,
+    `<ns>.<vm>-<disk>-restore-<restore>`; the old disks are left as they are;
+  - for each, a bound PVC `<vm>-<disk>-restore-<restore>` (`volumeMode:
+    Block`, label `storm.io/restored-from`) and its PV (class `stormblock`,
+    pinned to this node, reclaim Delete). The VM's placement follows the PV;
+  - the VirtualMachine's `spec.template.spec.volumes[<disk>]` becomes that
+    `persistentVolumeClaim`;
+  - `status.complete` with `restores` (disk, claim, snapshot) and a
+    `VirtualMachineRestoreComplete` Event. An error (snapshot Failed, no disk
+    map, the group gone) is written once, Ready False, with a Warning Event.
+  - Every step is find-or-create, so an interrupted restore finishes on the
+    next pass. A snapshot taken before the disk map was recorded cannot be
+    restored: take a new one.
+  - A restored disk is made on this node; pulling a RAID twin from another
+    node (the owner's note on #109) is not done.
 
 ## Tests on a node
 

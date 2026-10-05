@@ -382,7 +382,7 @@ mod tests {
                             }
                             (StatusCode::OK, axum::Json(json!({})))
                         }
-                        "POST" | "PATCH" => (StatusCode::OK, axum::Json(json!({}))),
+                        "PATCH" => (StatusCode::OK, axum::Json(json!({}))),
                         _ => (StatusCode::NOT_FOUND, axum::Json(json!({}))),
                     }
                 }

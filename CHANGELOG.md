@@ -2,6 +2,12 @@
 
 ## 2026-10-05
 
+- **feat:** `VirtualMachineRestore` (#53, owner's option A on #109): by the node that took the snapshot,
+  once the snapshot is Succeeded and the VM stopped, every disk but cloud-init gets a new volume from its
+  group member, a bound Block PVC/PV pair pinned to this node, and the VirtualMachine's template volume is
+  rewritten to that claim; `status.complete` with `restores`, Events, errors written once. A taken
+  snapshot records `storm.io/snapshot-disks` (disk → volume id) with its claim, which a restore needs.
+  New direct dependency `stormvm-block` (already in the lock).
 - **feat:** A pod-network VMI adopts its launcher Pod (#88, owner's choice B; the Pod is made by
   rustkube's VM controller, rustkube#203): the VMI waits for a Pod labelled `kubevirt.io: virt-launcher`
   and `kubevirt.io/created-by: <vmi uid>` and owned by it; the CNI ADD names that Pod, so Cilium labels
