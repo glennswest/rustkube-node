@@ -237,7 +237,8 @@ impl Kubelet {
             &self.config.node_name,
             crate::vm_manager::RUN_ROOT,
             crate::vm_snapshot::stormvm_take(self.config.engine.url().to_string()),
-        )));
+        )
+        .with_restore_engine(Arc::new(crate::vm_restore::Stormblock(self.config.engine.url().to_string())))));
         self
     }
 

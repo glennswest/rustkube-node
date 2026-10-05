@@ -19,8 +19,7 @@
 //! second take answers with what the first made — at the cost of the guest
 //! held still once more.
 //!
-//! `VirtualMachineRestore` is not served yet (#53: how a restored volume
-//! becomes the VM's disk is an open decision).
+//! `VirtualMachineRestore` is `vm_restore.rs` (#53, option A of #109).
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -34,6 +33,21 @@ use tracing::{debug, info, warn};
 
 /// Which node took (or is taking) a snapshot.
 pub const NODE_ANNOTATION: &str = "storm.io/snapshot-node";
+
+/// The VM's disks when the snapshot was taken, as `{"<disk>": "<volume id>"}`
+/// (#53): what a restore matches the group's members to. Written with the
+/// claim, from the registration, which is gone once the VM stops.
+pub const DISKS_ANNOTATION: &str = "storm.io/snapshot-disks";
+
+/// The disk map of a registration: every disk with a volume behind it.
+pub fn disk_map(reg: &Registration) -> Value {
+    Value::Object(
+        reg.disks
+            .iter()
+            .filter_map(|d| Some((d.name.clone(), json!(d.volume_id.clone()?))))
+            .collect(),
+    )
+}
 
 /// KubeVirt's default `failureDeadline`.
 const DEFAULT_DEADLINE_SECS: u64 = 300;
@@ -156,6 +170,11 @@ pub struct Snapshots {
     /// Told when a take finishes (#101): its status write is an API event
     /// too, but one that failed is not, and the next pass must still run.
     completed: Arc<tokio::sync::Notify>,
+    /// Makes restored volumes (#53). `None`: restores are not served.
+    pub(crate) restore_engine: Option<Arc<dyn crate::vm_restore::RestoreEngine>>,
+    /// Restores already written complete or failing the same way, so an
+    /// unchanged one is not written again.
+    pub(crate) restore_said: Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl Snapshots {
@@ -179,6 +198,24 @@ impl Snapshots {
             in_flight: Mutex::new(HashSet::new()),
             absent_said: std::sync::atomic::AtomicBool::new(false),
             completed: Arc::new(tokio::sync::Notify::new()),
+            restore_engine: None,
+            restore_said: Mutex::new(Default::default()),
+        }
+    }
+
+    /// Serve `VirtualMachineRestore` with this engine (#53).
+    pub fn with_restore_engine(mut self, engine: Arc<dyn crate::vm_restore::RestoreEngine>) -> Snapshots {
+        self.restore_engine = Some(engine);
+        self
+    }
+
+    pub(crate) fn api(&self) -> (&reqwest::Client, &str, &str) {
+        (&self.api, &self.api_url, &self.node)
+    }
+
+    pub(crate) async fn object_event(&self, kind: &str, obj: &Value, etype: &str, reason: &str, message: &str) {
+        if let Some(r) = &self.events {
+            r.object_event(API, kind, obj, etype, reason, message).await;
         }
     }
 
@@ -193,6 +230,9 @@ impl Snapshots {
     /// stormblock call, but freezing waits on the guest agent, and the tick
     /// that syncs every pod on the node must not wait with it.
     pub async fn sync(self: &Arc<Self>) {
+        // Restores first: they read snapshots as they stand, and a pass with
+        // no snapshot CRD has no restores either.
+        self.restores().await;
         let Some(items) = self.list().await else { return };
         let now = chrono::Utc::now();
         for obj in items {
@@ -213,7 +253,8 @@ impl Snapshots {
                     self.finish(&obj, String::new(), Taken::failed(why)).await;
                 }
                 Action::Claim => {
-                    if self.claim(&obj).await {
+                    let disks = reg.as_ref().map(disk_map).unwrap_or_else(|| json!({}));
+                    if self.claim(&obj, &disks).await {
                         self.start(obj, reg.expect("registered"), key);
                     }
                 }
@@ -253,9 +294,12 @@ impl Snapshots {
 
     /// Mark the snapshot as this node's, against the version read. A node
     /// that loses the race gets a conflict and leaves it.
-    async fn claim(&self, obj: &Value) -> bool {
+    async fn claim(&self, obj: &Value, disks: &Value) -> bool {
         let (ns, name) = ns_name(obj);
-        let mut meta = json!({ "annotations": { NODE_ANNOTATION: self.node } });
+        let mut meta = json!({ "annotations": {
+            NODE_ANNOTATION: self.node,
+            DISKS_ANNOTATION: disks.to_string(),
+        } });
         if let Some(rv) = obj["metadata"]["resourceVersion"].as_str() {
             meta["resourceVersion"] = json!(rv);
         }

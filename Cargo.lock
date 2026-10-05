@@ -1470,6 +1470,7 @@ dependencies = [
  "sha2",
  "stormpump",
  "stormpump-abi",
+ "stormvm-block",
  "stormvm-cloudinit",
  "stormvm-console",
  "stormvm-control",
