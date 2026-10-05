@@ -622,12 +622,14 @@ Steps:
        2026-10-05: half 1 is stormcos_qa `vm-waves` (noCloud key, ssh); half 2 filed as stormcos_qa#52. Runs on
        C2NR0Q2 get 507 on the image push (stormcentral#376); #92 proposed after it. Then run vm-waves, close.
 
-### In progress: #55, a presentation of rustkube-node (`docs/presentation.md`, Marp)
+### Done: #55, a presentation of rustkube-node (`docs/presentation.md`, Marp)
 
 2026-10-05. 8–15 slides from current code/docs: purpose; place in stormcos (stormcentral: depends on rustkube,
 stormpump, stormvm; depended on by stormcos, flowsdn); moving parts (diagram); features today (Pods, storage,
 VMs, node services); interfaces; shipping; planned (own slide); status and open issues. Check claims by grep;
 render with marp-cli via sc-build if dev can.
+Done: docs/presentation.md, 12 slides, ASCII diagrams (Marp shows Mermaid as source). sc-build `npx
+@marp-team/marp-cli docs/presentation.md -o …html`: renders, 12 sections. PDF needs a browser dev lacks (#154).
 
 ### Done: #122, host-network metadata by ServiceAccount token; pod-bound tokens
 
