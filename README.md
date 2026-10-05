@@ -136,6 +136,7 @@ retried on a backoff from its own first failure, 1 s at first (#148).
 Host-network Pods, the CNI agent's own among them, bypass this. CRI delegates networking to the external runtime. Node Ready
 is not yet gated on CNI readiness (#3/#32).
 
+An overview deck is [docs/presentation.md](docs/presentation.md) (Marp).
 See [configuration and defaults](docs/configuration.md), [ports and APIs](docs/api.md),
 and [build and shipping](docs/BUILD.md). The binaries share upstream names;
 this does **not** establish full upstream compatibility.
