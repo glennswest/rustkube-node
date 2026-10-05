@@ -597,6 +597,18 @@ impl RuntimeService for StormpumpRuntime {
         // is installed, and until then its containers share loopback with each
         // other and reach nothing outside, which is what a pod on a node with
         // no pod network honestly is.
+        // No config, no sandbox (#148): a pod scheduled before the CNI agent
+        // is up used to acquire a namespace, find no conflist and release it
+        // on every retry. Asked first, it waits for nothing but the file.
+        if !config.host_network {
+            if let Some(invoker) = &self.cni {
+                if let Err(e) = invoker.network_ready() {
+                    return Err(CriError::NetworkNotConfigured(format!(
+                        "no CNI network configured yet ({e})"
+                    )));
+                }
+            }
+        }
         let (handle, netns) = if config.host_network {
             (None, None)
         } else {
@@ -688,8 +700,10 @@ impl RuntimeService for StormpumpRuntime {
                     // Failing here leaves the pod to be retried, and the
                     // retry succeeds as soon as the agent is up. The agent
                     // itself is hostNetwork, so it is not waiting on this.
+                    // Checked before the acquire too: this is the config
+                    // going between the two.
                     self.release_sandbox(&id, handle).await;
-                    return Err(CriError::NetworkNotReady(format!(
+                    return Err(CriError::NetworkNotConfigured(format!(
                         "no CNI network configured yet ({e})"
                     )));
                 }

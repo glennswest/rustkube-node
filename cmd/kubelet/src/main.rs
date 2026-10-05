@@ -489,6 +489,7 @@ async fn main() -> anyhow::Result<()> {
         serving_key,
         server_auth_token,
         anonymous_auth: cli.anonymous_auth,
+        cni_conf_dir: (!cli.no_cni).then(|| std::path::PathBuf::from(&cli.cni_conf_dir)),
         engine: engine.clone(),
         pod_workers: cli.pod_workers.unwrap_or_else(kubelet::workload::default_workers).max(1),
         ..Default::default()

@@ -451,6 +451,11 @@ pub enum CriError {
     /// of every pod scheduled in the window before the network agent is ready.
     #[error("network not ready: {0}")]
     NetworkNotReady(String),
+    /// No CNI network config exists yet (#148): the pod waits for the file,
+    /// and is woken when the config directory changes rather than polled.
+    /// A config that exists but whose ADD fails is [`CriError::NetworkNotReady`].
+    #[error("network not ready: {0}")]
+    NetworkNotConfigured(String),
     /// The node's filesystem refused something the pod needs before it can
     /// start (ENOSPC, EDQUOT, EROFS on the container log directory), #129.
     ///

@@ -294,6 +294,10 @@ pub struct PodManager {
     /// When each pod (by uid) was first seen and not yet started, for
     /// `kubelet_pod_start_duration_seconds` (#36).
     first_seen: std::sync::Mutex<HashMap<String, Instant>>,
+    /// Pods (by uid) waiting on the pod network (#148): `None` for no CNI
+    /// config yet (woken by the config directory changing), `Some(at)` for a
+    /// config whose ADD has failed since `at` (retried on a backoff from then).
+    network_waits: std::sync::Mutex<HashMap<String, Option<Instant>>>,
     /// Each starting pod's phases (by uid), from seen to `Running`
     /// acknowledged (#132).
     timings: std::sync::Mutex<HashMap<String, crate::start_timing::StartTiming>>,
@@ -409,6 +413,7 @@ impl PodManager {
             csi: Arc::new(crate::csi_plugins::CsiPlugins::new(node_name)),
             csi_mountinfo: "/proc/1/mountinfo".to_string(),
             first_seen: std::sync::Mutex::new(HashMap::new()),
+            network_waits: Default::default(),
             timings: Default::default(),
             deadlines: Default::default(),
             event_waits: Default::default(),
@@ -2378,6 +2383,10 @@ impl PodManager {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .remove(uid);
+                        self.network_waits
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(uid);
                         self.waiting
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -2401,9 +2410,41 @@ impl PodManager {
                         self.retry_wait(uid, seen.elapsed());
                         outcome.updates.push(self.waiting_pod(pod,what));
                     }
+                    // No CNI config yet (#148): woken when the config
+                    // directory changes, so the pod starts as soon as the
+                    // agent writes its conflist instead of up to ten seconds
+                    // later on a backoff. The deadline is only the fallback
+                    // for a node where the directory cannot be watched.
+                    Err(CriError::NetworkNotConfigured(what)) => {
+                        info!("Pod {namespace}/{name} waiting for a CNI network config: {what}");
+                        self.network_waits
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(uid.to_string(), None);
+                        self.event_waits.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+                        self.due_in(uid, deadlines::NETWORK_FALLBACK);
+                        let message = format!("network is not ready: {what}");
+                        outcome.updates.push(self.waiting_pod(pod, message));
+                    }
+                    // A config, and its ADD failed (the agent is not serving
+                    // yet): retried on a backoff from the first ADD failure,
+                    // not from when the pod was first seen, so a pod that
+                    // waited 20 s for the config is not then asked about
+                    // every 5 s.
                     Err(CriError::NetworkNotReady(what)) => {
                         warn!("Pod {namespace}/{name} waiting on the pod network: {what}");
-                        self.retry_wait(uid, seen.elapsed());
+                        let since = *self
+                            .network_waits
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .entry(uid.to_string())
+                            .and_modify(|at| {
+                                at.get_or_insert_with(Instant::now);
+                            })
+                            .or_insert_with(|| Some(Instant::now()));
+                        let failing = since.map(|at| at.elapsed()).unwrap_or_default();
+                        self.event_waits.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+                        self.due_in(uid, deadlines::wait_backoff(failing));
                         let message = format!("network is not ready: {what}");
                         outcome.updates.push(self.waiting_pod(pod, message));
                     }
@@ -2480,6 +2521,10 @@ impl PodManager {
             return outcome;
         }
         self.first_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|uid, _| desired_uids.contains(uid));
+        self.network_waits
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|uid, _| desired_uids.contains(uid));
@@ -3879,6 +3924,18 @@ impl PodManager {
         });
     }
 
+    /// The pods (by uid) waiting for a CNI network config to appear (#148):
+    /// what a change in the config directory wakes.
+    pub fn waiting_for_network_config(&self) -> std::collections::HashSet<String> {
+        self.network_waits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(_, at)| at.is_none())
+            .map(|(uid, _)| uid.clone())
+            .collect()
+    }
+
     fn retry_wait(&self, uid: &str, waited: std::time::Duration) {
         if self.event_waits.lock().unwrap_or_else(|e| e.into_inner()).remove(uid) {
             return;
@@ -4041,6 +4098,10 @@ impl PodManager {
         self.backoff.forget_pod(uid);
         self.forget_deadlines(uid);
         self.first_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(uid);
+        self.network_waits
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(uid);
@@ -4991,6 +5052,8 @@ pub(crate) mod tests {
         stopped_sandboxes: Mutex<Vec<String>>,
         slow_image: Mutex<Option<Arc<tokio::sync::Notify>>>,
         image_pulls: AtomicU32,
+        /// run_pod_sandbox's network (#148): 0 ready, 1 no CNI config, 2 ADD fails.
+        network: AtomicU32,
     }
 
     impl FakeRuntime {
@@ -5045,6 +5108,11 @@ pub(crate) mod tests {
         }
 
         async fn run_pod_sandbox(&self, config: &PodSandboxConfig) -> Result<String, CriError> {
+            match self.network.load(Ordering::SeqCst) {
+                1 => return Err(CriError::NetworkNotConfigured("no CNI network configured yet".into())),
+                2 => return Err(CriError::NetworkNotReady("CNI ADD failed: agent not serving".into())),
+                _ => {}
+            }
             let id = format!(
                 "sb-{}-{}",
                 config.uid,
@@ -6955,5 +7023,48 @@ pub(crate) mod tests {
         // Gone before it was reported: the record goes with it.
         mgr.sync_pods(&[]).await;
         assert!(!mgr.timings.lock().unwrap().contains_key("uid-waited"));
+    }
+
+    /// #148: a pod with no CNI config waits for the config (woken by the
+    /// directory, 10 s only as a fallback), not on a backoff from when it was
+    /// seen; once the config is there, a failing ADD is retried from its own
+    /// first failure (1 s), not from the pod's 60 s of waiting.
+    #[tokio::test]
+    async fn a_pod_waits_for_the_cni_config_then_retries_add_from_its_own_failure() {
+        let (rt, mgr) = manager();
+        let p = pod("uid-net", "coredns", "Always", simple_container());
+        rt.network.store(1, Ordering::SeqCst);
+        mgr.note_seen(&[p.clone()]).await;
+        // As if it had been waiting a minute: the old backoff would be 10 s.
+        mgr.first_seen.lock().unwrap().insert("uid-net".into(), Instant::now() - std::time::Duration::from_secs(60));
+        let out = mgr.sync_pods(&[p.clone()]).await;
+        assert_eq!(out.updates[0].phase, "Pending");
+        assert!(out.updates[0].message.contains("network is not ready"), "{}", out.updates[0].message);
+        assert!(mgr.waiting_for_network_config().contains("uid-net"));
+        let due = mgr.take_due("uid-net").unwrap();
+        assert!(due > std::time::Duration::from_secs(9), "fallback, not a poll: {due:?}");
+
+        // The config appears; the agent is not serving yet.
+        rt.network.store(2, Ordering::SeqCst);
+        assert_eq!(mgr.sync_pods(&[p.clone()]).await.updates[0].phase, "Pending");
+        assert!(mgr.waiting_for_network_config().is_empty(), "no longer waiting on the file");
+        let due = mgr.take_due("uid-net").unwrap();
+        assert!(due <= std::time::Duration::from_secs(1), "ADD retried at once: {due:?}");
+
+        rt.network.store(0, Ordering::SeqCst);
+        assert_eq!(mgr.sync_pods(&[p.clone()]).await.updates[0].phase, "Running");
+        assert!(mgr.network_waits.lock().unwrap().is_empty());
+    }
+
+    /// #148: a waiting pod that goes is not left among the network waiters.
+    #[tokio::test]
+    async fn a_deleted_network_waiter_is_forgotten() {
+        let (rt, mgr) = manager();
+        let p = pod("uid-gone", "gone", "Always", simple_container());
+        rt.network.store(1, Ordering::SeqCst);
+        mgr.sync_pods(&[p.clone()]).await;
+        assert!(mgr.waiting_for_network_config().contains("uid-gone"));
+        mgr.sync_pods(&[]).await;
+        assert!(mgr.waiting_for_network_config().is_empty());
     }
 }

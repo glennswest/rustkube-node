@@ -30,6 +30,10 @@ pub(super) const RECHECK: Duration = Duration::from_secs(1);
 /// The longest a waiting start goes between attempts.
 const WAIT_CAP: Duration = Duration::from_secs(10);
 
+/// A pod waiting for a CNI config is woken by the config directory (#148);
+/// this is the look it gets anyway, where the directory cannot be watched.
+pub(super) const NETWORK_FALLBACK: Duration = WAIT_CAP;
+
 /// The probe kinds, as keys.
 pub(super) const STARTUP: &str = "startup";
 pub(super) const LIVENESS: &str = "liveness";

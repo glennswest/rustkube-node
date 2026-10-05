@@ -394,6 +394,14 @@ impl Executor {
         for key in keys { self.ready.add(key); }
     }
 
+    /// Wake the `kind` workloads whose key `wanted` picks (#148: the pods
+    /// waiting for a CNI config, by uid).
+    pub fn wake_where(&self, kind: Kind, wanted: impl Fn(&Key) -> bool) {
+        let keys: Vec<_> = self.desired.lock().unwrap().objects.keys()
+            .filter(|k| k.kind == kind && wanted(k)).cloned().collect();
+        for key in keys { self.ready.add(key); }
+    }
+
     pub fn wake_kind(&self, kind: Kind) {
         let keys: Vec<_> = self.desired.lock().unwrap().objects.keys()
             .filter(|k| k.kind == kind).cloned().collect();
@@ -502,6 +510,17 @@ mod tests {
         assert_eq!(e.objects(Kind::Pod), vec![object("api","a")]);
         assert!(e.replace_source("api", Kind::Pod, &[Value::Null]).is_err());
         assert_eq!(e.objects(Kind::Pod).len(),1);
+    }
+
+    #[tokio::test]
+    async fn wake_where_wakes_only_the_picked_keys() {
+        let e = Executor::new();
+        e.replace(Kind::Pod, &[object("a","data"), object("b","other")]).unwrap();
+        drop(e.ready.next().await); drop(e.ready.next().await);
+        e.wake_where(Kind::Pod, |k| k.uid == "b");
+        let work = e.ready.next().await;
+        assert_eq!(work.key().uid, "b"); drop(work);
+        assert!(tokio::time::timeout(Duration::from_millis(20),e.ready.next()).await.is_err());
     }
 
     #[tokio::test]

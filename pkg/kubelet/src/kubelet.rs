@@ -54,6 +54,10 @@ pub struct KubeletConfig {
     /// pods run locally, independent of the apiserver — this is how the control
     /// plane (apiserver, etcd) bootstraps. `None` disables static pods.
     pub pod_manifest_path: Option<std::path::PathBuf>,
+    /// The CNI config directory (`--cni-conf-dir`), watched so a pod waiting
+    /// for the network starts when its config appears (#148). `None`: not
+    /// watched; such a pod is looked at every 10 s.
+    pub cni_conf_dir: Option<std::path::PathBuf>,
     /// This node's stormblock engine, with its token (#66). One client for
     /// every engine call the kubelet makes.
     pub engine: crate::engine::EngineClient,
@@ -82,6 +86,7 @@ impl Default for KubeletConfig {
             server_auth_token: None,
             anonymous_auth: false,
             pod_manifest_path: Some(std::path::PathBuf::from("/etc/kubernetes/manifests")),
+            cni_conf_dir: None,
             engine: crate::engine::EngineClient::default(),
         }
     }
@@ -395,9 +400,26 @@ impl Kubelet {
                 async move { crate::fs_watch::watch(path, move || changed.enqueue()).await },
             );
         }
+        // The CNI config directory (#148): a pod with no network config yet
+        // is woken when it changes, not on a backoff.
+        let cni_changed = Arc::new(tokio::sync::Notify::new());
+        if let Some(path) = self.config.cni_conf_dir.clone() {
+            let changed = cni_changed.clone();
+            files.spawn(
+                async move { crate::fs_watch::watch(path, move || changed.notify_one()).await },
+            );
+        }
         loop {
             let work = tokio::select! {
                 work = worker.next() => work,
+                _ = cni_changed.notified() => {
+                    let waiting = self.pod_manager.waiting_for_network_config();
+                    if !waiting.is_empty() {
+                        info!(pods = waiting.len(), "CNI config directory changed: waking the pods waiting for the network");
+                        self.workloads.wake_where(Kind::Pod, |k| waiting.contains(&k.uid));
+                    }
+                    continue;
+                },
                 image = images.recv() => {
                     match image {
                         Ok(image)=>self.workloads.wake_dependency(&Dependency::Image(image)),
