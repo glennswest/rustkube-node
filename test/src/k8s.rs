@@ -261,6 +261,11 @@ mod tests {
         assert_eq!(pick_node(&nodes, "10.0.0.1"), None);
     }
 
+    #[test]
+    fn the_standard_names_the_image_by_suite_and_commit() {
+        assert_eq!(env().standard_image(), "test-rustkube-node-medium:0123456789ab");
+    }
+
     pub fn env() -> Env {
         Env {
             suite: "medium".into(),
@@ -268,6 +273,8 @@ mod tests {
             namespace: "test-ns".into(),
             api: "https://127.0.0.1:6443".into(),
             node: String::new(),
+            node_name: "node1".into(),
+            commit: "0123456789abcdef".into(),
             image: "img:1".into(),
             mint_budget: Duration::from_secs(1),
             token: None,
