@@ -478,19 +478,6 @@ async fn guest_addresses(vm: &Vm) -> Option<Vec<Vec<String>>> {
     )
 }
 
-/// How the address reaches the guest, in one word.
-///
-/// The difference that matters to somebody who cannot reach their VM:
-/// `bridge` puts the guest on a real network, `user` is a NAT inside the
-/// hypervisor process that nothing outside it can route to, and `passt` is
-/// the same shape in a userspace device. A VMI that reported only `Running`
-/// gave no way to tell those apart.
-fn binding_of(t: &stormvm_vmm::NicTransport) -> String {
-    match t {
-        stormvm_vmm::NicTransport::Tap(_) => "bridge".into(),
-        stormvm_vmm::NicTransport::User { .. } => "user".into(),
-        stormvm_vmm::NicTransport::Stream(_) => "passt".into(),
-    }
 }
 
 /// Why a machine did not start, and whether asking again would help.
@@ -864,6 +851,26 @@ pub struct VmManager {
     due: std::sync::Mutex<HashMap<String, std::time::Instant>>,
     /// When a start began waiting, for the backoff of the next try (#101).
     waiting_since: std::sync::Mutex<HashMap<String, std::time::Instant>>,
+    /// The CNI, for a VMI on the pod network (#88). `None` on a node with no
+    /// pod network, where such a VMI waits and says why.
+    cni: Option<cni::CniInvoker>,
+    /// Where each pod-network VMI's sandbox is recorded (#88).
+    net_store: crate::vm_network::Store,
+    /// The pod-network sandboxes of this node's machines, by uid (#88).
+    pod_nets: std::sync::Mutex<HashMap<String, crate::vm_network::PodNet>>,
+    /// Each bridged guest's DHCP responder, held for the machine's life (#88).
+    /// Not in [`Vm`], which is cloned freely, and a responder is a thread.
+    responders: std::sync::Mutex<HashMap<String, Vec<stormvm_net::Responder>>>,
+}
+
+/// What making a machine's NICs produced (#88 adds the leases and their
+/// responders).
+struct NicsMade {
+    nics: Vec<plan::ResolvedNic>,
+    reports: Vec<NicReport>,
+    snoopers: Watchers,
+    responders: Vec<stormvm_net::Responder>,
+    leases: Vec<crate::vm_network::LeaseRecord>,
 }
 
 /// A failed start waiting for its next try (#76).
@@ -992,7 +999,24 @@ impl VmManager {
             deposit_window: Mutex::new(()),
             due: Default::default(),
             waiting_since: Default::default(),
+            cni: None,
+            net_store: crate::vm_network::Store::default(),
+            pod_nets: Default::default(),
+            responders: Default::default(),
         }
+    }
+
+    /// The CNI a pod-network VMI's sandbox is filled by (#88).
+    pub fn with_cni(mut self, invoker: Option<cni::CniInvoker>) -> VmManager {
+        self.cni = invoker;
+        self
+    }
+
+    /// Keep the pod-network records here instead of `/run` (tests).
+    #[cfg(test)]
+    fn with_net_store(mut self, store: crate::vm_network::Store) -> VmManager {
+        self.net_store = store;
+        self
     }
 
     /// Look at `uid` again by `at` at the latest (#101).
@@ -1355,14 +1379,19 @@ impl VmManager {
 
     /// Startup adoption records facts only; cleanup belongs to the UID worker.
     pub async fn adopt_registered(&self) {
-        let mut records = self.vms.lock().await;
-        for reg in stormvm_node::console::list(RUN_ROOT) {
-            if !reg.uid.is_empty() {
-                if !records.contains_key(&reg.uid) {
-                    records.insert(reg.uid.clone(), vm_of(&reg));
+        {
+            let mut records = self.vms.lock().await;
+            for reg in stormvm_node::console::list(RUN_ROOT) {
+                if !reg.uid.is_empty() {
+                    if !records.contains_key(&reg.uid) {
+                        records.insert(reg.uid.clone(), vm_of(&reg));
+                    }
                 }
             }
         }
+        // Each adopted machine's pod network (#88): DHCP again for the
+        // running ones, released for the rest.
+        self.restore_pod_networks().await;
     }
 
     pub async fn cache_specs(&self, objects: &[Value]) {
@@ -1729,11 +1758,20 @@ impl VmManager {
             self.release(&disks).await;
             return Err(StartFail::Failed(format!("could not make {dir}: {e}")));
         }
+        // The pod network (#88), before the deposit window: a CNI ADD takes
+        // a while, and the window is meant to be milliseconds.
+        let pod = match self.acquire_pod_network(uid, &ns, &vm).await {
+            Ok(p) => p,
+            Err(e) => {
+                self.release(&disks).await;
+                return Err(e);
+            }
+        };
         // Taps, plan and spawn, inside the deposit window (#100): a failure
         // there is unwound before another start may deposit.
         let launched = {
             let _window = self.deposit_window.lock().await;
-            let launched = self.launch(uid, &ns, &vm, ring, &disks, &dir).await;
+            let launched = self.launch(uid, &ns, &vm, ring, &disks, &dir, pod.as_ref()).await;
             if launched.is_err() {
                 if let Err(e) = self.unwind_held(uid, false).await {
                     warn!(vm = %vm.name, "a failed start's taps are still held, retried before the next: {e}");
@@ -1741,13 +1779,28 @@ impl VmManager {
             }
             launched
         };
-        let (handle, nic_reports, snoopers, registration) = match launched {
+        let (handle, made, registration) = match launched {
             Ok(l) => l,
             Err(e) => {
                 self.release(&disks).await;
+                if pod.is_some() && !self.release_pod_network(uid).await {
+                    warn!(vm = %vm.name, "a failed start's pod network is still held, retried at teardown");
+                }
                 return Err(StartFail::Failed(e));
             }
         };
+        let NicsMade { reports: nic_reports, snoopers, responders, leases, .. } = made;
+        // What a restarted kubelet needs to answer the guest's DHCP again.
+        if let Some(mut net) = pod {
+            net.leases = leases;
+            if let Err(e) = self.net_store.save(&net) {
+                warn!(vm = %vm.name, "could not record the VM's leases: {e}");
+            }
+            self.pod_nets.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), net);
+        }
+        if !responders.is_empty() {
+            self.responders.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), responders);
+        }
 
         info!(vm = %vm.name, namespace = %ns, ?handle, "vm started");
         // The record a restarted kubelet finds it by (#35): the engine keeps
@@ -1800,14 +1853,18 @@ impl VmManager {
         ring: Arc<RingClient>,
         disks: &[ResolvedDisk],
         dir: &str,
-    ) -> Result<(Handle, Vec<NicReport>, Watchers, stormvm_node::console::Registration), String> {
+        pod: Option<&crate::vm_network::PodNet>,
+    ) -> Result<(Handle, NicsMade, stormvm_node::console::Registration), String> {
         // NICs, before the plan: the tap has to exist so its descriptor can
         // be named, and it has to be deposited so the engine can find it by
         // that name.
-        // The tap watchers come back too, held here until the machine is
-        // recorded: a start that fails below drops them with it.
-        let (nics, nic_reports, snoopers) = self.resolve_nics(uid, ns, vm, &ring).await?;
-        let snoopers = Watchers(snoopers);
+        // The tap watchers and DHCP responders come back too, held here until
+        // the machine is recorded: a start that fails below drops them with it.
+        let mut made = self.resolve_nics(uid, ns, vm, &ring, pod).await?;
+        let nics = std::mem::take(&mut made.nics);
+        // The VMI's sandbox (#88): the hypervisor runs in its namespace, so
+        // the pod's address is the guest's and masquerade NATs out of the pod.
+        let sandbox = pod.map_or(Handle::NONE, |n| Handle(n.sandbox));
 
         let logging = Logging::pod(dir, 0);
 
@@ -1878,11 +1935,11 @@ impl VmManager {
             }
             let spec = ring.spec_define(spec_bytes)?;
             note(&ledger, &owner, Undo::Release(UndoKind::Spec, spec));
-            // No root and no sandbox: a machine's root is a disk on the
-            // hypervisor's command line, and a VM is not put in a pod's
-            // network namespace by the engine — its NIC is a tap, which is a
-            // descriptor rather than a namespace.
-            let h = ring.spawn(spec, Handle::NONE, handles[0], Handle::NONE, &handles[1..], domain)?;
+            // No root: a machine's root is a disk on the hypervisor's command
+            // line. A sandbox only for a VMI on the pod network (#88), joined
+            // as a container joins its pod's; otherwise the machine is in the
+            // node's namespace and its NICs are taps on the node's bridges.
+            let h = ring.spawn(spec, Handle::NONE, handles[0], sandbox, &handles[1..], domain)?;
             // Deposits consumed; handles the machine's now.
             ledger.lock().unwrap_or_else(|e| e.into_inner()).remove(&owner);
             Ok(h)
@@ -1890,7 +1947,7 @@ impl VmManager {
         .await;
 
         match started {
-            Ok(Ok(handle)) => Ok((handle, nic_reports, snoopers, registration)),
+            Ok(Ok(handle)) => Ok((handle, made, registration)),
             Ok(Err(e)) => {
                 deregister(&vm.namespace, &vm.name);
                 Err(format!("stormpump refused: {e:?}"))
@@ -1951,6 +2008,15 @@ impl VmManager {
             // bridge where the agent may be absent and the neighbour table
             // knows only what the node has talked to.
             let addrs = prefer_snooped(addrs, self.snooped_addresses(&vm.uid, vm.nics.len()));
+            // A NIC on the pod network holds the pod's address, known at
+            // start (#88). A masqueraded guest's agent reports the private
+            // address inside qemu, which nothing outside can reach.
+            let addrs = addrs.map(|a| {
+                a.into_iter()
+                    .zip(vm.nics.iter())
+                    .map(|(a, n)| if crate::vm_network::on_pod_network(&n.binding) { n.addresses.clone() } else { a })
+                    .collect::<Vec<_>>()
+            });
             if let Some(addrs) = addrs {
                 let changed = vm.nics.iter().map(|n| &n.addresses).ne(addrs.iter());
                 // The agent answering *is* the readiness signal: it runs in
@@ -2028,6 +2094,10 @@ impl VmManager {
                 self.event_of(&done, "Warning", "Failed", &done.message).await;
             }
             self.drop_snoopers(&done.uid);
+            // An ended machine gives its pod address back now rather than
+            // when its object goes (#88, as #137 for pods). A failure is
+            // retried by the teardown.
+            self.release_pod_network(&done.uid).await;
             // Retain the handle and disks for checked teardown. Releasing the
             // handle here loses the authoritative exit record before cleanup.
             self.vms.lock().await.insert(done.uid.clone(), done.clone());
@@ -2082,6 +2152,11 @@ impl VmManager {
             if !matches!(tokio::task::spawn_blocking(move || ring.workload_release(handle)).await, Ok(Ok(_))) {
                 return false;
             }
+        }
+        // Its pod network (#88), once nothing runs in the sandbox: the
+        // address goes back to the CNI. Retried, record and all, until done.
+        if !self.release_pod_network(&vm.uid).await {
+            return false;
         }
         deregister(&vm.namespace, &vm.name);
         self.stopping.lock().await.remove(&vm.uid);
@@ -2338,7 +2413,8 @@ impl VmManager {
         namespace: &str,
         vm: &VmSpec,
         ring: &Arc<RingClient>,
-    ) -> Result<(Vec<plan::ResolvedNic>, Vec<NicReport>, Vec<(usize, stormvm_net::Snooper)>), String> {
+        pod: Option<&crate::vm_network::PodNet>,
+    ) -> Result<NicsMade, String> {
         let defaults = stormvm_net::Defaults { uplink_bridge: DEFAULT_BRIDGE.to_string() };
         // Pure: every decision that could be wrong is made here, with no
         // privilege and nothing created yet.
@@ -2349,12 +2425,18 @@ impl VmManager {
         // Wrapped so a later NIC's failure drops the earlier watchers off the
         // runtime rather than joining their threads on it.
         let mut snoopers = Watchers(Vec::new());
+        let mut responders = Vec::new();
+        let mut leases = Vec::new();
         for p in &plans {
-            // No sandbox: a VM on the pod network wants a namespace this
-            // kubelet does not pop here yet, and `realise` refuses that
-            // binding by name rather than landing the guest on the node's own
-            // network.
-            let made = stormvm_net::realise(p, None, RUN_ROOT)?;
+            // The VMI's own sandbox for a pod NIC (#88): the bridge binding
+            // takes the pod's address off the CNI's interface there. A host
+            // bridge NIC is made in the node's namespace whatever else the
+            // machine has.
+            let sandbox = match p.attach {
+                stormvm_net::Attach::Pod(_) => pod.map(|n| n.netns.as_str()),
+                stormvm_net::Attach::Bridge(_) => None,
+            };
+            let made = stormvm_net::realise(p, sandbox, RUN_ROOT)?;
             if let Some(fd) = made.fd {
                 // Before the spawn: the engine resolves `Spec.fds` against
                 // what was already deposited, so a descriptor that arrives
@@ -2389,12 +2471,33 @@ impl VmManager {
                     Err(e) => warn!(vm = %vm.name, nic = %p.nic, "cannot watch {} for the guest's address: {e}", p.tap),
                 }
             }
+            // The guest's DHCP (#88): it is told the pod's address, and
+            // nothing else answers it in the sandbox.
+            if let (Some(addr), Some(ns)) = (&made.address, sandbox) {
+                let (dns, search) = self.cluster_dns(namespace);
+                let host = vm.hostname.clone().filter(|h| !h.is_empty()).unwrap_or_else(|| vm.name.clone());
+                let lease = addr.lease(dns, search, Some(host))?;
+                leases.push(crate::vm_network::LeaseRecord::of(reports.len(), &mac, &lease));
+                let ns = ns.to_string();
+                let r = tokio::task::spawn_blocking(move || stormvm_net::serve_dhcp(&ns, lease))
+                    .await
+                    .map_err(|e| format!("dhcp task: {e}"))?
+                    .map_err(|e| format!("interface {}: DHCP for the guest: {e}", p.nic))?;
+                responders.push(r);
+            }
             reports.push(NicReport {
                 name: p.nic.clone(),
                 mac: mac.clone(),
-                binding: binding_of(&made.transport),
-                // Empty until the guest has booted far enough to have one.
-                addresses: vec![],
+                // The binding stormvm chose (#88): a tap on `stormbr0` and a
+                // tap bridged to the pod are the same transport.
+                binding: made.binding.to_string(),
+                // On the pod network the address is the pod's, known now
+                // (#88); elsewhere empty until the guest has booted far
+                // enough to have one.
+                addresses: match (pod, crate::vm_network::on_pod_network(made.binding)) {
+                    (Some(n), true) if !n.ip.is_empty() => vec![n.ip.clone()],
+                    _ => vec![],
+                },
             });
             out.push(plan::ResolvedNic {
                 name: p.nic.clone(),
@@ -2404,7 +2507,153 @@ impl VmManager {
                 transport: made.transport,
             });
         }
-        Ok((out, reports, snoopers.take()))
+        Ok(NicsMade { nics: out, reports, snoopers, responders, leases })
+    }
+
+    /// The cluster DNS a ClusterFirst pod in `namespace` gets, for a guest's
+    /// lease (#88): the pod manager's servers and domain.
+    fn cluster_dns(&self, namespace: &str) -> (Vec<std::net::Ipv4Addr>, Vec<String>) {
+        let (servers, domain) = match &self.claims {
+            Some(p) => p.cluster_dns_config(),
+            None => (vec!["10.96.0.10".to_string()], "cluster.local".to_string()),
+        };
+        crate::vm_network::cluster_first(namespace, &servers, &domain)
+    }
+
+    /// The VMI's sandbox on the pod network (#88), when any NIC is on it:
+    /// a namespace from the engine and a CNI ADD into it, recorded first.
+    ///
+    /// `Ok(None)` for a machine with no pod NIC. No CNI yet is a wait (the
+    /// agent writes its config when it is up), as for a pod.
+    async fn acquire_pod_network(
+        &self,
+        uid: &str,
+        namespace: &str,
+        vm: &VmSpec,
+    ) -> Result<Option<crate::vm_network::PodNet>, StartFail> {
+        let defaults = stormvm_net::Defaults { uplink_bridge: DEFAULT_BRIDGE.to_string() };
+        let plans = stormvm_net::plan(namespace, &vm.name, &vm.interfaces, &defaults).map_err(StartFail::Failed)?;
+        if !crate::vm_network::wants_sandbox(&plans) {
+            return Ok(None);
+        }
+        let Some(invoker) = &self.cni else {
+            return Err(StartFail::Waiting(
+                "a VM on the pod network needs the node's CNI, and this kubelet has none (--no-cni)".into(),
+            ));
+        };
+        if let Err(e) = invoker.network_ready() {
+            return Err(StartFail::Waiting(format!("waiting for the pod network: no CNI configured yet ({e})")));
+        }
+        let Some(r) = self.ring.clone() else {
+            return Err(StartFail::Failed("no ring to stormpump: only the engine gives a VM a sandbox".into()));
+        };
+        let (handle, pid) = tokio::task::spawn_blocking(move || r.sandbox_acquire(crate::vm_network::PROFILE_ISOLATED))
+            .await
+            .map_err(|e| StartFail::Failed(format!("sandbox task: {e}")))?
+            .map_err(|e| StartFail::Failed(format!("stormpump would not give the VM a sandbox: {e:?}")))?;
+        let mut net = crate::vm_network::PodNet {
+            uid: uid.to_string(),
+            namespace: namespace.to_string(),
+            name: vm.name.clone(),
+            sandbox: handle.0,
+            netns: format!("/proc/{pid}/ns/net"),
+            ip: String::new(),
+            leases: vec![],
+        };
+        // Recorded before the CNI is asked: a start interrupted here is still
+        // found and undone.
+        if let Err(e) = self.net_store.save(&net) {
+            warn!(vm = %vm.name, "could not record the VM's pod network: {e}");
+        }
+        self.pod_nets.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), net.clone());
+        if pid == 0 {
+            self.release_pod_network(uid).await;
+            return Err(StartFail::Failed("stormpump gave the VM a sandbox with no holder".into()));
+        }
+        match invoker.add(&net.cni_pod()).await {
+            Ok(result) => {
+                net.ip = result
+                    .ips
+                    .first()
+                    .map(|i| i.address.split('/').next().unwrap_or("").to_string())
+                    .unwrap_or_default();
+                info!(vm = %vm.name, ip = %net.ip, "CNI attached the VM's pod network");
+                let _ = self.net_store.save(&net);
+                self.pod_nets.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), net.clone());
+                Ok(Some(net))
+            }
+            // DEL, as for a pod (#100): a chain that failed half way may have
+            // allocated. Kept (record and all) when DEL fails too, released
+            // by the next teardown or restart.
+            Err(e) => {
+                self.release_pod_network(uid).await;
+                Err(StartFail::Waiting(format!("waiting for the pod network: CNI ADD failed: {e}")))
+            }
+        }
+    }
+
+    /// Give a VMI's sandbox back (#88): its DHCP responders stop, CNI DEL,
+    /// the engine's sandbox released, the record removed. `true` when there
+    /// was nothing or it is all done; `false` keeps the record to retry.
+    async fn release_pod_network(&self, uid: &str) -> bool {
+        let responders = self.responders.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+        if let Some(r) = responders {
+            let _ = tokio::task::spawn_blocking(move || drop(r)).await;
+        }
+        let Some(net) = self.pod_nets.lock().unwrap_or_else(|e| e.into_inner()).get(uid).cloned() else {
+            return true;
+        };
+        if let Some(invoker) = &self.cni {
+            if let Err(e) = invoker.del(&net.cni_pod()).await {
+                warn!(vm = %net.name, "CNI DEL of the VM's pod network failed, retried: {e}");
+                return false;
+            }
+        }
+        if let Some(ring) = self.ring.clone() {
+            let h = Handle(net.sandbox);
+            match tokio::task::spawn_blocking(move || ring.sandbox_release(h)).await {
+                Ok(Ok(())) => {}
+                // Already gone: a restarted engine, or released before.
+                Ok(Err(RingError::Failed { errno: crate::stormpump_ring::ESTALE, .. })) => {}
+                other => {
+                    warn!(vm = %net.name, "the VM's sandbox was not released, retried: {other:?}");
+                    return false;
+                }
+            }
+        }
+        self.pod_nets.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+        self.net_store.remove(uid);
+        info!(vm = %net.name, ip = %net.ip, "VM's pod network released");
+        true
+    }
+
+    /// After a restart (#88): a recorded sandbox whose machine runs here gets
+    /// its DHCP back (the guest renews); one with no machine is released.
+    async fn restore_pod_networks(&self) {
+        for net in self.net_store.load_all() {
+            let running = self.vms.lock().await.get(&net.uid).is_some_and(|v| !v.phase.terminal());
+            self.pod_nets.lock().unwrap_or_else(|e| e.into_inner()).insert(net.uid.clone(), net.clone());
+            if !running {
+                self.release_pod_network(&net.uid).await;
+                continue;
+            }
+            let mut held = Vec::new();
+            for l in &net.leases {
+                let (ns, lease) = (net.netns.clone(), l.lease());
+                let served = match lease {
+                    Ok(lease) => tokio::task::spawn_blocking(move || stormvm_net::serve_dhcp(&ns, lease))
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|r| r),
+                    Err(e) => Err(e),
+                };
+                match served {
+                    Ok(r) => held.push(r),
+                    Err(e) => warn!(vm = %net.name, "DHCP for the adopted guest not restarted: {e}"),
+                }
+            }
+            self.responders.lock().unwrap_or_else(|e| e.into_inner()).insert(net.uid.clone(), held);
+        }
     }
 
 
@@ -3570,6 +3819,98 @@ mod tests {
         assert!(vm.nics[0].addresses.is_empty());
         assert_eq!(vm.nics[1].addresses, vec!["192.168.30.4".to_string()]);
         assert!(vm.ready_unix.is_some());
+    }
+
+    fn pod_vmi(binding: &str) -> Value {
+        let mut iface = json!({ "name": "default" });
+        iface[binding] = json!({});
+        json!({
+            "kind": "VirtualMachineInstance",
+            "metadata": { "name": "web-1", "namespace": "default", "uid": "u-1" },
+            "spec": {
+                "domain": {
+                    "memory": { "guest": "1Gi" },
+                    "devices": { "interfaces": [iface] }
+                },
+                "networks": [{ "name": "default", "pod": {} }]
+            }
+        })
+    }
+
+    fn spec_of(obj: &Value) -> VmSpec {
+        stormvm_spec::kube::from_kube(obj).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_vm_on_the_pod_network_waits_for_the_cni_and_one_without_needs_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), "")
+            .with_net_store(crate::vm_network::Store::at(dir.path()));
+        // The pod NIC is what asks for a sandbox.
+        let pod = spec_of(&pod_vmi("bridge"));
+        let plans = stormvm_net::plan("default", &pod.name, &pod.interfaces, &Default::default()).unwrap();
+        assert!(crate::vm_network::wants_sandbox(&plans));
+        // No pod NIC: no sandbox, whatever the node has.
+        let plain = spec_of(&vmi("n1"));
+        let plans = stormvm_net::plan("default", &plain.name, &plain.interfaces, &Default::default()).unwrap();
+        if !crate::vm_network::wants_sandbox(&plans) {
+            assert!(matches!(m.acquire_pod_network("u-1", "default", &plain).await, Ok(None)));
+        }
+        // A pod NIC with no CNI at all: a wait that names why.
+        match m.acquire_pod_network("u-1", "default", &spec_of(&pod_vmi("bridge"))).await {
+            Err(StartFail::Waiting(why)) => assert!(why.contains("--no-cni"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        // A CNI with no config yet: a wait, and nothing recorded.
+        let conf = tempfile::tempdir().unwrap();
+        let m = m.with_cni(Some(cni::CniInvoker::new(conf.path(), vec![])));
+        match m.acquire_pod_network("u-1", "default", &spec_of(&pod_vmi("masquerade"))).await {
+            Err(StartFail::Waiting(why)) => assert!(why.contains("no CNI configured yet"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(crate::vm_network::Store::at(dir.path()).load_all().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_recorded_sandbox_with_no_machine_is_released_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::vm_network::Store::at(dir.path());
+        let net = crate::vm_network::PodNet {
+            uid: "gone".into(),
+            namespace: "default".into(),
+            name: "old".into(),
+            sandbox: 9,
+            netns: "/proc/1/ns/net".into(),
+            ip: "10.0.1.9".into(),
+            leases: vec![],
+        };
+        store.save(&net).unwrap();
+        // No CNI and no ring here: the release is the record's removal.
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), "").with_net_store(store.clone());
+        m.adopt_registered().await;
+        assert!(store.load_all().is_empty(), "a record whose machine is not here is let go");
+        assert!(m.pod_nets.lock().unwrap().is_empty());
+        // Nothing recorded: nothing to do, and that is success.
+        assert!(m.release_pod_network("never").await);
+    }
+
+    #[test]
+    fn a_pod_nics_address_is_the_pods_and_its_binding_is_stormvms() {
+        // What the status says for a NIC on the pod network (#88): the
+        // binding stormvm chose, and the pod IP from the start.
+        let vm = Vm {
+            nics: vec![NicReport {
+                name: "default".into(),
+                mac: "0a:58:0a:00:01:05".into(),
+                addresses: vec!["10.0.1.5".into()],
+                binding: "bridge".into(),
+            }],
+            ..vm_at("u-1", &[], Phase::Running)
+        };
+        assert!(crate::vm_network::on_pod_network(&vm.nics[0].binding));
+        let mut m = Machines::default();
+        m.insert("u-1".into(), vm);
+        assert_eq!(m.at("10.0.1.5").map(|v| v.uid.as_str()), Some("u-1"), "metadata finds it by its pod IP");
     }
 
     fn vm_at(uid: &str, addresses: &[&str], phase: Phase) -> Vm {

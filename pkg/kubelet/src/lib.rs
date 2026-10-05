@@ -31,6 +31,7 @@ pub mod pod_manager;
 pub mod runtime;
 pub mod server;
 pub mod vm_manager;
+pub mod vm_network;
 pub mod vm_migrate;
 pub mod vm_runtime;
 pub mod vm_snapshot;

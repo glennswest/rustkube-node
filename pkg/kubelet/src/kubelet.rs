@@ -207,7 +207,14 @@ impl Kubelet {
     /// manager so the manager gets *this* kubelet's authenticated apiserver
     /// client — a status written with an unauthenticated one is a status
     /// nobody ever sees.
-    pub fn with_engine(mut self, ring: Arc<crate::stormpump_ring::RingClient>) -> Self {
+    ///
+    /// `cni` is the node's CNI, for a VMI on the pod network (#88): its own
+    /// sandbox is filled by the same plugins a pod's is.
+    pub fn with_engine(
+        mut self,
+        ring: Arc<crate::stormpump_ring::RingClient>,
+        cni: Option<cni::CniInvoker>,
+    ) -> Self {
         self.runtime_changes = Some(ring.subscribe_exits());
         self.vms = Some(Arc::new(
             crate::vm_manager::VmManager::new(
@@ -217,7 +224,8 @@ impl Kubelet {
                 &self.config.api_server_url,
             )
             .with_storage(self.config.engine.clone())
-            .with_claims(self.pod_manager.clone()),
+            .with_claims(self.pod_manager.clone())
+            .with_cni(cni),
         ));
         self.snapshots = Some(Arc::new(crate::vm_snapshot::Snapshots::new(
             self.api_client.clone(),

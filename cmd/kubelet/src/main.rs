@@ -499,7 +499,12 @@ async fn main() -> anyhow::Result<()> {
         // The same connection the containers are started on, deliberately: a
         // workload belongs to the client that started it, so a second ring
         // would mean a second thing whose death is a VM's death.
-        kubelet = kubelet.with_engine(ring);
+        // The VM manager's own invoker on the same directories (#88): a VMI
+        // on the pod network gets its sandbox from the same plugins.
+        let vm_cni = (!cli.no_cni).then(|| {
+            cni::CniInvoker::new(cli.cni_conf_dir.clone(), vec![std::path::PathBuf::from(&cli.cni_bin_dir)])
+        });
+        kubelet = kubelet.with_engine(ring, vm_cni);
     }
     if let Err(e) = kubelet.run().await {
         anyhow::bail!("kubelet failed: {e}");

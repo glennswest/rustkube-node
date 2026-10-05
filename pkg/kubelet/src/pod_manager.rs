@@ -2224,6 +2224,12 @@ impl PodManager {
         }))
     }
 
+    /// The cluster DNS servers and domain a ClusterFirst pod gets, for a
+    /// VM's DHCP lease on the pod network (#88).
+    pub fn cluster_dns_config(&self) -> (Vec<String>, String) {
+        (self.cluster_dns.clone(), self.cluster_domain.clone())
+    }
+
     /// Point pods at a different cluster DNS, or a different domain.
     pub fn with_cluster_dns(mut self, servers: Vec<String>, domain: String) -> Self {
         if !servers.is_empty() {
