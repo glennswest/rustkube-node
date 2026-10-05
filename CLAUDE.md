@@ -57,7 +57,7 @@ not the release path.
 
 ## Work plan
 
-### In progress: #145 (P0), kube-proxy to a TLS apiserver with a token (stormcos#265, flowsdn edition)
+### Done: #145 (P0), kube-proxy to a TLS apiserver with a token (stormcos#265, flowsdn edition)
 
 2026-10-05. Found: kube-proxy builds `reqwest::Client::new()` (no CA, no token) and parses any answer as a list,
 so a 401 reads as "no Services" and wipes every rule. Its rules are never entered: nothing jumps from
@@ -70,8 +70,10 @@ counts, so a pod replaced at a new IP keeps the old DNAT.
 4. [x] `--cluster-cidr` (optional): ClusterIP traffic from outside it is marked for masquerade. Also found and
        fixed: service ports keyed without protocol (kube-dns 53/UDP vs 53/TCP collided), Endpoints matched by
        number not name, stale backends never cleared. 3243b77; sc-build eb0afdb: 30 proxy tests (13 new) pass.
-5. [ ] Tests, docs (configuration.md, README, status.md), CHANGELOG; sc-build; stage golden; answer the node
-       requirements on the issue.
+5. [x] Tests, docs (configuration.md, README, status.md), CHANGELOG (cbfaec0). sc-build cbfaec0 `cargo build --locked
+       && cargo test --locked`: 293 kubelet unit, 4 integration, 25 CNI, 30 proxy pass. Stage golden
+       golden-rustkube-node-ed553922ee44, release request stormcos#164; node requirements answered on #145; closed,
+       `stormcentral shipped`. Follow-up #147 (UDP conntrack cleanup). Not run on a node: live check is stormcos#265.
 
 ### Done from this side: #140 (P0), every new claim on the Dell (11.76): "stormblock would not clone pvc-ext4j-64m"
 
