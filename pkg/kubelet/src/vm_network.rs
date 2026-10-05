@@ -201,6 +201,60 @@ pub fn launcher_status(existing: &serde_json::Value, ip: &str, phase: &str, now:
     serde_json::Value::Object(st)
 }
 
+/// The pod a reviewed ServiceAccount token is bound to (#122).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundPod {
+    pub namespace: String,
+    pub name: String,
+    pub uid: String,
+    /// The node the apiserver says the pod is on, when it says.
+    pub node: Option<String>,
+}
+
+/// From a TokenReview answer: authenticated, a ServiceAccount
+/// (`system:serviceaccount:<ns>:<sa>`), and bound to a pod
+/// (`authentication.kubernetes.io/pod-name`/`pod-uid` in `status.user.extra`).
+pub fn bound_pod(review: &serde_json::Value) -> Option<BoundPod> {
+    let st = &review["status"];
+    if st["authenticated"].as_bool() != Some(true) {
+        return None;
+    }
+    let namespace = st["user"]["username"].as_str()?.strip_prefix("system:serviceaccount:")?.split(':').next()?.to_string();
+    let extra = |k: &str| -> Option<String> {
+        let v = &st["user"]["extra"][format!("authentication.kubernetes.io/{k}")];
+        v.as_array().and_then(|a| a.first()).or(Some(v)).and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(String::from)
+    };
+    Some(BoundPod { namespace, name: extra("pod-name")?, uid: extra("pod-uid")?, node: extra("node-name") })
+}
+
+/// Does this pod object answer for a token bound to `uid` on `node`: the same
+/// pod (a recreated one of the name is not), placed here, not ending?
+pub fn pod_answers(pod: &serde_json::Value, uid: &str, node: &str) -> bool {
+    pod["metadata"]["uid"].as_str() == Some(uid)
+        && pod["spec"]["nodeName"].as_str() == Some(node)
+        && pod["metadata"]["deletionTimestamp"].is_null()
+        && !matches!(pod["status"]["phase"].as_str(), Some("Succeeded") | Some("Failed"))
+}
+
+/// A pod's instance metadata (#122), shaped as a machine's: the pod's own
+/// identity, from its object.
+pub fn pod_metadata(pod: &serde_json::Value, ip: &str, node: &str) -> serde_json::Value {
+    let m = &pod["metadata"];
+    let name = m["name"].as_str().unwrap_or("");
+    serde_json::json!({
+        "instance_id": m["uid"],
+        "storm.io/kind": "Pod",
+        "hostname": pod["spec"]["hostname"].as_str().filter(|h| !h.is_empty()).unwrap_or(name),
+        "local_ipv4": ip,
+        "region": "storm",
+        "zone": node,
+        "tags": { "namespace": m["namespace"], "name": name },
+        "labels": m["labels"].as_object().map(|l| serde_json::Value::Object(l.clone())).unwrap_or_else(|| serde_json::json!({})),
+        "service_account": pod["spec"]["serviceAccountName"].as_str().unwrap_or("default"),
+        "launched_at": pod["status"]["startTime"],
+    })
+}
+
 /// The pod-network NICs of a plan: the ones that need a sandbox.
 pub fn wants_sandbox(plans: &[stormvm_net::NicPlan]) -> bool {
     plans.iter().any(|p| matches!(p.attach, stormvm_net::Attach::Pod(_)))
@@ -360,6 +414,52 @@ mod tests {
         assert_eq!(ended["phase"], "Failed");
         let ready = ended["conditions"].as_array().unwrap().iter().find(|c| c["type"] == "Ready").unwrap();
         assert_eq!((ready["status"].as_str(), ready["lastTransitionTime"].as_str()), (Some("False"), Some("2026-10-05T21:00:00Z")));
+    }
+
+    fn review(user: &str, name: &str, uid: &str, node: Option<&str>) -> serde_json::Value {
+        let mut extra = serde_json::json!({
+            "authentication.kubernetes.io/pod-name": [name],
+            "authentication.kubernetes.io/pod-uid": [uid],
+        });
+        if let Some(n) = node {
+            extra["authentication.kubernetes.io/node-name"] = serde_json::json!([n]);
+        }
+        serde_json::json!({ "status": { "authenticated": true, "user": { "username": user, "extra": extra } } })
+    }
+
+    #[test]
+    fn a_reviewed_token_names_its_pod() {
+        let b = bound_pod(&review("system:serviceaccount:ops:agent", "agent-x", "p-1", Some("n1"))).unwrap();
+        assert_eq!(b, BoundPod { namespace: "ops".into(), name: "agent-x".into(), uid: "p-1".into(), node: Some("n1".into()) });
+        assert!(bound_pod(&review("alice", "agent-x", "p-1", None)).is_none(), "not a ServiceAccount");
+        let mut unbound = review("system:serviceaccount:ops:agent", "", "", None);
+        unbound["status"]["user"]["extra"] = serde_json::json!({});
+        assert!(bound_pod(&unbound).is_none(), "a token bound to no pod");
+        let mut no = review("system:serviceaccount:ops:agent", "a", "p", None);
+        no["status"]["authenticated"] = serde_json::json!(false);
+        assert!(bound_pod(&no).is_none());
+    }
+
+    #[test]
+    fn only_the_same_pod_placed_here_and_running_answers() {
+        let pod = serde_json::json!({
+            "metadata": { "name": "agent-x", "namespace": "ops", "uid": "p-1", "labels": { "app": "agent" } },
+            "spec": { "nodeName": "n1", "hostNetwork": true, "serviceAccountName": "agent" },
+            "status": { "phase": "Running", "startTime": "2026-10-05T00:00:00Z" },
+        });
+        assert!(pod_answers(&pod, "p-1", "n1"));
+        assert!(!pod_answers(&pod, "p-2", "n1"), "a recreated pod of the name");
+        assert!(!pod_answers(&pod, "p-1", "n2"), "placed elsewhere");
+        let mut ending = pod.clone();
+        ending["metadata"]["deletionTimestamp"] = serde_json::json!("2026-10-05T01:00:00Z");
+        assert!(!pod_answers(&ending, "p-1", "n1"));
+        let md = pod_metadata(&pod, "192.168.30.2", "n1");
+        assert_eq!(md["instance_id"], "p-1");
+        assert_eq!(md["storm.io/kind"], "Pod");
+        assert_eq!(md["hostname"], "agent-x");
+        assert_eq!(md["labels"]["app"], "agent");
+        assert_eq!(md["tags"]["namespace"], "ops");
+        assert_eq!(md["service_account"], "agent");
     }
 
     #[test]

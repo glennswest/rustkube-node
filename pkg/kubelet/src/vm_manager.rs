@@ -3034,6 +3034,14 @@ impl VmManager {
     /// does not have is a machine that is not running here, which is exactly
     /// the answer a metadata service should give.
     pub async fn instance_at(&self, ip: &str) -> Option<Value> {
+        self.instance_for(ip, None).await
+    }
+
+    /// [`Self::instance_at`], with the caller's ServiceAccount token when it
+    /// presented one (#122): a host-network workload shares the node's
+    /// address, so its address names nobody, and its pod's token is its
+    /// identity instead. Only consulted for a node address.
+    pub async fn instance_for(&self, ip: &str, workload_token: Option<&str>) -> Option<Value> {
         // An address the node itself holds identifies nobody.
         //
         // A container on the host network shares the node's address, and so
@@ -3046,9 +3054,48 @@ impl VmManager {
         // needs an identity needs a different mechanism than an address, and
         // inventing one here quietly would be the worst version of that.
         if self.node_ip_holds(ip).await {
-            return None;
+            // Unless it says who it is, with a token bound to a pod here.
+            return match workload_token {
+                Some(t) if !t.is_empty() => self.pod_by_token(ip, t).await,
+                _ => None,
+            };
         }
         self.machine_at(ip).await
+    }
+
+    /// The pod a ServiceAccount token is bound to, as metadata, when that pod
+    /// runs on this node (#122). The token is reviewed by the apiserver
+    /// (TokenReview names the pod in `status.user.extra`, rustkube#182), and
+    /// the pod's own object is the truth (#119's rule): its uid must match,
+    /// it must be placed here, and not be ending. Anything else is no answer.
+    async fn pod_by_token(&self, ip: &str, token: &str) -> Option<Value> {
+        if self.api_url.is_empty() {
+            return None;
+        }
+        let review = json!({ "apiVersion": "authentication.k8s.io/v1", "kind": "TokenReview", "spec": { "token": token } });
+        let r = self
+            .api
+            .post(format!("{}/apis/authentication.k8s.io/v1/tokenreviews", self.api_url))
+            .json(&review)
+            .send()
+            .await
+            .ok()?;
+        let review: Value = r.json().await.ok()?;
+        let b = crate::vm_network::bound_pod(&review)?;
+        if b.node.as_deref().is_some_and(|n| n != self.node_name) {
+            return None;
+        }
+        let pod: Value = self
+            .api
+            .get(format!("{}/api/v1/namespaces/{}/pods/{}", self.api_url, b.namespace, b.name))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        crate::vm_network::pod_answers(&pod, &b.uid, &self.node_name)
+            .then(|| crate::vm_network::pod_metadata(&pod, ip, &self.node_name))
     }
 
     /// [`Self::instance_at`] past the node's own addresses.

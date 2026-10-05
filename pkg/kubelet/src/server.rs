@@ -305,6 +305,10 @@ async fn metrics(State(pm): State<Arc<PodManager>>) -> impl IntoResponse {
     ([("content-type", "text/plain; version=0.0.4")], crate::metrics::render_kubelet(&snap))
 }
 
+/// The header a metadata service forwards a host-network workload's
+/// ServiceAccount token in (#122).
+pub const WORKLOAD_TOKEN: &str = "x-storm-workload-token";
+
 /// `GET /vmInstance/{address}` — the instance metadata for whoever holds it.
 ///
 /// 404 for an address this node is not running a machine for, which is the
@@ -313,12 +317,20 @@ async fn metrics(State(pm): State<Arc<PodManager>>) -> impl IntoResponse {
 async fn vm_instance(
     State(vms): State<Option<Arc<crate::vm_manager::VmManager>>>,
     Path(address): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
+    // A host-network workload's own ServiceAccount token, forwarded by the
+    // metadata service (#122). Not `Authorization`: that is the caller's
+    // credential to this kubelet, and `auth_mw` has spent it.
+    let workload_token = headers
+        .get(WORKLOAD_TOKEN)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().trim_start_matches("Bearer ").to_string());
     let Some(vms) = vms else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "this node runs no machines"})))
             .into_response();
     };
-    match vms.instance_at(&address).await {
+    match vms.instance_for(&address, workload_token.as_deref()).await {
         // A cold cache is 503, not 404.
         //
         // "I have not synced" and "no such machine" are different answers and
