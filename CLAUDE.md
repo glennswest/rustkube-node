@@ -79,8 +79,10 @@ objects past 16 TiB. stormcos#91's table: nothing forces XFS. Found:
        4Ti/16Ti, Block 1Mi/20Ti/1Pi via volumeDevices, 20Ti filesystem refused, above-ladder 2Pi (312e9ff).
        Docs README, csi.md, status.md, CHANGELOG (04a6fdc).
 4. [x] Filed rustkube#201 (provisioner volumeMode), stormblock#289 (carry mkfs.ext4.rs#9/#10).
-5. [ ] sc-build HEAD, stage golden, close. Not run on a node: the medium Job waits on the test pipeline (#64)
-       and emulated large drives (stormcos#92).
+5. [x] sc-build 1e65251 `cargo build --locked && cargo test --locked`: 310 kubelet unit pass, exit 0 in 150 s;
+       `cd test && cargo test --locked` at 04a6fdc: 15 pass. Stage golden golden-rustkube-node-a0b9cebe68a0,
+       release request stormcos#164; #67 closed, shipped. Follow-up #149 (flip 64T+ to ext4) proposed after
+       stormblock#289. Not run on a node: medium Job waits on the test pipeline (#64), stormcos#92.
 
 ### Done: #119 (P3), metadata at scale (stormcos#54)
 
