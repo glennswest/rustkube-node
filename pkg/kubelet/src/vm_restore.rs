@@ -131,7 +131,7 @@ impl Snapshots {
         let Ok(req) = spec::restore_request(obj) else {
             return; // whose it is cannot be told without its snapshot
         };
-        let Some(snap) = self.get(&format!("/apis/{API}/namespaces/{}/virtualmachinesnapshots/{}", req.namespace, req.snapshot)).await else {
+        let Some(snap) = self.api_object(&format!("/apis/{API}/namespaces/{}/virtualmachinesnapshots/{}", req.namespace, req.snapshot)).await else {
             return;
         };
         let (_, _, node) = self.api();
@@ -141,7 +141,7 @@ impl Snapshots {
         match self.restore_steps(obj, &req, &snap, engine).await {
             Ok(restores) => {
                 let st = spec::restore_status(true, &now(), &restores, None);
-                if self.write_status(obj, st).await {
+                if self.write_restore_status(obj, st).await {
                     info!("{}/{}: restored {} from {}", req.namespace, req.vm, restores.len(), req.snapshot);
                     let msg = format!(
                         "restored {} disk(s) of {} from {}: {}",
@@ -167,7 +167,7 @@ impl Snapshots {
                 if progressing {
                     st["conditions"][0]["reason"] = json!(why);
                 }
-                self.write_status(obj, st).await;
+                self.write_restore_status(obj, st).await;
                 if !progressing {
                     warn!("{}/{}: restore failed: {why}", req.namespace, req.name);
                     self.object_event("VirtualMachineRestore", obj, "Warning", "VirtualMachineRestoreError", &why).await;
@@ -201,11 +201,11 @@ impl Snapshots {
             )));
         }
         // Stopped: a running guest's disks are not swapped under it.
-        if self.get(&format!("/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{}", req.vm)).await.is_some() {
+        if self.api_object(&format!("/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{}", req.vm)).await.is_some() {
             return Err(Step::Wait(format!("VirtualMachine {} is running: stop it to restore", req.vm)));
         }
         let vm_path = format!("/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{}", req.vm);
-        let Some(vm) = self.get(&vm_path).await else {
+        let Some(vm) = self.api_object(&vm_path).await else {
             return Err(Step::Error(format!("VirtualMachine {} not found", req.vm)));
         };
         let group = engine
@@ -247,7 +247,7 @@ impl Snapshots {
     async fn bind_restored(&self, ns: &str, claim: &str, volume: &str, bytes: u64, restore: &Value) -> Result<(), String> {
         let (api, url, node) = self.api();
         let pvc_path = format!("/api/v1/namespaces/{ns}/persistentvolumeclaims/{claim}");
-        let pvc = match self.get(&pvc_path).await {
+        let pvc = match self.api_object(&pvc_path).await {
             Some(p) => p,
             None => {
                 let mut pvc = json!({
@@ -276,7 +276,7 @@ impl Snapshots {
                 r.json().await.map_err(|e| format!("claim {claim}: {e}"))?
             }
         };
-        if self.get(&format!("/api/v1/persistentvolumes/{volume}")).await.is_none() {
+        if self.api_object(&format!("/api/v1/persistentvolumes/{volume}")).await.is_none() {
             let facts = crate::system_claims::VolumeFacts { name: volume.to_string(), bytes, block: true, ..Default::default() };
             let mut pv = crate::system_claims::stormblock_pv(&facts, volume, node, crate::system_claims::claim_ref(&pvc), "Delete");
             pv["metadata"]["labels"] = json!({ RESTORED_FROM: restore["metadata"]["name"] });
@@ -293,7 +293,7 @@ impl Snapshots {
         Ok(())
     }
 
-    async fn get(&self, path: &str) -> Option<Value> {
+    async fn api_object(&self, path: &str) -> Option<Value> {
         let (api, url, _) = self.api();
         match api.get(format!("{url}{path}")).send().await {
             Ok(r) if r.status().is_success() => r.json().await.ok(),
@@ -301,7 +301,7 @@ impl Snapshots {
         }
     }
 
-    async fn write_status(&self, obj: &Value, status: Value) -> bool {
+    async fn write_restore_status(&self, obj: &Value, status: Value) -> bool {
         let (api, url, _) = self.api();
         let ns = obj["metadata"]["namespace"].as_str().unwrap_or("default");
         let name = obj["metadata"]["name"].as_str().unwrap_or("");
