@@ -89,6 +89,38 @@ pub fn work(env: &Env, name: &str, claim: &str, mode: &str, args: &[String]) -> 
     })
 }
 
+/// The Node's name for `node`, which the runner gives as an address
+/// (`STORM_NODE`): the node whose name, or one of whose `status.addresses`,
+/// it is. Needs the `nodes` cluster read (`test/requires.toml`).
+pub async fn node_name(api: &Api, node: &str) -> Result<String, String> {
+    let nodes = api.list("/api/v1/nodes").await?.ok_or("nodes are not served")?;
+    pick_node(&nodes, node).ok_or_else(|| format!("no Node is named {node} or has it as an address"))
+}
+
+pub fn pick_node(nodes: &[Value], node: &str) -> Option<String> {
+    nodes
+        .iter()
+        .find(|n| {
+            s(n, "/metadata/name") == node
+                || n["status"]["addresses"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|a| a["address"].as_str() == Some(node)))
+        })
+        .map(|n| s(n, "/metadata/name").to_string())
+}
+
+/// The image this run's own pod runs (#97): the pod labelled with the run id
+/// in the run's namespace, its `test` container (else its first).
+pub async fn own_image(env: &Env, api: &Api) -> Option<String> {
+    let path = format!("{}?labelSelector=storm.io%2Ftest-run%3D{}", pods(env), env.run_id);
+    let pods = api.list(&path).await.ok()??;
+    pods.iter().find_map(|p| {
+        let cs = p["spec"]["containers"].as_array()?;
+        let c = cs.iter().find(|c| c["name"] == "test").or_else(|| cs.first())?;
+        c["image"].as_str().filter(|i| !i.is_empty()).map(String::from)
+    })
+}
+
 /// Whether the built-in class is here. `Ok(None)` when it is; `Ok(Some(why))`
 /// when it is not (the suite then reports one skip); `Err` when the API could
 /// not be asked.
@@ -216,6 +248,18 @@ pub async fn drain(env: &Env, api: &Api, within: Duration) -> Result<Vec<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_node_is_found_by_its_address_or_its_name() {
+        let nodes = vec![
+            serde_json::json!({"metadata": {"name": "c2nr0q2"}, "status": {"addresses": [
+                {"type": "InternalIP", "address": "192.168.30.2"}, {"type": "Hostname", "address": "c2nr0q2"}]}}),
+            serde_json::json!({"metadata": {"name": "other"}, "status": {"addresses": []}}),
+        ];
+        assert_eq!(pick_node(&nodes, "192.168.30.2").as_deref(), Some("c2nr0q2"));
+        assert_eq!(pick_node(&nodes, "other").as_deref(), Some("other"));
+        assert_eq!(pick_node(&nodes, "10.0.0.1"), None);
+    }
 
     pub fn env() -> Env {
         Env {

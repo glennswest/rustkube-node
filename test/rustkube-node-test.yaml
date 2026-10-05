@@ -1,5 +1,7 @@
-# rustkube-node-test-<suite>: how stormcentral runs rustkube-node's tests on a
-# test machine, per stormcentral docs/test-standard.md.
+# rustkube-node-test-<suite>: what a run of rustkube-node's tests looks like,
+# per stormcentral docs/test-standard.md. **Reference only:** stormcentral
+# builds the Job, its namespace-scoped Role and the cluster reads itself
+# (src/testruns.rs), from test/requires.toml; it does not apply this file.
 #
 # Test metadata (what the runner matches against the machine):
 #   suites:   medium (< 30 min): claims of the built-in stormblock class at

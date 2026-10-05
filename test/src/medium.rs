@@ -260,16 +260,16 @@ async fn above_ladder(env: &Env, api: &Api) -> Outcome {
 
 /// One class above what the test node says it can still take (#62).
 async fn overcommit_refused(env: &Env, api: &Api) -> Outcome {
-    let path = format!("/apis/storage.k8s.io/v1/namespaces/kube-system/csistoragecapacities/stormblock-{}", env.node);
+    let path = format!("/apis/storage.k8s.io/v1/namespaces/kube-system/csistoragecapacities/stormblock-{}", env.node_name);
     let cap = match api.get(&path).await {
         Ok(Some(c)) => c,
-        Ok(None) => return Outcome::Fail(format!("node {} publishes no CSIStorageCapacity ({path})", env.node)),
+        Ok(None) => return Outcome::Fail(format!("node {} publishes no CSIStorageCapacity ({path})", env.node_name)),
         Err(e) => return Outcome::Infra(e),
     };
     let max = api::quantity_bytes(s(&cap, "/maximumVolumeSize")).unwrap_or(0);
     let all: Vec<(&str, u64)> = LADDER.iter().chain(BLOCK_ONLY).copied().collect();
     let Some((request, _)) = all.iter().find(|(_, b)| *b > max) else {
-        return Outcome::Skip(format!("node {} can still take the largest class (maximumVolumeSize {max})", env.node));
+        return Outcome::Skip(format!("node {} can still take the largest class (maximumVolumeSize {max})", env.node_name));
     };
     // Block, so a class past the ext4 ones is refused for room, not for
     // having no filesystem.
@@ -296,7 +296,7 @@ async fn refused(env: &Env, api: &Api, name: &str, request: &str, why: &[&str], 
         k8s::work(env, name, name, "sized", &args)
     };
     if pinned_block {
-        pod["spec"]["nodeSelector"] = serde_json::json!({ "kubernetes.io/hostname": env.node });
+        pod["spec"]["nodeSelector"] = serde_json::json!({ "kubernetes.io/hostname": env.node_name });
     }
     if let Err(e) = api.create(&k8s::pods(env), &pod).await {
         return Outcome::Infra(e);

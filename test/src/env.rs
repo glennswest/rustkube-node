@@ -12,6 +12,7 @@ pub const CLASS: &str = "stormblock";
 /// Its provisioner (stormcos `deploy/manifests/45-storageclass.yaml`).
 pub const PROVISIONER: &str = "stormblock.storm.io";
 
+#[derive(Clone)]
 pub struct Env {
     pub suite: String,
     pub run_id: String,
@@ -19,12 +20,20 @@ pub struct Env {
     pub namespace: String,
     /// `STORM_API`: the apiserver.
     pub api: String,
-    /// `STORM_NODE`: the node's address. Informational: the kubelet is
-    /// reached through the API only.
+    /// `STORM_NODE`: the node's **address**, as the standard says. Not its
+    /// name: see [`Env::node_name`].
     pub node: String,
+    /// The Node object's name for [`Env::node`], resolved from the node list
+    /// at the start of a run (`k8s::node_name`): what the kubelet writes into
+    /// `storm.io/node`, `kubernetes.io/hostname` and object names.
+    pub node_name: String,
+    /// `STORM_COMMIT`.
+    pub commit: String,
     /// The image the workload pods run: this test image itself, in its
     /// workload modes, so nothing is pulled from outside the cluster.
-    /// `RUSTKUBE_NODE_TEST_IMAGE` (the Job sets it).
+    /// `RUSTKUBE_NODE_TEST_IMAGE` when set; otherwise resolved at the start
+    /// of a run from the Job's own pod, else the standard's name (#97):
+    /// stormcentral builds the Job itself and sets no such variable.
     pub image: String,
     /// How long the first 1 TiB claim may take, pod created to finished: it
     /// may mint the class's blank (one mkfs of 1 TiB, stormblock#141).
@@ -57,6 +66,8 @@ impl Env {
             namespace: var("STORM_NAMESPACE").or_else(|| sa("namespace")).unwrap_or_default(),
             api: var("STORM_API").unwrap_or_default(),
             node: var("STORM_NODE").unwrap_or_default(),
+            node_name: String::new(),
+            commit: var("STORM_COMMIT").unwrap_or_default(),
             image: var("RUSTKUBE_NODE_TEST_IMAGE").unwrap_or_default(),
             mint_budget: secs("RUSTKUBE_NODE_TEST_MINT_BUDGET", 1200),
             token: sa("token"),
@@ -79,10 +90,14 @@ impl Env {
         if self.namespace.is_empty() {
             m.push("STORM_NAMESPACE");
         }
-        if self.image.is_empty() {
-            m.push("RUSTKUBE_NODE_TEST_IMAGE");
-        }
         m
+    }
+
+    /// The image the standard names for this run when nothing better is
+    /// known: `test-rustkube-node-<suite>:<commit12>`.
+    pub fn standard_image(&self) -> String {
+        let commit: String = self.commit.chars().take(12).collect();
+        format!("test-rustkube-node-{}:{commit}", self.suite)
     }
 
     pub fn remaining(&self) -> Duration {

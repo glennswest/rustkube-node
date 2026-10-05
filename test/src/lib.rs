@@ -36,6 +36,20 @@ pub async fn run(env: Arc<Env>, r: &mut Report) {
             return;
         }
     };
+    // What the runner gives as an address, and the image it does not name
+    // (#97), resolved once for the whole run.
+    let mut e = (*env).clone();
+    match k8s::node_name(&api, &e.node).await {
+        Ok(n) => e.node_name = n,
+        Err(err) => {
+            r.record("node", Outcome::Infra(format!("which Node is {}: {err}", e.node)), 0, None);
+            return;
+        }
+    }
+    if e.image.is_empty() {
+        e.image = k8s::own_image(&e, &api).await.unwrap_or_else(|| e.standard_image());
+    }
+    let env = Arc::new(e);
     match env.suite.as_str() {
         "medium" => {
             match k8s::no_builtin_class(&api).await {

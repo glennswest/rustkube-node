@@ -1,0 +1,14 @@
+# What rustkube-node's suites need from the runner (stormcentral
+# docs/test-standard.md, #55, #74). Everything else is the run's namespace.
+
+[medium]
+# Cluster-wide reads (get, list, watch): which Node STORM_NODE is, the
+# built-in StorageClass, PVs (reclaim checks), kube-system's mirrored node
+# volume claims (#59) and the node's CSIStorageCapacity (#62).
+cluster_read = [
+  { apiGroup = "", resource = "nodes" },
+  { apiGroup = "", resource = "persistentvolumes" },
+  { apiGroup = "", resource = "persistentvolumeclaims" },
+  { apiGroup = "storage.k8s.io", resource = "storageclasses" },
+  { apiGroup = "storage.k8s.io", resource = "csistoragecapacities" },
+]

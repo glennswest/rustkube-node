@@ -2,6 +2,13 @@
 
 ## 2026-10-05
 
+- **fix:** The test container runs under stormcentral's real runner (#97; found checking #91). The runner
+  builds the Job itself, so: the workload image is the run's own pod's (`test` container), else the
+  standard's `test-rustkube-node-<suite>:<commit12>`, with `RUSTKUBE_NODE_TEST_IMAGE` only an override;
+  `STORM_NODE` is an address, so the Node's name is resolved from the node list; `test/requires.toml`
+  declares the medium suite's cluster reads (nodes, PVs, PVCs, StorageClasses, CSIStorageCapacities).
+  `node-volumes-restored` reports skip: a test may not delete kube-system's claims (cluster reads only).
+  `test/rustkube-node-test.yaml` is marked reference only.
 - **feat:** Claims are charged their full size class against the node's stormblock data slabs (#62; owner
   policy #108: class size at bind, overcommit ratio 1.0, class-sized clones). The node publishes
   `CSIStorageCapacity` `kube-system/stormblock-<node>` (room left, `maximumVolumeSize` = the largest class

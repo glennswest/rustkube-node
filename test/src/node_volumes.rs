@@ -8,13 +8,14 @@
 //!    the same `storm.io/volume-kind` and `storm.io/component`, and every such
 //!    PV of the node has its claim. There is at least one (every stormcos node
 //!    has `fastetcd-data`).
-//! 2. **Restored.** One claim (a `logs` one when there is one) is deleted;
-//!    the kubelet makes it again, and its PV names the new claim's uid.
+//! 2. **Restored:** reported skip. Deleting a `kube-system` claim is not a
+//!    test's to do (the runner grants cluster reads only); the kubelet's
+//!    mirror unit test covers it.
 //!
 //! Pairs under the old unqualified names (before #107) are not this check's:
 //! they are left as they were (no migration) and are skipped here.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -106,59 +107,26 @@ pub async fn pairs(env: &Env, api: &Api) -> Outcome {
         Ok(l) => l,
         Err(e) => return Outcome::Infra(e),
     };
-    let wrong = problems(&env.node, &pvcs, &pvs);
-    let n = ours(&pvcs, &env.node, false).len();
+    let wrong = problems(&env.node_name, &pvcs, &pvs);
+    let n = ours(&pvcs, &env.node_name, false).len();
     if wrong.is_empty() {
-        Outcome::Pass(format!("{n} node volumes of {} are complete PV + PVC pairs", env.node))
+        Outcome::Pass(format!("{n} node volumes of {} are complete PV + PVC pairs", env.node_name))
     } else {
         Outcome::Fail(wrong.join("; "))
     }
 }
 
-/// Check 2: a deleted claim is made again and its PV names the new uid.
-pub async fn restored(env: &Env, api: &Api, within: Duration) -> Outcome {
-    let (pvcs, _) = match lists(api).await {
-        Ok(l) => l,
-        Err(e) => return Outcome::Infra(e),
-    };
-    let claims = ours(&pvcs, &env.node, false);
-    let Some(c) = claims
-        .iter()
-        .find(|c| label(c, "storm.io/volume-kind") == "logs")
-        .or_else(|| claims.first())
-    else {
-        return Outcome::Fail(format!("no node volume of {} to delete", env.node));
-    };
-    let (name, old_uid) = (s(c, "/metadata/name").to_string(), c["metadata"]["uid"].clone());
-    let pv_name = s(c, "/spec/volumeName").to_string();
-    let path = format!("/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims/{name}");
-    if let Err(e) = api.delete(&path).await {
-        return Outcome::Infra(e);
-    }
-    let t = Instant::now();
-    let (path, pv_path) = (path.as_str(), format!("{}/{pv_name}", k8s::PVS));
-    let pv_path = pv_path.as_str();
-    let old = &old_uid;
-    let back = k8s::until(within, || async move {
-        let Some(c) = api.get(path).await? else { return Err("not made again yet".to_string()) };
-        if c["metadata"]["uid"] == *old || !c["metadata"]["deletionTimestamp"].is_null() {
-            return Err("the old claim is still going".to_string());
-        }
-        let pv = api.get(pv_path).await?.ok_or("its PV is gone")?;
-        if pv["spec"]["claimRef"]["uid"] != c["metadata"]["uid"] {
-            return Err(format!("PV {pv_path} still names uid {}", pv["spec"]["claimRef"]["uid"]));
-        }
-        Ok(Ok(()))
-    })
-    .await;
-    match back {
-        Ok(Ok(())) => Outcome::Pass(format!(
-            "claim {NAMESPACE}/{name} deleted and made again in {} ms; PV {pv_name} names the new uid",
-            t.elapsed().as_millis()
-        )),
-        Ok(Err(e)) => Outcome::Fail(e),
-        Err(e) => Outcome::Fail(format!("claim {NAMESPACE}/{name} was not restored: {e}")),
-    }
+/// Check 2: a deleted claim is made again. **Not from a test container**: the
+/// standard's runner grants a suite cluster-wide reads only (get, list,
+/// watch), and the claims are in `kube-system`, which a test never changes.
+/// The restore is covered by the kubelet's end-to-end mirror test against a
+/// fake apiserver (`system_claims.rs`). Reported as a skip, never a pass.
+pub async fn restored(_env: &Env, _api: &Api, _within: Duration) -> Outcome {
+    Outcome::Skip(
+        "a test may not delete kube-system's claims (the runner grants cluster reads only); \
+         the restore is covered by the kubelet's mirror unit test"
+            .into(),
+    )
 }
 
 #[cfg(test)]
