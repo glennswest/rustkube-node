@@ -94,11 +94,13 @@ joins a machine-domain spawn to a client-held sandbox (`inline_a`, `ns_fds`), as
 6. [x] **Owner (2026-10-05): B**, rustkube's VM controller creates a virt-launcher Pod, the kubelet adopts it;
        "can we have multiple vm in a namespace" (yes: a sandbox and a Pod each). Filed rustkube#203 (contract:
        labels `kubevirt.io: virt-launcher`, `kubevirt.io/created-by: <vmi uid>`, owner ref, nodeName set).
-7. [ ] Kubelet adopts it: launcher Pods kept out of the pod manager (and their VMI woken when one appears);
+7. [x] Kubelet adopts it (3d9d26e, test 1 more, docs 523e978): launcher Pods kept out of the pod manager (and their VMI woken when one appears);
        the pod-network VMI waits for its launcher Pod; CNI ADD with the Pod's ns/name/uid (recorded); the Pod's
        status written (Running + podIP + Ready at start, Succeeded/Failed at end); a terminating launcher Pod
        with no machine here is confirmed deleted (grace 0, uid precondition).
-8. [ ] Tests, docs, CHANGELOG, sc-build, golden; #88 proposed after rustkube#203 for the live done-when.
+8. [x] Tests (4 new), docs, CHANGELOG. sc-build `cargo build --locked && cargo test --locked`: 326 kubelet unit pass.
+9. [ ] Golden; #88 proposed after rustkube#203 (the Pod's creator), then the live done-when on the test host
+       (also behind stormcentral#376, test machines' registries full).
 
 ### Done from this side: #67 (P1), PVC ladder to PiB, raw block volumes, per-class filesystem
 
