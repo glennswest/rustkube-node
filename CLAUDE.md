@@ -57,6 +57,20 @@ not the release path.
 
 ## Work plan
 
+### In progress: #145 (P0), kube-proxy to a TLS apiserver with a token (stormcos#265, flowsdn edition)
+
+2026-10-05. Found: kube-proxy builds `reqwest::Client::new()` (no CA, no token) and parses any answer as a list,
+so a 401 reads as "no Services" and wipes every rule. Its rules are never entered: nothing jumps from
+PREROUTING/OUTPUT to `KUBE-SERVICES` or from POSTROUTING to `KUBE-POSTROUTING`. A change is detected only by
+counts, so a pod replaced at a new IP keeps the old DNAT.
+1. [ ] `--ca-file`/`--token-file` (`KUBE_PROXY_CA_FILE`/`KUBE_PROXY_TOKEN_FILE`), defaulting to the in-cluster
+       ServiceAccount paths when present; token re-read each pass (projected tokens rotate). Non-2xx is an error.
+2. [ ] Jumps ensured (`-C`, else `-I`) for PREROUTING, OUTPUT → KUBE-SERVICES, POSTROUTING → KUBE-POSTROUTING.
+3. [ ] Apply when the generated rules differ from the last applied set, or 60 s after it (resync).
+4. [ ] `--cluster-cidr` (optional): ClusterIP traffic from outside it is marked for masquerade.
+5. [ ] Tests, docs (configuration.md, README, status.md), CHANGELOG; sc-build; stage golden; answer the node
+       requirements on the issue.
+
 ### Done from this side: #140 (P0), every new claim on the Dell (11.76): "stormblock would not clone pvc-ext4j-64m"
 
 2026-10-03. C2NR0Q2 (Dell R230, 11.76: this repo at ac07686, stormblock v20.0.0); pvetest1 fine with the same
