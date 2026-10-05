@@ -622,21 +622,21 @@ Steps:
        2026-10-05: half 1 is stormcos_qa `vm-waves` (noCloud key, ssh); half 2 filed as stormcos_qa#52. Runs on
        C2NR0Q2 get 507 on the image push (stormcentral#376); #92 proposed after it. Then run vm-waves, close.
 
-### In progress: #122, host-network metadata by ServiceAccount token; pod-bound tokens
+### Done: #122, host-network metadata by ServiceAccount token; pod-bound tokens
 
 2026-10-05. rustkube#182 (in golden-rustkube-152acbd2a1f0): TokenRequest honours `expirationSeconds` and
 `boundObjectRef` (Pod name + uid); TokenReview returns `authentication.kubernetes.io/pod-name`/`pod-uid`/
 `node-name` in `status.user.extra`. The kubelet's `Authorization` header on :10250 is the caller's own credential
 (auth_mw), so the workload's token comes in `X-Storm-Workload-Token`.
-1. [ ] Tokens: kube-api-access asks `expirationSeconds: 3607` + `boundObjectRef` (the Pod); a projected
+1. [x] Tokens (d25f05c): kube-api-access asks `expirationSeconds: 3607` + `boundObjectRef` (the Pod); a projected
        `serviceAccountToken` passes its own `expirationSeconds` (default 3600) + the Pod. Each file recorded;
        a refresher rewrites it (tmp + rename) at 80% of its life (`status.expirationTimestamp`); dropped with the pod.
-2. [ ] `/vmInstance/{address}` from a node address with `X-Storm-Workload-Token`: TokenReview; the pod in
+2. [x] (0cdc142) `/vmInstance/{address}` from a node address with `X-Storm-Workload-Token`: TokenReview; the pod in
        `status.user.extra` must be on this node (node-name), and its object (GET) must match uid, nodeName,
        not terminating, not terminal; the answer is that pod's metadata (`storm.io/kind: Pod`). Anything else:
        today's refusal (404).
-3. [ ] Tests, docs (api.md, README, status.md), CHANGELOG, sc-build, golden; stormimds#12 note (forward the
-       header), close.
+3. [x] Tests (5 new), docs (c79e92c), CHANGELOG. sc-build `cargo build --locked && cargo test --locked`: 336
+       kubelet unit pass. Golden, stormimds#12 note, close.
 
 ### Waiting on the owner: #40, live migration of stormvm-started VMIs
 
