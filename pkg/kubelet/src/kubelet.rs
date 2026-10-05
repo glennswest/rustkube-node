@@ -780,9 +780,14 @@ impl Kubelet {
         url.query_pairs_mut().append_pair("fieldSelector",&format!("spec.nodeName={}",self.config.node_name));
         self.watches.observe(&self.api_client,url.to_string());
         let list = apimachinery::reactor::check(apimachinery::reflector::list(&self.api_client,url.as_str()).await)?;
+        // A VMI's launcher Pod (rustkube#203) is the VM manager's, never run
+        // as a pod: its VMI is woken when it appears, and a terminating one
+        // is let go once no machine of its VMI runs here (#88).
+        self.adopt_launchers(list["items"].as_array().map(|a| a.as_slice()).unwrap_or(&[])).await;
         let want: Vec<_> = list["items"].as_array().unwrap().iter().filter(|p|
             p["spec"]["nodeName"].as_str()==Some(&self.config.node_name)
             && p["metadata"]["annotations"]["kubernetes.io/config.source"].as_str()!=Some("stormpump")
+            && !crate::vm_network::is_launcher(p)
             && !p["metadata"]["uid"].as_str().unwrap_or("").starts_with("static-"))
             .cloned().collect();
         self.pod_manager.cache_specs(&want).await;
@@ -795,6 +800,35 @@ impl Kubelet {
         // Dependency collection changes wake only affected claim users.
         self.refresh_claim_dependencies().await;
         Ok(())
+    }
+
+    /// This node's launcher Pods (#88, rustkube#203).
+    async fn adopt_launchers(&self, pods: &[Value]) {
+        for p in pods.iter().filter(|p| p["spec"]["nodeName"].as_str() == Some(&self.config.node_name)) {
+            let Some(vmi) = crate::vm_network::launcher_of(p) else { continue };
+            if p["metadata"]["deletionTimestamp"].is_null() {
+                // A pod-network VMI waits for this Pod: start it now.
+                self.workloads.wake_where(Kind::VirtualMachine, |k| k.uid == vmi);
+                continue;
+            }
+            if let Some(vms) = &self.vms {
+                if vms.runs(vmi).await {
+                    continue; // the machine goes with its VMI; the Pod waits for that
+                }
+            }
+            let (ns, name) = (p["metadata"]["namespace"].as_str().unwrap_or(""), p["metadata"]["name"].as_str().unwrap_or(""));
+            let body = serde_json::json!({"apiVersion":"v1","kind":"DeleteOptions","gracePeriodSeconds":0,
+                "preconditions":{"uid":p["metadata"]["uid"]}});
+            match self.api_client.delete(format!("{}/api/v1/namespaces/{ns}/pods/{name}", self.config.api_server_url))
+                .json(&body).send().await
+            {
+                Ok(r) if r.status().is_success() || matches!(r.status().as_u16(), 404 | 409) => {
+                    info!(pod = %name, namespace = %ns, "launcher Pod let go: no machine of its VMI runs here")
+                }
+                Ok(r) => debug!(pod = %name, "launcher Pod deletion not confirmed: {}", r.status()),
+                Err(e) => debug!(pod = %name, "launcher Pod deletion not confirmed: {e}"),
+            }
+        }
     }
 
     async fn seed_names(&self) -> anyhow::Result<()> {

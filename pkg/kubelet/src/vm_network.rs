@@ -97,6 +97,13 @@ pub struct PodNet {
     /// What the CNI allocated; empty until ADD succeeded.
     pub ip: String,
     pub leases: Vec<LeaseRecord>,
+    /// The VMI's launcher Pod (rustkube#203), whose identity the CNI was
+    /// given and whose status this kubelet writes. Empty on a node with no
+    /// apiserver, where the VMI's own identity is used.
+    #[serde(default)]
+    pub pod_name: String,
+    #[serde(default)]
+    pub pod_uid: String,
 }
 
 impl PodNet {
@@ -106,8 +113,15 @@ impl PodNet {
         format!("vm-{}", self.uid)
     }
 
+    /// The CNI's view: the launcher Pod's name and uid when there is one, so
+    /// Cilium labels the endpoint from that Pod (the VMI's labels).
     pub fn cni_pod(&self) -> cni::PodNetwork {
-        cni::PodNetwork::new(&self.cni_id(), &self.netns, &self.namespace, &self.name, &self.uid)
+        let (name, uid) = if self.pod_name.is_empty() {
+            (self.name.as_str(), self.uid.as_str())
+        } else {
+            (self.pod_name.as_str(), self.pod_uid.as_str())
+        };
+        cni::PodNetwork::new(&self.cni_id(), &self.netns, &self.namespace, name, uid)
     }
 }
 
@@ -122,6 +136,69 @@ pub fn cluster_first(namespace: &str, servers: &[String], domain: &str) -> (Vec<
         vec![format!("{namespace}.svc.{domain}"), format!("svc.{domain}"), domain.to_string()]
     };
     (dns, search)
+}
+
+/// The label every launcher Pod carries (KubeVirt's), and its value.
+pub const LAUNCHER_LABEL: &str = "kubevirt.io";
+pub const LAUNCHER: &str = "virt-launcher";
+/// The label naming the VMI (by uid) a launcher Pod is for.
+pub const CREATED_BY: &str = "kubevirt.io/created-by";
+
+/// Is this Pod a VMI's launcher (rustkube#203)? Not the pod manager's to run:
+/// the VM manager adopts it.
+pub fn is_launcher(pod: &serde_json::Value) -> bool {
+    pod["metadata"]["labels"][LAUNCHER_LABEL].as_str() == Some(LAUNCHER)
+}
+
+/// The VMI uid a launcher Pod is for.
+pub fn launcher_of(pod: &serde_json::Value) -> Option<&str> {
+    is_launcher(pod).then(|| pod["metadata"]["labels"][CREATED_BY].as_str()).flatten().filter(|u| !u.is_empty())
+}
+
+/// The live launcher Pod for VMI `uid` among `pods`: one created by it and
+/// owned by it, not being deleted.
+pub fn launcher_for<'a>(pods: &'a [serde_json::Value], uid: &str) -> Option<&'a serde_json::Value> {
+    pods.iter().find(|p| {
+        launcher_of(p) == Some(uid)
+            && p["metadata"]["deletionTimestamp"].is_null()
+            && p["metadata"]["ownerReferences"]
+                .as_array()
+                .is_some_and(|o| o.iter().any(|r| r["uid"].as_str() == Some(uid)))
+    })
+}
+
+/// The launcher Pod's status for a machine: `Running` with the pod IP and
+/// Ready while it runs; `Succeeded`/`Failed` and not Ready once it ended.
+/// Merged over what the Pod has, so fields others own are kept.
+pub fn launcher_status(existing: &serde_json::Value, ip: &str, phase: &str, now: &str) -> serde_json::Value {
+    let running = phase == "Running";
+    let ready = if running { "True" } else { "False" };
+    let cond = |t: &str, s: &str| {
+        let since = existing["conditions"]
+            .as_array()
+            .and_then(|c| c.iter().find(|c| c["type"] == t && c["status"] == s))
+            .and_then(|c| c["lastTransitionTime"].as_str())
+            .unwrap_or(now)
+            .to_string();
+        serde_json::json!({ "type": t, "status": s, "lastTransitionTime": since })
+    };
+    let mut st = existing.as_object().cloned().unwrap_or_default();
+    st.insert("phase".into(), serde_json::json!(phase));
+    st.insert(
+        "conditions".into(),
+        serde_json::json!([
+            cond("PodScheduled", "True"),
+            cond("Initialized", "True"),
+            cond("ContainersReady", ready),
+            cond("Ready", ready),
+        ]),
+    );
+    if !ip.is_empty() {
+        st.insert("podIP".into(), serde_json::json!(ip));
+        st.insert("podIPs".into(), serde_json::json!([{ "ip": ip }]));
+    }
+    st.entry("startTime").or_insert_with(|| serde_json::json!(now));
+    serde_json::Value::Object(st)
 }
 
 /// The pod-network NICs of a plan: the ones that need a sandbox.
@@ -202,6 +279,8 @@ mod tests {
             sandbox: 42,
             netns: "/proc/77/ns/net".into(),
             ip: "10.0.1.5".into(),
+            pod_name: String::new(),
+            pod_uid: String::new(),
             leases: vec![LeaseRecord {
                 nic: 0,
                 mac: "0a:58:0a:00:01:05".into(),
@@ -231,6 +310,56 @@ mod tests {
         assert!(store.load_all().is_empty());
         // A missing directory is no records, not an error.
         assert!(Store::at(dir.path().join("none")).load_all().is_empty());
+    }
+
+    fn launcher(uid: &str, owner: &str) -> serde_json::Value {
+        serde_json::json!({ "metadata": {
+            "name": "virt-launcher-web-1-abcde", "namespace": "default", "uid": "p-1",
+            "labels": { "kubevirt.io": "virt-launcher", "kubevirt.io/created-by": uid, "app": "web" },
+            "ownerReferences": [{ "kind": "VirtualMachineInstance", "uid": owner, "controller": true }] } })
+    }
+
+    #[test]
+    fn the_launcher_pod_is_found_by_its_vmi_and_owner() {
+        let pods = vec![launcher("u-2", "u-2"), launcher("u-1", "u-1")];
+        assert_eq!(launcher_for(&pods, "u-1").unwrap()["metadata"]["uid"], "p-1");
+        assert!(launcher_for(&[launcher("u-1", "other")], "u-1").is_none(), "owned by another");
+        let mut going = launcher("u-1", "u-1");
+        going["metadata"]["deletionTimestamp"] = serde_json::json!("2026-10-05T00:00:00Z");
+        assert!(launcher_for(&[going.clone()], "u-1").is_none());
+        assert_eq!(launcher_of(&going), Some("u-1"));
+        assert!(!is_launcher(&serde_json::json!({ "metadata": { "labels": { "app": "x" } } })));
+    }
+
+    #[test]
+    fn the_cni_names_the_launcher_pod_when_there_is_one() {
+        let mut r = record();
+        r.pod_name = "virt-launcher-web-1-abcde".into();
+        r.pod_uid = "p-1".into();
+        let pod = r.cni_pod();
+        assert_eq!((pod.pod_name.as_str(), pod.pod_uid.as_str()), ("virt-launcher-web-1-abcde", "p-1"));
+        assert_eq!(pod.container_id, "vm-u-1", "the sandbox is still the VMI's");
+        // An old record (no launcher fields) still parses.
+        let old: PodNet = serde_json::from_str(r#"{"uid":"u","namespace":"n","name":"v","sandbox":1,"netns":"/x","ip":"","leases":[]}"#).unwrap();
+        assert_eq!(old.cni_pod().pod_name, "v");
+    }
+
+    #[test]
+    fn the_launcher_status_says_running_with_the_pod_ip_then_ended() {
+        let now = "2026-10-05T20:00:00Z";
+        let st = launcher_status(&serde_json::json!({ "qosClass": "Burstable" }), "10.0.1.5", "Running", now);
+        assert_eq!(st["phase"], "Running");
+        assert_eq!(st["podIP"], "10.0.1.5");
+        assert_eq!(st["podIPs"][0]["ip"], "10.0.1.5");
+        assert_eq!(st["qosClass"], "Burstable", "others' fields kept");
+        let ready = st["conditions"].as_array().unwrap().iter().find(|c| c["type"] == "Ready").unwrap();
+        assert_eq!(ready["status"], "True");
+        let later = launcher_status(&st, "10.0.1.5", "Running", "2026-10-05T21:00:00Z");
+        assert_eq!(later, st, "an unchanged status is the same object (no write)");
+        let ended = launcher_status(&st, "", "Failed", "2026-10-05T21:00:00Z");
+        assert_eq!(ended["phase"], "Failed");
+        let ready = ended["conditions"].as_array().unwrap().iter().find(|c| c["type"] == "Ready").unwrap();
+        assert_eq!((ready["status"].as_str(), ready["lastTransitionTime"].as_str()), (Some("False"), Some("2026-10-05T21:00:00Z")));
     }
 
     #[test]

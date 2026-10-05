@@ -1796,6 +1796,7 @@ impl VmManager {
             }
             self.pod_nets.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), net);
         }
+        let on_pod_network = self.pod_nets.lock().unwrap_or_else(|e| e.into_inner()).contains_key(uid);
         if !responders.is_empty() {
             self.responders.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), responders);
         }
@@ -1836,6 +1837,9 @@ impl VmManager {
             self.snoopers.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), snoopers);
         }
         self.patch_status(&rec).await;
+        if on_pod_network {
+            self.report_launcher(uid, "Running").await;
+        }
         Ok(())
     }
 
@@ -2092,6 +2096,8 @@ impl VmManager {
                 self.event_of(&done, "Warning", "Failed", &done.message).await;
             }
             self.drop_snoopers(&done.uid);
+            // Its launcher Pod says how it ended (rustkube#203).
+            self.report_launcher(&done.uid, if code == 0 { "Succeeded" } else { "Failed" }).await;
             // An ended machine gives its pod address back now rather than
             // when its object goes (#88, as #137 for pods). A failure is
             // retried by the teardown.
@@ -2518,6 +2524,53 @@ impl VmManager {
         crate::vm_network::cluster_first(namespace, &servers, &domain)
     }
 
+    /// The VMI's launcher Pod (rustkube#203), if the VM controller has made it.
+    async fn launcher_pod(&self, namespace: &str, uid: &str) -> Result<Option<Value>, String> {
+        let url = format!(
+            "{}/api/v1/namespaces/{namespace}/pods?labelSelector={}%3D{uid}",
+            self.api_url,
+            crate::vm_network::CREATED_BY.replace('/', "%2F")
+        );
+        let r = self.api.get(&url).send().await.map_err(|e| format!("listing pods: {e}"))?;
+        if !r.status().is_success() {
+            return Err(format!("listing pods: {}", r.status()));
+        }
+        let list: Value = r.json().await.map_err(|e| format!("listing pods: {e}"))?;
+        let pods = list["items"].as_array().cloned().unwrap_or_default();
+        Ok(crate::vm_network::launcher_for(&pods, uid).cloned())
+    }
+
+    /// Write the machine's state onto its launcher Pod (rustkube#203):
+    /// `Running` with the pod IP and Ready, or how it ended. Nothing written
+    /// when it already says so. Best effort: the next change writes again.
+    async fn report_launcher(&self, uid: &str, phase: &str) {
+        let Some(net) = self.pod_nets.lock().unwrap_or_else(|e| e.into_inner()).get(uid).cloned() else { return };
+        if net.pod_name.is_empty() || self.api_url.is_empty() {
+            return;
+        }
+        let path = format!("{}/api/v1/namespaces/{}/pods/{}", self.api_url, net.namespace, net.pod_name);
+        let Ok(r) = self.api.get(&path).send().await else { return };
+        let Ok(mut pod) = r.json::<Value>().await else { return };
+        if pod["metadata"]["uid"].as_str() != Some(net.pod_uid.as_str()) {
+            return; // another Pod of the name: not this machine's
+        }
+        let status = crate::vm_network::launcher_status(&pod["status"], &net.ip, phase, &now_rfc3339());
+        if status == pod["status"] {
+            return;
+        }
+        pod["status"] = status;
+        match self.api.put(format!("{path}/status")).json(&pod).send().await {
+            Ok(r) if r.status().is_success() => info!(pod = %net.pod_name, %phase, ip = %net.ip, "launcher Pod status written"),
+            Ok(r) => warn!(pod = %net.pod_name, "launcher Pod status not written: {}", r.status()),
+            Err(e) => warn!(pod = %net.pod_name, "launcher Pod status not written: {e}"),
+        }
+    }
+
+    /// Does a machine of VMI `uid` run here (not ended)?
+    pub async fn runs(&self, uid: &str) -> bool {
+        self.vms.lock().await.get(uid).is_some_and(|v| !v.phase.terminal())
+    }
+
     /// The VMI's sandbox on the pod network (#88), when any NIC is on it:
     /// a namespace from the engine and a CNI ADD into it, recorded first.
     ///
@@ -2542,6 +2595,28 @@ impl VmManager {
         if let Err(e) = invoker.network_ready() {
             return Err(StartFail::Waiting(format!("waiting for the pod network: no CNI configured yet ({e})")));
         }
+        // The VMI's launcher Pod (owner's choice B on #88, rustkube#203): the
+        // CNI is given its identity, so Cilium labels the endpoint from it,
+        // and Services select it. Created by the VM controller; the machine
+        // waits for it. A node with no apiserver uses the VMI's own identity.
+        let (pod_name, pod_uid) = if self.api_url.is_empty() {
+            (String::new(), String::new())
+        } else {
+            match self.launcher_pod(namespace, uid).await {
+                Ok(Some(p)) => (
+                    p["metadata"]["name"].as_str().unwrap_or("").to_string(),
+                    p["metadata"]["uid"].as_str().unwrap_or("").to_string(),
+                ),
+                Ok(None) => {
+                    return Err(StartFail::Waiting(
+                        "waiting for the VMI's launcher Pod (made by the VM controller, rustkube#203): a VM on \
+                         the pod network is that Pod to Cilium and to Services"
+                            .into(),
+                    ))
+                }
+                Err(e) => return Err(StartFail::Waiting(format!("waiting for the VMI's launcher Pod: {e}"))),
+            }
+        };
         let Some(r) = self.ring.clone() else {
             return Err(StartFail::Failed("no ring to stormpump: only the engine gives a VM a sandbox".into()));
         };
@@ -2557,6 +2632,8 @@ impl VmManager {
             netns: format!("/proc/{pid}/ns/net"),
             ip: String::new(),
             leases: vec![],
+            pod_name,
+            pod_uid,
         };
         // Recorded before the CNI is asked: a start interrupted here is still
         // found and undone.
@@ -3881,6 +3958,8 @@ mod tests {
             netns: "/proc/1/ns/net".into(),
             ip: "10.0.1.9".into(),
             leases: vec![],
+            pod_name: String::new(),
+            pod_uid: String::new(),
         };
         store.save(&net).unwrap();
         // No CNI and no ring here: the release is the record's removal.
