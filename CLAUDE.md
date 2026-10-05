@@ -57,7 +57,7 @@ not the release path.
 
 ## Work plan
 
-### In progress: #67 (P1), PVC ladder to PiB, raw block volumes, per-class filesystem
+### Done from this side: #67 (P1), PVC ladder to PiB, raw block volumes, per-class filesystem
 
 2026-10-05. Owner (#67, 09-25): large classes stay **ext4** unless stormcos#91 says otherwise; Block for single
 objects past 16 TiB. stormcos#91's table: nothing forces XFS. Found:
@@ -69,17 +69,18 @@ objects past 16 TiB. stormcos#91's table: nothing forces XFS. Found:
   `volumeDevices[].devicePath` with no stormpump change (`fstype: None`, source = the device).
 - rustkube's provisioner (`stormblock.rs`) writes the PV without `volumeMode` (admission → Filesystem), so a
   Block claim's control-plane PV mismatches: rustkube issue.
-1. [ ] storage.rs: classes carry their filesystem; 4T, 16T ext4; 64T, 256T, 1P block-only until stormblock
-       formats them (the reason names mkfs.ext4.rs#10/#9). `template_name(class)` from the class's fs.
-       Mint with `<MiB>M`.
-2. [ ] Block claims: `volumeMode: Block` → a raw stormblock volume (`POST /api/v1/volumes`, role data) of the
-       class size, or a clone of its dataSource; attached as for a filesystem claim. Pod: `volumeDevices` bind
-       the device at `devicePath`; a Block claim in `volumeMounts` or a Filesystem claim in `volumeDevices` is a
-       wait with the reason. VM claim disks take Block claims as they are. PV `volumeMode` follows the claim.
-3. [ ] Tests (ladder, block provisioning against fake stormblock, container mounts), `test/` medium cases for
-       4T/16T and a Block claim; docs (README, status.md, node-volumes/configuration), CHANGELOG.
-4. [ ] File: rustkube (provisioner volumeMode), stormblock (bump mkfs-ext4 once #9/#10 are tagged).
-       sc-build, stage golden, close (64T+ filesystem classes stay with those issues).
+1. [x] storage.rs: `SIZE_CLASSES` (name, bytes, `ClassFs`); 4T, 16T ext4; 64T, 256T, 1P `BlockOnly` (reason
+       names mkfs.ext4.rs#10/#9 and volumeMode: Block). Mint `fs` from the class, `size: <MiB>M`. d917f26.
+2. [x] Block claims: raw volume (`POST /api/v1/volumes`, role data, class size), `ResolvedVolume.block`,
+       `volumeDevices` bound at devicePath, `volume_mode_misuse` wait, PV `volumeMode` from the claim, `Pi`
+       quantities. Third-party CSI Block was already refused (csi_volumes.rs).
+3. [x] Tests: 9 new unit (ladder, fs per class, MiB sizes, raw volume end to end against one fake
+       apiserver+stormblock, 20Ti filesystem refused, mode misuse, device mounts, Block PV, Pi). `test/` medium:
+       4Ti/16Ti, Block 1Mi/20Ti/1Pi via volumeDevices, 20Ti filesystem refused, above-ladder 2Pi (312e9ff).
+       Docs README, csi.md, status.md, CHANGELOG (04a6fdc).
+4. [x] Filed rustkube#201 (provisioner volumeMode), stormblock#289 (carry mkfs.ext4.rs#9/#10).
+5. [ ] sc-build HEAD, stage golden, close. Not run on a node: the medium Job waits on the test pipeline (#64)
+       and emulated large drives (stormcos#92).
 
 ### Done: #119 (P3), metadata at scale (stormcos#54)
 
