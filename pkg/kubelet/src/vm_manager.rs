@@ -478,8 +478,6 @@ async fn guest_addresses(vm: &Vm) -> Option<Vec<Vec<String>>> {
     )
 }
 
-}
-
 /// Why a machine did not start, and whether asking again would help.
 ///
 /// The distinction the kubelet did not have: a spec that cannot work and a
