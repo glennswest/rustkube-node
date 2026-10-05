@@ -57,24 +57,23 @@ not the release path.
 
 ## Work plan
 
-### In progress: #62, slab capacity: publish, refuse, alert (#108 decided)
+### Done: #62, slab capacity: publish, refuse, alert (#108 decided)
 
 2026-10-05. Owner (#108): a claim's full class size counts at bind, overcommit ratio 1.0, clones keep the class
 size. Engine: `/api/v1/slabs` items `role`, `total_bytes`, `free_bytes`; volumes `role`, `sealed`,
 `virtual_size_bytes`. rustkube's scheduler (`capacity_fits`) reads `maximumVolumeSize` (else `capacity`) of a
 CSIStorageCapacity matching the class and node topology, against the raw request.
-1. [ ] `capacity.rs`: data slabs' total/free; committed = virtual size of writable data-role volumes (not
-       sealed, not goldens, not class blanks, not standbys); available = min(total×ratio − committed, free) −
-       reserve; `maximumVolumeSize` = the largest class ≤ available. Flags `--storage-overcommit` (1.0),
-       `--storage-reserve-percent` (5), `--storage-alert-percent` (85).
-2. [ ] Publish CSIStorageCapacity `kube-system/stormblock-<node>` (class stormblock, hostname topology) on
-       engine volume changes and every 60 s (writes change free space with no volume event).
-3. [ ] Refuse at provision: a new claim volume whose class does not fit waits (FailedMount, reason with the
-       numbers); check + create under one lock. No slab answer (older engine) = no check, logged.
-4. [ ] Alert: gauges `kubelet_stormblock_data_bytes{kind}`; past the alert percent, one Warning `SlabFilling`
-       Event per crossing on each of this node's stormblock PVs.
-5. [ ] Tests, docs (README PVC section, configuration.md, metrics.md, status.md), CHANGELOG; `test/` medium
-       `pvc-overcommit-refused` enabled; file stormcos#151 follow-up note; sc-build; close.
+1. [x] `capacity.rs`: `Capacity::of` (data slabs; committed = writable data volumes' virtual size, not
+       sealed/goldens/class blanks/standbys), available = min(total×ratio − committed, free) − reserve,
+       `largest_class`, `refusal`. Flags `--storage-overcommit` 1.0, `--storage-reserve-percent` 5,
+       `--storage-alert-percent` 85 (`KubeletConfig.storage`).
+2. [x] `capacity_loop`: CSIStorageCapacity `kube-system/stormblock-<node>` on engine volume changes + 60 s.
+3. [x] Refusal in `provision_claim_volume` for a new volume, under `capacity_lock`; no slab API = unchecked.
+4. [x] Gauges `kubelet_stormblock_data_bytes{kind}`, `_used_percent`; `SlabFilling` per crossing on PVs.
+5. [x] Tests (5 new), docs, CHANGELOG (700483a, 1c5db42). sc-build 700483a `cargo build --locked && cargo
+       test --locked`: 322 kubelet unit pass; `cd test && cargo test --locked && cargo build --release
+       --locked` at 1c5db42: 17 pass. Medium `pvc-overcommit-refused` enabled. Not run on a node.
+       stormcos#151 (storageCapacity: true) flips once every node runs this release.
 
 ### Waiting on the owner: #88 (P1), a VMI on the pod network gets its own sandbox (stormvm#16)
 
