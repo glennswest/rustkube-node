@@ -286,7 +286,7 @@ pub fn volume_name(namespace: &str, claim: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimSource {
     /// Another claim: its namespace when `dataSourceRef` names one (the
-    /// cross-namespace form, e.g. cloning `kube-system/fastetcd-data`), and
+    /// cross-namespace form, e.g. cloning `kube-system/fastetcd-data-<node>`), and
     /// its name.
     Claim(Option<String>, String),
     /// A golden, by name (`apiGroup: storm.io, kind: Golden`).

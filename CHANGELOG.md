@@ -2,6 +2,12 @@
 
 ## 2026-10-05
 
+- **fix:** Every node's service volumes are represented (#59, owner's naming on #107): the PVC is
+  `kube-system/<volume>-<node>` and the PV `storm-<volume>-<node>`. Before, the names were the same on
+  every node, so only the first node to write them had objects and the others logged a warning. No
+  migration: a pair under the old unqualified names is left as it is; the mirror now decides a volume
+  "went away" by the volume a claim names (`storm.io/volume`), not by the claim's name, so it does not
+  delete those old claims either.
 - **feat:** The PVC ladder reaches 1 PiB (#67): classes 4Ti, 16Ti, 64Ti, 256Ti and 1Pi after 1Ti (x4
   steps, still the quota). Each class names its filesystem; all are ext4 (owner, #67; stormcos#91).
   64Ti, 256Ti and 1Pi are raw block only until stormblock carries a formatter that can lay them down

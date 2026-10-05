@@ -8,13 +8,22 @@
 //! Kubernetes claim is: **a PV and its bound PVC, always together**.
 //!
 //! - namespace `kube-system`, beside the service's own mirrored pod
-//!   (`mirror.rs`): `kube-system/fastetcd-data` next to `kube-system/fastetcd-<node>`
-//! - a `PersistentVolume` named `storm-<volume>`, class `stormblock`, the
+//!   (`mirror.rs`): `kube-system/fastetcd-data-<node>` next to
+//!   `kube-system/fastetcd-<node>`
+//! - a `PersistentVolume` named `storm-<volume>-<node>`, class `stormblock`, the
 //!   stormblock volume as its CSI handle with its filesystem and golden, pinned
 //!   to this node, reclaim **Retain**: deleting the object must never delete a
 //!   service's data
-//! - a `PersistentVolumeClaim` named `<volume>`, bound to it, with the golden it
-//!   was cloned from as its `dataSourceRef`
+//! - a `PersistentVolumeClaim` named `<volume>-<node>`, bound to it, with the
+//!   golden it was cloned from as its `dataSourceRef`
+//!
+//! **Node-qualified names** (owner, #107): every node has a `fastetcd-data`, and
+//! a claim or PV name exists once per cluster, so unqualified names represented
+//! only the first node to write them. A service volume is one node's (no
+//! cross-node RAID for system services), so the node in the name is the whole
+//! identity. No migration: objects written under the old unqualified names are
+//! left as they are; the mirror lets go of a claim only when the volume its
+//! `storm.io/volume` names is gone from the node.
 //! - on both, `storm.io/volume-kind` (`data`, `state` or `logs`) and
 //!   `storm.io/component` (`fastetcd`), so `kubectl get pvc -l
 //!   storm.io/volume-kind=logs` lists the log volumes
@@ -99,9 +108,15 @@ pub fn quantity(bytes: u64) -> String {
     bytes.to_string()
 }
 
-/// The PV name for a node volume.
-pub fn pv_name(volume: &str) -> String {
-    format!("storm-{volume}")
+/// The PV name for a node volume on `node`: `storm-<volume>-<node>` (#107).
+pub fn pv_name(volume: &str, node: &str) -> String {
+    format!("storm-{volume}-{node}")
+}
+
+/// The claim name for a node volume on `node`: `<volume>-<node>` (#107), in
+/// [`NAMESPACE`].
+pub fn claim_name(volume: &str, node: &str) -> String {
+    format!("{volume}-{node}")
 }
 
 /// What the engine says about one volume, as the objects need it.
@@ -254,15 +269,15 @@ pub fn objects(f: &VolumeFacts, kind: &str, component: &str, node: &str) -> (Val
         "apiVersion": "v1",
         "kind": "PersistentVolumeClaim",
         "namespace": NAMESPACE,
-        "name": f.name,
+        "name": claim_name(&f.name, node),
     });
-    let mut pv = stormblock_pv(f, &pv_name(&f.name), node, claim_ref, "Retain");
+    let mut pv = stormblock_pv(f, &pv_name(&f.name, node), node, claim_ref, "Retain");
     pv["metadata"]["labels"] = labels.clone();
     let mut pvc = json!({
         "apiVersion": "v1",
         "kind": "PersistentVolumeClaim",
         "metadata": {
-            "name": f.name,
+            "name": claim_name(&f.name, node),
             "namespace": NAMESPACE,
             "labels": labels,
         },
@@ -276,7 +291,7 @@ pub fn objects(f: &VolumeFacts, kind: &str, component: &str, node: &str) -> (Val
     if let Some(g) = &f.golden {
         pvc["spec"]["dataSourceRef"] = json!({ "apiGroup": "storm.io", "kind": "Golden", "name": g });
     }
-    bind_pvc(&mut pvc, &pv_name(&f.name), node, &f.name);
+    bind_pvc(&mut pvc, &pv_name(&f.name, node), node, &f.name);
     (pv, pvc)
 }
 
@@ -459,13 +474,14 @@ pub async fn mirror(
 
     for (f, kind, component) in &mirrored {
         let (want_pv, want_pvc) = objects(f, kind, component, node);
-        let pvname = pv_name(&f.name);
+        let pvname = pv_name(&f.name, node);
+        let cname = claim_name(&f.name, node);
 
         // The claim first: the volume's claimRef names the claim's uid, which
         // exists only once the claim does.
-        let claim = match pvcs.get(&f.name) {
+        let claim = match pvcs.get(&cname) {
             Some(c) if !is_ours(c, node) => {
-                debug!("PVC {NAMESPACE}/{} belongs to another node or tool; left alone", f.name);
+                debug!("PVC {NAMESPACE}/{cname} belongs to another node or tool; left alone");
                 continue;
             }
             Some(c) if !c["metadata"]["deletionTimestamp"].is_null() => {
@@ -475,9 +491,9 @@ pub async fn mirror(
             }
             Some(c) => match reconcile_pvc(c, &want_pvc) {
                 Some(updated) => {
-                    let got = replace(client, &format!("{pvc_base}/{}", f.name), &updated).await;
+                    let got = replace(client, &format!("{pvc_base}/{cname}"), &updated).await;
                     if got.is_some() {
-                        info!("PVC {NAMESPACE}/{} brought up to date", f.name);
+                        info!("PVC {NAMESPACE}/{cname} brought up to date");
                     }
                     got.or_else(|| Some(c.clone()))
                 }
@@ -486,7 +502,7 @@ pub async fn mirror(
             None => {
                 let made = create(client, &pvc_base, &want_pvc).await;
                 if let Some(mut made) = made.clone() {
-                    info!("listed {kind} volume {} as PVC {NAMESPACE}/{}", f.name, f.name);
+                    info!("listed {kind} volume {} as PVC {NAMESPACE}/{cname}", f.name);
                     // Bound from the first moment it is visible: a claim with
                     // no status reads as Unknown until the binder's next pass.
                     made["status"] = json!({
@@ -494,7 +510,7 @@ pub async fn mirror(
                         "accessModes": ["ReadWriteOnce"],
                         "capacity": want_pvc["spec"]["resources"]["requests"].clone(),
                     });
-                    let _ = replace(client, &format!("{pvc_base}/{}", f.name), &made).await;
+                    let _ = replace(client, &format!("{pvc_base}/{cname}"), &made).await;
                 }
                 made
             }
@@ -503,8 +519,7 @@ pub async fn mirror(
         match pvs.get(&pvname) {
             Some(pv) if !is_ours(pv, node) => {
                 warn!(
-                    "PV {pvname} is another node's ({}); this node's {} has no volume object \
-                     (names collide across nodes)",
+                    "PV {pvname} is not this node's ({}); this node's {} has no volume object",
                     pv["metadata"]["annotations"]["storm.io/node"].as_str().unwrap_or("?"),
                     f.name
                 );
@@ -534,14 +549,20 @@ pub async fn mirror(
     // of where the data was, for an administrator. Only on a listing that
     // named at least one of this node's volumes (above), so an engine that
     // answers with nothing yet does not let go of every claim at once.
+    //
+    // By the volume a claim names (`storm.io/volume`), not by its name: a
+    // claim written under the old unqualified name (`fastetcd-data`, before
+    // #107) still names a volume that is here, and is left as it is rather
+    // than read as vanished (no migration, owner).
     let present: std::collections::HashSet<&str> = mirrored.iter().map(|(f, _, _)| f.name.as_str()).collect();
     for (name, c) in &pvcs {
-        if !is_ours(c, node) || !c["metadata"]["deletionTimestamp"].is_null() || present.contains(name.as_str()) {
+        let volume = c["metadata"]["annotations"]["storm.io/volume"].as_str().unwrap_or(name);
+        if !is_ours(c, node) || !c["metadata"]["deletionTimestamp"].is_null() || present.contains(volume) {
             continue;
         }
         match client.delete(format!("{pvc_base}/{name}")).send().await {
             Ok(r) if r.status().is_success() => {
-                info!("volume {name} is gone from this node: claim {NAMESPACE}/{name} deleted, its PV kept")
+                info!("volume {volume} is gone from this node: claim {NAMESPACE}/{name} deleted, its PV kept")
             }
             Ok(r) => debug!("PVC {NAMESPACE}/{name} not deleted: {}", r.status()),
             Err(e) => debug!("PVC {NAMESPACE}/{name} not deleted: {e}"),
@@ -606,10 +627,12 @@ mod tests {
     fn a_node_volume_is_a_complete_bound_pair() {
         let (pv, pvc) = objects(&facts("fastetcd-logs"), "logs", "fastetcd", "node1");
         // They name each other.
-        assert_eq!(pv["metadata"]["name"], "storm-fastetcd-logs");
-        assert_eq!(pv["spec"]["claimRef"]["name"], "fastetcd-logs");
+        assert_eq!(pv["metadata"]["name"], "storm-fastetcd-logs-node1");
+        assert_eq!(pvc["metadata"]["name"], "fastetcd-logs-node1");
+        assert_eq!(pv["spec"]["claimRef"]["name"], "fastetcd-logs-node1");
         assert_eq!(pv["spec"]["claimRef"]["namespace"], NAMESPACE);
-        assert_eq!(pvc["spec"]["volumeName"], "storm-fastetcd-logs");
+        assert_eq!(pvc["spec"]["volumeName"], "storm-fastetcd-logs-node1");
+        assert_eq!(pvc["metadata"]["annotations"]["storm.io/volume"], "fastetcd-logs");
         // The same kind and component on both.
         for o in [&pv, &pvc] {
             assert_eq!(o["metadata"]["labels"][KIND_LABEL], "logs");
@@ -707,7 +730,8 @@ mod tests {
 
     /// The whole pass against a fake apiserver and engine: every volume gets
     /// exactly one PV and one PVC that name each other, a deleted claim comes
-    /// back, and another node's same-named object is left alone.
+    /// back, two nodes with the same volume each get their own pair (#107),
+    /// and an old unqualified pair is left alone.
     #[tokio::test]
     async fn every_node_volume_gets_its_pair_and_a_deleted_claim_comes_back() {
         let api = fake::Api::serve().await;
@@ -722,17 +746,34 @@ mod tests {
         .await;
         let client = reqwest::Client::new();
 
+        let claim = |v: &str, n: &str| format!("/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims/{v}-{n}");
+        let pv_at = |v: &str, n: &str| format!("/api/v1/persistentvolumes/storm-{v}-{n}");
+
+        // A pair written under the old unqualified names (before #107): left
+        // as it is, never read as a vanished volume (no migration).
+        let (mut old_pv, mut old_pvc) = objects(&facts("fastetcd-data"), "data", "fastetcd", "node1");
+        old_pvc["metadata"]["name"] = json!("fastetcd-data");
+        old_pv["metadata"]["name"] = json!("storm-fastetcd-data");
+        api.put(&format!("/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims/fastetcd-data"), old_pvc.clone());
+        api.put("/api/v1/persistentvolumes/storm-fastetcd-data", old_pv.clone());
+
         mirror(&client, &api.url, &engine, "node1").await;
         for name in ["fastetcd-data", "fastetcd-logs"] {
-            let pvc = api.get(&format!("/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims/{name}")).unwrap();
-            let pv = api.get(&format!("/api/v1/persistentvolumes/storm-{name}")).unwrap();
-            assert_eq!(pvc["spec"]["volumeName"], json!(format!("storm-{name}")));
+            let pvc = api.get(&claim(name, "node1")).unwrap();
+            let pv = api.get(&pv_at(name, "node1")).unwrap();
+            assert_eq!(pvc["spec"]["volumeName"], json!(format!("storm-{name}-node1")));
+            assert_eq!(pv["spec"]["claimRef"]["name"], json!(format!("{name}-node1")));
             assert_eq!(pv["spec"]["claimRef"]["uid"], pvc["metadata"]["uid"], "{name}");
             assert_eq!(pv["metadata"]["labels"][KIND_LABEL], pvc["metadata"]["labels"][KIND_LABEL]);
             assert_eq!(pvc["status"]["phase"], "Bound");
         }
-        assert_eq!(api.count("persistentvolumeclaims"), 2, "pvc-* is the built-in driver's");
-        assert_eq!(api.count("persistentvolumes"), 2);
+        assert_eq!(api.count("persistentvolumeclaims"), 3, "pvc-* is the built-in driver's; the old one stays");
+        assert_eq!(api.count("persistentvolumes"), 3);
+        assert_eq!(
+            api.get(&format!("/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims/fastetcd-data")),
+            Some(old_pvc),
+            "the old unqualified claim is left as it was"
+        );
 
         // A second pass changes nothing.
         let writes = api.writes();
@@ -740,16 +781,24 @@ mod tests {
         assert_eq!(api.writes(), writes, "an up-to-date pair is not rewritten");
 
         // Deleted by hand: made again, and the volume names the new claim.
-        api.delete(&format!("/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims/fastetcd-data"));
+        api.delete(&claim("fastetcd-data", "node1"));
         mirror(&client, &api.url, &engine, "node1").await;
-        let pvc = api.get(&format!("/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims/fastetcd-data")).unwrap();
-        let pv = api.get("/api/v1/persistentvolumes/storm-fastetcd-data").unwrap();
+        let pvc = api.get(&claim("fastetcd-data", "node1")).unwrap();
+        let pv = api.get(&pv_at("fastetcd-data", "node1")).unwrap();
         assert_eq!(pv["spec"]["claimRef"]["uid"], pvc["metadata"]["uid"]);
 
-        // Another node's pass leaves this node's objects as they are.
-        let writes = api.writes();
+        // Another node with the same volumes gets its own pair (#107), and
+        // leaves this node's as they are.
+        let node1 = api.get(&claim("fastetcd-data", "node1"));
         mirror(&client, &api.url, &engine, "node2").await;
-        assert_eq!(api.writes(), writes);
+        assert_eq!(api.get(&claim("fastetcd-data", "node1")), node1);
+        for name in ["fastetcd-data", "fastetcd-logs"] {
+            let pvc = api.get(&claim(name, "node2")).expect("node2's claim");
+            let pv = api.get(&pv_at(name, "node2")).expect("node2's PV");
+            assert_eq!(pv["spec"]["claimRef"]["uid"], pvc["metadata"]["uid"]);
+            assert_eq!(pvc["metadata"]["annotations"]["storm.io/node"], "node2");
+            assert_eq!(pv["spec"]["nodeAffinity"]["required"]["nodeSelectorTerms"][0]["matchExpressions"][0]["values"][0], "node2");
+        }
 
         // A volume that went away: its claim goes, its PV stays (Retain), and
         // the other volume's pair is untouched.
@@ -759,14 +808,15 @@ mod tests {
         ]}))
         .await;
         mirror(&client, &api.url, &fewer, "node1").await;
-        assert!(api.get(&format!("/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims/fastetcd-logs")).is_none());
-        assert!(api.get("/api/v1/persistentvolumes/storm-fastetcd-logs").is_some(), "the PV is never deleted");
-        assert!(api.get(&format!("/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims/fastetcd-data")).is_some());
+        assert!(api.get(&claim("fastetcd-logs", "node1")).is_none());
+        assert!(api.get(&pv_at("fastetcd-logs", "node1")).is_some(), "the PV is never deleted");
+        assert!(api.get(&claim("fastetcd-data", "node1")).is_some());
+        assert!(api.get(&claim("fastetcd-logs", "node2")).is_some(), "node2's volume is node2's business");
 
         // An engine that lists none of the node's volumes lets go of nothing.
         let empty = fake::engine(json!({"items": []})).await;
         mirror(&client, &api.url, &empty, "node1").await;
-        assert!(api.get(&format!("/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims/fastetcd-data")).is_some());
+        assert!(api.get(&claim("fastetcd-data", "node1")).is_some());
     }
 
     #[test]
@@ -827,6 +877,10 @@ mod tests {
             }
             pub fn delete(&self, path: &str) {
                 self.store.lock().unwrap().remove(path);
+            }
+            /// Store an object as though another writer had made it.
+            pub fn put(&self, path: &str, obj: Value) {
+                self.store.lock().unwrap().insert(path.to_string(), obj);
             }
             pub fn count(&self, resource: &str) -> usize {
                 self.store.lock().unwrap().keys().filter(|k| k.contains(&format!("/{resource}/"))).count()

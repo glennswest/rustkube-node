@@ -3,13 +3,18 @@
 Every service on a stormcos node keeps its state in stormblock volumes, cloned
 from goldens and mounted at boot: `<component>-data`, `<component>-state` and
 `<component>-logs`. The kubelet (`pkg/kubelet/src/system_claims.rs`) shows each
-one as a Kubernetes claim: **a PV and its bound PVC** (#49, #59), subject to
-the cross-node naming limitation below.
+one as a Kubernetes claim: **a PV and its bound PVC** (#49, #59), on every node.
 
 | Object | Name | Notes |
 |---|---|---|
-| PVC | `kube-system/<volume>` | bound (`volumeName`), `dataSourceRef` = the golden |
-| PV | `storm-<volume>` | class `stormblock`, reclaim **Retain**, pinned to the node |
+| PVC | `kube-system/<volume>-<node>` | bound (`volumeName`), `dataSourceRef` = the golden, annotation `storm.io/volume: <volume>` |
+| PV | `storm-<volume>-<node>` | class `stormblock`, reclaim **Retain**, pinned to the node |
+
+Names carry the node (owner, #107): every node has a `fastetcd-data`, and a PV
+or claim name exists once per cluster. A service volume is one node's (system
+services have no cross-node RAID), so `fastetcd-data-<node>` is its whole
+identity. To clone one into a pod's claim, name it in `dataSourceRef`
+(`namespace: kube-system`, `name: fastetcd-data-<node>`).
 
 Both carry the labels `storm.io/system-volume=true`, `storm.io/volume-kind`
 (`data`, `state` or `logs`) and `storm.io/component`:
@@ -47,22 +52,23 @@ engine without it), and whenever one of these PVs or PVCs changes, the kubelet:
   PV's `claimRef` follows a claim that was made again;
 - deletes the claim of a volume that went away, so the binder marks the PV
   `Released`. The PV is never deleted. A listing with none of the node's volumes
-  in it lets go of nothing.
+  in it lets go of nothing. "Went away" is decided by the volume a claim names
+  (`storm.io/volume`), not by the claim's name.
 
 Phases and protection finalizers are the binder's (rustkube). The kubelet only
 writes a new claim's first status, so it does not read as Unknown until then.
 
 Only objects annotated `storm.io/node: <this node>` are written. An object of
-the same name from another node is left alone.
+the same name that is not this node's is left alone.
+
+**No migration** (owner, #107). A cluster that ran an earlier kubelet still
+has the first node's pair under the old unqualified names
+(`kube-system/fastetcd-data`, `storm-fastetcd-data`). Those objects are left as
+they are, and their volume still exists, so the mirror does not delete their
+claim; the new `-<node>` pair is written beside them. Deleting the old pair by
+hand is safe: the PV is Retain, so the volume is untouched.
 
 ## Remaining limitations
-
-Names are not node-qualified yet. When two nodes both have `fastetcd-data`,
-the cluster-scoped PV and kube-system PVC can represent only the first node;
-other nodes warn and leave the objects alone. The owner has decided the
-naming (#107): `<volume>-<node>` (for example `fastetcd-data-<node>`), with no
-migration of the existing objects. Implementing it is #59. Until then this is
-not an inventory of every node volume in a multi-node cluster.
 
 Drive/shelf/bay/RAID placement joins are not published here (#60). The engine
 and stormdrive placement APIs are prerequisites, not proof that this mirror
