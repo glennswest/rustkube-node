@@ -72,6 +72,7 @@ the full LIST, and a cluster without the VMI CRD never leaves "cold".
 4. [x] Tests (5 new), docs (README, api.md, status.md), CHANGELOG (3fe7496). sc-build 3fe7496 `cargo build
        --locked && cargo test --locked`: 301 kubelet unit, 30 proxy, 25 CNI, 1 doc-test pass; exit 0 in 147 s.
        Not run on a node.
+5. [x] Stage golden golden-rustkube-node-f254f18e7c47 (ed55857), release request stormcos#164; #119 closed, shipped.
 
 ### Done: #148 (P1), pods wait for the CNI instead of retrying into backoff
 
