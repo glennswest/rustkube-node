@@ -687,7 +687,7 @@ Found, 2026-09-27:
 - Open for the owner: overcommit ratio default (class size counted at bind vs written bytes), and whether
   to size clones to the exact request.
 
-### In progress: #59 (node-qualified names), every node volume a complete, current PV + PVC set
+### Done: #59, every node volume a complete, current PV + PVC set
 
 Found, 2026-09-27: `system_claims.rs` creates once and never updates, skips `*-logs`, and leaves
 `claimRef` without uid and the binding annotations off. rustkube's binder (persistentvolume.rs) owns PV
@@ -704,10 +704,12 @@ Steps:
 3. [x] `bind_claim` (built-in driver claims) uses the same builder.
 4. [x] (b) A vanished volume: the mirror deletes its claim, the binder makes the PV Released, the PV is never
        deleted (the issue's stated outcome). Not on a listing with none of the node's volumes.
-5. [ ] **Decided (#107): `<volume>-<node>`, no migration.** Doing (2026-10-05): PVC `kube-system/<volume>-<node>`,
-       PV `storm-<volume>-<node>` (`claim_name`/`pv_name` take the node). The vanished-volume branch keys on the
-       claim's `storm.io/volume` annotation, not its name, so the old unsuffixed objects are left as they are
-       (no migration) rather than read as vanished. Tests: two nodes with the same volume both get their pair.
+5. [x] **#107: `<volume>-<node>`, no migration** (5855ff8). PVC `kube-system/<volume>-<node>`, PV
+       `storm-<volume>-<node>`; the vanished-volume branch keys on the claim's `storm.io/volume`, so old
+       unqualified pairs are left as they are. E2E test: two nodes each get their pair, an old pair untouched.
+       sc-build 5855ff8: 310 kubelet unit pass. `test/` medium `node-volumes-pairs` / `-restored` (82bc3ce;
+       sc-build `cd test && cargo test --locked && cargo build --release --locked`: 17 pass). Live run waits on
+       the release (the test machine's kubelet writes the old names) and the test pipeline (#64).
 6. [x] Tests (fake apiserver + engine end to end), docs (`docs/node-volumes.md`), CHANGELOG. sc-build at 30bb887: all pass (kubelet 185).
 
 ### In progress: #57, pod limits onto stormpump `Spec.limits`, container stats from `QUERY`
