@@ -57,6 +57,19 @@ not the release path.
 
 ## Work plan
 
+### In progress: #119 (P3), metadata at scale (stormcos#54)
+
+2026-10-05. Found: `instance_at` scans every VM and NIC under the `vms` lock and answers from the local record
+even when the cached VMI is missing or places the machine elsewhere. Per-machine reconciliation is already the
+UID executor's (`replace_source` enqueues only UIDs whose intent changed); `desired` is still replaced only by
+the full LIST, and a cluster without the VMI CRD never leaves "cold".
+1. [ ] `Machines`: `vms` keeps an address → uids index, updated on insert/remove/update (only non-terminal
+       machines); `instance_at` answers from it, and refuses an address two machines here claim.
+2. [ ] `reconcile_one` refreshes that UID's cached object (removes it when gone/terminating); CRD 404 marks synced.
+3. [ ] Answer only when the cached object exists, is not terminating, its uid matches, `status.nodeName` is this
+       node and a completed `migrationState` does not name another target node (also covers address reuse).
+4. [ ] Tests, docs (README, api.md, status.md), CHANGELOG; sc-build; close.
+
 ### Done: #148 (P1), pods wait for the CNI instead of retrying into backoff
 
 2026-10-05. Dell 11.79: cilium agent `attempts=10` over 10.5 s, coredns 16 over 27 s; CNI → all pods ~20–27 s.
