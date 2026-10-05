@@ -621,7 +621,11 @@ Steps:
        The bump had also moved stormpump (30a76d3 → e8ccef9) and stormcast; pinned back with `--precise`, because
        stormvm-node doesn't build against stormpump's `Mount.propagation` (filed stormvm#65, which also blocks #81).
 5. [ ] On the test host (the issue's done-when): a new bridged VM shows its lease in `status.interfaces[].ipAddress`
-       within seconds. Waits on C2NR0Q2 (unreachable) and a release. Then close.
+       within seconds. 2026-10-05: C2NR0Q2 is up on 11.80 (carries 3ad9ea8). stormcos_qa's `vm-waves` suite is
+       exactly this (bridged `storm.io/bridge: stormbr0` Fedora VMs, "Running with an address in
+       status.interfaces[]"); running it there. Found on the way: stormcentral builds the Job itself (no
+       `test/rustkube-node-test.yaml`, no `RUSTKUBE_NODE_TEST_IMAGE` = #97), grants cluster reads only through
+       `test/requires.toml` (none here), and `STORM_NODE` is an address: the #59/#62 medium cases need fixing.
 
 ### In progress: #87, static (mirror) pods: logs and stale status
 
