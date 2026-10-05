@@ -380,6 +380,20 @@ impl Kubelet {
         // The data slabs' room for claims, published and watched (#62).
         tokio::spawn(self.clone().capacity_loop());
 
+        // Pods' ServiceAccount tokens, written again at 80% of their life
+        // (#122): on the earliest one's deadline, at most a minute apart so
+        // a token written since is not missed.
+        {
+            let pm = self.pod_manager.clone();
+            tokio::spawn(async move {
+                loop {
+                    let next = pm.refresh_tokens().await.unwrap_or(Duration::from_secs(60));
+                    time::sleep(next.clamp(Duration::from_secs(1), Duration::from_secs(60))).await;
+                    crate::metrics::observe_timed("tokens", "deadline");
+                }
+            });
+        }
+
         // Reclaim this node's released claims (reclaimPolicy: Delete), on PV
         // events (#101).
         tokio::spawn(self.clone().reclaim_loop());

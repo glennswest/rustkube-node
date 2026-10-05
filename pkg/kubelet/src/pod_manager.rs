@@ -290,6 +290,9 @@ pub struct PodManager {
     /// Cluster CA (PEM), written into ServiceAccount `ca.crt` so in-cluster
     /// clients can verify a TLS apiserver.
     ca_pem: Option<Vec<u8>>,
+    /// Every projected ServiceAccount token this kubelet wrote, by pod uid,
+    /// to be written again at 80% of its life (#122).
+    tokens: std::sync::Mutex<HashMap<String, Vec<TokenFile>>>,
     /// Per-container restart backoff, so a container that keeps dying is not
     /// recreated on every sync tick (#25).
     backoff: crate::crashloop::CrashLoopBackoff,
@@ -420,6 +423,7 @@ impl PodManager {
             cluster_dns: vec!["10.96.0.10".to_string()],
             cluster_domain: "cluster.local".to_string(),
             ca_pem: None,
+            tokens: Default::default(),
             backoff: crate::crashloop::CrashLoopBackoff::new(),
             csi: Arc::new(crate::csi_plugins::CsiPlugins::new(node_name)),
             csi_mountinfo: "/proc/1/mountinfo".to_string(),
@@ -2118,9 +2122,11 @@ impl PodManager {
                     .as_str()
                     .unwrap_or("default");
                 let aud = sat["audience"].as_str();
-                if let Some(token) = self.request_sa_token(namespace, sa, aud).await {
-                    std::fs::write(format!("{dir}/{path}"), token)?;
-                }
+                let _ = sa;
+                // Bound to the pod, for the projection's own lifetime
+                // (upstream's default 3600 s), refreshed at 80% (#122).
+                let secs = sat["expirationSeconds"].as_i64().unwrap_or(3600).max(600);
+                self.write_bound_token(pod, dir, path, aud, secs).await?;
             } else if let Some(cm) = src.get("configMap").filter(|v| !v.is_null()) {
                 let name = cm["name"].as_str().unwrap_or("");
                 let data = self
@@ -2162,14 +2168,25 @@ impl PodManager {
         sa: &str,
         audience: Option<&str>,
     ) -> Option<String> {
+        self.request_bound_token(namespace, sa, audience, None, None).await.map(|(t, _)| t)
+    }
+
+    /// A token bound to `pod` (`kind: Pod`, name, uid) for `expiration_secs`
+    /// (#122, rustkube#182), and when it expires: what upstream's kubelet asks
+    /// for, so the apiserver can tie the token to the pod's life and a
+    /// TokenReview names the pod.
+    async fn request_bound_token(
+        &self,
+        namespace: &str,
+        sa: &str,
+        audience: Option<&str>,
+        pod: Option<(&str, &str)>,
+        expiration_secs: Option<i64>,
+    ) -> Option<(String, Option<chrono::DateTime<chrono::Utc>>)> {
         if self.api_url.is_empty() {
             return None;
         }
-        let body = serde_json::json!({
-            "apiVersion": "authentication.k8s.io/v1",
-            "kind": "TokenRequest",
-            "spec": { "audiences": audience.map(|a| vec![a]).unwrap_or_default() }
-        });
+        let body = token_request(audience, pod, expiration_secs);
         let url = format!(
             "{}/api/v1/namespaces/{namespace}/serviceaccounts/{sa}/token",
             self.api_url
@@ -2179,7 +2196,92 @@ impl PodManager {
             return None;
         }
         let v: Value = resp.json().await.ok()?;
-        v["status"]["token"].as_str().map(String::from)
+        let token = v["status"]["token"].as_str()?.to_string();
+        let expires = v["status"]["expirationTimestamp"]
+            .as_str()
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.with_timezone(&chrono::Utc));
+        Some((token, expires))
+    }
+
+    /// Write a bound token for `pod` into `<dir>/<path>` and remember it, so
+    /// the refresher writes it again at 80% of its life (#122).
+    async fn write_bound_token(
+        &self,
+        pod: &Value,
+        dir: &str,
+        path: &str,
+        audience: Option<&str>,
+        expiration_secs: i64,
+    ) -> std::io::Result<bool> {
+        let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default");
+        let name = pod["metadata"]["name"].as_str().unwrap_or("");
+        let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
+        let sa = pod["spec"]["serviceAccountName"].as_str().unwrap_or("default");
+        let bound = (!name.is_empty() && !uid.is_empty()).then_some((name, uid));
+        let Some((token, expires)) = self
+            .request_bound_token(namespace, sa, audience, bound, Some(expiration_secs))
+            .await
+        else {
+            return Ok(false);
+        };
+        write_atomic(&format!("{dir}/{path}"), token.as_bytes())?;
+        let now = chrono::Utc::now();
+        let f = TokenFile {
+            file: format!("{dir}/{path}"),
+            namespace: namespace.to_string(),
+            sa: sa.to_string(),
+            audience: audience.map(String::from),
+            pod: bound.map(|(n, u)| (n.to_string(), u.to_string())),
+            expiration_secs,
+            refresh_at: refresh_at(now, expires, expiration_secs),
+        };
+        let mut t = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
+        let list = t.entry(uid.to_string()).or_default();
+        list.retain(|x| x.file != f.file);
+        list.push(f);
+        Ok(true)
+    }
+
+    /// Write again every token past 80% of its life (#122), and forget those
+    /// of pods this kubelet no longer has. Answers when the next one is due.
+    pub async fn refresh_tokens(&self) -> Option<std::time::Duration> {
+        let known: std::collections::HashSet<String> = self.pods.read().await.keys().cloned().collect();
+        let due: Vec<TokenFile> = {
+            let mut t = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
+            t.retain(|uid, _| known.contains(uid));
+            let now = chrono::Utc::now();
+            t.values().flatten().filter(|f| f.refresh_at <= now).cloned().collect()
+        };
+        for f in due {
+            let bound = f.pod.as_ref().map(|(n, u)| (n.as_str(), u.as_str()));
+            match self
+                .request_bound_token(&f.namespace, &f.sa, f.audience.as_deref(), bound, Some(f.expiration_secs))
+                .await
+            {
+                Some((token, expires)) => {
+                    if let Err(e) = write_atomic(&f.file, token.as_bytes()) {
+                        warn!(file = %f.file, "ServiceAccount token not refreshed: {e}");
+                        continue;
+                    }
+                    let next = refresh_at(chrono::Utc::now(), expires, f.expiration_secs);
+                    let mut t = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
+                    for x in t.values_mut().flatten().filter(|x| x.file == f.file) {
+                        x.refresh_at = next;
+                    }
+                    debug!(file = %f.file, "ServiceAccount token refreshed");
+                }
+                // Tried again on the next pass; the old token is still good
+                // for the remaining fifth of its life.
+                None => warn!(file = %f.file, "ServiceAccount token refresh refused; retried"),
+            }
+        }
+        let t = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
+        let now = chrono::Utc::now();
+        t.values()
+            .flatten()
+            .map(|f| (f.refresh_at - now).to_std().unwrap_or_default())
+            .min()
     }
 
     /// Standard in-cluster apiserver-discovery env vars. Points at the
@@ -2290,19 +2392,21 @@ impl PodManager {
             .unwrap_or("default");
 
         let dir = pod_volume_dir(&self.state_root, uid, "secret", "kube-api-access");
-        let token = self.request_sa_token(namespace, sa, None).await;
+        let _ = sa;
         let written = (|| -> std::io::Result<()> {
             std::fs::create_dir_all(&dir)?;
             std::fs::write(format!("{dir}/namespace"), namespace)?;
-            if let Some(token) = &token {
-                std::fs::write(format!("{dir}/token"), token)?;
-            }
             if let Some(ca) = &self.ca_pem {
                 std::fs::write(format!("{dir}/ca.crt"), ca)?;
             }
             Ok(())
         })();
         written.map_err(|e| pod_dir_error("kube-api-access", &dir, e))?;
+        // Bound to the pod for 3607 s, as upstream's kubelet asks for
+        // kube-api-access (#122); refreshed at 80% of its life.
+        self.write_bound_token(pod, &dir, "token", None, 3607)
+            .await
+            .map_err(|e| pod_dir_error("kube-api-access", &dir, e))?;
 
         Ok(Some(Mount {
             container_path: SA_MOUNT_PATH.to_string(),
@@ -4781,6 +4885,52 @@ fn volume_mode_misuse(pod: &Value, name: &str, block: bool) -> Option<String> {
         })
 }
 
+/// One ServiceAccount token file this kubelet keeps fresh (#122).
+#[derive(Debug, Clone, PartialEq)]
+struct TokenFile {
+    file: String,
+    namespace: String,
+    sa: String,
+    audience: Option<String>,
+    /// The pod it is bound to (name, uid).
+    pod: Option<(String, String)>,
+    expiration_secs: i64,
+    refresh_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The `TokenRequest` body: audiences, and (#122) the lifetime and the pod
+/// the token is bound to.
+fn token_request(audience: Option<&str>, pod: Option<(&str, &str)>, expiration_secs: Option<i64>) -> Value {
+    let mut spec = serde_json::json!({ "audiences": audience.map(|a| vec![a]).unwrap_or_default() });
+    if let Some(secs) = expiration_secs {
+        spec["expirationSeconds"] = serde_json::json!(secs);
+    }
+    if let Some((name, uid)) = pod {
+        spec["boundObjectRef"] = serde_json::json!({ "kind": "Pod", "apiVersion": "v1", "name": name, "uid": uid });
+    }
+    serde_json::json!({ "apiVersion": "authentication.k8s.io/v1", "kind": "TokenRequest", "spec": spec })
+}
+
+/// When a token issued `now` is written again: at 80% of its life, from the
+/// apiserver's `expirationTimestamp` when it gave one (it may grant longer
+/// than asked), else from what was asked (#122).
+fn refresh_at(
+    now: chrono::DateTime<chrono::Utc>,
+    expires: Option<chrono::DateTime<chrono::Utc>>,
+    asked_secs: i64,
+) -> chrono::DateTime<chrono::Utc> {
+    let life = expires.map(|e| (e - now).num_seconds()).filter(|s| *s > 0).unwrap_or(asked_secs);
+    now + chrono::Duration::seconds(life * 4 / 5)
+}
+
+/// Write a file whole, by a rename in its directory: a container reading the
+/// token through the directory's bind sees the old one or the new one.
+fn write_atomic(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
 /// Resolve a container's `volumeMounts` (and `volumeDevices`, #67) to CRI
 /// mounts using the pod's resolved volumes. Mounts whose volume didn't
 /// resolve are dropped.
@@ -6200,6 +6350,76 @@ pub(crate) mod tests {
         let w = claim_world_with(raw_claim("200Gi", "Block"), Some(slabs), vec![]).await;
         let (dev, _) = claim_manager(&w).provision_claim("default", "raw", "uid-1").await.unwrap();
         assert_eq!(dev, "/dev/ublkb7");
+    }
+
+    #[test]
+    fn a_token_is_asked_for_bound_to_its_pod_with_a_lifetime() {
+        let b = token_request(None, Some(("web-1", "u-1")), Some(3607));
+        assert_eq!(b["spec"]["expirationSeconds"], 3607);
+        assert_eq!(b["spec"]["boundObjectRef"], json!({ "kind": "Pod", "apiVersion": "v1", "name": "web-1", "uid": "u-1" }));
+        assert_eq!(b["spec"]["audiences"], json!([]));
+        let plain = token_request(Some("vault"), None, None);
+        assert_eq!(plain["spec"], json!({ "audiences": ["vault"] }));
+    }
+
+    #[test]
+    fn a_token_is_refreshed_at_four_fifths_of_its_life() {
+        let now = chrono::Utc::now();
+        // The apiserver granted a year (warnafter): 80% of that.
+        let year = now + chrono::Duration::days(365);
+        assert_eq!((refresh_at(now, Some(year), 3607) - now).num_days(), 292);
+        // No expiry said: 80% of what was asked.
+        assert_eq!((refresh_at(now, None, 3600) - now).num_seconds(), 2880);
+    }
+
+    #[tokio::test]
+    async fn a_pods_token_is_bound_written_and_refreshed_when_due() {
+        let asked: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let log = asked.clone();
+        let app = axum::Router::new().route(
+            "/api/v1/namespaces/default/serviceaccounts/default/token",
+            axum::routing::post(move |axum::Json(b): axum::Json<Value>| {
+                let log = log.clone();
+                async move {
+                    let n = { let mut l = log.lock().unwrap(); l.push(b); l.len() };
+                    axum::Json(json!({ "status": { "token": format!("tok-{n}"),
+                        "expirationTimestamp": (chrono::Utc::now() + chrono::Duration::seconds(3600)).to_rfc3339() } }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let rt = Arc::new(FakeRuntime::default());
+        let mgr = PodManager::with_api(rt.clone(), rt, NODE, &url, "127.0.0.1", reqwest::Client::new());
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap();
+        let p = json!({ "metadata": { "name": "web-1", "namespace": "default", "uid": "u-1" }, "spec": {} });
+
+        assert!(mgr.write_bound_token(&p, d, "token", None, 3607).await.unwrap());
+        assert_eq!(std::fs::read_to_string(dir.path().join("token")).unwrap(), "tok-1");
+        assert_eq!(asked.lock().unwrap()[0]["spec"]["boundObjectRef"]["uid"], "u-1");
+        assert_eq!(asked.lock().unwrap()[0]["spec"]["expirationSeconds"], 3607);
+
+        // Not due: nothing asked. A pod the kubelet does not have: forgotten.
+        mgr.pods.write().await.insert("u-1".into(), PodState {
+            namespace: "default".into(), name: "web-1".into(), uid: "u-1".into(),
+            sandbox_id: None, container_ids: HashMap::new(), phase: "Running".into(), pod: p.clone(),
+            pod_ip: None, restart_counts: HashMap::new(), ready: HashMap::new(),
+            liveness_failures: HashMap::new(), startup_passed: HashMap::new(), started: HashMap::new(),
+            terminated: HashMap::new(), init_statuses: Vec::new(), sandbox_stopped: false,
+        });
+        let next = mgr.refresh_tokens().await.unwrap();
+        assert!(next > std::time::Duration::from_secs(2800), "{next:?}");
+        assert_eq!(asked.lock().unwrap().len(), 1);
+        // Due: written again.
+        for f in mgr.tokens.lock().unwrap().values_mut().flatten() {
+            f.refresh_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        }
+        mgr.refresh_tokens().await;
+        assert_eq!(std::fs::read_to_string(dir.path().join("token")).unwrap(), "tok-2");
+        mgr.pods.write().await.remove("u-1");
+        assert!(mgr.refresh_tokens().await.is_none(), "a gone pod's tokens are forgotten");
     }
 
     #[test]
