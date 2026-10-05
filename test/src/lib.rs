@@ -4,7 +4,8 @@
 //! outside, through the Kubernetes API only:
 //!
 //! - `medium` (< 30 min): claims of the built-in `stormblock` class at every
-//!   size class and at arbitrary sizes, end to end (`medium.rs`, #64).
+//!   size class and at arbitrary sizes, end to end (`medium.rs`, #64), and
+//!   the node's own volumes as complete PV + PVC pairs (`node_volumes.rs`, #59).
 //! - `short` and `long`: not written yet (#61). Each reports one skip, which
 //!   never counts as a pass.
 //!
@@ -17,6 +18,7 @@ pub mod api;
 pub mod env;
 pub mod k8s;
 pub mod medium;
+pub mod node_volumes;
 pub mod report;
 pub mod workload;
 

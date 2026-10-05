@@ -418,6 +418,10 @@ stormcentral as a Job (`test/rustkube-node-test.yaml`):
   - Every case has `RUSTKUBE_NODE_TEST_MINT_BUDGET` (default 1200 s), because a
     class may be minted on first use.
   - Overcommit is reported skip until #62.
+  - The node's own volumes (#59): every claim mirrored for the test node is
+    `kube-system/<volume>-<node>`, Bound to `storm-<volume>-<node>`, whose
+    `claimRef` names it by uid, with the same kind and component labels; one
+    claim is deleted and must come back with its PV naming the new uid.
 - **short**, **long**: not written yet (#61). Each reports one skip.
 
 The same image is the workload pods' program (`/test sized <path> <seed>

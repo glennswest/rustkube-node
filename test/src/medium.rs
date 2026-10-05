@@ -156,6 +156,14 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
         0,
         None,
     );
+    // The node's own volumes (#59): complete pairs, and a deleted claim back.
+    let t = Instant::now();
+    let o = crate::node_volumes::pairs(&env, &api).await;
+    r.record("node-volumes-pairs", o, t.elapsed().as_millis(), None);
+    let t = Instant::now();
+    let o = crate::node_volumes::restored(&env, &api, within(&env, Duration::from_secs(120))).await;
+    r.record("node-volumes-restored", o, t.elapsed().as_millis(), None);
+
     let t = Instant::now();
     let o = match k8s::drain(&env, &api, env.budget(Duration::from_secs(300), Duration::from_secs(10))).await {
         Ok(left) if left.is_empty() => Outcome::Pass("nothing of this run is left: pods, claims and their PVs are gone".into()),

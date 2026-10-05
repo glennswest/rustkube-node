@@ -13,7 +13,9 @@
 #                            workload pods run as uid 0 with no capabilities,
 #                            to own a fresh filesystem's root)
 #   api:      namespaced in the run's namespace: PVCs, pods, events (read).
-#             Cluster-scoped: read StorageClasses and PVs.
+#             Cluster-scoped: read StorageClasses and PVs; read PVCs and
+#             delete one of kube-system's mirrored node-volume claims, which
+#             the kubelet makes again (#59; the PV is Retain).
 #   images:   only ${IMAGE}: the workload pods run it too
 #             (RUSTKUBE_NODE_TEST_IMAGE)
 #   external: none
@@ -68,6 +70,11 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumes"]
     verbs: ["get", "list"]
+  # node-volumes (#59): read kube-system's mirrored claims, and delete one to
+  # see the kubelet make it again (its PV is Retain; no data is touched).
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

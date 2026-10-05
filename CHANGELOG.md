@@ -8,6 +8,10 @@
   migration: a pair under the old unqualified names is left as it is; the mirror now decides a volume
   "went away" by the volume a claim names (`storm.io/volume`), not by the claim's name, so it does not
   delete those old claims either.
+- **test:** medium suite `node-volumes-pairs` and `node-volumes-restored` (#59): every claim mirrored for
+  the test node is a node-qualified, Bound pair whose PV names it by uid with matching kind/component
+  labels, and a deleted claim comes back with its PV naming the new uid. The Job's ClusterRole may read
+  PVCs and delete them (one mirrored claim; its PV is Retain).
 - **feat:** The PVC ladder reaches 1 PiB (#67): classes 4Ti, 16Ti, 64Ti, 256Ti and 1Pi after 1Ti (x4
   steps, still the quota). Each class names its filesystem; all are ext4 (owner, #67; stormcos#91).
   64Ti, 256Ti and 1Pi are raw block only until stormblock carries a formatter that can lay them down
