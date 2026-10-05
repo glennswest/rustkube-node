@@ -271,9 +271,31 @@ naming a Block claim gets the raw volume. Raw block from third-party CSI drivers
 is refused (`docs/csi.md`). Sizes go to stormblock as `<MiB>M`, since it has no
 `P` suffix.
 
-Capacity reservation/overcommit protection is not implemented (#62); the owner
-has decided its policy (#108: the class size counts at bind, overcommit ratio
-1.0, class-sized clones).
+**Room on the data slabs** (#62; policy #108, `pkg/kubelet/src/capacity.rs`).
+A claim is a thin clone, so nothing physical stops a slab filling under many
+large claims. So a claim is charged its **full class size** when its volume is
+made (a 600Gi claim takes 1 TiB of room: the class is what it can write),
+clones keep the class size, and the overcommit ratio is 1.0:
+
+- **Room** = `min(data total × --storage-overcommit − committed, data free) −
+  reserve`, where `committed` is the virtual size of every writable data-role
+  volume (claims, node service volumes, VM disks; not goldens, sealed volumes or
+  the class blanks) and `reserve` is `--storage-reserve-percent` (5) of the data
+  slabs.
+- **Published:** `CSIStorageCapacity` `kube-system/stormblock-<node>` (class
+  `stormblock`, topology `kubernetes.io/hostname`), `capacity` = the room and
+  `maximumVolumeSize` = the largest class that fits, on engine volume changes
+  and every 60 s. rustkube's scheduler compares a claim's request with it once
+  the CSIDriver says `storageCapacity: true` (stormcos#151).
+- **Refused at provision** too (static pods and `spec.nodeName` pods meet no
+  scheduler): a new volume whose class does not fit leaves the pod waiting with
+  `not enough room on this node's data slabs for the <class> class …` and the
+  numbers, and nothing is made. The check and the create are serialized. An
+  engine with no slab API is not checked.
+- **Alert:** gauges `kubelet_stormblock_data_bytes{kind}` and
+  `kubelet_stormblock_data_used_percent`; past `--storage-alert-percent` (85)
+  written, one Warning `SlabFilling` Event on each of this node's stormblock
+  PVs per crossing, and a log line.
 See [service volume objects](docs/node-volumes.md) for the PV/PVC mirror.
 
 ### Virtual machine disks
@@ -442,7 +464,10 @@ stormcentral as a Job (`test/rustkube-node-test.yaml`):
     `volumeMode: Block`.
   - Every case has `RUSTKUBE_NODE_TEST_MINT_BUDGET` (default 1200 s), because a
     class may be minted on first use.
-  - Overcommit is reported skip until #62.
+  - Overcommit (#62): a Block claim one class above the test node's published
+    `maximumVolumeSize`, its pod pinned to the node, must wait with "not enough
+    room" (or the scheduler's capacity reason) and never bind; skip when the
+    node can still take the largest class.
   - The node's own volumes (#59): every claim mirrored for the test node is
     `kube-system/<volume>-<node>`, Bound to `storm-<volume>-<node>`, whose
     `claimRef` names it by uid, with the same kind and component labels; one

@@ -69,7 +69,8 @@ stormcos shipping path. Its packages do not establish a tested deployment.
 
 `test/` is a separate workspace and test-container build. Its medium suite
 exercises the built-in PVC size ladder; short/long remain skip-only (#61),
-overcommit remains skipped (#62), and runner image injection remains #97.
+overcommit is checked against the node's published capacity (#62), and runner
+image injection remains #97.
 Run Jobs through stormcentral on capability-matched test machines; never infer
 live behavior from unit tests or hardcode a machine. See README and
 [status](status.md) for outstanding acceptance.

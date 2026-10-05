@@ -72,4 +72,4 @@ hand is safe: the PV is Retain, so the volume is untouched.
 
 Drive/shelf/bay/RAID placement joins are not published here (#60). The engine
 and stormdrive placement APIs are prerequisites, not proof that this mirror
-has consumed them. Capacity reservation/overcommit protection remains #62.
+has consumed them. Room for claims on the data slabs is #62 (README, "Room on the data slabs").

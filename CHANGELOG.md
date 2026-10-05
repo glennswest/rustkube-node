@@ -2,6 +2,17 @@
 
 ## 2026-10-05
 
+- **feat:** Claims are charged their full size class against the node's stormblock data slabs (#62; owner
+  policy #108: class size at bind, overcommit ratio 1.0, class-sized clones). The node publishes
+  `CSIStorageCapacity` `kube-system/stormblock-<node>` (room left, `maximumVolumeSize` = the largest class
+  that fits) on volume changes and every 60 s; a new claim volume that does not fit is refused at
+  provision (the pod waits with the numbers; check and create serialized); gauges
+  `kubelet_stormblock_data_bytes{kind}` / `kubelet_stormblock_data_used_percent`, and a `SlabFilling`
+  Warning on this node's stormblock PVs past the alert percent. New flags `--storage-overcommit` (1.0),
+  `--storage-reserve-percent` (5), `--storage-alert-percent` (85). The scheduler reads the object once
+  stormcos#151 sets `storageCapacity: true`.
+- **test:** medium `pvc-overcommit-refused` runs (#62): a Block claim one class above the test node's
+  `maximumVolumeSize`, pinned to the node, must wait with the reason and never bind.
 - **feat:** A VMI on the pod network gets its own sandbox (#88, stormvm#16): a stormpump network
   namespace and a CNI ADD (container `vm-<uid>`), its NICs realised in it (the bridge binding gives the
   guest the pod IP and MAC), the hypervisor spawned inside it, and a DHCP responder per bridged NIC

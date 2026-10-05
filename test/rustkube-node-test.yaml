@@ -13,7 +13,8 @@
 #                            workload pods run as uid 0 with no capabilities,
 #                            to own a fresh filesystem's root)
 #   api:      namespaced in the run's namespace: PVCs, pods, events (read).
-#             Cluster-scoped: read StorageClasses and PVs; read PVCs and
+#             Cluster-scoped: read StorageClasses, CSIStorageCapacities and
+#             PVs; read PVCs and
 #             delete one of kube-system's mirrored node-volume claims, which
 #             the kubelet makes again (#59; the PV is Retain).
 #   images:   only ${IMAGE}: the workload pods run it too
@@ -65,7 +66,7 @@ metadata:
   labels: { storm.io/test-run: "${RUN_ID}" }
 rules:
   - apiGroups: ["storage.k8s.io"]
-    resources: ["storageclasses"]
+    resources: ["storageclasses", "csistoragecapacities"]
     verbs: ["get"]
   - apiGroups: [""]
     resources: ["persistentvolumes"]

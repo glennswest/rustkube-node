@@ -28,6 +28,9 @@ An em dash means there is no environment binding or the value is unset.
 | `--cni-conf-dir` | `CNI_CONF_DIR` | `/etc/cni/net.d`; watched (inotify) unless `--no-cni`: a change wakes the Pods waiting for a network config (#148) |
 | `--cni-bin-dir` | `CNI_BIN_DIR` | `/opt/cni/bin` |
 | `--no-cni` | — | `false`; disables the kubelet CNI invoker; see runtime caveat below |
+| `--storage-overcommit` | `STORAGE_OVERCOMMIT` | `1.0`: committed bytes allowed per byte of stormblock data slab; a claim is charged its full class (#62, #108) |
+| `--storage-reserve-percent` | `STORAGE_RESERVE_PERCENT` | `5`: percent of the data slabs kept back from claims (#62) |
+| `--storage-alert-percent` | `STORAGE_ALERT_PERCENT` | `85`: percent of the data slabs written past which a `SlabFilling` Warning goes on this node's stormblock PVs (#62) |
 | `--pod-workers` | `POD_WORKERS` | 16 per CPU, at least 32, at most 256: Pod/VMI passes (starts, checks, teardowns) run at once (#138) |
 | `--kubelet-port` | `KUBELET_PORT` | `10250`; HTTPS on `0.0.0.0` |
 | `--apiserver-ca` | `APISERVER_CA` | Unset; PEM trust anchor, otherwise kubeconfig CA |
@@ -195,4 +198,4 @@ medium or long. The process passes this to `STORM_SUITE` (default short).
 
 Token and CA come from `/var/run/secrets/kubernetes.io/serviceaccount`.
 Missing required inputs exit 2. Short and long currently report skips; medium
-covers PVC sizes, with overcommit explicitly skipped. No live pass is implied.
+covers PVC sizes, raw block, node volumes and overcommit refusal. No live pass is implied.

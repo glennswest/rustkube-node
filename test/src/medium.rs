@@ -27,9 +27,12 @@
 //! which for 1 TiB is minutes of formatting (stormblock#141). Every case has
 //! [`Env::mint_budget`] to finish; the `ms` of the 1Ti case is that time.
 //!
-//! **Overcommit** (a no-overcommit drive refuses claims beyond its free space
-//! at bind) is reported skip: the kubelet has no such setting yet
-//! (rustkube-node#62).
+//! **Overcommit refused** (#62): the test node's published CSIStorageCapacity
+//! (`kube-system/stormblock-<node>`) says the largest class that still fits;
+//! a claim one class above it, for a pod pinned to that node, must wait with
+//! the reason ("not enough room", or the scheduler's "no published storage
+//! capacity") and never bind. Skip when the node can still take the largest
+//! class.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -135,7 +138,7 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
         let (env, api) = (env.clone(), api.clone());
         tokio::spawn(async move {
             let t = Instant::now();
-            let o = refused(&env, &api, "sz-fs-20ti", "20Ti", "volumeMode: Block").await;
+            let o = refused(&env, &api, "sz-fs-20ti", "20Ti", &["volumeMode: Block"], false).await;
             ("pvc-size-filesystem-past-ext4-classes".to_string(), o, t.elapsed().as_millis())
         })
     };
@@ -150,12 +153,9 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
             }
         }
     }
-    r.record(
-        "pvc-overcommit-refused",
-        Outcome::Skip("the kubelet has no overcommit setting to honour yet (rustkube-node#62)".into()),
-        0,
-        None,
-    );
+    let t = Instant::now();
+    let o = overcommit_refused(&env, &api).await;
+    r.record("pvc-overcommit-refused", o, t.elapsed().as_millis(), None);
     // The node's own volumes (#59): complete pairs, and a deleted claim back.
     let t = Instant::now();
     let o = crate::node_volumes::pairs(&env, &api).await;
@@ -255,17 +255,50 @@ async fn size_case(env: &Env, api: &Api, c: &Case, seed: u64) -> Outcome {
 
 /// 2Pi: the pod waits with the reason, and the claim is never Bound.
 async fn above_ladder(env: &Env, api: &Api) -> Outcome {
-    refused(env, api, "sz-above-ladder", "2Pi", "larger than the largest size class").await
+    refused(env, api, "sz-above-ladder", "2Pi", &["larger than the largest size class"], false).await
 }
 
-/// A filesystem claim of `request` that the node refuses: the pod waits with
-/// a reason containing `why`, and the claim is never Bound.
-async fn refused(env: &Env, api: &Api, name: &str, request: &str, why: &str) -> Outcome {
-    if let Err(e) = api.create(&k8s::pvcs(env), &k8s::claim(env, name, request)).await {
+/// One class above what the test node says it can still take (#62).
+async fn overcommit_refused(env: &Env, api: &Api) -> Outcome {
+    let path = format!("/apis/storage.k8s.io/v1/namespaces/kube-system/csistoragecapacities/stormblock-{}", env.node);
+    let cap = match api.get(&path).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return Outcome::Fail(format!("node {} publishes no CSIStorageCapacity ({path})", env.node)),
+        Err(e) => return Outcome::Infra(e),
+    };
+    let max = api::quantity_bytes(s(&cap, "/maximumVolumeSize")).unwrap_or(0);
+    let all: Vec<(&str, u64)> = LADDER.iter().chain(BLOCK_ONLY).copied().collect();
+    let Some((request, _)) = all.iter().find(|(_, b)| *b > max) else {
+        return Outcome::Skip(format!("node {} can still take the largest class (maximumVolumeSize {max})", env.node));
+    };
+    // Block, so a class past the ext4 ones is refused for room, not for
+    // having no filesystem.
+    let why = ["not enough room", "no published storage capacity"];
+    match refused(env, api, "sz-overcommit", request, &why, true).await {
+        Outcome::Pass(d) => Outcome::Pass(format!("{request} with maximumVolumeSize {}: {d}", s(&cap, "/maximumVolumeSize"))),
+        other => other,
+    }
+}
+
+/// A claim of `request` that the node refuses: the pod waits with a reason
+/// containing one of `why`, and the claim is never Bound. `pinned_block`: a
+/// Block claim, its pod pinned to the test node (so a scheduler that does not
+/// read capacity cannot place it elsewhere).
+async fn refused(env: &Env, api: &Api, name: &str, request: &str, why: &[&str], pinned_block: bool) -> Outcome {
+    let claim = if pinned_block { k8s::block_claim(env, name, request) } else { k8s::claim(env, name, request) };
+    if let Err(e) = api.create(&k8s::pvcs(env), &claim).await {
         return Outcome::Infra(e);
     }
     let args = ["1".to_string(), BYTES.to_string(), "0".to_string(), u64::MAX.to_string()];
-    if let Err(e) = api.create(&k8s::pods(env), &k8s::work(env, name, name, "sized", &args)).await {
+    let mut pod = if pinned_block {
+        k8s::work_device(env, name, name, "sized", &args)
+    } else {
+        k8s::work(env, name, name, "sized", &args)
+    };
+    if pinned_block {
+        pod["spec"]["nodeSelector"] = serde_json::json!({ "kubernetes.io/hostname": env.node });
+    }
+    if let Err(e) = api.create(&k8s::pods(env), &pod).await {
         return Outcome::Infra(e);
     }
     let pod_path = format!("{}/{name}", k8s::pods(env));
@@ -277,14 +310,14 @@ async fn refused(env: &Env, api: &Api, name: &str, request: &str, why: &str) -> 
             return Ok(Err(format!("the pod reached {phase}: a {request} claim was given a volume")));
         }
         let status = format!("{}{}", s(&p, "/status/message"), k8s::waiting(&p));
-        if status.contains(why) {
+        if why.iter().any(|w| status.contains(w)) {
             return Ok(Ok(format!("pod status: {status}")));
         }
         let mut evs = k8s::events_for(env, api, "Pod", name).await?;
         evs.extend(k8s::events_for(env, api, "PersistentVolumeClaim", name).await?);
-        match evs.iter().find(|e| e.contains(why)) {
+        match evs.iter().find(|e| why.iter().any(|w| e.contains(w))) {
             Some(e) => Ok(Ok(format!("event: {e}"))),
-            None => Err(format!("no reason containing {why:?} yet (pod {phase:?}{}; events: {evs:?})", k8s::waiting(&p))),
+            None => Err(format!("no reason containing any of {why:?} yet (pod {phase:?}{}; events: {evs:?})", k8s::waiting(&p))),
         }
     })
     .await;

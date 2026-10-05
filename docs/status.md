@@ -66,7 +66,6 @@ Each gap has an owning issue. These are limitations, not supported features.
 | NodeExpandVolume and completion of filesystem-resize status | [#42](https://github.com/glennswest/rustkube-node/issues/42) |
 | Generic ephemeral claim creation | [rustkube#94](https://github.com/glennswest/rustkube/issues/94) |
 | ext4 blanks for the 64Ti, 256Ti and 1Pi classes (raw block only until stormblock carries mkfs.ext4.rs#9/#10); a Block claim's PV written by the control plane says Filesystem | [stormblock#289](https://github.com/glennswest/stormblock/issues/289), [rustkube#201](https://github.com/glennswest/rustkube/issues/201) |
-| Slab capacity reservation/overcommit refusal (policy decided in #108, not implemented) | [#62](https://github.com/glennswest/rustkube-node/issues/62) |
 | StorageClass placement policy and cross-node replication | [#71](https://github.com/glennswest/rustkube-node/issues/71), [#68](https://github.com/glennswest/rustkube-node/issues/68) |
 | Every node's service volume represented (`<volume>-<node>` names decided in #107, not implemented); placement metadata join | [#59](https://github.com/glennswest/rustkube-node/issues/59), [#60](https://github.com/glennswest/rustkube-node/issues/60) |
 | Mutual Pod/VM claim exclusion on main | [#80](https://github.com/glennswest/rustkube-node/issues/80) |
