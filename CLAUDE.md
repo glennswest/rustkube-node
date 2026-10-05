@@ -57,6 +57,25 @@ not the release path.
 
 ## Work plan
 
+### In progress: #62, slab capacity: publish, refuse, alert (#108 decided)
+
+2026-10-05. Owner (#108): a claim's full class size counts at bind, overcommit ratio 1.0, clones keep the class
+size. Engine: `/api/v1/slabs` items `role`, `total_bytes`, `free_bytes`; volumes `role`, `sealed`,
+`virtual_size_bytes`. rustkube's scheduler (`capacity_fits`) reads `maximumVolumeSize` (else `capacity`) of a
+CSIStorageCapacity matching the class and node topology, against the raw request.
+1. [ ] `capacity.rs`: data slabs' total/free; committed = virtual size of writable data-role volumes (not
+       sealed, not goldens, not class blanks, not standbys); available = min(total×ratio − committed, free) −
+       reserve; `maximumVolumeSize` = the largest class ≤ available. Flags `--storage-overcommit` (1.0),
+       `--storage-reserve-percent` (5), `--storage-alert-percent` (85).
+2. [ ] Publish CSIStorageCapacity `kube-system/stormblock-<node>` (class stormblock, hostname topology) on
+       engine volume changes and every 60 s (writes change free space with no volume event).
+3. [ ] Refuse at provision: a new claim volume whose class does not fit waits (FailedMount, reason with the
+       numbers); check + create under one lock. No slab answer (older engine) = no check, logged.
+4. [ ] Alert: gauges `kubelet_stormblock_data_bytes{kind}`; past the alert percent, one Warning `SlabFilling`
+       Event per crossing on each of this node's stormblock PVs.
+5. [ ] Tests, docs (README PVC section, configuration.md, metrics.md, status.md), CHANGELOG; `test/` medium
+       `pvc-overcommit-refused` enabled; file stormcos#151 follow-up note; sc-build; close.
+
 ### Waiting on the owner: #88 (P1), a VMI on the pod network gets its own sandbox (stormvm#16)
 
 2026-10-05. stormvm dc1b7ea (in the lock) has `realise(p, Some(netns), …)` (bridge binding: pod IP/MAC off the
