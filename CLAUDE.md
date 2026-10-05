@@ -57,6 +57,30 @@ not the release path.
 
 ## Work plan
 
+### In progress: #67 (P1), PVC ladder to PiB, raw block volumes, per-class filesystem
+
+2026-10-05. Owner (#67, 09-25): large classes stay **ext4** unless stormcos#91 says otherwise; Block for single
+objects past 16 TiB. stormcos#91's table: nothing forces XFS. Found:
+- stormblock main pins mkfs-ext4 **v3.0.0**: format RAM ~8 KiB/group (16 TiB 1.3 GiB, 64 TiB 5.1 GiB, 256 TiB
+  17.6 GiB, 1 PiB OOM; the fix, mkfs.ext4.rs#10, is untagged), and the default inode count wraps at 256 TiB
+  (mkfs.ext4.rs#9, open: the filesystem is not clean). The fstemplate API exposes no inode ratio.
+- stormblock `size` strings parse K/M/G/T only (no P): sizes are sent as `<MiB>M`.
+- stormpump binds a non-directory source onto a file placeholder, so a raw device can be bound at a
+  `volumeDevices[].devicePath` with no stormpump change (`fstype: None`, source = the device).
+- rustkube's provisioner (`stormblock.rs`) writes the PV without `volumeMode` (admission → Filesystem), so a
+  Block claim's control-plane PV mismatches: rustkube issue.
+1. [ ] storage.rs: classes carry their filesystem; 4T, 16T ext4; 64T, 256T, 1P block-only until stormblock
+       formats them (the reason names mkfs.ext4.rs#10/#9). `template_name(class)` from the class's fs.
+       Mint with `<MiB>M`.
+2. [ ] Block claims: `volumeMode: Block` → a raw stormblock volume (`POST /api/v1/volumes`, role data) of the
+       class size, or a clone of its dataSource; attached as for a filesystem claim. Pod: `volumeDevices` bind
+       the device at `devicePath`; a Block claim in `volumeMounts` or a Filesystem claim in `volumeDevices` is a
+       wait with the reason. VM claim disks take Block claims as they are. PV `volumeMode` follows the claim.
+3. [ ] Tests (ladder, block provisioning against fake stormblock, container mounts), `test/` medium cases for
+       4T/16T and a Block claim; docs (README, status.md, node-volumes/configuration), CHANGELOG.
+4. [ ] File: rustkube (provisioner volumeMode), stormblock (bump mkfs-ext4 once #9/#10 are tagged).
+       sc-build, stage golden, close (64T+ filesystem classes stay with those issues).
+
 ### Done: #119 (P3), metadata at scale (stormcos#54)
 
 2026-10-05. Found: `instance_at` scans every VM and NIC under the `vms` lock and answers from the local record
