@@ -57,6 +57,21 @@ not the release path.
 
 ## Work plan
 
+### In progress: #148 (P1), pods wait for the CNI instead of retrying into backoff
+
+2026-10-05. Dell 11.79: cilium agent `attempts=10` over 10.5 s, coredns 16 over 27 s; CNI → all pods ~20–27 s.
+Found: the cilium agent is hostNetwork and never meets the CNI check; its attempts are its staged init containers
+(each a Pending pass woken by the exit, no backoff). A network pod with no CNI config acquires a stormpump
+sandbox, finds no conflist, releases it and retries on `wait_backoff` (a quarter of the wait, 1–10 s), so once
+the config appears it starts up to 10 s later. A CNI ADD that fails (agent not serving yet) has the same backoff.
+The executor's queue is apimachinery's FIFO with ≥32 workers: a network pod no longer holds a worker long
+enough to delay the agent, so no reorder.
+1. [ ] stormpump runtime: no conflist → `CriError::NetworkNotConfigured`, checked before the sandbox is acquired.
+2. [ ] Pod manager: a pod waiting on the config is woken by the config (event wait, 10 s fallback); an ADD failure
+       retries on a backoff from its first ADD failure, not from when the pod was seen.
+3. [ ] Kubelet: `--cni-conf-dir` watched (inotify, fs_watch); a change wakes only the pods waiting on the network.
+4. [ ] Tests, docs (README, configuration.md, status.md), CHANGELOG; sc-build; stage golden.
+
 ### Done: #145 (P0), kube-proxy to a TLS apiserver with a token (stormcos#265, flowsdn edition)
 
 2026-10-05. Found: kube-proxy builds `reqwest::Client::new()` (no CA, no token) and parses any answer as a list,
