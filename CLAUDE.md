@@ -75,7 +75,7 @@ CSIStorageCapacity matching the class and node topology, against the raw request
        --locked` at 1c5db42: 17 pass. Medium `pvc-overcommit-refused` enabled. Not run on a node.
        stormcos#151 (storageCapacity: true) flips once every node runs this release.
 
-### Waiting on the owner: #88 (P1), a VMI on the pod network gets its own sandbox (stormvm#16)
+### In progress: #88 (P1), a VMI on the pod network gets its own sandbox (stormvm#16)
 
 2026-10-05. stormvm dc1b7ea (in the lock) has `realise(p, Some(netns), …)` (bridge binding: pod IP/MAC off the
 CNI's interface onto `vmbr0` with the tap), `serve_dhcp(netns, lease)` and `Made.binding`. stormpump 30a76d3
@@ -91,9 +91,14 @@ joins a machine-domain spawn to a client-held sandbox (`inline_a`, `ns_fds`), as
        `Kubelet::with_engine(ring, cni)`; main passes an invoker on the same dirs.
 5. [x] Tests (7 new), README, status.md, CHANGELOG (b177a89, the brace fix, 7558936). sc-build of the
        fix commit `cargo build --locked && cargo test --locked`: 317 kubelet unit pass. Not run on a node.
-6. [ ] **Owner decision, posted on #88:** a VMI has no Pod object, and Cilium labels an endpoint (identity,
-       NetworkPolicy) from the Pod the CNI ADD names; Services/EndpointSlices select Pods. The issue's
-       done-when (policy across five VMs, a Service) needs one.
+6. [x] **Owner (2026-10-05): B**, rustkube's VM controller creates a virt-launcher Pod, the kubelet adopts it;
+       "can we have multiple vm in a namespace" (yes: a sandbox and a Pod each). Filed rustkube#203 (contract:
+       labels `kubevirt.io: virt-launcher`, `kubevirt.io/created-by: <vmi uid>`, owner ref, nodeName set).
+7. [ ] Kubelet adopts it: launcher Pods kept out of the pod manager (and their VMI woken when one appears);
+       the pod-network VMI waits for its launcher Pod; CNI ADD with the Pod's ns/name/uid (recorded); the Pod's
+       status written (Running + podIP + Ready at start, Succeeded/Failed at end); a terminating launcher Pod
+       with no machine here is confirmed deleted (grace 0, uid precondition).
+8. [ ] Tests, docs, CHANGELOG, sc-build, golden; #88 proposed after rustkube#203 for the live done-when.
 
 ### Done from this side: #67 (P1), PVC ladder to PiB, raw block volumes, per-class filesystem
 
