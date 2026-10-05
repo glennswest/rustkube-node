@@ -1,74 +1,29 @@
 //! Endpoints syncer.
 //!
-//! Watches the API server for Service and Endpoints changes,
-//! updating the service map and triggering iptables rule regeneration.
+//! Lists Services and Endpoints from the API server and updates the service
+//! map. Whether the dataplane needs rewriting is decided by the proxy loop,
+//! from the rules the map generates (`proxy.rs`).
 
+use crate::client::ApiClient;
 use crate::service_map::ServiceMap;
-use serde_json::Value;
-use tracing::{debug, info};
+use tracing::debug;
 
-/// Sync services and endpoints from the API server.
+/// Sync services and endpoints from the API server. An error (unreachable,
+/// refused, not a list) leaves the map as it was.
 pub async fn sync_services_and_endpoints(
-    api_url: &str,
+    client: &ApiClient,
     service_map: &ServiceMap,
-    client: &reqwest::Client,
-) -> anyhow::Result<bool> {
-    let mut changed = false;
-
-    // Fetch all services
-    let svc_resp: Value = client
-        .get(format!("{api_url}/api/v1/services"))
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    let services = svc_resp["items"].as_array().cloned().unwrap_or_default();
-    let svc_count = services.len();
-    let old_map = service_map.get_all();
+) -> anyhow::Result<()> {
+    // Both lists first: a failed second list must not leave Services updated
+    // with stale or missing backends.
+    let services = client.list("/api/v1/services").await?;
+    let endpoints = client.list("/api/v1/endpoints").await?;
     service_map.update_services(&services);
-
-    // Fetch all endpoints
-    let ep_resp: Value = client
-        .get(format!("{api_url}/api/v1/endpoints"))
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    let endpoints = ep_resp["items"].as_array().cloned().unwrap_or_default();
-    let ep_count = endpoints.len();
     service_map.update_endpoints(&endpoints);
-
-    let new_map = service_map.get_all();
-
-    // Detect changes (simple length + endpoint count comparison)
-    if old_map.len() != new_map.len() {
-        changed = true;
-    } else {
-        for new_svc in &new_map {
-            let old_svc = old_map
-                .iter()
-                .find(|s| s.key == new_svc.key);
-            match old_svc {
-                Some(old) if old.endpoints.len() != new_svc.endpoints.len() => {
-                    changed = true;
-                    break;
-                }
-                None => {
-                    changed = true;
-                    break;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    if changed {
-        info!("Service map updated: {svc_count} services, {ep_count} endpoint sets");
-    } else {
-        debug!("No service/endpoint changes");
-    }
-
-    Ok(changed)
+    debug!(
+        "listed {} services, {} endpoint sets",
+        services.len(),
+        endpoints.len()
+    );
+    Ok(())
 }

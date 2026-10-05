@@ -4,6 +4,7 @@
 //! Phase 2: eBPF-based packet redirection via aya for high performance.
 
 #[allow(unexpected_cfgs)]
+pub mod client;
 pub mod ebpf;
 pub mod endpoints;
 pub mod iptables;

@@ -35,6 +35,49 @@ pub struct IptablesRules {
     pub chains: Vec<String>,
     /// `-A CHAIN ...` append rules, in application order.
     pub nat_rules: Vec<String>,
+    /// Rules in the built-in nat chains that send traffic into ours. They
+    /// cannot go through `iptables-restore --noflush` (appending would add a
+    /// copy each pass), so the applier checks each (`-C`) and inserts it
+    /// (`-I`) only when missing.
+    pub jumps: Vec<Jump>,
+}
+
+/// One rule in a built-in nat chain, as iptables arguments after the chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Jump {
+    pub chain: &'static str,
+    pub args: Vec<String>,
+}
+
+/// The jumps upstream kube-proxy installs: PREROUTING (traffic arriving,
+/// pods included) and OUTPUT (the node's own processes, hostNetwork pods) into
+/// `KUBE-SERVICES`; POSTROUTING into `KUBE-POSTROUTING` (masquerade).
+pub fn jumps() -> Vec<Jump> {
+    let j = |chain: &'static str, comment: &str, target: &str| Jump {
+        chain,
+        args: vec![
+            "-m".into(),
+            "comment".into(),
+            "--comment".into(),
+            comment.into(),
+            "-j".into(),
+            target.into(),
+        ],
+    };
+    vec![
+        j("PREROUTING", "kubernetes service portals", CHAIN_SERVICES),
+        j("OUTPUT", "kubernetes service portals", CHAIN_SERVICES),
+        j("POSTROUTING", "kubernetes postrouting rules", CHAIN_POSTROUTING),
+    ]
+}
+
+/// Options for [`generate_rules_with`].
+#[derive(Debug, Clone, Default)]
+pub struct RuleOptions {
+    /// The pod CIDR (`--cluster-cidr`). When set, ClusterIP traffic from
+    /// outside it is marked for masquerade, so a backend's reply comes back
+    /// through this node (upstream's `! -s <cidr> … -j KUBE-MARK-MASQ`).
+    pub cluster_cidr: Option<String>,
 }
 
 impl IptablesRules {
@@ -128,6 +171,11 @@ fn base32(bytes: &[u8]) -> String {
 ///
 /// Services with no ready endpoints produce **no** DNAT (no service chain).
 pub fn generate_rules(services: &[ServiceInfo]) -> IptablesRules {
+    generate_rules_with(services, &RuleOptions::default())
+}
+
+/// [`generate_rules`] with options (the pod CIDR).
+pub fn generate_rules_with(services: &[ServiceInfo], opts: &RuleOptions) -> IptablesRules {
     let mut chains = vec![
         CHAIN_SERVICES.to_string(),
         CHAIN_NODEPORTS.to_string(),
@@ -154,8 +202,12 @@ pub fn generate_rules(services: &[ServiceInfo]) -> IptablesRules {
     // is backed by a DashMap, whose iteration order is not defined).
     let mut services: Vec<&ServiceInfo> = services.iter().collect();
     services.sort_by(|a, b| {
-        (a.key.namespace.as_str(), a.key.name.as_str(), a.key.port)
-            .cmp(&(b.key.namespace.as_str(), b.key.name.as_str(), b.key.port))
+        (a.key.namespace.as_str(), a.key.name.as_str(), a.key.port, a.key.protocol.as_str()).cmp(&(
+            b.key.namespace.as_str(),
+            b.key.name.as_str(),
+            b.key.port,
+            b.key.protocol.as_str(),
+        ))
     });
 
     for svc in services {
@@ -180,6 +232,14 @@ pub fn generate_rules(services: &[ServiceInfo]) -> IptablesRules {
             "-A {CHAIN_SERVICES} -d {cluster_ip}/32 -p {proto} -m {proto} --dport {port} \
              -m comment --comment \"{svc_comment}\" -j {svc_chain}"
         ));
+
+        // Off-cluster sources: masquerade, so the reply returns through here.
+        if let Some(cidr) = &opts.cluster_cidr {
+            nat_rules.push(format!(
+                "-A {svc_chain} ! -s {cidr} -d {cluster_ip}/32 -p {proto} -m {proto} --dport {port} \
+                 -m comment --comment \"{svc_comment}\" -j {CHAIN_MARK_MASQ}"
+            ));
+        }
 
         // NodePort: KUBE-NODEPORTS → service chain (+ masquerade the traffic).
         if let Some(node_port) = svc.key.node_port {
@@ -233,7 +293,7 @@ pub fn generate_rules(services: &[ServiceInfo]) -> IptablesRules {
          -m comment --comment \"kubernetes service nodeports\" -j {CHAIN_NODEPORTS}"
     ));
 
-    IptablesRules { chains, nat_rules }
+    IptablesRules { chains, nat_rules, jumps: jumps() }
 }
 
 /// A mockable seam for applying an [`IptablesRules`] set to the dataplane.
@@ -295,7 +355,7 @@ impl RuleApplier for IptablesRestoreApplier {
         );
 
         let output = Command::new("iptables-restore")
-            .arg("--noflush")
+            .args(["-w", "5", "--noflush"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -310,6 +370,10 @@ impl RuleApplier for IptablesRestoreApplier {
         match output {
             Ok(out) if out.status.success() => {
                 tracing::info!("Applied {} iptables rules", rules.nat_rules.len());
+                // After the restore: the chains the jumps name now exist.
+                for jump in &rules.jumps {
+                    ensure_jump(jump)?;
+                }
                 Ok(())
             }
             Ok(out) => {
@@ -322,6 +386,37 @@ impl RuleApplier for IptablesRestoreApplier {
                 anyhow::bail!("Failed to run iptables-restore: {e}");
             }
         }
+    }
+}
+
+/// Insert `jump` at the top of its nat chain unless it is already there.
+#[cfg(target_os = "linux")]
+fn ensure_jump(jump: &Jump) -> anyhow::Result<()> {
+    use std::process::Command;
+    let run = |op: &str| {
+        let mut c = Command::new("iptables");
+        c.args(["-w", "5", "-t", "nat", op, jump.chain]);
+        if op == "-I" {
+            c.arg("1");
+        }
+        c.args(&jump.args).output()
+    };
+    match run("-C") {
+        Ok(out) if out.status.success() => return Ok(()),
+        Ok(_) => {}
+        Err(e) => anyhow::bail!("Failed to run iptables: {e}"),
+    }
+    match run("-I") {
+        Ok(out) if out.status.success() => {
+            tracing::info!("Inserted nat {} jump: {}", jump.chain, jump.args.join(" "));
+            Ok(())
+        }
+        Ok(out) => anyhow::bail!(
+            "iptables -t nat -I {} failed: {}",
+            jump.chain,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => anyhow::bail!("Failed to run iptables: {e}"),
     }
 }
 
@@ -341,6 +436,7 @@ mod tests {
     fn svc(key: ServiceKey, endpoints: Vec<Endpoint>) -> ServiceInfo {
         ServiceInfo {
             key,
+            port_name: String::new(),
             endpoints,
             session_affinity: false,
         }
@@ -507,5 +603,51 @@ mod tests {
         let rules = generate_rules(&[]);
         let applier = NoopApplier;
         assert!(applier.apply(&rules).await.is_ok());
+    }
+
+    #[test]
+    fn jumps_enter_services_and_postrouting() {
+        let rules = generate_rules(&[]);
+        let targets: Vec<_> = rules
+            .jumps
+            .iter()
+            .map(|j| (j.chain, j.args.last().unwrap().as_str()))
+            .collect();
+        assert_eq!(
+            targets,
+            vec![
+                ("PREROUTING", CHAIN_SERVICES),
+                ("OUTPUT", CHAIN_SERVICES),
+                ("POSTROUTING", CHAIN_POSTROUTING)
+            ]
+        );
+        // Never appended through the restore (it would add one each pass).
+        assert!(!rules.to_restore_input().contains("-A PREROUTING"));
+    }
+
+    #[test]
+    fn cluster_cidr_marks_off_cluster_sources_for_masquerade() {
+        let key = clusterip_key("default", "kubernetes", "10.96.0.1", 443);
+        let svc_chain = service_chain_name(&key);
+        let s = svc(key, vec![ep("192.168.11.5", 6443, true)]);
+        let none = generate_rules(std::slice::from_ref(&s));
+        assert!(!none.nat_rules.iter().any(|r| r.contains("! -s")));
+        let opts = RuleOptions { cluster_cidr: Some("10.244.0.0/16".into()) };
+        let rules = generate_rules_with(std::slice::from_ref(&s), &opts);
+        let masq: Vec<_> = rules
+            .nat_rules
+            .iter()
+            .filter(|r| r.contains("! -s 10.244.0.0/16"))
+            .collect();
+        assert_eq!(masq.len(), 1);
+        assert!(masq[0].starts_with(&format!("-A {svc_chain} ")));
+        assert!(masq[0].contains("-d 10.96.0.1/32") && masq[0].ends_with(CHAIN_MARK_MASQ));
+        // Before the SEP jumps in the service chain.
+        let first_svc_rule = rules
+            .nat_rules
+            .iter()
+            .position(|r| r.starts_with(&format!("-A {svc_chain} ")))
+            .unwrap();
+        assert!(rules.nat_rules[first_svc_rule].contains("! -s"));
     }
 }

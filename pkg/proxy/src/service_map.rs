@@ -30,6 +30,9 @@ pub struct Endpoint {
 #[derive(Debug, Clone)]
 pub struct ServiceInfo {
     pub key: ServiceKey,
+    /// `spec.ports[].name`: an Endpoints port is matched to its Service port
+    /// by name (and protocol), as upstream does; empty for a lone unnamed port.
+    pub port_name: String,
     pub endpoints: Vec<Endpoint>,
     pub session_affinity: bool,
 }
@@ -37,7 +40,7 @@ pub struct ServiceInfo {
 /// Thread-safe service map.
 #[derive(Debug, Clone)]
 pub struct ServiceMap {
-    /// key: "namespace/name:port" → ServiceInfo
+    /// key: "namespace/name:port/protocol" → ServiceInfo
     services: Arc<DashMap<String, ServiceInfo>>,
 }
 
@@ -76,13 +79,15 @@ impl ServiceMap {
             for port_spec in &ports {
                 let port = port_spec["port"].as_u64().unwrap_or(0) as u16;
                 let protocol = port_spec["protocol"].as_str().unwrap_or("TCP").to_string();
+                let port_name = port_spec["name"].as_str().unwrap_or("").to_string();
                 let node_port = if svc_type == "NodePort" || svc_type == "LoadBalancer" {
                     port_spec["nodePort"].as_u64().map(|p| p as u16)
                 } else {
                     None
                 };
 
-                let map_key = format!("{namespace}/{name}:{port}");
+                // Protocol is part of the key: kube-dns serves 53/UDP and 53/TCP.
+                let map_key = format!("{namespace}/{name}:{port}/{protocol}");
                 seen.insert(map_key.clone());
 
                 let key = ServiceKey {
@@ -105,6 +110,7 @@ impl ServiceMap {
                     map_key,
                     ServiceInfo {
                         key,
+                        port_name,
                         endpoints: existing_endpoints,
                         session_affinity,
                     },
@@ -116,53 +122,48 @@ impl ServiceMap {
         self.services.retain(|k, _| seen.contains(k));
     }
 
-    /// Update endpoints from API server data.
+    /// Set every Service port's backends from the Endpoints list, as it is
+    /// now: a subset port is matched to the Service port of the same name and
+    /// protocol (its number is the target port, not the Service port), every
+    /// subset contributes, and a port with no Endpoints left has none.
     pub fn update_endpoints(&self, endpoints_list: &[Value]) {
+        use std::collections::HashMap;
+        // (namespace, name, port name, protocol) → backends
+        let mut found: HashMap<(String, String, String, String), Vec<Endpoint>> = HashMap::new();
         for ep in endpoints_list {
             let name = ep["metadata"]["name"].as_str().unwrap_or("");
             let namespace = ep["metadata"]["namespace"].as_str().unwrap_or("default");
-
-            let subsets = ep["subsets"].as_array().cloned().unwrap_or_default();
-
-            for subset in &subsets {
-                let addresses = subset["addresses"].as_array().cloned().unwrap_or_default();
-                let ports = subset["ports"].as_array().cloned().unwrap_or_default();
-
-                for port_spec in &ports {
-                    let port = port_spec["port"].as_u64().unwrap_or(0) as u16;
-                    let svc_port = port_spec["port"].as_u64().unwrap_or(0) as u16;
-
-                    // Find matching service entry
-                    // Services use spec.ports[].port, endpoints use subsets[].ports[].port (target port)
-                    let map_key = format!("{namespace}/{name}:{svc_port}");
-
-                    // Also try with the service port (may differ from target port)
-                    if let Some(mut svc_info) = self.services.get_mut(&map_key) {
-                        svc_info.endpoints = addresses
-                            .iter()
-                            .map(|addr| Endpoint {
-                                ip: addr["ip"].as_str().unwrap_or("").to_string(),
-                                port,
-                                ready: true,
-                            })
-                            .collect();
-                    } else {
-                        // Try to find by scanning all service ports for this namespace/name
-                        for mut entry in self.services.iter_mut() {
-                            if entry.key.namespace == namespace && entry.key.name == name {
-                                entry.endpoints = addresses
-                                    .iter()
-                                    .map(|addr| Endpoint {
-                                        ip: addr["ip"].as_str().unwrap_or("").to_string(),
-                                        port,
-                                        ready: true,
-                                    })
-                                    .collect();
-                            }
+            for subset in ep["subsets"].as_array().map(Vec::as_slice).unwrap_or_default() {
+                let addresses = subset["addresses"].as_array().map(Vec::as_slice).unwrap_or_default();
+                for port_spec in subset["ports"].as_array().map(Vec::as_slice).unwrap_or_default() {
+                    let Some(port) = port_spec["port"].as_u64().map(|p| p as u16) else {
+                        continue;
+                    };
+                    let key = (
+                        namespace.to_string(),
+                        name.to_string(),
+                        port_spec["name"].as_str().unwrap_or("").to_string(),
+                        port_spec["protocol"].as_str().unwrap_or("TCP").to_string(),
+                    );
+                    let list = found.entry(key).or_default();
+                    for addr in addresses {
+                        let Some(ip) = addr["ip"].as_str() else { continue };
+                        let e = Endpoint { ip: ip.to_string(), port, ready: true };
+                        if !list.contains(&e) {
+                            list.push(e);
                         }
                     }
                 }
             }
+        }
+        for mut entry in self.services.iter_mut() {
+            let key = (
+                entry.key.namespace.clone(),
+                entry.key.name.clone(),
+                entry.port_name.clone(),
+                entry.key.protocol.clone(),
+            );
+            entry.endpoints = found.get(&key).cloned().unwrap_or_default();
         }
     }
 
@@ -185,5 +186,90 @@ impl ServiceMap {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn by_port(m: &ServiceMap, port: u16, proto: &str) -> ServiceInfo {
+        m.get_all()
+            .into_iter()
+            .find(|s| s.key.port == port && s.key.protocol == proto)
+            .unwrap()
+    }
+
+    #[test]
+    fn kube_dns_udp_and_tcp_both_kept_and_matched_by_name() {
+        let m = ServiceMap::new();
+        m.update_services(&[json!({
+            "metadata": {"name": "kube-dns", "namespace": "kube-system"},
+            "spec": {"clusterIP": "10.96.0.10", "ports": [
+                {"name": "dns", "port": 53, "protocol": "UDP", "targetPort": 53},
+                {"name": "dns-tcp", "port": 53, "protocol": "TCP", "targetPort": 53},
+                {"name": "metrics", "port": 9153, "protocol": "TCP", "targetPort": 9153}
+            ]}
+        })]);
+        assert_eq!(m.get_all().len(), 3);
+        m.update_endpoints(&[json!({
+            "metadata": {"name": "kube-dns", "namespace": "kube-system"},
+            "subsets": [{"addresses": [{"ip": "10.244.0.7"}], "ports": [
+                {"name": "dns", "port": 53, "protocol": "UDP"},
+                {"name": "dns-tcp", "port": 53, "protocol": "TCP"},
+                {"name": "metrics", "port": 9153, "protocol": "TCP"}
+            ]}]
+        })]);
+        for (port, proto) in [(53, "UDP"), (53, "TCP"), (9153, "TCP")] {
+            let s = by_port(&m, port, proto);
+            assert_eq!(s.endpoints, vec![Endpoint { ip: "10.244.0.7".into(), port, ready: true }]);
+        }
+    }
+
+    #[test]
+    fn target_port_differs_from_service_port() {
+        let m = ServiceMap::new();
+        m.update_services(&[json!({
+            "metadata": {"name": "kubernetes", "namespace": "default"},
+            "spec": {"clusterIP": "10.96.0.1", "ports": [
+                {"name": "https", "port": 443, "protocol": "TCP", "targetPort": 6443}
+            ]}
+        })]);
+        m.update_endpoints(&[json!({
+            "metadata": {"name": "kubernetes", "namespace": "default"},
+            "subsets": [{"addresses": [{"ip": "192.168.11.5"}],
+                         "ports": [{"name": "https", "port": 6443, "protocol": "TCP"}]}]
+        })]);
+        let s = by_port(&m, 443, "TCP");
+        assert_eq!(s.endpoints[0].ip, "192.168.11.5");
+        assert_eq!(s.endpoints[0].port, 6443);
+    }
+
+    #[test]
+    fn multi_port_targets_are_not_crossed_and_vanished_endpoints_clear() {
+        let m = ServiceMap::new();
+        let svc = json!({
+            "metadata": {"name": "web", "namespace": "ns"},
+            "spec": {"clusterIP": "10.96.1.1", "ports": [
+                {"name": "http", "port": 80, "protocol": "TCP", "targetPort": 8080},
+                {"name": "https", "port": 443, "protocol": "TCP", "targetPort": 8443}
+            ]}
+        });
+        m.update_services(std::slice::from_ref(&svc));
+        m.update_endpoints(&[json!({
+            "metadata": {"name": "web", "namespace": "ns"},
+            "subsets": [{"addresses": [{"ip": "10.244.0.3"}, {"ip": "10.244.0.4"}], "ports": [
+                {"name": "http", "port": 8080, "protocol": "TCP"},
+                {"name": "https", "port": 8443, "protocol": "TCP"}
+            ]}]
+        })]);
+        assert!(by_port(&m, 80, "TCP").endpoints.iter().all(|e| e.port == 8080));
+        assert!(by_port(&m, 443, "TCP").endpoints.iter().all(|e| e.port == 8443));
+        assert_eq!(by_port(&m, 80, "TCP").endpoints.len(), 2);
+        // The Endpoints object goes: the Service keeps no stale backends.
+        m.update_services(std::slice::from_ref(&svc));
+        m.update_endpoints(&[]);
+        assert!(by_port(&m, 80, "TCP").endpoints.is_empty());
     }
 }
