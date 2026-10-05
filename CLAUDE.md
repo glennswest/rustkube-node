@@ -57,7 +57,7 @@ not the release path.
 
 ## Work plan
 
-### In progress: #148 (P1), pods wait for the CNI instead of retrying into backoff
+### Done: #148 (P1), pods wait for the CNI instead of retrying into backoff
 
 2026-10-05. Dell 11.79: cilium agent `attempts=10` over 10.5 s, coredns 16 over 27 s; CNI → all pods ~20–27 s.
 Found: the cilium agent is hostNetwork and never meets the CNI check; its attempts are its staged init containers
@@ -72,7 +72,8 @@ enough to delay the agent, so no reorder.
 3. [x] Kubelet: `--cni-conf-dir` watched (inotify, fs_watch); a change wakes only the pods waiting on the network.
 4. [x] Tests, docs (README, configuration.md, status.md), CHANGELOG. f1a0c38; sc-build f1a0c38 `cargo build --locked &&
        cargo test --locked`: 296 kubelet unit (3 new), 4 integration, 25 CNI, 30 proxy pass. Not run on a node.
-5. [ ] Stage golden, release request, close #148 / `stormcentral shipped`.
+5. [x] Stage golden golden-rustkube-node-61af4712bf0d (409a838), release request stormcos#164; #148 closed,
+       `stormcentral shipped`. Live check: coredns's start-timing `wait` ends ~1 s after Cilium's conflist.
 
 ### Done: #145 (P0), kube-proxy to a TLS apiserver with a token (stormcos#265, flowsdn edition)
 
