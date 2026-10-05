@@ -72,7 +72,9 @@ other than `stormblock.storm.io`:
 Inline `csi:` volumes are published without attach or stage, with the
 handle `csi-<sha256(pod uid + volume name)>`. The CSIDriver must list
 `Ephemeral` in `volumeLifecycleModes`. Raw block PVs (`volumeMode: Block`)
-are refused with a message, because only Filesystem is published.
+are refused with a message, because only Filesystem is published. Raw block
+claims of the built-in `stormblock` class are served by the kubelet itself
+(README, "Raw block claims", #67).
 
 ## Unmounting
 

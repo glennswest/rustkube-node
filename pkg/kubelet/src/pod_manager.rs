@@ -1064,14 +1064,6 @@ impl PodManager {
                             )));
                         }
                         if let Some(pv) = self.external_csi_pv(&pvc).await {
-                            if crate::storage::is_block(&pvc) {
-                                return Err(CriError::VolumeNotReady(format!(
-                                    "PVC {namespace}/{claim}: volumeMode: Block from CSI driver {} \
-                                     is not supported on this node (only the built-in stormblock \
-                                     class serves raw block claims)",
-                                    pv["spec"]["csi"]["driver"].as_str().unwrap_or("?")
-                                )));
-                            }
                             let readonly = vol["persistentVolumeClaim"]["readOnly"]
                                 .as_bool()
                                 .unwrap_or(false);

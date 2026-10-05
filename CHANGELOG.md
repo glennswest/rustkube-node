@@ -2,6 +2,20 @@
 
 ## 2026-10-05
 
+- **feat:** The PVC ladder reaches 1 PiB (#67): classes 4Ti, 16Ti, 64Ti, 256Ti and 1Pi after 1Ti (x4
+  steps, still the quota). Each class names its filesystem; all are ext4 (owner, #67; stormcos#91).
+  64Ti, 256Ti and 1Pi are raw block only until stormblock carries a formatter that can lay them down
+  (mkfs.ext4.rs#10 memory, #9 inode wrap; stormblock#289): a filesystem claim rounding to them waits
+  with that reason and names `volumeMode: Block`. Blanks are minted with the class's filesystem and
+  its size in MiB (stormblock's sizes have no `P`).
+- **feat:** Raw block claims (`volumeMode: Block`, #67): a plain thin stormblock volume of the class's
+  size (no template, no mkfs), attached over ublk, bound as the device at the container's
+  `volumeDevices[].devicePath`. A Block claim in `volumeMounts` or a Filesystem claim in
+  `volumeDevices` waits with the reason. The PV the node writes carries the claim's `volumeMode`
+  (the control plane's provisioner does not yet: rustkube#201). PV capacities read `Pi`.
+- **test:** medium suite: 4Ti and 16Ti classes, Block claims of 1Mi, 20Ti and 1Pi through
+  `volumeDevices` (the device exactly its class), a 20Ti filesystem claim refused naming Block, and
+  above-ladder moved to 2Pi.
 - **fix:** Guest metadata (`/vmInstance/{address}`) answers only for a machine whose VMI places it on this
   node (#119, stormcos#54): the cached object must exist, not be terminating, carry the machine's uid, name
   this node in `status.nodeName`, and not have completed a migration to another node. Before, the local

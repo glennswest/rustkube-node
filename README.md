@@ -250,13 +250,30 @@ itself is broken (its sealed volume missing or not sealed, or no sealed
 snapshot recorded) deletes the template and mints it again, so the next
 claim clones a sound one rather than meeting the same refusal forever (#140).
 
-The current ext4 ladder is **1Mi, 16Mi, 64Mi, 256Mi, 1Gi, 4Gi, 16Gi,
-64Gi, 256Gi, 1Ti**; requests round up, and requests above 1Ti are refused.
-The rounded class is the volume ceiling. Capacity reservation/overcommit
-protection is not implemented (#62); the owner has decided its policy (#108:
-the class size counts at bind, overcommit ratio 1.0, class-sized clones). Larger classes, per-class filesystems
-and raw block support remain #67; the owner's direction is ext4 first, with
-raw block for single objects past 16TiB, not an assumed XFS switch.
+The ladder is **1Mi, 16Mi, 64Mi, 256Mi, 1Gi, 4Gi, 16Gi, 64Gi, 256Gi, 1Ti,
+4Ti, 16Ti, 64Ti, 256Ti, 1Pi** (#67); requests round up, and requests above 1Pi
+are refused. The rounded class is the volume ceiling. Each class names its
+filesystem (`storage.rs` `SIZE_CLASSES`); all are ext4 (owner, #67; stormcos#91
+found nothing that forces XFS). **64Ti, 256Ti and 1Pi are raw block only** for
+now: stormblock's formatter (mkfs-ext4 v3.0.0) needs ~5 GiB to format 64 TiB
+(mkfs.ext4.rs#10) and wraps the inode count at 256 TiB (mkfs.ext4.rs#9), so a
+filesystem claim rounding to them waits with that reason and the hint to use
+`volumeMode: Block` (stormblock#289 tracks carrying the fixed formatter).
+
+**Raw block claims** (`volumeMode: Block`): a plain thin stormblock volume of
+the class's size (`POST /api/v1/volumes`, `role: data`; no template, no mkfs),
+attached over ublk like any claim, and bound at the container's
+`volumeDevices[].devicePath` as the device itself (no filesystem). A Block claim
+named in `volumeMounts`, or a Filesystem claim in `volumeDevices`, keeps the pod
+waiting with the reason. The PV's `volumeMode` follows the claim when the node writes it; the control
+plane's provisioner writes Filesystem until rustkube#201. A VM disk
+naming a Block claim gets the raw volume. Raw block from third-party CSI drivers
+is refused (`docs/csi.md`). Sizes go to stormblock as `<MiB>M`, since it has no
+`P` suffix.
+
+Capacity reservation/overcommit protection is not implemented (#62); the owner
+has decided its policy (#108: the class size counts at bind, overcommit ratio
+1.0, class-sized clones).
 See [service volume objects](docs/node-volumes.md) for the PV/PVC mirror.
 
 ### Virtual machine disks
@@ -387,13 +404,17 @@ stormcentral as a Job (`test/rustkube-node-test.yaml`):
     stormcentral test run rustkube-node medium --url http://stormcentral.g8.lo
 
 - **medium** (< 30 min): claims of the built-in `stormblock` class (#64).
-  - It makes a claim at every size class (1Mi … 1Ti) and at arbitrary sizes:
-    1 byte, 1Mi+1, 17Mi, 1500M, 3.5Gi and 600Gi. The claims run in parallel.
+  - It makes a claim at every filesystem size class (1Mi … 16Ti) and at
+    arbitrary sizes: 1 byte, 1Mi+1, 17Mi, 1500M, 3.5Gi and 600Gi, and raw block
+    claims of 1Mi, 20Ti and 1Pi (`volumeDevices`; the device must be exactly its
+    class). The claims run in parallel.
   - For each one, a pod writes and reads back 64 KiB and checks that `df` is
     within the class the request rounds to. The test then checks that the claim
     is Bound with that class as its status capacity, and deletes the pod and
     the claim. The PV must be reclaimed.
-  - A 2Ti claim must be refused with the reason, and never bound.
+  - A 2Pi claim must be refused with the reason, and never bound; a 20Ti
+    filesystem claim (64Ti class, no ext4 blank yet) must wait naming
+    `volumeMode: Block`.
   - Every case has `RUSTKUBE_NODE_TEST_MINT_BUDGET` (default 1200 s), because a
     class may be minted on first use.
   - Overcommit is reported skip until #62.
