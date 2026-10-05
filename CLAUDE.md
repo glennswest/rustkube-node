@@ -99,8 +99,11 @@ joins a machine-domain spawn to a client-held sandbox (`inline_a`, `ns_fds`), as
        status written (Running + podIP + Ready at start, Succeeded/Failed at end); a terminating launcher Pod
        with no machine here is confirmed deleted (grace 0, uid precondition).
 8. [x] Tests (4 new), docs, CHANGELOG. sc-build `cargo build --locked && cargo test --locked`: 326 kubelet unit pass.
-9. [ ] Golden; #88 proposed after rustkube#203 (the Pod's creator), then the live done-when on the test host
-       (also behind stormcentral#376, test machines' registries full).
+9. [x] rustkube#203 done (golden-rustkube-3397b0cb2d2d). #152 fixed (a318daf: launcher on this node; migration
+       target launchers), golden-rustkube-node-cce2c30dd5c8. Kubelet side complete.
+10. [ ] Live done-when = stormcos_qa#18 (5 pod-network VMs, same-namespace NetworkPolicy), behind
+       stormcentral#55, the Fedora golden, stormcentral#376. `virtctl ssh` via port-forward needs #56. #88 proposed
+       after stormcos_qa#18.
 
 ### Done from this side: #67 (P1), PVC ladder to PiB, raw block volumes, per-class filesystem
 
