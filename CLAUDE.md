@@ -535,7 +535,7 @@ At this checkpoint work was on `turbomode`; #114 supersedes that hold. Read rust
 Merging origin/main conflicts in `kubelet.rs` (turbomode's `pod_loop`/`vm_loop` vs main's #91 address pump,
 #35 `watch_for_node`/`list_for_node`, #53 `snapshots.sync()`): aborted, owner asked on #100 (resolve, or leave).
 
-### In progress: #53 restore (option A, #109), VirtualMachineSnapshot / VirtualMachineRestore
+### Done from this side: #53 snapshot + restore (option A, #109), VirtualMachineSnapshot / VirtualMachineRestore
 
 2026-09-30: owner chose A (a restore rewrites the VirtualMachine's disks to the restored PVCs).
 The text below predates the answer.
@@ -566,14 +566,12 @@ Steps:
 3. [x] Restore: owner chose **A** (#109): the restore rewrites the VirtualMachine's disks to restored PVCs; the
        whole disk set together; seed regenerated only when the VM has cloud-init (it is, each start, #75);
        placement follows the PVs' nodeAffinity.
-4. [ ] (2026-10-05) A Succeeded snapshot records `storm.io/snapshot-disks` (disk → volume id, from the
-       registration: after a stop nothing else maps group members to disks).
-5. [ ] `VirtualMachineRestore`, by the node that took its snapshot: waits for the snapshot Succeeded and the VM
-       stopped (no VMI); per disk (not cloud-init) `volume_from_snapshot` `<ns>.<vm>-<disk>-restore-<r>`
-       (idempotent by name), PVC `<vm>-<disk>-restore-<r>` (Block, bound) + PV (stormblock, this node,
-       Delete); the VM template's volume → `persistentVolumeClaim`; status `complete` + `restores` + Event.
-       Engine behind a seam (`RestoreEngine`), find-or-create everywhere.
-6. [ ] Tests (fake apiserver + engine), docs, CHANGELOG, sc-build, golden, close (live: CRDs stormcos#170).
+4. [x] (2026-10-05) The claim records `storm.io/snapshot-disks` (disk → volume id, `disk_map(reg)`).
+5. [x] `vm_restore.rs`: by the snapshot's node; waits (snapshot Succeeded, VM stopped); per non-cloud-init disk
+       `from_snapshot` + bound Block PVC/PV (Delete, this node); VM template volume → PVC; status + Events;
+       errors said once. `RestoreEngine` seam (`Stormblock` = stormvm_block::Client). 5c4edf2 (+ fix for #153).
+6. [x] Tests (5 new), docs (README "Restores", api.md, status.md), CHANGELOG. sc-build `cargo build --locked
+       && cargo test --locked`: 331 kubelet unit pass. Not run on a node: the CRDs are stormcos#170.
 
 ### Done: #83, the console router is told where stormblock is (the snapshot verb)
 
