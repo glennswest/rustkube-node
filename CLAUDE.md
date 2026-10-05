@@ -380,7 +380,8 @@ waits on the master installing the release (stormcos#164) = #102.
 5. [ ] Real-node measurements = #102; proposed #99 after it (moved behind #102).
        #102 (2026-10-05): pvetest1 day turbomode run 7277704177: sleep request→running p50 4.05 s, p95 61.1 s,
        of which scheduling p95 60.86 s (filed rustkube#205); PVC p95 10.85 s. C2NR0Q2 blocked by registry 507
-       (stormcentral#376). Owner asked on #102: full scale (>30 min) vs stormcentral#325 (A/B/C).
+       (stormcentral#376). Owner (#158): **C**, the day suite on the Dell is the acceptance; full scale scheduled
+       separately at night on a pve VM (reported, not gating). #102 proposed after stormcentral#376.
    Stage golden golden-rustkube-node-e8bca700a793 (bba7d54), release request stormcos#164.
 
 ### Done: #101, events and explicit deadlines instead of sync ticks
@@ -650,7 +651,7 @@ Done: docs/presentation.md, 12 slides, ASCII diagrams (Marp shows Mermaid as sou
 3. [x] Tests (5 new), docs (c79e92c), CHANGELOG. sc-build `cargo build --locked && cargo test --locked`: 336
        kubelet unit pass. Golden, stormimds#12 note, close.
 
-### Waiting on the owner: #40, live migration of stormvm-started VMIs
+### Waiting on stormstorage#44: #40, live migration of stormvm-started VMIs
 
 2026-10-05. Both halves exist: stormvm dc1b7ea `plan::build_receiving`, `Machine::{migrate, receive_migration,
 migration}`; rustkube#184 drives VMI `status.migrationState` (controller: migrationUid/sourceNode; scheduler:
@@ -659,6 +660,10 @@ CRD stormcos#288 (open). **Blocker: the disks.** Migration moves memory only; ev
 source node's stormblock, the target cannot attach it (#142, no NVMe/TCP connect) and stormvm copies no disks.
 A target started normally would clone a fresh root: guest RAM and disk would disagree. Asked on #40: A shared over
 NVMe/TCP (#142; recommended), B copy during migration (blockdev-mirror), C replicas only (#68). No code yet.
+**Owner (#159, 2026-10-05): add a RAID leg on the destination, let it catch up, then move memory.** Needs a storage
+primitive for in-use local volumes (migrate → synced → cut over / abort): filed stormstorage#44; #40 proposed after
+it. Kubelet side then: target waits all disks synced → receiving start on its copies → targetNodeAddress; source
+sends → completed/failed; cut over or abort each disk.
 
 ### In progress: #91, a bridged VM's IP from its tap (stormvm_net::snoop_tap)
 
