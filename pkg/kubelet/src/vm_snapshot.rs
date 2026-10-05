@@ -571,6 +571,20 @@ mod tests {
         (url, log)
     }
 
+    #[test]
+    fn the_disk_map_names_every_disk_with_a_volume() {
+        let reg: Registration = serde_json::from_value(json!({
+            "namespace": "web", "name": "web-1", "uid": "u",
+            "disks": [
+                { "name": "rootdisk", "volume_id": "v-root", "owned": true, "device": "/dev/ublkb1" },
+                { "name": "data", "volume_id": "v-data", "owned": false, "device": "/dev/ublkb2" },
+                { "name": "scratch", "device": "/dev/x" },
+            ],
+        }))
+        .unwrap();
+        assert_eq!(disk_map(&reg), json!({ "rootdisk": "v-root", "data": "v-data" }));
+    }
+
     fn register(run_dir: &str, ns: &str, name: &str) {
         let reg: Registration = serde_json::from_value(json!({
             "namespace": ns, "name": name, "uid": "vmi-uid",
