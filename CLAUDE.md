@@ -535,7 +535,7 @@ At this checkpoint work was on `turbomode`; #114 supersedes that hold. Read rust
 Merging origin/main conflicts in `kubelet.rs` (turbomode's `pod_loop`/`vm_loop` vs main's #91 address pump,
 #35 `watch_for_node`/`list_for_node`, #53 `snapshots.sync()`): aborted, owner asked on #100 (resolve, or leave).
 
-### Decided (#109, option A), restore not started: #53, VirtualMachineSnapshot / VirtualMachineRestore
+### In progress: #53 restore (option A, #109), VirtualMachineSnapshot / VirtualMachineRestore
 
 2026-09-30: owner chose A (a restore rewrites the VirtualMachine's disks to the restored PVCs).
 The text below predates the answer.
@@ -563,9 +563,17 @@ Steps:
        InProgress one of ours not in flight (kubelet restart) is taken again: idempotent by name.
 2. [x] Tests (fake apiserver, injected take), docs (README), CHANGELOG. sc-build at 2b88465: all pass (kubelet 221).
        Not run on a node (CRDs: stormcos#170; needs a running VM). Unreleased.
-3. [ ] Restore: **owner decision**, tracked on #109 (extracted from #53, 2026-09-29). A = restored volumes as PV + PVC, the kubelet
-       patches the VM template's volume to the claim + node affinity (recommended); B = annotation
-       `storm.io/restored-disks` copied by rustkube's VM controller to the VMI. Resume from the answer.
+3. [x] Restore: owner chose **A** (#109): the restore rewrites the VirtualMachine's disks to restored PVCs; the
+       whole disk set together; seed regenerated only when the VM has cloud-init (it is, each start, #75);
+       placement follows the PVs' nodeAffinity.
+4. [ ] (2026-10-05) A Succeeded snapshot records `storm.io/snapshot-disks` (disk → volume id, from the
+       registration: after a stop nothing else maps group members to disks).
+5. [ ] `VirtualMachineRestore`, by the node that took its snapshot: waits for the snapshot Succeeded and the VM
+       stopped (no VMI); per disk (not cloud-init) `volume_from_snapshot` `<ns>.<vm>-<disk>-restore-<r>`
+       (idempotent by name), PVC `<vm>-<disk>-restore-<r>` (Block, bound) + PV (stormblock, this node,
+       Delete); the VM template's volume → `persistentVolumeClaim`; status `complete` + `restores` + Event.
+       Engine behind a seam (`RestoreEngine`), find-or-create everywhere.
+6. [ ] Tests (fake apiserver + engine), docs, CHANGELOG, sc-build, golden, close (live: CRDs stormcos#170).
 
 ### Done: #83, the console router is told where stormblock is (the snapshot verb)
 
