@@ -57,6 +57,23 @@ not the release path.
 
 ## Work plan
 
+### In progress: #88 (P1), a VMI on the pod network gets its own sandbox (stormvm#16)
+
+2026-10-05. stormvm dc1b7ea (in the lock) has `realise(p, Some(netns), …)` (bridge binding: pod IP/MAC off the
+CNI's interface onto `vmbr0` with the tap), `serve_dhcp(netns, lease)` and `Made.binding`. stormpump 30a76d3
+joins a machine-domain spawn to a client-held sandbox (`inline_a`, `ns_fds`), as for a container.
+1. [ ] `vm_network.rs`: per VMI with any `pod` NIC, `sandbox_acquire(PROFILE_ISOLATED)` + CNI ADD (id `vm-<uid>`,
+       pod = the VMI's ns/name/uid), recorded in `/run/rustkube-node/vm-network/<uid>.json` (handle, netns, CNI
+       identity, IP, leases) before ADD; a failed ADD runs DEL; teardown = DEL + `sandbox_release` + file.
+2. [ ] `resolve_nics` realises in the netns; the hypervisor spawns in the sandbox; bridge NICs get a DHCP
+       `Responder` (cluster DNS + ClusterFirst search, hostname), held per uid.
+3. [ ] Status: `made.binding`, and the pod IP at start for pod NICs (not overwritten by agent/neighbour).
+4. [ ] Released when the machine ends, on a failed start, and at deletion; after a kubelet restart the record
+       restarts DHCP for adopted machines and releases records with no machine.
+5. [ ] Tests, docs (README VM section, status.md), CHANGELOG; sc-build; golden.
+Open, cross-component: a VMI has no Pod, so Cilium's endpoint labels (from the Pod named in CNI ADD) and
+Service/EndpointSlice selection have nothing to read. Raise on the issue at the end.
+
 ### Done from this side: #67 (P1), PVC ladder to PiB, raw block volumes, per-class filesystem
 
 2026-10-05. Owner (#67, 09-25): large classes stay **ext4** unless stormcos#91 says otherwise; Block for single
