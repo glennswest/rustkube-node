@@ -13,6 +13,8 @@ pub const MIB: u64 = 1 << 20;
 
 /// Where a workload pod sees its claim.
 pub const FS_PATH: &str = "/data";
+/// Where a workload pod sees a raw block claim (`volumeDevices`, #67).
+pub const DEV_PATH: &str = "/dev/xvda";
 
 pub fn pvcs(env: &Env) -> String {
     format!("/api/v1/namespaces/{}/persistentvolumeclaims", env.namespace)
@@ -41,6 +43,24 @@ pub fn claim(env: &Env, name: &str, request: &str) -> Value {
             "resources": { "requests": { "storage": request } },
         },
     })
+}
+
+/// A claim like [`claim`] of `volumeMode: Block`: a raw device, no filesystem.
+pub fn block_claim(env: &Env, name: &str, request: &str) -> Value {
+    let mut c = claim(env, name, request);
+    c["spec"]["volumeMode"] = json!("Block");
+    c
+}
+
+/// [`work`], with the claim a raw block device at [`DEV_PATH`]
+/// (`volumeDevices`) and that path given to the workload.
+pub fn work_device(env: &Env, name: &str, claim: &str, mode: &str, args: &[String]) -> Value {
+    let mut p = work(env, name, claim, mode, args);
+    let c = &mut p["spec"]["containers"][0];
+    c["args"][1] = json!(DEV_PATH);
+    c.as_object_mut().unwrap().remove("volumeMounts");
+    c["volumeDevices"] = json!([{ "name": "claim", "devicePath": DEV_PATH }]);
+    p
 }
 
 /// A pod running this image's workload `args` (after the mode, the claim's

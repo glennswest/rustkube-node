@@ -13,7 +13,13 @@
 //! 3. pod and claim deleted, and the PV is gone (reclaimed: the clone deleted
 //!    on the node).
 //!
-//! **Above the ladder** (2Ti): refused, not stuck. The pod waits with the
+//! **Raw block** (`volumeMode: Block`, #67): claims of 1Mi, 20Ti (the 64Ti
+//! class) and 1Pi, each a device at `volumeDevices[].devicePath`; the pod
+//! writes and reads back at offset 0 and the device is exactly its class.
+//! A 20Ti *filesystem* claim rounds to 64Ti, which has no ext4 blank yet: it
+//! waits with the reason, which names `volumeMode: Block`.
+//!
+//! **Above the ladder** (2Pi): refused, not stuck. The pod waits with the
 //! reason ("larger than the largest size class") on its status or in an
 //! Event, and the claim is never Bound.
 //!
@@ -50,19 +56,34 @@ pub const LADDER: &[(&str, u64)] = &[
     ("64Gi", 64 * 1024 * MIB),
     ("256Gi", 256 * 1024 * MIB),
     ("1Ti", 1024 * 1024 * MIB),
+    ("4Ti", 4 * 1024 * 1024 * MIB),
+    ("16Ti", 16 * 1024 * 1024 * MIB),
 ];
 
-/// One claim: a test name and the request, verbatim.
+/// The classes past [`LADDER`]: raw block only, until stormblock can format
+/// ext4 at these sizes (#67).
+pub const BLOCK_ONLY: &[(&str, u64)] = &[
+    ("64Ti", 64 * 1024 * 1024 * MIB),
+    ("256Ti", 256 * 1024 * 1024 * MIB),
+    ("1Pi", 1024 * 1024 * 1024 * MIB),
+];
+
+/// Raw block claims: a test name and the request.
+pub const BLOCK_CASES: &[(&str, &str)] = &[("1mi", "1Mi"), ("20ti", "20Ti"), ("1pi", "1Pi")];
+
+/// One claim: a test name and the request, verbatim, and whether it is a raw
+/// block claim.
 pub struct Case {
     pub name: String,
     pub request: String,
+    pub block: bool,
 }
 
 /// Every class, then the arbitrary sizes. 2Ti is separate (`above-ladder`).
 pub fn cases() -> Vec<Case> {
     let mut v: Vec<Case> = LADDER
         .iter()
-        .map(|(q, _)| Case { name: format!("class-{}", q.to_ascii_lowercase()), request: q.to_string() })
+        .map(|(q, _)| Case { name: format!("class-{}", q.to_ascii_lowercase()), request: q.to_string(), block: false })
         .collect();
     for (name, request) in [
         ("smallest", "1"),
@@ -72,18 +93,22 @@ pub fn cases() -> Vec<Case> {
         ("3.5gi", "3.5Gi"),
         ("600gi", "600Gi"),
     ] {
-        v.push(Case { name: name.into(), request: request.into() });
+        v.push(Case { name: name.into(), request: request.into(), block: false });
+    }
+    for (name, request) in BLOCK_CASES {
+        v.push(Case { name: format!("block-{name}"), request: request.to_string(), block: true });
     }
     v
 }
 
 /// The class a request rounds to, and the class below it (0 for the first):
 /// the filesystem must be larger than `lo` and at most `hi`. `None` above
-/// the ladder.
-pub fn class_range(request: &str) -> Option<(u64, u64)> {
+/// the ladder (for a filesystem, the ext4 classes; for a block claim, all).
+pub fn class_range(request: &str, block: bool) -> Option<(u64, u64)> {
     let want = api::quantity_bytes(request)?;
-    let i = LADDER.iter().position(|(_, b)| *b >= want)?;
-    Some((if i == 0 { 0 } else { LADDER[i - 1].1 }, LADDER[i].1))
+    let all: Vec<(&str, u64)> = LADDER.iter().chain(if block { BLOCK_ONLY } else { &[] }).copied().collect();
+    let i = all.iter().position(|(_, b)| *b >= want)?;
+    Some((if i == 0 { 0 } else { all[i - 1].1 }, all[i].1))
 }
 
 pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
@@ -106,6 +131,15 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
         })
     };
     tasks.push(above);
+    let unformatted = {
+        let (env, api) = (env.clone(), api.clone());
+        tokio::spawn(async move {
+            let t = Instant::now();
+            let o = refused(&env, &api, "sz-fs-20ti", "20Ti", "volumeMode: Block").await;
+            ("pvc-size-filesystem-past-ext4-classes".to_string(), o, t.elapsed().as_millis())
+        })
+    };
+    tasks.push(unformatted);
     for t in tasks {
         match t.await {
             Ok((name, o, ms)) => {
@@ -137,15 +171,23 @@ fn within(env: &Env, want: Duration) -> Duration {
 
 /// Claim `request`, mount, write, check the size, delete, check reclaimed.
 async fn size_case(env: &Env, api: &Api, c: &Case, seed: u64) -> Outcome {
-    let Some((lo, hi)) = class_range(&c.request) else {
+    let Some((lo, hi)) = class_range(&c.request, c.block) else {
         return Outcome::Infra(format!("{} does not round to a class here", c.request));
     };
     let name = format!("sz-{}", c.name.replace('.', "-"));
-    if let Err(e) = api.create(&k8s::pvcs(env), &k8s::claim(env, &name, &c.request)).await {
+    let claim = if c.block { k8s::block_claim(env, &name, &c.request) } else { k8s::claim(env, &name, &c.request) };
+    if let Err(e) = api.create(&k8s::pvcs(env), &claim).await {
         return Outcome::Infra(e);
     }
+    // A raw device is exactly its class: (hi - 1, hi].
+    let lo = if c.block { hi - 1 } else { lo };
     let args = [seed.to_string(), BYTES.to_string(), lo.to_string(), hi.to_string()];
-    if let Err(e) = api.create(&k8s::pods(env), &k8s::work(env, &name, &name, "sized", &args)).await {
+    let pod = if c.block {
+        k8s::work_device(env, &name, &name, "sized", &args)
+    } else {
+        k8s::work(env, &name, &name, "sized", &args)
+    };
+    if let Err(e) = api.create(&k8s::pods(env), &pod).await {
         return Outcome::Infra(e);
     }
     let done = match k8s::pod_done(env, api, &name, within(env, env.mint_budget)).await {
@@ -155,7 +197,7 @@ async fn size_case(env: &Env, api: &Api, c: &Case, seed: u64) -> Outcome {
     if done.phase != "Succeeded" {
         return Outcome::Fail(format!("request {}: pod failed on {}: {}", c.request, done.node, done.message));
     }
-    let class = LADDER.iter().find(|(_, b)| *b == hi).map(|(q, _)| *q).unwrap_or("?");
+    let class = LADDER.iter().chain(BLOCK_ONLY).find(|(_, b)| *b == hi).map(|(q, _)| *q).unwrap_or("?");
 
     // Bound, and saying the class it rounded to.
     let claim_path = format!("{}/{name}", k8s::pvcs(env));
@@ -203,11 +245,15 @@ async fn size_case(env: &Env, api: &Api, c: &Case, seed: u64) -> Outcome {
     }
 }
 
-/// 2Ti: the pod waits with the reason, and the claim is never Bound.
+/// 2Pi: the pod waits with the reason, and the claim is never Bound.
 async fn above_ladder(env: &Env, api: &Api) -> Outcome {
-    const WHY: &str = "larger than the largest size class";
-    let name = "sz-above-ladder";
-    if let Err(e) = api.create(&k8s::pvcs(env), &k8s::claim(env, name, "2Ti")).await {
+    refused(env, api, "sz-above-ladder", "2Pi", "larger than the largest size class").await
+}
+
+/// A filesystem claim of `request` that the node refuses: the pod waits with
+/// a reason containing `why`, and the claim is never Bound.
+async fn refused(env: &Env, api: &Api, name: &str, request: &str, why: &str) -> Outcome {
+    if let Err(e) = api.create(&k8s::pvcs(env), &k8s::claim(env, name, request)).await {
         return Outcome::Infra(e);
     }
     let args = ["1".to_string(), BYTES.to_string(), "0".to_string(), u64::MAX.to_string()];
@@ -220,17 +266,17 @@ async fn above_ladder(env: &Env, api: &Api) -> Outcome {
         let p = api.get(path).await?.ok_or_else(|| "the pod is gone".to_string())?;
         let phase = s(&p, "/status/phase");
         if phase == "Succeeded" || phase == "Failed" || phase == "Running" {
-            return Ok(Err(format!("the pod reached {phase}: a 2Ti claim was given a volume")));
+            return Ok(Err(format!("the pod reached {phase}: a {request} claim was given a volume")));
         }
         let status = format!("{}{}", s(&p, "/status/message"), k8s::waiting(&p));
-        if status.contains(WHY) {
+        if status.contains(why) {
             return Ok(Ok(format!("pod status: {status}")));
         }
         let mut evs = k8s::events_for(env, api, "Pod", name).await?;
         evs.extend(k8s::events_for(env, api, "PersistentVolumeClaim", name).await?);
-        match evs.iter().find(|e| e.contains(WHY)) {
+        match evs.iter().find(|e| e.contains(why)) {
             Some(e) => Ok(Ok(format!("event: {e}"))),
-            None => Err(format!("no reason naming the ladder yet (pod {phase:?}{}; events: {evs:?})", k8s::waiting(&p))),
+            None => Err(format!("no reason containing {why:?} yet (pod {phase:?}{}; events: {evs:?})", k8s::waiting(&p))),
         }
     })
     .await;
@@ -242,7 +288,7 @@ async fn above_ladder(env: &Env, api: &Api) -> Outcome {
         Ok(Ok(why)) if phase != "Bound" => Outcome::Pass(format!("refused: {why}; claim {phase:?}")),
         Ok(Ok(why)) => Outcome::Fail(format!("the reason is given ({why}) but the claim is Bound")),
         Ok(Err(e)) => Outcome::Fail(e),
-        Err(e) => Outcome::Fail(format!("a 2Ti claim is stuck without saying why: {e}")),
+        Err(e) => Outcome::Fail(format!("a {request} claim is stuck without saying why: {e}")),
     }
 }
 
@@ -252,22 +298,28 @@ mod tests {
 
     #[test]
     fn requests_round_to_the_class_above() {
-        assert_eq!(class_range("1"), Some((0, MIB)));
-        assert_eq!(class_range("1Mi"), Some((0, MIB)));
-        assert_eq!(class_range("1048577"), Some((MIB, 16 * MIB)));
-        assert_eq!(class_range("17Mi"), Some((16 * MIB, 64 * MIB)));
-        assert_eq!(class_range("1500M"), Some((1024 * MIB, 4096 * MIB)));
-        assert_eq!(class_range("3.5Gi"), Some((1024 * MIB, 4096 * MIB)));
-        assert_eq!(class_range("600Gi"), Some((256 << 30, 1 << 40)));
-        assert_eq!(class_range("1Ti"), Some((256 << 30, 1 << 40)));
-        assert_eq!(class_range("2Ti"), None);
+        let fs = |q| class_range(q, false);
+        assert_eq!(fs("1"), Some((0, MIB)));
+        assert_eq!(fs("1Mi"), Some((0, MIB)));
+        assert_eq!(fs("1048577"), Some((MIB, 16 * MIB)));
+        assert_eq!(fs("17Mi"), Some((16 * MIB, 64 * MIB)));
+        assert_eq!(fs("1500M"), Some((1024 * MIB, 4096 * MIB)));
+        assert_eq!(fs("3.5Gi"), Some((1024 * MIB, 4096 * MIB)));
+        assert_eq!(fs("600Gi"), Some((256 << 30, 1 << 40)));
+        assert_eq!(fs("1Ti"), Some((256 << 30, 1 << 40)));
+        assert_eq!(fs("2Ti"), Some((1 << 40, 4 << 40)));
+        assert_eq!(fs("16Ti"), Some((4 << 40, 16 << 40)));
+        assert_eq!(fs("20Ti"), None, "no ext4 class past 16Ti yet");
+        assert_eq!(class_range("20Ti", true), Some((16 << 40, 64 << 40)));
+        assert_eq!(class_range("1Pi", true), Some((256 << 40, 1 << 50)));
+        assert_eq!(class_range("2Pi", true), None);
     }
 
     #[test]
     fn every_class_and_the_arbitrary_sizes_are_cases() {
         let c = cases();
-        assert_eq!(c.len(), LADDER.len() + 6);
-        assert!(c.iter().all(|c| class_range(&c.request).is_some()));
+        assert_eq!(c.len(), LADDER.len() + 6 + BLOCK_CASES.len());
+        assert!(c.iter().all(|c| class_range(&c.request, c.block).is_some()));
         // Names are unique, and make valid object names.
         let mut names: Vec<String> = c.iter().map(|c| format!("sz-{}", c.name.replace('.', "-"))).collect();
         assert!(names.iter().all(|n| n.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')));
