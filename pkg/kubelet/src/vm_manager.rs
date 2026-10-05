@@ -3947,6 +3947,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_vm_on_the_pod_network_waits_for_its_launcher_pod() {
+        // Owner's choice B on #88 (rustkube#203): the VM controller makes the
+        // Pod, and the machine waits for it.
+        let pods: Arc<std::sync::Mutex<Value>> = Arc::new(std::sync::Mutex::new(json!({ "items": [] })));
+        let served = pods.clone();
+        let app = axum::Router::new().route(
+            "/api/v1/namespaces/default/pods",
+            axum::routing::get(move |q: axum::extract::RawQuery| {
+                let p = served.lock().unwrap().clone();
+                async move {
+                    assert_eq!(q.0.as_deref(), Some("labelSelector=kubevirt.io%2Fcreated-by%3Du-1"));
+                    axum::Json(p)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let conf = tempfile::tempdir().unwrap();
+        std::fs::write(conf.path().join("05-cilium.conflist"),
+            r#"{"cniVersion":"1.0.0","name":"cilium","plugins":[{"type":"cilium-cni"}]}"#).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), &url)
+            .with_net_store(crate::vm_network::Store::at(dir.path()))
+            .with_cni(Some(cni::CniInvoker::new(conf.path(), vec![])));
+        let spec = spec_of(&pod_vmi("bridge"));
+        match m.acquire_pod_network("u-1", "default", &spec).await {
+            Err(StartFail::Waiting(why)) => assert!(why.contains("launcher Pod") && why.contains("rustkube#203"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        // Made: the start goes on to the engine (none here), nothing recorded.
+        *pods.lock().unwrap() = json!({ "items": [{ "metadata": {
+            "name": "virt-launcher-web-1-abcde", "namespace": "default", "uid": "p-1",
+            "labels": { "kubevirt.io": "virt-launcher", "kubevirt.io/created-by": "u-1" },
+            "ownerReferences": [{ "kind": "VirtualMachineInstance", "uid": "u-1", "controller": true }] } }] });
+        match m.acquire_pod_network("u-1", "default", &spec).await {
+            Err(StartFail::Failed(why)) => assert!(why.contains("no ring"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(crate::vm_network::Store::at(dir.path()).load_all().is_empty());
+    }
+
+    #[tokio::test]
     async fn a_recorded_sandbox_with_no_machine_is_released_after_a_restart() {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::vm_network::Store::at(dir.path());
