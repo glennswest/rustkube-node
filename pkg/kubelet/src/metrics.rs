@@ -108,6 +108,12 @@ fn describe() {
         metrics::Unit::Seconds,
         "Duration in seconds of each phase of a pod start, by phase (storm.io/start-timing)"
     );
+    metrics::describe_gauge!(
+        STORMBLOCK_DATA,
+        metrics::Unit::Bytes,
+        "The node's stormblock data slabs: total, free, committed by claims at their class size, reserve, available for a new claim"
+    );
+    metrics::describe_gauge!(STORMBLOCK_USED, "Percent of the node's stormblock data slabs written");
     metrics::describe_counter!(
         TIMED,
         "Reconciles scheduled by a deadline or a polling fallback rather than an event"
@@ -144,6 +150,12 @@ pub fn observe_relist(seconds: f64) {
 
 /// Work scheduled on a clock rather than by an event (#101).
 pub const TIMED: &str = "kubelet_timed_reconciles_total";
+
+/// The node's stormblock data slabs, by `kind`: `total`, `free`, `committed`
+/// (claims at their class size), `reserve`, `available` for a new claim (#62).
+pub const STORMBLOCK_DATA: &str = "kubelet_stormblock_data_bytes";
+/// Percent of the data slabs written (#62).
+pub const STORMBLOCK_USED: &str = "kubelet_stormblock_data_used_percent";
 
 /// A worker scheduled work with no event behind it. `worker` names it (`pod`,
 /// `vmi`, `system-claims`, …); `cause` is `deadline` (a probe period, a

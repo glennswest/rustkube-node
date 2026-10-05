@@ -275,6 +275,11 @@ pub struct PodManager {
     /// The client for it, carrying the engine's token (#66). The apiserver
     /// client's token means nothing to the engine.
     engine: crate::engine::EngineClient,
+    /// How a claim is charged against the data slabs (#62).
+    storage_policy: crate::capacity::Policy,
+    /// Held from a new claim's capacity check to its volume's creation (#62),
+    /// so two claims cannot both take the last of the room.
+    capacity_lock: tokio::sync::Mutex<()>,
     /// Kubelet state root; per-pod volume dirs live under `<state_root>/pods`.
     /// Overridable in tests. Default `/var/lib/kubelet`.
     state_root: String,
@@ -409,6 +414,8 @@ impl PodManager {
             node_ip: node_ip.to_string(),
             storage_url: crate::engine::DEFAULT_URL.to_string(),
             engine: crate::engine::EngineClient::default(),
+            storage_policy: crate::capacity::Policy::default(),
+            capacity_lock: tokio::sync::Mutex::new(()),
             state_root: "/var/lib/kubelet".to_string(),
             cluster_dns: vec!["10.96.0.10".to_string()],
             cluster_domain: "cluster.local".to_string(),
@@ -594,6 +601,12 @@ impl PodManager {
     /// Use this registry of CSI drivers: the one the kubelet's registration
     /// loop fills.
     /// The node's engine, shared with the rest of the kubelet.
+    /// How claims are charged against the data slabs (#62).
+    pub fn with_storage_policy(mut self, policy: crate::capacity::Policy) -> Self {
+        self.storage_policy = policy;
+        self
+    }
+
     pub fn with_engine(mut self, engine: crate::engine::EngineClient) -> Self {
         self.storage_url = engine.url().to_string();
         self.engine = engine;
@@ -1640,6 +1653,25 @@ impl PodManager {
         let existing = match bound {
             Some(id) => Some(id),
             None => self.storage_volume_id(&name).await,
+        };
+        // **A new volume is charged its class** (#62, #108): refused here as
+        // well as by the scheduler, which static pods and pods written onto
+        // `spec.nodeName` never meet. Held until it is made. An engine that
+        // cannot list its slabs (older than the slab API) is not checked.
+        let _room = if existing.is_none() {
+            let guard = self.capacity_lock.lock().await;
+            match crate::capacity::read(&self.engine, &self.storage_policy).await {
+                Ok(c) if c.total > 0 => {
+                    if let Some(why) = c.refusal(class, class_bytes, &self.storage_policy) {
+                        return Err(ClaimError::Failed(format!("claim {namespace}/{claim}: {why}")));
+                    }
+                }
+                Ok(_) => debug!("no data slab reported; claim {namespace}/{claim} not checked for room"),
+                Err(e) => debug!("claim {namespace}/{claim} not checked for room: {e}"),
+            }
+            Some(guard)
+        } else {
+            None
         };
         let vol_id = match existing {
             Some(id) => id,
@@ -6048,12 +6080,18 @@ pub(crate) mod tests {
     }
 
     async fn claim_world(pvc: Value) -> ClaimWorld {
+        claim_world_with(pvc, None, vec![]).await
+    }
+
+    /// [`claim_world`] whose engine also lists `slabs` (#62) and starts with
+    /// `volumes`.
+    async fn claim_world_with(pvc: Value, slabs: Option<Value>, volumes: Vec<Value>) -> ClaimWorld {
         let calls: Arc<Mutex<Vec<(String, String, Value)>>> = Arc::default();
-        let volumes: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let volumes: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(volumes));
         let log = calls.clone();
         let app = axum::Router::new().fallback(
             move |method: axum::http::Method, uri: axum::http::Uri, body: axum::body::Bytes| {
-                let (log, volumes, pvc) = (log.clone(), volumes.clone(), pvc.clone());
+                let (log, volumes, pvc, slabs) = (log.clone(), volumes.clone(), pvc.clone(), slabs.clone());
                 async move {
                     use axum::http::StatusCode;
                     let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
@@ -6064,6 +6102,7 @@ pub(crate) mod tests {
                         ("GET", p) if p.contains("/persistentvolumeclaims/") => ok(pvc),
                         ("PUT", p) if p.contains("/persistentvolumeclaims/") => ok(body),
                         ("POST", "/api/v1/persistentvolumes") => (StatusCode::CREATED, axum::Json(body)),
+                        ("GET", "/api/v1/slabs") if slabs.is_some() => ok(json!({ "items": slabs })),
                         ("GET", "/api/v1/volumes") => {
                             ok(json!({ "items": volumes.lock().unwrap().clone() }))
                         }
@@ -6136,6 +6175,31 @@ pub(crate) mod tests {
         }
         let calls = w.calls.lock().unwrap().clone();
         assert!(!calls.iter().any(|(m, _, _)| m == "POST"), "nothing made: {calls:?}");
+    }
+
+    #[tokio::test]
+    async fn a_claim_whose_class_does_not_fit_waits_and_nothing_is_made() {
+        // #62: a 1.7 TB data slab with one 1 TiB claim on it has no room for a
+        // second 600Gi claim (its class is 1 TiB), at ratio 1.0.
+        let gi = 1u64 << 30;
+        let slabs = json!([{ "role": "data", "total_bytes": 1700 * gi, "free_bytes": 1690 * gi }]);
+        let first = json!({ "id": "v-1", "name": "pvc-default-first", "role": "data",
+                            "virtual_size_bytes": 1024 * gi, "sealed": false });
+        let w = claim_world_with(raw_claim("600Gi", "Block"), Some(slabs.clone()), vec![first]).await;
+        let mgr = claim_manager(&w);
+        match mgr.provision_claim("default", "raw", "uid-1").await {
+            Err(ClaimError::Failed(why)) => {
+                assert!(why.contains("not enough room") && why.contains("1T class"), "{why}")
+            }
+            other => panic!("{other:?}"),
+        }
+        let calls = w.calls.lock().unwrap().clone();
+        assert!(!calls.iter().any(|(m, _, _)| m == "POST"), "nothing made: {calls:?}");
+
+        // A 256Gi claim fits.
+        let w = claim_world_with(raw_claim("200Gi", "Block"), Some(slabs), vec![]).await;
+        let (dev, _) = claim_manager(&w).provision_claim("default", "raw", "uid-1").await.unwrap();
+        assert_eq!(dev, "/dev/ublkb7");
     }
 
     #[test]

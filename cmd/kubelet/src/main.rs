@@ -96,6 +96,20 @@ struct Cli {
     #[arg(long, env = "POD_WORKERS")]
     pod_workers: Option<usize>,
 
+    /// Committed bytes allowed per byte of the stormblock data slabs: a claim
+    /// is charged its full size class (#62, #108). 1.0 is no overcommit.
+    #[arg(long, env = "STORAGE_OVERCOMMIT", default_value_t = 1.0)]
+    storage_overcommit: f64,
+
+    /// Percent of the stormblock data slabs kept back from claims (#62).
+    #[arg(long, env = "STORAGE_RESERVE_PERCENT", default_value_t = 5.0)]
+    storage_reserve_percent: f64,
+
+    /// Percent of the stormblock data slabs written past which the node warns:
+    /// a SlabFilling Event on its stormblock PVs (#62).
+    #[arg(long, env = "STORAGE_ALERT_PERCENT", default_value_t = 85.0)]
+    storage_alert_percent: f64,
+
     /// Port for the kubelet's inbound HTTP server (/healthz, /metrics, /pods).
     #[arg(long, env = "KUBELET_PORT", default_value_t = 10250)]
     kubelet_port: u16,
@@ -492,6 +506,11 @@ async fn main() -> anyhow::Result<()> {
         cni_conf_dir: (!cli.no_cni).then(|| std::path::PathBuf::from(&cli.cni_conf_dir)),
         engine: engine.clone(),
         pod_workers: cli.pod_workers.unwrap_or_else(kubelet::workload::default_workers).max(1),
+        storage: kubelet::capacity::Policy {
+            overcommit: cli.storage_overcommit,
+            reserve_percent: cli.storage_reserve_percent,
+            alert_percent: cli.storage_alert_percent,
+        },
         ..Default::default()
     };
     let mut kubelet = Kubelet::new(config, runtime, images, migration)?;

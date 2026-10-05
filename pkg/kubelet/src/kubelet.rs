@@ -61,6 +61,8 @@ pub struct KubeletConfig {
     /// This node's stormblock engine, with its token (#66). One client for
     /// every engine call the kubelet makes.
     pub engine: crate::engine::EngineClient,
+    /// How claims are charged against the data slabs, and when to warn (#62).
+    pub storage: crate::capacity::Policy,
 }
 
 impl Default for KubeletConfig {
@@ -88,6 +90,7 @@ impl Default for KubeletConfig {
             pod_manifest_path: Some(std::path::PathBuf::from("/etc/kubernetes/manifests")),
             cni_conf_dir: None,
             engine: crate::engine::EngineClient::default(),
+            storage: crate::capacity::Policy::default(),
         }
     }
 }
@@ -173,6 +176,7 @@ impl Kubelet {
             )
             .with_ca_pem(config.apiserver_ca.clone())
             .with_engine(config.engine.clone())
+            .with_storage_policy(config.storage)
             .with_csi(csi.clone())
             .with_admission(workloads.reservations.clone())
             .with_load(workloads.load.clone()),
@@ -372,6 +376,9 @@ impl Kubelet {
         // engine volume and PV/PVC events (#101).
         tokio::spawn(self.clone().system_claims_loop());
 
+        // The data slabs' room for claims, published and watched (#62).
+        tokio::spawn(self.clone().capacity_loop());
+
         // Reclaim this node's released claims (reclaimPolicy: Delete), on PV
         // events (#101).
         tokio::spawn(self.clone().reclaim_loop());
@@ -507,6 +514,38 @@ impl Kubelet {
                 crate::system_claims::mirror(&self.api_client, &api, &self.config.engine, &self.config.node_name).await;
             }).await;
             drop(work);
+        }
+    }
+
+    /// The node's CSIStorageCapacity and slab gauges (#62), on engine volume
+    /// changes and every minute: written bytes change free space with no
+    /// volume event (counted as a fallback).
+    async fn capacity_loop(self: Arc<Self>) {
+        const PERIOD: Duration = Duration::from_secs(60);
+        let mut volumes = Some(self.engine_volumes.subscribe());
+        let events = (!self.config.api_server_url.is_empty()).then(|| {
+            crate::events::EventRecorder::new(self.api_client.clone(), &self.config.api_server_url, &self.config.node_name)
+        });
+        let mut alerted = false;
+        loop {
+            match crate::capacity::publish(
+                &self.api_client,
+                &self.config.api_server_url,
+                &self.config.engine,
+                &self.config.node_name,
+                &self.config.storage,
+                events.as_ref(),
+                alerted,
+            )
+            .await
+            {
+                Ok(past) => alerted = past,
+                Err(e) => debug!("storage capacity not published: {e}"),
+            }
+            tokio::select! {
+                _ = runtime_changed(&mut volumes) => {}
+                _ = tokio::time::sleep(PERIOD) => crate::metrics::observe_timed("capacity", "fallback"),
+            }
         }
     }
 
