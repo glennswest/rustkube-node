@@ -57,18 +57,21 @@ not the release path.
 
 ## Work plan
 
-### In progress: #119 (P3), metadata at scale (stormcos#54)
+### Done: #119 (P3), metadata at scale (stormcos#54)
 
 2026-10-05. Found: `instance_at` scans every VM and NIC under the `vms` lock and answers from the local record
 even when the cached VMI is missing or places the machine elsewhere. Per-machine reconciliation is already the
 UID executor's (`replace_source` enqueues only UIDs whose intent changed); `desired` is still replaced only by
 the full LIST, and a cluster without the VMI CRD never leaves "cold".
-1. [ ] `Machines`: `vms` keeps an address → uids index, updated on insert/remove/update (only non-terminal
-       machines); `instance_at` answers from it, and refuses an address two machines here claim.
-2. [ ] `reconcile_one` refreshes that UID's cached object (removes it when gone/terminating); CRD 404 marks synced.
-3. [ ] Answer only when the cached object exists, is not terminating, its uid matches, `status.nodeName` is this
-       node and a completed `migrationState` does not name another target node (also covers address reuse).
-4. [ ] Tests, docs (README, api.md, status.md), CHANGELOG; sc-build; close.
+1. [x] `Machines`: `vms` keeps an address → uids index, updated on insert/remove/update (only non-terminal
+       machines; no `DerefMut`); `instance_at` answers from it, and refuses an address two machines here claim.
+2. [x] `reconcile_one` refreshes that UID's cached object (removes it when gone); CRD 404 marks synced.
+3. [x] `placed_here`: cached object exists, not terminating, uid matches, `status.nodeName` is this node, no
+       completed (not failed) `migrationState` to another node. Covers address reuse. Not covered: a node
+       partitioned from the apiserver answers from its last cache (no lease; noted in status.md).
+4. [x] Tests (5 new), docs (README, api.md, status.md), CHANGELOG (3fe7496). sc-build 3fe7496 `cargo build
+       --locked && cargo test --locked`: 301 kubelet unit, 30 proxy, 25 CNI, 1 doc-test pass; exit 0 in 147 s.
+       Not run on a node.
 
 ### Done: #148 (P1), pods wait for the CNI instead of retrying into backoff
 
