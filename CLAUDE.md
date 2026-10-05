@@ -622,6 +622,13 @@ Steps:
        2026-10-05: half 1 is stormcos_qa `vm-waves` (noCloud key, ssh); half 2 filed as stormcos_qa#52. Runs on
        C2NR0Q2 get 507 on the image push (stormcentral#376); #92 proposed after it. Then run vm-waves, close.
 
+### In progress: #55, a presentation of rustkube-node (`docs/presentation.md`, Marp)
+
+2026-10-05. 8–15 slides from current code/docs: purpose; place in stormcos (stormcentral: depends on rustkube,
+stormpump, stormvm; depended on by stormcos, flowsdn); moving parts (diagram); features today (Pods, storage,
+VMs, node services); interfaces; shipping; planned (own slide); status and open issues. Check claims by grep;
+render with marp-cli via sc-build if dev can.
+
 ### Done: #122, host-network metadata by ServiceAccount token; pod-bound tokens
 
 2026-10-05. rustkube#182 (in golden-rustkube-152acbd2a1f0): TokenRequest honours `expirationSeconds` and
