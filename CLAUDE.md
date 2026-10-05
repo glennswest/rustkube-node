@@ -57,22 +57,25 @@ not the release path.
 
 ## Work plan
 
-### In progress: #88 (P1), a VMI on the pod network gets its own sandbox (stormvm#16)
+### Waiting on the owner: #88 (P1), a VMI on the pod network gets its own sandbox (stormvm#16)
 
 2026-10-05. stormvm dc1b7ea (in the lock) has `realise(p, Some(netns), …)` (bridge binding: pod IP/MAC off the
 CNI's interface onto `vmbr0` with the tap), `serve_dhcp(netns, lease)` and `Made.binding`. stormpump 30a76d3
 joins a machine-domain spawn to a client-held sandbox (`inline_a`, `ns_fds`), as for a container.
-1. [ ] `vm_network.rs`: per VMI with any `pod` NIC, `sandbox_acquire(PROFILE_ISOLATED)` + CNI ADD (id `vm-<uid>`,
-       pod = the VMI's ns/name/uid), recorded in `/run/rustkube-node/vm-network/<uid>.json` (handle, netns, CNI
-       identity, IP, leases) before ADD; a failed ADD runs DEL; teardown = DEL + `sandbox_release` + file.
-2. [ ] `resolve_nics` realises in the netns; the hypervisor spawns in the sandbox; bridge NICs get a DHCP
-       `Responder` (cluster DNS + ClusterFirst search, hostname), held per uid.
-3. [ ] Status: `made.binding`, and the pod IP at start for pod NICs (not overwritten by agent/neighbour).
-4. [ ] Released when the machine ends, on a failed start, and at deletion; after a kubelet restart the record
-       restarts DHCP for adopted machines and releases records with no machine.
-5. [ ] Tests, docs (README VM section, status.md), CHANGELOG; sc-build; golden.
-Open, cross-component: a VMI has no Pod, so Cilium's endpoint labels (from the Pod named in CNI ADD) and
-Service/EndpointSlice selection have nothing to read. Raise on the issue at the end.
+1. [x] `vm_network.rs` (record, store, lease round trip, ClusterFirst DNS); `acquire_pod_network`
+       (sandbox_acquire + CNI ADD `vm-<uid>`, recorded first; failed ADD → DEL; no CNI → Waiting) before the
+       deposit window; `release_pod_network` (responders, DEL, sandbox_release, ESTALE ok, record).
+2. [x] `resolve_nics(.., pod)` realises pod NICs in the netns, starts `serve_dhcp` per bridged NIC;
+       `launch` spawns with the sandbox handle (`inline_a`).
+3. [x] Status: `made.binding` (`binding_of` removed); pod NICs report the pod IP from the start, and
+       `absorb_ends` does not replace it.
+4. [x] Released at machine end, failed start, deletion; `adopt_registered` → `restore_pod_networks`.
+       `Kubelet::with_engine(ring, cni)`; main passes an invoker on the same dirs.
+5. [x] Tests (7 new), README, status.md, CHANGELOG (b177a89, the brace fix, 7558936). sc-build of the
+       fix commit `cargo build --locked && cargo test --locked`: 317 kubelet unit pass. Not run on a node.
+6. [ ] **Owner decision, posted on #88:** a VMI has no Pod object, and Cilium labels an endpoint (identity,
+       NetworkPolicy) from the Pod the CNI ADD names; Services/EndpointSlices select Pods. The issue's
+       done-when (policy across five VMs, a Service) needs one.
 
 ### Done from this side: #67 (P1), PVC ladder to PiB, raw block volumes, per-class filesystem
 
