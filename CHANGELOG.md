@@ -2,6 +2,15 @@
 
 ## 2026-10-05
 
+- **feat:** ServiceAccount tokens are bound to their pod (#122, rustkube#182): kube-api-access asks
+  `expirationSeconds: 3607` and `boundObjectRef` (the Pod's name and uid); a projected
+  `serviceAccountToken` passes its own `expirationSeconds` (default 3600) and the Pod. Each token file is
+  written again (atomically) at 80% of the life the apiserver granted, and forgotten with its pod. The
+  unbound request is gone.
+- **feat:** `/vmInstance/{address}` answers a host-network workload (#122): from a node address, with the
+  workload's ServiceAccount token in `X-Storm-Workload-Token`, the kubelet TokenReviews it and answers for
+  the pod the token is bound to (`storm.io/kind: Pod`) when that pod's object has the token's uid, is on
+  this node and is not ending. No token, or any other answer, is the refusal as before.
 - **feat:** `VirtualMachineRestore` (#53, owner's option A on #109): by the node that took the snapshot,
   once the snapshot is Succeeded and the VM stopped, every disk but cloud-init gets a new volume from its
   group member, a bound Block PVC/PV pair pinned to this node, and the VirtualMachine's template volume is
