@@ -2,6 +2,14 @@
 
 ## 2026-10-05
 
+- **feat:** A VMI on the pod network gets its own sandbox (#88, stormvm#16): a stormpump network
+  namespace and a CNI ADD (container `vm-<uid>`), its NICs realised in it (the bridge binding gives the
+  guest the pod IP and MAC), the hypervisor spawned inside it, and a DHCP responder per bridged NIC
+  (pod IP, gateway, cluster DNS, ClusterFirst search, hostname). `status.interfaces[]` reports the pod
+  IP from the start and the binding stormvm chose (`made.binding`; `binding_of` is gone). The sandbox
+  is recorded under `/run/rustkube-node/vm-network/` before the ADD, released (CNI DEL + sandbox
+  release) when the machine ends, on a failed start and at deletion, and restored (DHCP) or released
+  after a kubelet restart. No CNI yet is a wait, as for a pod.
 - **fix:** Every node's service volumes are represented (#59, owner's naming on #107): the PVC is
   `kube-system/<volume>-<node>` and the PV `storm-<volume>-<node>`. Before, the names were the same on
   every node, so only the first node to write them had objects and the others logged a warning. No

@@ -352,6 +352,31 @@ missing on main (#80).
     are kept.
 - Restarting a `running: true` VM whose instance ended is the VM controller's
   job (rustkube#104).
+- **The pod network: a sandbox per VMI** (#88, stormvm#16). A VMI with any NIC
+  on `networks: [{pod: {}}]` gets what a pod sandbox gets
+  (`pkg/kubelet/src/vm_network.rs`):
+  - a network namespace from stormpump (`sandbox_acquire`, the pod profile)
+    and a CNI ADD into it, as container `vm-<uid>` for the VMI's namespace,
+    name and uid, before the deposit window;
+  - its NICs realised there (`stormvm_net::realise(p, Some(netns), …)`): the
+    bridge binding (`pod: {}` with `bridge: {}` or no binding named) moves the
+    pod's address and MAC off the CNI's interface onto a bridge with the tap,
+    so the guest holds the pod IP;
+  - the hypervisor spawned in the sandbox (the engine joins a machine to it as
+    it joins a container), so `masquerade: {}` NATs out of the pod;
+  - a DHCP responder per bridged NIC (`serve_dhcp`), answering only the guest's
+    MAC with the pod IP, gateway, the cluster DNS, the ClusterFirst search list
+    and the VMI's hostname, held for the machine's life;
+  - `status.interfaces[]` has the pod IP from the start and the binding
+    stormvm chose (`bridge`, `masquerade`, `passt`, `host-bridge`); the agent
+    and neighbour table do not replace a pod NIC's address.
+  - The record (sandbox handle, netns, CNI identity, IP, leases) is written to
+    `/run/rustkube-node/vm-network/<uid>.json` before the ADD. Teardown is CNI
+    DEL and the sandbox release, retried until done: when the machine ends,
+    when a start fails after the ADD, and at deletion. A restarted kubelet
+    restarts DHCP for adopted machines and releases records with no machine.
+  - No CNI configured yet (or `--no-cni`) keeps the VMI Pending with the reason,
+    as for a pod; a failed ADD runs DEL and waits.
 - **A guest's address** goes to `status.interfaces[].ipAddress` / `ipAddresses`
   from three sources, in this order:
   - **The tap watcher:** a NIC on one of the node's bridges (`host`,
