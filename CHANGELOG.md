@@ -2,6 +2,14 @@
 
 ## 2026-10-05
 
+- **perf:** A pod scheduled before the CNI agent is up starts as soon as its config appears (#148, Dell
+  on 11.79: coredns 16 attempts over 27 s, CNI → all pods 20–27 s per boot). With no conflist the stormpump
+  runtime no longer acquires and releases a sandbox per attempt (the config is checked first), and the pod
+  is no longer retried on a backoff that reached 10 s: the kubelet watches `--cni-conf-dir` (inotify) and
+  wakes exactly the pods waiting for it, with a 10 s fallback. A CNI ADD that fails once the config is
+  there (agent not serving yet) is retried on a backoff from its own first failure (1 s at first), not from
+  when the pod was first seen. The cilium agent's `attempts=10` is its staged init containers (hostNetwork,
+  woken by each exit), not a network wait.
 - **feat:** kube-proxy talks to a TLS apiserver with a token (#145, for stormcos#265: the flowsdn
   edition has no Service datapath and runs this kube-proxy as a DaemonSet). `--ca-file` /
   `KUBE_PROXY_CA_FILE` and `--token-file` / `KUBE_PROXY_TOKEN_FILE` default to the pod's

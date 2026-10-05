@@ -66,11 +66,13 @@ sandbox, finds no conflist, releases it and retries on `wait_backoff` (a quarter
 the config appears it starts up to 10 s later. A CNI ADD that fails (agent not serving yet) has the same backoff.
 The executor's queue is apimachinery's FIFO with ≥32 workers: a network pod no longer holds a worker long
 enough to delay the agent, so no reorder.
-1. [ ] stormpump runtime: no conflist → `CriError::NetworkNotConfigured`, checked before the sandbox is acquired.
-2. [ ] Pod manager: a pod waiting on the config is woken by the config (event wait, 10 s fallback); an ADD failure
+1. [x] stormpump runtime: no conflist → `CriError::NetworkNotConfigured`, checked before the sandbox is acquired.
+2. [x] Pod manager: a pod waiting on the config is woken by the config (event wait, 10 s fallback); an ADD failure
        retries on a backoff from its first ADD failure, not from when the pod was seen.
-3. [ ] Kubelet: `--cni-conf-dir` watched (inotify, fs_watch); a change wakes only the pods waiting on the network.
-4. [ ] Tests, docs (README, configuration.md, status.md), CHANGELOG; sc-build; stage golden.
+3. [x] Kubelet: `--cni-conf-dir` watched (inotify, fs_watch); a change wakes only the pods waiting on the network.
+4. [x] Tests, docs (README, configuration.md, status.md), CHANGELOG. f1a0c38; sc-build f1a0c38 `cargo build --locked &&
+       cargo test --locked`: 296 kubelet unit (3 new), 4 integration, 25 CNI, 30 proxy pass. Not run on a node.
+5. [ ] Stage golden, release request, close #148 / `stormcentral shipped`.
 
 ### Done: #145 (P0), kube-proxy to a TLS apiserver with a token (stormcos#265, flowsdn edition)
 

@@ -25,7 +25,7 @@ An em dash means there is no environment binding or the value is unset.
 | `--registry` | — | `http://127.0.0.1:5100`; sbregistry (stormblock-registry), which mints image clones, with `--runtime stormpump` |
 | `--stormblock` | `STORMBLOCK_URL` | `http://127.0.0.1:9090`; engine for claims, VM disks and images |
 | `--cri-socket` | `CRI_SOCKET` | CRI auto-detection, or `/run/stormpump.sock` for stormpump |
-| `--cni-conf-dir` | `CNI_CONF_DIR` | `/etc/cni/net.d` |
+| `--cni-conf-dir` | `CNI_CONF_DIR` | `/etc/cni/net.d`; watched (inotify) unless `--no-cni`: a change wakes the Pods waiting for a network config (#148) |
 | `--cni-bin-dir` | `CNI_BIN_DIR` | `/opt/cni/bin` |
 | `--no-cni` | — | `false`; disables the kubelet CNI invoker; see runtime caveat below |
 | `--pod-workers` | `POD_WORKERS` | 16 per CPU, at least 32, at most 256: Pod/VMI passes (starts, checks, teardowns) run at once (#138) |

@@ -127,8 +127,13 @@ sandbox stops. A Pod that finishes (`restartPolicy` Never or OnFailure, every
 container terminated for good, Succeeded or Failed) has its sandbox stopped in
 that pass, so its address goes back to the CNI at once; its container records,
 status and logs stay until the Pod object is deleted (#137).
-Missing configuration or a failed ADD produces `NetworkNotReady`. Host-network
-Pods bypass this. CRI delegates networking to the external runtime. Node Ready
+A Pod with no CNI configuration yet waits Pending ("network is not ready")
+without a sandbox: the config is checked before one is acquired, and the
+kubelet watches `--cni-conf-dir` (inotify), so the Pods waiting on it are
+started as soon as the agent writes its conflist (10 s fallback where the
+directory cannot be watched). A failed ADD (the agent not serving yet) is
+retried on a backoff from its own first failure, 1 s at first (#148).
+Host-network Pods, the CNI agent's own among them, bypass this. CRI delegates networking to the external runtime. Node Ready
 is not yet gated on CNI readiness (#3/#32).
 
 See [configuration and defaults](docs/configuration.md), [ports and APIs](docs/api.md),
