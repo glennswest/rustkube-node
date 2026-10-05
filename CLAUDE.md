@@ -622,6 +622,16 @@ Steps:
        2026-10-05: half 1 is stormcos_qa `vm-waves` (noCloud key, ssh); half 2 filed as stormcos_qa#52. Runs on
        C2NR0Q2 get 507 on the image push (stormcentral#376); #92 proposed after it. Then run vm-waves, close.
 
+### Waiting on the owner: #40, live migration of stormvm-started VMIs
+
+2026-10-05. Both halves exist: stormvm dc1b7ea `plan::build_receiving`, `Machine::{migrate, receive_migration,
+migration}`; rustkube#184 drives VMI `status.migrationState` (controller: migrationUid/sourceNode; scheduler:
+targetNode; target kubelet: receiving start + `targetNodeAddress`; source kubelet: send + completed/failed).
+CRD stormcos#288 (open). **Blocker: the disks.** Migration moves memory only; every VM disk is a volume in the
+source node's stormblock, the target cannot attach it (#142, no NVMe/TCP connect) and stormvm copies no disks.
+A target started normally would clone a fresh root: guest RAM and disk would disagree. Asked on #40: A shared over
+NVMe/TCP (#142; recommended), B copy during migration (blockdev-mirror), C replicas only (#68). No code yet.
+
 ### In progress: #91, a bridged VM's IP from its tap (stormvm_net::snoop_tap)
 
 stormvm 2be5900 (lock moves 1b0d941 → dc1b7ea, `cargo update -p stormvm-net` on dev with
