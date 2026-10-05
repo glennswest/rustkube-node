@@ -2118,11 +2118,7 @@ impl PodManager {
         for src in sources {
             if let Some(sat) = src.get("serviceAccountToken").filter(|v| !v.is_null()) {
                 let path = sat["path"].as_str().unwrap_or("token");
-                let sa = pod["spec"]["serviceAccountName"]
-                    .as_str()
-                    .unwrap_or("default");
                 let aud = sat["audience"].as_str();
-                let _ = sa;
                 // Bound to the pod, for the projection's own lifetime
                 // (upstream's default 3600 s), refreshed at 80% (#122).
                 let secs = sat["expirationSeconds"].as_i64().unwrap_or(3600).max(600);
@@ -2160,19 +2156,10 @@ impl PodManager {
         Ok(())
     }
 
-    /// Request a ServiceAccount token via the TokenRequest API (best-effort;
-    /// None if the apiserver doesn't support it or the call fails).
-    async fn request_sa_token(
-        &self,
-        namespace: &str,
-        sa: &str,
-        audience: Option<&str>,
-    ) -> Option<String> {
-        self.request_bound_token(namespace, sa, audience, None, None).await.map(|(t, _)| t)
-    }
-
-    /// A token bound to `pod` (`kind: Pod`, name, uid) for `expiration_secs`
-    /// (#122, rustkube#182), and when it expires: what upstream's kubelet asks
+    /// A ServiceAccount token via the TokenRequest API (best-effort; `None`
+    /// if the apiserver doesn't support it or the call fails), bound to `pod`
+    /// (`kind: Pod`, name, uid) for `expiration_secs` (#122, rustkube#182),
+    /// and when it expires: what upstream's kubelet asks
     /// for, so the apiserver can tie the token to the pod's life and a
     /// TokenReview names the pod.
     async fn request_bound_token(
@@ -2387,12 +2374,8 @@ impl PodManager {
         }
         let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
         let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default");
-        let sa = pod["spec"]["serviceAccountName"]
-            .as_str()
-            .unwrap_or("default");
 
         let dir = pod_volume_dir(&self.state_root, uid, "secret", "kube-api-access");
-        let _ = sa;
         let written = (|| -> std::io::Result<()> {
             std::fs::create_dir_all(&dir)?;
             std::fs::write(format!("{dir}/namespace"), namespace)?;
