@@ -2,6 +2,12 @@
 
 ## 2026-10-05
 
+- **feat:** A pod-network VMI adopts its launcher Pod (#88, owner's choice B; the Pod is made by
+  rustkube's VM controller, rustkube#203): the VMI waits for a Pod labelled `kubevirt.io: virt-launcher`
+  and `kubevirt.io/created-by: <vmi uid>` and owned by it; the CNI ADD names that Pod, so Cilium labels
+  the endpoint from it; the kubelet writes its status (`Running`, `podIP`, Ready; `Succeeded`/`Failed`
+  at the end) so Services select the VM; such Pods never reach the pod manager, wake their VMI when
+  they appear, and are confirmed deleted (grace 0, uid precondition) once no machine of their VMI runs.
 - **fix:** The test container runs under stormcentral's real runner (#97; found checking #91). The runner
   builds the Job itself, so: the workload image is the run's own pod's (`test` container), else the
   standard's `test-rustkube-node-<suite>:<commit12>`, with `RUSTKUBE_NODE_TEST_IMAGE` only an override;

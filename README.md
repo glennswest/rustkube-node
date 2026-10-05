@@ -399,6 +399,16 @@ missing on main (#80).
     restarts DHCP for adopted machines and releases records with no machine.
   - No CNI configured yet (or `--no-cni`) keeps the VMI Pending with the reason,
     as for a pod; a failed ADD runs DEL and waits.
+  - **Its launcher Pod** (owner's choice on #88; made by rustkube's VM
+    controller, rustkube#203): a Pod labelled `kubevirt.io: virt-launcher` and
+    `kubevirt.io/created-by: <vmi uid>`, owned by the VMI, on this node. The
+    VMI waits for it. The CNI ADD names that Pod (its namespace, name and uid),
+    so Cilium labels the endpoint from it (the VMI's labels, so NetworkPolicy
+    applies), and the kubelet writes its status: `Running` with `podIP` and
+    Ready at start, `Succeeded`/`Failed` at the end, so Services select the VM.
+    The pod manager never runs it. A terminating launcher Pod with no machine
+    of its VMI here is confirmed deleted. Every VMI has its own sandbox and
+    launcher Pod, so a namespace holds any number of VMs.
 - **A guest's address** goes to `status.interfaces[].ipAddress` / `ipAddresses`
   from three sources, in this order:
   - **The tap watcher:** a NIC on one of the node's bridges (`host`,
