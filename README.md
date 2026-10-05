@@ -402,7 +402,9 @@ missing on main (#80).
     as for a pod; a failed ADD runs DEL and waits.
   - **Its launcher Pod** (owner's choice on #88; made by rustkube's VM
     controller, rustkube#203): a Pod labelled `kubevirt.io: virt-launcher` and
-    `kubevirt.io/created-by: <vmi uid>`, owned by the VMI, on this node. The
+    `kubevirt.io/created-by: <vmi uid>`, owned by the VMI, on this node (during
+    a migration the target node has its own; each node takes the one on it,
+    #152). The
     VMI waits for it. The CNI ADD names that Pod (its namespace, name and uid),
     so Cilium labels the endpoint from it (the VMI's labels, so NetworkPolicy
     applies), and the kubelet writes its status: `Running` with `podIP` and

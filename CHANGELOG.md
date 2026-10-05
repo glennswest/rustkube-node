@@ -2,6 +2,9 @@
 
 ## 2026-10-05
 
+- **fix:** A VMI's launcher Pod is the one on this node (#152): during a live migration rustkube gives the
+  target node its own launcher (rustkube#203, `kubevirt.io/migrationJobUID`), and `launcher_for` took the
+  first live one, so a target could have named the source's Pod in its CNI ADD and status.
 - **docs:** `docs/presentation.md`, a 12-slide Marp deck on rustkube-node's purpose and functionality (#55):
   what it is, where it sits in stormcos (stormcentral's relationships), how it works, what it does today
   (Pods, storage, VMs, node services), interfaces, shipping, planned work on its own slide, and status.

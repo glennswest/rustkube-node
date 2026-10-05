@@ -155,11 +155,15 @@ pub fn launcher_of(pod: &serde_json::Value) -> Option<&str> {
     is_launcher(pod).then(|| pod["metadata"]["labels"][CREATED_BY].as_str()).flatten().filter(|u| !u.is_empty())
 }
 
-/// The live launcher Pod for VMI `uid` among `pods`: one created by it and
-/// owned by it, not being deleted.
-pub fn launcher_for<'a>(pods: &'a [serde_json::Value], uid: &str) -> Option<&'a serde_json::Value> {
+/// The live launcher Pod for VMI `uid` on `node` among `pods`: one created
+/// by it and owned by it, placed on this node, not being deleted. During a
+/// live migration the target node has a launcher of its own (rustkube#203,
+/// `kubevirt.io/migrationJobUID`), so a VMI can have two; each node takes
+/// its own (#152).
+pub fn launcher_for<'a>(pods: &'a [serde_json::Value], uid: &str, node: &str) -> Option<&'a serde_json::Value> {
     pods.iter().find(|p| {
         launcher_of(p) == Some(uid)
+            && p["spec"]["nodeName"].as_str() == Some(node)
             && p["metadata"]["deletionTimestamp"].is_null()
             && p["metadata"]["ownerReferences"]
                 .as_array()
@@ -370,17 +374,28 @@ mod tests {
         serde_json::json!({ "metadata": {
             "name": "virt-launcher-web-1-abcde", "namespace": "default", "uid": "p-1",
             "labels": { "kubevirt.io": "virt-launcher", "kubevirt.io/created-by": uid, "app": "web" },
-            "ownerReferences": [{ "kind": "VirtualMachineInstance", "uid": owner, "controller": true }] } })
+            "ownerReferences": [{ "kind": "VirtualMachineInstance", "uid": owner, "controller": true }] },
+            "spec": { "nodeName": "n1" } })
     }
 
     #[test]
     fn the_launcher_pod_is_found_by_its_vmi_and_owner() {
         let pods = vec![launcher("u-2", "u-2"), launcher("u-1", "u-1")];
-        assert_eq!(launcher_for(&pods, "u-1").unwrap()["metadata"]["uid"], "p-1");
-        assert!(launcher_for(&[launcher("u-1", "other")], "u-1").is_none(), "owned by another");
+        assert_eq!(launcher_for(&pods, "u-1", "n1").unwrap()["metadata"]["uid"], "p-1");
+        assert!(launcher_for(&[launcher("u-1", "other")], "u-1", "n1").is_none(), "owned by another");
+        // A migration's target launcher (rustkube#203) is the target node's;
+        // each node takes its own (#152).
+        let mut target = launcher("u-1", "u-1");
+        target["metadata"]["uid"] = serde_json::json!("p-target");
+        target["metadata"]["labels"]["kubevirt.io/migrationJobUID"] = serde_json::json!("m-1");
+        target["spec"]["nodeName"] = serde_json::json!("n2");
+        let both = vec![target, launcher("u-1", "u-1")];
+        assert_eq!(launcher_for(&both, "u-1", "n1").unwrap()["metadata"]["uid"], "p-1");
+        assert_eq!(launcher_for(&both, "u-1", "n2").unwrap()["metadata"]["uid"], "p-target");
+        assert!(launcher_for(&both, "u-1", "n3").is_none());
         let mut going = launcher("u-1", "u-1");
         going["metadata"]["deletionTimestamp"] = serde_json::json!("2026-10-05T00:00:00Z");
-        assert!(launcher_for(&[going.clone()], "u-1").is_none());
+        assert!(launcher_for(&[going.clone()], "u-1", "n1").is_none());
         assert_eq!(launcher_of(&going), Some("u-1"));
         assert!(!is_launcher(&serde_json::json!({ "metadata": { "labels": { "app": "x" } } })));
     }

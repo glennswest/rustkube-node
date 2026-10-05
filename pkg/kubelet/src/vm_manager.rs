@@ -2537,7 +2537,7 @@ impl VmManager {
         }
         let list: Value = r.json().await.map_err(|e| format!("listing pods: {e}"))?;
         let pods = list["items"].as_array().cloned().unwrap_or_default();
-        Ok(crate::vm_network::launcher_for(&pods, uid).cloned())
+        Ok(crate::vm_network::launcher_for(&pods, uid, &self.node_name).cloned())
     }
 
     /// Write the machine's state onto its launcher Pod (rustkube#203):
@@ -4029,7 +4029,8 @@ mod tests {
         *pods.lock().unwrap() = json!({ "items": [{ "metadata": {
             "name": "virt-launcher-web-1-abcde", "namespace": "default", "uid": "p-1",
             "labels": { "kubevirt.io": "virt-launcher", "kubevirt.io/created-by": "u-1" },
-            "ownerReferences": [{ "kind": "VirtualMachineInstance", "uid": "u-1", "controller": true }] } }] });
+            "ownerReferences": [{ "kind": "VirtualMachineInstance", "uid": "u-1", "controller": true }] },
+            "spec": { "nodeName": "n1" } }] });
         match m.acquire_pod_network("u-1", "default", &spec).await {
             Err(StartFail::Failed(why)) => assert!(why.contains("no ring"), "{why}"),
             other => panic!("{other:?}"),
