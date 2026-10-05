@@ -2,6 +2,8 @@
 
 ## 2026-10-05
 
+- **docs:** presentation: the launcher Pod (rustkube#203) moved from Planned to what works; pod-network VMs'
+  live proof is stormcos_qa#18 (#55, #88).
 - **fix:** A VMI's launcher Pod is the one on this node (#152): during a live migration rustkube gives the
   target node its own launcher (rustkube#203, `kubevirt.io/migrationJobUID`), and `launcher_for` took the
   first live one, so a target could have named the source's Pod in its CNI ADD and status.

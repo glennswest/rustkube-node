@@ -130,7 +130,8 @@ KubeVirt `VirtualMachineInstance`s, run through stormvm and the ring (`vm_manage
 - **Disks:** golden clones, cloud-init seeds, emptyDisks and claims; disks outlive the VMI and belong to
   the VirtualMachine (#75); failed starts retried with backoff (#76)
 - **NICs:** node bridges with the guest's address read off its tap (#91); **pod network** with its own
-  sandbox, CNI ADD, the hypervisor in it, DHCP for the guest and the pod IP in status (#88)
+  sandbox, CNI ADD, the hypervisor in it, DHCP for the guest and the pod IP in status, under the
+  VMI's launcher Pod from rustkube's VM controller, so Cilium policy and Services apply (#88, #152)
 - **Adoption:** machines survive a kubelet restart and are adopted; deletion stops them (#35)
 - **`accessCredentials`:** keys into the seed and through the guest agent (#92)
 - **Snapshots and restores:** `VirtualMachineSnapshot` (one stormblock group snapshot) and
@@ -187,8 +188,8 @@ Full lists: `docs/api.md`, `docs/configuration.md`, `docs/metrics.md`.
 ## Planned (not in the code yet)
 
 - **Live migration** of stormvm machines: waits on how a target reaches the disks (owner decision on #40)
-- **A launcher Pod per pod-network VMI** from rustkube's VM controller, which the kubelet already adopts
-  (rustkube#203)
+- **Pod-network VMs on a live node:** the code is done on both sides (the kubelet adopts rustkube's
+  launcher Pod, rustkube#203); the proof is stormcos_qa#18's namespace-isolation run (#88)
 - **ext4 for the 64Ti–1Pi classes** once stormblock carries the fixed formatter (#149, stormblock#289)
 - **exec / attach / port-forward** (#56); image config (Entrypoint/Cmd/Env/User) under the pod spec (#98)
 - **Mount propagation for CSI** (#81); restartable init sidecars (#111); CNI-gated Node Ready (#3/#32)
