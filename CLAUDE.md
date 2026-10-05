@@ -375,6 +375,9 @@ waits on the master installing the release (stormcos#164) = #102.
 4. [x] sc-build db9b783: 269 kubelet unit, 4 integration, 25 CNI, 17 proxy,
    1 doc-test pass (1 ignored). Acceptance table in docs/event-driven-design.md.
 5. [ ] Real-node measurements = #102; proposed #99 after it (moved behind #102).
+       #102 (2026-10-05): pvetest1 day turbomode run 7277704177: sleep request→running p50 4.05 s, p95 61.1 s,
+       of which scheduling p95 60.86 s (filed rustkube#205); PVC p95 10.85 s. C2NR0Q2 blocked by registry 507
+       (stormcentral#376). Owner asked on #102: full scale (>30 min) vs stormcentral#325 (A/B/C).
    Stage golden golden-rustkube-node-e8bca700a793 (bba7d54), release request stormcos#164.
 
 ### Done: #101, events and explicit deadlines instead of sync ticks
