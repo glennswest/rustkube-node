@@ -68,6 +68,8 @@ and `remove_pod_sandbox` then waits on that record forever (pod deletion stuck t
        absorb_exits); `remove_pod_sandbox` retries its sandbox's pending removals first.
 2. [x] Test (1 new, no engine), CHANGELOG (1afb7e4). sc-build 1afb7e4 `cargo test --locked`: 340 kubelet unit,
        25 CNI, 30 proxy, integration and doc-tests pass. Not run on a node.
+3. [x] Stage golden golden-rustkube-node-ddcdf8b8bb73 (8664370); stage filed no release request (commented on
+       stormcentral#117); `stormcentral shipped`. #143's golden 65e3c3c shipped in 11.88 (stormcos#305).
 
 ### Done from this side: #143 (P1), pull_image binds its registry clone (stormblock#267)
 
