@@ -63,9 +63,11 @@ not the release path.
 stormpump#59: pods get the runtime's 14 + their `add`, boot.d services the full set). The lock's stormpump
 (30a76d3) cannot move until stormvm#65 either.
 1. [x] Now: `securityContext.capabilities.drop` parsed (`ContainerConfig.drop_capabilities`) and forwarded on the
-       CRI gRPC path (`Capability.drop_capabilities`), which also ignored it. Test, docs, CHANGELOG.
+       CRI gRPC path (`Capability.drop_capabilities`), which also ignored it. Test, docs, CHANGELOG. c934c5f; sc-build
+       `cargo build --locked && cargo test --locked`: 340 kubelet unit + CRI round trip pass. No golden (CRI path only).
 2. [ ] After stormpump#47 (and stormvm#65 for the lock): map add/drop/privileged into `Spec`'s field in `spec_for`;
-       test `CapEff` (NET_ADMIN added, NET_RAW dropped). Propose #118 after stormpump#47.
+       test `CapEff` (NET_ADMIN added, NET_RAW dropped). #118 proposed after stormpump#47 (commented there: names
+       add/drop + privileged, or a resolved mask if the engine prefers).
 
 ### Done from this side: #90 (P1), descriptors in PID 1: refused workload release after a stop
 
