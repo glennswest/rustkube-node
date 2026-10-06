@@ -81,6 +81,9 @@ every suite needs to resolve STORM_NODE). Pods are pinned with `spec.nodeName` (
        2434af9cf2 (C2NR0Q2; pvetest1 erroring: no VM 3101). Earlier medium fff1f4d9d9 (65e3c3c): the Dell's
        apiserver stopped answering mid-run (no results; 6443 refused after). If 2434af9cf2 does it again, suspect
        the storage cases' load and file it. Close #61 on their results.
+       Both errored: the Dell's apiserver is down (stormcos#337: engine :9090 and :6443 gone since 20:55Z, reinstall
+       queued; commented that fff1f4d9d9 already lost the apiserver at 17:35Z). Now queued: short 6ab7e3709e
+       (pvetest2), medium 1538b1fa13 (pvetest2), short 48f97966b0 (server1).
 
 ### Waiting on stormpump#47: #118 (P2), pod capabilities onto the ring
 
