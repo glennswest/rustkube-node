@@ -67,10 +67,11 @@ stormcos shipping path. Its packages do not establish a tested deployment.
 
 ## Runtime acceptance
 
-`test/` is a separate workspace and test-container build. Its medium suite
-exercises the built-in PVC size ladder; short/long remain skip-only (#61),
-overcommit is checked against the node's published capacity (#62), and runner
-image injection remains #97.
+`test/` is a separate workspace and test-container build with all three suites
+(#61): short (Node Ready, a pod's run, exit code, log and delete), medium (pod
+features and failure paths, the built-in PVC size ladder, overcommit against
+the node's published capacity #62, node volumes #59) and long (night waves of
+pods at the node's capacity, start latency and residue per wave).
 Run Jobs through stormcentral on capability-matched test machines; never infer
 live behavior from unit tests or hardcode a machine. See README and
 [status](status.md) for outstanding acceptance.

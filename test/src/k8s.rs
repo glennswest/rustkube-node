@@ -27,7 +27,11 @@ pub fn events(env: &Env) -> String {
 }
 pub const PVS: &str = "/api/v1/persistentvolumes";
 
-fn labels(env: &Env) -> Value {
+pub fn configmaps(env: &Env) -> String {
+    format!("/api/v1/namespaces/{}/configmaps", env.namespace)
+}
+
+pub fn labels(env: &Env) -> Value {
     json!({ "storm.io/test-run": env.run_id, "storm.io/test-of": "rustkube-node" })
 }
 
@@ -87,6 +91,63 @@ pub fn work(env: &Env, name: &str, claim: &str, mode: &str, args: &[String]) -> 
             "volumes": [{ "name": "claim", "persistentVolumeClaim": { "claimName": claim } }],
         },
     })
+}
+
+/// A pod of this image running workload `args`, pinned to the test node by
+/// `spec.nodeName` (the kubelet is under test, not the scheduler), with no
+/// ServiceAccount token, as uid 0 with no capabilities. `restartPolicy`
+/// Never; the caller adjusts the rest.
+pub fn pod(env: &Env, name: &str, args: &[&str]) -> Value {
+    json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": { "name": name, "namespace": env.namespace, "labels": labels(env) },
+        "spec": {
+            "nodeName": env.node_name,
+            "restartPolicy": "Never",
+            "automountServiceAccountToken": false,
+            "terminationGracePeriodSeconds": 10,
+            "containers": [container(env, "main", args)],
+        },
+    })
+}
+
+/// One container of this image running workload `args`.
+pub fn container(env: &Env, name: &str, args: &[&str]) -> Value {
+    json!({
+        "name": name,
+        "image": env.image,
+        "imagePullPolicy": "IfNotPresent",
+        "args": args,
+        "securityContext": { "runAsUser": 0, "allowPrivilegeEscalation": false, "capabilities": { "drop": ["ALL"] } },
+    })
+}
+
+/// A pod's container log, through the apiserver (which asks the kubelet).
+pub async fn log(env: &Env, api: &Api, pod: &str, previous: bool) -> Result<String, String> {
+    let path = format!("{}/{pod}/log{}", pods(env), if previous { "?previous=true" } else { "" });
+    match api.get(&path).await? {
+        Some(Value::String(t)) => Ok(t),
+        Some(v) => Ok(v.to_string()),
+        None => Err(format!("{path}: not found")),
+    }
+}
+
+/// Wait until pod `name` is Running with every container ready or started.
+pub async fn pod_running(env: &Env, api: &Api, name: &str, within: Duration) -> Result<Value, String> {
+    let path = format!("{}/{name}", pods(env));
+    until(within, || {
+        let path = path.clone();
+        async move {
+            let p = api.get(&path).await?.ok_or_else(|| format!("pod {name} is gone"))?;
+            let running = p.pointer("/status/containerStatuses/0/state/running").is_some();
+            if s(&p, "/status/phase") == "Running" && running {
+                Ok(p)
+            } else {
+                Err(format!("pod {name} is {:?}{}", s(&p, "/status/phase"), waiting(&p)))
+            }
+        }
+    })
+    .await
 }
 
 /// The Node's name for `node`, which the runner gives as an address
@@ -246,7 +307,7 @@ pub async fn drain(env: &Env, api: &Api, within: Duration) -> Result<Vec<String>
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     #[test]

@@ -3,26 +3,33 @@
 //! rustkube-node is the kubelet (and kube-proxy). The suites test it from
 //! outside, through the Kubernetes API only:
 //!
+//! - `short` (< 2 min): the node is Ready and the kubelet runs a pod, reports
+//!   its exit code, serves its log and stops it on delete (`short.rs`, #61).
 //! - `medium` (< 30 min): claims of the built-in `stormblock` class at every
-//!   size class and at arbitrary sizes, end to end (`medium.rs`, #64), and
-//!   the node's own volumes as complete PV + PVC pairs (`node_volumes.rs`, #59).
-//! - `short` and `long`: not written yet (#61). Each reports one skip, which
-//!   never counts as a pass.
+//!   size class and at arbitrary sizes, end to end (`medium.rs`, #64), the
+//!   node's own volumes as complete PV + PVC pairs (`node_volumes.rs`, #59),
+//!   and pod features and failure paths (`pods.rs`, #61).
+//! - `long` (the night): waves of pods sized from the node's capacity,
+//!   measuring start latency and what each wave leaves behind (`long.rs`).
 //!
 //! The workload pods run this same image in its workload modes, so a run
 //! pulls nothing but its own image. Where the built-in class is not there (no
-//! StorageClass `stormblock` of `stormblock.storm.io`), the suite reports one
-//! skip.
+//! StorageClass `stormblock` of `stormblock.storm.io`), medium's storage cases
+//! report one skip and long's waves carry no claims.
 
 pub mod api;
 pub mod env;
 pub mod k8s;
+pub mod long;
 pub mod medium;
 pub mod node_volumes;
+pub mod pods;
 pub mod report;
+pub mod short;
 pub mod workload;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use env::Env;
 use report::{Outcome, Report};
@@ -51,24 +58,25 @@ pub async fn run(env: Arc<Env>, r: &mut Report) {
     }
     let env = Arc::new(e);
     match env.suite.as_str() {
+        "short" => short::run(env, api, r).await,
         "medium" => {
+            // The pod cases need nothing but this image: they run whether or
+            // not the storage class is here.
+            let pod_cases = tokio::spawn(pods::run(env.clone(), api.clone()));
             match k8s::no_builtin_class(&api).await {
                 Err(e) => r.record("builtin-class", Outcome::Infra(e), 0, None),
                 Ok(Some(why)) => r.record("builtin-class", Outcome::Skip(why), 0, None),
                 Ok(None) => {
-                    Box::pin(medium::run(env, api, r)).await;
-                    true
+                    Box::pin(medium::run(env, api, r, pod_cases)).await;
+                    return;
                 }
             };
+            medium::record_pod_cases(pod_cases, r).await;
+            if let Err(e) = k8s::drain(&env, &api, Duration::from_secs(5)).await {
+                r.record("cleanup", Outcome::Infra(e), 0, None);
+            }
         }
-        "short" | "long" => {
-            r.record(
-                &format!("{}-suite", env.suite),
-                Outcome::Skip(format!("rustkube-node's {} suite is not written yet (rustkube-node#61)", env.suite)),
-                0,
-                None,
-            );
-        }
+        "long" => Box::pin(long::run(env, api, r)).await,
         other => {
             r.record("suite", Outcome::Infra(format!("STORM_SUITE {other:?} is not short, medium or long")), 0, None);
         }

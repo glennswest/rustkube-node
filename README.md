@@ -481,9 +481,28 @@ builds its static binary on the build box, and `test/Containerfile` copies it
 into a scratch image. The image is started as `/test <suite>` and run by
 stormcentral as a Job (`test/rustkube-node-test.yaml`):
 
-    stormcentral test run rustkube-node medium --url http://stormcentral.g8.lo
+    stormcentral test run rustkube-node short --tag <machine> --url http://stormcentral.g8.lo
 
-- **medium** (< 30 min): claims of the built-in `stormblock` class (#64).
+Every pod a suite makes is pinned to the test node (`spec.nodeName`): the
+kubelet is under test, not the scheduler.
+
+- **short** (< 2 min, the release gate, #61): needs nothing a machine may lack.
+  - `node-ready`: the Node is Ready, its heartbeat is under 120 s old, its
+    kubelet reports a version, and no pressure condition is True.
+  - `pod-runs`: a pod runs to Succeeded with exit code 0 and a pod IP, and its
+    log reads back through the apiserver.
+  - `pod-exit-code`: a container exiting 3 leaves its pod Failed with exit code 3.
+  - `pod-delete`: a running pod, deleted, is gone within 30 s.
+- **medium** (< 30 min): pod features and failure paths (#61), which run with
+  or without the storage class:
+  - `pod-restart-on-failure`: `OnFailure`, failing once: Succeeded with
+    restartCount 1, and `log?previous=true` is the failed run.
+  - `pod-init-first`: an init container's file (emptyDir) is there for the main one.
+  - `pod-config`: a ConfigMap volume, `configMapKeyRef` and `fieldRef` env.
+  - `pod-missing-image`: an image no registry has waits as ErrImagePull or
+    ImagePullBackOff and never runs.
+
+  And claims of the built-in `stormblock` class (#64):
   - It makes a claim at every filesystem size class (1Mi … 16Ti) and at
     arbitrary sizes: 1 byte, 1Mi+1, 17Mi, 1500M, 3.5Gi and 600Gi, and raw block
     claims of 1Mi, 20Ti and 1Pi (`volumeDevices`; the device must be exactly its
@@ -505,15 +524,25 @@ stormcentral as a Job (`test/rustkube-node-test.yaml`):
     `kube-system/<volume>-<node>`, Bound to `storm-<volume>-<node>`, whose
     `claimRef` names it by uid, with the same kind and component labels; one
     claim is deleted and must come back with its PV naming the new uid.
-- **short**, **long**: not written yet (#61). Each reports one skip.
+- **long** (the night window, on a pve VM): waves of pods, each 80% of the
+  node's free pod slots (`RUSTKUBE_NODE_TEST_WAVE_MAX`, default 500), every
+  fourth with a 16Mi built-in claim written by an init container. Per wave
+  (`wave-<n>`, with `pods`, `p50_ms`, `p95_ms`, `drain_ms`, `left` as fields):
+  each pod's start (create → seen Running, 1 s resolution), a 30 s hold and a
+  log read, then the drain. A wave fails on anything left after its drain
+  (pods, claims, PVs) or a p95 start over twice the first wave's plus 2 s.
+  Waves repeat until the suite's time is nearly out (`RUSTKUBE_NODE_TEST_WAVES`
+  caps them for a hand run). VM waves are stormcos_qa's `vm-waves`.
 
 The same image is the workload pods' program (`/test sized <path> <seed>
-<bytes> <lo> <hi>`), so a run pulls nothing else. Check it builds with
+<bytes> <lo> <hi>`, `/test echo …`, `sleep`, `exit`, `fail-once`,
+`write-file`, `expect-file`, `expect-env`), so a run pulls nothing else. Check it builds with
 `sc-build 'cd test && cargo test --locked && cargo build --release --locked'`.
 
 Required test inputs are listed in [configuration](docs/configuration.md#test-container).
-In particular `RUSTKUBE_NODE_TEST_IMAGE` is required; the runner does not yet
-supply it (#97). No successful live medium run is claimed (#64).
+The image the workload pods run is the Job's own (#97), and `STORM_NODE` (an
+address) is resolved to its Node. No successful live run of any suite is
+claimed yet (#64, #61).
 
 ## Relationship to rustkube
 

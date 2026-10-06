@@ -181,7 +181,8 @@ Full lists: `docs/api.md`, `docs/configuration.md`, `docs/metrics.md`.
 - **Updated** by installing a new stormcos release: the image carries the golden; nothing is installed by
   hand on a node
 - **Tested:** unit tests on every build (336 kubelet tests at 6ed5f70a3e71); the `test/` container
-  (`medium`: PVC ladder, raw block, overcommit, node volumes) runs as a Job through stormcentral
+  (`short`: Node Ready and a pod's life; `medium`: pod features, PVC ladder, raw block, overcommit, node
+  volumes; `long`: night waves) runs as a Job through stormcentral
 
 ---
 

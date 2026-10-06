@@ -114,7 +114,26 @@ pub fn class_range(request: &str, block: bool) -> Option<(u64, u64)> {
     Some((if i == 0 { 0 } else { all[i - 1].1 }, all[i].1))
 }
 
-pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
+/// The pod cases (`pods.rs`), started by the caller alongside these: run in
+/// parallel with the storage cases, and awaited before the final drain,
+/// which deletes every pod of the run.
+pub type PodCases = tokio::task::JoinHandle<Vec<(String, Outcome, u128)>>;
+
+/// Record the pod cases' results.
+pub async fn record_pod_cases(cases: PodCases, r: &mut Report) {
+    match cases.await {
+        Ok(v) => {
+            for (name, o, ms) in v {
+                r.record(&name, o, ms, None);
+            }
+        }
+        Err(e) => {
+            r.record("pod-cases", Outcome::Infra(format!("panicked: {e}")), 0, None);
+        }
+    }
+}
+
+pub async fn run(env: Arc<Env>, api: Api, r: &mut Report, pod_cases: PodCases) {
     // All at once: the budget is 30 minutes and a 1 TiB mint may take most of it.
     let mut tasks = Vec::new();
     for (i, c) in cases().into_iter().enumerate() {
@@ -163,6 +182,7 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
     let t = Instant::now();
     let o = crate::node_volumes::restored(&env, &api, within(&env, Duration::from_secs(120))).await;
     r.record("node-volumes-restored", o, t.elapsed().as_millis(), None);
+    record_pod_cases(pod_cases, r).await;
 
     let t = Instant::now();
     let o = match k8s::drain(&env, &api, env.budget(Duration::from_secs(300), Duration::from_secs(10))).await {

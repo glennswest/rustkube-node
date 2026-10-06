@@ -194,8 +194,10 @@ medium or long. The process passes this to `STORM_SUITE` (default short).
 | `STORM_API` | Required API URL |
 | `STORM_RUN_ID` | Required ownership/cleanup identifier |
 | `STORM_NAMESPACE` | Required, or namespace from the mounted ServiceAccount |
-| `STORM_NODE` | Empty; optional node selector input |
-| `RUSTKUBE_NODE_TEST_IMAGE` | Required workload image; runner injection is missing (#97) |
+| `STORM_NODE` | The test node's address (or name), resolved to its Node at the start of a run; the suites' pods are pinned to it |
+| `RUSTKUBE_NODE_TEST_IMAGE` | The workload pods' image; empty: the Job's own pod's image, else `test-rustkube-node-<suite>:<commit12>` (#97) |
+| `RUSTKUBE_NODE_TEST_WAVE_MAX` | long: the largest wave, default 500 pods (a wave is otherwise 80% of the node's free pod slots) |
+| `RUSTKUBE_NODE_TEST_WAVES` | long: stop after this many waves (default: until the suite's time is nearly out) |
 | `STORM_TIMEOUT` | Seconds: short 120, medium 1800, long 28800 |
 | `RUSTKUBE_NODE_TEST_MINT_BUDGET` | 1200 seconds per PVC case, bounded by remaining suite time |
 

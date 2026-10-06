@@ -4,17 +4,24 @@
 # (src/testruns.rs), from test/requires.toml; it does not apply this file.
 #
 # Test metadata (what the runner matches against the machine):
-#   suites:   medium (< 30 min): claims of the built-in stormblock class at
-#             every size class and arbitrary sizes (#64).
-#             short, long: not written yet (#61); each reports one skip.
+#   suites:   short (< 2 min): Node Ready; a pod runs, reports exit codes,
+#             serves its log and stops on delete (#61).
+#             medium (< 30 min): claims of the built-in stormblock class at
+#             every size class and arbitrary sizes (#64), the node's own
+#             volumes (#59), and pod features and failure paths (#61).
+#             long (night): waves of pods at the node's free capacity, start
+#             latency and residue per wave (#61).
 #   requires: []            (storage comes from the node's stormblock engine
 #                            through the kubelet. Where the class is not
 #                            offered — no StorageClass stormblock of
-#                            stormblock.storm.io — medium reports one skip.)
+#                            stormblock.storm.io — medium's storage cases
+#                            report one skip and long's waves have no claims.)
 #   privileged: no          (the Job and its workload pods run unprivileged;
 #                            workload pods run as uid 0 with no capabilities,
 #                            to own a fresh filesystem's root)
-#   api:      namespaced in the run's namespace: PVCs, pods, events (read).
+#   api:      namespaced in the run's namespace: PVCs, pods, pods/log,
+#             configmaps, events (read). Cluster reads per suite are in
+#             test/requires.toml (nodes for all; pods on the node for long).
 #             Cluster-scoped: read StorageClasses, CSIStorageCapacities and
 #             PVs; read PVCs and
 #             delete one of kube-system's mirrored node-volume claims, which

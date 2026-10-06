@@ -12,3 +12,20 @@ cluster_read = [
   { apiGroup = "storage.k8s.io", resource = "storageclasses" },
   { apiGroup = "storage.k8s.io", resource = "csistoragecapacities" },
 ]
+
+[short]
+# Which Node STORM_NODE is, and its Ready/heartbeat/pressure (#61).
+cluster_read = [
+  { apiGroup = "", resource = "nodes" },
+]
+
+[long]
+# The node's capacity (allocatable pods) and the pods already on it, which
+# size each wave; the built-in StorageClass and the waves' PVs, which every
+# drain checks are reclaimed (#61). The standard's 8 h night budget.
+cluster_read = [
+  { apiGroup = "", resource = "nodes" },
+  { apiGroup = "", resource = "pods" },
+  { apiGroup = "", resource = "persistentvolumes" },
+  { apiGroup = "storage.k8s.io", resource = "storageclasses" },
+]

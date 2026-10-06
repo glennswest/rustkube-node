@@ -10,6 +10,19 @@
 //!   size (what `df` reports) is more than `lo` and at most `hi`: the claim
 //!   got the size class it rounded to, not the one below or above.
 //!
+//! And for the pod cases (#61), which need no claim:
+//!
+//! - `echo <text>`: print it, exit 0.
+//! - `exit <code>`: exit with that code.
+//! - `sleep <secs>`: sleep; SIGTERM ends it with 0 (PID 1 in a container
+//!   ignores a signal it has no handler for, which would turn every delete
+//!   into a wait for the grace period).
+//! - `fail-once <dir>`: exit 1 the first time (leaving a marker in `dir`, an
+//!   emptyDir that outlives the container), 0 after.
+//! - `write-file <path> <text>`, `expect-file <path> <text>`: write, or check
+//!   the file holds exactly `text`.
+//! - `expect-env <name> <value>`: the variable is set to exactly `value`.
+//!
 //! A directory `path` means a filesystem volume: the data goes in
 //! `<path>/rustkube-node-test.bin`. Anything else is a raw block device,
 //! written from offset 0. Exit 0 on success, 1 on a mismatch or error; one
@@ -23,11 +36,30 @@ const CHUNK: usize = 1 << 20;
 
 /// Whether `args` (without the program name) is a workload invocation.
 pub fn is_workload(args: &[String]) -> bool {
-    matches!(args.first().map(String::as_str), Some("fill" | "verify" | "size-at-least" | "sized"))
+    matches!(
+        args.first().map(String::as_str),
+        Some(
+            "fill" | "verify" | "size-at-least" | "sized" | "echo" | "exit" | "sleep" | "fail-once"
+                | "write-file" | "expect-file" | "expect-env"
+        )
+    )
 }
 
 /// Run a workload invocation; returns the exit code.
 pub fn main(args: &[String]) -> i32 {
+    if args[0] == "exit" {
+        let code = args.get(1).and_then(|c| c.parse().ok()).unwrap_or(1);
+        println!("exiting {code} as asked");
+        return code;
+    }
+    if args[0] == "sleep" {
+        let secs = args.get(1).and_then(|c| c.parse().ok()).unwrap_or(3600);
+        // SAFETY: the handler only calls _exit, which is async-signal-safe.
+        unsafe { libc::signal(libc::SIGTERM, on_term as *const () as libc::sighandler_t) };
+        println!("sleeping {secs} s");
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+        return 0;
+    }
     let result = run(args);
     let (code, line) = match &result {
         Ok(d) => (0, format!("{{\"workload\": {}, \"ok\": true, \"detail\": {}}}", crate::report::json(&args.join(" ")), crate::report::json(d))),
@@ -36,6 +68,11 @@ pub fn main(args: &[String]) -> i32 {
     println!("{line}");
     let _ = std::fs::write("/dev/termination-log", &line);
     code
+}
+
+extern "C" fn on_term(_: libc::c_int) {
+    // SAFETY: _exit is async-signal-safe.
+    unsafe { libc::_exit(0) }
 }
 
 fn run(args: &[String]) -> Result<String, String> {
@@ -73,6 +110,34 @@ fn run(args: &[String]) -> Result<String, String> {
                 Ok(format!("wrote and read back {n} bytes; {} is {have} bytes, in ({lo}, {hi}]", dir.display()))
             } else {
                 Err(format!("{} is {have} bytes, not in ({lo}, {hi}]", dir.display()))
+            }
+        }
+        "echo" => Ok(args[1..].join(" ")),
+        "fail-once" => {
+            let marker = PathBuf::from(arg(1, "dir")?).join("rustkube-node-test.ran");
+            if marker.exists() {
+                Ok(format!("second run: {} is there", marker.display()))
+            } else {
+                std::fs::write(&marker, b"1").map_err(|e| format!("write {}: {e}", marker.display()))?;
+                Err("first run: failing on purpose".into())
+            }
+        }
+        "write-file" => {
+            let (p, text) = (arg(1, "path")?, arg(2, "text")?);
+            std::fs::write(&p, &text).map_err(|e| format!("write {p}: {e}"))?;
+            Ok(format!("wrote {p}"))
+        }
+        "expect-file" => {
+            let (p, text) = (arg(1, "path")?, arg(2, "text")?);
+            let have = std::fs::read_to_string(&p).map_err(|e| format!("read {p}: {e}"))?;
+            if have == text { Ok(format!("{p} holds {text:?}")) } else { Err(format!("{p} holds {have:?}, not {text:?}")) }
+        }
+        "expect-env" => {
+            let (k, v) = (arg(1, "name")?, arg(2, "value")?);
+            match std::env::var(&k) {
+                Ok(have) if have == v => Ok(format!("{k}={v}")),
+                Ok(have) => Err(format!("{k}={have:?}, not {v:?}")),
+                Err(_) => Err(format!("{k} is not set")),
             }
         }
         other => Err(format!("unknown workload {other:?}")),
@@ -206,6 +271,26 @@ mod tests {
         // Exclusive below, inclusive above.
         assert_eq!(main(&a(&["sized", &dir, "5", "4096", &have.to_string(), &u64::MAX.to_string()])), 1);
         assert_eq!(main(&a(&["sized", &dir, "5", "4096", "0", &(have - 1).to_string()])), 1);
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn pod_case_modes() {
+        let d = tmp("modes");
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let dir = d.to_string_lossy().to_string();
+        assert_eq!(main(&a(&["echo", "hello", "there"])), 0);
+        assert_eq!(main(&a(&["exit", "3"])), 3);
+        assert_eq!(main(&a(&["sleep", "0"])), 0);
+        assert_eq!(main(&a(&["fail-once", &dir])), 1);
+        assert_eq!(main(&a(&["fail-once", &dir])), 0);
+        let f = d.join("f").to_string_lossy().to_string();
+        assert_eq!(main(&a(&["expect-file", &f, "x"])), 1);
+        assert_eq!(main(&a(&["write-file", &f, "x"])), 0);
+        assert_eq!(main(&a(&["expect-file", &f, "x"])), 0);
+        assert_eq!(main(&a(&["expect-file", &f, "y"])), 1);
+        assert_eq!(main(&a(&["expect-env", "PATH", &std::env::var("PATH").unwrap()])), 0);
+        assert_eq!(main(&a(&["expect-env", "RKNT_UNSET_VAR", "x"])), 1);
         std::fs::remove_dir_all(d).unwrap();
     }
 

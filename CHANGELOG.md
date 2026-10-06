@@ -2,6 +2,14 @@
 
 ## 2026-10-06
 
+- **test:** short, medium pod cases and long (#61). short (< 2 min): Node Ready with a recent heartbeat and no
+  pressure, a pod runs to Succeeded with a pod IP and its log reads back, a container's exit code 3 is
+  reported, a running pod is deleted within 30 s. medium, with or without the storage class: OnFailure restart
+  with the previous log, init container before the main one, ConfigMap volume + configMapKeyRef + fieldRef env,
+  a missing image waits as ErrImagePull/ImagePullBackOff. long: waves of pods at 80% of the node's free pod
+  slots (every fourth with a 16Mi claim), p50/p95 start, drain and residue per wave; a slowdown or residue
+  fails the wave. Pods are pinned with `spec.nodeName`; new workload modes `echo`, `exit`, `sleep`,
+  `fail-once`, `write-file`, `expect-file`, `expect-env`. `test/requires.toml` declares [short] and [long].
 - **fix:** `securityContext.capabilities.drop` is parsed (`ContainerConfig.drop_capabilities`) and sent to a CRI
   runtime (`Capability.drop_capabilities`); only `add` was (#118). The stormpump ring path still forwards
   neither: its `Spec` has no capability field until stormpump#47.
