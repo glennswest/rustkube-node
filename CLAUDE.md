@@ -62,19 +62,22 @@ not the release path.
 2026-10-06. `test/` has medium's storage cases (#64, #59, #62, #67); short and long are one skip each. The
 runner's namespace Role is `*`; cluster reads come from `test/requires.toml` (only [medium] declares `nodes`, which
 every suite needs to resolve STORM_NODE). Pods are pinned with `spec.nodeName` (the kubelet, not the scheduler).
-1. [ ] Workload modes (scratch image, no shell): `echo`, `exit <code>`, `sleep` (exits 0 on SIGTERM),
+1. [x] Workload modes (scratch image, no shell): `echo`, `exit <code>`, `sleep` (exits 0 on SIGTERM),
        `fail-once <dir>`, `write-file`, `expect-file`, `expect-env`.
-2. [ ] short (< 2 min): node Ready + heartbeat + no pressure; a pod runs, has a pod IP, its log reads back through
+2. [x] short (< 2 min): node Ready + heartbeat + no pressure; a pod runs, has a pod IP, its log reads back through
        the apiserver; a pod exiting 3 is Failed with exit code 3; a running pod deleted is gone within its grace.
-3. [ ] medium pod cases (with or without the storage class): OnFailure restart (restartCount 1, `previous` log),
+3. [x] medium pod cases (with or without the storage class): OnFailure restart (restartCount 1, `previous` log),
        init container before the main one (emptyDir), configMap volume + configMapKeyRef + fieldRef env, a missing
        image waits with ErrImagePull/ImagePullBackOff and never runs.
-4. [ ] long (night, pve VM): waves of pods sized from the node's allocatable pods (every 4th with a 16Mi built-in
+4. [x] long (night, pve VM): waves of pods sized from the node's allocatable pods (every 4th with a 16Mi built-in
        claim when the class is there); per wave p50/p95 start, drain, leftover pods/PVs; a wave > 2× the first's
        p95 (+2 s) or any residue is a failure. VM waves are stormcos_qa's vm-waves.
 5. [ ] requires.toml [short]/[long], Job yaml notes, docs, CHANGELOG; sc-build `cd test && cargo test && build`;
        runs on C2NR0Q2 (short, medium) when the queue moves. Gaps that need node access (#35 restart adoption,
        #75 guest persistence, #72 mirror-pod logs, #83 snapshot) filed as a follow-up.
+       Done: d20ef52; sc-build `cd test && cargo test --locked; cargo build --release --locked`: 28 pass, release
+       builds. Filed #162 (terminationMessagePath never read), #163 (node-access medium gaps). Live: short
+       c822f4832d, medium 5d9d765385 queued on C2NR0Q2 (pvetest1 erroring: no VM 3101). Close #61 on their results.
 
 ### Waiting on stormpump#47: #118 (P2), pod capabilities onto the ring
 
