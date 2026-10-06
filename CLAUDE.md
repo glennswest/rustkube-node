@@ -57,7 +57,7 @@ not the release path.
 
 ## Work plan
 
-### In progress: #143 (P1), pull_image binds its registry clone (stormblock#267)
+### Done from this side: #143 (P1), pull_image binds its registry clone (stormblock#267)
 
 2026-10-06. Found: `pull_image` mints (`POST /v1/clones`, state claimed), attaches and mounts, never binds; the
 registry reaps a claimed clone after 900 s. sbregistry 0.26: `POST /v1/clones/{id}/bind {consumer}`,
@@ -67,7 +67,8 @@ kubelet unmounts/detaches a pulled image (no image GC; `remove_image` is a no-op
 1. [x] Consumer `kubelet/<node>/<image>`. A pull first asks for a clone bound to it (found again after a restart:
        attach and mount are idempotent); else mints. After the mount, bind; a refused bind keeps the image
        usable and is retried on the next pull of it (warned). A failed lookup fails the pull (no duplicate mint).
-2. [ ] Tests (fake registry + engine), docs (README, status.md), CHANGELOG.
+2. [x] Tests (3 new, fake registry), docs (configuration.md, status.md), CHANGELOG (38bf04e). sc-build 38bf04e
+       `cargo build --locked && cargo test --locked`: exit 0; 339 kubelet unit pass. Not run on a node.
 3. [x] Release = an image GC (unmount, detach, release when no container uses it): filed as #161.
 
 ### Done: #62, slab capacity: publish, refuse, alert (#108 decided)
