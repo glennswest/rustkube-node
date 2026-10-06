@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-06
+
+- **fix:** A pulled image's registry clone is bound (#143, stormblock#267): after the attach and mount,
+  `POST /v1/clones/{id}/bind` with consumer `kubelet/<node>/<image>`. It stayed `claimed`, and sbregistry
+  reaps a claim older than 900 s as abandoned, under the mounted image. A pull first asks the registry for
+  the clone bound to that consumer (`GET /v1/clones?consumer=&state=bound`) and reattaches it, so a kubelet
+  restart does not mint (and leak) a second one; a failed lookup fails the pull rather than minting. A
+  refused bind keeps the image usable and is asked again on its next pull. Pulls of one image are
+  serialised. Releasing a pulled image needs an image GC: #161.
+
 ## 2026-10-05
 
 - **docs:** presentation: the launcher Pod (rustkube#203) moved from Planned to what works; pod-network VMs'

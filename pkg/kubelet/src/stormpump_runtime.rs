@@ -1252,6 +1252,14 @@ pub struct StormpumpImages {
     /// registry round trip per container start, and `imagePullPolicy` is what
     /// exists to ask for it.
     pulled: Mutex<HashMap<String, String>>,
+    /// image ref -> registry clone id, for a pulled image whose bind the
+    /// registry refused (#143). The image is mounted and used; the bind is
+    /// asked again on the next pull of it, because a clone left `claimed` is
+    /// reaped by the registry after its grace period.
+    unbound: Mutex<HashMap<String, String>>,
+    /// One pull of an image at a time (#143): two concurrent pulls would mint
+    /// two clones, and a bound clone is never reaped, so the loser would leak.
+    pulling: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 /// The container's environment: what the pod asked for, plus the defaults an
@@ -1382,6 +1390,8 @@ impl StormpumpImages {
             http: reqwest::Client::new(),
             ring: None,
             pulled: Mutex::new(HashMap::new()),
+            unbound: Mutex::new(HashMap::new()),
+            pulling: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1452,6 +1462,115 @@ impl StormpumpImages {
         serde_json::from_str(&text).map_err(|e| format!("{url}: not JSON: {e}: {text}"))
     }
 
+    /// The mount of an image this kubelet pulled, with its bind asked again
+    /// first if the registry refused it before (#143).
+    async fn pulled_path(&self, image: &str) -> Option<String> {
+        let path = self.pulled.lock().await.get(image).cloned()?;
+        let pending = self.unbound.lock().await.get(image).cloned();
+        if let Some(id) = pending {
+            self.bind_or_note(image, &id).await;
+        }
+        Some(path)
+    }
+
+    /// What the registry records as holding a pulled image's clone (#143):
+    /// this kubelet, for this image. One clone per image per node, shared by
+    /// every container of it, so the image is the holder, not a container.
+    fn consumer(&self, image: &str) -> String {
+        format!("kubelet/{}/{image}", self.node_name)
+    }
+
+    /// The clone already bound to `consumer`, found by asking the registry
+    /// (#143, sbregistry#19). This is how a pull after a kubelet restart (or a
+    /// reboot) gets the clone it bound before instead of minting another: a
+    /// bound clone is never reaped, so minting again would leak one per
+    /// restart. An error is an error, not "none": minting on a failed lookup
+    /// is the same leak.
+    async fn bound_clone(&self, consumer: &str) -> Result<Option<serde_json::Value>, String> {
+        let url = format!("{}/v1/clones", self.registry);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("consumer", consumer), ("state", "bound")])
+            .send()
+            .await
+            .map_err(|e| format!("{url}: {e}"))?;
+        let list = Self::json_answer(&url, resp).await?;
+        let list = list.as_array().ok_or_else(|| format!("{url}: not a list: {list}"))?;
+        // The registry filters; checked here as well, because an older
+        // registry that ignores the query would hand back every clone.
+        Ok(list
+            .iter()
+            .find(|c| {
+                c["consumer"].as_str() == Some(consumer)
+                    && c["state"].as_str() == Some("bound")
+                    && c["id"].is_string()
+                    && c["volume_name"].is_string()
+            })
+            .cloned())
+    }
+
+    /// Tell the registry what holds clone `id` (#143). Until this, the clone
+    /// is `claimed`, and the registry reaps a claim older than its grace
+    /// period (900 s) as abandoned, under the mounted image.
+    async fn bind(&self, id: &str, consumer: &str) -> Result<(), String> {
+        let url = format!("{}/v1/clones/{id}/bind", self.registry);
+        let rec = self.post(&url, &serde_json::json!({ "consumer": consumer })).await?;
+        if rec["state"].as_str() != Some("bound") {
+            return Err(format!("{url}: the clone is {} after the bind", rec["state"]));
+        }
+        Ok(())
+    }
+
+    /// The registry half of a pull: the clone this node already bound for
+    /// `image`, else a new one. Returns (clone id, volume name, bound).
+    async fn clone_for(&self, image: &str) -> Result<(String, String, bool), CriError> {
+        let consumer = self.consumer(image);
+        let found = self.bound_clone(&consumer).await.map_err(|e| {
+            CriError::ImagePull(format!("registry could not say which clone holds {image}: {e}"))
+        })?;
+        let (clone, bound) = match found {
+            Some(c) => (c, true),
+            None => {
+                // `remote_image` is what lets the registry build the golden
+                // on demand when it has never seen this image.
+                let body = serde_json::json!({ "golden": image, "remote_image": image });
+                let c = self
+                    .post(&format!("{}/v1/clones", self.registry), &body)
+                    .await
+                    .map_err(|e| {
+                        CriError::ImagePull(format!("registry could not clone {image}: {e}"))
+                    })?;
+                (c, false)
+            }
+        };
+        let field = |k: &str| {
+            clone[k].as_str().map(str::to_owned).ok_or_else(|| {
+                CriError::ImagePull(format!("registry returned no clone {k} for {image}: {clone}"))
+            })
+        };
+        Ok((field("id")?, field("volume_name")?, bound))
+    }
+
+    /// Bind `id` for `image`, or note it for the next pull (#143). A refused
+    /// bind does not fail the pull: the image is mounted, and pulling again
+    /// would mint a second clone while the first one is in use.
+    async fn bind_or_note(&self, image: &str, id: &str) {
+        match self.bind(id, &self.consumer(image)).await {
+            Ok(()) => {
+                self.unbound.lock().await.remove(image);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    image = %image, clone = %id,
+                    "registry would not bind the image's clone (retried on the next pull; \
+                     an unbound clone is reaped after the registry's grace period): {e}"
+                );
+                self.unbound.lock().await.insert(image.to_string(), id.to_string());
+            }
+        }
+    }
+
     /// A volume's id by name, from this node's stormblock.
     async fn volume_id(&self, name: &str) -> Option<String> {
         let resp = self.engine.get(&format!("{}/api/v1/volumes", self.storage)).await.ok()?;
@@ -1501,7 +1620,12 @@ impl ImageService for StormpumpImages {
     /// 2. **Already pulled.** A previous container of this image did the work.
     /// 3. **A pull.** The registry turns the image into a sealed golden
     ///    volume, mints a copy-on-write clone of it, stormblock attaches the
-    ///    clone as a block device, and the engine mounts it.
+    ///    clone as a block device, and the engine mounts it. Then the clone
+    ///    is bound to `kubelet/<node>/<image>` (#143): a clone left `claimed`
+    ///    is reaped by the registry after its grace period, under the mount.
+    ///    A pull after a kubelet restart asks for that bound clone first and
+    ///    reattaches it rather than minting another. Nothing releases a
+    ///    pulled image yet: that needs an image GC (#161).
     ///
     /// Each step is somebody else's job and is idempotent, which is what makes
     /// a half-finished pull safe to retry: the registry reuses a sealed
@@ -1519,8 +1643,15 @@ impl ImageService for StormpumpImages {
             tracing::info!(image = %image, path = %path.display(), "image is a golden on this node");
             return Ok(path.to_string_lossy().into_owned());
         }
-        if let Some(path) = self.pulled.lock().await.get(image) {
-            return Ok(path.clone());
+        if let Some(path) = self.pulled_path(image).await {
+            return Ok(path);
+        }
+        // One pull of this image at a time; the one that waited finds the
+        // other's result.
+        let gate = self.pulling.lock().await.entry(image.to_string()).or_default().clone();
+        let _gate = gate.lock().await;
+        if let Some(path) = self.pulled_path(image).await {
+            return Ok(path);
         }
 
         // The engine is required, not optional: without it the pull can reach
@@ -1534,16 +1665,9 @@ impl ImageService for StormpumpImages {
         })?;
 
         // 1. The registry turns a reference into a sealed golden and hands
-        //    back a clone of it. `remote_image` is what lets it build the
-        //    golden on demand when it has never seen this image.
-        let body = serde_json::json!({ "golden": image, "remote_image": image });
-        let clone: serde_json::Value = self
-            .post(&format!("{}/v1/clones", self.registry), &body)
-            .await
-            .map_err(|e| CriError::ImagePull(format!("registry could not clone {image}: {e}")))?;
-        let volume = clone["volume_name"].as_str().ok_or_else(|| {
-            CriError::ImagePull(format!("registry returned no volume for {image}: {clone}"))
-        })?;
+        //    back a clone of it, or the one this node bound before (#143).
+        let (clone_id, volume, bound) = self.clone_for(image).await?;
+        let volume = volume.as_str();
 
         // 2. Attach the clone here, as a block device.
         let vol_id = self.volume_id(volume).await.ok_or_else(|| {
@@ -1568,7 +1692,12 @@ impl ImageService for StormpumpImages {
             CriError::ImagePull(format!("stormpump would not mount {device} at {mount}: {e}"))
         })?;
 
-        tracing::info!(image = %image, %device, %mount, "pulled");
+        // 4. Say what holds it, now that something does (#143).
+        if !bound {
+            self.bind_or_note(image, &clone_id).await;
+        }
+
+        tracing::info!(image = %image, %device, %mount, clone = %clone_id, found_again = bound, "pulled");
         self.pulled.lock().await.insert(image.to_string(), mount.clone());
         Ok(mount)
     }
@@ -2099,5 +2228,141 @@ mod tests {
             spec.argv,
             vec!["/usr/bin/cilium-agent", "--config-dir", "/tmp/cilium"]
         );
+    }
+
+    /// A fake sbregistry: clones by id, with the list filter, mint and bind
+    /// (#143). `refuse_bind` makes a bind answer 500; `refuse_list` the list.
+    #[derive(Default)]
+    struct FakeRegistry {
+        clones: Vec<serde_json::Value>,
+        minted: usize,
+        refuse_bind: bool,
+        refuse_list: bool,
+    }
+
+    async fn fake_registry() -> (String, Arc<std::sync::Mutex<FakeRegistry>>) {
+        use axum::extract::{Path, Query, State};
+        use axum::http::StatusCode;
+        use axum::Json;
+        type S = Arc<std::sync::Mutex<FakeRegistry>>;
+        let state: S = Default::default();
+        let app = axum::Router::new()
+            .route(
+                "/v1/clones",
+                axum::routing::get(
+                    |State(s): State<S>, Query(q): Query<HashMap<String, String>>| async move {
+                        let r = s.lock().unwrap();
+                        if r.refuse_list {
+                            return Err(StatusCode::SERVICE_UNAVAILABLE);
+                        }
+                        Ok(Json(serde_json::Value::Array(
+                            r.clones
+                                .iter()
+                                .filter(|c| q.get("consumer").map_or(true, |w| c["consumer"] == **w))
+                                .filter(|c| q.get("state").map_or(true, |w| c["state"] == **w))
+                                .cloned()
+                                .collect(),
+                        )))
+                    },
+                )
+                .post(|State(s): State<S>| async move {
+                    let mut r = s.lock().unwrap();
+                    r.minted += 1;
+                    let n = r.minted;
+                    let c = serde_json::json!({
+                        "id": format!("c{n}"), "volume_name": format!("img-clone-{n}"),
+                        "state": "claimed",
+                    });
+                    r.clones.push(c.clone());
+                    Json(c)
+                }),
+            )
+            .route(
+                "/v1/clones/{id}/bind",
+                axum::routing::post(
+                    |State(s): State<S>, Path(id): Path<String>, Json(b): Json<serde_json::Value>| async move {
+                        let mut r = s.lock().unwrap();
+                        if r.refuse_bind {
+                            return Err((StatusCode::INTERNAL_SERVER_ERROR, "state not saved".to_string()));
+                        }
+                        let c = r.clones.iter_mut().find(|c| c["id"] == *id)
+                            .ok_or((StatusCode::NOT_FOUND, format!("no clone {id}")))?;
+                        c["consumer"] = b["consumer"].clone();
+                        c["state"] = "bound".into();
+                        Ok(Json(c.clone()))
+                    },
+                ),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, state)
+    }
+
+    /// A pull's clone is bound to this node and image, and a kubelet that
+    /// restarts finds it again instead of minting a second one (#143).
+    #[tokio::test]
+    async fn a_pulled_clone_is_bound_and_found_again_after_a_restart() {
+        let (url, reg) = fake_registry().await;
+        let img = StormpumpImages::new(&url).with_engine(None, "node1");
+        let (id, volume, bound) = img.clone_for("quay.io/a/b:1").await.unwrap();
+        assert_eq!((id.as_str(), volume.as_str(), bound), ("c1", "img-clone-1", false));
+        img.bind_or_note("quay.io/a/b:1", &id).await;
+        {
+            let r = reg.lock().unwrap();
+            assert_eq!(r.clones[0]["state"], "bound");
+            assert_eq!(r.clones[0]["consumer"], "kubelet/node1/quay.io/a/b:1");
+        }
+        assert!(img.unbound.lock().await.is_empty());
+
+        // A new kubelet (restart): same clone, already bound, nothing minted.
+        let again = StormpumpImages::new(&url).with_engine(None, "node1");
+        assert_eq!(
+            again.clone_for("quay.io/a/b:1").await.unwrap(),
+            ("c1".to_string(), "img-clone-1".to_string(), true)
+        );
+        // Another image, or the same image on another node, is its own clone.
+        assert_eq!(again.clone_for("quay.io/a/b:2").await.unwrap().0, "c2");
+        let other = StormpumpImages::new(&url).with_engine(None, "node2");
+        assert_eq!(other.clone_for("quay.io/a/b:1").await.unwrap().0, "c3");
+        assert_eq!(reg.lock().unwrap().minted, 3);
+    }
+
+    /// A refused bind leaves the image usable and is asked again on the next
+    /// pull of it (#143).
+    #[tokio::test]
+    async fn a_refused_bind_is_retried_on_the_next_pull() {
+        let (url, reg) = fake_registry().await;
+        let img = StormpumpImages::new(&url).with_engine(None, "node1");
+        let (id, volume, _) = img.clone_for("busybox:1").await.unwrap();
+        reg.lock().unwrap().refuse_bind = true;
+        img.bind_or_note("busybox:1", &id).await;
+        assert_eq!(img.unbound.lock().await.get("busybox:1"), Some(&id));
+        assert_eq!(reg.lock().unwrap().clones[0]["state"], "claimed");
+        img.pulled.lock().await.insert("busybox:1".into(), pulled_mount(&volume));
+
+        // Still refused: the path is answered, the bind stays pending.
+        assert_eq!(img.pull_image("busybox:1").await.unwrap(), pulled_mount(&volume));
+        assert!(img.unbound.lock().await.contains_key("busybox:1"));
+
+        reg.lock().unwrap().refuse_bind = false;
+        assert_eq!(img.pull_image("busybox:1").await.unwrap(), pulled_mount(&volume));
+        assert!(img.unbound.lock().await.is_empty());
+        let r = reg.lock().unwrap();
+        assert_eq!(r.clones[0]["state"], "bound");
+        assert_eq!(r.minted, 1);
+    }
+
+    /// A registry that cannot say which clone holds an image is a failed
+    /// pull, never a second mint (#143).
+    #[tokio::test]
+    async fn a_failed_lookup_mints_nothing() {
+        let (url, reg) = fake_registry().await;
+        reg.lock().unwrap().refuse_list = true;
+        let img = StormpumpImages::new(&url).with_engine(None, "node1");
+        let e = img.clone_for("busybox:1").await.unwrap_err();
+        assert!(e.to_string().contains("which clone holds busybox:1"), "{e}");
+        assert_eq!(reg.lock().unwrap().minted, 0);
     }
 }
