@@ -135,6 +135,40 @@ struct Container {
     privileged: bool,
     host_network: bool,
     host_pid: bool,
+    /// Set when the kubelet asked for the removal, to when it was last tried;
+    /// the record stays until every release it holds is done (#90). The
+    /// engine refuses `WorkloadRelease` while the workload runs, and a stop
+    /// only signals: a removal right after a stop (a restart, an init past
+    /// its deadline) is refused, and the callers there do not retry. So the
+    /// runtime does: when the workload's exit arrives, at least every
+    /// [`REMOVAL_RETRY`], and before its sandbox is removed. A removed
+    /// container is gone to the kubelet (not listed, NotFound) at once.
+    removing: Option<std::time::Instant>,
+}
+
+/// How often a removal the engine refused is tried again with no exit to
+/// prompt it (#90).
+const REMOVAL_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The removals to try again now (#90): a refused one whose workload has
+/// just exited (the release the engine refused while it ran can succeed), or
+/// one last tried at least [`REMOVAL_RETRY`] ago (a refused volume release,
+/// or an exit drained before the removal was asked).
+fn removals_due(
+    containers: &HashMap<String, Container>,
+    exits: &[crate::stormpump_ring::Exited],
+) -> Vec<String> {
+    containers
+        .values()
+        .filter(|c| match c.removing {
+            None => false,
+            Some(t) => {
+                t.elapsed() >= REMOVAL_RETRY
+                    || exits.iter().any(|e| c.workload_handle == Some(e.handle))
+            }
+        })
+        .map(|c| c.id.clone())
+        .collect()
 }
 
 /// One pod sandbox.
@@ -331,10 +365,16 @@ impl StormpumpRuntime {
         let exits = tokio::task::spawn_blocking(move || ring.drain_exits())
             .await
             .unwrap_or_default();
-        if exits.is_empty() {
-            return;
-        }
+        self.note_exits(exits).await;
+    }
+
+    /// [`Self::absorb_exits`] without the ring: record the exits, then try
+    /// again every removal one of them (or the retry interval) unblocks.
+    async fn note_exits(&self, exits: Vec<crate::stormpump_ring::Exited>) {
+        let retry;
+        {
         let mut containers = self.containers.lock().await;
+        retry = removals_due(&containers, &exits);
         for e in exits {
             for c in containers.values_mut() {
                 if c.workload_handle == Some(e.handle) {
@@ -355,6 +395,48 @@ impl StormpumpRuntime {
                         code = c.exit_code, "stormpump: container exited"
                     );
                 }
+            }
+        }
+        }
+        self.retry_removals(retry).await;
+    }
+
+    /// Release what a container holds in the engine (its workload, then its
+    /// volumes) and forget it once all of it is released. Each release that
+    /// succeeds is dropped from the record, so a retry does only what is left.
+    async fn finish_removal(&self, container_id: &str) -> Result<(), CriError> {
+        let (workload, volumes) = {
+            let containers = self.containers.lock().await;
+            let Some(c) = containers.get(container_id) else { return Ok(()) };
+            (c.workload_handle, c.volume_handles.clone())
+        };
+        if let Some(c) = self.containers.lock().await.get_mut(container_id) {
+            c.removing = Some(std::time::Instant::now());
+        }
+        if let Some(workload) = workload {
+            // Busy/timeout is pending cleanup, never permission to forget it.
+            self.on_ring(move |r| r.workload_release(workload)).await?;
+            if let Some(c) = self.containers.lock().await.get_mut(container_id) {
+                c.workload_handle = None;
+            }
+        }
+        for volume in volumes {
+            self.on_ring(move |r| r.volume_release(volume)).await?;
+            if let Some(c) = self.containers.lock().await.get_mut(container_id) {
+                c.volume_handles.retain(|held| *held != volume);
+            }
+        }
+        self.containers.lock().await.remove(container_id);
+        Ok(())
+    }
+
+    /// Finish the removals in `ids` (#90). A refusal keeps the record and is
+    /// tried again later; nothing is forgotten here.
+    async fn retry_removals(&self, ids: Vec<String>) {
+        for id in ids {
+            match self.finish_removal(&id).await {
+                Ok(()) => tracing::info!(container = %id, "stormpump: deferred removal done, engine resources released"),
+                Err(e) => tracing::debug!(container = %id, "stormpump: removal still refused, retried: {e}"),
             }
         }
     }
@@ -776,6 +858,13 @@ impl RuntimeService for StormpumpRuntime {
     }
 
     async fn remove_pod_sandbox(&self, sandbox_id: &str) -> Result<(), CriError> {
+        // Removals the engine refused before (a restart's old container,
+        // #90) are tried again now, since they are what this waits on.
+        let pending: Vec<String> = self.containers.lock().await.values()
+            .filter(|c| c.sandbox_id == sandbox_id && c.removing.is_some())
+            .map(|c| c.id.clone())
+            .collect();
+        self.retry_removals(pending).await;
         if self.containers.lock().await.values().any(|c|c.sandbox_id==sandbox_id) {
             return Err(CriError::Pending("sandbox still has container cleanup records".into()));
         }
@@ -920,6 +1009,7 @@ impl RuntimeService for StormpumpRuntime {
             privileged: config.privileged,
             host_network: config.host_network,
             host_pid: config.host_pid,
+            removing: None,
         };
         let qualified = format!("{}/{}/{}", c.namespace, c.pod, c.name);
         self.containers.lock().await.insert(id.clone(), c);
@@ -1087,24 +1177,14 @@ impl RuntimeService for StormpumpRuntime {
     }
 
     async fn remove_container(&self, container_id: &str) -> Result<(), CriError> {
-        let (workload,volumes)={
-            let containers=self.containers.lock().await;
-            let Some(c)=containers.get(container_id) else {return Ok(())};
-            (c.workload_handle,c.volume_handles.clone())
-        };
-        if let Some(workload)=workload {
-            // Busy/timeout is pending cleanup, never permission to forget it.
-            self.on_ring(move |r|r.workload_release(workload)).await?;
-            if let Some(c)=self.containers.lock().await.get_mut(container_id) {c.workload_handle=None;}
+        // Asked for from here on, whatever the engine answers: the runtime
+        // finishes it if this attempt is refused (#90).
+        {
+            let mut containers = self.containers.lock().await;
+            let Some(c) = containers.get_mut(container_id) else { return Ok(()) };
+            c.removing.get_or_insert_with(std::time::Instant::now);
         }
-        for volume in volumes {
-            self.on_ring(move |r|r.volume_release(volume)).await?;
-            if let Some(c)=self.containers.lock().await.get_mut(container_id) {
-                c.volume_handles.retain(|held|*held!=volume);
-            }
-        }
-        self.containers.lock().await.remove(container_id);
-        Ok(())
+        self.finish_removal(container_id).await
     }
 
     async fn container_status(
@@ -1115,6 +1195,7 @@ impl RuntimeService for StormpumpRuntime {
         let containers = self.containers.lock().await;
         let c = containers
             .get(container_id)
+            .filter(|c| c.removing.is_none())
             .ok_or_else(|| CriError::NotFound(format!("container {container_id}")))?;
         Ok(ContainerStatusInfo {
             id: c.id.clone(),
@@ -1151,7 +1232,7 @@ impl RuntimeService for StormpumpRuntime {
             let containers = self.containers.lock().await;
             containers
                 .values()
-                .filter(|c| c.state == ContainerState::Running)
+                .filter(|c| c.state == ContainerState::Running && c.removing.is_none())
                 .filter_map(|c| {
                     Some((
                         c.workload_handle?,
@@ -1192,6 +1273,7 @@ impl RuntimeService for StormpumpRuntime {
         Ok(containers
             .values()
             .filter(|c| sandbox_id.is_none_or(|s| c.sandbox_id == s))
+            .filter(|c| c.removing.is_none())
             .map(|c| ContainerStatusInfo {
                 id: c.id.clone(),
                 name: c.name.clone(),
@@ -1931,6 +2013,7 @@ mod tests {
                     privileged: false,
                     host_network: false,
                     host_pid: false,
+                    removing: None,
                 },
             );
         }
@@ -2066,6 +2149,7 @@ mod tests {
                     privileged: false,
                     host_network: false,
                     host_pid: false,
+                    removing: None,
                 },
             );
             ids.push(id);
@@ -2364,5 +2448,89 @@ mod tests {
         let e = img.clone_for("busybox:1").await.unwrap_err();
         assert!(e.to_string().contains("which clone holds busybox:1"), "{e}");
         assert_eq!(reg.lock().unwrap().minted, 0);
+    }
+
+    fn bare(id: &str, sandbox: &str) -> Container {
+        Container {
+            id: id.into(),
+            sandbox_id: sandbox.into(),
+            name: id.into(),
+            namespace: "default".into(),
+            pod: "p".into(),
+            image: "i".into(),
+            spec_handle: None,
+            workload_handle: None,
+            volume_handles: Vec::new(),
+            root_handle: None,
+            log_dir: String::new(),
+            mount_sources: Vec::new(),
+            root_path: None,
+            state: ContainerState::Exited,
+            created_at: 0,
+            started_at: 0,
+            finished_at: 0,
+            exit_code: 0,
+            privileged: false,
+            host_network: false,
+            host_pid: false,
+            removing: None,
+        }
+    }
+
+    /// A removal the engine refuses is not dropped (#90): the record stays,
+    /// hidden from the kubelet, and the runtime finishes it on the workload's
+    /// exit, on the retry interval, or before its sandbox goes.
+    #[tokio::test]
+    async fn a_refused_removal_is_kept_hidden_and_finished_later() {
+        let r = rt();
+        let w = Handle(7);
+        let mut c = bare("ct-1", "sb-1");
+        c.workload_handle = Some(w);
+        r.containers.lock().await.insert("ct-1".into(), c);
+        r.containers.lock().await.insert("ct-2".into(), bare("ct-2", "sb-1"));
+
+        // Refused (no engine here stands in for EBUSY right after a stop).
+        assert!(r.remove_container("ct-1").await.is_err());
+        assert!(r.containers.lock().await["ct-1"].removing.is_some());
+        assert!(matches!(r.container_status("ct-1").await, Err(CriError::NotFound(_))));
+        let listed: Vec<String> = r.list_containers(None).await.unwrap().into_iter().map(|c| c.id).collect();
+        assert_eq!(listed, vec!["ct-2".to_string()]);
+
+        // Due on its workload's exit, not on another's; not yet by time.
+        let exit = |h| crate::stormpump_ring::Exited { handle: h, status: 0 };
+        {
+            let cs = r.containers.lock().await;
+            assert_eq!(removals_due(&cs, &[exit(w)]), vec!["ct-1".to_string()]);
+            assert!(removals_due(&cs, &[exit(Handle(8))]).is_empty());
+            assert!(removals_due(&cs, &[]).is_empty());
+        }
+        // Due by time once the interval has passed since the last try.
+        r.containers.lock().await.get_mut("ct-1").unwrap().removing =
+            std::time::Instant::now().checked_sub(REMOVAL_RETRY);
+        assert_eq!(removals_due(&*r.containers.lock().await, &[]), vec!["ct-1".to_string()]);
+
+        // The engine has let go (the workload is released): the next exit
+        // pass finishes the removal.
+        r.containers.lock().await.get_mut("ct-1").unwrap().workload_handle = None;
+        r.note_exits(Vec::new()).await;
+        assert!(!r.containers.lock().await.contains_key("ct-1"));
+
+        // A pending one in a sandbox being removed is tried first, so the
+        // sandbox is not held by a record the kubelet no longer names.
+        r.containers.lock().await.get_mut("ct-2").unwrap().removing = Some(std::time::Instant::now());
+        r.sandboxes.lock().await.insert(
+            "sb-1".into(),
+            Sandbox {
+                id: "sb-1".into(),
+                handle: None,
+                config: PodSandboxConfig::default(),
+                state: PodSandboxState::Ready,
+                created_at: 0,
+                netns: None,
+                ip: String::new(),
+            },
+        );
+        r.remove_pod_sandbox("sb-1").await.unwrap();
+        assert!(r.containers.lock().await.is_empty());
     }
 }

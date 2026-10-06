@@ -57,6 +57,17 @@ not the release path.
 
 ## Work plan
 
+### Done from this side: #90 (P1), descriptors in PID 1: refused workload release after a stop
+
+2026-10-06. Half 1 (a failed start's volumes) was af1704b: handles kept on the record, the Cleanup pass's
+`stop_pod` releases them. Half 2: `restart_container` and the init deadline path stop then remove with `let _`;
+the engine refuses `WorkloadRelease` (EBUSY) until the exit, the kubelet forgets the old cid, nothing retries,
+and `remove_pod_sandbox` then waits on that record forever (pod deletion stuck too).
+1. [x] Runtime-owned: `Container.removing` (asked at / last tried); a removed record is hidden (list, status,
+       stats); `removals_due` = its workload's exit or ≥ 10 s since the last try, from `note_exits` (every
+       absorb_exits); `remove_pod_sandbox` retries its sandbox's pending removals first.
+2. [ ] Test (fake handles, no engine), CHANGELOG; sc-build; golden; close.
+
 ### Done from this side: #143 (P1), pull_image binds its registry clone (stormblock#267)
 
 2026-10-06. Found: `pull_image` mints (`POST /v1/clones`, state claimed), attaches and mounts, never binds; the

@@ -2,6 +2,13 @@
 
 ## 2026-10-06
 
+- **fix:** A container removal the engine refuses is finished by the runtime (#90): `WorkloadRelease` is
+  refused while the workload runs, and a stop only signals, so a removal right after a stop (a restart, an
+  init container past its deadline) was refused and its caller dropped the error. The record (workload,
+  cgroup, volume handles in PID 1; the sandbox it occupies) stayed for good, and the pod's sandbox removal
+  waited on it. Now the record is kept, hidden from the kubelet (not listed, NotFound), and the removal is
+  tried again on the workload's exit, at least every 10 s, and before its sandbox is removed.
+- **docs:** presentation: #143 and #90 are no longer open P1s.
 - **fix:** A pulled image's registry clone is bound (#143, stormblock#267): after the attach and mount,
   `POST /v1/clones/{id}/bind` with consumer `kubelet/<node>/<image>`. It stayed `claimed`, and sbregistry
   reaps a claim older than 900 s as abandoned, under the mounted image. A pull first asks the registry for

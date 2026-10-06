@@ -203,7 +203,7 @@ Full lists: `docs/api.md`, `docs/configuration.md`, `docs/metrics.md`.
   ran (`docs/status.md` is the audit)
 - **Live checks blocked** by full test-machine registries (stormcentral#376): #91, #92, #97, #102
 - **P0:** #140, claims on the Dell (diagnosis shipped; waits on the next release there)
-- **P1:** #143 (a pulled image's registry clone is reaped at 15 min), #90 (descriptor leak in PID 1), #95
+- **P1:** #95
   and #99/#102 (startup speed), #98, #56, #61 (test suites), #69 (missing credentials skipped silently)
 - **Waiting on the owner:** #40 (migration disks), #102 (where the full-scale run happens)
 
