@@ -5173,14 +5173,19 @@ fn build_container_config(
         .unwrap_or_default();
 
     let sc = &spec["securityContext"];
-    let add_capabilities: Vec<String> = sc["capabilities"]["add"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let capabilities = |which: &str| -> Vec<String> {
+        sc["capabilities"][which]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let add_capabilities = capabilities("add");
+    // Dropped too (#118): a pod that drops NET_RAW must not keep it.
+    let drop_capabilities = capabilities("drop");
 
     // securityContext.seLinuxOptions — pass the container's SELinux label to the
     // runtime (e.g. cilium's init containers request `type: spc_t`). A
@@ -5221,6 +5226,7 @@ fn build_container_config(
         privileged: sc["privileged"].as_bool().unwrap_or(false),
         readonly_rootfs: sc["readOnlyRootFilesystem"].as_bool().unwrap_or(false),
         add_capabilities,
+        drop_capabilities,
         selinux_options,
         host_network: false,
         host_pid: false,
@@ -6775,7 +6781,7 @@ pub(crate) mod tests {
             "securityContext": {
                 "privileged": true,
                 "readOnlyRootFilesystem": true,
-                "capabilities": {"add": ["NET_ADMIN", "SYS_MODULE"]}
+                "capabilities": {"add": ["NET_ADMIN", "SYS_MODULE"], "drop": ["NET_RAW"]}
             },
             "volumeMounts": [
                 {"name": "bpf", "mountPath": "/sys/fs/bpf", "mountPropagation": "Bidirectional"},
@@ -6787,6 +6793,7 @@ pub(crate) mod tests {
         assert!(c.privileged);
         assert!(c.readonly_rootfs);
         assert_eq!(c.add_capabilities, vec!["NET_ADMIN", "SYS_MODULE"]);
+        assert_eq!(c.drop_capabilities, vec!["NET_RAW"]);
         // Only the resolvable mount is included; the unresolved one is dropped.
         assert_eq!(c.mounts.len(), 1);
         assert_eq!(c.mounts[0].host_path, "/sys/fs/bpf");
@@ -7019,6 +7026,7 @@ pub(crate) mod tests {
         let c = build_container_config(&simple_container(), "img", vec![], vec![]);
         assert!(!c.privileged);
         assert!(c.add_capabilities.is_empty());
+        assert!(c.drop_capabilities.is_empty());
         assert!(c.mounts.is_empty());
     }
 

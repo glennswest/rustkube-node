@@ -57,6 +57,16 @@ not the release path.
 
 ## Work plan
 
+### Waiting on stormpump#47: #118 (P2), pod capabilities onto the ring
+
+2026-10-06. stormpump main (819b55d) has no capability field in `Spec`; #47 (open) is the engine side (owner on
+stormpump#59: pods get the runtime's 14 + their `add`, boot.d services the full set). The lock's stormpump
+(30a76d3) cannot move until stormvm#65 either.
+1. [x] Now: `securityContext.capabilities.drop` parsed (`ContainerConfig.drop_capabilities`) and forwarded on the
+       CRI gRPC path (`Capability.drop_capabilities`), which also ignored it. Test, docs, CHANGELOG.
+2. [ ] After stormpump#47 (and stormvm#65 for the lock): map add/drop/privileged into `Spec`'s field in `spec_for`;
+       test `CapEff` (NET_ADMIN added, NET_RAW dropped). Propose #118 after stormpump#47.
+
 ### Done from this side: #90 (P1), descriptors in PID 1: refused workload release after a stop
 
 2026-10-06. Half 1 (a failed start's volumes) was af1704b: handles kept on the record, the Cleanup pass's

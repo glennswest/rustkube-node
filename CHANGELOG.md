@@ -2,6 +2,9 @@
 
 ## 2026-10-06
 
+- **fix:** `securityContext.capabilities.drop` is parsed (`ContainerConfig.drop_capabilities`) and sent to a CRI
+  runtime (`Capability.drop_capabilities`); only `add` was (#118). The stormpump ring path still forwards
+  neither: its `Spec` has no capability field until stormpump#47.
 - **fix:** A container removal the engine refuses is finished by the runtime (#90): `WorkloadRelease` is
   refused while the workload runs, and a stop only signals, so a removal right after a stop (a restart, an
   init container past its deadline) was refused and its caller dropped the error. The record (workload,

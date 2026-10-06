@@ -103,6 +103,9 @@ pub struct ContainerConfig {
     pub readonly_rootfs: bool,
     /// securityContext.capabilities.add (Linux capability names, e.g. NET_ADMIN).
     pub add_capabilities: Vec<String>,
+    /// securityContext.capabilities.drop (#118). `ALL` is a name here as in
+    /// the pod spec; the runtime resolves it.
+    pub drop_capabilities: Vec<String>,
     /// securityContext.seLinuxOptions — the container's SELinux label. Cilium's
     /// init containers request `type: spc_t` so they can write host paths under
     /// enforcing SELinux; without passing this the runtime uses `container_t`

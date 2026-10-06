@@ -42,9 +42,11 @@
 //! not drop anything, so a workload keeps what PID 1 had. That is permissive
 //! rather than restrictive: a privileged container works, and an unprivileged
 //! one is over-privileged. Cilium runs; a hostile workload is not contained.
-//! The fields are accepted here and recorded, so the day stormpump learns to
-//! drop capabilities this file needs no rewriting — but nothing enforces them
-//! today and this comment is the only honest place to say so.
+//! `ContainerConfig` carries the pod's `capabilities.add`/`drop` and
+//! `privileged`, but `spec_for` has nowhere to put them until stormpump#47 gives
+//! `Spec` a capability set (#118). It must map them before stormpump's default
+//! narrows to the runtime's standard set, or every pod that adds one (Cilium's
+//! NET_ADMIN, BPF, …) loses it as an EPERM rather than a refused start.
 
 use std::collections::HashMap;
 use std::sync::Arc;

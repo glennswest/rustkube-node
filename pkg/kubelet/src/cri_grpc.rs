@@ -276,6 +276,7 @@ fn to_proto_container_config(config: &ContainerConfig) -> proto::ContainerConfig
                 namespace_options: Some(container_namespace_options(config)),
                 capabilities: Some(proto::Capability {
                     add_capabilities: config.add_capabilities.clone(),
+                    drop_capabilities: config.drop_capabilities.clone(),
                     ..Default::default()
                 }),
                 selinux_options: config.selinux_options.as_ref().map(to_proto_selinux),

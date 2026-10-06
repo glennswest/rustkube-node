@@ -400,6 +400,7 @@ async fn full_pod_flow_over_unix_socket() {
         privileged: true,
         readonly_rootfs: false,
         add_capabilities: vec!["NET_ADMIN".into()],
+        drop_capabilities: vec!["NET_RAW".into()],
         selinux_options: Some(kubelet::cri::SeLinuxOptions {
             type_: "spc_t".into(),
             level: "s0".into(),
@@ -422,10 +423,12 @@ async fn full_pod_flow_over_unix_socket() {
     let resources = linux.resources.unwrap();
     assert_eq!(resources.cpu_quota, 20_000);
     assert_eq!(resources.memory_limit_in_bytes, 64 * 1024 * 1024);
-    // securityContext: privileged + NET_ADMIN reach the wire.
+    // securityContext: privileged + NET_ADMIN reach the wire, and the drop (#118).
     let sc = linux.security_context.unwrap();
     assert!(sc.privileged);
-    assert_eq!(sc.capabilities.unwrap().add_capabilities, vec!["NET_ADMIN"]);
+    let caps = sc.capabilities.unwrap();
+    assert_eq!(caps.add_capabilities, vec!["NET_ADMIN"]);
+    assert_eq!(caps.drop_capabilities, vec!["NET_RAW"]);
 
     client.start_container(&container_id).await.unwrap();
 
