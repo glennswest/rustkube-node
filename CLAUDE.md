@@ -66,7 +66,8 @@ and `remove_pod_sandbox` then waits on that record forever (pod deletion stuck t
 1. [x] Runtime-owned: `Container.removing` (asked at / last tried); a removed record is hidden (list, status,
        stats); `removals_due` = its workload's exit or ≥ 10 s since the last try, from `note_exits` (every
        absorb_exits); `remove_pod_sandbox` retries its sandbox's pending removals first.
-2. [ ] Test (fake handles, no engine), CHANGELOG; sc-build; golden; close.
+2. [x] Test (1 new, no engine), CHANGELOG (1afb7e4). sc-build 1afb7e4 `cargo test --locked`: 340 kubelet unit,
+       25 CNI, 30 proxy, integration and doc-tests pass. Not run on a node.
 
 ### Done from this side: #143 (P1), pull_image binds its registry clone (stormblock#267)
 
