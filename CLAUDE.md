@@ -77,7 +77,10 @@ every suite needs to resolve STORM_NODE). Pods are pinned with `spec.nodeName` (
        #75 guest persistence, #72 mirror-pod logs, #83 snapshot) filed as a follow-up.
        Done: d20ef52; sc-build `cd test && cargo test --locked; cargo build --release --locked`: 28 pass, release
        builds. Filed #162 (terminationMessagePath never read), #163 (node-access medium gaps). Live: short
-       c822f4832d, medium 5d9d765385 queued on C2NR0Q2 (pvetest1 erroring: no VM 3101). Close #61 on their results.
+       c822f4832d, medium 5d9d765385 dropped by a stormcentral restart; requeued short e4bbc4ea0f, medium
+       2434af9cf2 (C2NR0Q2; pvetest1 erroring: no VM 3101). Earlier medium fff1f4d9d9 (65e3c3c): the Dell's
+       apiserver stopped answering mid-run (no results; 6443 refused after). If 2434af9cf2 does it again, suspect
+       the storage cases' load and file it. Close #61 on their results.
 
 ### Waiting on stormpump#47: #118 (P2), pod capabilities onto the ring
 
