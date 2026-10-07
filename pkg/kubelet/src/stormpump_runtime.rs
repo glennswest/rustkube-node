@@ -185,6 +185,9 @@ struct Sandbox {
     netns: Option<String>,
     /// What the CNI gave this pod, empty when none ran.
     ip: String,
+    /// The acquire and the CNI ADD that made it (#139); `None` for one adopted
+    /// rather than made by this process.
+    made: Option<crate::cri::SandboxSteps>,
 }
 
 /// A sandbox whose CNI ADD failed and whose DEL has not succeeded yet (#100).
@@ -693,10 +696,15 @@ impl RuntimeService for StormpumpRuntime {
                 }
             }
         }
+        // Each step timed for the start timing (#139): on a slow disk the sum
+        // was read as a stormblock clone, and no clone is made here.
+        let mut steps = crate::cri::SandboxSteps::default();
+        let acquiring = std::time::Instant::now();
         let (handle, netns) = if config.host_network {
             (None, None)
         } else {
             let (h, pid) = self.on_ring(|r| r.sandbox_acquire(PROFILE_ISOLATED)).await?;
+            steps.acquire = acquiring.elapsed();
             // A pid of 0 means the engine reported no holder; `/proc/0/ns/net`
             // is not a path and handing it to a plugin would fail a long way
             // from here.
@@ -735,7 +743,10 @@ impl RuntimeService for StormpumpRuntime {
                         &config.name,
                         &config.uid,
                     );
-                    match invoker.add(&pod).await {
+                    let adding = std::time::Instant::now();
+                    let added = invoker.add(&pod).await;
+                    steps.cni = adding.elapsed();
+                    match added {
                         Ok(result) => {
                             ip = result
                                 .ips
@@ -802,6 +813,7 @@ impl RuntimeService for StormpumpRuntime {
             created_at: now_nanos(),
             netns,
             ip,
+            made: Some(steps),
         };
         self.sandboxes.lock().await.insert(id.clone(), sb);
         tracing::info!(
@@ -900,6 +912,7 @@ impl RuntimeService for StormpumpRuntime {
             ip: sb.ip.clone(),
             additional_ips: Vec::new(),
             netns_path: sb.netns.clone(),
+            made: sb.made,
         })
     }
 
@@ -1988,6 +2001,7 @@ mod tests {
                 created_at: 0,
                 netns: None,
                 ip: String::new(),
+                made: None,
             },
         );
         for (id, sb) in [("ct-1", "sb-1"), ("ct-2", "sb-1"), ("ct-3", "sb-other")] {
@@ -2114,6 +2128,7 @@ mod tests {
                     created_at: 0,
                     netns: None,
                     ip: String::new(),
+                    made: None,
                 },
             );
         }
@@ -2530,6 +2545,7 @@ mod tests {
                 created_at: 0,
                 netns: None,
                 ip: String::new(),
+                made: None,
             },
         );
         r.remove_pod_sandbox("sb-1").await.unwrap();

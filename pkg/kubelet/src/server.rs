@@ -514,6 +514,7 @@ mod tests {
                 ip: String::new(),
                 additional_ips: vec![],
                 netns_path: None,
+                made: None,
             })
         }
         async fn list_pod_sandbox(&self) -> Result<Vec<PodSandboxSummary>, CriError> {

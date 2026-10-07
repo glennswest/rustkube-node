@@ -426,6 +426,7 @@ impl RuntimeService for CriGrpcClient {
             ip: network.ip,
             additional_ips: network.additional_ips.into_iter().map(|i| i.ip).collect(),
             netns_path,
+            made: None,
         })
     }
 

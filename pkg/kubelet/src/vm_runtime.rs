@@ -575,6 +575,7 @@ mod linux {
                 ip: vm.ip.clone(),
                 additional_ips: vec![],
                 netns_path: None,
+                made: None,
             })
         }
 

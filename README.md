@@ -72,7 +72,7 @@ histogram `kubelet_pod_start_phase_duration_seconds{phase}` and one INFO log lin
 
     storm.io/start-timing: scheduled=850ms wait=1.2ms image=0.3ms volumes=4.4ms sandbox=40ms
       init=0.0ms containers=180ms report=8.1ms total=236ms attempts=1 workers=3/64 pending=1
-      volume/data=3.9ms volume/(serviceaccount)=0.4ms container/app=180ms
+      sandbox/acquire=6.2ms sandbox/cni=31ms sandbox/status=0.1ms sandbox/other=2.7ms volume/data=3.9ms volume/(serviceaccount)=0.4ms container/app=180ms
 
 | phase | from → to |
 |---|---|
@@ -80,7 +80,7 @@ histogram `kubelet_pod_start_phase_duration_seconds{phase}` and one INFO log lin
 | `wait` | seen → the start attempt that succeeded began: admission, image and volume waits, earlier attempts |
 | `image` | the pod's images first asked for → the last resolved. A golden is ~0; a pull is the registry's clone of the golden, its attach and its mount |
 | `volumes` | the pod's volumes in that attempt: claims cloned and attached, configMaps, secrets, projected, the ServiceAccount token, resolv.conf and log dirs. Each spec volume also as `volume/<name>` |
-| `sandbox` | the sandbox made, its network (CNI) included, → its address read |
+| `sandbox` | the sandbox made, its network (CNI) included, → its address read. Taken apart (#139) when the attempt made it: `sandbox/acquire` (stormpump `SandboxAcquire`, the warm namespace holder; 0 on the host network), `sandbox/cni` (the CNI ADD, the plugin's exec included), `sandbox/status` (the address read) and `sandbox/other` (the rest: the runtime's checks, retried DELs of earlier failed networks). A CRI runtime gives only status and other. No step is a stormblock call: a pod's root is a golden mounted at boot |
 | `init` | init containers run to completion |
 | `containers` | every app container created and started; each also as `container/<name>` |
 | `report` | the `Running` status write sent → acknowledged |

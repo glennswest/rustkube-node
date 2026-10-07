@@ -250,6 +250,19 @@ pub struct PodSandboxStatusInfo {
     /// runtime reports it. Used to run http/tcp health probes inside the pod's
     /// netns so `127.0.0.1`/loopback-bound health servers are reachable.
     pub netns_path: Option<String>,
+    /// How the runtime spent making it, when it times that (#139): the
+    /// stormpump runtime does, a CRI runtime does not.
+    pub made: Option<SandboxSteps>,
+}
+
+/// The runtime's own steps in making a sandbox (#139), for the start timing's
+/// `sandbox/acquire` and `sandbox/cni`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SandboxSteps {
+    /// stormpump `SandboxAcquire` (a warm namespace holder); zero on the host network.
+    pub acquire: std::time::Duration,
+    /// The CNI ADD, the plugin's exec included; zero when none ran.
+    pub cni: std::time::Duration,
 }
 
 /// Image information.

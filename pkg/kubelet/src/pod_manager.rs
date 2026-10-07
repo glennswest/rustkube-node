@@ -2968,6 +2968,8 @@ impl PodManager {
         // Create pod sandbox
         let step = Instant::now();
         let existing=self.pods.read().await.get(uid).and_then(|p|p.sandbox_id.clone());
+        // Made by this attempt: its steps are this start's to report (#139).
+        let made_here=existing.is_none();
         let sandbox_id=if let Some(existing)=existing {existing} else {
         let sandbox_id = self.runtime.run_pod_sandbox(&sandbox_config).await?;
         // Persist each side effect before the next await. A failed or cancelled
@@ -2984,6 +2986,7 @@ impl PodManager {
         info!("Created sandbox {sandbox_id} for {namespace}/{name}");
 
         // Get sandbox IP
+        let status_step = Instant::now();
         let sandbox_status = self.runtime.pod_sandbox_status(&sandbox_id).await?;
         let pod_ip = if sandbox_status.ip.is_empty() {
             None
@@ -2991,6 +2994,9 @@ impl PodManager {
             Some(sandbox_status.ip.clone())
         };
         attempt.sandbox(step.elapsed());
+        if made_here {
+            attempt.sandbox_steps(sandbox_status.made, status_step.elapsed());
+        }
 
         // Run init containers to completion (in order) before the app
         // containers — each must exit 0. A failure aborts pod start.
@@ -5470,6 +5476,11 @@ pub(crate) mod tests {
                 ip: "10.88.0.5".to_string(),
                 additional_ips: vec![],
                 netns_path: None,
+                // As the stormpump runtime reports it (#139).
+                made: Some(crate::cri::SandboxSteps {
+                    acquire: std::time::Duration::from_millis(1),
+                    cni: std::time::Duration::from_millis(2),
+                }),
             })
         }
 
@@ -7520,7 +7531,9 @@ pub(crate) mod tests {
         assert!(t.is_started());
         let text = t.finish(std::time::Duration::from_millis(3), Instant::now()).text;
         for part in ["wait=", "image=", "volumes=", "sandbox=", "init=", "containers=",
-            "report=3.0ms", "total=", "attempts=1", "pending=1", "volume/scratch=", "container/app="] {
+            "report=3.0ms", "total=", "attempts=1", "pending=1", "volume/scratch=", "container/app=",
+            // #139: the runtime's steps, the status read and the rest.
+            "sandbox/acquire=1.0ms", "sandbox/cni=2.0ms", "sandbox/status=", "sandbox/other="] {
             assert!(text.contains(part), "{part} in {text}");
         }
 

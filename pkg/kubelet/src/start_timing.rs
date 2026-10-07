@@ -16,6 +16,10 @@
 //! | `image`      | this pod's images first asked for → the last of them resolved; a pull is the registry's clone, its attach and its mount |
 //! | `volumes`    | every volume of the pod (each also as `volume/<name>`), claims cloned and attached included |
 //! | `sandbox`    | the sandbox made (its network included) → its address read |
+//! | `sandbox/acquire` | stormpump `SandboxAcquire`, the warm namespace holder (#139) |
+//! | `sandbox/cni`     | the CNI ADD, the plugin's exec included |
+//! | `sandbox/status`  | the sandbox's status read (its address) |
+//! | `sandbox/other`   | the rest of `sandbox`: the runtime's checks, retried DELs of earlier failed networks, bookkeeping |
 //! | `init`       | init containers, run to completion |
 //! | `containers` | every app container created and started (each also as `container/<name>`) |
 //! | `report`     | the `Running` status sent → acknowledged |
@@ -25,6 +29,11 @@
 //! the executor's passes running when it began (this one included) out of
 //! `--pod-workers`, and `pending=<n>`, the pods seen here and not yet started
 //! (this one included).
+//!
+//! The `sandbox/*` steps are written when this attempt made the sandbox: acquire
+//! and cni only from a runtime that times them (stormpump; a CRI runtime gives
+//! `sandbox/status` and `sandbox/other`). None of them is a stormblock call: a
+//! pod's root is a golden mounted at boot (#139, stormblock#264).
 //!
 //! `image` overlaps `wait` (an image is resolved off the worker while the pod
 //! waits); the rest follow one another, so `wait + volumes + sandbox + init +
@@ -44,6 +53,9 @@ pub const PHASES: &[&str] = &[
     "scheduled", "wait", "image", "volumes", "sandbox", "init", "containers", "report", "total",
 ];
 
+/// `sandbox`'s steps (#139), with a histogram each when they were measured.
+pub const SANDBOX_STEPS: &[&str] = &["sandbox/acquire", "sandbox/cni", "sandbox/status", "sandbox/other"];
+
 /// One pod's start, as far as it has got.
 #[derive(Debug, Clone)]
 pub struct StartTiming {
@@ -59,6 +71,14 @@ pub struct StartTiming {
     started: bool,
 }
 
+/// `sandbox` taken apart (#139).
+#[derive(Debug, Clone, Copy)]
+struct SandboxSplit {
+    /// The runtime's own steps, when it times them.
+    made: Option<crate::cri::SandboxSteps>,
+    status: Duration,
+}
+
 /// The steps of one start attempt.
 #[derive(Debug, Clone)]
 pub struct Attempt {
@@ -66,6 +86,8 @@ pub struct Attempt {
     volumes: Duration,
     per_volume: Vec<(String, Duration)>,
     sandbox: Duration,
+    /// What making the sandbox was made of (#139), when this attempt made it.
+    sandbox_steps: Option<SandboxSplit>,
     init: Duration,
     containers: Duration,
     per_container: Vec<(String, Duration)>,
@@ -84,6 +106,7 @@ impl Attempt {
             volumes: Duration::ZERO,
             per_volume: Vec::new(),
             sandbox: Duration::ZERO,
+            sandbox_steps: None,
             init: Duration::ZERO,
             containers: Duration::ZERO,
             per_container: Vec::new(),
@@ -102,6 +125,11 @@ impl Attempt {
     }
     pub fn sandbox(&mut self, took: Duration) {
         self.sandbox = took;
+    }
+    /// The sandbox this attempt made: the runtime's steps (`None` from one that
+    /// does not time them) and the status read after it (#139).
+    pub fn sandbox_steps(&mut self, made: Option<crate::cri::SandboxSteps>, status: Duration) {
+        self.sandbox_steps = Some(SandboxSplit { made, status });
     }
     pub fn init(&mut self, took: Duration) {
         self.init = took;
@@ -191,6 +219,22 @@ impl StartTiming {
         }
         if let Some(p) = a.and_then(|a| a.pending) {
             text.push(format!("pending={p}"));
+        }
+        if let Some((a, split)) = a.and_then(|a| Some((a, a.sandbox_steps?))) {
+            let made = split.made.unwrap_or_default();
+            let other = a.sandbox.saturating_sub(made.acquire + made.cni + split.status);
+            let steps = [
+                ("sandbox/acquire", split.made.map(|m| m.acquire)),
+                ("sandbox/cni", split.made.map(|m| m.cni)),
+                ("sandbox/status", Some(split.status)),
+                ("sandbox/other", Some(other)),
+            ];
+            for (name, d) in steps {
+                if let Some(d) = d {
+                    text.push(format!("{name}={}", ms(d)));
+                    phases.push((name, d));
+                }
+            }
         }
         if let Some(a) = a {
             for (name, d) in &a.per_volume {
@@ -287,6 +331,41 @@ mod tests {
         );
         let names: Vec<_> = f.phases.iter().map(|(n, _)| *n).collect();
         assert_eq!(names, PHASES);
+    }
+
+    #[test]
+    fn sandbox_is_taken_apart_into_acquire_cni_status_and_the_rest() {
+        let seen = Instant::now();
+        let mut t = StartTiming::seen_at(&json!({}), seen, at("2026-10-02T10:00:00Z"));
+        let mut a = Attempt::begin();
+        a.sandbox(Duration::from_millis(621));
+        let made = crate::cri::SandboxSteps { acquire: Duration::from_millis(15), cni: Duration::from_millis(590) };
+        a.sandbox_steps(Some(made), Duration::from_micros(400));
+        t.started(a);
+        let f = t.finish(Duration::ZERO, seen);
+        assert!(
+            f.text.contains(" sandbox=621ms ")
+                && f.text.contains(" sandbox/acquire=15ms sandbox/cni=590ms sandbox/status=0.4ms sandbox/other=16ms"),
+            "{}",
+            f.text
+        );
+        let names: Vec<_> = f.phases.iter().map(|(n, _)| *n).filter(|n| n.starts_with("sandbox/")).collect();
+        assert_eq!(names, SANDBOX_STEPS);
+
+        // A runtime that does not time its steps: status and the rest only.
+        let mut t = StartTiming::seen_at(&json!({}), seen, at("2026-10-02T10:00:00Z"));
+        let mut a = Attempt::begin();
+        a.sandbox(Duration::from_millis(50));
+        a.sandbox_steps(None, Duration::from_millis(2));
+        t.started(a);
+        let f = t.finish(Duration::ZERO, seen);
+        assert!(!f.text.contains("sandbox/acquire") && !f.text.contains("sandbox/cni"), "{}", f.text);
+        assert!(f.text.contains("sandbox/status=2.0ms sandbox/other=48ms"), "{}", f.text);
+
+        // A sandbox an earlier attempt made: nothing to take apart.
+        let mut t = StartTiming::seen_at(&json!({}), seen, at("2026-10-02T10:00:00Z"));
+        t.started(Attempt::begin());
+        assert!(!t.finish(Duration::ZERO, seen).text.contains("sandbox/"));
     }
 
     #[test]

@@ -161,6 +161,7 @@ impl RuntimeService for CriClient {
             ip,
             additional_ips,
             netns_path: None,
+            made: None,
         })
     }
 

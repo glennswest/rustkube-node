@@ -2,6 +2,13 @@
 
 ## 2026-10-08
 
+- **feat:** Start timing takes `sandbox` apart (#139): `sandbox/acquire` (stormpump `SandboxAcquire`),
+  `sandbox/cni` (the CNI ADD with the plugin's exec), `sandbox/status` (the address read) and `sandbox/other`
+  (the rest), in `storm.io/start-timing`, the Event, the log line and
+  `kubelet_pod_start_phase_duration_seconds{phase}`. server3's 265 ms–2.3 s `sandbox` (stormblock#264) was read as
+  a stormblock clone; the step makes none, and the next measurement names which part is slow. The stormpump
+  runtime reports its steps in the sandbox status (`PodSandboxStatusInfo.made`); a CRI runtime gives status and
+  other only. Written only when the attempt made the sandbox.
 - **fix:** A credential file named on the command line is waited for (60 s) and its absence is fatal, never
   skipped (#69). `--client-certificate`, `--client-key` and `--token-file` were read once and dropped when
   missing, so a kubelet started before stormcert wrote its pair, or given a mistyped path, ran as

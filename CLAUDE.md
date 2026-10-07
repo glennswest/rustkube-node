@@ -73,7 +73,7 @@ the boot (build-goldens.sh:5353), so a wait is safe for them.
 2026-10-08. `start_pod` times `sandbox` around `run_pod_sandbox` + `pod_sandbox_status`; on stormpump that is
 SandboxAcquire, network_ready and the CNI ADD (no stormblock call). Wanted: `acquire`, `cni`, `status` sub-phases
 in `storm.io/start-timing`, so the blade's next measurement names the slow step.
-1. [ ] Runtime reports the sandbox's own split; start timing records it; annotation/Event/histogram/log.
+1. [x] Runtime reports the sandbox's own split; start timing records it; annotation/Event/histogram/log.
 2. [ ] Tests, docs (README, metrics.md, status.md), CHANGELOG; sc-build; stage golden; close.
 
 ### Done: #51, retire `scripts/build-golden.sh` (the second golden builder)
