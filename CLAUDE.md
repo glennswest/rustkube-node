@@ -57,6 +57,18 @@ by #51.
 
 ## Work plan
 
+### In progress: #82 (P2), a node service's last exit and output on its mirror pod
+
+2026-10-08. stormpump#51 (adc64f8) writes `last_exit_code` | `last_exit_signal`, `last_exit` and `last_output` (20
+lines) per asset in assets.json, once it has exited, kept across the restart. fc867c1 (#124) reads `last_exit` /
+`last_output` for pods/log only (`node_logs.rs`). `container_failing` is stormd's own event (stormd README,
+"Events"), not the kubelet's: the kubelet's counterpart is the mirror's BackOff/Stopped Event.
+1. [ ] `mirror::Asset.last_exit` (code, signal, text, output); `mirror_pod_with`: `lastState.terminated`
+       (exitCode, or 128+signal, signal, reason Error, message = output tail ≤ 80 lines / 4 KiB) and the same on a
+       stopped service's `state.terminated`; `status_current` and `table_key` see a new exit.
+2. [ ] BackOff/Stopped Events carry the exit and the tail.
+3. [ ] Tests, README, CHANGELOG; sc-build; close.
+
 ### 2026-10-08: the build backlog ran
 
 The build-VM slot came free; sc-build 134fd60 (job 9161dda65c) `cargo build --locked && cargo test --locked`: 398 kubelet unit pass, plus 34 proxy, 25 CNI and the integration tests; every waiting issue's own
