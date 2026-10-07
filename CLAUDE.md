@@ -64,7 +64,7 @@ Lease renewed (heartbeat, 10 s) or a VMI LIST (`cache_specs`, a live LIST). Past
 (default 40 s, the Lease duration; 0 disables) a machine found here answers 503 + Retry-After, not its identity.
 An address with no machine here stays 404 (the local record is the truth for "not here"); the token path (#122)
 is live GETs already.
-1. [ ] `heartbeat` returns whether the Lease was renewed; VmManager `note_apiserver_contact`, bound, stale → 503.
+1. [x] `heartbeat` returns whether the Lease was renewed; VmManager `note_apiserver_contact`, bound, stale → 503.
 2. [ ] Flag/env/config, tests, docs (README, api.md, configuration.md, status.md), CHANGELOG; sc-build; close.
 
 ### Done: #155, docs: no stormcos edition runs kube-proxy
@@ -231,7 +231,7 @@ the full LIST, and a cluster without the VMI CRD never leaves "cold".
 2. [x] `reconcile_one` refreshes that UID's cached object (removes it when gone); CRD 404 marks synced.
 3. [x] `placed_here`: cached object exists, not terminating, uid matches, `status.nodeName` is this node, no
        completed (not failed) `migrationState` to another node. Covers address reuse. Not covered: a node
-       partitioned from the apiserver answers from its last cache (no lease; noted in status.md).
+       partitioned from the apiserver answers from its last cache (no lease; noted in status.md). Bounded by #156.
 4. [x] Tests (5 new), docs (README, api.md, status.md), CHANGELOG (3fe7496). sc-build 3fe7496 `cargo build
        --locked && cargo test --locked`: 301 kubelet unit, 30 proxy, 25 CNI, 1 doc-test pass; exit 0 in 147 s.
        Not run on a node.

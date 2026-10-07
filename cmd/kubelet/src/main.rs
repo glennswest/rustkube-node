@@ -110,6 +110,12 @@ struct Cli {
     #[arg(long, env = "STORAGE_ALERT_PERCENT", default_value_t = 85.0)]
     storage_alert_percent: f64,
 
+    /// Seconds `/vmInstance` answers guest metadata from the VMI cache without
+    /// word from the apiserver (a renewed node Lease or a VMI list); past it,
+    /// 503 + Retry-After (#156). Default: the Lease duration. 0: unbounded.
+    #[arg(long, env = "METADATA_MAX_STALENESS", default_value_t = 40)]
+    metadata_max_staleness: u64,
+
     /// Port for the kubelet's inbound HTTP server (/healthz, /metrics, /pods).
     #[arg(long, env = "KUBELET_PORT", default_value_t = 10250)]
     kubelet_port: u16,
@@ -511,6 +517,7 @@ async fn main() -> anyhow::Result<()> {
             reserve_percent: cli.storage_reserve_percent,
             alert_percent: cli.storage_alert_percent,
         },
+        metadata_max_staleness: std::time::Duration::from_secs(cli.metadata_max_staleness),
         ..Default::default()
     };
     let mut kubelet = Kubelet::new(config, runtime, images, migration)?;

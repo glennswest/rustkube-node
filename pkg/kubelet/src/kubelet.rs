@@ -63,6 +63,9 @@ pub struct KubeletConfig {
     pub engine: crate::engine::EngineClient,
     /// How claims are charged against the data slabs, and when to warn (#62).
     pub storage: crate::capacity::Policy,
+    /// How long `/vmInstance` answers from the VMI cache without word from
+    /// the apiserver (`--metadata-max-staleness`, #156). Zero: unbounded.
+    pub metadata_max_staleness: Duration,
 }
 
 impl Default for KubeletConfig {
@@ -91,6 +94,7 @@ impl Default for KubeletConfig {
             cni_conf_dir: None,
             engine: crate::engine::EngineClient::default(),
             storage: crate::capacity::Policy::default(),
+            metadata_max_staleness: crate::vm_manager::METADATA_MAX_STALENESS,
         }
     }
 }
@@ -229,7 +233,8 @@ impl Kubelet {
             )
             .with_storage(self.config.engine.clone())
             .with_claims(self.pod_manager.clone())
-            .with_cni(cni),
+            .with_cni(cni)
+            .with_max_staleness(self.config.metadata_max_staleness),
         ));
         self.snapshots = Some(Arc::new(crate::vm_snapshot::Snapshots::new(
             self.api_client.clone(),
@@ -346,6 +351,7 @@ impl Kubelet {
         let heartbeat_interval = self.config.heartbeat_interval;
         let kubelet_port = self.config.kubelet_port;
         let hb_client = self.api_client.clone();
+        let hb_vms = self.vms.clone();
         tokio::spawn(async move {
             let reporter = NodeReporter::with_pod_cidr(&reporter_url, &node_name, pod_cidr)
                 .with_runtime_version(runtime_version)
@@ -354,8 +360,16 @@ impl Kubelet {
             let mut interval = time::interval(heartbeat_interval);
             loop {
                 interval.tick().await;
-                if let Err(e) = reporter.heartbeat().await {
-                    error!("Heartbeat failed: {e}");
+                match reporter.heartbeat().await {
+                    // Heard from: guest metadata may keep answering from
+                    // the cache (#156).
+                    Ok(true) => {
+                        if let Some(vms) = &hb_vms {
+                            vms.note_apiserver_contact();
+                        }
+                    }
+                    Ok(false) => debug!("Heartbeat: the Lease was not renewed"),
+                    Err(e) => error!("Heartbeat failed: {e}"),
                 }
             }
         });

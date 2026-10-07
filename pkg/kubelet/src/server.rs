@@ -343,6 +343,17 @@ async fn vm_instance(
             Json(serde_json::json!({"error": "this node has not synced yet"})),
         )
             .into_response(),
+        // A cache the apiserver has not confirmed within the bound (#156):
+        // the machine may have moved while this node was cut off.
+        Some(v) if v.get("storm.io/stale").is_some() => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("retry-after", "5")],
+            Json(serde_json::json!({"error": format!(
+                "this node has not heard from the apiserver for {}s",
+                v["storm.io/stale"].as_u64().unwrap_or_default()
+            )})),
+        )
+            .into_response(),
         Some(v) => Json(v).into_response(),
         None => (
             StatusCode::NOT_FOUND,

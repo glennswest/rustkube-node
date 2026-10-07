@@ -292,7 +292,11 @@ impl NodeReporter {
     }
 
     /// Send a heartbeat via Lease object.
-    pub async fn heartbeat(&self) -> anyhow::Result<()> {
+    ///
+    /// `Ok(true)` when the apiserver accepted the Lease: the node has been
+    /// heard from, which is what lets it keep answering guest metadata from
+    /// its cache (#156).
+    pub async fn heartbeat(&self) -> anyhow::Result<bool> {
         let now = chrono::Utc::now();
         let lease = json!({
             "apiVersion": "coordination.k8s.io/v1",
@@ -316,17 +320,20 @@ impl NodeReporter {
         );
 
         let resp = self.client.put(&path).json(&lease).send().await;
-        match resp {
-            Ok(r) if r.status().is_success() => {}
+        let renewed = match resp {
+            Ok(r) if r.status().is_success() => true,
             _ => {
                 // Create it
                 let create_path = format!(
                     "{}/apis/coordination.k8s.io/v1/namespaces/kube-node-lease/leases",
                     self.api_url
                 );
-                let _ = self.client.post(&create_path).json(&lease).send().await;
+                matches!(
+                    self.client.post(&create_path).json(&lease).send().await,
+                    Ok(r) if r.status().is_success()
+                )
             }
-        }
+        };
 
         // Refresh node status conditions via the /status subresource so that
         // metadata (labels) and spec (podCIDR) are preserved across heartbeats.
@@ -353,7 +360,7 @@ impl NodeReporter {
             Err(e) => tracing::warn!("Heartbeat: node status update failed: {e}"),
         }
 
-        Ok(())
+        Ok(renewed)
     }
 
     /// Build the node status, merging the kubelet-owned conditions into

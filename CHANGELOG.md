@@ -2,6 +2,12 @@
 
 ## 2026-10-07
 
+- **fix:** `/vmInstance` no longer answers from a cache the apiserver has not confirmed (#156). A node cut off
+  from the apiserver kept handing out the identity its last cache placed here, while the control plane could
+  move the machine or give its address to another. The kubelet now records when it last heard from the
+  apiserver (a renewed node Lease, or a VMI LIST); past `--metadata-max-staleness` (`METADATA_MAX_STALENESS`,
+  default 40 s, the Lease duration; 0 is unbounded) a machine found here answers 503 + `Retry-After: 5`. An
+  address with no machine here stays 404. `NodeReporter::heartbeat` returns whether the Lease was renewed.
 - **docs:** No stormcos edition runs kube-proxy (#155): README, BUILD.md, status.md, the presentation and
   CLAUDE.md said the flowsdn edition ran it as a DaemonSet. The owner chose flowsdn's own Services (#145;
   stormcos#265 removed `65-kube-proxy.yaml`, flowsdn#292). kube-proxy stays in the golden.

@@ -738,6 +738,11 @@ impl Machines {
     }
 }
 
+/// How long guest metadata is answered from the cache without word from the
+/// apiserver (#156): the node Lease's duration, past which the control plane
+/// itself stops counting on this node.
+pub const METADATA_MAX_STALENESS: std::time::Duration = std::time::Duration::from_secs(40);
+
 /// Is the machine this object describes this node's to answer for (#119)?
 ///
 /// The object places a machine; the local record only says a hypervisor is
@@ -819,6 +824,13 @@ pub struct VmManager {
     /// are different answers and only one of them is safe to act on: a guest
     /// told the second at boot configures itself as nobody.
     synced: std::sync::atomic::AtomicBool,
+    /// When the apiserver was last heard from: a renewed node Lease or a VMI
+    /// LIST (#156). A partitioned node cannot see a machine move away, so
+    /// metadata from the cache is answered only within `max_staleness` of it.
+    contact: std::sync::Mutex<Option<std::time::Instant>>,
+    /// How long the cache may answer metadata without word from the
+    /// apiserver (`--metadata-max-staleness`, #156). Zero: unbounded.
+    max_staleness: std::time::Duration,
     /// What each running machine's bridged taps have shown the guest take
     /// (#91), by uid: the NIC's index and its watcher. A guest on a node
     /// bridge gets its address from a DHCP server the node does not run, and
@@ -987,6 +999,8 @@ impl VmManager {
             disk_lifecycle: tokio::sync::RwLock::new(()),
             watched: Mutex::new(None),
             synced: std::sync::atomic::AtomicBool::new(false),
+            contact: std::sync::Mutex::new(None),
+            max_staleness: METADATA_MAX_STALENESS,
             snoopers: std::sync::Mutex::new(HashMap::new()),
             snoop_tx,
             snoop_rx: std::sync::Mutex::new(Some(snoop_rx)),
@@ -1008,6 +1022,33 @@ impl VmManager {
     pub fn with_cni(mut self, invoker: Option<cni::CniInvoker>) -> VmManager {
         self.cni = invoker;
         self
+    }
+
+    /// How long metadata may be answered from the cache without word from the
+    /// apiserver (#156). Zero: unbounded.
+    pub fn with_max_staleness(mut self, bound: std::time::Duration) -> VmManager {
+        self.max_staleness = bound;
+        self
+    }
+
+    /// The apiserver answered: the node Lease was renewed, or the VMIs were
+    /// listed (#156).
+    pub fn note_apiserver_contact(&self) {
+        self.heard_at(std::time::Instant::now());
+    }
+
+    fn heard_at(&self, at: std::time::Instant) {
+        *self.contact.lock().unwrap_or_else(|e| e.into_inner()) = Some(at);
+    }
+
+    /// How long since the apiserver was last heard from, when that is past
+    /// the bound: the cache may no longer be the truth (#156).
+    fn stale_for(&self) -> Option<std::time::Duration> {
+        if self.max_staleness.is_zero() {
+            return None;
+        }
+        let since = (*self.contact.lock().unwrap_or_else(|e| e.into_inner()))?.elapsed();
+        (since > self.max_staleness).then_some(since)
     }
 
     /// Keep the pod-network records here instead of `/run` (tests).
@@ -1393,6 +1434,8 @@ impl VmManager {
     }
 
     pub async fn cache_specs(&self, objects: &[Value]) {
+        // A LIST just answered (#156).
+        self.note_apiserver_contact();
         *self.desired.lock().await = objects.iter().filter_map(|o|
             o["metadata"]["uid"].as_str().map(|uid| (uid.into(), o.clone()))).collect();
         self.synced.store(true, std::sync::atomic::Ordering::Release);
@@ -3110,6 +3153,14 @@ impl VmManager {
         // its own address rather than resolving a pod and assuming one: one
         // lookup in the address index, not a scan (#119).
         let vm = self.vms.lock().await.at(ip)?.clone();
+        // A machine here, but a cache the apiserver has not confirmed for
+        // longer than the bound (#156). A partitioned node cannot see the
+        // machine move or its address go to another, so it must not hand out
+        // this one's identity; "ask again" is safe, a wrong answer is not.
+        // (No machine here stays 404: the local record is the truth for that.)
+        if let Some(since) = self.stale_for() {
+            return Some(json!({ "storm.io/stale": since.as_secs() }));
+        }
         // The object, which is the truth. The local record only said which
         // machine holds this address; whether this node may answer for it,
         // and everything a guest is told about itself, comes from what the
@@ -4178,6 +4229,34 @@ mod tests {
         // answering at once, from that machine's own reconcile.
         m.reconcile_one("a", Some(&placed("a", "n2"))).await.ok();
         assert!(m.machine_at("10.0.0.5").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_cache_the_apiserver_has_not_confirmed_within_the_bound_answers_ask_again() {
+        let bound = std::time::Duration::from_secs(40);
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), "").with_max_staleness(bound);
+        m.vms.lock().await.insert("a".into(), vm_at("a", &["10.0.0.5"], Phase::Running));
+        m.cache_specs(&[placed("a", "n1")]).await;
+        assert_eq!(m.machine_at("10.0.0.5").await.unwrap()["instance_id"], "a", "just listed: fresh");
+
+        // Partitioned: nothing heard for longer than the bound.
+        let Some(long_ago) = std::time::Instant::now().checked_sub(bound + std::time::Duration::from_secs(5)) else {
+            return; // a monotonic clock this young cannot express it
+        };
+        m.heard_at(long_ago);
+        let md = m.machine_at("10.0.0.5").await.unwrap();
+        assert!(md["storm.io/stale"].as_u64().unwrap() >= 45, "stale, not the machine: {md}");
+        assert!(md.get("instance_id").is_none());
+        assert!(m.machine_at("10.0.0.9").await.is_none(), "no machine here is still 404");
+
+        // A renewed Lease is word from the apiserver.
+        m.note_apiserver_contact();
+        assert_eq!(m.machine_at("10.0.0.5").await.unwrap()["instance_id"], "a");
+
+        // Zero is unbounded.
+        let m = m.with_max_staleness(std::time::Duration::ZERO);
+        m.heard_at(long_ago);
+        assert_eq!(m.machine_at("10.0.0.5").await.unwrap()["instance_id"], "a");
     }
 
     #[tokio::test]

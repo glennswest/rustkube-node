@@ -90,7 +90,7 @@ async fn heartbeat_recreates_a_deleted_node() {
 
     // Normal startup: the node is created and heartbeats land on it.
     reporter.register().await.unwrap();
-    reporter.heartbeat().await.unwrap();
+    assert!(reporter.heartbeat().await.unwrap(), "the Lease was accepted: the node was heard from (#156)");
     assert_eq!(api.creates.load(Ordering::SeqCst), 1);
     assert_eq!(api.status_updates.load(Ordering::SeqCst), 1);
 
@@ -127,4 +127,16 @@ async fn registration_does_not_loop_when_the_node_cannot_be_created() {
     // POST 409s (exists), status PUT succeeds.
     reporter.register().await.unwrap();
     assert_eq!(api.status_updates.load(Ordering::SeqCst), 1);
+}
+
+/// An apiserver the node cannot reach renews no Lease, and the heartbeat says
+/// so: metadata answered from the cache is bounded by it (#156).
+#[tokio::test]
+async fn heartbeat_reports_an_unrenewed_lease() {
+    // A port nothing listens on: every request is refused.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let reporter = NodeReporter::new(&url, "rknode1.g8.lo");
+    assert!(!reporter.heartbeat().await.unwrap());
 }
