@@ -2,6 +2,8 @@
 
 ## 2026-10-08
 
+- **fix:** The #85 change compiles: `watch_for_node`'s per-placement closure no longer moves the node name it
+  still passes on, and `assigned_to`'s helper is a function, not a closure returning a borrow (build-failure #188).
 - **fix:** A Pod held back by a claim a VM on this node is using says why (#80). Admission already reserves a
   VMI's claims exclusively (since #100), so the Pod was never started against the guest's disk, but it sat with
   no status and no Event. It is now Pending with its containers `ContainerCreating` and the reason ("claim ns/c is

@@ -3649,7 +3649,7 @@ pub async fn watch_for_node<F>(
         Arc::new(std::sync::Mutex::new(vec![HashMap::new(); PLACEMENTS.len()]));
     let on_set = Arc::new(on_set);
     let watches = PLACEMENTS.iter().enumerate().map(|(slot, field)| {
-        let (sets, on_set, node) = (sets.clone(), on_set.clone(), node.clone());
+        let (sets, on_set, mine) = (sets.clone(), on_set.clone(), node.clone());
         let publish = move |have: &HashMap<String, Value>| {
             let mut sets = sets.lock().unwrap();
             sets[slot] = have.clone();
@@ -3660,7 +3660,7 @@ pub async fn watch_for_node<F>(
                 }
             }
             let all: Vec<Value> =
-                all.into_values().filter(|o| assigned_to(o, &node)).cloned().collect();
+                all.into_values().filter(|o| assigned_to(o, &mine)).cloned().collect();
             on_set(all);
         };
         watch_selector(api.clone(), api_url.clone(), node.clone(), field, publish)
@@ -3879,7 +3879,9 @@ pub fn placed_on(lists: &[Value], node: &str) -> Vec<Value> {
 /// one placed by hand. Anything unassigned is not this node's business — a
 /// kubelet that started unscheduled work would start it on every node at once.
 pub fn assigned_to(obj: &Value, node: &str) -> bool {
-    let placed = |v: &Value| v.as_str().filter(|s| !s.is_empty());
+    fn placed(v: &Value) -> Option<&str> {
+        v.as_str().filter(|s| !s.is_empty())
+    }
     placed(&obj["status"]["nodeName"]).or_else(|| placed(&obj["spec"]["nodeName"])) == Some(node)
 }
 
