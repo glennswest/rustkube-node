@@ -453,6 +453,8 @@ waits on the master installing the release (stormcos#164) = #102.
        of which scheduling p95 60.86 s (filed rustkube#205); PVC p95 10.85 s. C2NR0Q2 blocked by registry 507
        (stormcentral#376). Owner (#158): **C**, the day suite on the Dell is the acceptance; full scale scheduled
        separately at night on a pve VM (reported, not gating). #102 proposed after stormcentral#376.
+       2026-10-07: #376 closed, 11.88 has the 4 GiB registry; the Dell is down (stormcos#337), pve VMs missing.
+       #102 proposed after stormcos#337; then `stormcentral test run stormcos_qa turbomode --tag C2NR0Q2`.
    Stage golden golden-rustkube-node-e8bca700a793 (bba7d54), release request stormcos#164.
 
 ### Done: #101, events and explicit deadlines instead of sync ticks
