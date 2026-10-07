@@ -135,7 +135,7 @@ filesystem mount is PID 1's, at container create (in `containers`).
        cold / 1.5–1.7 s warm: bind 150–220 ms (ours), PID 1's ext4 mount 0.55–0.88 s warm (stormpump#107), blank
        clone 0.3–0.37 s warm (stormblock#327); control plane 0.3–3.1 s (rustkube#147, commented). The Dell's 11.91
        failed its fresh-slab gate: no samples there.
-3. [x] Bind off a pod's start path (9a1df4f): `ClaimBinder` task after the attach; VM path still inline; `ClaimSteps.bind`
+3. [x] Bind off a pod's start path (d758167): `ClaimBinder` task after the attach; VM path still inline; `ClaimSteps.bind`
        optional. SC_BUILD_VM sc-build: 365 kubelet unit pass.
 4. [ ] Golden (stormcentral#527); then the claim target behind stormpump#107, stormblock#327, rustkube#147. #95
        proposed after stormcentral#527.
