@@ -57,6 +57,17 @@ by #51.
 
 ## Work plan
 
+### In progress: #115 (P2), a stormpump exit wakes its own workload only
+
+2026-10-08. An unsolicited exit bumps the ring's counter; `pod_loop`/`vm_loop` answer with `wake_kind` **and**
+`worker.enqueue()` (a full list sync), so one exit wakes every Pod and VMI worker and re-syncs every pod.
+1. [ ] Ring: a broadcast of exiting handles beside the drained queue. Router task: the Pod runtime maps handle →
+       container → sandbox → pod uid (`RuntimeService::pod_of_workload`), the VM manager handle → VMI uid; wake that
+       uid only (`wake_where`). Unknown handle or a lagged channel: wake both kinds (the old behaviour). The loops'
+       exit arms go (the counter stays: it says the runtime has exit events).
+2. [ ] Tests (one exit → its own uid only; the mappings; fallback), docs (README event table), CHANGELOG; sc-build
+       (blocked: stormcentral#536).
+
 ### Waiting on stormcentral#536 (builds): #126 (P2), no fixed init deadline; activeDeadlineSeconds bounds it
 
 2026-10-08. `run_init_containers` stops an init still running after 120 s (`DeadlineExceeded`, exit -1). Upstream:
