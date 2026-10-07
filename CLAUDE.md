@@ -57,15 +57,15 @@ by #51.
 
 ## Work plan
 
-### In progress: #42 (P2), the node half of volume expansion (ReadWriteOncePod done in v0.8.0)
+### Done: #42 (P2), the node half of volume expansion (ReadWriteOncePod done in v0.8.0)
 
 2026-10-08. rustkube#63 done: a grown claim has `allocatedResourceStatuses.storage: NodeResizePending`,
 `Resizing` + `FileSystemResizePending`, PV capacity = new size, claim capacity old. Upstream then: NodeExpandVolume,
 capacity = new, both conditions removed, allocatedResourceStatuses dropped.
 1. [x] `csi.rs`: `expand_volume` capability, `node_expand`. `csi_volumes.rs`: `resize_due`, `resized_status`,
        `expand_csi_volumes` (records → PV → claim; driver call; status merge patch; Events). csi sweep loop watches PVCs.
-2. [ ] Tests (mock driver end to end, resize_due), csi.md, status.md, CHANGELOG; sc-build; close (live: with #52's
-       driver once stormblock-registry#99 is fixed).
+2. [x] Tests (2), csi.md, status.md, CHANGELOG (1af5ece). sc-build job 8d5ba26c64: 415 kubelet unit pass. Stage golden
+       golden-rustkube-node-0ee0277c7dba (stormcos#366). Closed. Live with #52's driver (stormblock-registry#99).
 
 ### Paused (P0 #104 first): #21 (P2), cadvisor's library for node / machine / filesystem stats and eviction signals
 
