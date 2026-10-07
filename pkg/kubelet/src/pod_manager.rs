@@ -537,6 +537,10 @@ pub struct WaitingPod {
     pub name: String,
     /// What it waits on, as `describe` shows it.
     pub reason: String,
+    /// The containers' reason: `ContainerCreating`, `ErrImagePull`,
+    /// `ImagePullBackOff`, `CreateContainerError`, `RunContainerError`, or
+    /// `StartError` for one that failed for good (#133).
+    pub kind: String,
 }
 
 /// A background mint of a size-class blank.
@@ -4538,6 +4542,11 @@ impl PodManager {
     /// Record a pod as admitted and waiting, and the status that says so:
     /// Pending, every container `waiting: ContainerCreating` with `message`.
     fn waiting_pod(&self, pod: &Value, message: String) -> PodStatusUpdate {
+        self.waiting_pod_as(pod, "ContainerCreating", message)
+    }
+
+    /// [`Self::waiting_pod`], with the containers' reason (#133).
+    fn waiting_pod_as(&self, pod: &Value, kind: &str, message: String) -> PodStatusUpdate {
         let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
         let name = pod["metadata"]["name"].as_str().unwrap_or("").to_string();
         let namespace = pod["metadata"]["namespace"]
@@ -4553,13 +4562,14 @@ impl PodManager {
                     namespace: namespace.clone(),
                     name: name.clone(),
                     reason: message.clone(),
+                    kind: kind.to_string(),
                 },
             );
         PodStatusUpdate {
             namespace,
             name,
             phase: "Pending".to_string(),
-            container_statuses: creating_statuses(pod, &message),
+            container_statuses: creating_statuses_as(pod, kind, &message),
             message,
             init_container_statuses: vec![],
             declared_init_containers: declared_init_containers(pod),
@@ -4570,12 +4580,18 @@ impl PodManager {
     /// Why a pod this node has admitted is not started yet, when it is
     /// waiting (#63). `logs` answers with it rather than "not found".
     pub fn waiting_reason(&self, namespace: &str, name: &str) -> Option<String> {
+        self.waiting_state(namespace, name).map(|(_, why)| why)
+    }
+
+    /// The containers' reason and why, for a pod admitted here and not
+    /// running (#133): what `logs` answers instead of "not found".
+    pub fn waiting_state(&self, namespace: &str, name: &str) -> Option<(String, String)> {
         self.waiting
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
             .find(|w| w.namespace == namespace && w.name == name)
-            .map(|w| w.reason.clone())
+            .map(|w| (w.kind.clone(), w.reason.clone()))
     }
 
     /// Where to reach a pod's ports from (#56): its uid and the sandbox's
@@ -4986,6 +5002,11 @@ pub struct ContainerStatusReport {
 /// with why. An empty list read as "this pod has no containers", and
 /// `kubectl get pod` showed Pending with nothing under it (#63).
 fn creating_statuses(pod: &Value, message: &str) -> Vec<ContainerStatusReport> {
+    creating_statuses_as(pod, "ContainerCreating", message)
+}
+
+/// Every app container waiting with `kind` as its reason (#133).
+fn creating_statuses_as(pod: &Value, kind: &str, message: &str) -> Vec<ContainerStatusReport> {
     pod["spec"]["containers"]
         .as_array()
         .map(|cs| {
@@ -4999,7 +5020,7 @@ fn creating_statuses(pod: &Value, message: &str) -> Vec<ContainerStatusReport> {
                     exit_code: 0,
                     image: c["image"].as_str().unwrap_or("").to_string(),
                     image_ref: String::new(),
-                    reason: "ContainerCreating".to_string(),
+                    reason: kind.to_string(),
                     message: message.to_string(),
                     started_at: 0,
                     finished_at: 0,

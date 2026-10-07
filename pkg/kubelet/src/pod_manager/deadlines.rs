@@ -69,6 +69,14 @@ pub(super) fn wait_backoff(waited: Duration) -> Duration {
     (waited / 4).clamp(RECHECK, WAIT_CAP)
 }
 
+/// How long a pod whose image would not pull, or whose container would not
+/// be created or started, waits before the next try (#133): as long as it has
+/// waited so far, between 10 s and 5 min, upstream's image back-off range. A
+/// missing image is not asked of the registry every second.
+pub(super) fn start_backoff(waited: Duration) -> Duration {
+    waited.clamp(Duration::from_secs(10), Duration::from_secs(300))
+}
+
 impl Deadlines {
     fn due_at(&mut self, uid: &str, at: Instant) {
         self.due

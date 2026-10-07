@@ -461,6 +461,12 @@ pub enum CriError {
     #[error("image pull error: {0}")]
     ImagePull(String),
 
+    /// One container could not be created or started (#133): `reason` is
+    /// upstream's word for it (`CreateContainerError`, `StartError`), so the
+    /// pod reports that container's state rather than none at all.
+    #[error("{reason}: container {container}: {message}")]
+    Container { container: String, reason: String, message: String },
+
     /// A volume is not ready yet — the pod stays Pending and is retried,
     /// which is what upstream does for a hostPath that is not there. Failing
     /// the pod would be wrong: the path may appear.
