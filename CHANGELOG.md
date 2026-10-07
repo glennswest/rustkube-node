@@ -2,6 +2,11 @@
 
 ## 2026-10-08
 
+- **fix:** A Pod held back by a claim a VM on this node is using says why (#80). Admission already reserves a
+  VMI's claims exclusively (since #100), so the Pod was never started against the guest's disk, but it sat with
+  no status and no Event. It is now Pending with its containers `ContainerCreating` and the reason ("claim ns/c is
+  a disk of VirtualMachineInstance ns/vm on this node"; a ReadWriteOncePod holder or a reclaim is named the same
+  way), with a FailedMount Event; the VM's release wakes it.
 - **feat:** The Node says whether it can run a VM (#65). A test in a Job has no /dev/kvm and could not tell a
   VM-capable node through the API. With the stormpump engine the kubelet checks KVM each heartbeat
   (`/sys/class/misc/kvm`, else a `/dev/kvm` or `/hostroot/dev/kvm` that opens read-write) and reports

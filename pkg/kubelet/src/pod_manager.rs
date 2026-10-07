@@ -4708,6 +4708,15 @@ impl PodManager {
         }
     }
 
+    /// A pod admission refused over a claim another workload here holds
+    /// (#80): Pending, its containers `ContainerCreating` with `why`, and a
+    /// FailedMount Event, as for any volume it waits on. The holder's release
+    /// wakes it.
+    pub async fn claim_held(&self, pod: &Value, why: String) -> PodStatusUpdate {
+        self.event(pod, "Warning", "FailedMount", &why).await;
+        self.waiting_pod(pod, why)
+    }
+
     /// Try this pod's start again after `after`, and not before (#133).
     fn hold_off(&self, uid: &str, after: std::time::Duration) {
         self.start_holdoff

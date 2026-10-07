@@ -401,8 +401,11 @@ Stopping the VM never deletes a claim's disk; its PVC reclaim policy owns deleti
 A claim's disk waits, with the reason on the VMI, while the claim is unbound,
 belongs to another StorageClass, or is in use by a pod on this node. A pod
 mounts the filesystem and a VM writes the raw device, so the two must not
-share it. The reverse check (a Pod starting against a VM-held claim) is still
-missing on main (#80).
+share it. The reverse holds too: admission reserves a VMI's claims exclusively,
+so a Pod wanting a claim a VM here holds is not started. It waits Pending, its
+containers `ContainerCreating` with "claim ns/c is a disk of
+VirtualMachineInstance ns/vm on this node" and a FailedMount Event, and
+starts once the VM lets the claim go (#80).
 
 ### Virtual machine lifecycle
 

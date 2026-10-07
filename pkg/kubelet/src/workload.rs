@@ -258,6 +258,30 @@ impl Reservations {
         }).collect()
     }
 
+    /// Each claim in `claims` that [`Self::acquire`] refuses `key` over, with
+    /// a workload holding it against the request (#80): what a refused Pod is
+    /// told it waits on.
+    pub fn blockers(&self, key: &Key, claims: &[(Resource, Access)]) -> Vec<(Resource, Key)> {
+        let state = self.state.lock().unwrap();
+        claims
+            .iter()
+            .filter(|(resource, _)| matches!(resource, Resource::Claim(..)))
+            .filter_map(|(resource, access)| {
+                let holders = state.holders.get(resource)?;
+                let mut against: Vec<&Key> = holders
+                    .iter()
+                    .filter(|(owner, mode)| {
+                        *owner != key && (*access == Access::Exclusive || **mode == Access::Exclusive)
+                    })
+                    .map(|(owner, _)| owner)
+                    .collect();
+                // The same answer each pass, so its Event aggregates.
+                against.sort_by(|a, b| (a.kind as u8, &a.namespace, &a.name).cmp(&(b.kind as u8, &b.namespace, &b.name)));
+                against.first().map(|owner| (resource.clone(), (*owner).clone()))
+            })
+            .collect()
+    }
+
     pub fn holder(&self, resource: &Resource) -> Option<Key> {
         self.state.lock().unwrap().holders.get(resource)?.keys().next().cloned()
     }
@@ -294,6 +318,28 @@ impl Reservations {
         for key in wake {
             self.ready.add(key);
         }
+    }
+}
+
+/// Why a workload waits on `claim`, held by `holder` (#80): "claim ns/c is a
+/// disk of VirtualMachineInstance ns/vm on this node".
+pub fn claim_held_message(claim: &Resource, holder: &Key) -> String {
+    let Resource::Claim(ns, name) = claim else {
+        return format!("{claim:?} is held by {}/{} on this node", holder.namespace, holder.name);
+    };
+    match holder.kind {
+        Kind::VirtualMachine => format!(
+            "claim {ns}/{name} is a disk of VirtualMachineInstance {}/{} on this node",
+            holder.namespace, holder.name
+        ),
+        // `reclaim` holds a claim while its volume is deleted.
+        Kind::Pod if holder.namespace == *ns && holder.name == format!("reclaim-{name}") => {
+            format!("claim {ns}/{name} is being reclaimed on this node")
+        }
+        Kind::Pod => format!(
+            "claim {ns}/{name} is in use by Pod {}/{} on this node (ReadWriteOncePod, or a VM's disk)",
+            holder.namespace, holder.name
+        ),
     }
 }
 
@@ -656,6 +702,34 @@ mod tests {
         assert_eq!(work.key(), &vm);
         assert!(reservations.acquire(&vm, &[(claim, Access::Exclusive)]));
     }
+    /// #80: a Pod refused a claim a VM here holds is told which VM.
+    #[test]
+    fn a_refused_pod_learns_who_holds_its_claim() {
+        let reservations = Reservations::new(WorkQueue::new());
+        let vm = key(Kind::VirtualMachine, "vm");
+        let pod = key(Kind::Pod, "late");
+        let claim = Resource::Claim("ns".into(), "data".into());
+        let other = Resource::Claim("ns".into(), "free".into());
+        assert!(reservations.acquire(&vm, &[(claim.clone(), Access::Exclusive)]));
+        let wants = [(claim.clone(), Access::SharedFilesystem), (other, Access::SharedFilesystem)];
+        assert!(!reservations.acquire(&pod, &wants));
+        let blocked = reservations.blockers(&pod, &wants);
+        assert_eq!(blocked, vec![(claim.clone(), vm.clone())], "only the held claim, and its holder");
+        assert_eq!(
+            claim_held_message(&blocked[0].0, &blocked[0].1),
+            format!("claim ns/data is a disk of VirtualMachineInstance {}/vm on this node", vm.namespace)
+        );
+        // Shared filesystem users do not block each other: nothing to say.
+        let reader = key(Kind::Pod, "reader");
+        let shared = Resource::Claim("ns".into(), "shared".into());
+        assert!(reservations.acquire(&reader, &[(shared.clone(), Access::SharedFilesystem)]));
+        assert!(reservations.blockers(&pod, &[(shared, Access::SharedFilesystem)]).is_empty());
+        // Once the VM lets go, the Pod is admitted.
+        reservations.release(&vm);
+        assert!(reservations.blockers(&pod, &wants).is_empty());
+        assert!(reservations.acquire(&pod, &wants));
+    }
+
     #[test]
     fn failed_admission_reserves_no_partial_claims() {
         let ready = WorkQueue::new();

@@ -1546,7 +1546,19 @@ impl workload::Adapter for Kubelet {
             }
         }
         let claims=self.claims_for(key,&object).await?;
-        if !self.workloads.reservations.acquire(key,&claims) {return Ok(Next::AwaitEvent)}
+        if !self.workloads.reservations.acquire(key,&claims) {
+            // Refused over a claim another workload here holds (a VM's disk,
+            // a ReadWriteOncePod user): say so on the Pod (#80). Released, the
+            // holder wakes it.
+            if key.kind==Kind::Pod {
+                if let Some((claim,holder))=self.workloads.reservations.blockers(key,&claims).into_iter().next() {
+                    let why=workload::claim_held_message(&claim,&holder);
+                    let update=self.pod_manager.claim_held(&object,why).await;
+                    self.report_pod_status(&update,&object).await?;
+                }
+            }
+            return Ok(Next::AwaitEvent)
+        }
         let Some(_operations)=self.workloads.reservations.try_operations(&claims) else {return Ok(Next::After(Duration::from_millis(100)))};
         match key.kind {
             Kind::Pod=> {
