@@ -57,6 +57,20 @@ by #51.
 
 ## Work plan
 
+### Waiting on the owner: #3 (P1), the node side Cilium needs
+
+2026-10-08. Already on main (validated 09-29): CNI ADD with the sandbox's netns, `K8S_POD_*` CNI_ARGS, the IP into
+status, a failed ADD fails the sandbox (DEL first), DEL at stop (#137), host network skips it. Item 1 holds: stormcos
+mounts the host's /etc/cni/net.d and /opt/cni/bin at the kubelet's defaults (build-goldens.sh:2590).
+**Item 2 needs the owner:** rustkube's scheduler refuses every pod on a node whose Ready is not True
+(filter.rs:65, no toleration helps), so a kubelet that posts Ready=False without a CNI config would keep Cilium's
+own agent off the node: never Ready. And rustkube's node controller removes `not-ready` taints while the Lease is
+healthy. stormcos registers no `node.cilium.io/agent-not-ready` taint. Options posted on #3.
+1. [ ] Test: run_pod_sandbox for a host-network pod with a CNI but no config succeeds with no address; a pod-network
+       one is NetworkNotConfigured. `--no-cni` help: pods get an isolated namespace with loopback only (#54 audit).
+2. [ ] Question on #3, `stormcentral wait-owner`. Live checks (pod CIDR address, coredns leaves Pending, endpoint
+       released, agent stopped → sandbox fails) wait on a test machine (stormcos#337).
+
 ### Done: #69, a named credential that is missing is waited for, then fatal (never anonymous)
 
 2026-10-08. `main.rs` waited (60 s, then fatal) only for `--apiserver-ca`; `--client-certificate`, `--client-key`,
