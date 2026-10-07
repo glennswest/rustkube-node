@@ -1502,7 +1502,7 @@ Steps:
 4. [x] `sc-build 'cargo build --release --locked --target x86_64-unknown-linux-musl'`, then `cargo test --locked`: passed at 6741e93.
 5. [x] Close #58, request the golden.
 
-### Unblocked (stormvm#65 closed, #81 done 2026-10-08): #52, external StorageClasses (the CSI node side)
+### Waiting on stormcos#366 (release with #81): #52, external StorageClasses (the CSI node side)
 
 2026-09-29: stormpump#35's engine side is on stormpump main (a06ce4c..), and `/` is rshared on C2NR0Q2 (11.51).
 What is left here is step 6 = #81 (`Mount.propagation` into `spec_for`), which needs stormpump ≥ a06ce4c in the
@@ -1534,7 +1534,10 @@ Steps:
 6. [x] Pass `mountPropagation` through to stormpump (#81, 599a86e). Was stormpump#35. Until then the mountinfo check keeps pods waiting instead of giving them an empty directory.
 7. [x] Tests: a mock driver and registrar on a real Unix socket, the full round trip.
 8. [x] Docs (`docs/csi.md`), CHANGELOG.
-9. [ ] End to end with csi-driver-host-path on a node (step 6 done by #81): waits on a test machine (stormcos#337).
+9. [ ] End to end with csi-driver-host-path on a node (step 6 done by #81). 2026-10-08: no node runs #81 yet (goldens
+       in the open release request stormcos#366; test machines on 11.91); the driver's images must be in the node's
+       registry. #52 proposed after stormcos#366. Then: lease a machine, deploy the driver, pod on its claim, write/read,
+       kubelet restart, delete → NodeUnpublish.
 10. [x] Build verified: `sc-build scripts/sc-build.sh` at 004b2e7, build clean, all kubelet tests pass.
 
 Related, filed elsewhere: rustkube#94 (no ephemeral-volume controller).
