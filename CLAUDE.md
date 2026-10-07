@@ -57,6 +57,14 @@ by #51.
 
 ## Work plan
 
+### Waiting on the owner: #104 (P2), private writable container roots
+
+2026-10-08. stormpump's rule ("one storage primitive … no overlay, no tmpfs layering", spec.rs) makes a private
+root a CoW clone per container (clone the golden, attach, PID 1 mount as root, delete on removal/restart), the path
+claims and pulls already use. Cost on 11.91 warm: ~0.4–1.3 s per start (clone, attach, mount: #95, stormblock#327,
+stormpump#107) and a volume per container. Asked on #104: A private by default + readOnlyRootFilesystem keeps the
+shared root (recommended), B private only when asked, C A with pre-minted clones.
+
 ### Waiting on the owner: #86 (P2), versioned goldens for pods
 
 2026-10-08. Kubelet half clear: the release manifest (`/etc/stormcos/release/manifest.json`, `assets[kind=golden]`
