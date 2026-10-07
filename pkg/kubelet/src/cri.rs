@@ -97,6 +97,9 @@ pub struct ContainerConfig {
     pub cpu_quota: i64,
     pub cpu_shares: i64,
     pub memory_limit_bytes: i64,
+    /// The pod's QoS class (`Guaranteed`, `Burstable`, `BestEffort`), which
+    /// picks its cgroup group on stormpump (#57, stormpump#68). Empty: unknown.
+    pub qos_class: String,
     /// securityContext.runAsUser (the container's, else the pod's; #98). `None`:
     /// the image's `User`, else root.
     pub run_as_user: Option<i64>,

@@ -380,6 +380,13 @@ async fn main() -> anyhow::Result<()> {
                         let rt = rt.clone();
                         tokio::spawn(async move { rt.sweep_roots().await });
                     }
+                    // The Pod groups' weights (#57): `pods` as the node's
+                    // CPUs, `besteffort` the floor.
+                    {
+                        let rt = rt.clone();
+                        let cpus = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1);
+                        tokio::spawn(async move { rt.size_pod_groups(cpus).await });
+                    }
                     // A pull only finds the image's golden (#104).
                     let img = Arc::new(
                         kubelet::stormpump_runtime::StormpumpImages::new(

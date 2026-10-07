@@ -5975,6 +5975,8 @@ fn build_container_config(
         // Container-level seccompProfile; a pod-level one is filled in later by
         // apply_pod_namespaces when the container doesn't set its own.
         seccomp_profile: parse_seccomp(sc),
+        // The pod's, set by apply_pod_namespaces (#57).
+        qos_class: String::new(),
     }
 }
 
@@ -6016,8 +6018,41 @@ fn parse_selinux_options(security_context: &Value) -> Option<SeLinuxOptions> {
 /// container's CRI namespace_options must be consistent with the sandbox's
 /// (both derive from the pod), or the runtime refuses to start the container —
 /// e.g. a hostPID pod's sandbox is pid=NODE, so its containers must be too.
+/// A pod's QoS class, by upstream's rule (#57): `BestEffort` when no container
+/// asks for or limits CPU or memory; `Guaranteed` when every container limits
+/// both and asks for exactly that (a request left unset is its limit);
+/// `Burstable` otherwise. Init containers count as containers do.
+pub fn qos_class(pod: &Value) -> &'static str {
+    let containers: Vec<&Value> = ["initContainers", "containers"]
+        .iter()
+        .flat_map(|k| pod["spec"][*k].as_array().into_iter().flatten())
+        .collect();
+    let res = |c: &Value, side: &str, r: &str| c["resources"][side][r].as_str().filter(|v| !v.is_empty()).map(str::to_string);
+    let any = containers.iter().any(|c| {
+        ["requests", "limits"].iter().any(|side| ["cpu", "memory"].iter().any(|r| res(c, side, r).is_some()))
+    });
+    if !any {
+        return "BestEffort";
+    }
+    let guaranteed = !containers.is_empty()
+        && containers.iter().all(|c| {
+            ["cpu", "memory"].iter().all(|r| match res(c, "limits", r) {
+                Some(limit) => res(c, "requests", r).map_or(true, |req| {
+                    if *r == "cpu" {
+                        parse_cpu_shares(&req) == parse_cpu_shares(&limit)
+                    } else {
+                        crate::storage::parse_quantity(&req) == crate::storage::parse_quantity(&limit)
+                    }
+                }),
+                None => false,
+            })
+        });
+    if guaranteed { "Guaranteed" } else { "Burstable" }
+}
+
 fn apply_pod_namespaces(config: &mut ContainerConfig, pod: &Value) {
     let spec = &pod["spec"];
+    config.qos_class = qos_class(pod).to_string();
     config.host_network = spec["hostNetwork"].as_bool().unwrap_or(false);
     config.host_pid = spec["hostPID"].as_bool().unwrap_or(false);
     config.host_ipc = spec["hostIPC"].as_bool().unwrap_or(false);
@@ -7950,6 +7985,17 @@ pub(crate) mod tests {
             resolve_mounts(&spec(false), &volumes)[0].propagation,
             MountPropagation::Private
         );
+    }
+
+    #[test]
+    fn qos_class_is_upstreams() {
+        let pod = |cs: Value| json!({"spec": {"containers": cs}});
+        assert_eq!(qos_class(&pod(json!([{"name": "a"}]))), "BestEffort");
+        assert_eq!(qos_class(&pod(json!([{"name": "a", "resources": {"limits": {"cpu": "1", "memory": "1Gi"}}}]))), "Guaranteed", "a request left unset is its limit");
+        assert_eq!(qos_class(&pod(json!([{"name": "a", "resources": {"requests": {"cpu": "1000m", "memory": "1Gi"}, "limits": {"cpu": "1", "memory": "1Gi"}}}]))), "Guaranteed");
+        assert_eq!(qos_class(&pod(json!([{"name": "a", "resources": {"requests": {"cpu": "500m"}, "limits": {"cpu": "1", "memory": "1Gi"}}}]))), "Burstable");
+        assert_eq!(qos_class(&pod(json!([{"name": "a", "resources": {"requests": {"memory": "64Mi"}}}]))), "Burstable");
+        assert_eq!(qos_class(&pod(json!([{"name": "a", "resources": {"limits": {"cpu": "1", "memory": "1Gi"}}}, {"name": "b"}]))), "Burstable", "every container must be");
     }
 
     #[test]

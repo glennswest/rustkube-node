@@ -379,6 +379,20 @@ impl StormpumpRuntime {
         self
     }
 
+    /// Size the Pod groups (#57, stormpump#68): `pods` as `allocatable_cpus`
+    /// cores of shares (OpenShift's `kubepods`), `pods/besteffort` the floor
+    /// (upstream's 2 shares). An engine without groups refuses, and Pods keep
+    /// the engine's defaults.
+    pub async fn size_pod_groups(&self, allocatable_cpus: u32) {
+        let pods = shares_to_weight(i64::from(allocatable_cpus) * 1024);
+        for (group, weight) in [(stormpump::spec::Group::Pods, pods), (stormpump::spec::Group::PodsBestEffort, 1)] {
+            match self.on_ring(move |r| r.group_set(group as u8, Some(weight), None)).await {
+                Ok(()) => tracing::info!(group = group.dir(), weight, "stormpump: Pod group sized"),
+                Err(e) => tracing::warn!(group = group.dir(), "stormpump: Pod group not sized (an engine before stormpump#68?): {e}"),
+            }
+        }
+    }
+
     /// Delete the container roots nothing holds: what a kubelet that died
     /// between a create and a removal left (#104). Run once at start; a root
     /// still attached or mounted is never touched.
@@ -742,15 +756,43 @@ fn spec_for(
             uts: false,
         },
         tty: config.tty,
-        // `cpu_shares` (the CPU *request*) is not mapped onto `cpu_weight`
-        // yet. Every stormpump workload is a sibling under one cgroup parent,
-        // node services included, and upstream's conversion gives a pod
-        // weights far below the engine's default of 100 (1 CPU → 39, no
-        // request → 1, stormpump's filler weight). Upstream's pods compete
-        // only inside `kubepods`. Which way this node goes is open on #57.
+        // The pod's QoS group (#57, the owner's choice on #106: OpenShift's
+        // shape, stormpump#68): Pods under `pods/`, beside the node services
+        // rather than among them, so upstream's shares → weight conversion
+        // makes a small request small relative to other Pods only.
+        group: group_for(&config.qos_class),
+        cpu_weight: weight_for(config),
         limits: limits_for(config),
         ..Spec::default()
     }
+}
+
+/// The cgroup group a pod's containers run in, by its QoS class (#57).
+/// Unknown (a CRI caller that set none): the node group, as before.
+fn group_for(qos: &str) -> stormpump::spec::Group {
+    use stormpump::spec::Group;
+    match qos {
+        "Guaranteed" => Group::Pods,
+        "Burstable" => Group::PodsBurstable,
+        "BestEffort" => Group::PodsBestEffort,
+        _ => Group::Node,
+    }
+}
+
+/// Upstream's `cpuSharesToCPUWeight`: shares 2..=262144 onto weight 1..=10000.
+pub fn shares_to_weight(shares: i64) -> u32 {
+    let shares = shares.clamp(2, 262_144) as u64;
+    (1 + (shares - 2) * 9999 / 262_142) as u32
+}
+
+/// A container's `cpu.weight`: its request's, once it is in a Pod group;
+/// the engine's default otherwise (a weight among the node services would
+/// starve it, which is why #106 put Pods under their own parent).
+fn weight_for(config: &ContainerConfig) -> u32 {
+    if group_for(&config.qos_class) == stormpump::spec::Group::Node {
+        return stormpump::spec::Spec::default().cpu_weight;
+    }
+    shares_to_weight(config.cpu_shares)
 }
 
 /// A container's stats from the engine's block. `u64::MAX` is the engine's
@@ -758,10 +800,14 @@ fn spec_for(
 fn stats_info(
     mut info: crate::cri::ContainerStatsInfo,
     st: &stormpump_abi::query::Stats,
+    memory: Option<&stormpump_abi::query::Memory>,
 ) -> crate::cri::ContainerStatsInfo {
     let known = |v: u64| (v != stormpump_abi::query::UNKNOWN).then_some(v);
     info.cpu_usage_core_nanos = known(st.cpu_usage_usec).map(|us| us.saturating_mul(1000));
-    info.memory_working_set_bytes = known(st.memory_current);
+    // The working set when the engine gives it (stormpump#64), else
+    // memory.current, which counts page cache and reads high.
+    info.memory_working_set_bytes =
+        memory.and_then(|m| known(m.working_set)).or_else(|| known(st.memory_current));
     info
 }
 
@@ -1530,8 +1576,8 @@ impl RuntimeService for StormpumpRuntime {
             running
                 .into_iter()
                 .filter_map(|(h, info)| {
-                    let st = ring.query_stats(h).ok().flatten()?;
-                    Some(stats_info(info, &st))
+                    let (st, memory) = ring.query_usage(h).ok()?;
+                    Some(stats_info(info, &st?, memory.as_ref()))
                 })
                 .collect::<Vec<_>>()
         })
@@ -1995,12 +2041,35 @@ mod tests {
             Some(stormpump::spec::CpuMax { quota_us: 50_000, period_us: 100_000 })
         );
         assert_eq!(spec.limits.pids_max, None);
-        // The request is not a weight yet (open on #57).
+        // No QoS class (a CRI caller that set none): the node group, the
+        // engine's default weight, as before.
         assert_eq!(spec.cpu_weight, stormpump::spec::Spec::default().cpu_weight);
+        assert_eq!(spec.group, stormpump::spec::Group::Node);
 
         // What the engine receives is what was set: through the wire and back.
         let back = stormpump::spec::Spec::decode(&spec.encode()).unwrap();
         assert_eq!(back.limits, spec.limits);
+    }
+
+    /// #57 step 4 (#106, stormpump#68): a Pod's containers run in its QoS
+    /// group, and the CPU request becomes a weight by upstream's conversion.
+    #[test]
+    fn a_pods_request_is_its_weight_inside_its_qos_group() {
+        use stormpump::spec::Group;
+        assert_eq!(shares_to_weight(2), 1, "no request: the floor");
+        assert_eq!(shares_to_weight(1024), 39, "one CPU, as upstream");
+        assert_eq!(shares_to_weight(262_144), 10_000);
+        assert_eq!(shares_to_weight(0), 1, "clamped");
+        let cc = |qos: &str, shares| ContainerConfig { name: "c".into(), command: vec!["/c".into()], cpu_shares: shares, qos_class: qos.into(), ..Default::default() };
+        let s = spec_of(&cc("Guaranteed", 2048), &PodSandboxConfig::default());
+        assert_eq!((s.group, s.cpu_weight), (Group::Pods, shares_to_weight(2048)));
+        let s = spec_of(&cc("Burstable", 512), &PodSandboxConfig::default());
+        assert_eq!((s.group, s.cpu_weight), (Group::PodsBurstable, shares_to_weight(512)));
+        let s = spec_of(&cc("BestEffort", 2), &PodSandboxConfig::default());
+        assert_eq!((s.group, s.cpu_weight), (Group::PodsBestEffort, 1));
+        // Through the wire and back: the engine gets the group.
+        let back = stormpump::spec::Spec::decode(&s.encode()).unwrap();
+        assert_eq!((back.group, back.cpu_weight), (Group::PodsBestEffort, 1));
     }
 
     #[test]
@@ -2028,11 +2097,18 @@ mod tests {
             memory_current: 4096,
             ..Default::default()
         };
-        let info = stats_info(crate::cri::ContainerStatsInfo::default(), &st);
+        let info = stats_info(crate::cri::ContainerStatsInfo::default(), &st, None);
         assert_eq!(info.cpu_usage_core_nanos, Some(2_500_000_000));
-        assert_eq!(info.memory_working_set_bytes, Some(4096));
+        assert_eq!(info.memory_working_set_bytes, Some(4096), "no memory block: memory.current");
+        // stormpump#64's block: the real working set, page cache left out.
+        let m = stormpump_abi::query::Memory { working_set: 1024, ..Default::default() };
+        let info = stats_info(crate::cri::ContainerStatsInfo::default(), &st, Some(&m));
+        assert_eq!(info.memory_working_set_bytes, Some(1024));
+        let unknown_ws = stormpump_abi::query::Memory::default();
+        let info = stats_info(crate::cri::ContainerStatsInfo::default(), &st, Some(&unknown_ws));
+        assert_eq!(info.memory_working_set_bytes, Some(4096), "an unknown working set falls back");
 
-        let unknown = stats_info(crate::cri::ContainerStatsInfo::default(), &Default::default());
+        let unknown = stats_info(crate::cri::ContainerStatsInfo::default(), &Default::default(), None);
         assert_eq!(unknown.cpu_usage_core_nanos, None);
         assert_eq!(unknown.memory_working_set_bytes, None);
     }

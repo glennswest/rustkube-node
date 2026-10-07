@@ -619,6 +619,20 @@ impl RingClient {
         Ok(stormpump_abi::query::stats(r.cqe.flags, &r.arena))
     }
 
+    /// Set a Pod group's `cpu.weight` and/or `memory.max` (#57, stormpump#68,
+    /// `GROUP_SET`). The engine makes the group if it is not there.
+    pub fn group_set(&self, group: u8, cpu_weight: Option<u32>, memory_max: Option<u64>) -> Result<(), RingError> {
+        let payload = stormpump_abi::op::group_set::encode(group, cpu_weight, memory_max).to_vec();
+        self.submit(
+            Sqe {
+                opcode: Op::GroupSet as u8,
+                ..Default::default()
+            },
+            Some(payload),
+        )?;
+        Ok(())
+    }
+
     /// A workload's pid, state and exit, from QUERY's info block (#84).
     /// `Ok(None)` when the engine wrote none.
     pub fn query_info(
@@ -635,6 +649,29 @@ impl RingClient {
             true,
         )?;
         Ok(stormpump_abi::query::info(r.cqe.flags, &r.arena))
+    }
+
+    /// [`Self::query_stats`] with the memory block too (stormpump#64): the
+    /// working set as upstream computes it (`memory.current − inactive_file`).
+    /// The memory half is `None` from an engine without the block.
+    pub fn query_usage(
+        &self,
+        workload: Handle,
+    ) -> Result<(Option<stormpump_abi::query::Stats>, Option<stormpump_abi::query::Memory>), RingError> {
+        let r = self.request(
+            Sqe {
+                opcode: Op::Query as u8,
+                flags: stormpump_abi::flags::MEMORY,
+                primary: workload,
+                ..Default::default()
+            },
+            Some(vec![0u8; stormpump_abi::query::MEMORY_END]),
+            true,
+        )?;
+        Ok((
+            stormpump_abi::query::stats(r.cqe.flags, &r.arena),
+            stormpump_abi::query::memory(r.cqe.flags, &r.arena),
+        ))
     }
 
     /// Ask about a workload without changing it.
