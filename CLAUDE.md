@@ -57,7 +57,7 @@ not the release path.
 
 ## Work plan
 
-### In progress: #156 (P3), /vmInstance refuses metadata from a cache past a staleness bound
+### Done: #156 (P3), /vmInstance refuses metadata from a cache past a staleness bound
 
 2026-10-07. A VMI cache answer is fresh only while the apiserver has been heard from within a bound: the node
 Lease renewed (heartbeat, 10 s) or a VMI LIST (`cache_specs`, a live LIST). Past `--metadata-max-staleness`
@@ -65,7 +65,9 @@ Lease renewed (heartbeat, 10 s) or a VMI LIST (`cache_specs`, a live LIST). Past
 An address with no machine here stays 404 (the local record is the truth for "not here"); the token path (#122)
 is live GETs already.
 1. [x] `heartbeat` returns whether the Lease was renewed; VmManager `note_apiserver_contact`, bound, stale → 503.
-2. [ ] Flag/env/config, tests, docs (README, api.md, configuration.md, status.md), CHANGELOG; sc-build; close.
+2. [x] Flag/env/config, tests (2 new), docs (README, api.md, configuration.md, status.md), CHANGELOG (5ae5c2e). sc-build
+       `cargo build --locked && cargo test --locked`: 341 kubelet unit, 3 node_reregister pass. Stage golden
+       golden-rustkube-node-c539820ae4ec, release request stormcos#366. Closed. Not run on a node (no live partition).
 
 ### Done: #155, docs: no stormcos edition runs kube-proxy
 
