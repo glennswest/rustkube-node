@@ -57,6 +57,15 @@ by #51.
 
 ## Work plan
 
+### In progress: #81, pod mount propagation onto stormpump's `Mount.propagation`
+
+2026-10-08. Unblocked: stormvm#65 closed (stormvm main builds against stormpump main f466116, stormcast bba68c9).
+The lock pins stormpump 30a76d3, stormvm dc1b7ea, stormcast 801f822; all three move together.
+1. [ ] Lock: `cargo update -p stormpump -p stormvm-node -p stormcast` on dev (CARGO_NET_GIT_FETCH_WITH_CLI), diff
+       applied here; fix what the newer stormvm/stormpump APIs break.
+2. [ ] `spec_for`: `propagation` from `cri::MountPropagation`; test; docs (csi.md, README), CHANGELOG; sc-build;
+       golden; close. Then #52's step 6 is done (its end-to-end stays).
+
 ### Waiting on stormpump#103: #56 (P1), exec, attach and portForward on :10250
 
 2026-10-08. rustkube's apiserver splices the upgrade transparently (streaming.rs: headers and bytes as they are,
