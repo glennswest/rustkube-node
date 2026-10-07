@@ -762,6 +762,8 @@ Steps:
        Test container fixed for the real runner (fb7fc66, 8d65920: own image #97, node name, requires.toml,
        node-volumes restore → skip); sc-build `cd test && cargo test --locked && cargo build --release
        --locked`: 19 pass. #97 also proposed after stormcentral#376 for its live run.
+       2026-10-07: stormcentral#376 closed; vm-waves 18d8dc0653 died on the Dell's apiserver (stormcos#337, down since
+       20:55Z, reinstall queued). #91 proposed after stormcos#337.
        2026-10-06: 11.88 on C2NR0Q2 has the 4 GiB registry (stormcos#122, no more 507). Queued: vm-waves
        18d8dc0653 (#91, #92 half 1), rustkube-node medium fff1f4d9d9 (#64, #59, #62, #67) and short c7e24520ec,
        at 65e3c3c. Read with `stormcentral test show <id>`; close what passes.
