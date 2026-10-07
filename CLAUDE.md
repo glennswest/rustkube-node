@@ -57,6 +57,19 @@ by #51.
 
 ## Work plan
 
+### In progress: #79 (P2), an image the node's registry has no golden of: ask the cluster, else a pull failure
+
+2026-10-08. The kubelet sent `POST /v1/clones {golden, remote_image}`; sbregistry dropped `remote_image` (f9bcfdd), so
+an unknown image 404'd. Since #104 (0241211) a pull is `GET /v1/goldens/{image}` and a miss is ErrImagePull with
+the registry's answer, option (b). Found: that GET does not start sbregistry's cluster fetch (`repljobs::demand`
+runs only on the clone routes, 503 "fetching it from the cluster … retry shortly"; `/v1/replicate` is admin), so
+#104 lost it. Option (a) (build from upstream, `POST /v1/goldens` pull-through) waits on stormblock-registry#50.
+1. [ ] A 404 golden: `POST /v1/clones {golden}` as the demand; 503/404 → ErrImagePull with its message (retried on
+       the pull back-off); a clone minted because the golden turned ready meanwhile is deleted and the record read.
+2. [ ] File sbregistry: a demand that mints nothing (`GET /v1/goldens/{name}?demand=true`).
+3. [ ] Tests (fake registry: demand 503, 404, ready-in-between deletes the clone), README, CHANGELOG; sc-build
+       (stormcentral#544); close.
+
 ### Waiting on stormcentral#544 (builds): #104 (P0), every container its own CoW root (owner: A, no exceptions)
 
 2026-10-08. Owner (#104, 10-07): every container's root is its own CoW clone of the image's **sealed golden**,
