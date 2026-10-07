@@ -57,6 +57,18 @@ by #51.
 
 ## Work plan
 
+### In progress: #65 (P2), the Node advertises KVM
+
+2026-10-08. `node_status.rs` reports no KVM, so a test Job (no /dev/kvm in its container) cannot tell a VM-capable
+node (`requires: [kvm]`, stormcos_qa vm-lifecycle). VMs run only with the stormpump engine (`Kubelet.vms`). The
+kubelet's own container has no /dev/kvm (the engine spawns the VMM in the node's mount view), so detection reads
+the kernel: `/sys/class/misc/kvm` (the kernel registered the device), or /dev/kvm (or /hostroot/dev/kvm) opens.
+1. [ ] `kvm_available()`; NodeReporter `with_kvm` (only with the VM manager); capacity/allocatable
+       `devices.kubevirt.io/kvm: 1k` (KubeVirt's), every heartbeat; labels `storm.io/kvm=true`,
+       `kubevirt.io/schedulable=true` at registration and patched on an existing node whenever they differ
+       (`false`/removed when KVM is gone).
+2. [ ] Tests, docs (README, status.md), CHANGELOG; sc-build; close (tell stormcos_qa#16 how to check).
+
 ### Waiting on stormcentral#541 (builds): #85, a VMI placed with spec.nodeName is never started
 
 2026-10-07. Found: vm_loop lists VMIs with `fieldSelector=status.nodeName=<node>` and filters `want` on
