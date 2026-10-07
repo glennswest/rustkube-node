@@ -614,10 +614,11 @@ async fn pods(State(pm): State<Arc<PodManager>>) -> impl IntoResponse {
 async fn metrics_cadvisor(State(pm): State<Arc<PodManager>>) -> impl IntoResponse {
     let containers = pm.container_stats().await;
     let pods = pm.pod_network_stats().await;
-    (
-        [("content-type", "text/plain; version=0.0.4")],
-        crate::metrics::render_cadvisor(&containers, &pods),
-    )
+    // The node's own root container and machine (#21), from the cadvisor library.
+    let node = tokio::task::spawn_blocking(crate::node_stats::read_usage).await.unwrap_or_default();
+    let mut body = crate::metrics::render_cadvisor_with_node(&containers, &pods, Some(&node));
+    body.push_str(&crate::node_stats::render(&node, crate::node_stats::machine()));
+    ([("content-type", "text/plain; version=0.0.4")], body)
 }
 
 /// Minimal Summary API (metrics-server / `kubectl top`) — node + per-pod
@@ -660,10 +661,29 @@ async fn stats_summary(State(pm): State<Arc<PodManager>>) -> impl IntoResponse {
             "usedBytes": total.saturating_sub(avail),
         })
     });
+    // The node's own usage from its root cgroup (#21), as upstream's summary
+    // reports it: every process on the node, node services included. The sum
+    // of the containers known here only when the root cannot be read.
+    let node = tokio::task::spawn_blocking(crate::node_stats::read_usage).await.unwrap_or_default();
+    let mut memory = serde_json::json!({
+        "workingSetBytes": node.memory_working_set_bytes.unwrap_or(node_mem),
+    });
+    for (k, v) in [
+        ("usageBytes", node.memory_usage_bytes),
+        ("availableBytes", node.memory_available_bytes),
+        ("rssBytes", node.memory_rss_bytes),
+        ("pageFaults", node.page_faults),
+        ("majorPageFaults", node.major_page_faults),
+    ] {
+        if let Some(v) = v {
+            memory[k] = serde_json::json!(v);
+        }
+    }
+    let time = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     Json(serde_json::json!({
         "node": {
-            "cpu": {"usageCoreNanoSeconds": node_cpu},
-            "memory": {"workingSetBytes": node_mem},
+            "cpu": {"time": time, "usageCoreNanoSeconds": node.cpu_usage_ns.unwrap_or(node_cpu)},
+            "memory": memory,
             "fs": node_fs,
         },
         "pods": pods,

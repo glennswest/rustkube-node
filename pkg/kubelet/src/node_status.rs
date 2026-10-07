@@ -475,7 +475,14 @@ impl NodeReporter {
         let (total_mem_ki, cpu_count) = get_system_resources();
         let (fs_total, fs_avail) = ephemeral_fs_stats().unwrap_or((0, 0));
         // Available memory drives MemoryPressure; fall back to "plenty" if unknown.
-        let avail_mem_ki = available_memory_ki().unwrap_or(total_mem_ki);
+        // Upstream's eviction signal (#21): memory.available = capacity − the
+        // root's working set (cAdvisor's), not MemAvailable; MemAvailable
+        // only when the working set cannot be read.
+        let avail_mem_ki = crate::node_stats::read_usage()
+            .memory_available_bytes
+            .map(|b| b / 1024)
+            .or_else(available_memory_ki)
+            .unwrap_or(total_mem_ki);
 
         // Eviction-style pressure signals (kubelet defaults: memory.available<100Mi,
         // nodefs.available<10%). PIDPressure only when very few PIDs remain.
