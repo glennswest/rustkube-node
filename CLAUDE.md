@@ -696,6 +696,8 @@ Steps:
 5. [ ] The issue's done-when on the test host: console-created VM, ssh in with the key; "Add my keys" live.
        2026-10-05: half 1 is stormcos_qa `vm-waves` (noCloud key, ssh); half 2 filed as stormcos_qa#52. Runs on
        C2NR0Q2 get 507 on the image push (stormcentral#376); #92 proposed after it. Then run vm-waves, close.
+       2026-10-07: #376 closed; vm-waves 18d8dc0653 died on the Dell's apiserver (stormcos#337). #92 proposed after
+       stormcos#337; half 2 still needs stormcos_qa#52.
 
 ### Done: #55, a presentation of rustkube-node (`docs/presentation.md`, Marp)
 
