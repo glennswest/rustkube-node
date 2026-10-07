@@ -5,6 +5,7 @@
 //! and reports node status via Lease heartbeats.
 
 pub mod capacity;
+pub mod container_roots;
 pub mod dns;
 pub mod engine;
 pub mod events;
