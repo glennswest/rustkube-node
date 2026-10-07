@@ -263,6 +263,15 @@ container log directories): they are written before the sandbox, and a write the
 node refuses (a full disk, ENOSPC) leaves the pod waiting with the path and the
 errno, retried until there is room (#129).
 
+**A pod that cannot start says which container and why, as upstream does** (#133). An image that will not pull
+is a wait: the containers are `waiting: ErrImagePull`, then `ImagePullBackOff`, and the pull is asked again after a
+back-off of as long as it has waited (10 s to 5 min). A container that will not be created waits as
+`CreateContainerError`; one that will not start waits as `RunContainerError`, except under `restartPolicy: Never`,
+where the pod is Failed with that container terminated `StartError`, exit 128. A start that got past its sandbox
+is torn down before the next try, and the try waits its back-off whatever wakes the pod. Anything else that ends a
+start (an init container that failed) leaves the pod Failed with its init statuses and its containers
+`PodInitializing`, never with no container state, and `logs` answers why (400), not "not found".
+
 The image ships sealed blanks for the common classes (`pvc-ext4j-<MiB>m`,
 sbregistry's naming). A class with no blank is minted on its first claim:
 stormblock formats and seals it once (`role: data`). The mint runs in

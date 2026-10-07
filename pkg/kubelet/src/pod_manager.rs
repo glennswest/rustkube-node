@@ -507,6 +507,10 @@ pub struct PodManager {
     /// on (#63). Without this a pod waiting on its claim was known to nobody:
     /// `logs` said "not found on this node" and it had no container statuses.
     waiting: std::sync::Mutex<HashMap<String, WaitingPod>>,
+    /// Not before (#133): a pod whose image would not pull, or whose
+    /// container would not start, is not tried again before its back-off is
+    /// up, whatever wakes it (an exit anywhere wakes every workload, #115).
+    start_holdoff: std::sync::Mutex<HashMap<String, Instant>>,
     /// Blanks being minted in the background, by name (#63). A 1 TiB blank
     /// takes minutes to format, and the sync loop must not wait for it.
     minting: Arc<std::sync::Mutex<HashMap<String, Mint>>>,
@@ -627,6 +631,7 @@ impl PodManager {
             deadlines: Default::default(),
             event_waits: Default::default(),
             waiting: std::sync::Mutex::new(HashMap::new()),
+            start_holdoff: std::sync::Mutex::new(HashMap::new()),
             minting: Arc::new(std::sync::Mutex::new(HashMap::new())),
             volume_changes: tokio::sync::watch::channel(0).0,
             host_root: crate::node_logs::HOST_ROOT.into(),
@@ -2702,10 +2707,21 @@ impl PodManager {
 
             let partial = self.pods.read().await.get(uid).is_some_and(|p| p.phase=="Cleanup");
             if partial {
+                // The teardown forgets the pod; when it was first seen and
+                // why it waits are kept, so its back-off grows and its reason
+                // still answers `logs` (#133).
+                let seen = self.first_seen.lock().unwrap_or_else(|e| e.into_inner()).get(uid).copied();
+                let waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner()).get(uid).cloned();
                 if let Err(error)=self.stop_pod(uid).await {
                     warn!(%error, %uid, "partial Pod start cleanup pending");
                     self.due_in(uid, deadlines::RECHECK);
                     continue;
+                }
+                if let Some(seen) = seen {
+                    self.first_seen.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), seen);
+                }
+                if let Some(w) = waiting {
+                    self.waiting.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), w);
                 }
             }
 
@@ -2715,6 +2731,12 @@ impl PodManager {
             };
 
             if !is_known {
+                // Not before its back-off (#133).
+                let holdoff = self.start_holdoff.lock().unwrap_or_else(|e| e.into_inner()).get(uid).copied();
+                if let Some(at) = holdoff.filter(|at| Instant::now() < *at) {
+                    self.due_at(uid, at);
+                    continue;
+                }
                 // New pod — start it
                 let seen = *self
                     .first_seen
@@ -2728,6 +2750,7 @@ impl PodManager {
                 }
                 match started {
                     Ok(status) => {
+                        self.start_holdoff.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
                         self.first_seen
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -2816,23 +2839,91 @@ impl PodManager {
                         self.event(pod, "Warning", "FailedMount", &message).await;
                         outcome.updates.push(self.waiting_pod(pod, message));
                     }
+                    // An image that would not pull is a wait, as upstream's
+                    // ErrImagePull and then ImagePullBackOff (#133): it may be
+                    // pushed, the registry may come back. Failing the pod
+                    // ended it with no container state, and the failed pull
+                    // was cached for the pod, so nothing asked again.
+                    Err(CriError::ImagePull(what)) => {
+                        self.start_images.lock().unwrap().remove(uid);
+                        self.cleanup_partial_start(uid).await;
+                        let again = self.waiting_state(namespace, name)
+                            .is_some_and(|(k, _)| k == "ErrImagePull" || k == "ImagePullBackOff");
+                        let kind = if again { "ImagePullBackOff" } else { "ErrImagePull" };
+                        warn!("Pod {namespace}/{name}: {kind}: {what}");
+                        if again {
+                            self.event(pod, "Normal", "BackOff", &format!("Back-off pulling image: {what}")).await;
+                        } else {
+                            self.event(pod, "Warning", "Failed", &format!("Failed to pull image: {what}")).await;
+                        }
+                        self.event_waits.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+                        self.hold_off(uid, deadlines::start_backoff(seen.elapsed()));
+                        outcome.updates.push(self.waiting_pod_as(pod, kind, what));
+                    }
+                    // One container would not be created or started (#133).
+                    // Under restartPolicy Never a start failure ends the pod,
+                    // with that container terminated StartError (exit 128),
+                    // as upstream reports it; anything else waits and tries
+                    // again on a back-off, with the container's reason.
+                    Err(CriError::Container { container, reason, message }) => {
+                        self.cleanup_partial_start(uid).await;
+                        let never = pod["spec"]["restartPolicy"].as_str() == Some("Never");
+                        if reason == "StartError" && never {
+                            error!("Pod {namespace}/{name}: container {container} failed to start: {message}");
+                            self.note_waiting(pod, "StartError", &message);
+                            outcome.updates.push(PodStatusUpdate {
+                                namespace: namespace.to_string(),
+                                name: name.to_string(),
+                                phase: "Failed".to_string(),
+                                message: format!("container {container} failed to start: {message}"),
+                                container_statuses: failed_start_statuses(pod, &container, &message),
+                                init_container_statuses: self.recorded_inits(uid).await,
+                                declared_init_containers: declared_init_containers(pod),
+                                pod_ip: None,
+                            });
+                        } else {
+                            let kind = if reason == "StartError" { "RunContainerError".to_string() } else { reason };
+                            warn!("Pod {namespace}/{name}: {kind}: container {container}: {message}");
+                            self.event_waits.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+                            self.hold_off(uid, deadlines::start_backoff(seen.elapsed()));
+                            outcome.updates.push(self.waiting_pod_as(pod, &kind, format!("container {container}: {message}")));
+                        }
+                    }
+                    // The runtime did not answer: it may be restarting. A
+                    // wait, not the end of the pod.
+                    Err(CriError::Connection(what)) => {
+                        self.cleanup_partial_start(uid).await;
+                        warn!("Pod {namespace}/{name}: container runtime unreachable: {what}");
+                        self.retry_wait(uid, seen.elapsed());
+                        outcome.updates.push(self.waiting_pod_as(pod, "ContainerCreating", format!("container runtime unreachable: {what}")));
+                    }
                     Err(e) => {
                         self.start_images.lock().unwrap().remove(uid);
+                        let inits = self.recorded_inits(uid).await;
                         if let Some(state)=self.pods.write().await.get_mut(uid) { state.phase="Cleanup".into(); }
                         apimachinery::reactor::failed();
                         self.retry_wait(uid, seen.elapsed());
                         error!("Failed to start pod {namespace}/{name}: {e}");
-                        self.waiting
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .remove(uid);
+                        // Never terminal with no container state (#133): an
+                        // init container that failed is in the init statuses
+                        // and the apps wait on it (PodInitializing); otherwise
+                        // the apps are terminated StartError. `logs` answers
+                        // why, not "not found".
+                        let message = e.to_string();
+                        let init_failed = inits.iter().any(|r| r.state == "terminated" && r.exit_code != 0);
+                        let container_statuses = if init_failed {
+                            creating_statuses_as(pod, "PodInitializing", &message)
+                        } else {
+                            failed_start_statuses(pod, "", &message)
+                        };
+                        self.note_waiting(pod, "StartError", &message);
                         outcome.updates.push(PodStatusUpdate {
                             namespace: namespace.to_string(),
                             name: name.to_string(),
                             phase: "Failed".to_string(),
-                            message: e.to_string(),
-                            container_statuses: vec![],
-                            init_container_statuses: vec![],
+                            message,
+                            container_statuses,
+                            init_container_statuses: inits,
                             declared_init_containers: declared_init_containers(pod),
                             pod_ip: None,
                         });
@@ -2882,6 +2973,10 @@ impl PodManager {
             .unwrap_or_else(|e| e.into_inner())
             .retain(|uid, _| desired_uids.contains(uid));
         self.waiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|uid, _| desired_uids.contains(uid));
+        self.start_holdoff
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|uid, _| desired_uids.contains(uid));
@@ -3449,7 +3544,7 @@ impl PodManager {
                         &format!("Error creating container {container_name}: {e}"),
                     )
                     .await;
-                    return Err(e);
+                    return Err(container_error(e, container_name, "CreateContainerError"));
                 }
             };
 
@@ -3465,7 +3560,7 @@ impl PodManager {
                     &format!("Error starting container {container_name}: {e}"),
                 )
                 .await;
-                return Err(e);
+                return Err(container_error(e, container_name, "StartError"));
             }
             self.event_later(
                 pod,
@@ -4577,6 +4672,44 @@ impl PodManager {
         }
     }
 
+    /// Try this pod's start again after `after`, and not before (#133).
+    fn hold_off(&self, uid: &str, after: std::time::Duration) {
+        self.start_holdoff
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(uid.to_string(), Instant::now() + after);
+        self.due_in(uid, after);
+    }
+
+    /// A start that got as far as a sandbox and then failed is torn down on
+    /// the next pass (`Cleanup`), so the try after it begins clean (#133).
+    async fn cleanup_partial_start(&self, uid: &str) {
+        if let Some(state) = self.pods.write().await.get_mut(uid) {
+            if state.sandbox_id.is_some() || !state.container_ids.is_empty() {
+                state.phase = "Cleanup".into();
+            }
+        }
+    }
+
+    /// The init containers' reports recorded for a pod so far.
+    async fn recorded_inits(&self, uid: &str) -> Vec<InitContainerStatusReport> {
+        self.pods.read().await.get(uid).map(|p| p.init_statuses.clone()).unwrap_or_default()
+    }
+
+    /// Record why a pod is not running, for `logs` (#133).
+    fn note_waiting(&self, pod: &Value, kind: &str, message: &str) {
+        let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
+        self.waiting.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            uid.to_string(),
+            WaitingPod {
+                namespace: pod["metadata"]["namespace"].as_str().unwrap_or("default").to_string(),
+                name: pod["metadata"]["name"].as_str().unwrap_or("").to_string(),
+                reason: message.to_string(),
+                kind: kind.to_string(),
+            },
+        );
+    }
+
     /// Why a pod this node has admitted is not started yet, when it is
     /// waiting (#63). `logs` answers with it rather than "not found".
     pub fn waiting_reason(&self, namespace: &str, name: &str) -> Option<String> {
@@ -5001,8 +5134,36 @@ pub struct ContainerStatusReport {
 /// Every container of a pod that has not started, as `ContainerCreating`
 /// with why. An empty list read as "this pod has no containers", and
 /// `kubectl get pod` showed Pending with nothing under it (#63).
+/// A container's create or start failure, with upstream's reason for it
+/// (#133). Waits stay waits.
+fn container_error(e: CriError, container: &str, reason: &str) -> CriError {
+    match e {
+        CriError::Runtime(_) | CriError::NotFound(_) | CriError::Timeout | CriError::ImagePull(_) | CriError::Migration(_) => {
+            CriError::Container { container: container.into(), reason: reason.into(), message: e.to_string() }
+        }
+        other => other,
+    }
+}
+
 fn creating_statuses(pod: &Value, message: &str) -> Vec<ContainerStatusReport> {
     creating_statuses_as(pod, "ContainerCreating", message)
+}
+
+/// A pod that did not start, as upstream reports it (#133): `failed` (every
+/// app container when empty) terminated `StartError`, exit 128, with why; the
+/// others never ran and say so.
+fn failed_start_statuses(pod: &Value, failed: &str, message: &str) -> Vec<ContainerStatusReport> {
+    let mut out = creating_statuses_as(pod, "ContainerCreating", message);
+    for cs in &mut out {
+        if failed.is_empty() || cs.name == failed {
+            cs.state = "terminated".into();
+            cs.reason = "StartError".into();
+            cs.exit_code = 128;
+        } else {
+            cs.message = format!("not started: container {failed} failed to start");
+        }
+    }
+    out
 }
 
 /// Every app container waiting with `kind` as its reason (#133).
@@ -5865,6 +6026,11 @@ pub(crate) mod tests {
         image_pulls: AtomicU32,
         /// run_pod_sandbox's network (#148): 0 ready, 1 no CNI config, 2 ADD fails.
         network: AtomicU32,
+        /// Images that do not pull, and container names whose create or
+        /// start fails (#133).
+        missing_images: Mutex<std::collections::HashSet<String>>,
+        fail_create: Mutex<std::collections::HashSet<String>>,
+        fail_start: Mutex<std::collections::HashSet<String>>,
     }
 
     impl FakeRuntime {
@@ -5998,6 +6164,9 @@ pub(crate) mod tests {
             _sandbox_config: &PodSandboxConfig,
         ) -> Result<String, CriError> {
             *self.last_container_config.lock().unwrap() = Some(config.clone());
+            if self.fail_create.lock().unwrap().contains(&config.name) {
+                return Err(CriError::Runtime(format!("{}: injected create failure", config.name)));
+            }
             let id = format!(
                 "c-{}-{}",
                 config.name,
@@ -6020,6 +6189,9 @@ pub(crate) mod tests {
             let c = containers
                 .get_mut(container_id)
                 .ok_or_else(|| CriError::NotFound(container_id.to_string()))?;
+            if self.fail_start.lock().unwrap().contains(&c.name) {
+                return Err(CriError::Runtime(format!("{}: injected start failure (exec: no such file)", c.name)));
+            }
             // Init containers exit immediately on start when configured to.
             if let Some(&code) = self.exit_on_start.lock().unwrap().get(&c.name) {
                 c.state = ContainerState::Exited;
@@ -6097,6 +6269,9 @@ pub(crate) mod tests {
     impl ImageService for FakeRuntime {
         async fn pull_image(&self, image: &str) -> Result<String, CriError> {
             self.image_pulls.fetch_add(1,Ordering::SeqCst);
+            if self.missing_images.lock().unwrap().contains(image) {
+                return Err(CriError::ImagePull(format!("{image}: manifest unknown")));
+            }
             let gate=if image=="slow" {self.slow_image.lock().unwrap().clone()} else {None};
             if let Some(gate)=gate {gate.notified().await;}
             Ok(format!("{image}@sha256:fake"))
@@ -7263,6 +7438,73 @@ pub(crate) mod tests {
         assert_eq!(outcome.updates[0].phase, "Failed");
         // App container never created because init failed.
         assert!(!rt.created_names().contains(&"app".to_string()));
+        // #133: never terminal with no container state. The failed init is
+        // reported, and the app waits on it.
+        let u = &outcome.updates[0];
+        assert!(u.init_container_statuses.iter().any(|r| r.name == "setup" && r.exit_code == 1), "{:?}", u.init_container_statuses);
+        assert_eq!(u.container_statuses.len(), 1);
+        assert_eq!((u.container_statuses[0].state.as_str(), u.container_statuses[0].reason.as_str()), ("waiting", "PodInitializing"));
+        assert_eq!(mgr.waiting_state("default", "web").map(|(k, _)| k).as_deref(), Some("StartError"), "logs say why");
+    }
+
+    /// #133: an image that will not pull is a wait (ErrImagePull, then
+    /// ImagePullBackOff), not a pod ended with no container state; the next
+    /// try waits its back-off, and the partial start is torn down.
+    #[tokio::test]
+    async fn an_image_that_will_not_pull_waits_with_errimagepull_then_backoff() {
+        let (rt, mgr) = manager();
+        rt.missing_images.lock().unwrap().insert("nope:1".into());
+        let p = pod("uid-img", "img", "Never", json!({"name": "app", "image": "nope:1"}));
+        let u = mgr.sync_pods(&[p.clone()]).await.updates.remove(0);
+        assert_eq!(u.phase, "Pending");
+        let cs = &u.container_statuses[0];
+        assert_eq!((cs.state.as_str(), cs.reason.as_str()), ("waiting", "ErrImagePull"));
+        assert!(cs.message.contains("manifest unknown"), "{}", cs.message);
+        assert_eq!(mgr.waiting_state("default", "img").unwrap().0, "ErrImagePull");
+
+        // Woken early: held off, and the partial start is gone.
+        let pulls = rt.image_pulls.load(Ordering::SeqCst);
+        let again = mgr.sync_pods(&[p.clone()]).await;
+        assert!(again.updates.is_empty(), "not tried before its back-off");
+        assert_eq!(rt.image_pulls.load(Ordering::SeqCst), pulls);
+        assert!(rt.sandboxes.lock().unwrap().is_empty(), "the partial start was torn down");
+
+        // Its back-off up: tried again, now ImagePullBackOff.
+        mgr.start_holdoff.lock().unwrap().clear();
+        let u = mgr.sync_pods(&[p]).await.updates.remove(0);
+        assert_eq!((u.phase.as_str(), u.container_statuses[0].reason.as_str()), ("Pending", "ImagePullBackOff"));
+        assert!(rt.image_pulls.load(Ordering::SeqCst) > pulls, "asked the registry again");
+    }
+
+    #[tokio::test]
+    async fn a_container_that_will_not_be_created_waits_with_its_reason() {
+        let (rt, mgr) = manager();
+        rt.fail_create.lock().unwrap().insert("app".into());
+        let p = pod("uid-cc", "cc", "Always", simple_container());
+        let u = mgr.sync_pods(&[p]).await.updates.remove(0);
+        assert_eq!(u.phase, "Pending");
+        assert_eq!(u.container_statuses[0].reason, "CreateContainerError");
+        assert!(u.container_statuses[0].message.contains("injected create failure"));
+    }
+
+    /// Under restartPolicy Never a start failure ends the pod, with the
+    /// container terminated StartError, exit 128, as upstream reports it;
+    /// under Always it waits and tries again.
+    #[tokio::test]
+    async fn a_start_failure_is_starterror_under_never_and_a_wait_otherwise() {
+        let (rt, mgr) = manager();
+        rt.fail_start.lock().unwrap().insert("app".into());
+        let p = pod("uid-se", "se", "Never", simple_container());
+        let u = mgr.sync_pods(&[p]).await.updates.remove(0);
+        assert_eq!(u.phase, "Failed");
+        let cs = &u.container_statuses[0];
+        assert_eq!((cs.state.as_str(), cs.reason.as_str(), cs.exit_code), ("terminated", "StartError", 128));
+        assert!(cs.message.contains("no such file"), "{}", cs.message);
+        assert_eq!(mgr.waiting_state("default", "se").unwrap().0, "StartError");
+
+        let p = pod("uid-se2", "se2", "Always", simple_container());
+        let u = mgr.sync_pods(&[p]).await.updates.remove(0);
+        assert_eq!((u.phase.as_str(), u.container_statuses[0].reason.as_str()), ("Pending", "RunContainerError"));
     }
 
     #[tokio::test]

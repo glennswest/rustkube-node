@@ -1336,8 +1336,13 @@ fn plain_log(lines: &[String], opts: &LogOptions) -> String {
 }
 
 /// Upstream's answer to `logs` on a container that has not started.
-fn waiting_to_start(container: &str, pod: &str, why: &str) -> String {
-    format!("container \"{container}\" in pod \"{pod}\" is waiting to start: ContainerCreating ({why})\n")
+fn waiting_to_start(container: &str, pod: &str, kind: &str, why: &str) -> String {
+    // A container that failed to start has nothing to read either, and says
+    // why rather than "not found" (#133).
+    if kind == "StartError" {
+        return format!("container \"{container}\" in pod \"{pod}\" failed to start: StartError ({why})\n");
+    }
+    format!("container \"{container}\" in pod \"{pod}\" is waiting to start: {kind} ({why})\n")
 }
 
 /// Which file holds the run the caller asked for.
@@ -1355,8 +1360,8 @@ async fn log_file(
     let Some(uid) = pm.pod_uid(namespace, pod).await else {
         // A pod this node admitted and has not started is not "not found"
         // (#63): upstream answers 400 with why it is waiting.
-        if let Some(why) = pm.waiting_reason(namespace, pod) {
-            return Err((StatusCode::BAD_REQUEST, waiting_to_start(container, pod, &why))
+        if let Some((kind, why)) = pm.waiting_state(namespace, pod) {
+            return Err((StatusCode::BAD_REQUEST, waiting_to_start(container, pod, &kind, &why))
                 .into_response());
         }
         return Err((

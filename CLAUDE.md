@@ -65,7 +65,7 @@ runtime unreachable, init failure) made the pod **Failed with no container statu
 pull was also cached for the pod for good. Upstream: image/create errors are waits with the container's reason
 (ErrImagePull → ImagePullBackOff, CreateContainerError), a start failure under restartPolicy Never is Failed with
 the container terminated `StartError` (exit 128).
-1. [ ] `CriError::Container{container, reason, message}` from start_pod's create/start; sync arms: ImagePull (forget
+1. [x] `CriError::Container{container, reason, message}` from start_pod's create/start; sync arms: ImagePull (forget
        the cached failure; ErrImagePull → ImagePullBackOff; 10 s–5 min back-off), Container (Never + StartError:
        Failed with the terminated status; else Pending with the reason, partial start torn down, first_seen kept so
        the back-off grows), Connection (a wait); the rest Failed *with* init statuses and app containers

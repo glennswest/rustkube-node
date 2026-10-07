@@ -2,6 +2,14 @@
 
 ## 2026-10-08
 
+- **fix:** A start error no longer ends a pod with no container state and a 404 log (#133, stormcos_qa short on
+  C2NR0Q2 10-02, triggered then by #103). An image that will not pull waits as `ErrImagePull` →
+  `ImagePullBackOff` and is pulled again after a 10 s–5 min back-off (the failed pull was cached for the pod for
+  good); a container that will not be created waits as `CreateContainerError`, one that will not start as
+  `RunContainerError`, or under `restartPolicy: Never` ends the pod with that container terminated `StartError`
+  (exit 128). An unreachable runtime is a wait. Any other failure (an init container's) reports the init statuses
+  and the apps `PodInitializing`. A partial start is torn down before the next try, which waits its back-off however
+  the pod is woken. `logs` on such a pod answers 400 with the reason.
 - **feat:** Native sidecars (#111): an init container with `restartPolicy: Always` is started in its slot and the
   next init goes once it has started (running, startupProbe passed), with no init deadline; it runs for the pod's
   life, probed and restarted (Always, whatever the pod's policy; an early exit is a restart with back-off, never a
