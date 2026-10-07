@@ -57,21 +57,6 @@ by #51.
 
 ## Work plan
 
-### In progress: #21 (P2), cadvisor's library for node / machine / filesystem stats and eviction signals
-
-2026-10-08. Scoping answered on the issue (owner: glennswest/cadvisor; upstream split cadvisor into a kubelet library,
-node/fs/machine there, containers on CRI). On main: pressure from procfs/statfs (cac53ca), container families (f239350),
-stormpump CPU/memory (#57). Fake or missing: the summary's node CPU/memory are sums of containers, no machine_*
-families, no root (`id="/"`) series, MemoryPressure from MemAvailable rather than upstream's working set.
-glennswest/cadvisor afb46a0 `cadvisor-host`: `CgroupReader::read_stats("/")` (working set = memory.current −
-inactive_file), `machine_info(&FsService)`, `FsService`.
-1. [ ] Dependency `cadvisor-host` + `cadvisor-model` (git, rev afb46a0); lock from the build box.
-2. [ ] `node_stats.rs`: root cgroup stats and machine info, read off the request path (cached, 10 s).
-3. [ ] `/stats/summary` node cpu/memory from it (container sums only as the fallback); `/metrics/cadvisor`
-       `machine_*` and the `id="/"` series; MemoryPressure = capacity − root working set < 100Mi (upstream's signal).
-4. [ ] Tests, metrics.md, CHANGELOG; sc-build; live: /stats/summary and /metrics/cadvisor on a node; close.
-       Not here: PSI, imagefs (images are stormblock volumes on stormcos), noted.
-
 ### Paused (P0 #104 first): #60 (P2), each PV's storage placement: volume, drives, shelf/bay, RAID partners
 
 2026-10-08. Both sources exist: stormblock `GET /api/v1/volumes?placement=true` (`placement.drives[]` serial/wwn,
