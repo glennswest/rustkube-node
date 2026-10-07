@@ -2,6 +2,12 @@
 
 ## 2026-10-08
 
+- **perf:** A pod's probe pass no longer rewrites an unchanged status (#141, #138 follow-up). The skip compared with
+  the watch's copy of the pod, which a second after a start was still the pre-Running object, so the unchanged
+  Running status was written again, on a worker, on a stale revision. The kubelet now keeps per pod the status the
+  apiserver acknowledged and the revision it answered with; while the watch's copy is still at the revision that
+  write was made on, the write is what is compared with and its revision what the next write is made on. New
+  counter `kubelet_pod_status_writes_total{result="written|skipped"}`.
 - **fix:** A start error no longer ends a pod with no container state and a 404 log (#133, stormcos_qa short on
   C2NR0Q2 10-02, triggered then by #103). An image that will not pull waits as `ErrImagePull` →
   `ImagePullBackOff` and is pulled again after a 10 s–5 min back-off (the failed pull was cached for the pod for

@@ -132,6 +132,8 @@ pub struct Kubelet {
     /// The external CSI drivers on this node, shared with the pod manager
     /// and kept current by the registration loop (#52).
     csi: Arc<crate::csi_plugins::CsiPlugins>,
+    /// Per pod UID, the status this kubelet last had acknowledged (#141).
+    acked_status: std::sync::Mutex<std::collections::HashMap<String, AckedStatus>>,
     watches: apimachinery::reactor::WatchHub,
     last_claims: std::sync::Mutex<crate::workload::VolumeIndex>,
     static_read_complete: std::sync::atomic::AtomicBool,
@@ -209,6 +211,7 @@ impl Kubelet {
             vmis_synced: AtomicBool::new(false),
             engine_volumes: tokio::sync::watch::channel(0).0,
             csi,
+            acked_status: Default::default(),
         })
     }
 
@@ -1341,29 +1344,46 @@ impl Kubelet {
 
         // Preserve status fields owned by admission/scheduling; use the
         // source revision so a slow start cannot overwrite a recreated Pod.
-        let mut merged = source["status"].as_object().cloned().unwrap_or_default();
+        // While the watch has not yet delivered this kubelet's own last write,
+        // that write is the status to compare with and its revision the one to
+        // write on (#141): the probe pass a second after a start found the
+        // pre-Running status here and wrote an unchanged one again.
+        let uid = source["metadata"]["uid"].as_str().unwrap_or("").to_string();
+        let acked = self.acked_status.lock().unwrap_or_else(|e| e.into_inner()).get(&uid).cloned();
+        let (base, revision) = status_base(source, acked.as_ref());
+        let mut merged = base.as_object().cloned().unwrap_or_default();
         if status.get("message").is_none() {
             merged.remove("message");
             merged.remove("reason");
         }
         merged.extend(status.as_object().unwrap().clone());
         let status = Value::Object(merged);
-        if status == source["status"] {
+        if status == base {
+            crate::metrics::observe_status_write("skipped");
             return Ok(());
         }
         // Static manifests have no API identity; their mirror publication is
         // separate from managing their local runtime state.
-        if source["metadata"]["resourceVersion"].as_str().is_none() {
+        let Some(revision) = revision else {
             return Ok(());
-        }
-        self.api_client.put(format!("{path}/status"))
+        };
+        let written: Value = self.api_client.put(format!("{path}/status"))
             .timeout(Duration::from_secs(10))
             .json(&serde_json::json!({
                 "apiVersion": "v1", "kind": "Pod",
                 "metadata": {"name": &update.name, "namespace": &update.namespace,
-                    "uid": source["metadata"]["uid"], "resourceVersion": source["metadata"]["resourceVersion"]},
+                    "uid": source["metadata"]["uid"], "resourceVersion": revision},
                 "status": status
-            })).send().await?.error_for_status()?;
+            })).send().await?.error_for_status()?.json().await.unwrap_or(Value::Null);
+        crate::metrics::observe_status_write("written");
+        // What the apiserver now holds, and at which revision, for the next
+        // pass that runs before the watch delivers it.
+        if let Some(now) = written["metadata"]["resourceVersion"].as_str() {
+            self.acked_status.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                uid,
+                AckedStatus { written_on: revision, now: now.to_string(), status },
+            );
+        }
 
         Ok(())
     }
@@ -1380,6 +1400,7 @@ impl workload::Adapter for Kubelet {
             match key.kind {
                 Kind::Pod=> {
                     self.pod_manager.stop_pod(&key.uid).await?;
+                    self.acked_status.lock().unwrap_or_else(|e| e.into_inner()).remove(&key.uid);
                     if let Some(object)=&desired {
                         // Never acknowledge deletion of a same-name successor.
                         let response=self.api_client.delete(format!("{}/api/v1/namespaces/{}/pods/{}",self.config.api_server_url,key.namespace,key.name))
@@ -1807,6 +1828,64 @@ fn nanos_to_rfc3339(nanos: i64) -> serde_json::Value {
 /// non-empty, because those two differ exactly where it matters: a pod that
 /// has not reached its init containers yet reports none, and "none reported"
 /// must not read the same as "none declared".
+/// A pod status this kubelet wrote and the apiserver acknowledged (#141).
+#[derive(Debug, Clone)]
+struct AckedStatus {
+    /// The revision the write was made on.
+    written_on: String,
+    /// The revision the apiserver answered with.
+    now: String,
+    status: Value,
+}
+
+/// The status to compare a new one with, and the revision to write it on
+/// (#141). The watch's copy (`source`), unless it is still at the revision
+/// this kubelet's last acknowledged write was made on: then that write is
+/// newer than the copy, and is what the apiserver holds. `None` revision: an
+/// object with none (a static manifest's), which is not written.
+fn status_base(source: &Value, acked: Option<&AckedStatus>) -> (Value, Option<String>) {
+    let rv = source["metadata"]["resourceVersion"].as_str();
+    match acked {
+        Some(a) if rv == Some(a.written_on.as_str()) => (a.status.clone(), Some(a.now.clone())),
+        _ => (source["status"].clone(), rv.map(String::from)),
+    }
+}
+
+#[cfg(test)]
+mod status_base_tests {
+    use super::*;
+
+    fn pod(rv: &str, phase: &str) -> Value {
+        serde_json::json!({"metadata": {"uid": "u", "resourceVersion": rv}, "status": {"phase": phase}})
+    }
+
+    fn acked() -> AckedStatus {
+        AckedStatus { written_on: "10".into(), now: "11".into(), status: serde_json::json!({"phase": "Running"}) }
+    }
+
+    #[test]
+    fn the_watch_behind_our_own_write_compares_with_the_write_and_writes_on_its_revision() {
+        // The watch still shows the pre-Running object our PUT was made on.
+        let (base, rv) = status_base(&pod("10", "Pending"), Some(&acked()));
+        assert_eq!((base, rv.as_deref()), (serde_json::json!({"phase": "Running"}), Some("11")));
+    }
+
+    #[test]
+    fn the_watch_caught_up_or_moved_on_is_the_base() {
+        let (base, rv) = status_base(&pod("11", "Running"), Some(&acked()));
+        assert_eq!((base["phase"].as_str(), rv.as_deref()), (Some("Running"), Some("11")));
+        // Someone else wrote after us: their object is the truth.
+        let (base, rv) = status_base(&pod("15", "Failed"), Some(&acked()));
+        assert_eq!((base["phase"].as_str(), rv.as_deref()), (Some("Failed"), Some("15")));
+        // Nothing acknowledged yet.
+        let (base, rv) = status_base(&pod("3", "Pending"), None);
+        assert_eq!((base["phase"].as_str(), rv.as_deref()), (Some("Pending"), Some("3")));
+        // A static manifest has no revision and is never written.
+        let (_, rv) = status_base(&serde_json::json!({"metadata": {}, "status": {}}), None);
+        assert!(rv.is_none());
+    }
+}
+
 fn pod_initialized(declared: usize, reports: &[InitContainerStatusReport]) -> bool {
     if declared == 0 {
         return true;

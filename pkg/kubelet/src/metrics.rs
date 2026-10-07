@@ -115,6 +115,10 @@ fn describe() {
     );
     metrics::describe_gauge!(STORMBLOCK_USED, "Percent of the node's stormblock data slabs written");
     metrics::describe_counter!(
+        STATUS_WRITES,
+        "Pod status writes by result: written, or skipped because nothing changed since the last acknowledged one"
+    );
+    metrics::describe_counter!(
         TIMED,
         "Reconciles scheduled by a deadline or a polling fallback rather than an event"
     );
@@ -150,6 +154,15 @@ pub fn observe_relist(seconds: f64) {
 
 /// Work scheduled on a clock rather than by an event (#101).
 pub const TIMED: &str = "kubelet_timed_reconciles_total";
+/// Pod status writes, by result: `written` or `skipped` (unchanged, #141).
+pub const STATUS_WRITES: &str = "kubelet_pod_status_writes_total";
+
+/// A pod status was written, or skipped as unchanged (#141).
+pub fn observe_status_write(result: &'static str) {
+    if handle().is_some() {
+        metrics::counter!(STATUS_WRITES, "result" => result).increment(1);
+    }
+}
 
 /// The node's stormblock data slabs, by `kind`: `total`, `free`, `committed`
 /// (claims at their class size), `reserve`, `available` for a new claim (#62).
