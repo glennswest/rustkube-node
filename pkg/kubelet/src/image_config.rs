@@ -196,11 +196,11 @@ pub fn compose(pod: &PodSide, image: Option<&ImageConfig>, root: Option<&Path>) 
     for e in img.env.iter().chain(pod.env.iter()) {
         set(e);
     }
-    let has = |key: &str| env.iter().any(|e| e.starts_with(&format!("{key}=")));
-    if !has("PATH") {
+    let has = |env: &[String], key: &str| env.iter().any(|e| e.starts_with(&format!("{key}=")));
+    if !has(&env, "PATH") {
         env.push(DEFAULT_PATH.to_string());
     }
-    if !has("HOME") {
+    if !has(&env, "HOME") {
         env.push(format!("HOME={}", home.unwrap_or_else(|| if uid == 0 { "/root".into() } else { "/".into() })));
     }
 

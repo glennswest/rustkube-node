@@ -251,6 +251,7 @@ impl StormpumpRuntime {
             containers: Mutex::new(HashMap::new()),
             failed_networks: Mutex::new(Vec::new()),
             next_id: std::sync::atomic::AtomicU64::new(1),
+            image_configs: Arc::default(),
         })
     }
 
