@@ -138,7 +138,7 @@ runs only on the clone routes, 503 "fetching it from the cluster … retry short
        Done: 3822c45 (1 new test, 1 extended). sc-build refused (409 build VMs are off, stormcentral#544); #79
        proposed after it.
 
-### Waiting on stormcentral#362 (stage golden): #104 (P0), every container its own CoW root (owner: A, no exceptions)
+### Shipped (golden 0fc1a74fff24): #104 (P0), every container its own CoW root (owner: A, no exceptions)
 
 2026-10-08. Owner (#104, 10-07): every container's root is its own CoW clone of the image's **sealed golden**,
 writable, deleted with the container; a restart gets a fresh clone; never shared; exactly one layer between
@@ -172,6 +172,8 @@ Steps:
        2026-10-08: built at c8256ac (job 61569b65c2, after #189's two compile errors): 413 kubelet unit pass, every #104
        test by name. `component stage` aborted twice (`[platform in] …/stormd`, `[platform abort]`, exit 255) =
        stormcentral#362 (stormd golden lacks bin/stormd), commented; #104 proposed after it. Then stage, shipped, live check.
+       #362 fixed: stage golden golden-rustkube-node-0fc1a74fff24 (7df677b = c8256ac code), stormcos#366 (asked the gate for
+       the isolation / one-clone / pods-start checks); `stormcentral shipped`. Close #161 as superseded once released.
 
 ### Paused (P0 #104 first): #71 (P2), built-in driver: redundancy / spread / tier from the StorageClass
 
