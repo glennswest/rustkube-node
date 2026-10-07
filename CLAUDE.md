@@ -57,6 +57,22 @@ by #51.
 
 ## Work plan
 
+### In progress: #84 (P2), each stormpump workload's cgroup → pod/container identity, for cadvisor
+
+2026-10-08. cadvisor (cadvisor#3, #15) waits on this repo to pick the shape. Found: stormpump does not report a
+workload's cgroup name, but QUERY's info block gives its pid (`stormpump_abi::query::info`) and the kubelet shares the
+host pid namespace, so `/proc/<pid>/cgroup` names it; a sandbox's holder pid comes from SANDBOX_ACQUIRE. cadvisor
+(stormcos boot unit) mounts only its data and logs, so either shape needs a stormcos mount.
+Shape chosen: one JSON file per workload, `/run/rustkube/workloads/<cgroup basename>.json` (host /run, the kubelet's
+own /run): cgroup, pid, kind (container | sandbox), reports_network (the pod-network sandbox only), namespace, pod,
+pod_uid, container, container_id, image, labels (`io.kubernetes.*` + the CRI labels), annotations. Written atomically at
+container start / sandbox made, removed at removal; files whose pid no longer has that cgroup swept at start. No
+auth, inotify-watchable, survives a kubelet restart.
+1. [ ] `workload_identity.rs` (record, cgroup_of, publish/withdraw/sweep); `RingClient::query_info`.
+2. [ ] stormpump runtime: publish at start/sandbox, withdraw at removal; sweep at connect.
+3. [ ] Tests, docs (README, api.md), CHANGELOG; file stormcos (cadvisor mounts host /run ro) and comment cadvisor#3/#15;
+       sc-build (stormcentral#544); close. VMs (cadvisor#15) next: same record, kind vm, from the VM manager.
+
 ### Waiting on stormcentral#544 (builds): #70 (P2), Events on the claim while its blank mints, and when a mint or clone fails
 
 2026-10-08. Done before: a blank not `ready` is a wait (c78baf0, #63), the mint is background and bounded by
