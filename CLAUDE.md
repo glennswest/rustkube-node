@@ -606,7 +606,9 @@ waits on the master installing the release (stormcos#164) = #102.
        vm-waves 845557b202 queued too (#91/#92's check). Read with `stormcentral test show <id>`; compare with the
        11.50/11.51 baseline (container start 20.8/21.2 s, claim 75.5/67.2 s) and post on #102.
        630379c31b: error at the test-image build on dev.g8.lo (retired; stormcentral#521), after the node settled.
-       #102 proposed after stormcentral#521; rerun then.
+       #102 proposed after stormcentral#521; rerun then. #521 closed before the build-VM stormcentral installed (plain
+       sc-build still went to dev at ~13:45Z): #102 and #97 re-proposed after stormcentral#526 (test-image builds),
+       #165 after stormcentral#527 (component stage).
    Stage golden golden-rustkube-node-e8bca700a793 (bba7d54), release request stormcos#164.
 
 ### Done: #101, events and explicit deadlines instead of sync ticks
