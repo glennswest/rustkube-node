@@ -111,8 +111,12 @@ struct Container {
     /// released, so a claim's device mount outlived every pod that used it
     /// and the volume was later detached under a live filesystem.
     volume_handles: Vec<Handle>,
-    /// The image's volume, registered with the engine. `None` until started.
+    /// This container's own root, registered with the engine (PID 1 mounted
+    /// it) at create, released at removal (#104).
     root_handle: Option<Handle>,
+    /// The engine volume that is this container's own root (#104): one CoW
+    /// clone of its image's sealed golden, deleted with the container.
+    root_volume: Option<String>,
     /// The directory this container's log file is opened in:
     /// `<sandbox log_directory>/<container>`. Kubernetes reads
     /// `<that>/<restart>.log` and nowhere else.
@@ -228,6 +232,10 @@ pub struct StormpumpRuntime {
     next_id: std::sync::atomic::AtomicU64,
     /// Image configs by image root, filled by [`StormpumpImages`] (#98).
     image_configs: Arc<crate::image_config::ImageConfigs>,
+    /// Makes and deletes each container's own root (#104).
+    roots: Option<Arc<crate::container_roots::Roots>>,
+    /// Root volumes being made, which the orphan sweep must not take.
+    making: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl StormpumpRuntime {
@@ -253,6 +261,8 @@ impl StormpumpRuntime {
             failed_networks: Mutex::new(Vec::new()),
             next_id: std::sync::atomic::AtomicU64::new(1),
             image_configs: Arc::default(),
+            roots: None,
+            making: Default::default(),
         })
     }
 
@@ -322,6 +332,30 @@ impl StormpumpRuntime {
             failed_networks: Mutex::new(Vec::new()),
             next_id: std::sync::atomic::AtomicU64::new(1),
             image_configs: Arc::default(),
+            roots: None,
+            making: Default::default(),
+        }
+    }
+
+    /// The engine that makes each container's own root (#104).
+    pub fn with_roots(mut self, roots: crate::container_roots::Roots) -> Self {
+        self.roots = Some(Arc::new(roots));
+        self
+    }
+
+    /// Delete the container roots nothing holds: what a kubelet that died
+    /// between a create and a removal left (#104). Run once at start; a root
+    /// still attached or mounted is never touched.
+    pub async fn sweep_roots(&self) {
+        let Some(roots) = self.roots.clone() else { return };
+        let mut known: std::collections::HashSet<String> =
+            self.making.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        known.extend(
+            self.containers.lock().await.keys().map(|id| crate::container_roots::volume_name(id)),
+        );
+        let gone = roots.sweep(&known).await;
+        if gone > 0 {
+            tracing::info!(gone, "stormpump: orphan container roots deleted");
         }
     }
 
@@ -443,8 +477,40 @@ impl StormpumpRuntime {
                 c.volume_handles.retain(|held| *held != volume);
             }
         }
+        // Its own root last (#104): the last release unmounts it, then the
+        // clone is detached and deleted. A refusal keeps the record, retried.
+        let (root, volume) = {
+            let containers = self.containers.lock().await;
+            containers.get(container_id).map(|c| (c.root_handle, c.root_volume.clone())).unwrap_or_default()
+        };
+        if let Some(root) = root {
+            self.on_ring(move |r| r.volume_release(root)).await?;
+            if let Some(c) = self.containers.lock().await.get_mut(container_id) {
+                c.root_handle = None;
+            }
+        }
+        if let (Some(volume), Some(roots)) = (volume, self.roots.clone()) {
+            roots.destroy(&volume).await.map_err(CriError::Runtime)?;
+            if let Some(c) = self.containers.lock().await.get_mut(container_id) {
+                c.root_volume = None;
+            }
+        }
         self.containers.lock().await.remove(container_id);
         Ok(())
+    }
+
+    /// Undo a root made for a container that will not be created (#104).
+    async fn discard_root(&self, handle: Option<Handle>, volume: &str) {
+        if let Some(h) = handle {
+            if let Err(e) = self.on_ring(move |r| r.volume_release(h)).await {
+                tracing::warn!(volume = %volume, "a discarded root was not released: {e}");
+            }
+        }
+        if let Some(roots) = &self.roots {
+            if let Err(e) = roots.destroy(volume).await {
+                tracing::warn!(volume = %volume, "a discarded root was not deleted (the sweep retries): {e}");
+            }
+        }
     }
 
     /// Finish the removals in `ids` (#90). A refusal keeps the record and is
@@ -492,9 +558,10 @@ fn compose_for(
     config: &ContainerConfig,
     image: Option<&crate::image_config::ImageConfig>,
     image_name: Option<&str>,
+    read_root: Option<&std::path::Path>,
 ) -> Result<crate::image_config::Composed, String> {
     let env: Vec<String> = config.envs.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    let root = image_root(&config.image);
+    let root = read_root.map(std::path::Path::to_path_buf);
     let pod = crate::image_config::PodSide {
         // The reference the pod wrote, when known, rather than its mount.
         image: image_name.unwrap_or(&config.image),
@@ -519,6 +586,7 @@ fn spec_for(
     config: &ContainerConfig,
     sandbox: &PodSandboxConfig,
     run: crate::image_config::Composed,
+    read_root: Option<&std::path::Path>,
 ) -> stormpump::spec::Spec {
     use stormpump::spec::{Logs, Root, Share, Spec};
 
@@ -537,8 +605,8 @@ fn spec_for(
     // the engine still receives an absolute path.
     if let Some(first) = argv.first().cloned() {
         if !first.starts_with('/') {
-            match image_root(&config.image) {
-                Some(root) => match resolve_in_image(&root, &first, &crate::image_config::path_of(&env)) {
+            match read_root {
+                Some(root) => match resolve_in_image(root, &first, &crate::image_config::path_of(&env)) {
                     Some(abs) => argv[0] = abs,
                     None => tracing::warn!(
                         image = %config.image, argv0 = %first,
@@ -557,9 +625,9 @@ fn spec_for(
     Spec {
         domain: Domain::Container,
         // The root arrives as a registered volume handle at spawn, not here:
-        // the spec is defined once and can be spawned many times, and the
-        // image a container runs is a property of the spawn. `Chroot` is
-        // "enter the volume's mount view", which is what a container root is.
+        // the container's own clone of its image's golden (#104), which PID 1
+        // mounted. `Chroot` is "enter the volume's mount view", which is what
+        // a container root is.
         root: Root::Chroot,
         // Its own file, in the directory Kubernetes will look in.
         //
@@ -1020,25 +1088,79 @@ impl RuntimeService for StormpumpRuntime {
             }
         }
         self.probe()?;
-        // The image's own config under the pod spec (#98). Known when the
-        // image service found it for this root; a refusal names the image.
-        let image = self.image_configs.get(&config.image);
-        let name = self.image_configs.image_of(&config.image);
-        let run = compose_for(config, image.as_ref(), name.as_deref()).map_err(|e| {
-            CriError::Runtime(format!("container {}: {e}", config.name))
-        })?;
-        let encoded = spec_for(config, _sandbox_config, run).encode();
-        let spec = self.on_ring(move |r| r.spec_define(encoded)).await?;
-
-        let (namespace, pod) = {
+        let (namespace, pod, pod_uid) = {
             let sandboxes = self.sandboxes.lock().await;
             sandboxes
                 .get(sandbox_id)
-                .map(|sb| (sb.config.namespace.clone(), sb.config.name.clone()))
+                .map(|sb| (sb.config.namespace.clone(), sb.config.name.clone(), sb.config.uid.clone()))
                 .unwrap_or_default()
         };
-
         let id = self.mint_id("ct");
+
+        // **Its own root** (#104, the owner's rule): one CoW clone of the
+        // image's sealed golden, attached here and mounted by PID 1, never a
+        // directory another container also runs on.
+        let roots = self.roots.clone().ok_or_else(|| {
+            CriError::Runtime(format!(
+                "container {}: no engine to make its own root from image {}",
+                config.name, config.image
+            ))
+        })?;
+        let volume = crate::container_roots::volume_name(&id);
+        self.making.lock().unwrap_or_else(|e| e.into_inner()).insert(volume.clone());
+        let owner = serde_json::json!({ "kind": "Pod", "namespace": namespace, "name": pod, "uid": pod_uid });
+        let made = roots.make(&volume, &config.image, &owner).await;
+        let made = match made {
+            Ok(m) => m,
+            Err(e) => {
+                self.making.lock().unwrap_or_else(|e| e.into_inner()).remove(&volume);
+                return Err(CriError::Runtime(format!("container {}: its root: {e}", config.name)));
+            }
+        };
+        let mount = crate::container_roots::mount_point(&id);
+        let (at, device) = (mount.clone(), made.device.clone());
+        let root = self.on_ring(move |r| r.volume_register_device(&at, &device, "ext4")).await;
+        self.making.lock().unwrap_or_else(|e| e.into_inner()).remove(&volume);
+        let root = match root {
+            Ok(h) => h,
+            Err(e) => {
+                self.discard_root(None, &made.volume_id).await;
+                return Err(CriError::Runtime(format!(
+                    "container {}: stormpump would not mount its root {} at {mount}: {e}",
+                    config.name, made.device
+                )));
+            }
+        };
+        if config.readonly_rootfs {
+            tracing::warn!(
+                container = %config.name, pod = %pod,
+                "readOnlyRootFilesystem: the container's own root is mounted writable until the \
+                 engine can mount it read-only (stormpump#108)"
+            );
+        }
+
+        // User names and argv[0] are read from the image: a pallet's mount,
+        // or this container's root for a pulled image.
+        let read_root = image_root(&config.image).unwrap_or_else(|| std::path::PathBuf::from(&mount));
+        // The image's own config under the pod spec (#98). Known when the
+        // image service found it for this image; a refusal names the image.
+        let image = self.image_configs.get(&config.image);
+        let name = self.image_configs.image_of(&config.image);
+        let defined = match compose_for(config, image.as_ref(), name.as_deref(), Some(&read_root)) {
+            Ok(run) => {
+                let encoded = spec_for(config, _sandbox_config, run, Some(&read_root)).encode();
+                self.on_ring(move |r| r.spec_define(encoded)).await
+            }
+            Err(e) => Err(CriError::Runtime(format!("container {}: {e}", config.name))),
+        };
+        let spec = match defined {
+            Ok(s) => s,
+            Err(e) => {
+                self.discard_root(Some(root), &made.volume_id).await;
+                return Err(e);
+            }
+        };
+
         let c = Container {
             id: id.clone(),
             sandbox_id: sandbox_id.to_string(),
@@ -1060,14 +1182,9 @@ impl RuntimeService for StormpumpRuntime {
             spec_handle: Some(spec),
             workload_handle: None,
             volume_handles: Vec::new(),
-            root_handle: None,
-            // The image ref is the mounted path, which is what pull_image
-            // returned: `/pallets/<name>` for a golden, `/run/stormpump/
-            // images/<volume>` for a pull (#103). A pod whose image was never
-            // pulled has none, and start_container says so rather than
-            // spawning onto nothing.
-            root_path: image_root(&config.image)
-                .map(|p| p.to_string_lossy().into_owned()),
+            root_handle: Some(root),
+            root_volume: Some(made.volume_id.clone()),
+            root_path: Some(mount.clone()),
             state: ContainerState::Created,
             created_at: now_nanos(),
             started_at: 0,
@@ -1081,8 +1198,8 @@ impl RuntimeService for StormpumpRuntime {
         let qualified = format!("{}/{}/{}", c.namespace, c.pod, c.name);
         self.containers.lock().await.insert(id.clone(), c);
         tracing::info!(
-            container = %id, name = %qualified, image = %config.image,
-            "stormpump: container created"
+            container = %id, name = %qualified, image = %config.image, root = %volume,
+            "stormpump: container created on its own root"
         );
         Ok(id)
     }
@@ -1100,14 +1217,16 @@ impl RuntimeService for StormpumpRuntime {
             // The root is the image's filesystem. Without one there is nothing
             // to run, and saying so is better than spawning a container onto
             // nothing and reporting that it started.
-            let path = c.root_path.clone().ok_or_else(|| {
+            let root = c.root_handle.ok_or_else(|| {
                 CriError::Runtime(format!(
-                    "container {container_id} has no root — image {} was never pulled",
+                    "container {container_id} has no root of its own (image {})",
                     c.image
                 ))
             })?;
-            (spec, path, c.log_dir.clone(), c.sandbox_id.clone(), c.mount_sources.clone())
+            let path = c.root_path.clone().unwrap_or_default();
+            (spec, (root, path), c.log_dir.clone(), c.sandbox_id.clone(), c.mount_sources.clone())
         };
+        let (root, path) = path;
 
         // The pod's sandbox, if it has one. A host-network pod has none and
         // each container is simply in the node's namespaces.
@@ -1140,8 +1259,7 @@ impl RuntimeService for StormpumpRuntime {
             .on_ring(move |r| {
                 let mut held = Vec::new();
                 let result = (|| {
-                let root = r.volume_register(&path)?;
-                held.push(root);
+                // Its own root, registered at create and released at removal.
                 let logs = r.volume_register(&log_dir)?;
                 held.push(logs);
                 // One per mount point, in the spec's order.
@@ -1391,34 +1509,14 @@ impl RuntimeService for StormpumpRuntime {
 pub struct StormpumpImages {
     /// The registry's base URL, e.g. `http://127.0.0.1:5100`.
     registry: String,
-    /// This node's stormblock, which attaches a clone as a block device.
-    storage: String,
-    /// Its client, with the engine's token (#66). `http` is for the registry,
-    /// which must not be sent the engine's token.
-    engine: crate::engine::EngineClient,
-    /// Passed to the attach, because a volume is attached *somewhere*.
-    node_name: String,
     http: reqwest::Client,
-    /// The engine, for the one thing only the engine can do: mount.
-    ring: Option<Arc<RingClient>>,
-    /// image ref -> mountpoint, for images already pulled.
-    ///
-    /// A pull is expensive (fetch, unpack, seal, clone, attach, mount) and the
-    /// kubelet pulls per container, so the second container of an image must
-    /// not repeat it. Keyed on the ref as written: a tag that moves is a
-    /// different image, but resolving that on every start would mean a
-    /// registry round trip per container start, and `imagePullPolicy` is what
-    /// exists to ask for it.
+    /// image ref -> the reference a container is created from
+    /// (`template:<name>`, the image's sealed golden here), for images whose
+    /// golden this kubelet has already found. Keyed on the ref as written: a
+    /// tag that moves is a different image, and `imagePullPolicy` is what
+    /// exists to ask again.
     pulled: Mutex<HashMap<String, String>>,
-    /// image ref -> registry clone id, for a pulled image whose bind the
-    /// registry refused (#143). The image is mounted and used; the bind is
-    /// asked again on the next pull of it, because a clone left `claimed` is
-    /// reaped by the registry after its grace period.
-    unbound: Mutex<HashMap<String, String>>,
-    /// One pull of an image at a time (#143): two concurrent pulls would mint
-    /// two clones, and a bound clone is never reaped, so the loser would leak.
-    pulling: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    /// Each image root's config, from the registry's golden record (#98).
+    /// Each image's config, from the registry's golden record (#98).
     configs: Arc<crate::image_config::ImageConfigs>,
 }
 
@@ -1450,42 +1548,19 @@ fn resolve_in_image(root: &std::path::Path, argv0: &str, path: &[String]) -> Opt
 /// How long the registry is given to answer for an image's config (#98).
 const CONFIG_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Where a pulled image is mounted. Under `/run` because it does not survive a
-/// reboot: the clone does, and is found again by name.
-const IMAGE_ROOT: &str = "/run/stormpump/images";
 /// Where the engine mounts a claim's block device for its pods to bind.
 const PVC_ROOT: &str = "/run/stormpump/pvc";
 
-/// The root a container of `image` runs on, or `None` when this node has none.
-///
-/// `image` is what the kubelet hands `create_container`: the reference
-/// [`StormpumpImages::pull_image`] returned, which is the mounted path. A
-/// golden's is `/pallets/<name>`; a pull's is `/run/stormpump/images/<volume>`,
-/// and that one is taken as given (#103). Mapping it through
-/// [`StormpumpImages::local_path`] as well made every pulled image look for
-/// `/pallets/<volume>`, and fail at start as "never pulled".
-///
-/// The pulled path is not checked for content from here: PID 1 mounted it in
-/// the node's namespace, which is where the engine resolves the root at spawn,
-/// and this process may not see that mount. A path that is not mounted fails
-/// there, with the engine's own error.
-/// Where [`StormpumpImages::pull_image`] mounts a pulled clone, and so the
-/// reference it returns for it.
-fn pulled_mount(volume: &str) -> String {
-    format!("{IMAGE_ROOT}/{volume}")
-}
-
+/// A pallet image's mounted path, for reading the image (user names, argv[0]),
+/// or `None` for anything else: a pulled image (`template:<name>`) is read
+/// from the container's own root once it is mounted (#104).
 fn image_root(image: &str) -> Option<std::path::PathBuf> {
     image_root_in(image, std::path::Path::new(PALLET_ROOT))
 }
 
 fn image_root_in(image: &str, pallets: &std::path::Path) -> Option<std::path::PathBuf> {
-    if let Some(rest) = image.strip_prefix(IMAGE_ROOT) {
-        // Exactly one component below the image root, which is what a pull
-        // makes: nothing above it, nothing beside it.
-        let volume = rest.strip_prefix('/')?;
-        let plain = !volume.is_empty() && !volume.contains('/') && volume != "." && volume != "..";
-        return plain.then(|| std::path::PathBuf::from(image));
+    if image.starts_with(crate::container_roots::TEMPLATE_PREFIX) {
+        return None;
     }
     StormpumpImages::local_path_in(image, pallets)
 }
@@ -1494,14 +1569,8 @@ impl StormpumpImages {
     pub fn new(registry: impl Into<String>) -> StormpumpImages {
         StormpumpImages {
             registry: registry.into(),
-            storage: crate::engine::DEFAULT_URL.to_string(),
-            engine: crate::engine::EngineClient::default(),
-            node_name: String::new(),
             http: reqwest::Client::new(),
-            ring: None,
             pulled: Mutex::new(HashMap::new()),
-            unbound: Mutex::new(HashMap::new()),
-            pulling: Mutex::new(HashMap::new()),
             configs: Arc::default(),
         }
     }
@@ -1546,25 +1615,6 @@ impl StormpumpImages {
         self.configs.put(root, image, config);
     }
 
-    /// The engine and the node identity, without which a pull can get as far
-    /// as a clone and no further.
-    pub fn with_engine(
-        mut self,
-        ring: Option<Arc<RingClient>>,
-        node_name: impl Into<String>,
-    ) -> StormpumpImages {
-        self.ring = ring;
-        self.node_name = node_name.into();
-        self
-    }
-
-    /// The node's engine, shared with the rest of the kubelet.
-    pub fn with_storage(mut self, engine: crate::engine::EngineClient) -> StormpumpImages {
-        self.storage = engine.url().to_string();
-        self.engine = engine;
-        self
-    }
-
     pub fn registry(&self) -> &str {
         &self.registry
     }
@@ -1579,160 +1629,6 @@ impl StormpumpImages {
 const PALLET_ROOT: &str = "/pallets";
 
 impl StormpumpImages {
-    /// POST JSON and read JSON back, or say why not.
-    ///
-    /// A non-2xx carries the body: the registry and the engine both explain
-    /// themselves in it, and "HTTP 409" on its own has sent people to the
-    /// wrong component more than once.
-    async fn post(
-        &self,
-        url: &str,
-        body: &serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        let resp =
-            self.http.post(url).json(body).send().await.map_err(|e| format!("{url}: {e}"))?;
-        Self::json_answer(url, resp).await
-    }
-
-    /// [`Self::post`] to the engine, with its token.
-    async fn post_engine(
-        &self,
-        url: &str,
-        body: &serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        let resp = self.engine.post(url, body).await.map_err(|e| format!("{url}: {e}"))?;
-        Self::json_answer(url, resp).await
-    }
-
-    async fn json_answer(url: &str, resp: reqwest::Response) -> Result<serde_json::Value, String> {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(format!("{url}: {status}: {text}"));
-        }
-        serde_json::from_str(&text).map_err(|e| format!("{url}: not JSON: {e}: {text}"))
-    }
-
-    /// The mount of an image this kubelet pulled, with its bind asked again
-    /// first if the registry refused it before (#143).
-    async fn pulled_path(&self, image: &str) -> Option<String> {
-        let path = self.pulled.lock().await.get(image).cloned()?;
-        let pending = self.unbound.lock().await.get(image).cloned();
-        if let Some(id) = pending {
-            self.bind_or_note(image, &id).await;
-        }
-        Some(path)
-    }
-
-    /// What the registry records as holding a pulled image's clone (#143):
-    /// this kubelet, for this image. One clone per image per node, shared by
-    /// every container of it, so the image is the holder, not a container.
-    fn consumer(&self, image: &str) -> String {
-        format!("kubelet/{}/{image}", self.node_name)
-    }
-
-    /// The clone already bound to `consumer`, found by asking the registry
-    /// (#143, sbregistry#19). This is how a pull after a kubelet restart (or a
-    /// reboot) gets the clone it bound before instead of minting another: a
-    /// bound clone is never reaped, so minting again would leak one per
-    /// restart. An error is an error, not "none": minting on a failed lookup
-    /// is the same leak.
-    async fn bound_clone(&self, consumer: &str) -> Result<Option<serde_json::Value>, String> {
-        let url = format!("{}/v1/clones", self.registry);
-        let resp = self
-            .http
-            .get(&url)
-            .query(&[("consumer", consumer), ("state", "bound")])
-            .send()
-            .await
-            .map_err(|e| format!("{url}: {e}"))?;
-        let list = Self::json_answer(&url, resp).await?;
-        let list = list.as_array().ok_or_else(|| format!("{url}: not a list: {list}"))?;
-        // The registry filters; checked here as well, because an older
-        // registry that ignores the query would hand back every clone.
-        Ok(list
-            .iter()
-            .find(|c| {
-                c["consumer"].as_str() == Some(consumer)
-                    && c["state"].as_str() == Some("bound")
-                    && c["id"].is_string()
-                    && c["volume_name"].is_string()
-            })
-            .cloned())
-    }
-
-    /// Tell the registry what holds clone `id` (#143). Until this, the clone
-    /// is `claimed`, and the registry reaps a claim older than its grace
-    /// period (900 s) as abandoned, under the mounted image.
-    async fn bind(&self, id: &str, consumer: &str) -> Result<(), String> {
-        let url = format!("{}/v1/clones/{id}/bind", self.registry);
-        let rec = self.post(&url, &serde_json::json!({ "consumer": consumer })).await?;
-        if rec["state"].as_str() != Some("bound") {
-            return Err(format!("{url}: the clone is {} after the bind", rec["state"]));
-        }
-        Ok(())
-    }
-
-    /// The registry half of a pull: the clone this node already bound for
-    /// `image`, else a new one. Returns (clone id, volume name, bound).
-    async fn clone_for(&self, image: &str) -> Result<(String, String, bool), CriError> {
-        let consumer = self.consumer(image);
-        let found = self.bound_clone(&consumer).await.map_err(|e| {
-            CriError::ImagePull(format!("registry could not say which clone holds {image}: {e}"))
-        })?;
-        let (clone, bound) = match found {
-            Some(c) => (c, true),
-            None => {
-                // `remote_image` is what lets the registry build the golden
-                // on demand when it has never seen this image.
-                let body = serde_json::json!({ "golden": image, "remote_image": image });
-                let c = self
-                    .post(&format!("{}/v1/clones", self.registry), &body)
-                    .await
-                    .map_err(|e| {
-                        CriError::ImagePull(format!("registry could not clone {image}: {e}"))
-                    })?;
-                (c, false)
-            }
-        };
-        let field = |k: &str| {
-            clone[k].as_str().map(str::to_owned).ok_or_else(|| {
-                CriError::ImagePull(format!("registry returned no clone {k} for {image}: {clone}"))
-            })
-        };
-        Ok((field("id")?, field("volume_name")?, bound))
-    }
-
-    /// Bind `id` for `image`, or note it for the next pull (#143). A refused
-    /// bind does not fail the pull: the image is mounted, and pulling again
-    /// would mint a second clone while the first one is in use.
-    async fn bind_or_note(&self, image: &str, id: &str) {
-        match self.bind(id, &self.consumer(image)).await {
-            Ok(()) => {
-                self.unbound.lock().await.remove(image);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    image = %image, clone = %id,
-                    "registry would not bind the image's clone (retried on the next pull; \
-                     an unbound clone is reaped after the registry's grace period): {e}"
-                );
-                self.unbound.lock().await.insert(image.to_string(), id.to_string());
-            }
-        }
-    }
-
-    /// A volume's id by name, from this node's stormblock.
-    async fn volume_id(&self, name: &str) -> Option<String> {
-        let resp = self.engine.get(&format!("{}/api/v1/volumes", self.storage)).await.ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        let list: serde_json::Value = resp.json().await.ok()?;
-        let v = list["items"].as_array()?.iter().find(|v| v["name"].as_str() == Some(name))?;
-        Some(v["id"].as_str()?.to_string())
-    }
-
     /// The mounted path for an image, if this node ships it as a golden.
     ///
     /// `docker.io/library/busybox:latest` -> `busybox`, so a pod can name an
@@ -1761,34 +1657,22 @@ impl StormpumpImages {
 
 #[async_trait]
 impl ImageService for StormpumpImages {
-    /// Make an image available on this node, as a path a container can be
-    /// rooted at.
+    /// Make sure an image's **sealed golden** is on this node, and answer the
+    /// reference a container is created from (#104).
     ///
-    /// Three cases, in order of cost:
+    /// A pull clones nothing and mounts nothing: each container's root is its
+    /// own clone of the golden, made at create (`container_roots`). The image
+    /// was cloned once per image here before, and every container of it ran on
+    /// that one clone; a container cloning *that* would have been a clone of a
+    /// clone.
     ///
-    /// 1. **A golden.** The image shipped in a pallet and is already mounted.
-    ///    Free, and the case every standard component takes.
-    /// 2. **Already pulled.** A previous container of this image did the work.
-    /// 3. **A pull.** The registry turns the image into a sealed golden
-    ///    volume, mints a copy-on-write clone of it, stormblock attaches the
-    ///    clone as a block device, and the engine mounts it. Then the clone
-    ///    is bound to `kubelet/<node>/<image>` (#143): a clone left `claimed`
-    ///    is reaped by the registry after its grace period, under the mount.
-    ///    A pull after a kubelet restart asks for that bound clone first and
-    ///    reattaches it rather than minting another. Nothing releases a
-    ///    pulled image yet: that needs an image GC (#161).
-    ///
-    /// Each step is somebody else's job and is idempotent, which is what makes
-    /// a half-finished pull safe to retry: the registry reuses a sealed
-    /// template for a digest it already has, the attach returns the device it
-    /// already made, and the mount treats "already mounted there" as success.
-    ///
-    /// **One clone per image, not per container.** Containers of the same
-    /// image share the mount, which is what goldens already do — `/pallets/
-    /// busybox` is one clone however many pods name busybox. A writable layer
-    /// per container is the next step and a real one; until then an image
-    /// whose containers write to their own root will have them write to each
-    /// other's.
+    /// 1. **A pallet.** The image shipped with the node: its golden is in the
+    ///    slab. The reference is the pallet's path (`/pallets/<x>`).
+    /// 2. **Already found.** A previous container of this image asked.
+    /// 3. **The registry's.** sbregistry's golden record for the image names
+    ///    the fstemplate it sealed in this node's engine: `template:<name>`.
+    ///    A golden still building, failed, or unknown is a pull that failed
+    ///    for now, with the registry's answer (ErrImagePull, then back-off).
     async fn pull_image(&self, image: &str) -> Result<String, CriError> {
         if let Some(path) = Self::local_path(image) {
             tracing::info!(image = %image, path = %path.display(), "image is a golden on this node");
@@ -1796,66 +1680,33 @@ impl ImageService for StormpumpImages {
             self.learn_config(image, &path).await;
             return Ok(path);
         }
-        if let Some(path) = self.pulled_path(image).await {
-            self.learn_config(image, &path).await;
-            return Ok(path);
+        if let Some(found) = self.pulled.lock().await.get(image).cloned() {
+            return Ok(found);
         }
-        // One pull of this image at a time; the one that waited finds the
-        // other's result.
-        let gate = self.pulling.lock().await.entry(image.to_string()).or_default().clone();
-        let _gate = gate.lock().await;
-        if let Some(path) = self.pulled_path(image).await {
-            self.learn_config(image, &path).await;
-            return Ok(path);
+        let mut url = reqwest::Url::parse(&self.registry)
+            .map_err(|e| CriError::ImagePull(format!("registry {}: {e}", self.registry)))?;
+        if let Ok(mut path) = url.path_segments_mut() {
+            path.pop_if_empty().extend(["v1", "goldens", image]);
         }
-
-        // The engine is required, not optional: without it the pull can reach
-        // a clone and an attached device and then have nowhere to put it.
-        // Saying so here beats a mount that silently went nowhere.
-        let ring = self.ring.as_ref().ok_or_else(|| {
-            CriError::ImagePull(format!(
-                "{image} is not a golden on this node and cannot be pulled: the kubelet \
-                 has no ring to stormpump, and only the engine can mount a volume"
-            ))
-        })?;
-
-        // 1. The registry turns a reference into a sealed golden and hands
-        //    back a clone of it, or the one this node bound before (#143).
-        let (clone_id, volume, bound) = self.clone_for(image).await?;
-        let volume = volume.as_str();
-
-        // 2. Attach the clone here, as a block device.
-        let vol_id = self.volume_id(volume).await.ok_or_else(|| {
-            CriError::ImagePull(format!("stormblock has no volume {volume} for {image}"))
-        })?;
-        let attach = serde_json::json!({ "node": self.node_name, "transport": "ublk" });
-        let info: serde_json::Value = self
-            .post_engine(&format!("{}/api/v1/volumes/{vol_id}/attach", self.storage), &attach)
+        let resp = self
+            .http
+            .get(url.clone())
+            .send()
             .await
-            .map_err(|e| CriError::ImagePull(format!("could not attach {volume}: {e}")))?;
-        let device = info["device_hint"].as_str().ok_or_else(|| {
+            .map_err(|e| CriError::ImagePull(format!("registry {url} did not answer for {image}: {e}")))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let record: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        let reference = golden_reference(&record).ok_or_else(|| {
             CriError::ImagePull(format!(
-                "{volume} did not attach locally: {info} — an NVMe-oF attach needs a connect \
-                 this node does not do yet"
+                "registry has no ready golden for {image} ({status}): {}",
+                text.chars().take(300).collect::<String>()
             ))
         })?;
-
-        // 3. The engine mounts it, in the node's mount namespace rather than
-        //    this container's.
-        let mount = pulled_mount(volume);
-        ring.volume_register_device(&mount, device, "ext4").map_err(|e| {
-            CriError::ImagePull(format!("stormpump would not mount {device} at {mount}: {e}"))
-        })?;
-
-        // 4. Say what holds it, now that something does (#143).
-        if !bound {
-            self.bind_or_note(image, &clone_id).await;
-        }
-
-        tracing::info!(image = %image, %device, %mount, clone = %clone_id, found_again = bound, "pulled");
-        self.pulled.lock().await.insert(image.to_string(), mount.clone());
-        self.learn_config(image, &mount).await;
-        Ok(mount)
+        tracing::info!(image = %image, golden = %reference, "image's golden is on this node");
+        self.configs.put(&reference, image, crate::image_config::from_golden(&record));
+        self.pulled.lock().await.insert(image.to_string(), reference.clone());
+        Ok(reference)
     }
 
     /// Whether the image is on this node — as a golden, or already pulled.
@@ -1897,6 +1748,17 @@ impl ImageService for StormpumpImages {
         // what runs is a clone of it. Removing images is the pallet's business.
         Ok(())
     }
+}
+
+/// The reference a container is created from, for a registry golden record
+/// that is ready: `template:<template_name>`, the fstemplate the registry
+/// sealed in this node's engine (#104). `None` for anything not ready.
+fn golden_reference(record: &serde_json::Value) -> Option<String> {
+    if record["status"].as_str() != Some("ready") {
+        return None;
+    }
+    let t = record["template_name"].as_str().filter(|t| !t.is_empty())?;
+    Some(format!("{}{t}", crate::container_roots::TEMPLATE_PREFIX))
 }
 
 #[cfg(test)]
@@ -1954,14 +1816,14 @@ mod tests {
     /// `spec_for` with the pod's own argv (no image config), and an empty one
     /// allowed: these tests are about the spec's other fields.
     fn spec_of(cc: &ContainerConfig, sb: &PodSandboxConfig) -> stormpump::spec::Spec {
-        let run = compose_for(cc, None, None).unwrap_or_else(|_| crate::image_config::Composed {
+        let run = compose_for(cc, None, None, None).unwrap_or_else(|_| crate::image_config::Composed {
             argv: Vec::new(),
             env: Vec::new(),
             cwd: "/".into(),
             uid: 0,
             gid: 0,
         });
-        spec_for(cc, sb, run)
+        spec_for(cc, sb, run, None)
     }
 
     fn rt() -> StormpumpRuntime {
@@ -2121,6 +1983,7 @@ mod tests {
                     workload_handle: None,
             volume_handles: Vec::new(),
                     root_handle: None,
+                    root_volume: None,
                     root_path: None,
                     state: ContainerState::Created,
                     created_at: 0,
@@ -2289,6 +2152,7 @@ mod tests {
                     workload_handle: None,
             volume_handles: Vec::new(),
                     root_handle: None,
+                    root_volume: None,
                     root_path: None,
                     state: ContainerState::Created,
                     created_at: 0,
@@ -2349,7 +2213,7 @@ mod tests {
             command: vec!["/usr/bin/cilium-operator".into()],
             ..Default::default()
         };
-        let env = compose_for(&cfg, None, None).unwrap().env;
+        let env = compose_for(&cfg, None, None, None).unwrap().env;
         assert!(env.iter().any(|e| e == "HOME=/root"), "{env:?}");
         assert!(env.iter().any(|e| e.starts_with("PATH=/usr/local/sbin:")), "{env:?}");
         assert!(env.iter().any(|e| e == "HOSTNAME=cilium-operator"), "{env:?}");
@@ -2367,7 +2231,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let env = compose_for(&cfg, None, None).unwrap().env;
+        let env = compose_for(&cfg, None, None, None).unwrap().env;
         assert!(env.iter().any(|e| e == "HOME=/home/app"), "{env:?}");
         assert!(env.iter().any(|e| e == "PATH=/opt/bin"), "{env:?}");
         // And exactly once each — a duplicate would leave which one wins to
@@ -2380,25 +2244,21 @@ mod tests {
     /// must resolve to that mount — not to `/pallets/<volume>`. The volume is
     /// the one from the live repro on C2NR0Q2.
     #[test]
-    fn a_pulled_image_resolves_to_its_mount() {
+    fn a_pulled_images_reference_is_its_golden_not_a_shared_mount() {
         let pallets = tempfile::tempdir().unwrap();
-        let pulled = pulled_mount("clone-test-stormcos-qa-short-bf7012f9fe4b-18dad12e8a816346");
+        // A pull answers the golden's reference; there is no image-level mount
+        // to read from (or run on): each container reads its own root (#104).
+        assert_eq!(image_root_in("template:sbr-quay.io-a-b-1", pallets.path()), None);
         assert_eq!(
-            image_root_in(&pulled, pallets.path()),
-            Some(std::path::PathBuf::from(&pulled))
+            golden_reference(&serde_json::json!({"status": "ready", "template_name": "sbr-a-1"})).as_deref(),
+            Some("template:sbr-a-1")
         );
-        // The same reference again (a retry, or the second container of the
-        // image) resolves the same way: nothing is remembered between calls.
-        assert_eq!(image_root(&pulled), Some(std::path::PathBuf::from(&pulled)));
-        // Only a single volume directly below the image root.
-        for bad in [
-            IMAGE_ROOT.to_string(),
-            format!("{IMAGE_ROOT}/"),
-            format!("{IMAGE_ROOT}/.."),
-            format!("{IMAGE_ROOT}/a/b"),
-            format!("{IMAGE_ROOT}x/v"),
+        for not_ready in [
+            serde_json::json!({"status": "building", "template_name": "sbr-a-1"}),
+            serde_json::json!({"status": "ready", "template_name": ""}),
+            serde_json::json!({"error": "no golden a"}),
         ] {
-            assert_eq!(image_root_in(&bad, pallets.path()), None, "{bad}");
+            assert_eq!(golden_reference(&not_ready), None, "{not_ready}");
         }
     }
 
@@ -2576,8 +2436,11 @@ mod tests {
                 axum::routing::get(|State(s): State<S>, Path(name): Path<String>| async move {
                     s.lock().unwrap().golden_lookups.push(name.clone());
                     if name == "registry.k8s.io/coredns/coredns:v1.11.1" {
-                        Ok(Json(serde_json::json!({"name": name, "config": {
+                        Ok(Json(serde_json::json!({"name": name, "status": "ready",
+                            "template_name": "sbr-coredns-1", "config": {
                             "Entrypoint": ["/coredns"], "User": "65532:65532", "WorkingDir": "/"}})))
+                    } else if name == "quay.io/a/building:1" {
+                        Ok(Json(serde_json::json!({"name": name, "status": "building", "template_name": "sbr-b-1"})))
                     } else {
                         Err((StatusCode::NOT_FOUND, format!("no golden {name}")))
                     }
@@ -2617,82 +2480,43 @@ mod tests {
             args: vec!["-conf".into(), "/etc/coredns/Corefile".into()],
             ..Default::default()
         };
-        let run = compose_for(&cc, configs.get(root).as_ref(), configs.image_of(root).as_deref()).unwrap();
-        let spec = spec_for(&cc, &PodSandboxConfig::default(), run);
+        let run = compose_for(&cc, configs.get(root).as_ref(), configs.image_of(root).as_deref(), None).unwrap();
+        let spec = spec_for(&cc, &PodSandboxConfig::default(), run, None);
         assert_eq!(spec.argv, vec!["/coredns", "-conf", "/etc/coredns/Corefile"]);
         assert_eq!((spec.uid, spec.gid), (65532, 65532));
 
         // The pallet has no config: the same args-only container is refused,
         // naming the image, instead of exec'ing `-conf`.
         let cc = ContainerConfig { image: "/pallets/busybox".into(), ..cc };
-        let e = compose_for(&cc, configs.get("/pallets/busybox").as_ref(), configs.image_of("/pallets/busybox").as_deref())
+        let e = compose_for(&cc, configs.get("/pallets/busybox").as_ref(), configs.image_of("/pallets/busybox").as_deref(), None)
             .unwrap_err();
         assert!(e.contains("image busybox ") && e.contains("-conf"), "{e}");
     }
 
-    /// A pull's clone is bound to this node and image, and a kubelet that
-    /// restarts finds it again instead of minting a second one (#143).
+    /// #104: a pull makes sure the image's sealed golden is here and answers
+    /// its reference. It clones nothing: the registry mints no clone, and a
+    /// second container of the image asks nothing again.
     #[tokio::test]
-    async fn a_pulled_clone_is_bound_and_found_again_after_a_restart() {
+    async fn a_pull_finds_the_golden_and_clones_nothing() {
         let (url, reg) = fake_registry().await;
-        let img = StormpumpImages::new(&url).with_engine(None, "node1");
-        let (id, volume, bound) = img.clone_for("quay.io/a/b:1").await.unwrap();
-        assert_eq!((id.as_str(), volume.as_str(), bound), ("c1", "img-clone-1", false));
-        img.bind_or_note("quay.io/a/b:1", &id).await;
-        {
-            let r = reg.lock().unwrap();
-            assert_eq!(r.clones[0]["state"], "bound");
-            assert_eq!(r.clones[0]["consumer"], "kubelet/node1/quay.io/a/b:1");
-        }
-        assert!(img.unbound.lock().await.is_empty());
-
-        // A new kubelet (restart): same clone, already bound, nothing minted.
-        let again = StormpumpImages::new(&url).with_engine(None, "node1");
-        assert_eq!(
-            again.clone_for("quay.io/a/b:1").await.unwrap(),
-            ("c1".to_string(), "img-clone-1".to_string(), true)
-        );
-        // Another image, or the same image on another node, is its own clone.
-        assert_eq!(again.clone_for("quay.io/a/b:2").await.unwrap().0, "c2");
-        let other = StormpumpImages::new(&url).with_engine(None, "node2");
-        assert_eq!(other.clone_for("quay.io/a/b:1").await.unwrap().0, "c3");
-        assert_eq!(reg.lock().unwrap().minted, 3);
-    }
-
-    /// A refused bind leaves the image usable and is asked again on the next
-    /// pull of it (#143).
-    #[tokio::test]
-    async fn a_refused_bind_is_retried_on_the_next_pull() {
-        let (url, reg) = fake_registry().await;
-        let img = StormpumpImages::new(&url).with_engine(None, "node1");
-        let (id, volume, _) = img.clone_for("busybox:1").await.unwrap();
-        reg.lock().unwrap().refuse_bind = true;
-        img.bind_or_note("busybox:1", &id).await;
-        assert_eq!(img.unbound.lock().await.get("busybox:1"), Some(&id));
-        assert_eq!(reg.lock().unwrap().clones[0]["state"], "claimed");
-        img.pulled.lock().await.insert("busybox:1".into(), pulled_mount(&volume));
-
-        // Still refused: the path is answered, the bind stays pending.
-        assert_eq!(img.pull_image("busybox:1").await.unwrap(), pulled_mount(&volume));
-        assert!(img.unbound.lock().await.contains_key("busybox:1"));
-
-        reg.lock().unwrap().refuse_bind = false;
-        assert_eq!(img.pull_image("busybox:1").await.unwrap(), pulled_mount(&volume));
-        assert!(img.unbound.lock().await.is_empty());
+        let configs = Arc::new(crate::image_config::ImageConfigs::default());
+        let img = StormpumpImages::new(&url).with_image_configs(configs.clone());
+        let coredns = "registry.k8s.io/coredns/coredns:v1.11.1";
+        let reference = img.pull_image(coredns).await.unwrap();
+        assert_eq!(reference, "template:sbr-coredns-1");
+        assert_eq!(img.pull_image(coredns).await.unwrap(), reference);
         let r = reg.lock().unwrap();
-        assert_eq!(r.clones[0]["state"], "bound");
-        assert_eq!(r.minted, 1);
-    }
-
-    /// A registry that cannot say which clone holds an image is a failed
-    /// pull, never a second mint (#143).
-    #[tokio::test]
-    async fn a_failed_lookup_mints_nothing() {
-        let (url, reg) = fake_registry().await;
-        reg.lock().unwrap().refuse_list = true;
-        let img = StormpumpImages::new(&url).with_engine(None, "node1");
-        let e = img.clone_for("busybox:1").await.unwrap_err();
-        assert!(e.to_string().contains("which clone holds busybox:1"), "{e}");
+        assert_eq!(r.minted, 0, "no clone at pull time: the container's root is its own clone");
+        assert_eq!(r.golden_lookups, vec![coredns.to_string()], "asked once");
+        drop(r);
+        // The config came with the record, keyed by the reference.
+        assert_eq!(configs.get(&reference).unwrap().entrypoint, vec!["/coredns".to_string()]);
+        assert_eq!(configs.image_of(&reference).as_deref(), Some(coredns));
+        // Still building, or unknown: a failed pull, with the registry's answer.
+        let e = img.pull_image("quay.io/a/building:1").await.unwrap_err().to_string();
+        assert!(e.contains("no ready golden") && e.contains("building"), "{e}");
+        let e = img.pull_image("quay.io/a/nonesuch:1").await.unwrap_err().to_string();
+        assert!(e.contains("no ready golden") && e.contains("404"), "{e}");
         assert_eq!(reg.lock().unwrap().minted, 0);
     }
 
@@ -2708,6 +2532,7 @@ mod tests {
             workload_handle: None,
             volume_handles: Vec::new(),
             root_handle: None,
+            root_volume: None,
             log_dir: String::new(),
             mount_sources: Vec::new(),
             root_path: None,

@@ -365,17 +365,24 @@ async fn main() -> anyhow::Result<()> {
                     // The images found and the containers created share each
                     // image's config (#98).
                     let configs = Arc::new(kubelet::image_config::ImageConfigs::default());
-                    let rt = Arc::new(rt.with_cni(cni_invoker).with_image_configs(configs.clone()));
+                    // Each container's own root is cloned from its image's
+                    // golden through the node's engine (#104).
+                    let rt = Arc::new(
+                        rt.with_cni(cni_invoker)
+                            .with_image_configs(configs.clone())
+                            .with_roots(kubelet::container_roots::Roots::new(engine.clone(), node_name.clone())),
+                    );
                     engine_ring = rt.ring_client();
-                    // The ring goes to the image service too: a pull ends in
-                    // a mount, and only the engine can make one the rest of
-                    // the node can see.
+                    // Roots a kubelet that died mid-create or mid-removal left.
+                    {
+                        let rt = rt.clone();
+                        tokio::spawn(async move { rt.sweep_roots().await });
+                    }
+                    // A pull only finds the image's golden (#104).
                     let img = Arc::new(
                         kubelet::stormpump_runtime::StormpumpImages::new(
                             cli.registry.clone(),
                         )
-                        .with_engine(rt.ring_client(), node_name.clone())
-                        .with_storage(engine.clone())
                         .with_image_configs(configs),
                     );
                     let mig = Arc::new(NativeRuntime::new())
