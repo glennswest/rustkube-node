@@ -57,7 +57,7 @@ by #51.
 
 ## Work plan
 
-### In progress: #147 (P2), kube-proxy clears stale UDP conntrack entries
+### Waiting on stormcentral#536 (builds): #147 (P2), kube-proxy clears stale UDP conntrack entries
 
 2026-10-08. kube-proxy rewrites the DNAT when an endpoint goes but leaves conntrack: a UDP flow to a ClusterIP
 (kube-dns) keeps its NAT to the old backend for 30–120 s. (No stormcos edition runs kube-proxy since #145/#155;
@@ -68,6 +68,7 @@ first endpoint.
        `conntrack` binary: exit 1 with "0 flow entries" is fine, a missing binary warns once). Deletes after a
        successful apply. Tests (fake apiserver: endpoint replaced, NodePort, first endpoint, TCP untouched); docs
        (configuration.md, README), CHANGELOG; sc-build (blocked: stormcentral#536).
+       Done: 033a05a (4 tests). NOT yet built: the SC_BUILD_VM job was cancelled while queued. Rerun, close.
 
 ### Waiting on stormcentral#536 (builds): #115 (P2), a stormpump exit wakes its own workload only
 
