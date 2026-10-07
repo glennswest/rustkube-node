@@ -75,7 +75,8 @@ every suite needs to resolve STORM_NODE). Pods are pinned with `spec.nodeName` (
 5. [ ] requires.toml [short]/[long], Job yaml notes, docs, CHANGELOG; sc-build `cd test && cargo test && build`;
        runs on C2NR0Q2 (short, medium) when the queue moves. Gaps that need node access (#35 restart adoption,
        #75 guest persistence, #72 mirror-pod logs, #83 snapshot) filed as a follow-up.
-       #97: short 89e5de132e queued on pvetest1 (2026-10-07 01:20Z) as its live check (past `environment`).
+       #97: short 89e5de132e (pvetest1) dropped by a stormcentral restart (stormcentral#466), bb31b533fe: no VM 3101.
+       #97 proposed after stormcos#337; any suite's run past `environment` closes it (a blade after 06:00 Chicago too).
        Done: d20ef52; sc-build `cd test && cargo test --locked; cargo build --release --locked`: 28 pass, release
        builds. Filed #162 (terminationMessagePath never read), #163 (node-access medium gaps). Live: short
        c822f4832d, medium 5d9d765385 dropped by a stormcentral restart; requeued short e4bbc4ea0f, medium
