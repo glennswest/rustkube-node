@@ -49,6 +49,10 @@ repository = "https://github.com/glennswest/rustkube-node"
 # commit, with `--locked`, so a sibling path cannot work there (#58). Moving to
 # a newer rustkube is an explicit change of `rev` here, and Cargo.lock records it.
 apimachinery = { git = "https://github.com/glennswest/rustkube", rev = "2b3f2c16dde2f9b9519e39aac299d007aaae8cbe" }
+# The cadvisor library's data plane (#21): cgroup v2, procfs, sysfs, filesystem
+# and machine readers, with google/cadvisor's semantics. Pinned like apimachinery.
+cadvisor-host = { git = "https://github.com/glennswest/cadvisor", rev = "afb46a0" }
+cadvisor-model = { git = "https://github.com/glennswest/cadvisor", rev = "afb46a0" }
 
 # Internal libs (pkg/) — consumed by the cmd/ binary crates
 kubelet = { path = "pkg/kubelet" }
