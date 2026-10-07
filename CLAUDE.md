@@ -57,6 +57,23 @@ by #51.
 
 ## Work plan
 
+### In progress: #60 (P2), each PV's storage placement: volume, drives, shelf/bay, RAID partners
+
+2026-10-08. Both sources exist: stormblock `GET /api/v1/volumes?placement=true` (`placement.drives[]` serial/wwn,
+`legs` policy/health/missing, `rebuild`, `arrays[].members[]` state/drive/node = RAID partners; stormblock#136) and
+stormdrive `GET https://<node>:9092/api/v1/placement` (drives with wwn/serial, `shelf.key`, `labels.shelf`, `bay`,
+health, designation; TLS with the node CA, a node-CA client cert reads it, stormdrive#19). The kubelet's apiserver
+client is that CA + `kubelet.crt`. The node-volume mirror covers only `-data/-state/-logs`; built-in claim PVs are
+never refreshed, so placement is its own pass over every PV of this node's stormblock volumes.
+1. [ ] `pv_placement.rs`: drive index (wwn, else serial); annotations `storm.io/volume-id`, `storm.io/golden`,
+       `storm.io/redundancy`, `storm.io/health`, `storm.io/rebuild`, `storm.io/drives` (JSON: wwn, serial, model,
+       node, shelf, bay), `storm.io/raid-partners` (JSON: array, level, index, drive, node, state); labels
+       `storm.io/shelf` (one shelf), `storm.io/redundancy`, `storm.io/health` (label-safe); Events on change
+       (VolumeDegraded / VolumeHealthy, RebuildStarted / RebuildFinished, VolumeMoved, RaidPartnerChanged).
+2. [ ] `placement_loop`: engine volume changes + 60 s; merge-patch only what changed. stormdrive unreachable:
+       stormblock's half alone, said once.
+3. [ ] Tests, docs (node-volumes.md, README), CHANGELOG; sc-build (stormcentral#544); close.
+
 ### Waiting on stormcentral#544 (builds): #84 (P2), each stormpump workload's cgroup → pod/container identity, for cadvisor
 
 2026-10-08. cadvisor (cadvisor#3, #15) waits on this repo to pick the shape. Found: stormpump does not report a
