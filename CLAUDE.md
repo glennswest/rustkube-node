@@ -57,7 +57,7 @@ by #51.
 
 ## Work plan
 
-### In progress: #126 (P2), no fixed init deadline; activeDeadlineSeconds bounds it
+### Waiting on stormcentral#536 (builds): #126 (P2), no fixed init deadline; activeDeadlineSeconds bounds it
 
 2026-10-08. `run_init_containers` stops an init still running after 120 s (`DeadlineExceeded`, exit -1). Upstream:
 an init runs until it exits; only the pod's `activeDeadlineSeconds` (from its startTime) limits it. The admission
@@ -66,6 +66,9 @@ path (production) already waits on the exit event; the non-admission path slept 
        DeadlineExceeded ("Pod was active on the node longer than the specified deadline"); both paths Pending
        (deadline as the due time when set). Tests; README/status.md/CHANGELOG; sc-build. File: activeDeadlineSeconds
        for a running pod is enforced nowhere (follow-up).
+       Done: 9a39a40 (3 tests), #185 filed. NOT yet built: both SC_BUILD_VM runs cancelled while queued (platform-wide,
+       stormcentral#535/#536). Rerun `SC_BUILD_VM=1 sc-build 'cargo build --locked && cargo test --locked'`, then
+       golden (stormcentral#527) and close.
 
 ### Waiting on stormcentral#527/#526: #141 (P2), the probe pass's status PUT skipped when nothing changed
 
