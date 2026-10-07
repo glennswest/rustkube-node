@@ -68,6 +68,9 @@ status.nodeName, so a hand-placed VMI (spec.nodeName only) never reaches `assign
 3. [x] A hand-placed VMI taken here gets `status.nodeName` written (`take_hand_placed`, uid-guarded).
 4. [ ] Tests (2), docs, CHANGELOG (c71b858); sc-build at c71b858 (stormcentral#536 closed, so this one build
        also covers #126, #115, #147, #89, #87, #94, #96, #77); close.
+       Job a8e2791d84 cancelled while queued: the master's deliberate drain (1 slot, queued jobs cancelled until
+       stormcentral's bootstrap job 03e9cbfde9 installs; said on stormcentral#536). `tmp/wait-drain.sh` reruns
+       the build once that job is done or the slots come back.
 
 ### Waiting on stormcentral#536 (builds): #77, the client certificate reloaded when stormcert renews it
 
