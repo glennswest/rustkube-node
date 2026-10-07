@@ -62,11 +62,12 @@ by #51.
 2026-10-07. Found: vm_loop lists VMIs with `fieldSelector=status.nodeName=<node>` and filters `want` on
 status.nodeName, so a hand-placed VMI (spec.nodeName only) never reaches `assigned_to`. rustkube's scheduler
 (`virtualmachine.rs`) places by status.nodeName, else spec.nodeName, and skips a VMI that has either.
-1. [ ] One rule (`assigned_to`, rustkube's): status.nodeName when set, else spec.nodeName.
-2. [ ] vm_loop and `list_for_node`/`watch_for_node`: a second list (and watch) by `spec.nodeName`, merged by
-       uid, narrowed by `assigned_to`.
-3. [ ] A hand-placed VMI taken here gets `status.nodeName` written (status merge patch, uid precondition).
-4. [ ] Tests, docs, CHANGELOG; sc-build; close.
+1. [x] One rule (`assigned_to`, rustkube's): status.nodeName when set, else spec.nodeName.
+2. [x] vm_loop and `list_for_node`/`watch_for_node`: a second list (and watch) by `spec.nodeName`, merged by
+       uid, narrowed by `assigned_to` (`placement_urls`, `placed_on`).
+3. [x] A hand-placed VMI taken here gets `status.nodeName` written (`take_hand_placed`, uid-guarded).
+4. [ ] Tests (2), docs, CHANGELOG (c71b858); sc-build at c71b858 (stormcentral#536 closed, so this one build
+       also covers #126, #115, #147, #89, #87, #94, #96, #77); close.
 
 ### Waiting on stormcentral#536 (builds): #77, the client certificate reloaded when stormcert renews it
 
