@@ -106,11 +106,14 @@ makes the bind. So:
 - **The kubelet** passes Bidirectional through only for a privileged
   container, as upstream does. For any other container it is Private, with
   a warning.
-- **stormpump** has implemented per-mount propagation (stormpump#35), but
-  this checkout's pinned adapter does not copy `cri::Mount.propagation` into
-  `spec::Mount` yet (#81). Updating it is blocked on stormvm#65's compatibility
-  with the engine field. Thus propagation is not complete end to end here.
-  The mountinfo check keeps consumers waiting when the mount is not visible.
+- **stormpump** applies it per mount (stormpump#35): the kubelet copies each
+  `cri::Mount.propagation` into `spec::Mount.propagation` (#81), Private as
+  `rprivate`, HostToContainer as `rslave`, Bidirectional as `rshared`. The
+  engine refuses a propagating mount on anything but a bind in a container,
+  and every pod mount is a bind. A spec with a propagating mount is payload
+  v6, which an engine older than stormpump#35 refuses rather than running
+  private. Not yet seen end to end with a real driver (#52); the mountinfo
+  check still keeps a consumer waiting when a mount has not reached the node.
 - **The kubelet's own view** of `/var/lib/kubelet` (stormcos: `mount
   kubeletdir /var/lib/kubelet`) does not need to see the mounts. The kubelet
   never reads a published volume, it only creates directories and hands paths

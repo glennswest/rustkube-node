@@ -238,8 +238,8 @@ token again and retries once if the token changed. Separate admin-token support 
 through its CSI driver. The kubelet registers node plugins from
 `/var/lib/kubelet/plugins_registry`, writes `CSINode`, and stages and
 publishes volumes. It will not give a pod a volume whose mount has not reached
-the node. See [docs/csi.md](docs/csi.md). The engine propagation feature has landed, but this checkout still drops
-`Mount.propagation` in its stormpump adapter (#81, blocked on stormvm#65).
+the node. See [docs/csi.md](docs/csi.md). Each pod mount's `mountPropagation` reaches stormpump's spec (#81,
+stormpump#35): HostToContainer as `rslave`, Bidirectional (privileged containers only) as `rshared`.
 Real-driver mount/restart/delete acceptance remains #52.
 
 **A pod whose volumes are not ready waits, and says why.** It is `Pending`,

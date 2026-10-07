@@ -2,6 +2,10 @@
 
 ## 2026-10-08
 
+- **feat:** A pod mount's `mountPropagation` reaches the engine (#81): `spec_for` maps `cri::MountPropagation`
+  onto stormpump's `Mount.propagation` (stormpump#35), so Cilium's HostToContainer mounts are `rslave` and a CSI
+  node plugin's Bidirectional `/var/lib/kubelet` is `rshared` (privileged only, as before). Lock: stormpump
+  30a76d3 → 795b92e, stormvm dc1b7ea → 180fa13, stormcast 801f822 → 2bcdafc (stormvm#65 made them compatible).
 - **feat:** `kubectl port-forward` is served (#56): `/portForward/{ns}/{pod}` upgrades to SPDY/3.1
   (`portforward.k8s.io`) or to a WebSocket tunnelling SPDY (`SPDY/3.1+portforward.k8s.io`, a newer kubectl's
   first try), pairs each request's error and data streams, connects to `localhost:<port>` inside the pod's network

@@ -61,7 +61,8 @@ use stormpump_abi::Domain;
 
 use crate::cri::{
     ContainerConfig, ContainerState, ContainerStatusInfo, CriError, ImageInfo, ImageService,
-    PodSandboxConfig, PodSandboxState, PodSandboxStatusInfo, PodSandboxSummary, RuntimeService,
+    MountPropagation, PodSandboxConfig, PodSandboxState, PodSandboxStatusInfo, PodSandboxSummary,
+    RuntimeService,
 };
 
 /// Where stormpump listens for clients on a stormcos node.
@@ -590,14 +591,21 @@ fn spec_for(
             .mounts
             .iter()
             .take(MAX_MOUNTS)
-            // `m.propagation` has nowhere to go yet: the engine's mounts are
-            // all private, so a Bidirectional one (a CSI node plugin's
-            // /var/lib/kubelet) does not push its mounts back to the node.
-            // The kubelet catches the result before a pod is given an empty
-            // volume (`csi::is_mount_point`). stormpump#35 adds the field.
             .map(|m| stormpump::spec::Mount {
                 dst: m.container_path.clone(),
                 readonly: m.readonly,
+                // The pod's mountPropagation (#81, stormpump#35): rslave for
+                // HostToContainer (Cilium's agent watching /sys/fs/bpf and
+                // pod netns), rshared for Bidirectional (a CSI node plugin's
+                // /var/lib/kubelet, whose mounts must reach the node). The pod
+                // manager gives Bidirectional only to privileged containers,
+                // as upstream does; the engine refuses it on a filesystem
+                // mount, and these are all binds.
+                propagation: match m.propagation {
+                    MountPropagation::Private => stormpump::spec::Propagation::Private,
+                    MountPropagation::HostToContainer => stormpump::spec::Propagation::HostToContainer,
+                    MountPropagation::Bidirectional => stormpump::spec::Propagation::Bidirectional,
+                },
                 // Always a bind. A PersistentVolumeClaim resolves to a block
                 // device, and the *engine* mounts it at registration (see the
                 // spawn below) — the same path an image pull takes. Registering
@@ -2285,6 +2293,7 @@ mod tests {
         };
         let spec = spec_of(&cc, &PodSandboxConfig::default());
         assert_eq!(spec.mounts.len(), 2);
+        assert!(spec.mounts.iter().all(|m| m.propagation == stormpump::spec::Propagation::Private), "the default");
         assert_eq!(spec.mounts[0].dst, "/data");
         assert!(!spec.mounts[0].readonly);
         assert_eq!(spec.mounts[1].dst, "/cfg");
@@ -2410,6 +2419,42 @@ mod tests {
         assert_eq!(resolve_in_image(&root, "adir", &std_path()), None);
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// #81: each mount's propagation reaches the engine's spec as CRI's mode.
+    #[test]
+    fn mount_propagation_reaches_the_spec() {
+        use stormpump::spec::Propagation;
+        let m = |dst: &str, p: MountPropagation| Mount {
+            container_path: dst.into(),
+            host_path: format!("/host{dst}"),
+            propagation: p,
+            ..Default::default()
+        };
+        let cc = ContainerConfig {
+            command: vec!["/bin/agent".into()],
+            privileged: true,
+            mounts: vec![
+                m("/etc/cfg", MountPropagation::Private),
+                m("/sys/fs/bpf", MountPropagation::HostToContainer),
+                m("/var/lib/kubelet", MountPropagation::Bidirectional),
+            ],
+            ..Default::default()
+        };
+        let spec = spec_of(&cc, &PodSandboxConfig::default());
+        let got: Vec<_> = spec.mounts.iter().map(|m| (m.dst.as_str(), m.propagation)).collect();
+        assert_eq!(
+            got,
+            [
+                ("/etc/cfg", Propagation::Private),
+                ("/sys/fs/bpf", Propagation::HostToContainer),
+                ("/var/lib/kubelet", Propagation::Bidirectional)
+            ]
+        );
+        // Every mount stays a bind: the engine refuses propagation on a filesystem mount.
+        assert!(spec.mounts.iter().all(|m| m.fstype.is_none()));
+        // And it survives the encoding the engine is handed.
+        assert!(!spec.encode().is_empty());
     }
 
     #[test]

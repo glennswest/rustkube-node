@@ -61,7 +61,7 @@ by #51.
 
 2026-10-08. Unblocked: stormvm#65 closed (stormvm main builds against stormpump main f466116, stormcast bba68c9).
 The lock pins stormpump 30a76d3, stormvm dc1b7ea, stormcast 801f822; all three move together.
-1. [ ] Lock: `cargo update -p stormpump -p stormvm-node -p stormcast` on dev (CARGO_NET_GIT_FETCH_WITH_CLI), diff
+1. [x] Lock: `cargo update -p stormpump -p stormvm-node -p stormcast` on dev (CARGO_NET_GIT_FETCH_WITH_CLI), diff
        applied here; fix what the newer stormvm/stormpump APIs break.
 2. [ ] `spec_for`: `propagation` from `cri::MountPropagation`; test; docs (csi.md, README), CHANGELOG; sc-build;
        golden; close. Then #52's step 6 is done (its end-to-end stays).

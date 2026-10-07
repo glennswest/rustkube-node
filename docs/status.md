@@ -62,7 +62,7 @@ Each gap has an owning issue. These are limitations, not supported features.
 | Full upstream/drop-in Kubernetes node compatibility; API types still use v1_32 | [#23](https://github.com/glennswest/rustkube-node/issues/23) |
 | Interactive exec and attach, and the streaming path `kubectl cp` uses (port-forward is served since #56; exec/attach need the engine) | [#56](https://github.com/glennswest/rustkube-node/issues/56), [stormpump#103](https://github.com/glennswest/stormpump/issues/103) |
 | Full upstream cAdvisor dashboards, actual node CPU/memory, PSI/imagefs-aware eviction and CRI pod-network stats | [#21](https://github.com/glennswest/rustkube-node/issues/21) |
-| External CSI propagation and real-driver acceptance | [#81](https://github.com/glennswest/rustkube-node/issues/81), [#52](https://github.com/glennswest/rustkube-node/issues/52), [stormvm#65](https://github.com/glennswest/stormvm/issues/65) |
+| External CSI real-driver acceptance (mount propagation reaches the engine since #81) | [#52](https://github.com/glennswest/rustkube-node/issues/52) |
 | NodeExpandVolume and completion of filesystem-resize status | [#42](https://github.com/glennswest/rustkube-node/issues/42) |
 | Generic ephemeral claim creation | [rustkube#94](https://github.com/glennswest/rustkube/issues/94) |
 | ext4 blanks for the 64Ti, 256Ti and 1Pi classes (raw block only until stormblock carries mkfs.ext4.rs#9/#10); a Block claim's PV written by the control plane says Filesystem | [stormblock#289](https://github.com/glennswest/stormblock/issues/289), [rustkube#201](https://github.com/glennswest/rustkube/issues/201) |
