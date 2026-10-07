@@ -84,6 +84,9 @@ every suite needs to resolve STORM_NODE). Pods are pinned with `spec.nodeName` (
        Both errored: the Dell's apiserver is down (stormcos#337: engine :9090 and :6443 gone since 20:55Z, reinstall
        queued; commented that fff1f4d9d9 already lost the apiserver at 17:35Z). Now queued: short 6ab7e3709e
        (pvetest2), medium 1538b1fa13 (pvetest2), short 48f97966b0 (server1).
+       All three errored on the machines (pvetest2: no VM 3102; server1: a stormcentral restart). No test machine
+       works (pvetest1/2 VMs missing, the Dell down). Requeued short on server1 once; #61 proposed after
+       stormcos#337. Resume: `stormcentral test run rustkube-node short|medium --tag C2NR0Q2` once it is reinstalled.
 
 ### Waiting on stormpump#47: #118 (P2), pod capabilities onto the ring
 
