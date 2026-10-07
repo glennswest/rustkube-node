@@ -57,6 +57,11 @@ not the release path.
 
 ## Work plan
 
+### Done: #155, docs: no stormcos edition runs kube-proxy
+
+2026-10-07. de51950: README, BUILD.md, status.md, presentation, CLAUDE.md (flowsdn owns Services in its edition,
+#145; checked against stormcos main). sc-build: deck renders (12 slides), `cargo build --locked` ok. Closed.
+
 ### In progress: #61, short, medium and long test suites (stormcentral docs/test-standard.md)
 
 2026-10-06. `test/` has medium's storage cases (#64, #59, #62, #67); short and long are one skip each. The
