@@ -57,12 +57,13 @@ by #51.
 
 ## Work plan
 
-### In progress: #174, a stop's grace goes where STOP reads it
+### Waiting on stormcentral#527 (golden): #174, a stop's grace goes where STOP reads it
 
 2026-10-08. `RingClient::stop` put the grace in `inline_a` (seconds); STOP reads `inline_b` in ms (0 = 30 s) and
 `flags::FORCE` for "now" (stormpump docs/ABI.md op 20, same at the lock's 795b92e). Every stop waited 30 s.
 1. [x] `stop_sqe`: `inline_b = grace_secs * 1000`, grace 0 → FORCE; unit test; CHANGELOG; sc-build (build VM);
        golden when component stage works (stormcentral#527); close.
+       Done: a6b3155; SC_BUILD_VM sc-build: 366 kubelet unit pass. One golden after #527 carries #165, #95, #174.
 
 ### Waiting on stormcentral#521 (golden): #165 (P1), --max-pods (owner: option A on rustkube#205; stormcos sets 250)
 
