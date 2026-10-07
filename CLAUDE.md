@@ -64,7 +64,7 @@ starts, unbounded CNI, inline events, per-pass PUTs) by #99/#100/#101/#134/#138.
 for a claim". A claim's volume is one `volume/<name>`; its steps are lookup (PVC, PV, existing volume), make (clone
 of the class blank / of a source / raw volume; none when reused), attach (ublk), bind (PV/PVC writes). The
 filesystem mount is PID 1's, at container create (in `containers`).
-1. [ ] `ClaimSteps` from `provision_claim_volume`; `claim/<volume>/{lookup,blank|clone|raw,attach,bind}` in the
+1. [x] `ClaimSteps` from `provision_claim_volume`; `claim/<volume>/{lookup,blank|clone|raw,attach,bind}` in the
        annotation, Event and log line. Tests, docs (README, status.md), CHANGELOG; sc-build; golden.
 2. [ ] Targets measured on a node: C2NR0Q2 down (stormcos#337), as #102. Then propose #95 after it.
 

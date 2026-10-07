@@ -20,6 +20,10 @@
 //! | `sandbox/cni`     | the CNI ADD, the plugin's exec included |
 //! | `sandbox/status`  | the sandbox's status read (its address) |
 //! | `sandbox/other`   | the rest of `sandbox`: the runtime's checks, retried DELs of earlier failed networks, bookkeeping |
+//! | `claim/<volume>/lookup` | a claim's PVC, PV and existing volume read, its room checked (#95) |
+//! | `claim/<volume>/<made>` | the volume made: `blank` (clone of the class's sealed blank), `clone` (of a source), `raw` (a Block claim); absent when it already existed |
+//! | `claim/<volume>/attach` | the ublk attach |
+//! | `claim/<volume>/bind`   | the PV written and the claim bound |
 //! | `init`       | init containers, run to completion |
 //! | `containers` | every app container created and started (each also as `container/<name>`) |
 //! | `report`     | the `Running` status sent → acknowledged |
@@ -53,6 +57,9 @@ pub const PHASES: &[&str] = &[
     "scheduled", "wait", "image", "volumes", "sandbox", "init", "containers", "report", "total",
 ];
 
+/// A claim's steps (#95), each with a histogram (one observation per claim).
+pub const CLAIM_STEPS: &[&str] = &["claim/lookup", "claim/make", "claim/attach", "claim/bind"];
+
 /// `sandbox`'s steps (#139), with a histogram each when they were measured.
 pub const SANDBOX_STEPS: &[&str] = &["sandbox/acquire", "sandbox/cni", "sandbox/status", "sandbox/other"];
 
@@ -71,6 +78,19 @@ pub struct StartTiming {
     started: bool,
 }
 
+/// What making a claim's volume took (#95). The mount is not here: PID 1
+/// mounts the filesystem when the container is created (`containers`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClaimSteps {
+    /// The PVC, its PV and an existing volume read; the room checked.
+    pub lookup: Duration,
+    /// How the volume was made (`blank`, `clone`, `raw`) and how long it took;
+    /// `None` when it already existed.
+    pub made: Option<(&'static str, Duration)>,
+    pub attach: Duration,
+    pub bind: Duration,
+}
+
 /// `sandbox` taken apart (#139).
 #[derive(Debug, Clone, Copy)]
 struct SandboxSplit {
@@ -85,6 +105,8 @@ pub struct Attempt {
     began: Instant,
     volumes: Duration,
     per_volume: Vec<(String, Duration)>,
+    /// Each claim's steps, by its volume's name in the pod spec (#95).
+    claims: Vec<(String, ClaimSteps)>,
     sandbox: Duration,
     /// What making the sandbox was made of (#139), when this attempt made it.
     sandbox_steps: Option<SandboxSplit>,
@@ -105,6 +127,7 @@ impl Attempt {
             began: Instant::now(),
             volumes: Duration::ZERO,
             per_volume: Vec::new(),
+            claims: Vec::new(),
             sandbox: Duration::ZERO,
             sandbox_steps: None,
             init: Duration::ZERO,
@@ -119,6 +142,10 @@ impl Attempt {
     }
     pub fn volume(&mut self, name: &str, took: Duration) {
         self.per_volume.push((name.to_string(), took));
+    }
+    /// A claim's steps, under its volume's name in the pod spec (#95).
+    pub fn claim(&mut self, volume: &str, steps: ClaimSteps) {
+        self.claims.push((volume.to_string(), steps));
     }
     pub fn volumes(&mut self, took: Duration) {
         self.volumes = took;
@@ -240,6 +267,18 @@ impl StartTiming {
             for (name, d) in &a.per_volume {
                 text.push(format!("volume/{name}={}", ms(*d)));
             }
+            for (name, c) in &a.claims {
+                text.push(format!("claim/{name}/lookup={}", ms(c.lookup)));
+                phases.push(("claim/lookup", c.lookup));
+                if let Some((how, d)) = c.made {
+                    text.push(format!("claim/{name}/{how}={}", ms(d)));
+                    phases.push(("claim/make", d));
+                }
+                text.push(format!("claim/{name}/attach={}", ms(c.attach)));
+                phases.push(("claim/attach", c.attach));
+                text.push(format!("claim/{name}/bind={}", ms(c.bind)));
+                phases.push(("claim/bind", c.bind));
+            }
             for (name, d) in &a.per_container {
                 text.push(format!("container/{name}={}", ms(*d)));
             }
@@ -331,6 +370,34 @@ mod tests {
         );
         let names: Vec<_> = f.phases.iter().map(|(n, _)| *n).collect();
         assert_eq!(names, PHASES);
+    }
+
+    #[test]
+    fn a_claims_steps_follow_its_volume() {
+        let seen = Instant::now();
+        let mut t = StartTiming::seen_at(&json!({}), seen, at("2026-10-02T10:00:00Z"));
+        let mut a = Attempt::begin();
+        a.volume("data", Duration::from_millis(80));
+        a.claim("data", ClaimSteps {
+            lookup: Duration::from_micros(2_500),
+            made: Some(("blank", Duration::from_millis(12))),
+            attach: Duration::from_millis(60),
+            bind: Duration::from_micros(5_400),
+        });
+        // One that already existed: nothing made.
+        a.claim("old", ClaimSteps { attach: Duration::from_millis(30), ..Default::default() });
+        t.started(a);
+        let f = t.finish(Duration::ZERO, seen);
+        assert!(
+            f.text.ends_with(
+                "volume/data=80ms claim/data/lookup=2.5ms claim/data/blank=12ms claim/data/attach=60ms \
+                 claim/data/bind=5.4ms claim/old/lookup=0.0ms claim/old/attach=30ms claim/old/bind=0.0ms"
+            ),
+            "{}",
+            f.text
+        );
+        let claims: Vec<_> = f.phases.iter().map(|(n, _)| *n).filter(|n| n.starts_with("claim/")).collect();
+        assert_eq!(claims, [CLAIM_STEPS, &["claim/lookup", "claim/attach", "claim/bind"]].concat());
     }
 
     #[test]

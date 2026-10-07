@@ -996,15 +996,16 @@ impl PodManager {
         &self,
         pod: &Value,
     ) -> Result<HashMap<String, ResolvedVolume>, CriError> {
-        self.resolve_volumes_timed(pod, &mut Vec::new()).await
+        self.resolve_volumes_timed(pod, &mut Vec::new(), &mut Vec::new()).await
     }
 
     /// [`resolve_volumes`](Self::resolve_volumes), with how long each volume
-    /// took (#132).
+    /// took (#132) and each claim's steps (#95).
     async fn resolve_volumes_timed(
         &self,
         pod: &Value,
         times: &mut Vec<(String, std::time::Duration)>,
+        claims: &mut Vec<(String, crate::start_timing::ClaimSteps)>,
     ) -> Result<HashMap<String, ResolvedVolume>, CriError> {
         let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
         let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default");
@@ -1126,8 +1127,11 @@ impl PodManager {
                 // in the wrong place is bad, but so is a pod that will not start
                 // on a node whose storage is briefly unreachable. The fallback
                 // is loud, and `kubectl describe` shows the reason.
-                match self.provision_claim(namespace, claim, uid).await {
+                let mut steps = crate::start_timing::ClaimSteps::default();
+                let provisioned = self.provision_claim_timed(namespace, claim, uid, &mut steps).await;
+                match provisioned {
                     Ok((device, fstype)) => {
+                        claims.push((name.clone(), steps));
                         map.insert(
                             name,
                             ResolvedVolume {
@@ -1521,7 +1525,18 @@ impl PodManager {
         claim: &str,
         pod_uid: &str,
     ) -> Result<(String, Option<&'static str>), ClaimError> {
-        self.provision_claim_volume(namespace, claim, pod_uid)
+        self.provision_claim_timed(namespace, claim, pod_uid, &mut Default::default()).await
+    }
+
+    /// [`Self::provision_claim`], with its steps (#95).
+    async fn provision_claim_timed(
+        &self,
+        namespace: &str,
+        claim: &str,
+        pod_uid: &str,
+        steps: &mut crate::start_timing::ClaimSteps,
+    ) -> Result<(String, Option<&'static str>), ClaimError> {
+        self.provision_claim_volume(namespace, claim, pod_uid, steps)
             .await
             .map(|(_, dev, fs)| (dev, fs))
     }
@@ -1551,7 +1566,7 @@ impl PodManager {
             Ok(None) => {}
             Err(e) => return Err(format!("claim {namespace}/{claim}: {e}")),
         }
-        self.provision_claim_volume(namespace, claim, "")
+        self.provision_claim_volume(namespace, claim, "", &mut Default::default())
             .await
             .map(|(id, dev, _)| (id, dev))
             .map_err(|e| match e {
@@ -1568,8 +1583,11 @@ impl PodManager {
         namespace: &str,
         claim: &str,
         pod_uid: &str,
+        steps: &mut crate::start_timing::ClaimSteps,
     ) -> Result<(String, String, Option<&'static str>), ClaimError> {
         let name = crate::storage::volume_name(namespace, claim);
+        // Each step timed for the pod's start timing (#95).
+        let mut step = Instant::now();
 
         // What the claim asked for, rounded up to a class. The class is also
         // the ceiling: a claim gets the blank that holds it and no more.
@@ -1677,6 +1695,14 @@ impl PodManager {
         } else {
             None
         };
+        steps.lookup = step.elapsed();
+        step = Instant::now();
+        let how = match &existing {
+            None if crate::storage::claim_source(&pvc).is_some() => Some("clone"),
+            None if block => Some("raw"),
+            None => Some("blank"),
+            Some(_) => None,
+        };
         let vol_id = match existing {
             Some(id) => id,
             // **A claim with a source is a clone of it.** Cloning data volumes
@@ -1714,6 +1740,8 @@ impl PodManager {
         // asking for it where it cannot be offered is a 409 rather than a
         // silent downgrade to nvme-tcp, and a downgrade is not something to
         // discover from a mount that behaves oddly later.
+        steps.made = how.map(|h| (h, step.elapsed()));
+        step = Instant::now();
         let attach = serde_json::json!({ "node": self.node_name, "transport": "ublk" });
         let info: Value = self
             .storage_post(&format!("/api/v1/volumes/{vol_id}/attach"), &attach)
@@ -1723,6 +1751,8 @@ impl PodManager {
                     "stormblock would not attach {name} as a local device: {r}"
                 ))
             })?;
+        steps.attach = step.elapsed();
+        step = Instant::now();
         if let Some(dev) = info["device_hint"].as_str() {
             info!("PVC {namespace}/{claim} -> {name} ({class}) at {dev}");
             // Say so on the claim, now that there is something to point at.
@@ -1731,6 +1761,7 @@ impl PodManager {
             // that was not made, and after the attach so a bound claim means
             // storage a pod can actually use.
             self.bind_claim(namespace, claim, &name, class_bytes).await;
+            steps.bind = step.elapsed();
             return Ok((vol_id, dev.to_string(), fstype));
         }
         Err(ClaimError::Failed(format!(
@@ -2936,7 +2967,8 @@ impl PodManager {
         let sandbox_config = build_sandbox_config(pod);
         let step = Instant::now();
         let mut volume_times = Vec::new();
-        let volumes = self.resolve_volumes_timed(pod, &mut volume_times).await?;
+        let mut claim_steps = Vec::new();
+        let volumes = self.resolve_volumes_timed(pod, &mut volume_times, &mut claim_steps).await?;
         // Everything the kubelet writes for the pod is written before the
         // sandbox exists, so a node that cannot hold it (a full disk, #129)
         // leaves the pod waiting with the errno and nothing to undo.
@@ -2951,6 +2983,9 @@ impl PodManager {
         prepare_log_dirs(pod, &sandbox_config.log_directory)?;
         for (volume, took) in &volume_times {
             attempt.volume(volume, *took);
+        }
+        for (volume, steps) in claim_steps {
+            attempt.claim(&volume, steps);
         }
         attempt.volumes(step.elapsed());
 
@@ -6311,6 +6346,21 @@ pub(crate) mod tests {
         let pv = calls.iter().find(|(m, p, _)| m == "POST" && p == "/api/v1/persistentvolumes").unwrap();
         assert_eq!(pv.2["spec"]["volumeMode"], "Block");
         assert_eq!(pv.2["spec"]["capacity"]["storage"], "1Pi");
+    }
+
+    /// #95: a claim's steps, as the start timing reports them. Each one here is
+    /// at least one request to the fake apiserver or stormblock.
+    #[tokio::test]
+    async fn a_claims_steps_are_timed_lookup_make_attach_bind() {
+        let w = claim_world(raw_claim("16Mi", "Block")).await;
+        let mgr = claim_manager(&w);
+        let mut steps = crate::start_timing::ClaimSteps::default();
+        mgr.provision_claim_timed("default", "raw", "uid-1", &mut steps).await.unwrap();
+        let (how, made) = steps.made.expect("a new volume was made");
+        assert_eq!(how, "raw");
+        for (step, d) in [("lookup", steps.lookup), ("raw", made), ("attach", steps.attach), ("bind", steps.bind)] {
+            assert!(d > std::time::Duration::ZERO, "{step} was not timed: {steps:?}");
+        }
     }
 
     #[tokio::test]

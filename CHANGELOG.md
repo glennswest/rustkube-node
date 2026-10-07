@@ -2,6 +2,11 @@
 
 ## 2026-10-08
 
+- **feat:** Start timing takes a claim apart (#95): `claim/<volume>/lookup` (PVC, PV, existing volume, room),
+  `claim/<volume>/blank|clone|raw` (how its volume was made, absent when it existed), `claim/<volume>/attach`
+  (ublk) and `claim/<volume>/bind` (PV written, claim bound), in the annotation, Event and log line, with
+  histograms `claim/lookup`, `claim/make`, `claim/attach`, `claim/bind`. The 4–67 s claim bind+mount samples had
+  only the one `volume/<name>` number.
 - **docs:** `--no-cni`'s help no longer says pods use host networking (#3): a pod that is not hostNetwork still
   gets an isolated namespace, with loopback only and no address. The startup warning says the same.
 - **test:** A host-network pod's sandbox is made with a CNI configured and no config present (no namespace, no
