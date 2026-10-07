@@ -57,7 +57,7 @@ by #51.
 
 ## Work plan
 
-### In progress: #77, the client certificate reloaded when stormcert renews it
+### Waiting on stormcentral#536 (builds): #77, the client certificate reloaded when stormcert renews it
 
 2026-10-08. The apiserver client (one `reqwest::Client`, cloned into every module) takes the client pair once.
 Rather than rebuild it everywhere: a rustls `ClientConfig` (CA roots + a `ResolvesClientCert` whose pair can be
@@ -66,6 +66,7 @@ is watched (+ hourly); a new pair that does not parse or whose key does not matc
 Only with a CA and verification on (stormcos); insecure / no-CA keep the static identity, said in the log.
 1. [x] client.rs `ReloadingClientCert` + `build_authed_client_reloadable`; KubeletConfig cert/key paths; reload
        task; tests (rcgen pairs: swap, unchanged, mismatched key refused); docs, CHANGELOG; sc-build.
+       Done: d1ad901 (2 tests). NOT yet built: the SC_BUILD_VM job was cancelled while queued. Rerun, close.
 
 ### Waiting on stormcentral#536 (builds): #96, a node service's mirror pod is Ready only while it answers
 
