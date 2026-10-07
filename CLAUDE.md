@@ -57,6 +57,22 @@ by #51.
 
 ## Work plan
 
+### Paused (P0 #104 first): #21 (P2), cadvisor's library for node / machine / filesystem stats and eviction signals
+
+2026-10-08. Work is on branch `wip/21-cadvisor-node` (5f81dec), reverted on main (290938e) so main keeps building:
+the dependency needs Cargo.lock entries made on the build box. Scoping answered on the issue (owner: glennswest/cadvisor;
+upstream split cadvisor into a kubelet library: node/fs/machine there, containers on CRI). On the branch:
+- `cadvisor-host` + `cadvisor-model` (git, rev afb46a0) in Cargo.toml; **lock not made yet**: `cargo update -p` cannot
+  name a new package, so run `sc-build 'cargo metadata --format-version 1 >/dev/null; git diff Cargo.lock'` on the
+  branch and apply the printed diff (that job was started at 5f81dec; read it or rerun).
+- `node_stats.rs`: root cgroup CPU (`CgroupReader::read_stats("/")`), root memory as cAdvisor computes it (usage =
+  MemTotal − MemFree, working set = usage − inactive_file, available = total − working set), machine info once;
+  `render` (machine_*, root memory usage/rss); 2 tests.
+- `metrics::render_cadvisor_with_node` (root `id="/"` series in the cpu/working-set families); `/stats/summary`
+  node cpu/memory from the root (container sums only as fallback); MemoryPressure on capacity − working set.
+Resume: lock, merge the branch to main, sc-build, live check (/stats/summary, /metrics/cadvisor on a node), close.
+Not here: PSI, imagefs (images are stormblock volumes on stormcos).
+
 ### Paused (P0 #104 first): #60 (P2), each PV's storage placement: volume, drives, shelf/bay, RAID partners
 
 2026-10-08. Both sources exist: stormblock `GET /api/v1/volumes?placement=true` (`placement.drives[]` serial/wwn,
