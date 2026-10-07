@@ -329,6 +329,10 @@ FailedMount Event and container message. A refusal that means the template
 itself is broken (its sealed volume missing or not sealed, or no sealed
 snapshot recorded) deletes the template and mints it again, so the next
 claim clones a sound one rather than meeting the same refusal forever (#140).
+**The claim itself says so** (#70), with external-provisioner's reasons: a Normal `Provisioning` while its
+class's blank is minted or formats, a Warning `ProvisioningFailed` with stormblock's words when a mint or a
+clone is refused, and a Normal `ProvisioningSucceeded` once it is cloned (`kubectl describe pvc`; repeats
+aggregate).
 
 The ladder is **1Mi, 16Mi, 64Mi, 256Mi, 1Gi, 4Gi, 16Gi, 64Gi, 256Gi, 1Ti,
 4Ti, 16Ti, 64Ti, 256Ti, 1Pi** (#67); requests round up, and requests above 1Pi

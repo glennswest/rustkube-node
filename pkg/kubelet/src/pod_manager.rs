@@ -882,6 +882,15 @@ impl PodManager {
         }
     }
 
+    /// An Event on a PersistentVolumeClaim (#70): its provisioning, as
+    /// external-provisioner reports it (`Provisioning`, `ProvisioningFailed`,
+    /// `ProvisioningSucceeded`). Repeats aggregate in the recorder.
+    async fn claim_event(&self, claim: &Value, etype: &str, reason: &str, message: &str) {
+        if let Some(r) = &self.events {
+            r.object_event("v1", "PersistentVolumeClaim", claim, etype, reason, message).await;
+        }
+    }
+
     /// An ordinary lifecycle event, queued rather than awaited (#134): see
     /// [`crate::events::EventRecorder::pod_event_later`].
     async fn event_later(&self, pod: &Value, reason: &str, message: &str) {
@@ -1878,7 +1887,7 @@ impl PodManager {
                 // it descends from a sealed volume, records lineage, and
                 // stamps the clone with its own filesystem UUID — two live
                 // filesystems must never claim one identity (stormblock#76).
-                self.clone_blank(class, &name).await?
+                self.clone_blank(class, &name, &pvc).await?
             }
         };
 
@@ -1963,7 +1972,7 @@ impl PodManager {
     /// again: the refusal is the same on every retry, so a claim that only
     /// retried the clone waited forever (#140). Any other refusal is the
     /// claim's wait, with stormblock's answer in it.
-    async fn clone_blank(&self, class: &str, name: &str) -> Result<String, ClaimError> {
+    async fn clone_blank(&self, class: &str, name: &str, claim: &Value) -> Result<String, ClaimError> {
         let blank = crate::storage::template_name(class);
         let template = match self.storage_template_state(&blank).await {
             // A blank not sealed yet cannot be cloned. Formatting a
@@ -1971,6 +1980,9 @@ impl PodManager {
             // waits with the state named rather than failing a clone.
             Some((id, state)) if state == "ready" => id,
             Some((_, state)) => {
+                self.claim_event(claim, "Normal", "Provisioning", &format!(
+                    "waiting for the {class} blank {blank} to be formatted and sealed ({state})"
+                )).await;
                 return Err(ClaimError::Failed(format!(
                     "waiting for volume {name}: template {blank} {state}"
                 )))
@@ -1993,9 +2005,22 @@ impl PodManager {
             // format is done, and a 1 TiB class held the whole sync
             // loop for it. Every pod on the node stopped being
             // reconciled, and the waiting pod was nowhere.
-            None => self.mint_template(&blank, class).await.map_err(|e| {
-                ClaimError::Failed(format!("waiting for volume {name}: {e}"))
-            })?,
+            None => match self.mint_template(&blank, class).await {
+                Ok(id) => id,
+                Err(e) => {
+                    // On the claim too (#70): `describe pvc` said nothing,
+                    // and "a stormblock fault" in the console said less.
+                    if mint_refused(&e) {
+                        self.claim_event(claim, "Warning", "ProvisioningFailed", &e).await;
+                    } else {
+                        self.claim_event(claim, "Normal", "Provisioning", &format!(
+                            "minting the {class} blank {blank}: one format per class on this node, \
+                             then every claim of the class is a clone of it"
+                        )).await;
+                    }
+                    return Err(ClaimError::Failed(format!("waiting for volume {name}: {e}")));
+                }
+            },
         };
 
         // Through the template, not the volume: `fstemplates/{id}/clone`
@@ -2017,16 +2042,21 @@ impl PodManager {
                     },
                     Err(e) => format!("could not delete it: {e}"),
                 };
-                return Err(ClaimError::Failed(format!(
-                    "waiting for volume {name}: template {blank} is broken ({r}); {again}"
-                )));
+                let why = format!("template {blank} is broken ({r}); {again}");
+                self.claim_event(claim, "Warning", "ProvisioningFailed", &why).await;
+                return Err(ClaimError::Failed(format!("waiting for volume {name}: {why}")));
             }
             Err(r) => {
-                return Err(ClaimError::Failed(format!(
-                    "stormblock would not clone {blank} to {name}: {r}"
-                )))
+                let why = format!("stormblock would not clone {blank} to {name}: {r}");
+                self.claim_event(claim, "Warning", "ProvisioningFailed", &why).await;
+                return Err(ClaimError::Failed(why))
             }
         };
+        if created["volume_id"].is_string() {
+            self.claim_event(claim, "Normal", "ProvisioningSucceeded", &format!(
+                "volume {name} cloned from the {class} blank {blank}"
+            )).await;
+        }
         created["volume_id"]
             .as_str()
             .map(String::from)
@@ -4986,6 +5016,12 @@ impl PodManager {
 /// the system half is replaced by every install. stormblock formats and seals
 /// it. A racing mint of the same class gets 409, which is not a failure: the
 /// caller looks the template up either way.
+/// Whether a [`PodManager::mint_template`] error is the engine refusing the
+/// mint ([`mint_blank`]'s words), not a mint still under way (#70).
+fn mint_refused(e: &str) -> bool {
+    e.starts_with("stormblock would not mint")
+}
+
 async fn mint_blank(
     engine: &crate::engine::EngineClient,
     url: &str,
@@ -6703,6 +6739,78 @@ pub(crate) mod tests {
         (format!("http://{addr}"), posts, started)
     }
 
+    /// #70: the claim says what its blank is doing. A mint under way is a
+    /// Normal `Provisioning`, a refused mint a Warning `ProvisioningFailed`
+    /// with the engine's words, and the clone `ProvisioningSucceeded`, all on
+    /// the PersistentVolumeClaim (the pod's FailedMount was all there was).
+    #[tokio::test]
+    async fn the_claim_says_what_its_blank_is_doing() {
+        use axum::routing::{get as http_get, post as http_post};
+        let events = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let ready = Arc::new(AtomicBool::new(false));
+        let (ev, r1, r2) = (events.clone(), ready.clone(), ready.clone());
+        let app = axum::Router::new()
+            .route("/api/v1/namespaces/{ns}/events", http_post(move |axum::Json(b): axum::Json<Value>| {
+                ev.lock().unwrap().push(b);
+                async { (axum::http::StatusCode::CREATED, axum::Json(json!({}))) }
+            }))
+            // No room for the blank: the engine refuses the mint.
+            .route("/api/v1/fstemplates", http_post(|| async {
+                // Not at once: the first ask sees the mint under way.
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                (axum::http::StatusCode::INSUFFICIENT_STORAGE, "no data slab has 64 MiB free")
+            }))
+            .route("/api/v1/fstemplates/{name}", http_get(move || {
+                let ready = r1.load(Ordering::SeqCst);
+                async move {
+                    if ready { Ok(axum::Json(json!({"id": "tpl-64", "state": "ready"}))) }
+                    else { Err(axum::http::StatusCode::NOT_FOUND) }
+                }
+            }))
+            .route("/api/v1/fstemplates/{id}/clone", http_post(move || {
+                let _ = &r2;
+                async { axum::Json(json!({"volume_id": "vol-d"})) }
+            }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let rt = Arc::new(FakeRuntime::default());
+        let mgr = PodManager::with_api(rt.clone(), rt, NODE, &url, "127.0.0.1", reqwest::Client::new());
+        let mgr = with_stormblock(mgr, &url);
+        let claim = json!({"metadata": {"namespace": "ns", "name": "d", "uid": "pvc-uid"}});
+        let said = |reason: &str| {
+            events.lock().unwrap().iter().filter(|e| e["reason"] == reason).cloned().collect::<Vec<_>>()
+        };
+
+        // First ask: the mint starts in the background; the claim says so.
+        assert!(mgr.clone_blank("64M", "pvc-ns-d", &claim).await.is_err());
+        let minting = said("Provisioning");
+        assert_eq!(minting.len(), 1, "{:?}", events.lock().unwrap());
+        assert_eq!(minting[0]["type"], "Normal");
+        assert_eq!(minting[0]["involvedObject"]["kind"], "PersistentVolumeClaim");
+        assert_eq!(minting[0]["involvedObject"]["name"], "d");
+        assert!(minting[0]["message"].as_str().unwrap().contains("minting the 64M blank pvc-ext4j-64m"));
+
+        // The engine refused it: the next ask says why, on the claim.
+        let t = Instant::now();
+        while said("ProvisioningFailed").is_empty() {
+            assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", events.lock().unwrap());
+            let _ = mgr.clone_blank("64M", "pvc-ns-d", &claim).await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let failed = said("ProvisioningFailed");
+        assert_eq!(failed[0]["type"], "Warning");
+        let m = failed[0]["message"].as_str().unwrap();
+        assert!(m.contains("would not mint the blank pvc-ext4j-64m") && m.contains("no data slab has 64 MiB free"), "{m}");
+
+        // A ready blank: cloned, and the claim says so.
+        ready.store(true, Ordering::SeqCst);
+        assert_eq!(mgr.clone_blank("64M", "pvc-ns-d", &claim).await.unwrap(), "vol-d");
+        let ok = said("ProvisioningSucceeded");
+        assert_eq!(ok.len(), 1);
+        assert!(ok[0]["message"].as_str().unwrap().contains("volume pvc-ns-d cloned from the 64M blank pvc-ext4j-64m"));
+    }
+
     fn with_stormblock(mgr: PodManager, url: &str) -> PodManager {
         mgr.with_engine(crate::engine::EngineClient::new(
             url,
@@ -6813,7 +6921,7 @@ pub(crate) mod tests {
             refusing_stormblock((404, "volume 5c1e0b7a-0000-4000-8000-000000000001 not found")).await;
         let (_rt, mgr) = manager();
         let mgr = with_stormblock(mgr, &url);
-        let e = mgr.clone_blank("64M", "pvc-ns-d").await.unwrap_err().to_string();
+        let e = mgr.clone_blank("64M", "pvc-ns-d", &Value::Null).await.unwrap_err().to_string();
         assert!(e.contains("template pvc-ext4j-64m is broken"), "{e}");
         assert!(e.contains("404"), "{e}");
         assert!(e.contains("volume 5c1e0b7a-0000-4000-8000-000000000001 not found"), "{e}");
@@ -6834,7 +6942,7 @@ pub(crate) mod tests {
             refusing_stormblock((500, "cloning volume: no free slots in the data half")).await;
         let (_rt, mgr) = manager();
         let mgr = with_stormblock(mgr, &url);
-        let e = mgr.clone_blank("64M", "pvc-ns-d").await.unwrap_err().to_string();
+        let e = mgr.clone_blank("64M", "pvc-ns-d", &Value::Null).await.unwrap_err().to_string();
         assert!(e.starts_with("stormblock would not clone pvc-ext4j-64m to pvc-ns-d: "), "{e}");
         assert!(e.contains("-> 500: cloning volume: no free slots in the data half"), "{e}");
         assert_eq!(deletes.load(Ordering::SeqCst), 0);

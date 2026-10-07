@@ -2,6 +2,10 @@
 
 ## 2026-10-08
 
+- **feat:** Events on the claim while its size-class blank is made (#70): Normal `Provisioning` while the blank is
+  minted or formats, Warning `ProvisioningFailed` with stormblock's words when a mint or clone is refused, Normal
+  `ProvisioningSucceeded` once cloned. Only the pod's FailedMount said anything before; the console showed "a
+  stormblock fault" and no reason. (The wait for a formatting blank and the bounded mint landed with #63 and #99.)
 - **fix:** An image the node's registry has no golden of is asked of the cluster, else fails its pull with the
   registry's words (#79). The kubelet sent `remote_image`, which sbregistry dropped, so such an image 404'd; and
   #104's `GET /v1/goldens` did not start sbregistry's cluster fetch. A 404 golden now posts the clone route as the
