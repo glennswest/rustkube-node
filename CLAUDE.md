@@ -57,6 +57,18 @@ by #51.
 
 ## Work plan
 
+### In progress: #147 (P2), kube-proxy clears stale UDP conntrack entries
+
+2026-10-08. kube-proxy rewrites the DNAT when an endpoint goes but leaves conntrack: a UDP flow to a ClusterIP
+(kube-dns) keeps its NAT to the old backend for 30–120 s. (No stormcos edition runs kube-proxy since #145/#155;
+the binary ships and this is its correctness.) Upstream: `conntrack -D -p udp --orig-dst <svc> --dst-nat <ep>`
+per removed UDP endpoint, `--dport <nodePort>` for NodePorts, and `--orig-dst <svc>` when a UDP Service gains its
+first endpoint.
+1. [ ] `conntrack.rs`: the stale set from the last applied and new UDP backends; a `Conntrack` seam (the
+       `conntrack` binary: exit 1 with "0 flow entries" is fine, a missing binary warns once). Deletes after a
+       successful apply. Tests (fake apiserver: endpoint replaced, NodePort, first endpoint, TCP untouched); docs
+       (configuration.md, README), CHANGELOG; sc-build (blocked: stormcentral#536).
+
 ### Waiting on stormcentral#536 (builds): #115 (P2), a stormpump exit wakes its own workload only
 
 2026-10-08. An unsolicited exit bumps the ring's counter; `pod_loop`/`vm_loop` answer with `wake_kind` **and**
