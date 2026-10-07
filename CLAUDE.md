@@ -1056,7 +1056,7 @@ Steps:
        18d8dc0653 (#91, #92 half 1), rustkube-node medium fff1f4d9d9 (#64, #59, #62, #67) and short c7e24520ec,
        at 65e3c3c. Read with `stormcentral test show <id>`; close what passes.
 
-### In progress: #87, static (mirror) pods: logs and stale status
+### Waiting on stormcentral#536 (builds): #87, static (mirror) pods: logs and stale status
 
 Logs: stormd services answered by #72. registry/stormblock/timesync wait on stormpump#55 (assets.json names no log).
 Stale status, found 2026-09-28: stormpump lists every asset it tried to start (refused ones too, with
@@ -1074,6 +1074,7 @@ Steps:
        running one last), each with `log` (`w<id>.log`) and `log_rotated`, or `stdout`/`stderr`. Doing: `Record.runs`;
        current = the running run's files (rotated first), `-f` follows the live one; `--previous` = stormd's
        `.failed.log`, else the newest ended run's files, else `last_output`. Tests, README/api.md, CHANGELOG.
+       Done: 99c34e2 (2 tests). NOT yet built: the SC_BUILD_VM job was cancelled while queued. Rerun, close.
 
 ### Done: #72, `kubectl logs` on a node service's mirror pod reads its stormd log volume
 
