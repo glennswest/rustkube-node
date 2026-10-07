@@ -2,6 +2,12 @@
 
 ## 2026-10-08
 
+- **fix:** An image the node's registry has no golden of is asked of the cluster, else fails its pull with the
+  registry's words (#79). The kubelet sent `remote_image`, which sbregistry dropped, so such an image 404'd; and
+  #104's `GET /v1/goldens` did not start sbregistry's cluster fetch. A 404 golden now posts the clone route as the
+  demand: 503 "fetching it from the cluster" / 404 "push the image" are ErrImagePull, retried on the back-off; a
+  clone minted because the golden became ready meanwhile is deleted at once. stormblock-registry#98 asks for a
+  demand that mints nothing.
 - **feat:** Every container runs on its own root (#104, the owner's rule): a copy-on-write clone of its image's
   sealed golden, made at create (engine volume `ctr-<container>`, attached over ublk, mounted by PID 1 at
   `/run/stormpump/roots/<container>`), and detached and deleted with the container; a restart gets a fresh

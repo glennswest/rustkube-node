@@ -1615,6 +1615,44 @@ impl StormpumpImages {
         self.configs.put(root, image, config);
     }
 
+    /// Ask sbregistry's cluster for a golden this node has none of (#79), by
+    /// the clone route, the one that starts the fetch. `Err` is the pull's
+    /// failure with the registry's words; `Ok(Some(record))` the golden that
+    /// turned ready meanwhile, its stray clone deleted.
+    async fn demand(&self, image: &str) -> Result<Option<serde_json::Value>, String> {
+        let url = format!("{}/v1/clones", self.registry.trim_end_matches('/'));
+        let resp = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({ "golden": image }))
+            .send()
+            .await
+            .map_err(|e| format!("registry {url} did not answer for {image}: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let answer: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        if !status.is_success() {
+            let said = answer["error"].as_str().map(str::to_string).unwrap_or_else(|| text.chars().take(300).collect());
+            return Err(format!("{image} is not on this node ({status}): {said}"));
+        }
+        // Ready in the meantime: the clone is not wanted (#104).
+        if let Some(id) = answer["id"].as_str() {
+            let gone = self.http.delete(format!("{url}/{id}")).send().await;
+            if !matches!(gone, Ok(ref r) if r.status().is_success() || r.status().as_u16() == 404) {
+                tracing::warn!(image = %image, clone = %id, "a registry clone minted by the demand was not deleted (the registry reaps it)");
+            }
+        }
+        let mut again = reqwest::Url::parse(&self.registry).map_err(|e| format!("registry: {e}"))?;
+        if let Ok(mut path) = again.path_segments_mut() {
+            path.pop_if_empty().extend(["v1", "goldens", image]);
+        }
+        let record = match self.http.get(again).send().await {
+            Ok(r) if r.status().is_success() => r.json().await.ok(),
+            _ => None,
+        };
+        Ok(record)
+    }
+
     pub fn registry(&self) -> &str {
         &self.registry
     }
@@ -1671,8 +1709,15 @@ impl ImageService for StormpumpImages {
     /// 2. **Already found.** A previous container of this image asked.
     /// 3. **The registry's.** sbregistry's golden record for the image names
     ///    the fstemplate it sealed in this node's engine: `template:<name>`.
-    ///    A golden still building, failed, or unknown is a pull that failed
-    ///    for now, with the registry's answer (ErrImagePull, then back-off).
+    ///    A golden still building or failed is a pull that failed for now,
+    ///    with the registry's answer (ErrImagePull, then back-off).
+    /// 4. **Not on this node** (404): the cluster is asked for it (#79). Only
+    ///    the clone route starts sbregistry's cluster fetch, so it is posted
+    ///    as the demand: 503 "fetching it from the cluster" or 404 "push it"
+    ///    is the pull's failure, retried on the back-off. A clone it minted
+    ///    because the golden turned ready meanwhile is deleted at once: the
+    ///    container's root is its own clone, never the registry's
+    ///    (stormblock-registry#98 asks for a demand that mints nothing).
     async fn pull_image(&self, image: &str) -> Result<String, CriError> {
         if let Some(path) = Self::local_path(image) {
             tracing::info!(image = %image, path = %path.display(), "image is a golden on this node");
@@ -1695,8 +1740,16 @@ impl ImageService for StormpumpImages {
             .await
             .map_err(|e| CriError::ImagePull(format!("registry {url} did not answer for {image}: {e}")))?;
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        let record: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        let mut text = resp.text().await.unwrap_or_default();
+        let mut record: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        if status == reqwest::StatusCode::NOT_FOUND {
+            match self.demand(image).await {
+                Ok(Some(found)) => record = found,
+                Ok(None) => {}
+                Err(why) => return Err(CriError::ImagePull(why)),
+            }
+            text = record.to_string();
+        }
         let reference = golden_reference(&record).ok_or_else(|| {
             CriError::ImagePull(format!(
                 "registry has no ready golden for {image} ({status}): {}",
@@ -2375,6 +2428,10 @@ mod tests {
         refuse_list: bool,
         /// Golden records asked for, by name as the registry decoded it (#98).
         golden_lookups: Vec<String>,
+        /// A golden that became ready while the demand was posted (#79).
+        arrived: bool,
+        /// Clones deleted.
+        deleted: Vec<String>,
     }
 
     async fn fake_registry() -> (String, Arc<std::sync::Mutex<FakeRegistry>>) {
@@ -2402,8 +2459,17 @@ mod tests {
                         )))
                     },
                 )
-                .post(|State(s): State<S>| async move {
+                .post(|State(s): State<S>, Json(b): Json<serde_json::Value>| async move {
                     let mut r = s.lock().unwrap();
+                    // The cluster demand (#79): elsewhere in the cluster, or nowhere.
+                    match b["golden"].as_str() {
+                        Some("quay.io/a/elsewhere:1") => return Err((StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                            "error": "quay.io/a/elsewhere:1 is not on this node: fetching it from the cluster (job j1, queued); retry shortly"})))),
+                        Some("quay.io/a/nonesuch:1") => return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({
+                            "error": "no ready golden quay.io/a/nonesuch:1 — push the image, or POST /v1/goldens to build it"})))),
+                        Some("quay.io/a/arrived:1") => r.arrived = true,
+                        _ => {}
+                    }
                     r.minted += 1;
                     let n = r.minted;
                     let c = serde_json::json!({
@@ -2411,7 +2477,14 @@ mod tests {
                         "state": "claimed",
                     });
                     r.clones.push(c.clone());
-                    Json(c)
+                    Ok(Json(c))
+                }),
+            )
+            .route(
+                "/v1/clones/{id}",
+                axum::routing::delete(|State(s): State<S>, Path(id): Path<String>| async move {
+                    s.lock().unwrap().deleted.push(id);
+                    Json(serde_json::json!({}))
                 }),
             )
             .route(
@@ -2439,6 +2512,8 @@ mod tests {
                         Ok(Json(serde_json::json!({"name": name, "status": "ready",
                             "template_name": "sbr-coredns-1", "config": {
                             "Entrypoint": ["/coredns"], "User": "65532:65532", "WorkingDir": "/"}})))
+                    } else if name == "quay.io/a/arrived:1" && s.lock().unwrap().arrived {
+                        Ok(Json(serde_json::json!({"name": name, "status": "ready", "template_name": "sbr-arrived-1"})))
                     } else if name == "quay.io/a/building:1" {
                         Ok(Json(serde_json::json!({"name": name, "status": "building", "template_name": "sbr-b-1"})))
                     } else {
@@ -2516,8 +2591,27 @@ mod tests {
         let e = img.pull_image("quay.io/a/building:1").await.unwrap_err().to_string();
         assert!(e.contains("no ready golden") && e.contains("building"), "{e}");
         let e = img.pull_image("quay.io/a/nonesuch:1").await.unwrap_err().to_string();
-        assert!(e.contains("no ready golden") && e.contains("404"), "{e}");
+        assert!(e.contains("not on this node (404") && e.contains("push the image"), "{e}");
         assert_eq!(reg.lock().unwrap().minted, 0);
+    }
+
+    /// #79: an image this node's registry has no golden of is asked of the
+    /// cluster (the clone route is the one that starts the fetch); its 503 is
+    /// the pull's failure, retried. A golden that turns ready meanwhile is
+    /// used, and the clone the demand minted is deleted (#104).
+    #[tokio::test]
+    async fn an_image_not_on_this_node_is_asked_of_the_cluster() {
+        let (url, reg) = fake_registry().await;
+        let img = StormpumpImages::new(&url);
+        let e = img.pull_image("quay.io/a/elsewhere:1").await.unwrap_err();
+        assert!(matches!(e, CriError::ImagePull(_)), "{e}");
+        let e = e.to_string();
+        assert!(e.contains("503") && e.contains("fetching it from the cluster"), "{e}");
+
+        assert_eq!(img.pull_image("quay.io/a/arrived:1").await.unwrap(), "template:sbr-arrived-1");
+        let r = reg.lock().unwrap();
+        assert_eq!(r.minted, 1, "the demand minted one, because the golden was ready by then");
+        assert_eq!(r.deleted, vec!["c1".to_string()], "and it was deleted: the container makes its own root");
     }
 
     fn bare(id: &str, sandbox: &str) -> Container {

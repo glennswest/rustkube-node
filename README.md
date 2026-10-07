@@ -145,7 +145,12 @@ container is removed; a restart is a new container with a fresh clone. Container
 layer sits between the golden and what the workload writes. A pallet image's golden is the slab's
 `<volume>.golden` (else the mounted volume's sealed parent; the volume is the one `rd.stormblock.mount=` mounts
 at `/p/<path>`); a pulled image's is the fstemplate sbregistry sealed for it, so a pull clones nothing: it finds
-the golden record (`GET /v1/goldens/{image}`, ready, `template_name`) and answers `template:<name>`. A failed
+the golden record (`GET /v1/goldens/{image}`, ready, `template_name`) and answers `template:<name>`. An image
+this node's registry has no golden of is asked of the cluster (#79): the kubelet posts sbregistry's clone route,
+the one that starts its cluster fetch, and its answer (503 "fetching it from the cluster", 404 "push the image")
+is the pull's ErrImagePull, retried on the back-off; a clone it minted because the golden became ready meanwhile
+is deleted (stormblock-registry#98 would make that a plain demand). Building an image from upstream on demand
+(`POST /v1/goldens`) is not done: whether that endpoint stays is stormblock-registry#50. A failed
 create or start removes the clone; roots no container holds (a kubelet that died mid-way) are deleted at
 start, never one still attached. `readOnlyRootFilesystem` mounts the container's own clone read-only once the
 engine can (stormpump#108); until then it is private and writable, and the kubelet says so. Per container
