@@ -573,9 +573,9 @@ persistent checkout on dev.
 A stormcos release consumes a **stage golden**, containing stormd, its config
 and the binaries. After completed release work passes validation, request it
 through `stormcentral component stage rustkube-node --url http://stormcentral.g8.lo`.
-Do not use `component build` or `scripts/build-golden.sh`: they produce the
-bin-only artifact that cannot start this service. The legacy script still
-exists pending #51. See [BUILD.md](docs/BUILD.md) for the complete workflow.
+Do not use `component build`: it produces the bin-only artifact that cannot
+start this service. The repository's own golden builder (`scripts/build-golden.sh`)
+was removed (#51). See [BUILD.md](docs/BUILD.md) for the complete workflow.
 
 ## License
 

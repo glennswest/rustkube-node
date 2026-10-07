@@ -2,8 +2,8 @@
 
 The node half of rustkube: the kubelet (`pkg/kubelet`, `cmd/kubelet`), kube-proxy
 (`pkg/proxy`, `cmd/kube-proxy`) and the CNI helpers (`pkg/cni`). It ships as a
-stage golden through `stormcentral component stage rustkube-node`, not the
-legacy bin-only `scripts/build-golden.sh` or a package. The cross-project rules are in
+stage golden through `stormcentral component stage rustkube-node`, not a package
+(the legacy bin-only `scripts/build-golden.sh` was removed, #51). The cross-project rules are in
 `../CLAUDE.md`; this file is the project's own context and work plan.
 
 ## Version
@@ -52,8 +52,8 @@ binaries alone). 11.49 shipped one and the kubelet could not start.
 stormcentral now refuses that mix-up. The goldens requested with `build` for
 v0.10.0–v0.12.0 (ca8caa9be480, fdc1c7497472, 2e39fa8daf0a) are bin-only. The
 owner built the stage golden for v0.12.0: golden-rustkube-node-ce66e97945ad
-(image 11.50). `scripts/build-golden.sh` also makes a bin-only golden, and is
-not the release path.
+(image 11.50). `scripts/build-golden.sh` (another bin-only builder) was removed
+by #51.
 
 ## Work plan
 

@@ -2,6 +2,9 @@
 
 ## 2026-10-07
 
+- **chore(build):** Removed `scripts/build-golden.sh` (#51). It was a second golden builder (root on dev,
+  bin-only output) beside the platform's stage recipe, which is the only release path:
+  `stormcentral component stage rustkube-node`. Nothing called it. README and BUILD.md updated.
 - **fix:** `/vmInstance` no longer answers from a cache the apiserver has not confirmed (#156). A node cut off
   from the apiserver kept handing out the identity its last cache placed here, while the control plane could
   move the machine or give its address to another. The kubelet now records when it last heard from the

@@ -59,11 +59,11 @@ The recipe copies kube-proxy but does not start it: no stormcos edition runs it
 Host mounts and certificates are platform responsibilities; see
 [configuration](configuration.md) for the executable defaults and overrides.
 
-Do not use `stormcentral component build rustkube-node` or the legacy
-`scripts/build-golden.sh` for releases. Their bin-only output omits the service
-base/config. The legacy script remains in the repository pending
-[#51](https://github.com/glennswest/rustkube-node/issues/51); it is not a second
-supported builder. `packaging/build-packages.sh` is also legacy and is not the
+Do not use `stormcentral component build rustkube-node` for releases. Its
+bin-only output omits the service base/config. The repository's own builder,
+`scripts/build-golden.sh` (also bin-only, run as root on dev), was removed
+([#51](https://github.com/glennswest/rustkube-node/issues/51)): there is one
+golden builder, the platform's. `packaging/build-packages.sh` is also legacy and is not the
 stormcos shipping path. Its packages do not establish a tested deployment.
 
 ## Runtime acceptance
