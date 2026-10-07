@@ -323,8 +323,9 @@ impl Kubelet {
             let labels = self.config.node_labels.clone();
             let annotations = self.config.node_annotations.clone();
             let taints = self.config.register_with_taints.clone();
+            let runs_vms = self.vms.is_some();
             tokio::spawn(async move {
-                let reporter = NodeReporter::with_pod_cidr(&url, &node_name, pod_cidr)
+                let mut reporter = NodeReporter::with_pod_cidr(&url, &node_name, pod_cidr)
                     .with_runtime_version(rv)
                     .with_kubelet_port(port)
                     .with_max_pods(max_pods)
@@ -334,6 +335,10 @@ impl Kubelet {
                     // every few seconds would undo every removal.
                     .with_registration(labels, annotations, taints)
                     .with_client(client);
+                if runs_vms {
+                    // KVM on the Node (#65): only where VMs can run at all.
+                    reporter = reporter.with_kvm(Arc::new(crate::node_status::kvm_available));
+                }
                 let mut backoff = Duration::from_secs(1);
                 loop {
                     match reporter.register().await {
@@ -386,11 +391,14 @@ impl Kubelet {
         let hb_client = self.api_client.clone();
         let hb_vms = self.vms.clone();
         tokio::spawn(async move {
-            let reporter = NodeReporter::with_pod_cidr(&reporter_url, &node_name, pod_cidr)
+            let mut reporter = NodeReporter::with_pod_cidr(&reporter_url, &node_name, pod_cidr)
                 .with_runtime_version(runtime_version)
                 .with_kubelet_port(kubelet_port)
                 .with_max_pods(max_pods)
                 .with_client(hb_client);
+            if hb_vms.is_some() {
+                reporter = reporter.with_kvm(Arc::new(crate::node_status::kvm_available));
+            }
             let mut interval = time::interval(heartbeat_interval);
             loop {
                 interval.tick().await;

@@ -2,6 +2,13 @@
 
 ## 2026-10-08
 
+- **feat:** The Node says whether it can run a VM (#65). A test in a Job has no /dev/kvm and could not tell a
+  VM-capable node through the API. With the stormpump engine the kubelet checks KVM each heartbeat
+  (`/sys/class/misc/kvm`, else a `/dev/kvm` or `/hostroot/dev/kvm` that opens read-write) and reports
+  `devices.kubevirt.io/kvm: 1k` in capacity and allocatable, as KubeVirt's device plugin does, plus the labels
+  `storm.io/kvm=true` and `kubevirt.io/schedulable=true`. The labels are written at registration and patched on an
+  existing node whenever they change; without KVM the resource goes, `storm.io/kvm` is removed and
+  `kubevirt.io/schedulable` is `false`.
 - **fix:** A VMI placed by hand with `spec.nodeName` is started (#85). The kubelet listed and watched VMIs by
   `status.nodeName` only, and filtered what came back on it too, so the `spec.nodeName` half of its own
   assignment rule never saw anything. It now lists and watches both fields, merges them by uid and keeps what

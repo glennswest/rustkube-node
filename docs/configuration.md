@@ -16,7 +16,7 @@ An em dash means there is no environment binding or the value is unset.
 | `--apiserver` | `APISERVER_URL` | `http://127.0.0.1:6443`; kubeconfig server may replace this default |
 | `--node-name` | `NODE_NAME` | Detect NODE_NAME, HOSTNAME, system hostname, then `localhost` |
 | `--pod-cidr` | `POD_CIDR` | Unset; when set writes Node spec.podCIDR |
-| `--node-labels` | `NODE_LABELS` | Empty; comma-separated `key=value` |
+| `--node-labels` | `NODE_LABELS` | Empty; comma-separated `key=value`. With the stormpump engine the kubelet also writes `storm.io/kvm` and `kubevirt.io/schedulable` itself, from whether KVM is there (#65) |
 | `--node-annotations` | `NODE_ANNOTATIONS` | Empty; comma-separated `key=value` |
 | `--register-with-taints` | `REGISTER_WITH_TAINTS` | Empty; `key=value:Effect` or `key:Effect`, on Node creation only |
 | `--pod-manifest-path` | `POD_MANIFEST_PATH` | `/etc/kubernetes/manifests`; empty string disables static Pods |

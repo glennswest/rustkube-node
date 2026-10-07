@@ -107,7 +107,52 @@ pub struct NodeReporter {
     /// Cilium must not come back on the next kubelet restart, or the node
     /// oscillates and nothing can ever be scheduled.
     taints: Vec<Value>,
+    /// Whether this node can start a VM (#65), asked each status pass. `None`
+    /// on a node that runs no VMs at all (no stormpump engine): it says nothing
+    /// about KVM either way.
+    kvm: Option<KvmProbe>,
+    /// The KVM labels last written to the Node, so they are patched only when
+    /// they change.
+    kvm_labelled: std::sync::Mutex<Option<bool>>,
     client: reqwest::Client,
+}
+
+/// Asks whether KVM is usable now; [`kvm_available`] outside tests.
+pub type KvmProbe = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// The extended resource KubeVirt's device plugin publishes for KVM, and the
+/// amount it publishes (`1k`): a VM-capable node, as anything that already
+/// knows KubeVirt reads it (#65).
+pub const KVM_RESOURCE: &str = "devices.kubevirt.io/kvm";
+pub const KVM_QUANTITY: &str = "1k";
+/// The labels a VM-capable node carries (#65): ours, and the one KubeVirt's
+/// virt-handler writes.
+pub const KVM_LABEL: &str = "storm.io/kvm";
+pub const SCHEDULABLE_LABEL: &str = "kubevirt.io/schedulable";
+
+/// Whether this node can start a VM: the kernel has a KVM device (#65).
+///
+/// The kubelet's own container has no /dev/kvm on stormcos (the engine starts
+/// the hypervisor in the node's mount view, not the kubelet's), so the
+/// kernel's own record comes first: `/sys/class/misc/kvm` is there exactly
+/// while kvm_intel or kvm_amd has registered the device. Otherwise a /dev/kvm
+/// the kubelet can open read-write, its own or the host's under /hostroot.
+pub fn kvm_available() -> bool {
+    if std::path::Path::new("/sys/class/misc/kvm/dev").exists() {
+        return true;
+    }
+    ["/dev/kvm", "/hostroot/dev/kvm"]
+        .iter()
+        .any(|p| std::fs::OpenOptions::new().read(true).write(true).open(p).is_ok())
+}
+
+/// The label merge patch for KVM `on` or off: off removes `storm.io/kvm` and
+/// says `kubevirt.io/schedulable: "false"`, as virt-handler does.
+pub fn kvm_labels_patch(on: bool) -> Value {
+    json!({ "metadata": { "labels": {
+        KVM_LABEL: if on { json!("true") } else { Value::Null },
+        SCHEDULABLE_LABEL: if on { "true" } else { "false" },
+    }}})
 }
 
 impl NodeReporter {
@@ -126,6 +171,8 @@ impl NodeReporter {
             labels: Vec::new(),
             annotations: Vec::new(),
             taints: Vec::new(),
+            kvm: None,
+            kvm_labelled: std::sync::Mutex::new(None),
             client: reqwest::Client::new(),
         }
     }
@@ -158,6 +205,13 @@ impl NodeReporter {
         self
     }
 
+    /// This node runs VMs (#65): report whether KVM is usable, asked through
+    /// `probe` on each status pass.
+    pub fn with_kvm(mut self, probe: KvmProbe) -> Self {
+        self.kvm = Some(probe);
+        self
+    }
+
     pub fn with_kubelet_port(mut self, port: u16) -> Self {
         self.kubelet_port = port;
         self
@@ -178,6 +232,11 @@ impl NodeReporter {
             "node.kubernetes.io/instance-type": "rustkube"
         });
         if let Some(m) = labels.as_object_mut() {
+            if let Some(probe) = &self.kvm {
+                if let Some(l) = kvm_labels_patch(probe())["metadata"]["labels"].as_object() {
+                    m.extend(l.iter().filter(|(_, v)| !v.is_null()).map(|(k, v)| (k.clone(), v.clone())));
+                }
+            }
             for (k, v) in &self.labels {
                 m.insert(k.clone(), Value::String(v.clone()));
             }
@@ -372,8 +431,37 @@ impl NodeReporter {
             }
             Err(e) => tracing::warn!("Heartbeat: node status update failed: {e}"),
         }
+        self.sync_kvm_labels().await;
 
         Ok(renewed)
+    }
+
+    /// Write the KVM labels (#65) when they differ from what was last written:
+    /// at the first heartbeat (registration labels only a node it creates),
+    /// and whenever KVM comes or goes. A failed patch is tried again on the
+    /// next heartbeat.
+    async fn sync_kvm_labels(&self) {
+        let Some(probe) = &self.kvm else { return };
+        let on = probe();
+        if *self.kvm_labelled.lock().unwrap() == Some(on) {
+            return;
+        }
+        let url = format!("{}/api/v1/nodes/{}", self.api_url, self.node_name);
+        match self
+            .client
+            .patch(&url)
+            .header("content-type", "application/merge-patch+json")
+            .json(&kvm_labels_patch(on))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                info!(kvm = on, "node KVM labels written");
+                *self.kvm_labelled.lock().unwrap() = Some(on);
+            }
+            Ok(r) => tracing::warn!(status = %r.status(), "node KVM labels not written"),
+            Err(e) => tracing::warn!("node KVM labels not written: {e}"),
+        }
     }
 
     /// Build the node status, merging the kubelet-owned conditions into
@@ -402,7 +490,7 @@ impl NodeReporter {
         let eph_cap_ki = fs_total / 1024;
         let eph_alloc_ki = (fs_total / 1024) * 9 / 10;
 
-        json!({
+        let mut status = json!({
             "capacity": {
                 "cpu": cpu_count.to_string(),
                 "memory": format!("{total_mem_ki}Ki"),
@@ -434,7 +522,15 @@ impl NodeReporter {
                 "kubeletEndpoint": { "Port": self.kubelet_port }
             },
             "addresses": build_addresses(&self.node_name)
-        })
+        });
+        // KVM as KubeVirt's device plugin reports it (#65). The status is PUT
+        // whole, so a node that loses KVM drops the key on its next pass.
+        if self.kvm.as_ref().is_some_and(|probe| probe()) {
+            for side in ["capacity", "allocatable"] {
+                status[side][KVM_RESOURCE] = json!(KVM_QUANTITY);
+            }
+        }
+        status
     }
 }
 
@@ -734,6 +830,69 @@ mod tests {
         assert_eq!(pods(&r), (json!("110"), json!("110")));
         let r = r.with_max_pods(250);
         assert_eq!(pods(&r), (json!("250"), json!("250")));
+    }
+
+    /// #65: a VM-capable node says so through the API; a node without KVM, or
+    /// one that runs no VMs, does not.
+    #[test]
+    fn a_node_with_kvm_advertises_it() {
+        let kvm = |on: bool| -> KvmProbe { std::sync::Arc::new(move || on) };
+        let with = NodeReporter::new("http://x", "n1").with_kvm(kvm(true));
+        let st = with.build_status(&[]);
+        assert_eq!(st["capacity"][KVM_RESOURCE], "1k");
+        assert_eq!(st["allocatable"][KVM_RESOURCE], "1k");
+        let meta = with.node_metadata();
+        assert_eq!(meta["labels"][KVM_LABEL], "true");
+        assert_eq!(meta["labels"][SCHEDULABLE_LABEL], "true");
+
+        let without = NodeReporter::new("http://x", "n1").with_kvm(kvm(false));
+        assert!(without.build_status(&[])["allocatable"].get(KVM_RESOURCE).is_none());
+        let meta = without.node_metadata();
+        assert!(meta["labels"].get(KVM_LABEL).is_none());
+        assert_eq!(meta["labels"][SCHEDULABLE_LABEL], "false");
+
+        let no_vms = NodeReporter::new("http://x", "n1");
+        assert!(no_vms.build_status(&[])["allocatable"].get(KVM_RESOURCE).is_none());
+        assert!(no_vms.node_metadata()["labels"].get(SCHEDULABLE_LABEL).is_none());
+
+        assert_eq!(
+            kvm_labels_patch(false),
+            json!({ "metadata": { "labels": { KVM_LABEL: null, SCHEDULABLE_LABEL: "false" } } }),
+            "losing KVM removes our label and says unschedulable"
+        );
+    }
+
+    /// The labels are patched on an existing node at the first heartbeat and
+    /// again only when KVM comes or goes.
+    #[tokio::test]
+    async fn kvm_labels_are_patched_only_when_they_change() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let patches = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let seen = patches.clone();
+        let app = axum::Router::new().route(
+            "/api/v1/nodes/n1",
+            axum::routing::patch(move |axum::Json(body): axum::Json<Value>| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push(body);
+                    axum::Json(json!({}))
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+
+        let on = std::sync::Arc::new(AtomicBool::new(true));
+        let probe = on.clone();
+        let r = NodeReporter::new(&url, "n1")
+            .with_kvm(std::sync::Arc::new(move || probe.load(Ordering::SeqCst)));
+        r.sync_kvm_labels().await;
+        r.sync_kvm_labels().await;
+        on.store(false, Ordering::SeqCst);
+        r.sync_kvm_labels().await;
+        let got = patches.lock().unwrap().clone();
+        assert_eq!(got, vec![kvm_labels_patch(true), kvm_labels_patch(false)]);
     }
 
     fn types(v: &Value) -> Vec<String> {

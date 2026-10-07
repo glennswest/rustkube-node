@@ -406,6 +406,16 @@ missing on main (#80).
 
 ### Virtual machine lifecycle
 
+- **A VM-capable node says so (#65).** With the stormpump engine (the only
+  runtime that starts VMs), the kubelet checks for KVM on each heartbeat: the
+  kernel's `/sys/class/misc/kvm`, or a `/dev/kvm` (its own or `/hostroot`'s)
+  that opens read-write. While it is there the Node carries
+  `devices.kubevirt.io/kvm: 1k` in capacity and allocatable (KubeVirt's device
+  plugin's resource) and the labels `storm.io/kvm=true` and
+  `kubevirt.io/schedulable=true`. Without it the resource is gone, `storm.io/kvm`
+  is removed and `kubevirt.io/schedulable` is `false`. A node with the native
+  runtime reports none of these. A test that `requires: [kvm]` checks
+  `kubectl get nodes -l storm.io/kvm=true`.
 - **A VMI being deleted stops its machine.** While a machine runs, its VMI
   carries the finalizer `storm.io/vm`, so the deletion completes only once the
   machine is gone. The stop is ACPI with a 30 s grace, then a kill, then the
