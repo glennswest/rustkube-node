@@ -33,7 +33,7 @@ below has been measured on a node yet (#102, target C2NR0Q2 per #110).
 | Burst starts (#138) | 8 fixed workers queued 173 pods on pvetest1 (wait p50 2.4 s, max 9.3 s): `--pod-workers` (16 per CPU, 32–256), the start-timing PATCH off the worker, `workers=`/`pending=` in the annotation, no PodState clone per pass (`20e95fc`); not yet measured on a node |
 | Clone refusals (#140) | Dell C2NR0Q2 on 11.76: every claim waited on "stormblock would not clone pvc-ext4j-64m". Engine POSTs (template clone, attach, snapshot) now carry stormblock's status and `error`, or the transport error, into the claim's wait; a template refused as broken (sealed volume 404 / not sealed / no sealed snapshot) is deleted and minted again; not yet run on a node |
 | Pods wait for the CNI config (#148) | Dell 11.79: coredns took 16 sandbox attempts over 27 s before the network. No conflist is now a wait without a sandbox, woken by an inotify watch on `--cni-conf-dir` (10 s fallback); a failing ADD backs off from its own first failure (`f1a0c38`); not yet measured on a node |
-| kube-proxy on a TLS apiserver (#145) | `--ca-file`/`--token-file` defaulting to the ServiceAccount, token re-read per request; refused lists are errors, not empty; jumps into `KUBE-SERVICES`/`KUBE-POSTROUTING` ensured; rules rewritten on any change (not counts), resynced every 60 s; ports keyed by protocol and matched by name; optional `--cluster-cidr` (`3243b77`). For stormcos#265's flowsdn edition; not yet run on a node |
+| kube-proxy on a TLS apiserver (#145) | `--ca-file`/`--token-file` defaulting to the ServiceAccount, token re-read per request; refused lists are errors, not empty; jumps into `KUBE-SERVICES`/`KUBE-POSTROUTING` ensured; rules rewritten on any change (not counts), resynced every 60 s; ports keyed by protocol and matched by name; optional `--cluster-cidr` (`3243b77`). No stormcos edition runs it (the flowsdn edition uses flowsdn's own Services, owner on #145, stormcos#265); kept in the golden, not run on a node |
 | Tests | PVC medium-suite container and remote static-binary staging (`f63d8c2`, `38dba5a`); latest full sc-build at `c74b589`: 270 kubelet unit, 4 integration, 25 CNI, 17 proxy tests; live acceptance remains open |
 
 ## Owner decisions recorded, implementation pending
@@ -92,4 +92,5 @@ Each gap has an owning issue. These are limitations, not supported features.
 
 The former CRI-O/crun/conmon-rs default-stack roadmap (#22/#28) is superseded
 by the platform's stormpump selection. An eBPF kube-proxy in this repository
-is not a shipping commitment: Cilium owns the service dataplane (#2).
+is not a shipping commitment: Cilium owns the service dataplane in the Cilium
+edition and flowsdn in the flowsdn edition (#2, #145).

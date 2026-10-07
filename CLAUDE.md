@@ -16,8 +16,8 @@ legacy bin-only `scripts/build-golden.sh` or a package. The cross-project rules 
 Main baseline: fecb331. See `docs/status.md` for changes since September 25,
 the owner's recorded decisions and issue-backed limitations, `docs/configuration.md` for every CLI/env/default,
 and `docs/api.md` for ports and actual routes. CLI runtime defaults to native;
-stormcos explicitly chooses stormpump. Cilium owns Services; the packaged
-kube-proxy is not started. PVCs use the built-in stormblock driver and sealed
+stormcos explicitly chooses stormpump. Cilium (or, in the flowsdn edition, flowsdn) owns
+Services; the packaged kube-proxy is not started in either edition (#145, #155). PVCs use the built-in stormblock driver and sealed
 size-class blanks over ublk, with CSI only for third-party drivers.
 
 Main has VMI adoption, persistent VM-owned disks, accessCredentials, tap address

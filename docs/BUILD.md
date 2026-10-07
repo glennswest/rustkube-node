@@ -54,7 +54,8 @@ It builds x86_64 musl kubelet/kube-proxy binaries onto a stormd base, writes
 The generated config runs kubelet with `--runtime stormpump`, ring socket
 `/hostrun/stormpump.sock`, the node's HTTPS apiserver, node certificate paths,
 and local registry. stormd's management API binds `0.0.0.0:9085`.
-The recipe copies kube-proxy but does not start it: Cilium owns Services.
+The recipe copies kube-proxy but does not start it: no stormcos edition runs it
+(Cilium owns Services in one edition, flowsdn in the other; #145, stormcos#265).
 Host mounts and certificates are platform responsibilities; see
 [configuration](configuration.md) for the executable defaults and overrides.
 

@@ -112,7 +112,7 @@ Warnings are written before the start moves on.
 | Component | Source | Current role |
 |---|---|---|
 | `kubelet` | `cmd/kubelet`, `pkg/kubelet` | Node registration, Pod lifecycle, probes, storage, logs, metrics and stormvm VMIs |
-| `kube-proxy` | `cmd/kube-proxy`, `pkg/proxy` | iptables Services/Endpoints (polled every 5 s), TLS + ServiceAccount token to the apiserver (#145). The Cilium edition of stormcos does not start it (Cilium owns Services); the flowsdn edition runs it as a DaemonSet (stormcos#265) |
+| `kube-proxy` | `cmd/kube-proxy`, `pkg/proxy` | iptables Services/Endpoints (polled every 5 s), TLS + ServiceAccount token to the apiserver (#145). No stormcos edition starts it: Cilium owns Services in the Cilium edition, flowsdn in the flowsdn edition (owner, #145; stormcos#265, flowsdn#292). It stays in the golden for anything that runs it later |
 | CNI library | `pkg/cni` | Standard plugin invocation and networking helpers |
 
 The executable defaults to **`--runtime native`**. The stormcos stage recipe

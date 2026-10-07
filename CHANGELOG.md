@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-07
+
+- **docs:** No stormcos edition runs kube-proxy (#155): README, BUILD.md, status.md, the presentation and
+  CLAUDE.md said the flowsdn edition ran it as a DaemonSet. The owner chose flowsdn's own Services (#145;
+  stormcos#265 removed `65-kube-proxy.yaml`, flowsdn#292). kube-proxy stays in the golden.
+
 ## 2026-10-06
 
 - **test:** short, medium pod cases and long (#61). short (< 2 min): Node Ready with a recent heartbeat and no

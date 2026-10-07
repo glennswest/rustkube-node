@@ -45,15 +45,15 @@ It speaks the upstream API shapes (`kubectl logs`, `describe`, metrics under ups
 ## Where it sits in stormcos
 
 ```
-        stormcos (the product)        flowsdn (runs kube-proxy)
+        stormcos (the product)        flowsdn (its edition's CNI and Services)
                     \                    /
                      v                  v
  rustkube  ----->  [ rustkube-node: kubelet ]
  apiserver,          |      |       |       |        |
  scheduler,          v      v       v       v        v
  controllers    stormpump stormvm stormblock sbregistry CNI
-                (PID 1,  (plans,  (volumes, (image    (Cilium)
-                 ring)   console)  goldens)  clones)
+                (PID 1,  (plans,  (volumes, (image    (Cilium
+                 ring)   console)  goldens)  clones)  or flowsdn)
 ```
 
 stormcentral's relationships: **rustkube-node → rustkube, stormpump, stormvm**; depended on by
