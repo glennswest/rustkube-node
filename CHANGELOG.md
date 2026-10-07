@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-10-08
+
+- **fix:** A credential file named on the command line is waited for (60 s) and its absence is fatal, never
+  skipped (#69). `--client-certificate`, `--client-key` and `--token-file` were read once and dropped when
+  missing, so a kubelet started before stormcert wrote its pair, or given a mistyped path, ran as
+  `system:anonymous` (cluster-admin on sno, 403s elsewhere). Only `--apiserver-ca` was waited for. The same
+  wait now covers `--kubeconfig`, `--tls-cert-file`/`--tls-private-key-file` (a missing pair became a
+  self-signed one) and `--server-token-file`. An empty file counts as not written yet. The error names the flag.
+
 ## 2026-10-07
 
 - **chore(build):** Removed `scripts/build-golden.sh` (#51). It was a second golden builder (root on dev,

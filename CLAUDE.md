@@ -64,7 +64,7 @@ by #51.
 sno). The serving pair (`--tls-cert-file`/`--tls-private-key-file`, else self-signed) and `--server-token-file`
 had the same silent fallback; stormcos names the client and serving pairs under /data/stormcert, all minted by
 the boot (build-goldens.sh:5353), so a wait is safe for them.
-1. [ ] `wait_for_ca` → `wait_for_file(flag, path, limit)` for every named credential file and `--kubeconfig`;
+1. [x] `wait_for_ca` → `wait_for_file(flag, path, limit)` for every named credential file and `--kubeconfig`;
        absent after 60 s: exit naming the flag. Unit tests (appears late, never appears, empty = not yet).
 2. [ ] Docs (configuration.md, README), CHANGELOG; sc-build; stage golden; close.
 

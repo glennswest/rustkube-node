@@ -163,59 +163,61 @@ struct Cli {
     anonymous_auth: bool,
 }
 
-/// Read a file to bytes, warning (not failing) if it can't be read — matches
-/// the best-effort handling of the other credential files.
-/// Read a CA that the boot may not have written yet.
+/// How long a credential file named on the command line may take to appear.
+const CREDENTIAL_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Read a credential file the boot may not have written yet: the apiserver CA,
+/// the client pair, a token, the serving pair (#69).
 ///
 /// Bounded, because a wait that never ends is a node that never says why it is
-/// not up; and fatal at the end of it, because a trust anchor that was named
-/// on the command line and is not on disk is a misconfiguration this process
-/// cannot work around.
-async fn wait_for_ca(path: &str) -> anyhow::Result<Vec<u8>> {
-    const LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+/// not up; and fatal at the end of it, because a credential that was named on
+/// the command line and is not on disk is a misconfiguration this process
+/// cannot work around. Answering "none" instead is a downgrade: a missing
+/// client pair or token made this kubelet `system:anonymous` (cluster-admin on
+/// sno, a stream of 403s that read as RBAC elsewhere), a missing CA a client
+/// that can never verify the apiserver, a missing serving pair a self-signed
+/// one.
+async fn wait_for_file(flag: &str, path: &str, limit: std::time::Duration) -> anyhow::Result<Vec<u8>> {
     let started = std::time::Instant::now();
     let mut said = false;
     loop {
         match std::fs::read(path) {
-            // An empty file is a write in progress, not an anchor.
+            // An empty file is a write in progress, not a credential.
             Ok(b) if !b.is_empty() => {
                 if said {
-                    tracing::info!(
-                        "apiserver CA {path} appeared after {:.1}s",
-                        started.elapsed().as_secs_f64()
-                    );
+                    tracing::info!("{flag} {path} appeared after {:.1}s", started.elapsed().as_secs_f64());
                 }
                 return Ok(b);
             }
             _ => {}
         }
-        if started.elapsed() >= LIMIT {
+        if started.elapsed() >= limit {
             anyhow::bail!(
-                "--apiserver-ca {path} was named but is still not readable after {}s. \
-                 Without it this kubelet cannot verify the apiserver and would retry \
-                 forever without saying why",
-                LIMIT.as_secs()
+                "{flag} {path} was named but is still not readable after {}s. \
+                 A credential that was asked for is never replaced by none",
+                limit.as_secs()
             );
         }
         if !said {
-            tracing::warn!("apiserver CA {path} is not there yet — waiting for it");
+            tracing::warn!("{flag} {path} is not there yet — waiting for it");
             said = true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
 
-fn read_file_bytes(path: &str) -> Option<Vec<u8>> {
-    match std::fs::read(path) {
-        Ok(b) => Some(b),
-        Err(e) => {
-            tracing::warn!("cannot read {path}: {e}");
-            None
-        }
+/// [`wait_for_file`] for an optional flag.
+async fn named(flag: &str, path: Option<&str>) -> anyhow::Result<Option<Vec<u8>>> {
+    match path {
+        Some(p) => Ok(Some(wait_for_file(flag, p, CREDENTIAL_WAIT).await?)),
+        None => Ok(None),
     }
 }
 
-const DEFAULT_APISERVER: &str = "http://127.0.0.1:6443";
+/// A token file's contents, trimmed.
+fn token_text(bytes: Vec<u8>) -> anyhow::Result<String> {
+    Ok(String::from_utf8(bytes)?.trim().to_string())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -394,6 +396,8 @@ async fn main() -> anyhow::Result<()> {
 
     // A kubeconfig supplies defaults for the apiserver URL, CA, client cert/key,
     // and token; explicit --* flags override the matching kubeconfig field.
+    // Written by the same boot as the credentials it names: waited for too.
+    named("--kubeconfig", cli.kubeconfig.as_deref()).await?;
     let kubeconfig = match cli.kubeconfig.as_deref() {
         Some(p) => match kubelet::kubeconfig::load(p) {
             Ok(kc) => {
@@ -407,7 +411,7 @@ async fn main() -> anyhow::Result<()> {
 
     // A trust anchor that was asked for and is not there **yet**.
     //
-    // `read_file_bytes` answers `None` for a missing file, and `None` here
+    // A best-effort read answered `None` for a missing file, and `None` here
     // means "no CA", so an explicitly configured anchor that had not been
     // written yet turned into a client that trusts only the public roots and
     // can therefore never verify this cluster's apiserver. Nothing rebuilds
@@ -431,32 +435,22 @@ async fn main() -> anyhow::Result<()> {
     //
     // So an anchor that was named is waited for, briefly, and its continued
     // absence is fatal rather than silent. A path that was given and cannot
-    // be read is a misconfiguration; only the delay is transient.
-    let apiserver_ca = match cli.apiserver_ca.as_deref() {
-        Some(path) => Some(wait_for_ca(path).await?),
-        None => kubeconfig.as_ref().and_then(|k| k.ca_pem.clone()),
-    };
-    let client_cert = cli
-        .client_certificate
-        .as_deref()
-        .and_then(read_file_bytes)
+    // be read is a misconfiguration; only the delay is transient. The same
+    // holds for every credential named below (#69): a missing client pair or
+    // token was skipped, and the kubelet ran as `system:anonymous`.
+    let apiserver_ca = named("--apiserver-ca", cli.apiserver_ca.as_deref())
+        .await?
+        .or_else(|| kubeconfig.as_ref().and_then(|k| k.ca_pem.clone()));
+    let client_cert = named("--client-certificate", cli.client_certificate.as_deref())
+        .await?
         .or_else(|| kubeconfig.as_ref().and_then(|k| k.client_cert_pem.clone()));
-    let client_key = cli
-        .client_key
-        .as_deref()
-        .and_then(read_file_bytes)
+    let client_key = named("--client-key", cli.client_key.as_deref())
+        .await?
         .or_else(|| kubeconfig.as_ref().and_then(|k| k.client_key_pem.clone()));
-    let bearer_token = cli
-        .token_file
-        .as_ref()
-        .and_then(|p| match std::fs::read_to_string(p) {
-            Ok(s) => Some(s.trim().to_string()),
-            Err(e) => {
-                tracing::warn!("cannot read token file {p}: {e}");
-                None
-            }
-        })
-        .or_else(|| kubeconfig.as_ref().and_then(|k| k.token.clone()));
+    let bearer_token = match named("--token-file", cli.token_file.as_deref()).await? {
+        Some(b) => Some(token_text(b)?),
+        None => kubeconfig.as_ref().and_then(|k| k.token.clone()),
+    };
 
     // Explicit --apiserver wins over kubeconfig's server, which wins over the default.
     let api_server_url = if cli.apiserver != DEFAULT_APISERVER {
@@ -474,18 +468,14 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(false);
 
     // Inbound :10250 server TLS + auth (rustkube-node#9).
-    let serving_cert = cli.tls_cert_file.as_deref().and_then(read_file_bytes);
-    let serving_key = cli.tls_private_key_file.as_deref().and_then(read_file_bytes);
-    let server_auth_token = cli
-        .server_token_file
-        .as_ref()
-        .and_then(|p| match std::fs::read_to_string(p) {
-            Ok(s) => Some(s.trim().to_string()),
-            Err(e) => {
-                tracing::warn!("cannot read server token file {p}: {e}");
-                None
-            }
-        });
+    // Named serving files too (#69): a missing pair silently became a
+    // self-signed one, a missing token no static token.
+    let serving_cert = named("--tls-cert-file", cli.tls_cert_file.as_deref()).await?;
+    let serving_key = named("--tls-private-key-file", cli.tls_private_key_file.as_deref()).await?;
+    let server_auth_token = match named("--server-token-file", cli.server_token_file.as_deref()).await? {
+        Some(b) => Some(token_text(b)?),
+        None => None,
+    };
 
     let config = KubeletConfig {
         node_name,
@@ -536,4 +526,51 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("kubelet failed: {e}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("kubelet-main-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[tokio::test]
+    async fn a_named_credential_written_late_is_waited_for() {
+        let f = scratch("late").join("kubelet.crt");
+        let g = f.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            // An empty file first: a write in progress, not the credential.
+            std::fs::write(&g, b"").unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            std::fs::write(&g, b"PEM").unwrap();
+        });
+        let got = wait_for_file("--client-certificate", f.to_str().unwrap(), Duration::from_secs(10)).await;
+        assert_eq!(got.unwrap(), b"PEM");
+    }
+
+    #[tokio::test]
+    async fn a_named_credential_that_never_appears_is_fatal_naming_the_flag() {
+        let f = scratch("never").join("token");
+        let e = wait_for_file("--token-file", f.to_str().unwrap(), Duration::from_millis(600))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("--token-file") && e.contains(f.to_str().unwrap()), "{e}");
+    }
+
+    #[tokio::test]
+    async fn an_unnamed_credential_is_none_at_once() {
+        assert!(named("--client-key", None).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn a_token_file_is_trimmed() {
+        assert_eq!(token_text(b"abc.def\n".to_vec()).unwrap(), "abc.def");
+    }
 }
