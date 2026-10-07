@@ -57,12 +57,13 @@ by #51.
 
 ## Work plan
 
-### In progress: #51, retire `scripts/build-golden.sh` (the second golden builder)
+### Done: #51, retire `scripts/build-golden.sh` (the second golden builder)
 
 2026-10-07. Authority is decided: `stormcentral component stage rustkube-node` (stormcos `deploy/build-goldens.sh`
 in stage mode). README/BUILD.md already say so (ad43ee9); the script remains. Nothing calls it: stormcentral runs
 stormcos's stage recipe or a repo's `deploy/build-golden.sh` (none here); no stormcos/stormpump/master reference.
-1. [ ] Delete `scripts/build-golden.sh`; README, BUILD.md, CLAUDE.md say it is gone; CHANGELOG; sc-build; close.
+1. [x] Deleted `scripts/build-golden.sh`; README, BUILD.md, CLAUDE.md, CHANGELOG (10d859c). sc-build `cargo build
+       --locked && cargo test --locked`: exit 0, 341 kubelet unit pass. No golden (nothing shipped changed). Closed.
 
 ### Done: #156 (P3), /vmInstance refuses metadata from a cache past a staleness bound
 
