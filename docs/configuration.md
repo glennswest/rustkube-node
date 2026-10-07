@@ -31,7 +31,7 @@ An em dash means there is no environment binding or the value is unset.
 | `--storage-overcommit` | `STORAGE_OVERCOMMIT` | `1.0`: committed bytes allowed per byte of stormblock data slab; a claim is charged its full class (#62, #108) |
 | `--storage-reserve-percent` | `STORAGE_RESERVE_PERCENT` | `5`: percent of the data slabs kept back from claims (#62) |
 | `--metadata-max-staleness` | `METADATA_MAX_STALENESS` | `40` (seconds, the node Lease duration): `/vmInstance` answers a machine's metadata from the VMI cache only within this long of word from the apiserver (a renewed Lease or a VMI list); past it, 503 + `Retry-After: 5` (#156). `0`: unbounded |
-| (env only) | `STORMDRIVE_URL` | `https://<node-ip>:9092`: the node's stormdrive, read for each PV's drive shelf/bay (#60) |
+| (env only) | `STORMDRIVE_URL` | `https://<node-ip>:9092`, then `http://<node-ip>:9092` (a stormdrive before stormdrive#19): the node's stormdrive, read for each PV's drive shelf/bay (#60) |
 | `--storage-alert-percent` | `STORAGE_ALERT_PERCENT` | `85`: percent of the data slabs written past which a `SlabFilling` Warning goes on this node's stormblock PVs (#62) |
 | `--pod-workers` | `POD_WORKERS` | 16 per CPU, at least 32, at most 256: Pod/VMI passes (starts, checks, teardowns) run at once (#138) |
 | `--kubelet-port` | `KUBELET_PORT` | `10250`; HTTPS on `0.0.0.0` |

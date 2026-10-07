@@ -323,13 +323,14 @@ pub fn ours(pv: &Value, node: &str) -> Option<String> {
 }
 
 /// One pass: every PV of this node's stormblock volumes brought up to date.
-/// `stormdrive` is the node's drive service; unreachable, the drives carry
+/// `stormdrive` is the node's drive service, the addresses tried in order
+/// (TLS since stormdrive#19, plain before it); unreachable, the drives carry
 /// stormblock's half alone. Answers how many PVs were written.
 pub async fn pass(
     client: &reqwest::Client,
     api_url: &str,
     engine: &crate::engine::EngineClient,
-    stormdrive: &str,
+    stormdrive: &[String],
     node: &str,
     events: Option<&crate::events::EventRecorder>,
 ) -> Result<usize, String> {
@@ -348,20 +349,25 @@ pub async fn pass(
         .collect();
     let by_name: HashMap<&str, &Value> = items.iter().filter_map(|v| Some((v["name"].as_str()?, v))).collect();
 
-    let drives = match client.get(format!("{}/api/v1/placement", stormdrive.trim_end_matches('/'))).send().await {
-        Ok(r) if r.status().is_success() => drive_index(&r.json().await.unwrap_or(Value::Null)),
-        other => {
-            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                let why = match other {
-                    Ok(r) => r.status().to_string(),
-                    Err(e) => e.to_string(),
-                };
-                tracing::warn!(%stormdrive, "drive locations unavailable (PVs carry stormblock's placement alone): {why}");
+    let mut drives = None;
+    let mut why = Vec::new();
+    for base in stormdrive {
+        match client.get(format!("{}/api/v1/placement", base.trim_end_matches('/'))).send().await {
+            Ok(r) if r.status().is_success() => {
+                drives = Some(drive_index(&r.json().await.unwrap_or(Value::Null)));
+                break;
             }
-            HashMap::new()
+            Ok(r) => why.push(format!("{base}: {}", r.status())),
+            Err(e) => why.push(format!("{base}: {e}")),
         }
-    };
+    }
+    let drives = drives.unwrap_or_else(|| {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!("drive locations unavailable (PVs carry stormblock's placement alone): {}", why.join("; "));
+        }
+        HashMap::new()
+    });
 
     let pvs: Value = match client.get(format!("{api_url}/api/v1/persistentvolumes")).send().await {
         Ok(r) if r.status().is_success() => r.json().await.map_err(|e| format!("PV list: {e}"))?,

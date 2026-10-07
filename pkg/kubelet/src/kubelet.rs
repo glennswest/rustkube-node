@@ -684,10 +684,12 @@ impl Kubelet {
         let events = (!self.config.api_server_url.is_empty()).then(|| {
             crate::events::EventRecorder::new(self.api_client.clone(), &self.config.api_server_url, &self.config.node_name)
         });
-        let stormdrive = std::env::var("STORMDRIVE_URL")
-            .ok()
-            .filter(|u| !u.is_empty())
-            .unwrap_or_else(|| format!("https://{}:9092", self.node_ip));
+        // TLS first (stormdrive#19); a stormdrive from before it speaks plain
+        // HTTP, and a newer one refuses plain reads, so the order is safe.
+        let stormdrive: Vec<String> = match std::env::var("STORMDRIVE_URL").ok().filter(|u| !u.is_empty()) {
+            Some(u) => vec![u],
+            None => vec![format!("https://{}:9092", self.node_ip), format!("http://{}:9092", self.node_ip)],
+        };
         loop {
             match crate::pv_placement::pass(
                 &self.api_client,
