@@ -57,7 +57,7 @@ by #51.
 
 ## Work plan
 
-### In progress: #98 (P1), the image config applied under the pod spec
+### Done: #98 (P1), the image config applied under the pod spec
 
 2026-10-08. sbregistry serves a pushed image's OCI config (`Entrypoint`, `Cmd`, `Env`, `WorkingDir`, `User`) as
 `config` on `GET /v1/goldens/{name}`; boot pallets have none until stormblock-registry#58 (open; `Volumes` too).
@@ -70,8 +70,10 @@ stormpump's Spec has `uid`/`gid` and the engine drops to them (exec.rs). Found: 
 2. [x] StormpumpImages fetches the config when it resolves a root (pallet or pull); the runtime composes in
        `create_container`. ContainerConfig `run_as_user`/`run_as_group`/`run_as_non_root` (container, else pod),
        forwarded on CRI gRPC too. emptyDir 0777 as upstream (a non-root user must write it).
-3. [ ] Tests, docs (README, status.md), CHANGELOG; sc-build; golden; file fsGroup (claims writable by a non-root
-       uid) and image `Volumes` (after stormblock-registry#58) as follow-ups; close.
+3. [x] Tests (8 new; `command_and_args_become_one_argv` had lost its #[test]), docs (README, status.md), CHANGELOG
+       (bbbb96a; build fix 01361c6 = #170). sc-build 31e53c6 `cargo build --locked && cargo test --locked`: 353
+       kubelet unit pass. Golden golden-rustkube-node-04134493c42a (stormcos#366). Follow-ups #171 (fsGroup), #172
+       (image Volumes, after stormblock-registry#58). Closed. Not run on a node.
 
 ### Waiting on stormcos#337: #95 (P1), pod/claim start toward ≤2 s / ≤1 s: the claim's own steps timed
 
