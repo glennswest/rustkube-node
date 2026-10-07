@@ -57,14 +57,15 @@ by #51.
 
 ## Work plan
 
-### In progress: #50 (P2), node services' lifecycle Events
+### Done: #50 (P2), node services' lifecycle Events
 
 2026-10-08. Done before: Started/Stopped/BackOff on transitions (7e6f4b0), NotStarted (7f4f3d1), exit and tail on
 Stopped/BackOff (#82). Left: first sight said nothing, events carried observation time, a failure read as Stopped.
 1. [x] `mirror::transition`: first sight judged against the API's mirror pod (same startedAt ±5 s and restartCount =
        the same run, nothing; else Started with the real start time; down while the API says running = ended);
        non-zero exit / signal = Warning Failed. mirror_node_services reads the mirror list first, then the events.
-2. [ ] Test, README, CHANGELOG; sc-build; golden; close.
+2. [x] Test, README, CHANGELOG (700d134). sc-build job 5246ba2d95: 416 pass. In golden c2f201fd4cb5 (stage: unchanged).
+       Closed.
 
 ### Done: #42 (P2), the node half of volume expansion (ReadWriteOncePod done in v0.8.0)
 
