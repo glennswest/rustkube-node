@@ -55,10 +55,9 @@ sha2 = "0.10"
 miniz_oxide = "0.8"
 # WebSocket framing for port-forward's SPDY tunnel and the channel protocols.
 # The handshake is answered here (sha1 + base64 for Sec-WebSocket-Accept), so
-# only the framing is taken. All three are already in the lock.
+# only the framing is taken (base64 is a dependency already). Both are in the lock.
 tokio-tungstenite = { version = "0.29", default-features = false }
 sha1 = "0.10"
-base64 = "0.22"
 tower = { version = "0.5" }
 hyper-util = { version = "0.1" }
 # The console doors themselves — serial and VNC — mounted in this server
