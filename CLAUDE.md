@@ -183,7 +183,7 @@ first endpoint.
        (configuration.md, README), CHANGELOG; sc-build (blocked: stormcentral#536).
        Done: 033a05a (4 tests). NOT yet built: the SC_BUILD_VM job was cancelled while queued. Rerun, close.
 
-### Waiting on stormcentral#536 (builds): #115 (P2), a stormpump exit wakes its own workload only
+### Waiting on stormcentral#541 (builds): #115 (P2), a stormpump exit wakes its own workload only
 
 2026-10-08. An unsolicited exit bumps the ring's counter; `pod_loop`/`vm_loop` answer with `wake_kind` **and**
 `worker.enqueue()` (a full list sync), so one exit wakes every Pod and VMI worker and re-syncs every pod.
@@ -193,6 +193,7 @@ first endpoint.
        exit arms go (the counter stays: it says the runtime has exit events).
 2. [ ] Tests (3), README, event-driven-design.md, CHANGELOG (92cd9ef). NOT yet built: the SC_BUILD_VM job was
        cancelled while queued (stormcentral#535/#536). Rerun, then golden (stormcentral#527) and close.
+       2026-10-08: e58d5ed7fc (97801bc) cancelled the same way; #115 proposed after stormcentral#541.
 
 ### Waiting on stormcentral#541 (builds): #126 (P2), no fixed init deadline; activeDeadlineSeconds bounds it
 
