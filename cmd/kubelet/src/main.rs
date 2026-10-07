@@ -512,6 +512,8 @@ async fn main() -> anyhow::Result<()> {
         serving_cert,
         serving_key,
         serving_cert_path: cli.tls_cert_file.as_ref().map(std::path::PathBuf::from),
+        client_cert_path: cli.client_certificate.as_ref().map(std::path::PathBuf::from),
+        client_key_path: cli.client_key.as_ref().map(std::path::PathBuf::from),
         serving_key_path: cli.tls_private_key_file.as_ref().map(std::path::PathBuf::from),
         server_auth_token,
         anonymous_auth: cli.anonymous_auth,

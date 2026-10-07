@@ -43,6 +43,87 @@ pub struct ClientAuth<'a> {
 /// (rustkube-node#16 — the old `build().unwrap_or_default()` dropped the CA and
 /// token on any builder failure, so the node never registered).
 pub fn build_authed_client(auth: &ClientAuth) -> anyhow::Result<reqwest::Client> {
+    build_authed_client_reloadable(auth).map(|(client, _)| client)
+}
+
+/// The kubelet's client certificate, replaceable while every clone of the
+/// client keeps working (#77). stormcert renews `system:node:<node>` in place
+/// at 80% of its year; the client read it once, so a kubelet that ran a year
+/// presented the old one until it expired and lost the apiserver.
+///
+/// rustls asks this for the pair on every handshake, and every clone of the
+/// `reqwest::Client` shares it: a new connection presents the current pair.
+#[derive(Debug)]
+pub struct ReloadingClientCert {
+    current: std::sync::RwLock<(std::sync::Arc<rustls::sign::CertifiedKey>, Vec<u8>, Vec<u8>)>,
+}
+
+impl ReloadingClientCert {
+    /// A pair as rustls presents it, checked: the key parses and matches the
+    /// certificate.
+    fn certified(cert_pem: &[u8], key_pem: &[u8]) -> anyhow::Result<std::sync::Arc<rustls::sign::CertifiedKey>> {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
+            .collect::<Result<_, _>>()
+            .map_err(|e| anyhow::anyhow!("client certificate: {e:?}"))?;
+        anyhow::ensure!(!certs.is_empty(), "client certificate: no certificate in the PEM");
+        let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| anyhow::anyhow!("client key: {e:?}"))?;
+        let signer = rustls::crypto::ring::sign::any_supported_type(&key)
+            .map_err(|e| anyhow::anyhow!("client key: {e}"))?;
+        let ck = rustls::sign::CertifiedKey::new(certs, signer);
+        ck.keys_match().map_err(|e| anyhow::anyhow!("client key does not match its certificate: {e}"))?;
+        Ok(std::sync::Arc::new(ck))
+    }
+
+    pub fn new(cert_pem: &[u8], key_pem: &[u8]) -> anyhow::Result<Self> {
+        Ok(Self {
+            current: std::sync::RwLock::new((Self::certified(cert_pem, key_pem)?, cert_pem.to_vec(), key_pem.to_vec())),
+        })
+    }
+
+    /// Present this pair from the next handshake on. `Ok(false)`: the same
+    /// bytes as now. An error (unparsable, the key not the certificate's, a
+    /// half-written pair) leaves the current pair in place.
+    pub fn replace(&self, cert_pem: &[u8], key_pem: &[u8]) -> anyhow::Result<bool> {
+        {
+            let cur = self.current.read().unwrap_or_else(|e| e.into_inner());
+            if cur.1 == cert_pem && cur.2 == key_pem {
+                return Ok(false);
+            }
+        }
+        let ck = Self::certified(cert_pem, key_pem)?;
+        *self.current.write().unwrap_or_else(|e| e.into_inner()) = (ck, cert_pem.to_vec(), key_pem.to_vec());
+        Ok(true)
+    }
+
+    /// The pair presented now (tests).
+    pub fn current(&self) -> std::sync::Arc<rustls::sign::CertifiedKey> {
+        self.current.read().unwrap_or_else(|e| e.into_inner()).0.clone()
+    }
+}
+
+impl rustls::client::ResolvesClientCert for ReloadingClientCert {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        _sigschemes: &[rustls::SignatureScheme],
+    ) -> Option<std::sync::Arc<rustls::sign::CertifiedKey>> {
+        Some(self.current())
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
+/// [`build_authed_client`], and the client certificate's resolver when the
+/// pair can be reloaded (#77): a client pair with the cluster CA and
+/// verification on. Otherwise (no pair, no CA, `--insecure-skip-tls-verify`)
+/// the identity is fixed for the life of the process, as it was.
+pub fn build_authed_client_reloadable(
+    auth: &ClientAuth,
+) -> anyhow::Result<(reqwest::Client, Option<std::sync::Arc<ReloadingClientCert>>)> {
     // Bound every request: without a timeout a single unresponsive apiserver
     // call (e.g. a TokenRequest that never returns) wedges the kubelet's sync
     // loop indefinitely. Connect + overall timeouts keep the loop live.
@@ -66,7 +147,29 @@ pub fn build_authed_client(auth: &ClientAuth) -> anyhow::Result<reqwest::Client>
     // Client certificate (mutual TLS). reqwest wants the cert chain and key in
     // one PEM bundle; require both halves so we fail loudly rather than sending
     // an anonymous handshake the apiserver will reject.
+    let mut reloadable = None;
     match (auth.client_cert_pem, auth.client_key_pem) {
+        (Some(cert), Some(key)) if auth.ca_pem.is_some() && !auth.insecure_skip_tls_verify => {
+            // The CA is the whole root store: the apiserver is the cluster's,
+            // signed by its CA, and nothing else is spoken to with this client.
+            use rustls::pki_types::pem::PemObject;
+            let mut roots = rustls::RootCertStore::empty();
+            for c in rustls::pki_types::CertificateDer::pem_slice_iter(auth.ca_pem.unwrap_or_default()) {
+                let c = c.map_err(|e| anyhow::anyhow!("apiserver CA cert not usable: {e:?}"))?;
+                roots.add(c).map_err(|e| anyhow::anyhow!("apiserver CA cert not usable: {e}"))?;
+            }
+            anyhow::ensure!(!roots.is_empty(), "apiserver CA cert not usable: no certificate in the PEM");
+            let resolver = std::sync::Arc::new(
+                ReloadingClientCert::new(cert, key).map_err(|e| anyhow::anyhow!("client certificate/key not usable: {e}"))?,
+            );
+            let tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .map_err(|e| anyhow::anyhow!("TLS config: {e}"))?
+                .with_root_certificates(roots)
+                .with_client_cert_resolver(resolver.clone());
+            builder = builder.use_preconfigured_tls(tls);
+            reloadable = Some(resolver);
+        }
         (Some(cert), Some(key)) => {
             let mut bundle = Vec::with_capacity(cert.len() + key.len() + 1);
             bundle.extend_from_slice(cert);
@@ -99,14 +202,70 @@ pub fn build_authed_client(auth: &ClientAuth) -> anyhow::Result<reqwest::Client>
     }
     builder = builder.default_headers(headers);
 
-    builder
+    let client = builder
         .build()
-        .map_err(|e| anyhow::anyhow!("failed to build apiserver HTTP client: {e}"))
+        .map_err(|e| anyhow::anyhow!("failed to build apiserver HTTP client: {e}"))?;
+    Ok((client, reloadable))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pair() -> (Vec<u8>, Vec<u8>) {
+        let k = rcgen::generate_simple_self_signed(vec!["system:node:n1".to_string()]).unwrap();
+        (k.cert.pem().into_bytes(), k.key_pair.serialize_pem().into_bytes())
+    }
+
+    /// #77: a renewed pair replaces the presented one; the same bytes do
+    /// nothing; a key that is not the certificate's is refused and the
+    /// current pair stays.
+    #[test]
+    fn a_renewed_client_pair_is_presented_and_a_mismatched_one_is_refused() {
+        let (ca, _) = pair();
+        let (a_cert, a_key) = pair();
+        let (client, resolver) = build_authed_client_reloadable(&ClientAuth {
+            ca_pem: Some(&ca),
+            client_cert_pem: Some(&a_cert),
+            client_key_pem: Some(&a_key),
+            ..Default::default()
+        })
+        .unwrap();
+        drop(client);
+        let r = resolver.expect("reloadable with a CA and a pair");
+        let first = r.current();
+        assert!(!r.replace(&a_cert, &a_key).unwrap(), "unchanged");
+        let (b_cert, b_key) = pair();
+        assert!(r.replace(&b_cert, &b_key).unwrap());
+        assert!(!std::sync::Arc::ptr_eq(&first, &r.current()), "the renewed pair is presented");
+        let now = r.current();
+        let err = r.replace(&b_cert, &a_key).unwrap_err().to_string();
+        assert!(err.contains("does not match"), "{err}");
+        assert!(std::sync::Arc::ptr_eq(&now, &r.current()), "the current pair stays");
+        assert!(r.replace(&b_cert, b"-----BEGIN PRIVATE KEY-----\nhalf").is_err());
+    }
+
+    #[test]
+    fn without_a_ca_or_with_insecure_the_identity_is_fixed() {
+        let (cert, key) = pair();
+        let (_, r) = build_authed_client_reloadable(&ClientAuth {
+            client_cert_pem: Some(&cert),
+            client_key_pem: Some(&key),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(r.is_none());
+        let (ca, _) = pair();
+        let (_, r) = build_authed_client_reloadable(&ClientAuth {
+            ca_pem: Some(&ca),
+            client_cert_pem: Some(&cert),
+            client_key_pem: Some(&key),
+            insecure_skip_tls_verify: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(r.is_none());
+    }
 
     #[test]
     fn builds_without_ca_or_token() {

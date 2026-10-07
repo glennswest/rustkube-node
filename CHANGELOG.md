@@ -2,6 +2,12 @@
 
 ## 2026-10-08
 
+- **fix:** A renewed client certificate is presented without a restart (#77). The apiserver client took
+  `--client-certificate`/`--client-key` once, so a kubelet that ran past stormcert's renewal (80% of 365 days)
+  kept presenting the old one until it expired. With a CA and verification on, the client's TLS now asks a
+  resolver for the pair on each handshake, shared by every clone of the client; the pair's directory is watched
+  (and looked at hourly) and the resolver swapped when the bytes change, after checking the key matches the
+  certificate.
 - **fix:** A node service's mirror pod is Ready only while the service answers (#96). It read Running and Ready
   whenever PID 1 had the process up, so stormstorage refusing `:9093` on 11.50 looked healthy to the console, test
   runs and release gates. The kubelet now reads each host-network service's own liveness URL from its golden's

@@ -38,7 +38,7 @@ An em dash means there is no environment binding or the value is unset.
 | `--apiserver-ca` | `APISERVER_CA` | Unset; PEM trust anchor, otherwise kubeconfig CA |
 | `--token-file` | `KUBELET_TOKEN_FILE` | Unset; outbound bearer token file, otherwise kubeconfig token |
 | `--kubeconfig` | `KUBECONFIG` | Unset; explicit file, not automatic `~/.kube/config` discovery |
-| `--client-certificate` | `KUBELET_CLIENT_CERT` | Unset; outbound PEM client certificate, otherwise kubeconfig |
+| `--client-certificate` | `KUBELET_CLIENT_CERT` | Unset; outbound PEM client certificate, otherwise kubeconfig. With `--apiserver-ca` (and verification on), its directory is watched (and looked at hourly) and a renewed pair is presented from the next connection on, no restart (#77; stormcert renews it at 80% of its year). A pair that does not load or whose key is not its certificate's is refused; the previous one stays. Without a CA, or with `--insecure-skip-tls-verify`, it is read once |
 | `--client-key` | `KUBELET_CLIENT_KEY` | Unset; outbound PEM key, otherwise kubeconfig |
 | `--insecure-skip-tls-verify` | — | `false`; ORed with kubeconfig's skip-verification setting |
 | `--tls-cert-file` | `KUBELET_TLS_CERT_FILE` | Unset; inbound serving PEM certificate (else a self-signed one, and the log says so). Its directory is watched, and the pair is reloaded in place when it changes, e.g. renewed by stormcert at boot (#89); a pair that does not load yet (half-written) leaves the previous one serving |

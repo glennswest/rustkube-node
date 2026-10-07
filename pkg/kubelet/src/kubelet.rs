@@ -49,6 +49,10 @@ pub struct KubeletConfig {
     /// Inbound `:10250` serving cert + key (PEM). None → self-signed at startup.
     pub serving_cert: Option<Vec<u8>>,
     pub serving_key: Option<Vec<u8>>,
+    /// Where the client pair came from (`--client-certificate`/`--client-key`),
+    /// to present a renewed one without a restart (#77).
+    pub client_cert_path: Option<std::path::PathBuf>,
+    pub client_key_path: Option<std::path::PathBuf>,
     /// Where the serving pair came from, to reload it when it is renewed (#89).
     pub serving_cert_path: Option<std::path::PathBuf>,
     pub serving_key_path: Option<std::path::PathBuf>,
@@ -97,6 +101,8 @@ impl Default for KubeletConfig {
             serving_key: None,
             serving_cert_path: None,
             serving_key_path: None,
+            client_cert_path: None,
+            client_key_path: None,
             server_auth_token: None,
             anonymous_auth: false,
             pod_manifest_path: Some(std::path::PathBuf::from("/etc/kubernetes/manifests")),
@@ -139,6 +145,8 @@ pub struct Kubelet {
     csi: Arc<crate::csi_plugins::CsiPlugins>,
     /// Per pod UID, the status this kubelet last had acknowledged (#141).
     acked_status: std::sync::Mutex<std::collections::HashMap<String, AckedStatus>>,
+    /// The client certificate, swapped in place when it is renewed (#77).
+    client_cert: Option<Arc<crate::client::ReloadingClientCert>>,
     /// What each node service's health endpoint says (#96), by asset name.
     service_health: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::node_health::ServiceHealth>>>,
     watches: apimachinery::reactor::WatchHub,
@@ -171,7 +179,7 @@ impl Kubelet {
         // A build failure is fatal — proceeding with a silently-degraded client
         // would fail every apiserver call with an opaque transport error
         // (rustkube-node#16).
-        let api_client = crate::client::build_authed_client(&crate::client::ClientAuth {
+        let (api_client, client_cert) = crate::client::build_authed_client_reloadable(&crate::client::ClientAuth {
             ca_pem: config.apiserver_ca.as_deref(),
             token: config.bearer_token.as_deref(),
             client_cert_pem: config.client_cert.as_deref(),
@@ -223,6 +231,7 @@ impl Kubelet {
             csi,
             acked_status: Default::default(),
             service_health: Default::default(),
+            client_cert,
         })
     }
 
@@ -405,6 +414,22 @@ impl Kubelet {
 
         // Each engine exit wakes its own Pod or VMI worker (#115).
         tokio::spawn(self.clone().exit_router());
+
+        // A renewed client certificate is presented without a restart (#77).
+        match (&self.client_cert, &self.config.client_cert_path, &self.config.client_key_path) {
+            (Some(resolver), Some(cert), Some(key)) => {
+                info!("apiserver client certificate {} is reloaded when it changes", cert.display());
+                tokio::spawn(reload_client_cert(resolver.clone(), cert.clone(), key.clone()));
+            }
+            (None, Some(cert), _) => {
+                warn!(
+                    "apiserver client certificate {} is read once: reloading it needs --apiserver-ca with \
+                     verification on; a renewed one is used after a restart",
+                    cert.display()
+                );
+            }
+            _ => {}
+        }
 
         // stormblock's volume changes, for the workers below (#101).
         {
@@ -1614,6 +1639,32 @@ impl Kubelet {
                 Next::After(d)
             }
             None => Next::AwaitEvent,
+        }
+    }
+}
+
+/// Watch the client pair's directory (and look every hour in case an event is
+/// missed) and present a renewed pair from the next handshake on (#77). A pair
+/// that does not load (half-written, the key not the certificate's) leaves
+/// the current one, and is tried again on the next change.
+async fn reload_client_cert(
+    resolver: Arc<crate::client::ReloadingClientCert>,
+    cert: std::path::PathBuf,
+    key: std::path::PathBuf,
+) {
+    let changed = Arc::new(tokio::sync::Notify::new());
+    let dir = cert.parent().map(|d| d.to_path_buf()).unwrap_or_else(|| cert.clone());
+    let notify = changed.clone();
+    tokio::spawn(async move { crate::fs_watch::watch(dir, move || notify.notify_one()).await });
+    loop {
+        let _ = tokio::time::timeout(Duration::from_secs(3600), changed.notified()).await;
+        // A writer replacing both files fires twice; the second look sees both.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (Ok(c), Ok(k)) = (std::fs::read(&cert), std::fs::read(&key)) else { continue };
+        match resolver.replace(&c, &k) {
+            Ok(true) => info!("apiserver client certificate reloaded from {}", cert.display()),
+            Ok(false) => {}
+            Err(e) => warn!("apiserver client certificate {} changed but does not load yet ({e}); still presenting the previous one", cert.display()),
         }
     }
 }
