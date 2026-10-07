@@ -511,6 +511,8 @@ async fn main() -> anyhow::Result<()> {
         insecure_skip_tls_verify,
         serving_cert,
         serving_key,
+        serving_cert_path: cli.tls_cert_file.as_ref().map(std::path::PathBuf::from),
+        serving_key_path: cli.tls_private_key_file.as_ref().map(std::path::PathBuf::from),
         server_auth_token,
         anonymous_auth: cli.anonymous_auth,
         cni_conf_dir: (!cli.no_cni).then(|| std::path::PathBuf::from(&cli.cni_conf_dir)),

@@ -2,6 +2,11 @@
 
 ## 2026-10-08
 
+- **fix:** The `:10250` serving pair is reloaded when stormcert renews it (#89). It was read once, so a pair renewed at
+  boot after the kubelet started (stormcert#14) was not served until the next restart. `--tls-cert-file`'s directory
+  is now watched and the pair reloaded in place when its bytes change (a half-written pair leaves the previous one
+  serving). The log says which pair is served, configured or self-signed. A named pair that is missing already waits
+  and then exits, never falling back (#69).
 - **fix:** kube-proxy deletes stale UDP conntrack entries (#147). It rewrote the DNAT when a Service's backend went
   but left conntrack, so a long-lived UDP socket to a ClusterIP (a DNS client of kube-dns) kept reaching the
   replaced pod for 30–120 s. After an apply it now runs, as upstream, `conntrack -D -p udp --orig-dst <clusterIP>

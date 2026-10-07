@@ -38,6 +38,10 @@ pub struct ServerConfig {
     /// generated at startup (SANs = node name + node IP).
     pub tls_cert: Option<Vec<u8>>,
     pub tls_key: Option<Vec<u8>>,
+    /// The files the pair was read from: watched, and the pair reloaded when
+    /// they change (#89, stormcert renews it at boot).
+    pub tls_cert_path: Option<std::path::PathBuf>,
+    pub tls_key_path: Option<std::path::PathBuf>,
     pub node_name: String,
     pub node_ip: String,
     /// Static bearer token accepted for inbound auth (e.g. a monitoring scraper).
@@ -197,24 +201,38 @@ pub async fn serve(
     )
     .layer(middleware::from_fn_with_state(auth, auth_mw));
 
-    // Serving cert: use the provided pair, else self-sign.
+    // Serving cert: use the provided pair, else self-sign, and say which
+    // (#89). A pair that was named and is missing never gets here: main waits
+    // for it and then exits (#69).
     let (cert_pem, key_pem) = match (&config.tls_cert, &config.tls_key) {
-        (Some(c), Some(k)) => (c.clone(), k.clone()),
-        _ => match self_signed_cert(&config.node_name, &config.node_ip) {
-            Ok(pair) => pair,
-            Err(e) => {
-                warn!("kubelet server: self-signed cert generation failed: {e}");
-                return;
+        (Some(c), Some(k)) => {
+            info!(
+                "kubelet server: serving the configured pair ({})",
+                config.tls_cert_path.as_ref().map_or("given".into(), |p| p.display().to_string())
+            );
+            (c.clone(), k.clone())
+        }
+        _ => {
+            warn!("kubelet server: no --tls-cert-file: serving a self-signed certificate for {}", config.node_name);
+            match self_signed_cert(&config.node_name, &config.node_ip) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn!("kubelet server: self-signed cert generation failed: {e}");
+                    return;
+                }
             }
-        },
+        }
     };
-    let tls = match axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem, key_pem).await {
+    let tls = match axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem.clone(), key_pem.clone()).await {
         Ok(t) => t,
         Err(e) => {
             warn!("kubelet server: TLS config failed: {e}");
             return;
         }
     };
+    if let (Some(cert), Some(key)) = (config.tls_cert_path.clone(), config.tls_key_path.clone()) {
+        tokio::spawn(reload_on_change(tls.clone(), cert, key, (cert_pem, key_pem)));
+    }
 
     let addr: SocketAddr = ([0, 0, 0, 0], port).into();
     info!(
@@ -288,6 +306,55 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Reload the serving pair whenever its files change (#89): stormcert renews
+/// it at boot (stormcert#14), and a kubelet that read it once served the old
+/// one until it restarted. Watches the pair's directory; reloads only when
+/// the bytes differ from what is served.
+async fn reload_on_change(
+    tls: axum_server::tls_rustls::RustlsConfig,
+    cert: std::path::PathBuf,
+    key: std::path::PathBuf,
+    mut served: (Vec<u8>, Vec<u8>),
+) {
+    let changed = Arc::new(tokio::sync::Notify::new());
+    let dir = cert.parent().map(|d| d.to_path_buf()).unwrap_or_else(|| cert.clone());
+    let notify = changed.clone();
+    tokio::spawn(async move { crate::fs_watch::watch(dir, move || notify.notify_one()).await });
+    loop {
+        changed.notified().await;
+        // A writer that replaces both files fires twice; the second look sees both.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if let Some(now) = reload_pair(&tls, &cert, &key, &served).await {
+            served = now;
+        }
+    }
+}
+
+/// Read the pair; when it differs from `served`, load it into `tls`. The new
+/// pair when it was loaded; `None` when unchanged, unreadable or refused (a
+/// half-written pair: the old one stays until the next change).
+async fn reload_pair(
+    tls: &axum_server::tls_rustls::RustlsConfig,
+    cert: &std::path::Path,
+    key: &std::path::Path,
+    served: &(Vec<u8>, Vec<u8>),
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let (Ok(c), Ok(k)) = (std::fs::read(cert), std::fs::read(key)) else { return None };
+    if c.is_empty() || k.is_empty() || (c.as_slice(), k.as_slice()) == (served.0.as_slice(), served.1.as_slice()) {
+        return None;
+    }
+    match tls.reload_from_pem(c.clone(), k.clone()).await {
+        Ok(()) => {
+            info!("kubelet server: serving pair reloaded from {}", cert.display());
+            Some((c, k))
+        }
+        Err(e) => {
+            warn!("kubelet server: {} changed but does not load yet ({e}); still serving the previous pair", cert.display());
+            None
+        }
+    }
 }
 
 /// Generate a self-signed serving cert (PEM cert, PEM key) for the node.
@@ -757,6 +824,39 @@ mod tests {
         async fn remove_image(&self, _: &str) -> Result<(), CriError> {
             Ok(())
         }
+    }
+
+    /// #89: a renewed serving pair is loaded in place; an unchanged one is
+    /// left alone, and a half-written one does not replace what is served.
+    #[tokio::test]
+    async fn a_renewed_serving_pair_is_reloaded_and_a_half_written_one_is_not() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = std::env::temp_dir().join(format!("kubelet-serving-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert, key) = (dir.join("kubelet-serving.crt"), dir.join("kubelet-serving.key"));
+        let a = self_signed_cert("node-a", "10.0.0.1").unwrap();
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem(a.0.clone(), a.1.clone()).await.unwrap();
+        let before = tls.get_inner();
+
+        std::fs::write(&cert, &a.0).unwrap();
+        std::fs::write(&key, &a.1).unwrap();
+        assert!(reload_pair(&tls, &cert, &key, &a).await.is_none(), "unchanged: not reloaded");
+        assert!(Arc::ptr_eq(&before, &tls.get_inner()));
+
+        // Renewed: a new pair is served.
+        let b = self_signed_cert("node-a", "10.0.0.1").unwrap();
+        std::fs::write(&cert, &b.0).unwrap();
+        std::fs::write(&key, &b.1).unwrap();
+        let served = reload_pair(&tls, &cert, &key, &a).await.expect("reloaded");
+        assert_eq!(served, b);
+        let after = tls.get_inner();
+        assert!(!Arc::ptr_eq(&before, &after));
+
+        // Half-written (a key that does not parse yet): the old pair stays.
+        std::fs::write(&key, b"-----BEGIN PRIVATE KEY-----\npartial").unwrap();
+        assert!(reload_pair(&tls, &cert, &key, &b).await.is_none());
+        assert!(Arc::ptr_eq(&after, &tls.get_inner()), "still the previous pair");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     pub(super) fn app() -> Router {

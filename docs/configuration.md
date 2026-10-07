@@ -41,7 +41,7 @@ An em dash means there is no environment binding or the value is unset.
 | `--client-certificate` | `KUBELET_CLIENT_CERT` | Unset; outbound PEM client certificate, otherwise kubeconfig |
 | `--client-key` | `KUBELET_CLIENT_KEY` | Unset; outbound PEM key, otherwise kubeconfig |
 | `--insecure-skip-tls-verify` | — | `false`; ORed with kubeconfig's skip-verification setting |
-| `--tls-cert-file` | `KUBELET_TLS_CERT_FILE` | Unset; inbound serving PEM certificate |
+| `--tls-cert-file` | `KUBELET_TLS_CERT_FILE` | Unset; inbound serving PEM certificate (else a self-signed one, and the log says so). Its directory is watched, and the pair is reloaded in place when it changes, e.g. renewed by stormcert at boot (#89); a pair that does not load yet (half-written) leaves the previous one serving |
 | `--tls-private-key-file` | `KUBELET_TLS_PRIVATE_KEY_FILE` | Unset; inbound serving PEM key |
 | `--server-token-file` | `KUBELET_SERVER_TOKEN_FILE` | Unset; static token accepted by inbound server, alongside TokenReview |
 | `--anonymous-auth` | — | `false`; when true disables inbound bearer authentication |

@@ -49,6 +49,9 @@ pub struct KubeletConfig {
     /// Inbound `:10250` serving cert + key (PEM). None → self-signed at startup.
     pub serving_cert: Option<Vec<u8>>,
     pub serving_key: Option<Vec<u8>>,
+    /// Where the serving pair came from, to reload it when it is renewed (#89).
+    pub serving_cert_path: Option<std::path::PathBuf>,
+    pub serving_key_path: Option<std::path::PathBuf>,
     /// Static bearer token accepted by the inbound server (e.g. for monitoring).
     pub server_auth_token: Option<String>,
     /// Serve the inbound `:10250` endpoints unauthenticated (dev only).
@@ -92,6 +95,8 @@ impl Default for KubeletConfig {
             insecure_skip_tls_verify: false,
             serving_cert: None,
             serving_key: None,
+            serving_cert_path: None,
+            serving_key_path: None,
             server_auth_token: None,
             anonymous_auth: false,
             pod_manifest_path: Some(std::path::PathBuf::from("/etc/kubernetes/manifests")),
@@ -345,6 +350,8 @@ impl Kubelet {
             let server_config = crate::server::ServerConfig {
                 tls_cert: self.config.serving_cert.clone(),
                 tls_key: self.config.serving_key.clone(),
+                tls_cert_path: self.config.serving_cert_path.clone(),
+                tls_key_path: self.config.serving_key_path.clone(),
                 node_name: self.config.node_name.clone(),
                 node_ip: self.node_ip.clone(),
                 auth_token: self.config.server_auth_token.clone(),
