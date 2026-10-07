@@ -135,8 +135,14 @@ kubelet watches `--cni-conf-dir` (inotify), so the Pods waiting on it are
 started as soon as the agent writes its conflist (10 s fallback where the
 directory cannot be watched). A failed ADD (the agent not serving yet) is
 retried on a backoff from its own first failure, 1 s at first (#148).
-Host-network Pods, the CNI agent's own among them, bypass this. CRI delegates networking to the external runtime. Node Ready
-is not yet gated on CNI readiness (#3/#32).
+Host-network Pods, the CNI agent's own among them, bypass this. CRI delegates networking to the external runtime. **Node
+Ready is not gated on the CNI** (owner, #3: "we want to get working early"): the node is Ready once the kubelet is up, a
+pod-network pod waits for the config and then for a working ADD, and host-network pods start at once. A waiting pod says
+why on its containers and in an Event: `NetworkNotReady` with no config, `FailedCreatePodSandBox` with the plugin's own
+words when ADD fails (Cilium's "unable to connect to Cilium agent … Is the agent running?" with the agent gone). The
+CNI ADD runs with the sandbox's netns and `K8S_POD_NAMESPACE`/`K8S_POD_NAME`/`K8S_POD_INFRA_CONTAINER_ID`, its address is
+the pod's IP, a failed ADD is DEL'd and never leaves a pod addressless, and DEL runs at stop (verified live on server3,
+11.91, #3).
 
 **Every container runs on its own root** on stormpump (#104, the owner's rule): a copy-on-write clone of its
 image's **sealed golden**, made when the container is created (engine volume `ctr-<container>`, attached over

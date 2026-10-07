@@ -193,7 +193,7 @@ Full lists: `docs/api.md`, `docs/configuration.md`, `docs/metrics.md`.
   launcher Pod, rustkube#203); the proof is stormcos_qa#18's namespace-isolation run (#88)
 - **ext4 for the 64Ti–1Pi classes** once stormblock carries the fixed formatter (#149, stormblock#289)
 - **exec / attach / port-forward** (#56); image config (Entrypoint/Cmd/Env/User) under the pod spec (#98)
-- **Mount propagation for CSI** (#81); restartable init sidecars (#111); CNI-gated Node Ready (#3/#32)
+- **Mount propagation for CSI** (#81); restartable init sidecars (#111)
 - **Live measurement** of warm subsecond starts on the Dell (#102)
 
 ---

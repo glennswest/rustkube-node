@@ -2,6 +2,12 @@
 
 ## 2026-10-08
 
+- **feat:** A pod waiting on the network says why in an Event too (#3), as upstream: Warning `NetworkNotReady` with no
+  CNI config, Warning `FailedCreatePodSandBox` with the plugin's words when CNI ADD fails. Only the container's waiting
+  message (and the kubelet's log) said it before.
+- **docs:** Node Ready is not gated on the CNI (owner's decision on #3); the node side Cilium needs verified live on
+  server3 (11.91): pod-to-pod on one node, endpoint released on delete, a sandbox that fails rather than starts
+  addressless with the agent gone, and the pod starting by itself once the agent is back.
 - **feat:** Events on the claim while its size-class blank is made (#70): Normal `Provisioning` while the blank is
   minted or formats, Warning `ProvisioningFailed` with stormblock's words when a mint or clone is refused, Normal
   `ProvisioningSucceeded` once cloned. Only the pod's FailedMount said anything before; the console showed "a

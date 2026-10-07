@@ -2850,6 +2850,8 @@ impl PodManager {
                         self.event_waits.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
                         self.due_in(uid, deadlines::NETWORK_FALLBACK);
                         let message = format!("network is not ready: {what}");
+                        // Upstream's Event for it (#3); repeats aggregate.
+                        self.event(pod, "Warning", "NetworkNotReady", &message).await;
                         outcome.updates.push(self.waiting_pod(pod, message));
                     }
                     // A config, and its ADD failed (the agent is not serving
@@ -2872,6 +2874,12 @@ impl PodManager {
                         self.event_waits.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
                         self.due_in(uid, deadlines::wait_backoff(failing));
                         let message = format!("network is not ready: {what}");
+                        // The plugin's own reason on the pod (#3): Cilium's
+                        // "unable to connect to Cilium agent … Is the agent
+                        // running?" was only in the kubelet's log.
+                        self.event(pod, "Warning", "FailedCreatePodSandBox", &format!(
+                            "Failed to create pod sandbox: {what}"
+                        )).await;
                         outcome.updates.push(self.waiting_pod(pod, message));
                     }
                     // Admitted and waiting, not missing (#63): the pod is
@@ -8721,6 +8729,41 @@ pub(crate) mod tests {
         rt.network.store(0, Ordering::SeqCst);
         assert_eq!(mgr.sync_pods(&[p.clone()]).await.updates[0].phase, "Running");
         assert!(mgr.network_waits.lock().unwrap().is_empty());
+    }
+
+    /// #3: a pod waiting on the network says why in Events too, as upstream:
+    /// `NetworkNotReady` with no CNI config, `FailedCreatePodSandBox` with the
+    /// plugin's own words when ADD fails (seen live: Cilium's agent gone).
+    #[tokio::test]
+    async fn a_pod_waiting_on_the_network_has_upstreams_events() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let ev = events.clone();
+        let app = axum::Router::new().route(
+            "/api/v1/namespaces/{ns}/events",
+            axum::routing::post(move |axum::Json(b): axum::Json<Value>| {
+                ev.lock().unwrap().push(b);
+                async { (axum::http::StatusCode::CREATED, axum::Json(json!({}))) }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let rt = Arc::new(FakeRuntime::default());
+        let mut mgr = PodManager::with_api(rt.clone(), rt.clone(), NODE, &url, "127.0.0.1", reqwest::Client::new());
+        let tmp = tempfile::tempdir().unwrap();
+        mgr.state_root = tmp.path().to_string_lossy().into_owned();
+        let p = pod("uid-ev", "web", "Always", simple_container());
+        let reasons = || events.lock().unwrap().iter().map(|e| (e["type"].as_str().unwrap_or("").to_string(), e["reason"].as_str().unwrap_or("").to_string(), e["message"].as_str().unwrap_or("").to_string())).collect::<Vec<_>>();
+
+        rt.network.store(1, Ordering::SeqCst);
+        mgr.sync_pods(&[p.clone()]).await;
+        let r = reasons();
+        assert!(r.iter().any(|(t, why, m)| t == "Warning" && why == "NetworkNotReady" && m.contains("no CNI network configured yet")), "{r:?}");
+
+        rt.network.store(2, Ordering::SeqCst);
+        mgr.sync_pods(&[p.clone()]).await;
+        let r = reasons();
+        assert!(r.iter().any(|(t, why, m)| t == "Warning" && why == "FailedCreatePodSandBox" && m.contains("CNI ADD failed: agent not serving")), "{r:?}");
     }
 
     /// #148: a waiting pod that goes is not left among the network waiters.
