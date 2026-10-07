@@ -2,6 +2,11 @@
 
 ## 2026-10-08
 
+- **feat:** A VM's verbs on `:10250` (#94): `PUT /vmVerb/{ns}/{name}/{verb}` hands `pause`, `unpause`, `softreboot`,
+  `reset`, `status`, `freeze`, `thaw` (KubeVirt's `unfreeze` accepted) and `snapshot` to stormvm's mounted router,
+  behind the server's auth with the same handover as the console doors (now one `to_console`), the verb's query
+  forwarded without `token`. `migrate`/`receive` are refused (migration is the VMI status's, #40). For the
+  apiserver's `subresources.kubevirt.io` verbs (rustkube#141).
 - **feat:** `kubectl logs` on a node service not run by stormd (stormblock, the registry, timesync) reads its live log
   (#87). stormpump#90 lists each asset's last runs in `assets.json`, each naming its `w<id>.log`; the kubelet now
   serves the running run's files (rotated part first, `-f` follows the live one) and, for `--previous`, the newest

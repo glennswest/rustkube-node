@@ -63,7 +63,7 @@ by #51.
 softreboot, reset, status, freeze, thaw, snapshot (and migrate/receive, not for here: migration is #40's, by the
 VMI's status). rustkube#141 (the apiserver's verb proxy) is open and has not fixed a path: this route is the one #94
 proposed, said on rustkube#141. KubeVirt says `unfreeze` where stormvm says `thaw`: both accepted.
-1. [ ] `vm_verb`: verb allow-list, query forwarded without `token`, the console's handover (`to_console`, shared
+1. [x] `vm_verb`: verb allow-list, query forwarded without `token`, the console's handover (`to_console`, shared
        with `/vmConsole`). Tests through the kubelet router; docs (api.md, README), CHANGELOG; sc-build.
 
 ### Waiting on stormcentral#536 (builds): #89, the serving pair: never a silent self-signed fallback; reloaded when renewed

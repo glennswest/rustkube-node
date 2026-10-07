@@ -207,8 +207,13 @@ unauthenticated node-local port.
 The mounted router is told where this node's stormblock engine is (the
 kubelet's `--stormblock`, default `http://127.0.0.1:9090`), so its `snapshot`
 verb can take a VM's disks as one group snapshot; it finds the engine token
-itself, in the same places the kubelet does. Only the console doors are routed
-onto `:10250` so far: the control verbs (`pause`, `snapshot`, …) wait on #94.
+itself, in the same places the kubelet does. Its verbs are on `:10250` too (#94):
+`PUT /vmVerb/{ns}/{name}/{verb}`, for `pause`, `unpause`, `softreboot`, `reset`,
+`status`, `freeze`, `thaw` (KubeVirt's `unfreeze` is accepted for it) and
+`snapshot`, its query (`name`, `quiesce`) forwarded without any `token`, behind this
+server's auth exactly as the doors are. `migrate`/`receive` are not offered: a
+migration is driven by the VMI's status (#40). The apiserver's
+`subresources.kubevirt.io` verb proxy is rustkube#141.
 
 `stormvm serve` mounts the same router on `127.0.0.1:9095`, and it ships: stormcos
 runs it on every node as a service golden (`stormvm`, port 9095, loopback only;

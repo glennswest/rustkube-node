@@ -26,7 +26,7 @@ use axum::extract::{ConnectInfo, FromRef, Path, Query, Request, State};
 use axum::http::{header::AUTHORIZATION, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::{routing::{delete, get}, Json, Router};
+use axum::{routing::{delete, get, put}, Json, Router};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -150,6 +150,9 @@ fn router_with_console(
         // handler proxies to (rustkube#61), answered by stormvm's own router
         // mounted below (rustkube-node#43).
         .route("/vmConsole/{namespace}/{name}/{door}", get(vm_console))
+        // A VM's verbs (#94): what the apiserver's subresources.kubevirt.io
+        // verb handlers proxy to (rustkube#141), answered by the same router.
+        .route("/vmVerb/{namespace}/{name}/{verb}", put(vm_verb))
         // The streaming subresources the apiserver splices through (#56):
         // `kubectl port-forward`, `exec`, `attach`. GET for a WebSocket
         // handshake, POST for SPDY.
@@ -1877,10 +1880,8 @@ mod log_tests {
 async fn vm_console(
     State(console): State<Router>,
     Path((namespace, name, door)): Path<(String, String, String)>,
-    mut req: Request,
+    req: Request,
 ) -> Response {
-    use tower::ServiceExt;
-
     // stormvm's own spelling: `serial` and `vnc` are the doors it serves.
     // Refused here rather than forwarded, so a typo reads as a bad request
     // rather than as a 404 that could equally mean "no such VM".
@@ -1935,6 +1936,56 @@ async fn vm_console(
     // doors from here for the same reason the `Authorization` header must
     // not — see below. (`to` belongs to the migrate and receive verbs, which
     // are not mounted.)
+    to_console(console, uri, req).await
+}
+
+/// `PUT /vmVerb/{namespace}/{name}/{verb}`: a VM's verb (#94), answered by
+/// stormvm's router (`PUT /api/v1/vms/{ns}/{name}/{verb}`) behind this
+/// server's auth, as the console doors are. KubeVirt's `unfreeze` is stormvm's
+/// `thaw`. `migrate` and `receive` are not offered: migration is driven by the
+/// VMI's status (#40), never by a verb from outside.
+async fn vm_verb(
+    State(console): State<Router>,
+    Path((namespace, name, verb)): Path<(String, String, String)>,
+    req: Request,
+) -> Response {
+    const VERBS: &[&str] = &["pause", "unpause", "softreboot", "reset", "status", "freeze", "thaw", "snapshot"];
+    let verb = if verb == "unfreeze" { "thaw".to_string() } else { verb };
+    if !VERBS.contains(&verb.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("no VM verb {verb}: expected one of {}, or unfreeze\n", VERBS.join(", ")),
+        )
+            .into_response();
+    }
+    // The verb's own parameters go with it (snapshot's `name`, `quiesce`); a
+    // `token` does not, for the reason `to_console` drops `Authorization`.
+    let query: String = req
+        .uri()
+        .query()
+        .map(|q| {
+            q.split('&')
+                .filter(|kv| !kv.is_empty() && kv.split('=').next() != Some("token"))
+                .collect::<Vec<_>>()
+                .join("&")
+        })
+        .unwrap_or_default();
+    let path = format!(
+        "/api/v1/vms/{namespace}/{name}/{verb}{}{query}",
+        if query.is_empty() { "" } else { "?" }
+    );
+    let uri = match path.parse::<axum::http::Uri>() {
+        Ok(u) => u,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad verb path: {e}\n")).into_response(),
+    };
+    to_console(console, uri, req).await
+}
+
+/// Hand `req` to the console router at `uri`, as its own listener would have
+/// built it (the reasons are on [`vm_console`]): the path captures cleared,
+/// `ConnectInfo` loopback, the upgrade handle kept, `Authorization` dropped.
+async fn to_console(console: Router, uri: axum::http::Uri, req: Request) -> Response {
+    use tower::ServiceExt;
     let (mut parts, body) = req.into_parts();
     parts.uri = uri;
 
@@ -2211,11 +2262,54 @@ mod console_tests {
         assert_eq!(get(app, "/api/v1/vms").await.status(), StatusCode::NOT_FOUND);
     }
 
+    async fn put_verb(app: Router, uri: &str) -> (StatusCode, String) {
+        let req = HttpRequest::builder().method("PUT").uri(uri).body(Body::empty()).unwrap();
+        status_and_body(app.oneshot(req).await.unwrap()).await
+    }
+
+    /// #94: the verbs reach stormvm's router through the kubelet: `snapshot`
+    /// with its own parameters gets as far as the machine (no hypervisor
+    /// listens here), so the route, the loopback admission and the stripped
+    /// `token` all held; an unregistered VM gets the router's own answer.
+    #[tokio::test]
+    async fn a_vm_verb_reaches_stormvms_router_through_the_kubelet() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().to_str().unwrap();
+        register(run_dir, "default", "web-1");
+        let app = app_with_console(run_dir);
+
+        let (status, body) =
+            put_verb(app.clone(), "/vmVerb/default/web-1/snapshot?name=before&quiesce=never&token=nope").await;
+        assert_ne!(status, StatusCode::FORBIDDEN, "a token reached the router: {body}");
+        assert!(body.contains("hypervisor"), "{status}: {body}");
+
+        let (status, body) = put_verb(app.clone(), "/vmVerb/default/ghost/pause").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(body.contains("no vm default/ghost"), "the router's answer, not a missing route: {body}");
+
+        // KubeVirt's spelling of thaw is accepted and forwarded.
+        let (status, body) = put_verb(app.clone(), "/vmVerb/default/web-1/unfreeze").await;
+        assert_ne!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(!body.contains("no VM verb"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_verb_that_is_not_offered_is_refused_here() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_with_console(dir.path().to_str().unwrap());
+        for verb in ["migrate", "receive", "nonsense"] {
+            let (status, body) = put_verb(app.clone(), &format!("/vmVerb/default/web-1/{verb}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{verb}: {body}");
+            assert!(body.contains("no VM verb"), "{body}");
+        }
+        assert_eq!(get(app, "/vmVerb/default/web-1/pause").await.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
     /// #83: the console is told where stormblock is, so `snapshot` gets past
     /// "this service was not told where stormblock is" to the machine itself.
     ///
-    /// Asked of the console router directly: the kubelet does not route the
-    /// verbs onto :10250 yet (#94). No hypervisor listens here, so the answer
+    /// Asked of the console router directly (through the kubelet it is
+    /// `a_vm_verb_reaches_stormvms_router_through_the_kubelet`, #94). No hypervisor listens here, so the answer
     /// is the machine's silence — which is only reached once stormblock is set.
     #[tokio::test]
     async fn the_snapshot_verb_knows_where_stormblock_is() {
