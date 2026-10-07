@@ -57,6 +57,15 @@ by #51.
 
 ## Work plan
 
+### In progress: #89, the serving pair: never a silent self-signed fallback; reloaded when renewed
+
+2026-10-08. The wait-then-fatal half was #69 (5d869b9): `--tls-cert-file`/`--tls-private-key-file` wait 60 s, then
+exit naming the flag. Left: say which pair :10250 serves, and reload it when stormcert renews it (at boot,
+stormcert#14) instead of serving the old one until the kubelet restarts.
+1. [ ] Paths into `ServerConfig`; log "configured pair <path>" or "self-signed (no --tls-cert-file)"; watch the
+       pair's directory (fs_watch) and `reload_from_pem` when its bytes change; a half-written pair fails and the
+       old one stays. Test; docs (configuration.md), CHANGELOG; sc-build (stormcentral#536).
+
 ### Waiting on the owner: #104 (P2), private writable container roots
 
 2026-10-08. stormpump's rule ("one storage primitive … no overlay, no tmpfs layering", spec.rs) makes a private
