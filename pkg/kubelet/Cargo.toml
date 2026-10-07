@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+# Node, machine and filesystem stats (#21).
+cadvisor-host = { workspace = true }
+cadvisor-model = { workspace = true }
 # The node's execution engine. Depended on for its ring client and spec
 # encoding rather than for the engine itself — its whole dependency set is
 # libc plus two crates with none of their own, so this costs the kubelet
