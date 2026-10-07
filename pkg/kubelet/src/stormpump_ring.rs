@@ -535,15 +535,7 @@ impl RingClient {
 
     /// Signal, grace, kill — one op, so the policy timer is the engine's.
     pub fn stop(&self, workload: Handle, grace_secs: u64) -> Result<(), RingError> {
-        self.submit(
-            Sqe {
-                opcode: Op::Stop as u8,
-                primary: workload,
-                inline_a: grace_secs,
-                ..Default::default()
-            },
-            None,
-        )?;
+        self.submit(stop_sqe(workload, grace_secs), None)?;
         Ok(())
     }
 
@@ -913,9 +905,38 @@ fn run(
     }
 }
 
+/// `STOP`: SIGTERM, the grace, then SIGKILL (stormpump docs/ABI.md, op 20).
+///
+/// The grace is `inline_b`, in **milliseconds**, and 0 there means the
+/// engine's default of 30 s, so "now" is `FORCE` (#174). This put the grace in
+/// `inline_a`, in seconds, which the engine overwrites with the signal: every
+/// stop waited the default 30 s before the kill, whatever the pod's
+/// `terminationGracePeriodSeconds`.
+fn stop_sqe(workload: Handle, grace_secs: u64) -> Sqe {
+    let (flags, grace_ms) = match grace_secs {
+        0 => (stormpump_abi::flags::FORCE, 0),
+        s => (0, s.saturating_mul(1000)),
+    };
+    Sqe { opcode: Op::Stop as u8, primary: workload, flags, inline_b: grace_ms, ..Default::default() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #174: the grace reaches the engine in `inline_b`, in milliseconds;
+    /// zero is FORCE, because zero there means the 30 s default.
+    #[test]
+    fn a_stops_grace_is_inline_b_in_milliseconds_and_zero_is_force() {
+        let h = Handle::NONE;
+        let s = stop_sqe(h, 5);
+        assert_eq!((s.opcode, s.inline_a, s.inline_b, s.flags), (Op::Stop as u8, 0, 5_000, 0));
+        let s = stop_sqe(h, 30);
+        assert_eq!((s.inline_b, s.flags), (30_000, 0));
+        let s = stop_sqe(h, 0);
+        assert_eq!((s.inline_b, s.flags), (0, stormpump_abi::flags::FORCE));
+        assert_eq!(stop_sqe(h, u64::MAX).inline_b, u64::MAX, "saturates rather than wrapping to a short grace");
+    }
 
     /// A request past its deadline is answered `Timeout` and kept, so its
     /// late completion is recognised; one that answers in time is not (#99).

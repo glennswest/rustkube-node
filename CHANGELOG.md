@@ -2,6 +2,10 @@
 
 ## 2026-10-08
 
+- **fix:** A container's stop grace reaches the engine (#174). `RingClient::stop` put it in `inline_a`, in seconds;
+  stormpump's STOP reads `inline_b`, in milliseconds (0 = its 30 s default), so every stop waited 30 s before the
+  SIGKILL whatever `terminationGracePeriodSeconds` said (seen in stormpump's medium suite: a 5 s grace killed at
+  30.06 s). Now `inline_b = grace × 1000`, and a grace of 0 is `FORCE`.
 - **perf:** A pod's claim no longer waits for its PV and binding to be written (#95). On 11.91 (pvetest1,
   server3) the kubelet's claim start was 0.5–0.7 s cold and 1.5–1.7 s warm, and its `bind` (an engine volume
   listing, the PVC read, the PV written, the claim written) was 150–220 ms of it. The pod needs the attached
