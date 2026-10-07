@@ -57,6 +57,13 @@ not the release path.
 
 ## Work plan
 
+### In progress: #51, retire `scripts/build-golden.sh` (the second golden builder)
+
+2026-10-07. Authority is decided: `stormcentral component stage rustkube-node` (stormcos `deploy/build-goldens.sh`
+in stage mode). README/BUILD.md already say so (ad43ee9); the script remains. Nothing calls it: stormcentral runs
+stormcos's stage recipe or a repo's `deploy/build-golden.sh` (none here); no stormcos/stormpump/master reference.
+1. [ ] Delete `scripts/build-golden.sh`; README, BUILD.md, CLAUDE.md say it is gone; CHANGELOG; sc-build; close.
+
 ### Done: #156 (P3), /vmInstance refuses metadata from a cache past a staleness bound
 
 2026-10-07. A VMI cache answer is fresh only while the apiserver has been heard from within a bound: the node
