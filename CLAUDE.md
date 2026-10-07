@@ -57,6 +57,29 @@ by #51.
 
 ## Work plan
 
+### Paused (P0 #104 first): #71 (P2), built-in driver: redundancy / spread / tier from the StorageClass
+
+2026-10-08. Stopped before code at stormcentral's word (P0 #104 waited 40 h). Findings:
+- Engine: `POST /api/v1/fstemplates` and `/api/v1/volumes` take `redundancy`, spelled with the spread:
+  `mirror:2@shelf` (stormblock `RedundancyPolicy::parse`, `@rung` suffix); a clone inherits its template's
+  policy. **No `tier` field** on fstemplates: that is stormblock#151 (open; also /v1 for stormblock-csi).
+- The default for a class naming no policy is stormblock's design "owner decision 2" (`none` vs `mirror`),
+  unanswered: keep today's `none`, and today's blank names, so shipped blanks still hit.
+- Both halves match the class *name* `stormblock`: `storage::provisioned_here` here, rustkube
+  `controller-manager/src/stormblock.rs` STORAGE_CLASS. stormcos's class: provisioner `stormblock.storm.io`,
+  WFFC. A second class (e.g. `stormblock-mirror`) needs rustkube to match by provisioner too: file there.
+Design (resume here):
+1. [ ] storage.rs `Policy::from_class(sc)`: parameters `redundancy` (none|mirror|mirror:N|raid5:D+1|raid6:D+2),
+       `spread` (rung), `tier` (absent/`hot` only, else refused naming stormblock#151); unknown keys refused.
+       `engine()` → `<redundancy>[@<spread>]` or None; blank name `template_name(class)` + `-<slug>-<spread>`
+       when not none (`pvc-ext4j-1048576m-mirror2-shelf`).
+2. [ ] pod_manager `provision_claim_volume`: resolve the class (GET storageclasses/{name}; provisioner
+       `stormblock.storm.io` = ours; unset = ours, default policy; `""` = not ours; unreadable = wait, never
+       "none"); pass the policy to `clone_blank`/`mint_template`/`mint_blank` (`redundancy` in the body) and
+       `raw_volume`. A refused mint (InsufficientDomains) also as an Event on the PVC (`events.object_event`).
+3. [ ] Tests (policy parse, names, mint body against the fake stormblock), README/csi.md, CHANGELOG; sc-build
+       (submit when the slot is free: stormcentral#541); file rustkube (provisioner match); golden; close.
+
 ### Shipped (golden 670219fd054b): #82 (P2), a node service's last exit and output on its mirror pod
 
 2026-10-08. stormpump#51 (adc64f8) writes `last_exit_code` | `last_exit_signal`, `last_exit` and `last_output` (20
