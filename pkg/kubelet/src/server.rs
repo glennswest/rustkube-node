@@ -1097,6 +1097,55 @@ mod tests {
         }
     }
 
+    /// #87 (stormpump#90): a running node service that stormd does not run
+    /// (the registry) is read from its own `w<id>.log`, which assets.json now
+    /// names; `--previous` from the run before it.
+    #[tokio::test]
+    async fn a_running_service_not_run_by_stormd_is_read_from_its_own_run() {
+        let root = tempfile::tempdir().unwrap();
+        let run = root.path().join("run/stormpump");
+        std::fs::create_dir_all(run.join("logs")).unwrap();
+        std::fs::write(
+            run.join("assets.json"),
+            r#"{"assets":[{"name":"registry","running":true,"restarts":1,"age_secs":30,"domain":1,
+               "last_exit":"exited 2","last_output":["old tail"],
+               "runs":[{"started_at":10,"ended_at":20,"exit_code":2,"exit":"exited 2","log":"w3.log"},
+                       {"started_at":21,"log":"w8.log","log_rotated":"w8.1.log"}]}]}"#,
+        )
+        .unwrap();
+        std::fs::write(run.join("logs/w3.log"), "registry: bad config\n").unwrap();
+        std::fs::write(run.join("logs/w8.1.log"), "registry: starting\n").unwrap();
+        std::fs::write(run.join("logs/w8.log"), "registry: serving :5100\nregistry: GET /v2/\n").unwrap();
+
+        let rt = Arc::new(NoopRt);
+        let pm = Arc::new(
+            PodManager::new(rt.clone(), rt, "n1")
+                .with_host_root(root.path())
+                .with_assets_json(run.join("assets.json")),
+        );
+        let get = |uri: &str| {
+            let app = router(pm.clone());
+            let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            async move {
+                let resp = app.oneshot(req).await.unwrap();
+                let status = resp.status();
+                let body = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+                (status, String::from_utf8_lossy(&body).into_owned())
+            }
+        };
+        assert_eq!(
+            get("/containerLogs/kube-system/registry-n1/registry").await,
+            (StatusCode::OK, "registry: starting\nregistry: serving :5100\nregistry: GET /v2/\n".to_string()),
+            "the running run, rotated part first, not the last exit's tail"
+        );
+        assert_eq!(
+            get("/containerLogs/kube-system/registry-n1/registry?previous=true").await,
+            (StatusCode::OK, "registry: bad config\n".to_string())
+        );
+        let (_, body) = get("/containerLogs/kube-system/registry-n1/registry?tailLines=1").await;
+        assert_eq!(body, "registry: GET /v2/\n");
+    }
+
     /// A node service that died before stormd wrote its volume (stormcluster
     /// and stormrdp on 11.61) answers with what PID 1 kept of its last exit,
     /// not "not found on this node" (#124). So does one not run by stormd.
@@ -1314,7 +1363,7 @@ async fn node_service_logs(
 ) -> Response {
     use crate::node_logs;
     let mut budget = opts.limit_bytes;
-    let crate::pod_manager::NodeService { log_dir, record } = svc;
+    let crate::pod_manager::NodeService { log_dir, record, runs_dir } = svc;
     let last_output = record.as_ref().map(|r| r.last_output.as_slice()).filter(|o| !o.is_empty());
 
     if opts.previous.unwrap_or(false) {
@@ -1324,6 +1373,15 @@ async fn node_service_logs(
                 Err(e) => (StatusCode::NOT_FOUND, format!("cannot read {}: {e}\n", file.display()))
                     .into_response(),
             };
+        }
+        // A service stormd does not run: its previous incarnation's own file
+        // (#87, stormpump#90).
+        if let Some(run) = record.as_ref().and_then(|r| r.previous_run()) {
+            let files = node_logs::run_files(&runs_dir, run);
+            if !files.is_empty() {
+                let lines = node_logs::read_run(&files);
+                return (StatusCode::OK, cap(plain_log(&lines, &opts), &mut budget)).into_response();
+            }
         }
         if let Some(lines) = last_output {
             return (StatusCode::OK, cap(plain_log(lines, &opts), &mut budget)).into_response();
@@ -1341,6 +1399,16 @@ async fn node_service_logs(
     let dir = match log_dir {
         Some(d) if !node_logs::current_files(&d).is_empty() => d,
         log_dir => {
+            // Not run by stormd (stormblock, the registry, timesync): the
+            // running incarnation's own file, named in assets.json (#87).
+            let live = record
+                .as_ref()
+                .and_then(|r| r.current_run())
+                .map(|run| node_logs::run_files(&runs_dir, run))
+                .filter(|f| !f.is_empty());
+            if let Some(files) = live {
+                return engine_run_logs(files, opts, budget).await;
+            }
             if let (Some(lines), Some(false)) = (last_output, record.as_ref().map(|r| r.running)) {
                 return (StatusCode::OK, cap(plain_log(lines, &opts), &mut budget)).into_response();
             }
@@ -1397,6 +1465,47 @@ async fn node_service_logs(
         .unwrap_or_else(|e| {
             (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response()
         })
+}
+
+/// A node service's running incarnation, from PID 1's own files for it (#87):
+/// the rotated part, then the live file; `follow` polls the live one. Its
+/// lines carry no timestamps, so only `tailLines` and `limitBytes` apply.
+async fn engine_run_logs(files: Vec<std::path::PathBuf>, opts: LogOptions, mut budget: Option<usize>) -> Response {
+    let lines = crate::node_logs::read_run(&files);
+    let head = cap(plain_log(&lines, &opts), &mut budget);
+    if !opts.follow.unwrap_or(false) || budget == Some(0) {
+        return (StatusCode::OK, head).into_response();
+    }
+    let Some(live) = files.last().cloned() else {
+        return (StatusCode::OK, head).into_response();
+    };
+    let mut offset = std::fs::metadata(&live).map(|m| m.len()).unwrap_or(0);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(16);
+    if !head.is_empty() && tx.send(Ok(head.into_bytes())).await.is_err() {
+        return (StatusCode::OK, String::new()).into_response();
+    }
+    let opts = LogOptions { tail_lines: None, ..opts };
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let Ok(chunk) = tail_from(&live.to_string_lossy(), &mut offset) else {
+                return; // the run ended and its file went
+            };
+            let lines: Vec<String> = chunk.lines().map(str::to_string).collect();
+            let out = cap(plain_log(&lines, &opts), &mut budget);
+            if !out.is_empty() && tx.send(Ok(out.into_bytes())).await.is_err() {
+                return;
+            }
+            if budget == Some(0) {
+                return;
+            }
+        }
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        .unwrap_or_else(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response())
 }
 
 /// What was looked at for a node service's log and found empty, and what PID

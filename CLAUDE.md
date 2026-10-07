@@ -1068,7 +1068,7 @@ Steps:
        is not in the table gets status "not started on this boot" (phase Pending, waiting NotStarted, not
        Ready), written once (skipped when already so), with a Warning Event. Never deleted.
 2. [x] Tests, docs (README), CHANGELOG. sc-build at 7f4f3d1: all pass (kubelet 203). Not run on a node.
-3. [ ] registry/stormblock/timesync logs: after stormpump#55 names each asset's `w<id>.log`, serve it (and the
+3. [x] registry/stormblock/timesync logs: after stormpump#55 names each asset's `w<id>.log`, serve it (and the
        previous incarnation's for `--previous`) from `/hostrun/stormpump/logs`. Then close #87.
        2026-10-08: landed as stormpump#90 (17407fc, #55 left open): assets.json `runs` (last 5, oldest first, the
        running one last), each with `log` (`w<id>.log`) and `log_rotated`, or `stdout`/`stderr`. Doing: `Record.runs`;

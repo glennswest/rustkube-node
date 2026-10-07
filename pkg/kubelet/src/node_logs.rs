@@ -30,8 +30,13 @@
 //! the process it came from.
 //!
 //! A service not run by stormd (stormblock, the registry) has no such volume.
-//! Its output is stormpump's `w<id>.log`, and `assets.json` does not say which
-//! id is whose (stormpump#55), so its live log cannot be served from here yet.
+//! Its output is stormpump's `w<id>.log`, and since stormpump#90 `assets.json`
+//! says which is whose: each asset's last five `runs`, oldest first, the one
+//! running now last, each naming its `log` (and `log_rotated`, the earlier part
+//! of a long run) or its `stdout`/`stderr`, under `/run/stormpump/logs`. So its
+//! live log is served from the running run's files, and `--previous` from the
+//! newest ended one's (#87). Those lines are the process's own output, with no
+//! timestamp: only `tailLines` and `limitBytes` apply.
 //!
 //! What `assets.json` does carry (stormpump#51) is the end of the last
 //! incarnation that exited: `last_output`, its last lines of `w<id>.log`, with
@@ -270,6 +275,55 @@ pub struct Record {
     pub last_error: Option<String>,
     /// Its last lines of output (stormpump's `w<id>.log`), oldest first.
     pub last_output: Vec<String>,
+    /// Its last runs, oldest first, the running one last (stormpump#90).
+    pub runs: Vec<Run>,
+}
+
+/// One incarnation of a node service, as PID 1 lists it (stormpump#90).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Run {
+    pub started_at: u64,
+    /// `None` while it runs.
+    pub ended_at: Option<u64>,
+    /// "exited 1", "killed by signal 9".
+    pub exit: Option<String>,
+    /// Why its start was refused (a run that never ran).
+    pub error: Option<String>,
+    /// Its output files under PID 1's log directory, in reading order: the
+    /// rotated generation first, then the live one; or stdout, then stderr.
+    pub files: Vec<String>,
+}
+
+impl Record {
+    /// The run in progress, when it has output files.
+    pub fn current_run(&self) -> Option<&Run> {
+        self.runs.iter().rev().find(|r| r.ended_at.is_none() && !r.files.is_empty())
+    }
+
+    /// The newest run that ended and left output: `--previous`.
+    pub fn previous_run(&self) -> Option<&Run> {
+        self.runs.iter().rev().find(|r| r.ended_at.is_some() && !r.files.is_empty())
+    }
+}
+
+/// Where PID 1 keeps the workloads' output, as the kubelet sees it: beside
+/// [`ASSETS_JSON`].
+pub fn engine_log_dir() -> PathBuf {
+    Path::new(ASSETS_JSON).parent().unwrap_or(Path::new("/run/stormpump")).join("logs")
+}
+
+/// A run's files that are there, in reading order.
+pub fn run_files(dir: &Path, run: &Run) -> Vec<PathBuf> {
+    run.files.iter().map(|f| dir.join(f)).filter(|p| p.is_file()).collect()
+}
+
+/// A run's output as lines, its files read in order.
+pub fn read_run(files: &[PathBuf]) -> Vec<String> {
+    files
+        .iter()
+        .filter_map(|f| std::fs::read_to_string(f).ok())
+        .flat_map(|t| t.lines().map(str::to_string).collect::<Vec<_>>())
+        .collect()
 }
 
 /// `asset`'s entry in the asset table; `None` when it is not listed or the
@@ -287,6 +341,24 @@ pub fn record(assets_json: &str, asset: &str) -> Option<Record> {
             .into_iter()
             .flatten()
             .filter_map(|l| l.as_str().map(str::to_string))
+            .collect(),
+        runs: a["runs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|r| {
+                let s = |k: &str| r[k].as_str().filter(|s| !s.is_empty()).map(str::to_string);
+                Run {
+                    started_at: r["started_at"].as_u64().unwrap_or(0),
+                    ended_at: r["ended_at"].as_u64(),
+                    exit: s("exit"),
+                    error: s("error"),
+                    files: ["log_rotated", "log", "stdout", "stderr"]
+                        .iter()
+                        .filter_map(|k| s(k))
+                        .collect(),
+                }
+            })
             .collect(),
     })
 }
@@ -400,6 +472,32 @@ spec    rustkube-node
 
     /// The table as stormpump#51 writes it: the exit, the refusal and the
     /// output only once there is one (#124).
+    /// #87 (stormpump#90): the runs, oldest first, the running one last; its
+    /// files in reading order, rotated first.
+    #[test]
+    fn an_assets_record_names_its_runs_and_their_files() {
+        let json = r#"{"assets":[{"name":"registry","running":true,"runs":[
+            {"started_at":10,"ended_at":20,"exit_code":1,"exit":"exited 1","log":"w3.log"},
+            {"started_at":21,"ended_at":22,"error":"no root","refusals":2},
+            {"started_at":30,"log":"w7.log","log_rotated":"w7.1.log"}]}]}"#;
+        let r = record(json, "registry").unwrap();
+        assert_eq!(r.runs.len(), 3);
+        assert_eq!(r.current_run().unwrap().files, ["w7.1.log", "w7.log"]);
+        let prev = r.previous_run().unwrap();
+        assert_eq!((prev.files.as_slice(), prev.exit.as_deref()), (&["w3.log".to_string()][..], Some("exited 1")));
+        // A refused start has no files and is neither.
+        assert_eq!(r.runs[1].error.as_deref(), Some("no root"));
+
+        let dir = std::env::temp_dir().join(format!("node-logs-runs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("w7.1.log"), "early\n").unwrap();
+        std::fs::write(dir.join("w7.log"), "late 1\nlate 2\n").unwrap();
+        let files = run_files(&dir, r.current_run().unwrap());
+        assert_eq!(read_run(&files), ["early", "late 1", "late 2"]);
+        assert!(run_files(&dir, prev).is_empty(), "w3.log is gone");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn an_assets_record_carries_the_last_exit_and_output() {
         let table = r#"{"assets":[

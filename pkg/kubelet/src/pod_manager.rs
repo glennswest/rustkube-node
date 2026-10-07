@@ -304,6 +304,8 @@ pub struct ResolvedVolume {
 pub struct NodeService {
     pub log_dir: Option<std::path::PathBuf>,
     pub record: Option<crate::node_logs::Record>,
+    /// PID 1's workload log directory, where a run's files are (#87).
+    pub runs_dir: std::path::PathBuf,
 }
 
 /// The claim's binding (its PV and the claim bound to it), with only what it
@@ -816,7 +818,11 @@ impl PodManager {
         if log_dir.is_none() && record.is_none() {
             return None;
         }
-        Some(NodeService { log_dir, record })
+        let runs_dir = std::path::Path::new(&self.assets_json)
+            .parent()
+            .map(|d| d.join("logs"))
+            .unwrap_or_else(crate::node_logs::engine_log_dir);
+        Some(NodeService { log_dir, record, runs_dir })
     }
 
     /// Use this registry of CSI drivers: the one the kubelet's registration

@@ -2,6 +2,10 @@
 
 ## 2026-10-08
 
+- **feat:** `kubectl logs` on a node service not run by stormd (stormblock, the registry, timesync) reads its live log
+  (#87). stormpump#90 lists each asset's last runs in `assets.json`, each naming its `w<id>.log`; the kubelet now
+  serves the running run's files (rotated part first, `-f` follows the live one) and, for `--previous`, the newest
+  ended run's. `last_output` stays the fallback for a PID 1 without runs.
 - **fix:** The `:10250` serving pair is reloaded when stormcert renews it (#89). It was read once, so a pair renewed at
   boot after the kubelet started (stormcert#14) was not served until the next restart. `--tls-cert-file`'s directory
   is now watched and the pair reloaded in place when its bytes change (a half-written pair leaves the previous one
