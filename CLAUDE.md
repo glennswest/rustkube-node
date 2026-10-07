@@ -57,6 +57,14 @@ by #51.
 
 ## Work plan
 
+### In progress: #165 (P1), --max-pods (owner: option A on rustkube#205; stormcos sets 250)
+
+2026-10-08. `node_status.rs` reports a fixed `pods: "110"` in capacity and allocatable. The kubelet reads no
+KubeletConfiguration file and admits Pods against no count of its own, so the flag and the status are all.
+1. [ ] `--max-pods` / `MAX_PODS` (default 110) → `KubeletConfig.max_pods` → `NodeReporter::with_max_pods` →
+       capacity and allocatable `pods`; test; docs (configuration.md, README, status.md), CHANGELOG; sc-build;
+       golden; close; tell stormcos it can set 250 (its /24 pod range note stays theirs).
+
 ### Done: #81, pod mount propagation onto stormpump's `Mount.propagation`
 
 2026-10-08. Unblocked: stormvm#65 closed (stormvm main builds against stormpump main f466116, stormcast bba68c9).
