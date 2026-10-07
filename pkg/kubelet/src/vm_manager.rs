@@ -5308,7 +5308,8 @@ mod tests {
         let made = f.created.lock().unwrap().clone();
         assert_eq!(made.len(), 1);
         assert_eq!(made[0]["name"], json!(stormvm_node::start::volume_name(&vm, "data")));
-        assert_eq!(made[0]["size"], json!("2Gi"));
+        // Bytes, as stormblock reads them: it refused "2Gi" (#164, stormvm b5979ef).
+        assert_eq!(made[0]["size"], json!("2147483648"));
         assert_eq!(made[0]["label"], json!("storm.io/vm=default/web-1"));
         // The engine's default redundancy, not the seed's `none`: this is data.
         assert!(made[0].get("redundancy").is_none(), "{}", made[0]);
