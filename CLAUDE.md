@@ -57,6 +57,15 @@ by #51.
 
 ## Work plan
 
+### Waiting on the owner: #86 (P2), versioned goldens for pods
+
+2026-10-08. Kubelet half clear: the release manifest (`/etc/stormcos/release/manifest.json`, `assets[kind=golden]`
+name → digest) says each pallet's golden; a tag/digest naming another version selects `golden-<name>-<sha12>`,
+cloned CoW and mounted like a pulled image. Missing: the source when the node lacks the version. sbregistry's
+catalog lists forge goldens but "nothing is copied" (#43), and cross-engine clones need NVMe/TCP (#142).
+Asked on #86: A copy on demand (recommended), B remote attach, C node-local only. A tag/digest matching no known
+golden version keeps running the pallet (upstream OCI tags/digests, Cilium's `@sha256:`).
+
 ### Waiting on stormcentral#536 (builds): #147 (P2), kube-proxy clears stale UDP conntrack entries
 
 2026-10-08. kube-proxy rewrites the DNAT when an endpoint goes but leaves conntrack: a UDP flow to a ClusterIP
