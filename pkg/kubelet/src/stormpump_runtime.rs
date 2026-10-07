@@ -2425,7 +2425,7 @@ mod tests {
     #[test]
     fn mount_propagation_reaches_the_spec() {
         use stormpump::spec::Propagation;
-        let m = |dst: &str, p: MountPropagation| Mount {
+        let m = |dst: &str, p: MountPropagation| crate::cri::Mount {
             container_path: dst.into(),
             host_path: format!("/host{dst}"),
             propagation: p,
