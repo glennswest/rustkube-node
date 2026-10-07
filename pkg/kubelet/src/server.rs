@@ -776,8 +776,8 @@ mod tests {
             "spec": {"hostNetwork": true, "nodeName": "test-node",
                      "containers": [{"name": "app", "image": "busybox", "command": ["/bin/sleep", "1d"]}]}
         });
-        pm.sync_pods(&[pod]).await;
-        assert!(pm.pod_network("default", "web").await.is_some(), "the pod runs here");
+        pm.record_running_for_test(&pod, "sb").await;
+        assert!(matches!(pm.pod_network("default", "web").await, Some(Ok((_, None)))), "hostNetwork: the node's");
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(l, router(pm)).await.unwrap() });

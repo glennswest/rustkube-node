@@ -575,6 +575,7 @@ mod tests {
         cli.write_all(&c.syn_stream(3, &[("streamtype", "error")], true)).await.unwrap();
         let mut e = streams.recv().await.unwrap();
         assert!(e.data.recv().await.is_none());
+        assert!(matches!(read_frame(&mut cli).await.unwrap(), Frame::Control(SYN_REPLY, _, _)));
 
         // A stream the client resets refuses further writes. The PING after
         // the RST is echoed only once the RST has been read.

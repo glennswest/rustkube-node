@@ -4253,6 +4253,22 @@ impl PodManager {
         })
     }
 
+    /// Record `pod` as running in `sandbox`, for tests of what reads the
+    /// record (the server's streaming routes) without a start.
+    #[cfg(test)]
+    pub(crate) async fn record_running_for_test(&self, pod: &Value, sandbox: &str) {
+        let m = &pod["metadata"];
+        let s = |k: &str| m[k].as_str().unwrap_or("").to_string();
+        self.pods.write().await.insert(s("uid"), PodState {
+            namespace: s("namespace"), name: s("name"), uid: s("uid"),
+            sandbox_id: Some(sandbox.into()), container_ids: HashMap::new(),
+            phase: "Running".into(), pod: pod.clone(), pod_ip: None,
+            restart_counts: HashMap::new(), ready: HashMap::new(), liveness_failures: HashMap::new(),
+            startup_passed: HashMap::new(), started: HashMap::new(), terminated: HashMap::new(),
+            init_statuses: Vec::new(), sandbox_stopped: false,
+        });
+    }
+
     pub async fn pod_uid(&self, namespace: &str, name: &str) -> Option<String> {
         let pods = self.pods.read().await;
         pods.values()
