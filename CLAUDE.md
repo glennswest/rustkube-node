@@ -57,7 +57,7 @@ by #51.
 
 ## Work plan
 
-### In progress: #111 (P2), restartable init containers (native sidecars, restartPolicy: Always)
+### Waiting on stormcentral#527 (golden): #111 (P2), restartable init containers (native sidecars, restartPolicy: Always)
 
 2026-10-08. `run_init_containers` runs each init to exit 0 (120 s deadline) and removes it; a sidecar blocks the
 start and is killed. Upstream (KEP-753): a sidecar is started in its init slot, the next init waits only until it
@@ -71,8 +71,8 @@ after the app containers finish (Never/OnFailure) and torn down after them, in r
 3. [x] `start_pod` carries sidecar records into the tracked state; `check_pod_status` probes/restarts sidecars
        (Always), reports them as init statuses, leaves them out of the phase, stops them once the apps finished.
 4. [x] `stop_pod`: apps first, then sidecars in reverse declaration order.
-5. [ ] Tests (sidecar → init → app order; sidecar stays and restarts under restartPolicy Never; phase ignores it
-       and it is stopped after; teardown order; readiness), docs (README, status.md), CHANGELOG; SC_BUILD_VM sc-build.
+5. [x] Tests (5 new), docs (README, status.md, planning/container-startup.md), CHANGELOG (d5c3d85). SC_BUILD_VM
+       sc-build: 371 kubelet unit pass. Golden after stormcentral#527 (with #165, #95, #174). Not run on a node.
 
 ### Waiting on stormcentral#527 (golden): #174, a stop's grace goes where STOP reads it
 
