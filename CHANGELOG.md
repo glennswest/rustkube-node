@@ -2,6 +2,12 @@
 
 ## 2026-10-08
 
+- **feat:** Each stormblock PV carries its storage placement (#60): `storm.io/volume-id`, `storm.io/golden`,
+  `storm.io/redundancy`, `storm.io/health`, `storm.io/rebuild`, `storm.io/drives` (wwn, serial, model, node, shelf,
+  bay, health) and `storm.io/raid-partners` (array members and their state), labels `storm.io/shelf`,
+  `storm.io/redundancy`, `storm.io/health`; Events on change (VolumeDegraded/VolumeHealthy, RebuildStarted/Finished,
+  VolumeMoved, RaidPartnerChanged). stormblock's per-volume placement joined with stormdrive's drive locations on
+  WWN or serial; refreshed on engine volume changes and every minute; only changes written. `STORMDRIVE_URL`.
 - **feat:** Each stormpump workload's cgroup → pod/container identity, for cadvisor (#84): one JSON file per workload in
   `/run/rustkube/workloads/<cgroup>.json` (cgroup from `/proc/<pid>/cgroup`, init pid from QUERY's info block, kind
   container | sandbox, `reports_network` on the pod-network sandbox, namespace/pod/uid/container/id/image, CRI labels

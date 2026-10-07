@@ -68,8 +68,27 @@ they are, and their volume still exists, so the mirror does not delete their
 claim; the new `-<node>` pair is written beside them. Deleting the old pair by
 hand is safe: the PV is Retain, so the volume is untouched.
 
+## Placement: drives, shelf/bay, RAID partners (#60)
+
+Every PV of a stormblock volume this node holds (these node volumes and the built-in driver's claims alike) carries
+where the volume physically is, refreshed on engine volume changes and every minute (`pv_placement.rs`). Two sources
+are joined on the drive's WWN, else its serial: stormblock's `GET /api/v1/volumes?placement=true` (drives, legs,
+rebuild, drive-level RAID arrays and their members) and stormdrive's `GET https://<node>:9092/api/v1/placement`
+(shelf, bay, drive health), read with the kubelet's node-CA client certificate (`STORMDRIVE_URL` overrides the
+address; unreachable, the PV carries stormblock's half and the kubelet says so once).
+
+| | |
+|---|---|
+| `storm.io/volume-id`, `storm.io/golden` | the engine's id; what it was cloned from |
+| `storm.io/redundancy`, `storm.io/health`, `storm.io/rebuild` | the policy (`mirror:2@shelf`), `healthy`/`degraded`/`failed`, `none`/`needed`/the rebuild's state |
+| `storm.io/drives` | JSON: per drive `wwn`, `serial`, `model`, `node`, `shelf`, `bay`, `health` |
+| `storm.io/raid-partners` | JSON: per array member `array`, `level`, `index`, `state`, `wwn`, `serial`, `node`, `shelf`, `bay` |
+| labels `storm.io/shelf` (when every drive is in one shelf), `storm.io/redundancy`, `storm.io/health` | label-safe (`mirror-2-shelf`) |
+
+A change is an Event on the PV: `VolumeDegraded`/`VolumeFailed`/`VolumeHealthy`, `RebuildStarted`/`RebuildFinished`,
+`VolumeMoved` (its drives changed), `RaidPartnerChanged` (a member's state; a failed one is a Warning). Only what changed
+is written (a merge patch); the first sight of a PV writes and says nothing.
+
 ## Remaining limitations
 
-Drive/shelf/bay/RAID placement joins are not published here (#60). The engine
-and stormdrive placement APIs are prerequisites, not proof that this mirror
-has consumed them. Room for claims on the data slabs is #62 (README, "Room on the data slabs").
+Room for claims on the data slabs is #62 (README, "Room on the data slabs").

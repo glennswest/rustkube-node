@@ -386,7 +386,8 @@ clones keep the class size, and the overcommit ratio is 1.0:
   `kubelet_stormblock_data_used_percent`; past `--storage-alert-percent` (85)
   written, one Warning `SlabFilling` Event on each of this node's stormblock
   PVs per crossing, and a log line.
-See [service volume objects](docs/node-volumes.md) for the PV/PVC mirror.
+See [service volume objects](docs/node-volumes.md) for the PV/PVC mirror, and for each stormblock PV's placement
+(drives, shelf/bay, RAID partners, health and rebuild, with Events on change; #60).
 
 ### Virtual machine disks
 

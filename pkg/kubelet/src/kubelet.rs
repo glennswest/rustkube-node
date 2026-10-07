@@ -456,6 +456,7 @@ impl Kubelet {
 
         // The data slabs' room for claims, published and watched (#62).
         tokio::spawn(self.clone().capacity_loop());
+        tokio::spawn(self.clone().placement_loop());
 
         // Pods' ServiceAccount tokens, written again at 80% of their life
         // (#122): on the earliest one's deadline, at most a minute apart so
@@ -669,6 +670,42 @@ impl Kubelet {
             tokio::select! {
                 _ = runtime_changed(&mut volumes) => {}
                 _ = tokio::time::sleep(PERIOD) => crate::metrics::observe_timed("capacity", "fallback"),
+            }
+        }
+    }
+
+    /// Each stormblock PV's placement (#60): drives, shelf/bay, RAID partners,
+    /// on engine volume changes and every minute (a rebuild's progress and a
+    /// drive's health change with no volume event). stormdrive is asked on
+    /// the node's address over TLS (`STORMDRIVE_URL` overrides).
+    async fn placement_loop(self: Arc<Self>) {
+        const PERIOD: Duration = Duration::from_secs(60);
+        let mut volumes = Some(self.engine_volumes.subscribe());
+        let events = (!self.config.api_server_url.is_empty()).then(|| {
+            crate::events::EventRecorder::new(self.api_client.clone(), &self.config.api_server_url, &self.config.node_name)
+        });
+        let stormdrive = std::env::var("STORMDRIVE_URL")
+            .ok()
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| format!("https://{}:9092", self.node_ip));
+        loop {
+            match crate::pv_placement::pass(
+                &self.api_client,
+                &self.config.api_server_url,
+                &self.config.engine,
+                &stormdrive,
+                &self.config.node_name,
+                events.as_ref(),
+            )
+            .await
+            {
+                Ok(n) if n > 0 => debug!(written = n, "PV placement brought up to date"),
+                Ok(_) => {}
+                Err(e) => debug!("PV placement not published: {e}"),
+            }
+            tokio::select! {
+                _ = runtime_changed(&mut volumes) => {}
+                _ = tokio::time::sleep(PERIOD) => crate::metrics::observe_timed("placement", "fallback"),
             }
         }
     }
