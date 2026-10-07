@@ -3417,6 +3417,11 @@ impl PodManager {
             )
             .await;
         if let Err(e) = init_outcome {
+            // Kept on the record (#133): the pod's status says which init
+            // container failed and how, however the error is reported.
+            if let Some(state) = self.pods.write().await.get_mut(uid) {
+                state.init_statuses = init_statuses.clone();
+            }
             if let Some(failed) = init_statuses.iter().find(|s| !s.initialized()) {
                 warn!(
                     "Pod {namespace}/{name}: init container {} {} (exit {})",
