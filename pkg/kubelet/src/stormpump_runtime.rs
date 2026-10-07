@@ -2296,8 +2296,7 @@ mod tests {
         assert_eq!(sources, vec!["/host/a".to_string(), "/host/b".to_string()]);
     }
 
-    #[test]
-    /// A golden carries no image config, so HOME and PATH arrive unset unless
+    /// With no image config, HOME and PATH arrive unset unless
     /// the runtime supplies them. Cilium's operator died on an empty $HOME
     /// after getting all the way to starting its hive.
     #[test]
@@ -2413,6 +2412,7 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    #[test]
     fn command_and_args_become_one_argv() {
         let cc = ContainerConfig {
             command: vec!["/usr/bin/cilium-agent".into()],
