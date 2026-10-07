@@ -92,6 +92,18 @@ refused. A pod the apiserver still shows as bound here and unfinished is
 never swept, which keeps the sweep away from a pod that is still starting. If
 the apiserver cannot be asked, nothing is swept.
 
+## Growing a volume (#42)
+
+The controller half (rustkube#63, the external resizer) grows the volume and leaves the claim with
+`status.allocatedResourceStatuses.storage: NodeResizePending` (or a `FileSystemResizePending` condition) and the PV's
+`spec.capacity` past the claim's `status.capacity`. On a claim event (and the sweep's retry), the kubelet finds each
+such claim among the volumes published on this node and, when the driver has `EXPAND_VOLUME`, calls
+`NodeExpandVolume` on the published path (with the staging path and the new size). Then it writes the claim's status
+as upstream's kubelet does: `capacity` = the new size, `Resizing` and `FileSystemResizePending` removed,
+`allocatedResourceStatuses` dropped, with a `FileSystemResizeSuccessful` Event on the claim. A driver without the
+capability grows it all from the controller, and the status is finished the same way. A refusal is a
+`FileSystemResizeFailed` Warning, tried again.
+
 ## Mount propagation: the decision
 
 The driver mounts **in its own container's mount namespace**. For the pod to
@@ -131,5 +143,4 @@ does the mount, in whatever namespace it runs in.
 - Generic ephemeral volumes: the kubelet resolves them to the claim
   `<pod>-<volume>` and waits for it. rustkube has no controller that creates
   that claim (rustkube#94).
-- Raw block volumes, NodeGetVolumeStats, NodeExpandVolume (#42 covers
-  expansion).
+- Raw block volumes, NodeGetVolumeStats.

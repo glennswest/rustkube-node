@@ -563,6 +563,147 @@ impl PodManager {
     }
 }
 
+/// The size a claim's filesystem is to grow to, when the control plane has
+/// grown its volume and left the rest to the node (#42): the claim says
+/// `NodeResizePending` (or `FileSystemResizePending`), and the PV's capacity is
+/// past the claim's. The PV's quantity as written, and its bytes.
+pub fn resize_due(pv: &Value, pvc: &Value) -> Option<(String, u64)> {
+    let st = &pvc["status"];
+    let pending = st["allocatedResourceStatuses"]["storage"].as_str() == Some("NodeResizePending")
+        || st["conditions"].as_array().is_some_and(|cs| {
+            cs.iter().any(|c| c["type"] == "FileSystemResizePending" && c["status"] == "True")
+        });
+    if !pending {
+        return None;
+    }
+    let want = pv["spec"]["capacity"]["storage"].as_str()?;
+    let want_bytes = crate::storage::parse_quantity(want)?;
+    let have = st["capacity"]["storage"].as_str().and_then(crate::storage::parse_quantity).unwrap_or(0);
+    (want_bytes > have).then(|| (want.to_string(), want_bytes))
+}
+
+/// The claim's status once its filesystem is grown, as upstream's kubelet
+/// writes it: the new capacity, `Resizing` and `FileSystemResizePending` gone,
+/// `allocatedResourceStatuses.storage` dropped. A merge patch (conditions
+/// replaced whole).
+pub fn resized_status(pvc: &Value, quantity: &str) -> Value {
+    let conditions: Vec<Value> = pvc["status"]["conditions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| !matches!(c["type"].as_str(), Some("Resizing") | Some("FileSystemResizePending")))
+        .cloned()
+        .collect();
+    serde_json::json!({ "status": {
+        "capacity": { "storage": quantity },
+        "conditions": conditions,
+        "allocatedResourceStatuses": null,
+    }})
+}
+
+impl PodManager {
+    /// Grow the filesystems of this node's external CSI volumes whose claims
+    /// were expanded (#42), and say so on the claim. `true` while one is left
+    /// to try again (a driver not registered, a refused expansion).
+    pub async fn expand_csi_volumes(&self) -> bool {
+        let Ok(records) = csi_records_with_dirs(&self.state_root) else { return true };
+        let mut by_pv: std::collections::BTreeMap<String, (PathBuf, VolData)> = Default::default();
+        for (dir, d) in records {
+            if d.volume_lifecycle_mode == "Persistent" {
+                by_pv.entry(d.spec_vol_id.clone()).or_insert((dir, d));
+            }
+        }
+        let mut pending = false;
+        for (pv_name, (dir, data)) in by_pv {
+            let Some(pv) = self.api_get(&format!("/api/v1/persistentvolumes/{pv_name}")).await else { continue };
+            let (Some(ns), Some(claim)) = (pv["spec"]["claimRef"]["namespace"].as_str(), pv["spec"]["claimRef"]["name"].as_str()) else { continue };
+            let Some(pvc) = self.api_get(&format!("/api/v1/namespaces/{ns}/persistentvolumeclaims/{claim}")).await else { continue };
+            let Some((quantity, bytes)) = resize_due(&pv, &pvc) else { continue };
+            let Some(reg) = self.csi.get(&data.driver_name).await else {
+                pending = true;
+                continue;
+            };
+            let target = dir.join("mount").to_string_lossy().into_owned();
+            let grown = if reg.caps.expand_volume {
+                let first_mode = pv["spec"]["accessModes"][0].as_str().unwrap_or("ReadWriteOnce");
+                let spec = VolumeSpec {
+                    volume_id: data.volume_handle.clone(),
+                    fs_type: pv["spec"]["csi"]["fsType"].as_str().unwrap_or("").to_string(),
+                    access_mode: csi::access_mode(first_mode, reg.caps) as i32,
+                    ..Default::default()
+                };
+                let Some(_operation) = self.csi_operation(&data) else {
+                    pending = true;
+                    continue;
+                };
+                reg.client
+                    .node_expand(&spec, &target, data.staging_path.as_deref(), bytes as i64)
+                    .await
+                    .map(|_| ())
+            } else {
+                // Nothing for the node to do: the driver grows it all from
+                // the controller (upstream marks it done the same way).
+                Ok(())
+            };
+            match grown {
+                Ok(()) => {
+                    let url = format!("{}/api/v1/namespaces/{ns}/persistentvolumeclaims/{claim}/status", self.api_url);
+                    let patched = self
+                        .api_client
+                        .patch(&url)
+                        .header("content-type", "application/merge-patch+json")
+                        .json(&resized_status(&pvc, &quantity))
+                        .send()
+                        .await
+                        .is_ok_and(|r| r.status().is_success());
+                    if !patched {
+                        pending = true;
+                        continue;
+                    }
+                    info!("CSI {} volume {} filesystem grown to {quantity} for claim {ns}/{claim}", data.driver_name, data.volume_handle);
+                    if let Some(r) = &self.events {
+                        r.object_event("v1", "PersistentVolumeClaim", &pvc, "Normal", "FileSystemResizeSuccessful",
+                            &format!("MountVolume.NodeExpandVolume succeeded for volume {pv_name}: {quantity}")).await;
+                    }
+                }
+                Err(e) => {
+                    pending = true;
+                    warn!("CSI {} volume {} not grown: {e:#}", data.driver_name, data.volume_handle);
+                    if let Some(r) = &self.events {
+                        r.object_event("v1", "PersistentVolumeClaim", &pvc, "Warning", "FileSystemResizeFailed",
+                            &format!("MountVolume.NodeExpandVolume failed for volume {pv_name}: {e:#}")).await;
+                    }
+                }
+            }
+        }
+        pending
+    }
+}
+
+/// Every CSI record with its directory (the target is `<dir>/mount`).
+fn csi_records_with_dirs(state_root: &str) -> std::io::Result<Vec<(PathBuf, VolData)>> {
+    let mut out = Vec::new();
+    let pods = match std::fs::read_dir(Path::new(state_root).join("pods")) {
+        Ok(pods) => pods,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e),
+    };
+    for pod in pods {
+        let vols = match std::fs::read_dir(pod?.path().join("volumes/kubernetes.io~csi")) {
+            Ok(vols) => vols,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        for v in vols {
+            let dir = v?.path();
+            if let Some(d) = read_vol_data_checked(&dir)? {
+                out.push((dir, d));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// The pod's identity, for a driver that asked for it (`podInfoOnMount`).
 fn pod_info(pod: &Value, ephemeral: bool) -> HashMap<String, String> {
     let m = &pod["metadata"];
@@ -655,6 +796,7 @@ mod tests {
         calls: Arc<Mutex<Vec<String>>>,
         stage: Arc<Mutex<Option<proto::NodeStageVolumeRequest>>>,
         publish: Arc<Mutex<Option<proto::NodePublishVolumeRequest>>>,
+        expand: Arc<Mutex<Option<proto::NodeExpandVolumeRequest>>>,
         mountinfo: PathBuf,
         propagates: Arc<std::sync::atomic::AtomicBool>,
         fail_unstage: Arc<std::sync::atomic::AtomicBool>,
@@ -754,9 +896,13 @@ mod tests {
         }
         async fn node_expand_volume(
             &self,
-            _: Request<proto::NodeExpandVolumeRequest>,
+            r: Request<proto::NodeExpandVolumeRequest>,
         ) -> R<proto::NodeExpandVolumeResponse> {
-            Err(Status::unimplemented("expand"))
+            self.record("expand");
+            let r = r.into_inner();
+            let bytes = r.capacity_range.as_ref().map_or(0, |c| c.required_bytes);
+            *self.expand.lock().unwrap() = Some(r);
+            Ok(Response::new(proto::NodeExpandVolumeResponse { capacity_bytes: bytes }))
         }
         async fn node_get_capabilities(
             &self,
@@ -764,11 +910,10 @@ mod tests {
         ) -> R<proto::NodeGetCapabilitiesResponse> {
             use proto::node_service_capability::{rpc::Type, Rpc, Type as Cap};
             Ok(Response::new(proto::NodeGetCapabilitiesResponse {
-                capabilities: vec![proto::NodeServiceCapability {
-                    r#type: Some(Cap::Rpc(Rpc {
-                        r#type: Type::StageUnstageVolume as i32,
-                    })),
-                }],
+                capabilities: [Type::StageUnstageVolume, Type::ExpandVolume]
+                    .into_iter()
+                    .map(|t| proto::NodeServiceCapability { r#type: Some(Cap::Rpc(Rpc { r#type: t as i32 })) })
+                    .collect(),
             }))
         }
         async fn node_get_info(
@@ -897,6 +1042,7 @@ mod tests {
             calls: Default::default(),
             stage: Default::default(),
             publish: Default::default(),
+            expand: Default::default(),
             mountinfo: mountinfo.clone(),
             propagates: Arc::new(true.into()),
             fail_unstage: Arc::new(false.into()),
@@ -1148,6 +1294,75 @@ mod tests {
             ]
         );
         assert!(csi_records(&rig.mgr.state_root).is_empty());
+    }
+
+    /// #42: a claim the control plane grew (`NodeResizePending`, the PV past
+    /// the claim's capacity) has its filesystem grown by NodeExpandVolume on
+    /// the published path, and its status written as upstream's kubelet does.
+    #[tokio::test]
+    async fn a_grown_claim_has_its_filesystem_expanded_and_its_status_finished() {
+        let rig = rig().await;
+        store_claim(&rig.api);
+        rig.csi.scan_once().await;
+        attach(&rig.api);
+        let pod = claim_pod("uid-1", "app-1");
+        rig.mgr.resolve_volumes(&pod).await.unwrap();
+        let target = csi::publish_path(&rig.mgr.state_root, "uid-1", "data");
+
+        // Not grown: nothing to do.
+        assert!(!rig.mgr.expand_csi_volumes().await);
+        assert!(!rig.driver.calls().contains(&"expand".to_string()));
+
+        // rustkube#63's state after the resizer's ControllerExpandVolume.
+        rig.api.put(
+            "/api/v1/persistentvolumes/pv-data",
+            json!({"metadata": {"name": "pv-data"},
+                   "spec": {"accessModes": ["ReadWriteOnce"], "capacity": {"storage": "2Gi"},
+                            "claimRef": {"namespace": "default", "name": "data"},
+                            "csi": {"driver": DRIVER, "volumeHandle": "vol-1", "fsType": "ext4"}}}),
+        );
+        rig.api.put(
+            "/api/v1/namespaces/default/persistentvolumeclaims/data",
+            json!({"metadata": {"name": "data", "namespace": "default"},
+                   "spec": {"volumeName": "pv-data", "resources": {"requests": {"storage": "2Gi"}}},
+                   "status": {"capacity": {"storage": "1Gi"},
+                              "allocatedResources": {"storage": "2Gi"},
+                              "allocatedResourceStatuses": {"storage": "NodeResizePending"},
+                              "conditions": [{"type": "Resizing", "status": "True"},
+                                             {"type": "FileSystemResizePending", "status": "True"},
+                                             {"type": "Other", "status": "True"}]}}),
+        );
+        assert!(!rig.mgr.expand_csi_volumes().await, "done, nothing pending");
+        assert!(rig.driver.calls().contains(&"expand".to_string()), "{:?}", rig.driver.calls());
+        let e = rig.driver.expand.lock().unwrap().clone().unwrap();
+        assert_eq!(e.volume_id, "vol-1");
+        assert_eq!(e.volume_path, target);
+        assert_eq!(e.staging_target_path, csi::staging_path(&rig.mgr.state_root, DRIVER, "vol-1"));
+        assert_eq!(e.capacity_range.unwrap().required_bytes, 2 << 30);
+
+        let patches = rig.api.patches.lock().unwrap().clone();
+        let (_, body) = patches
+            .iter()
+            .find(|(p, _)| p.ends_with("/persistentvolumeclaims/data/status"))
+            .expect("the claim's status written");
+        assert_eq!(body["status"]["capacity"]["storage"], "2Gi");
+        assert_eq!(body["status"]["allocatedResourceStatuses"], Value::Null);
+        assert_eq!(body["status"]["conditions"], json!([{"type": "Other", "status": "True"}]), "only the resize conditions go");
+    }
+
+    #[test]
+    fn a_resize_is_due_only_when_the_node_is_asked_and_the_volume_is_bigger() {
+        let pv = json!({"spec": {"capacity": {"storage": "2Gi"}}});
+        let pvc = |status: Value| json!({"status": status});
+        assert_eq!(
+            resize_due(&pv, &pvc(json!({"capacity": {"storage": "1Gi"}, "allocatedResourceStatuses": {"storage": "NodeResizePending"}}))),
+            Some(("2Gi".into(), 2 << 30))
+        );
+        assert!(resize_due(&pv, &pvc(json!({"capacity": {"storage": "1Gi"},
+            "conditions": [{"type": "FileSystemResizePending", "status": "True"}]}))).is_some());
+        assert_eq!(resize_due(&pv, &pvc(json!({"capacity": {"storage": "1Gi"}}))), None, "not asked of the node");
+        assert_eq!(resize_due(&pv, &pvc(json!({"capacity": {"storage": "2Gi"},
+            "allocatedResourceStatuses": {"storage": "NodeResizePending"}}))), None, "already that size");
     }
 
     #[tokio::test]

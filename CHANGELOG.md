@@ -2,6 +2,11 @@
 
 ## 2026-10-08
 
+- **feat:** The node half of volume expansion (#42): a claim the control plane grew (`NodeResizePending` /
+  `FileSystemResizePending`, PV past the claim's capacity) has its filesystem grown by `NodeExpandVolume` on the
+  published path, then its status finished as upstream's kubelet does (new capacity, `Resizing` and
+  `FileSystemResizePending` gone, `allocatedResourceStatuses` dropped) with a `FileSystemResizeSuccessful` Event;
+  a refusal is `FileSystemResizeFailed`, retried. Driven by claim events. ReadWriteOncePod (the other half) since v0.8.0.
 - **feat:** Each stormblock PV carries its storage placement (#60): `storm.io/volume-id`, `storm.io/golden`,
   `storm.io/redundancy`, `storm.io/health`, `storm.io/rebuild`, `storm.io/drives` (wwn, serial, model, node, shelf,
   bay, health) and `storm.io/raid-partners` (array members and their state), labels `storm.io/shelf`,

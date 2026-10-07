@@ -99,6 +99,9 @@ pub struct NodeCapabilities {
     /// The driver understands SINGLE_NODE_SINGLE_WRITER and
     /// SINGLE_NODE_MULTI_WRITER, so ReadWriteOncePod can be said precisely.
     pub single_node_multi_writer: bool,
+    /// NodeExpandVolume is implemented: the node grows the filesystem after
+    /// the controller grows the volume (#42).
+    pub expand_volume: bool,
 }
 
 /// A PersistentVolume access mode, in CSI terms.
@@ -230,6 +233,7 @@ impl CsiDriverClient {
                 match NodeRpc::try_from(rpc.r#type) {
                     Ok(NodeRpc::StageUnstageVolume) => caps.stage_unstage = true,
                     Ok(NodeRpc::SingleNodeMultiWriter) => caps.single_node_multi_writer = true,
+                    Ok(NodeRpc::ExpandVolume) => caps.expand_volume = true,
                     _ => {}
                 }
             }
@@ -279,6 +283,31 @@ impl CsiDriverClient {
             .await
             .map_err(|s| status_error("NodePublishVolume", &v.volume_id, s))?;
         Ok(())
+    }
+
+    /// Grow the filesystem of a published volume to `required_bytes` (#42).
+    /// The driver's answer, when it says what it grew it to.
+    pub async fn node_expand(
+        &self,
+        v: &VolumeSpec,
+        volume_path: &str,
+        staging: Option<&str>,
+        required_bytes: i64,
+    ) -> Result<Option<i64>> {
+        let r = self
+            .node()
+            .node_expand_volume(proto::NodeExpandVolumeRequest {
+                volume_id: v.volume_id.clone(),
+                volume_path: volume_path.to_string(),
+                capacity_range: Some(proto::CapacityRange { required_bytes, limit_bytes: 0 }),
+                staging_target_path: staging.unwrap_or("").to_string(),
+                volume_capability: Some(v.capability()),
+                secrets: HashMap::new(),
+            })
+            .await
+            .map_err(|s| status_error("NodeExpandVolume", &v.volume_id, s))?
+            .into_inner();
+        Ok((r.capacity_bytes > 0).then_some(r.capacity_bytes))
     }
 
     pub async fn unpublish(&self, volume_id: &str, target: &str) -> Result<()> {

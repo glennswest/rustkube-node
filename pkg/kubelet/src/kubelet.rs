@@ -743,7 +743,11 @@ impl Kubelet {
                 if api.is_empty() { return; }
                 self.watches.observe(&self.api_client, format!(
                     "{api}/api/v1/pods?fieldSelector=spec.nodeName%3D{}", self.config.node_name));
-                if self.pod_manager.sweep_csi_volumes().await {
+                // A claim grown by the control plane (#42) is a claim event.
+                self.watches.observe(&self.api_client, format!("{api}/api/v1/persistentvolumeclaims"));
+                let teardown = self.pod_manager.sweep_csi_volumes().await;
+                let expansion = self.pod_manager.expand_csi_volumes().await;
+                if teardown || expansion {
                     crate::metrics::observe_timed("csi-sweep", "deadline");
                     apimachinery::reactor::requeue_after(CSI_TEARDOWN_PENDING);
                 }
