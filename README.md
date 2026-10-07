@@ -235,9 +235,6 @@ data.
 
 ## The node's services as pods
 
-Readiness currently follows the asset's running state rather than a health
-endpoint (#96); lifecycle Events lack full exit detail (#50/#82).
-
 When PID 1's asset table (`/run/stormpump/assets.json`) changes, and when a mirror pod is edited or deleted,
 the kubelet mirrors each asset as a
 read-only pod, `kube-system/<asset>-<node>` (labels `storm.io/asset`, `storm.io/component=node-service`).
@@ -247,7 +244,13 @@ host-network service the kubelet reads the liveness URL its golden's stormd conf
 and asks it every 10 s (2 s timeout). Three failures in a row make the pod Running but not ready: container
 `ready: false`, `Ready`/`ContainersReady` False, reason `Unhealthy` with the failure, and an `Unhealthy` Warning
 Event; one answer makes it ready again. A service with no declared HTTP liveness, or not on the host network,
-is Ready while running, as before. A mirror whose asset is not in the
+is Ready while running, as before. **A service that has exited says how** (#82): PID 1 keeps each asset's last
+exit in assets.json (`last_exit_code` or `last_exit_signal`, `last_exit`, the last 20 lines of `last_output`;
+stormpump#51), and the mirror's container carries it as `lastState.terminated` (`exitCode`, 128 + the signal
+when a signal ended it, `signal`, reason `Error`, `message` = the output's tail within upstream's 80 lines /
+4 KiB). A service that stays down has the same on `state.terminated`; one that never exited invents no exit
+code. The `BackOff` and `Stopped` Events end with the exit and that tail. For a service run by stormd the
+output is stormd's own until stormd#29. A mirror whose asset is not in the
 table on this boot (its unit was not started) becomes Pending, with its container waiting `NotStarted`, no
 `startTime`, and one Warning Event. It used to keep the previous boot's Running status. Mirrors are never
 deleted by the kubelet, and `kubectl logs` on them is described above.

@@ -23,12 +23,92 @@
 use serde_json::{json, Value};
 
 /// One asset, as PID 1 reports it in `/run/stormpump/assets.json`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Asset {
     pub name: String,
     pub running: bool,
     pub restarts: u32,
     pub age_secs: u64,
+    /// How it last ended (stormpump#51), once it has: kept across the
+    /// restart, so a crash-looping service carries its reason while it is
+    /// briefly running again (#82).
+    pub last_exit: Option<LastExit>,
+}
+
+/// A node service's last exit, from assets.json (stormpump#51).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct LastExit {
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+    /// PID 1's words: `exited 1`, `killed by signal 9`.
+    pub text: String,
+    /// Its last non-blank output lines (20).
+    pub output: Vec<String>,
+}
+
+/// Upstream's cap on a terminated container's `message`: the last 80 lines,
+/// at most 4 KiB.
+const MESSAGE_LINES: usize = 80;
+const MESSAGE_BYTES: usize = 4096;
+
+impl LastExit {
+    fn of(a: &Value) -> Option<Self> {
+        let code = a["last_exit_code"].as_i64().map(|c| c as i32);
+        let signal = a["last_exit_signal"].as_i64().map(|s| s as i32);
+        let text = a["last_exit"].as_str().unwrap_or("").to_string();
+        let output: Vec<String> = a["last_output"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|l| l.as_str().map(str::to_string))
+            .collect();
+        (code.is_some() || signal.is_some() || !text.is_empty() || !output.is_empty())
+            .then_some(Self { code, signal, text, output })
+    }
+
+    /// The exit code a terminated container reports: the code, else 128 plus
+    /// the signal, as a shell and upstream's runtimes say it.
+    pub fn exit_code(&self) -> i32 {
+        self.code.or(self.signal.map(|s| 128 + s)).unwrap_or(-1)
+    }
+
+    /// The output's tail, within upstream's cap (whole lines, newest kept).
+    pub fn tail(&self) -> String {
+        let mut lines: Vec<&str> = Vec::new();
+        let mut bytes = 0;
+        for line in self.output.iter().rev().take(MESSAGE_LINES) {
+            if bytes + line.len() + 1 > MESSAGE_BYTES {
+                break;
+            }
+            bytes += line.len() + 1;
+            lines.push(line);
+        }
+        lines.reverse();
+        lines.join("\n")
+    }
+
+    /// For an Event: what ended it, then the tail.
+    pub fn summary(&self) -> String {
+        let what = if self.text.is_empty() { format!("exit code {}", self.exit_code()) } else { self.text.clone() };
+        match self.tail() {
+            t if t.is_empty() => what,
+            t => format!("{what}; last output:\n{t}"),
+        }
+    }
+
+    /// `terminated` for a container status, with `finishedAt` when known.
+    fn terminated(&self, finished: Option<&str>) -> Value {
+        let mut t = json!({ "exitCode": self.exit_code(), "reason": "Error" });
+        if let Some(s) = self.signal {
+            t["signal"] = json!(s);
+        }
+        let message = self.tail();
+        t["message"] = json!(if message.is_empty() { self.text.clone() } else { message });
+        if let Some(f) = finished {
+            t["finishedAt"] = json!(f);
+        }
+        t
+    }
 }
 
 /// Parse the asset table.
@@ -57,6 +137,7 @@ pub fn parse_assets(text: &str) -> Vec<Asset> {
                 running: a["running"].as_bool().unwrap_or(false),
                 restarts: a["restarts"].as_u64().unwrap_or(0) as u32,
                 age_secs: a["age_secs"].as_u64().unwrap_or(0),
+                last_exit: LastExit::of(a),
             })
         })
         .collect()
@@ -99,9 +180,12 @@ pub fn mirror_pod_with(
     let state = if asset.running {
         json!({ "running": { "startedAt": started } })
     } else {
-        // No exit code: PID 1 reports whether it is up, not how it died. A
-        // fabricated 0 would read as a clean exit.
-        json!({ "terminated": { "reason": "Error", "finishedAt": started } })
+        match &asset.last_exit {
+            // How it died, from PID 1 (stormpump#51, #82).
+            Some(exit) => json!({ "terminated": exit.terminated(Some(started)) }),
+            // Not said: never a fabricated 0, which would read as a clean exit.
+            None => json!({ "terminated": { "reason": "Error", "finishedAt": started } }),
+        }
     };
 
     json!({
@@ -155,22 +239,35 @@ pub fn mirror_pod_with(
                   "reason": if unhealthy.is_some() { json!("Unhealthy") } else { Value::Null },
                   "message": unhealthy.map_or(Value::Null, |h| json!(format!("health endpoint: {}", h.reason))) },
             ],
-            "containerStatuses": [{
-                "name": asset.name,
-                "image": format!("stormpump://{}", asset.name),
-                "ready": ready,
-                "restartCount": asset.restarts,
-                "state": state,
-            }],
+            "containerStatuses": [container_status(asset, ready, state)],
         }
     })
+}
+
+/// The mirror's one container status: with `lastState.terminated` when PID 1
+/// has seen the service exit (#82), as upstream reports a restarted container.
+fn container_status(asset: &Asset, ready: bool, state: Value) -> Value {
+    let mut cs = json!({
+        "name": asset.name,
+        "image": format!("stormpump://{}", asset.name),
+        "ready": ready,
+        "restartCount": asset.restarts,
+        "state": state,
+    });
+    if let Some(exit) = &asset.last_exit {
+        cs["lastState"] = json!({ "terminated": exit.terminated(None) });
+    }
+    cs
 }
 
 /// What of the asset table a mirror reflects (#101). PID 1 rewrites the file
 /// every pass with fresh ages (stormpump#67); a change is a different name
 /// set, a service starting or stopping, or a restart.
-pub fn table_key(assets: &[Asset]) -> Vec<(String, bool, u32)> {
-    let mut key: Vec<_> = assets.iter().map(|a| (a.name.clone(), a.running, a.restarts)).collect();
+pub fn table_key(assets: &[Asset]) -> Vec<(String, bool, u32, Option<LastExit>)> {
+    let mut key: Vec<_> = assets
+        .iter()
+        .map(|a| (a.name.clone(), a.running, a.restarts, a.last_exit.clone()))
+        .collect();
     key.sort();
     key
 }
@@ -213,6 +310,8 @@ pub fn status_current(existing: &Value, want: &Value) -> bool {
         && ec["ready"] == wc["ready"]
         && ec["restartCount"] == wc["restartCount"]
         && state_kind(ec) == state_kind(wc)
+        && ec["lastState"] == wc["lastState"]
+        && ec["state"]["terminated"]["message"] == wc["state"]["terminated"]["message"]
         && start_same
 }
 
@@ -290,7 +389,7 @@ mod tests {
             {"name":"registry","running":false,"restarts":7,"age_secs":3,"domain":1}]}"#;
         let a = parse_assets(text);
         assert_eq!(a.len(), 2);
-        assert_eq!(a[0], Asset { name: "stormblock".into(), running: true, restarts: 0, age_secs: 120 });
+        assert_eq!(a[0], Asset { name: "stormblock".into(), running: true, restarts: 0, age_secs: 120, ..Default::default() });
         assert_eq!(a[1].restarts, 7);
         assert!(!a[1].running);
 
@@ -317,16 +416,16 @@ mod tests {
     /// A service PID 1 did not list on this boot keeps no stale Running (#87).
     #[test]
     fn a_mirror_whose_asset_is_not_listed_is_marked_not_started_once() {
-        let running = Asset { name: "fastetcd".into(), running: true, restarts: 0, age_secs: 5 };
+        let running = Asset { name: "fastetcd".into(), running: true, restarts: 0, age_secs: 5, ..Default::default() };
         let listed = mirror_pod(&running, "n1", "u", "2026-09-28T17:32:00Z");
         let old = mirror_pod(
-            &Asset { name: "registry".into(), running: true, restarts: 3, age_secs: 9 },
+            &Asset { name: "registry".into(), running: true, restarts: 3, age_secs: 9, ..Default::default() },
             "n1",
             "u",
             "2026-09-28T14:02:00Z",
         );
         let other_node = mirror_pod(
-            &Asset { name: "registry".into(), running: true, restarts: 0, age_secs: 9 },
+            &Asset { name: "registry".into(), running: true, restarts: 0, age_secs: 9, ..Default::default() },
             "n2",
             "u",
             "2026-09-28T14:02:00Z",
@@ -357,7 +456,7 @@ mod tests {
     /// Ages are not a change; a restart or a stop is (#101).
     #[test]
     fn only_state_changes_the_table_key() {
-        let a = |running, restarts, age_secs| Asset { name: "stormblock".into(), running, restarts, age_secs };
+        let a = |running, restarts, age_secs| Asset { name: "stormblock".into(), running, restarts, age_secs, ..Default::default() };
         assert_eq!(table_key(&[a(true, 1, 5)]), table_key(&[a(true, 1, 500)]));
         assert_ne!(table_key(&[a(true, 1, 5)]), table_key(&[a(true, 2, 5)]));
         assert_ne!(table_key(&[a(true, 1, 5)]), table_key(&[a(false, 1, 5)]));
@@ -367,7 +466,7 @@ mod tests {
     /// watch would wake it for ever (#101).
     #[test]
     fn a_current_mirror_needs_no_write() {
-        let a = Asset { name: "stormblock".into(), running: true, restarts: 2, age_secs: 60 };
+        let a = Asset { name: "stormblock".into(), running: true, restarts: 2, age_secs: 60, ..Default::default() };
         let p = mirror_pod(&a, "n1", "u", "2026-08-29T00:00:00Z");
         let mut stored = p.clone();
         stored["metadata"]["resourceVersion"] = json!("41");
@@ -382,7 +481,7 @@ mod tests {
 
     #[test]
     fn a_running_asset_mirrors_as_a_ready_pod() {
-        let a = Asset { name: "stormblock".into(), running: true, restarts: 2, age_secs: 60 };
+        let a = Asset { name: "stormblock".into(), running: true, restarts: 2, age_secs: 60, ..Default::default() };
         let p = mirror_pod(&a, "n1", "uid-1", "2026-08-29T00:00:00Z");
         assert_eq!(p["status"]["phase"], "Running");
         assert_eq!(p["status"]["containerStatuses"][0]["restartCount"], 2);
@@ -399,7 +498,7 @@ mod tests {
     /// not ready, with why; healthy, or never probed, it is ready as before.
     #[test]
     fn a_running_service_that_does_not_answer_is_not_ready() {
-        let a = Asset { name: "stormstorage".into(), running: true, restarts: 0, age_secs: 60 };
+        let a = Asset { name: "stormstorage".into(), running: true, restarts: 0, age_secs: 60, ..Default::default() };
         let down = crate::node_health::ServiceHealth { ready: false, failures: 3, reason: "http://127.0.0.1:9093/api/v1/health: connection refused".into() };
         let p = mirror_pod_with(&a, "n1", "u", "2026-10-08T00:00:00Z", Some(&down));
         assert_eq!(p["status"]["phase"], "Running");
@@ -414,11 +513,67 @@ mod tests {
         assert_eq!(mirror_pod_with(&a, "n1", "u", "x", None)["status"]["containerStatuses"][0]["ready"], true);
     }
 
+    /// #82: PID 1's last exit and output (stormpump#51) reach the mirror pod:
+    /// `lastState.terminated` on a service running again, `state.terminated`
+    /// on one that stays down, with the exit code and the output's tail.
+    #[test]
+    fn a_crashed_service_shows_its_exit_and_last_output() {
+        let text = r#"{"assets":[
+            {"name":"fastetcd","running":true,"restarts":4,"age_secs":2,"domain":1,
+             "last_exit_code":1,"last_exit":"exited 1",
+             "last_output":["starting","Error: storage io: DB corrupted: bad page"]},
+            {"name":"registry","running":false,"restarts":7,"age_secs":3,"domain":1,
+             "last_exit_signal":9,"last_exit":"killed by signal 9","last_output":[]},
+            {"name":"stormblock","running":true,"restarts":0,"age_secs":9,"domain":1}]}"#;
+        let a = parse_assets(text);
+        let etcd = a[0].last_exit.clone().unwrap();
+        assert_eq!((etcd.code, etcd.signal, etcd.text.as_str()), (Some(1), None, "exited 1"));
+        assert_eq!(a[1].last_exit.as_ref().unwrap().exit_code(), 137, "128 + SIGKILL");
+        assert!(a[2].last_exit.is_none(), "never exited: nothing invented");
+
+        // Crash-looping, briefly running again: the reason is on lastState.
+        let p = mirror_pod(&a[0], "n1", "u", "2026-10-08T00:00:00Z");
+        let cs = &p["status"]["containerStatuses"][0];
+        assert!(cs["state"]["running"].is_object());
+        let last = &cs["lastState"]["terminated"];
+        assert_eq!((last["exitCode"].as_i64(), last["reason"].as_str()), (Some(1), Some("Error")));
+        assert_eq!(last["message"], "starting\nError: storage io: DB corrupted: bad page");
+        assert!(etcd.summary().starts_with("exited 1; last output:\n"));
+        assert!(etcd.summary().ends_with("DB corrupted: bad page"));
+
+        // Down for good: state.terminated says how, with a signal and no output.
+        let p = mirror_pod(&a[1], "n1", "u", "2026-10-08T00:00:00Z");
+        let term = &p["status"]["containerStatuses"][0]["state"]["terminated"];
+        assert_eq!((term["exitCode"].as_i64(), term["signal"].as_i64()), (Some(137), Some(9)));
+        assert_eq!(term["message"], "killed by signal 9");
+
+        // A new exit is a change to write; the same one is not.
+        let before = mirror_pod(&a[0], "n1", "u", "2026-10-08T00:00:00Z");
+        let mut again = a[0].clone();
+        again.last_exit.as_mut().unwrap().output.push("Error: again".into());
+        assert!(!status_current(&before, &mirror_pod(&again, "n1", "u", "2026-10-08T00:00:00Z")));
+        assert!(status_current(&before, &mirror_pod(&a[0], "n1", "u", "2026-10-08T00:00:01Z")));
+        assert_ne!(table_key(&a[..1]), table_key(&[again]));
+    }
+
+    /// Upstream's cap on `message`: the newest lines, at most 80 and 4 KiB.
+    #[test]
+    fn the_output_tail_keeps_the_newest_lines_within_the_cap() {
+        let many = LastExit { output: (0..100).map(|i| format!("line {i}")).collect(), ..Default::default() };
+        let tail = many.tail();
+        assert_eq!(tail.lines().count(), 80);
+        assert!(tail.ends_with("line 99") && tail.starts_with("line 20"));
+        let wide = LastExit { output: (0..10).map(|i| format!("{i}{}", "x".repeat(1000))).collect(), ..Default::default() };
+        let tail = wide.tail();
+        assert!(tail.len() <= 4096, "{}", tail.len());
+        assert!(tail.lines().last().unwrap().starts_with('9'), "the newest line is kept");
+    }
+
     /// A stopped asset is not Ready, and does not claim an exit code PID 1
     /// never reported — a fabricated 0 would read as a clean exit.
     #[test]
     fn a_stopped_asset_is_not_ready_and_invents_no_exit_code() {
-        let a = Asset { name: "registry".into(), running: false, restarts: 9, age_secs: 1 };
+        let a = Asset { name: "registry".into(), running: false, restarts: 9, age_secs: 1, ..Default::default() };
         let p = mirror_pod(&a, "n1", "uid-1", "2026-08-29T00:00:00Z");
         assert_eq!(p["status"]["phase"], "Failed");
         assert_eq!(p["status"]["containerStatuses"][0]["ready"], false);

@@ -2,6 +2,11 @@
 
 ## 2026-10-08
 
+- **feat:** A node service's last exit and output on its mirror pod (#82). PID 1 keeps them in assets.json
+  (stormpump#51); the kubelet read them only for pods/log. The mirror's container now carries
+  `lastState.terminated` (exit code, or 128 + the signal; `signal`; reason `Error`; `message` = the last output
+  lines within 80 lines / 4 KiB), a stopped service the same on `state.terminated`, and the `BackOff`/`Stopped`
+  Events end with the exit and the tail. A new exit is a change the mirror writes.
 - **fix:** The #85 change compiles: `watch_for_node`'s per-placement closure no longer moves the node name it
   still passes on, and `assigned_to`'s helper is a function, not a closure returning a borrow (build-failure #188).
 - **fix:** A Pod held back by a claim a VM on this node is using says why (#80). Admission already reserves a

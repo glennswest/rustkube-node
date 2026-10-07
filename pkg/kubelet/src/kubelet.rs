@@ -1900,12 +1900,15 @@ async fn mirror_node_services(
                         // announce itself on every kubelet restart.
                     }
                     Some((was_running, was_restarts)) => {
+                        // How it ended and what it said last (#82): the
+                        // node-console reason, through the API.
+                        let exit = a.last_exit.as_ref().map(|e| format!(": {}", e.summary())).unwrap_or_default();
                         if a.restarts > was_restarts {
                             changes.push((
                                 a.name.clone(),
                                 "BackOff",
                                 format!(
-                                    "restarted {} time(s); PID 1 has restarted it {} times",
+                                    "restarted {} time(s); PID 1 has restarted it {} times{exit}",
                                     a.restarts - was_restarts,
                                     a.restarts
                                 ),
@@ -1914,7 +1917,7 @@ async fn mirror_node_services(
                             changes.push((
                                 a.name.clone(),
                                 "Stopped",
-                                "the service is no longer running".into(),
+                                format!("the service is no longer running{exit}"),
                             ));
                         } else if !was_running && a.running {
                             changes.push((
