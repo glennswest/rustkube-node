@@ -57,7 +57,7 @@ by #51.
 
 ## Work plan
 
-### In progress: #69, a named credential that is missing is waited for, then fatal (never anonymous)
+### Done: #69, a named credential that is missing is waited for, then fatal (never anonymous)
 
 2026-10-08. `main.rs` waited (60 s, then fatal) only for `--apiserver-ca`; `--client-certificate`, `--client-key`,
 `--token-file` were read once and skipped when missing, so the kubelet ran as `system:anonymous` (cluster-admin on
@@ -66,15 +66,19 @@ had the same silent fallback; stormcos names the client and serving pairs under 
 the boot (build-goldens.sh:5353), so a wait is safe for them.
 1. [x] `wait_for_ca` → `wait_for_file(flag, path, limit)` for every named credential file and `--kubeconfig`;
        absent after 60 s: exit naming the flag. Unit tests (appears late, never appears, empty = not yet).
-2. [ ] Docs (configuration.md, README), CHANGELOG; sc-build; stage golden; close.
+2. [x] Docs (configuration.md), CHANGELOG (5d869b9; 0f4cc7d restores `DEFAULT_APISERVER`, which the edit dropped:
+       build-failure #169, closed). sc-build 0f4cc7d `cargo build --locked && cargo test --locked`: exit 0, 4 new
+       main.rs tests pass. Stage golden golden-rustkube-node-236e69973cf6 (stormcos#366). Closed. Not run on a node.
 
-### In progress: #139, start timing: `sandbox` split into acquire / cni / status
+### Done: #139, start timing: `sandbox` split into acquire / cni / status
 
 2026-10-08. `start_pod` times `sandbox` around `run_pod_sandbox` + `pod_sandbox_status`; on stormpump that is
 SandboxAcquire, network_ready and the CNI ADD (no stormblock call). Wanted: `acquire`, `cni`, `status` sub-phases
 in `storm.io/start-timing`, so the blade's next measurement names the slow step.
 1. [x] Runtime reports the sandbox's own split; start timing records it; annotation/Event/histogram/log.
-2. [ ] Tests, docs (README, metrics.md, status.md), CHANGELOG; sc-build; stage golden; close.
+2. [x] Tests (1 new, the end-to-end timing test extended), docs (README, metrics.md, status.md), CHANGELOG (fa18eaf).
+       sc-build 0f4cc7d: 342 kubelet unit pass. Golden golden-rustkube-node-236e69973cf6 (stormcos#366). Closed.
+       Live check after the release: busybox pods on server3 show `sandbox/acquire|cni|status|other`.
 
 ### Done: #51, retire `scripts/build-golden.sh` (the second golden builder)
 
