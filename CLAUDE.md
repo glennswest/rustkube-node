@@ -57,7 +57,7 @@ by #51.
 
 ## Work plan
 
-### In progress: #165 (P1), --max-pods (owner: option A on rustkube#205; stormcos sets 250)
+### Waiting on stormcentral#521 (golden): #165 (P1), --max-pods (owner: option A on rustkube#205; stormcos sets 250)
 
 2026-10-08. `node_status.rs` reports a fixed `pods: "110"` in capacity and allocatable. The kubelet reads no
 KubeletConfiguration file and admits Pods against no count of its own, so the flag and the status are all.
@@ -66,8 +66,9 @@ KubeletConfiguration file and admits Pods against no count of its own, so the fl
        golden; close; tell stormcos it can set 250 (its /24 pod range note stays theirs).
        Done: c635c02; sc-build `cargo build --locked && cargo test --locked`: 365 kubelet unit pass (1 new);
        `kubelet --help` lists `--max-pods <MAX_PODS>` [env: MAX_PODS]. (#179 was my bad extra command, closed.)
-2. [ ] Stage golden: dev.g8.lo refused :22 at the request (2026-10-08, pings fine). Request it again when dev
-       answers, then close #165 and tell stormcos#329 (which sets 250).
+       Rerun on a build VM (dev.g8.lo is retired): `SC_BUILD_VM=1 sc-build …` at fb94c9a, exit 0, same results.
+2. [ ] Stage golden: `component stage` is blocked until stormcentral#521. #165 proposed after it. Then close #165
+       and tell stormcos#329 (which sets 250).
 
 ### Done: #81, pod mount propagation onto stormpump's `Mount.propagation`
 
