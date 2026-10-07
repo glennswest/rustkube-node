@@ -93,7 +93,7 @@ never refreshed, so placement is its own pass over every PV of this node's storm
        live on server3, read-only: wwn `naa.…`, no shelf/bay on a blade). 4 tests. Paused for P0 #104; the sc-build of
        b1e91d6 (which carries #104) is running. Resume: read that build, then a live PV check, close.
 
-### Waiting on stormcentral#362 (stage golden): #84 (P2), each stormpump workload's cgroup → pod/container identity, for cadvisor
+### Shipped (golden 0fc1a74fff24): #84 (P2), each stormpump workload's cgroup → pod/container identity, for cadvisor
 
 2026-10-08. cadvisor (cadvisor#3, #15) waits on this repo to pick the shape. Found: stormpump does not report a
 workload's cgroup name, but QUERY's info block gives its pid (`stormpump_abi::query::info`) and the kubelet shares the
