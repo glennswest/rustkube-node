@@ -2,6 +2,15 @@
 
 ## 2026-10-08
 
+- **feat:** Every container runs on its own root (#104, the owner's rule): a copy-on-write clone of its image's
+  sealed golden, made at create (engine volume `ctr-<container>`, attached over ublk, mounted by PID 1 at
+  `/run/stormpump/roots/<container>`), and detached and deleted with the container; a restart gets a fresh
+  clone. Before, every container of an image ran on one directory (the pallet's mount, or the single clone a
+  pull made per image), so containers wrote each other's roots. A pull now clones nothing: it finds the image's
+  golden (a pallet: `<volume>.golden` in the slab, else the mounted volume's sealed parent; a pull: the
+  fstemplate in sbregistry's golden record, `template:<name>`). The per-image registry clone and its binding
+  (#143) are gone. A failed create removes its clone; roots nothing holds are deleted when the kubelet starts.
+  `readOnlyRootFilesystem` waits on stormpump#108 (the root is private and writable until then, and logged).
 - **feat:** A node service's last exit and output on its mirror pod (#82). PID 1 keeps them in assets.json
   (stormpump#51); the kubelet read them only for pods/log. The mirror's container now carries
   `lastState.terminated` (exit code, or 128 + the signal; `signal`; reason `Error`; `message` = the last output

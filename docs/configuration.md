@@ -146,11 +146,11 @@ follow their watch and take completions.
 Fixed paths include `/var/lib/kubelet` for volume records,
 `/var/log/pods` for container logs, `/run/stormvm/<namespace>/<name>/vm.json`
 for VM registration, `/run/stormpump/assets.json` for service mirrors,
-`/pallets` for shipped images and `/run/stormpump/images/<volume>` for pulled images
-(the path a pull returns is the container's root as given, #103). A pulled image's
-sbregistry clone is bound to `kubelet/<node>/<image>` after the mount, and a pull after a
-kubelet restart reattaches that bound clone instead of minting another (#143); nothing
-unmounts or releases a pulled image yet (#161).
+`/pallets` for shipped images (read for user names and argv[0]), and
+`/run/stormpump/roots/<container>` where PID 1 mounts each container's own root: engine volume
+`ctr-<container>`, a clone of the image's sealed golden (a pallet's `<volume>.golden`, a pull's
+sbregistry fstemplate, referred to as `template:<name>`), deleted with the container (#104).
+The kernel command line's `rd.stormblock.mount=` maps a pallet path to its slab volume.
 The kubelet views host files under `/hostroot` in stormcos; the stage/boot
 configuration must provide those mounts.
 

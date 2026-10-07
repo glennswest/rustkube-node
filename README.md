@@ -79,12 +79,12 @@ histogram `kubelet_pod_start_phase_duration_seconds{phase}` and one INFO log lin
 |---|---|
 | `scheduled` | the pod's `PodScheduled` transition (else its `creationTimestamp`) → seen here. Wall clocks of two machines: negative when they disagree by more than the gap |
 | `wait` | seen → the start attempt that succeeded began: admission, image and volume waits, earlier attempts |
-| `image` | the pod's images first asked for → the last resolved. A golden is ~0; a pull is the registry's clone of the golden, its attach and its mount |
+| `image` | the pod's images first asked for → the last resolved. A pallet is ~0; a pull is one registry lookup of the image's golden record (no clone: #104) |
 | `volumes` | the pod's volumes in that attempt: claims cloned and attached, configMaps, secrets, projected, the ServiceAccount token, resolv.conf and log dirs. Each spec volume also as `volume/<name>` |
-| `sandbox` | the sandbox made, its network (CNI) included, → its address read. Taken apart (#139) when the attempt made it: `sandbox/acquire` (stormpump `SandboxAcquire`, the warm namespace holder; 0 on the host network), `sandbox/cni` (the CNI ADD, the plugin's exec included), `sandbox/status` (the address read) and `sandbox/other` (the rest: the runtime's checks, retried DELs of earlier failed networks). A CRI runtime gives only status and other. No step is a stormblock call: a pod's root is a golden mounted at boot |
+| `sandbox` | the sandbox made, its network (CNI) included, → its address read. Taken apart (#139) when the attempt made it: `sandbox/acquire` (stormpump `SandboxAcquire`, the warm namespace holder; 0 on the host network), `sandbox/cni` (the CNI ADD, the plugin's exec included), `sandbox/status` (the address read) and `sandbox/other` (the rest: the runtime's checks, retried DELs of earlier failed networks). A CRI runtime gives only status and other. No step is a stormblock call |
 | `claim/<volume>/…` | a claim's steps (#95), after its `volume/<name>`: `lookup` (the PVC, its PV and an existing volume read, the room checked), how it was made with its time (`blank`: a clone of the class's sealed blank; `clone`: of a source; `raw`: a Block claim; absent when the volume already existed), `attach` (ublk) and `bind` (the PV written, the claim bound; only where the start waits for it, the VM path: a pod's start runs it in the background since #95, as the control plane has normally bound the claim already). The filesystem mount is PID 1's, when the container is created, so it is in `containers` |
 | `init` | init containers run to completion |
-| `containers` | every app container created and started; each also as `container/<name>` |
+| `containers` | every app container created and started; each also as `container/<name>`. Creating one includes making its own root (#104): the clone of the image's golden, its attach and PID 1's mount |
 | `report` | the `Running` status write sent → acknowledged |
 | `total` | seen → `Running` acknowledged |
 
@@ -137,6 +137,20 @@ directory cannot be watched). A failed ADD (the agent not serving yet) is
 retried on a backoff from its own first failure, 1 s at first (#148).
 Host-network Pods, the CNI agent's own among them, bypass this. CRI delegates networking to the external runtime. Node Ready
 is not yet gated on CNI readiness (#3/#32).
+
+**Every container runs on its own root** on stormpump (#104, the owner's rule): a copy-on-write clone of its
+image's **sealed golden**, made when the container is created (engine volume `ctr-<container>`, attached over
+ublk, mounted by PID 1 at `/run/stormpump/roots/<container>`), writable, and detached and deleted when the
+container is removed; a restart is a new container with a fresh clone. Containers never share a root, and one
+layer sits between the golden and what the workload writes. A pallet image's golden is the slab's
+`<volume>.golden` (else the mounted volume's sealed parent; the volume is the one `rd.stormblock.mount=` mounts
+at `/p/<path>`); a pulled image's is the fstemplate sbregistry sealed for it, so a pull clones nothing: it finds
+the golden record (`GET /v1/goldens/{image}`, ready, `template_name`) and answers `template:<name>`. A failed
+create or start removes the clone; roots no container holds (a kubelet that died mid-way) are deleted at
+start, never one still attached. `readOnlyRootFilesystem` mounts the container's own clone read-only once the
+engine can (stormpump#108); until then it is private and writable, and the kubelet says so. Per container
+start this is a clone, an attach and an ext4 mount (~0.4–1.3 s on 11.91, faster as stormblock#327 and
+stormpump#107 land).
 
 **The image's config is applied under the pod spec** on stormpump (#98), as a CRI runtime does. When an image
 resolves (a pallet or a pull), the kubelet asks sbregistry for its golden record (`GET /v1/goldens/{image}`,
