@@ -61,7 +61,9 @@ by #51.
 
 The build-VM slot came free; sc-build 134fd60 (job 9161dda65c) `cargo build --locked && cargo test --locked`: 398 kubelet unit pass, plus 34 proxy, 25 CNI and the integration tests; every waiting issue's own
 tests by name. First run 924aaaa811 found two #85 compile errors (#188, fixed 134fd60). Closed: #89, #147, #87, #94,
-#96, #77, #85, #65, #80, #188. #126 and #115 wait on the stage golden (requested; stormcentral#527).
+#96, #77, #85, #65, #80, #188. Stage golden golden-rustkube-node-6894f5af0f45 (134fd60, 3m42s), release request
+stormcos#366: `stormcentral shipped` for #126, #115, #165, #174, #111, #133 (told stormcos#329 about --max-pods).
+#141 proposed after stormcentral#526 (live burst), #95 after stormpump#107 (claim target).
 
 ### Waiting on the owner: #68 (P2), replicated claims (a StorageClass asks for replicas on other servers)
 
@@ -190,7 +192,7 @@ first endpoint.
        Done: 033a05a (4 tests). NOT yet built: the SC_BUILD_VM job was cancelled while queued. Rerun, close.
        2026-10-08: e58d5ed7fc (97801bc) cancelled the same way; #147 proposed after stormcentral#541.
 
-### Waiting on stormcentral#527 (golden): #115 (P2), a stormpump exit wakes its own workload only
+### Shipped (golden 6894f5af0f45): #115 (P2), a stormpump exit wakes its own workload only
 
 2026-10-08. An unsolicited exit bumps the ring's counter; `pod_loop`/`vm_loop` answer with `wake_kind` **and**
 `worker.enqueue()` (a full list sync), so one exit wakes every Pod and VMI worker and re-syncs every pod.
@@ -202,7 +204,7 @@ first endpoint.
        cancelled while queued (stormcentral#535/#536). Rerun, then golden (stormcentral#527) and close.
        2026-10-08: e58d5ed7fc (97801bc) cancelled the same way; #115 proposed after stormcentral#541.
 
-### Waiting on stormcentral#527 (golden): #126 (P2), no fixed init deadline; activeDeadlineSeconds bounds it
+### Shipped (golden 6894f5af0f45): #126 (P2), no fixed init deadline; activeDeadlineSeconds bounds it
 
 2026-10-08. `run_init_containers` stops an init still running after 120 s (`DeadlineExceeded`, exit -1). Upstream:
 an init runs until it exits; only the pod's `activeDeadlineSeconds` (from its startTime) limits it. The admission
@@ -216,7 +218,7 @@ path (production) already waits on the exit event; the non-admission path slept 
        golden (stormcentral#527) and close.
        2026-10-08: e58d5ed7fc (97801bc) cancelled too; #126 proposed after stormcentral#541.
 
-### Waiting on stormcentral#527/#526: #141 (P2), the probe pass's status PUT skipped when nothing changed
+### Waiting on stormcentral#526 (live run; golden 6894f5af0f45 built): #141 (P2), the probe pass's status PUT skipped when nothing changed
 
 2026-10-08. `report_pod_status` skips when the merged status equals `source["status"]`, but `source` is the
 watch's copy, which can still be the version before this kubelet's own last PUT: the comparison runs against the
@@ -229,7 +231,7 @@ pre-Running status and an unchanged status is written again (and with a stale re
 3. [ ] Golden (stormcentral#527), then a turbomode burst on pvetest1 (stormcentral#526): no second PUT, wait p90
        < 100 ms. #141 proposed after stormcentral#527.
 
-### Waiting on stormcentral#527 (golden): #133 (P2), a start error is never "terminal with no container state"
+### Shipped (golden 6894f5af0f45): #133 (P2), a start error is never "terminal with no container state"
 
 2026-10-08. The 10-02 trigger was #103 (a pulled image's root unresolved → start_container failed; fixed 4263d80,
 shipped). The behaviour it exposed stands: every start error not matched as a wait (image pull, create, start,
@@ -245,7 +247,7 @@ the container terminated `StartError` (exit 128).
 2. [x] Tests (3 new, 1 extended), README, CHANGELOG (dc3eed0, 2910b5a: a failed init's report kept, #183).
        SC_BUILD_VM sc-build: 374 kubelet unit pass. Golden after stormcentral#527 (with #165, #95, #174, #111).
 
-### Waiting on stormcentral#527 (golden): #111 (P2), restartable init containers (native sidecars, restartPolicy: Always)
+### Shipped (golden 6894f5af0f45): #111 (P2), restartable init containers (native sidecars, restartPolicy: Always)
 
 2026-10-08. `run_init_containers` runs each init to exit 0 (120 s deadline) and removes it; a sidecar blocks the
 start and is killed. Upstream (KEP-753): a sidecar is started in its init slot, the next init waits only until it
@@ -262,7 +264,7 @@ after the app containers finish (Never/OnFailure) and torn down after them, in r
 5. [x] Tests (5 new), docs (README, status.md, planning/container-startup.md), CHANGELOG (d5c3d85). SC_BUILD_VM
        sc-build: 371 kubelet unit pass. Golden after stormcentral#527 (with #165, #95, #174). Not run on a node.
 
-### Waiting on stormcentral#527 (golden): #174, a stop's grace goes where STOP reads it
+### Shipped (golden 6894f5af0f45): #174, a stop's grace goes where STOP reads it
 
 2026-10-08. `RingClient::stop` put the grace in `inline_a` (seconds); STOP reads `inline_b` in ms (0 = 30 s) and
 `flags::FORCE` for "now" (stormpump docs/ABI.md op 20, same at the lock's 795b92e). Every stop waited 30 s.
@@ -270,7 +272,7 @@ after the app containers finish (Never/OnFailure) and torn down after them, in r
        golden when component stage works (stormcentral#527); close.
        Done: a6b3155; SC_BUILD_VM sc-build: 366 kubelet unit pass. One golden after #527 carries #165, #95, #174.
 
-### Waiting on stormcentral#521 (golden): #165 (P1), --max-pods (owner: option A on rustkube#205; stormcos sets 250)
+### Shipped (golden 6894f5af0f45): #165 (P1), --max-pods (owner: option A on rustkube#205; stormcos sets 250)
 
 2026-10-08. `node_status.rs` reports a fixed `pods: "110"` in capacity and allocatable. The kubelet reads no
 KubeletConfiguration file and admits Pods against no count of its own, so the flag and the status are all.
@@ -332,7 +334,7 @@ stormpump's Spec has `uid`/`gid` and the engine drops to them (exec.rs). Found: 
        kubelet unit pass. Golden golden-rustkube-node-04134493c42a (stormcos#366). Follow-ups #171 (fsGroup), #172
        (image Volumes, after stormblock-registry#58). Closed. Not run on a node.
 
-### Waiting on stormcos#337: #95 (P1), pod/claim start toward ≤2 s / ≤1 s: the claim's own steps timed
+### Waiting on stormpump#107 (claim target; golden 6894f5af0f45 built): #95 (P1), pod/claim start toward ≤2 s / ≤1 s: the claim's own steps timed
 
 2026-10-08. Done elsewhere: phases on the pod (#132), `sandbox` split (#139); the traced causes (2 s pass, serial
 starts, unbounded CNI, inline events, per-pass PUTs) by #99/#100/#101/#134/#138. Still undone from item 1: "the same
