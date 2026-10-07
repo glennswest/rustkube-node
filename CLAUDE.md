@@ -64,6 +64,10 @@ KubeletConfiguration file and admits Pods against no count of its own, so the fl
 1. [x] `--max-pods` / `MAX_PODS` (default 110) → `KubeletConfig.max_pods` → `NodeReporter::with_max_pods` →
        capacity and allocatable `pods`; test; docs (configuration.md, README, status.md), CHANGELOG; sc-build;
        golden; close; tell stormcos it can set 250 (its /24 pod range note stays theirs).
+       Done: c635c02; sc-build `cargo build --locked && cargo test --locked`: 365 kubelet unit pass (1 new);
+       `kubelet --help` lists `--max-pods <MAX_PODS>` [env: MAX_PODS]. (#179 was my bad extra command, closed.)
+2. [ ] Stage golden: dev.g8.lo refused :22 at the request (2026-10-08, pings fine). Request it again when dev
+       answers, then close #165 and tell stormcos#329 (which sets 250).
 
 ### Done: #81, pod mount propagation onto stormpump's `Mount.propagation`
 
