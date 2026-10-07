@@ -57,17 +57,18 @@ by #51.
 
 ## Work plan
 
-### In progress: #80 (P2), a Pod blocked on a claim a VM here holds says why
+### Waiting on stormcentral#541 (builds): #80 (P2), a Pod blocked on a claim a VM here holds says why
 
 2026-10-08. The two-writer case is closed by admission since #100/#114: a VMI's claims are reserved Exclusive
 (`claims_for`), so a Pod wanting the same claim is not admitted (`reconcile` → `AwaitEvent`). Left (owner's recheck
 on #80): the blocked Pod gets no reason (no waiting status, no Event), no test, README/status.md say the check is
 missing.
-1. [ ] `Reservations::blockers(key, claims)`: each claim held against this request and who holds it.
-2. [ ] `reconcile`: a Pod refused on a claim gets Pending + `ContainerCreating` "claim ns/c is in use by
+1. [x] `Reservations::blockers(key, claims)`: each claim held against this request and who holds it.
+2. [x] `reconcile`: a Pod refused on a claim gets Pending + `ContainerCreating` "claim ns/c is in use by
        VirtualMachineInstance ns/vm on this node" (or by Pod … for RWOP) and a FailedMount Event
        (`PodManager::claim_held`); still AwaitEvent (the release wakes it).
 3. [ ] Tests (blockers; a Pod after a VM), README/status.md, CHANGELOG; sc-build; close.
+       Done: 43ab0e9 (1 test). Job 560e7c6206 cancelled while queued (stormcentral#541); #80 proposed after it.
 
 ### Waiting on stormcentral#541 (builds): #65 (P2), the Node advertises KVM
 
