@@ -139,6 +139,8 @@ pub struct Kubelet {
     csi: Arc<crate::csi_plugins::CsiPlugins>,
     /// Per pod UID, the status this kubelet last had acknowledged (#141).
     acked_status: std::sync::Mutex<std::collections::HashMap<String, AckedStatus>>,
+    /// What each node service's health endpoint says (#96), by asset name.
+    service_health: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::node_health::ServiceHealth>>>,
     watches: apimachinery::reactor::WatchHub,
     last_claims: std::sync::Mutex<crate::workload::VolumeIndex>,
     static_read_complete: std::sync::atomic::AtomicBool,
@@ -220,6 +222,7 @@ impl Kubelet {
             engine_volumes: tokio::sync::watch::channel(0).0,
             csi,
             acked_status: Default::default(),
+            service_health: Default::default(),
         })
     }
 
@@ -1537,6 +1540,45 @@ impl Kubelet {
                 }
             });
         }
+        // Each running service's own health endpoint, on its own clock (#96):
+        // a flip in readiness is a mirror pass.
+        {
+            let worker = worker.clone();
+            let health = self.service_health.clone();
+            tokio::spawn(async move {
+                let probes = reqwest::Client::new();
+                loop {
+                    tokio::time::sleep(crate::node_health::PERIOD).await;
+                    let urls = crate::node_health::health_urls(std::path::Path::new(crate::node_logs::HOST_ROOT));
+                    let text = std::fs::read_to_string(format!("{RUN_DIR}/assets.json")).unwrap_or_default();
+                    let running: Vec<String> = crate::mirror::parse_assets(&text)
+                        .into_iter()
+                        .filter(|a| a.running)
+                        .map(|a| a.name)
+                        .collect();
+                    let mut flipped = false;
+                    for name in &running {
+                        let Some(url) = urls.get(name) else { continue };
+                        let result = crate::node_health::probe(&probes, url).await;
+                        let mut map = health.lock().unwrap_or_else(|e| e.into_inner());
+                        let h = map.entry(name.clone()).or_insert(crate::node_health::ServiceHealth { ready: true, ..Default::default() });
+                        if crate::node_health::observe(h, result) {
+                            if h.ready {
+                                info!("node service {name}: its health endpoint answers again");
+                            } else {
+                                warn!("node service {name}: not ready: {}", h.reason);
+                            }
+                            flipped = true;
+                        }
+                    }
+                    // A stopped or unlisted service starts again from ready.
+                    health.lock().unwrap_or_else(|e| e.into_inner()).retain(|n, _| running.contains(n));
+                    if flipped {
+                        worker.enqueue();
+                    }
+                }
+            });
+        }
         let url = self.config.api_server_url.clone();
         let node = self.config.node_name.clone();
         loop {
@@ -1547,7 +1589,8 @@ impl Kubelet {
                         self.watches.observe(&self.api_client, format!(
                             "{url}/api/v1/namespaces/kube-system/pods?labelSelector=storm.io%2Fcomponent%3Dnode-service"));
                     }
-                    mirror_node_services(&self.api_client, &url, &node).await;
+                    let health = self.service_health.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    mirror_node_services(&self.api_client, &url, &node, &health).await;
                 })
                 .await;
             drop(work);
@@ -1688,7 +1731,12 @@ static LAST_SEEN: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, (bool, u32)>>,
 > = std::sync::OnceLock::new();
 
-async fn mirror_node_services(client: &reqwest::Client, api_url: &str, node: &str) {
+async fn mirror_node_services(
+    client: &reqwest::Client,
+    api_url: &str,
+    node: &str,
+    health: &std::collections::HashMap<String, crate::node_health::ServiceHealth>,
+) {
     // No cluster: nothing to mirror into, and nothing to retry.
     if api_url.is_empty() {
         return;
@@ -1845,9 +1893,14 @@ async fn mirror_node_services(client: &reqwest::Client, api_url: &str, node: &st
         // already says it is not written (#101).
         match existing {
             Some(existing) => {
-                let pod = crate::mirror::mirror_pod(a, node, "", &started);
+                let pod = crate::mirror::mirror_pod_with(a, node, "", &started, health.get(&a.name));
                 if crate::mirror::status_current(existing, &pod) {
                     continue;
+                }
+                // Ready to not ready on its health endpoint: say so (#96).
+                let was_ready = existing["status"]["containerStatuses"][0]["ready"] == true;
+                if let (true, Some(h), Some(r)) = (was_ready, health.get(&a.name).filter(|h| a.running && !h.ready), &events) {
+                    r.pod_event(existing, "Warning", "Unhealthy", &format!("Readiness probe failed: {}", h.reason)).await;
                 }
                 let mut pod = pod;
                 pod["metadata"] = existing["metadata"].clone();
@@ -1874,7 +1927,7 @@ async fn mirror_node_services(client: &reqwest::Client, api_url: &str, node: &st
                     apimachinery::reactor::failed();
                     return;
                 };
-                let pod = crate::mirror::mirror_pod(a, node, uid, &started);
+                let pod = crate::mirror::mirror_pod_with(a, node, uid, &started, health.get(&a.name));
                 let created = client.post(&base).json(&pod).send().await;
                 if !matches!(created, Ok(ref r) if r.status().is_success() || r.status() == 409) {
                     apimachinery::reactor::failed();

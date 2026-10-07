@@ -10,6 +10,7 @@ pub mod engine;
 pub mod events;
 pub mod metrics;
 pub mod mirror;
+pub mod node_health;
 pub mod node_logs;
 pub mod start_timing;
 pub mod storage;

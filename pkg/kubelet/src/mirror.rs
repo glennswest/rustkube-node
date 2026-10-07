@@ -79,7 +79,23 @@ pub fn mirror_name(asset: &str, node: &str) -> String {
 /// object is collected when the node goes away and nothing has to remember to
 /// clean it up.
 pub fn mirror_pod(asset: &Asset, node: &str, node_uid: &str, started: &str) -> Value {
+    mirror_pod_with(asset, node, node_uid, started, None)
+}
+
+/// [`mirror_pod`], with what the service's own health endpoint says (#96): a
+/// running service that does not answer is `Running` but not ready, its
+/// container `ready: false` and `Ready=False` with why, as upstream reports a
+/// running container failing its readiness probe.
+pub fn mirror_pod_with(
+    asset: &Asset,
+    node: &str,
+    node_uid: &str,
+    started: &str,
+    health: Option<&crate::node_health::ServiceHealth>,
+) -> Value {
     let phase = if asset.running { "Running" } else { "Failed" };
+    let unhealthy = health.filter(|h| asset.running && !h.ready);
+    let ready = asset.running && unhealthy.is_none();
     let state = if asset.running {
         json!({ "running": { "startedAt": started } })
     } else {
@@ -133,14 +149,16 @@ pub fn mirror_pod(asset: &Asset, node: &str, node_uid: &str, started: &str) -> V
                 { "type": "PodScheduled", "status": "True" },
                 { "type": "Initialized", "status": "True" },
                 { "type": "ContainersReady",
-                  "status": if asset.running { "True" } else { "False" } },
+                  "status": if ready { "True" } else { "False" } },
                 { "type": "Ready",
-                  "status": if asset.running { "True" } else { "False" } },
+                  "status": if ready { "True" } else { "False" },
+                  "reason": if unhealthy.is_some() { json!("Unhealthy") } else { Value::Null },
+                  "message": unhealthy.map_or(Value::Null, |h| json!(format!("health endpoint: {}", h.reason))) },
             ],
             "containerStatuses": [{
                 "name": asset.name,
                 "image": format!("stormpump://{}", asset.name),
-                "ready": asset.running,
+                "ready": ready,
                 "restartCount": asset.restarts,
                 "state": state,
             }],
@@ -375,6 +393,25 @@ mod tests {
         // Owned by the Node, so it is collected with it.
         assert_eq!(p["metadata"]["ownerReferences"][0]["kind"], "Node");
         assert_eq!(p["metadata"]["ownerReferences"][0]["uid"], "uid-1");
+    }
+
+    /// #96: a running service its health endpoint says is down is Running and
+    /// not ready, with why; healthy, or never probed, it is ready as before.
+    #[test]
+    fn a_running_service_that_does_not_answer_is_not_ready() {
+        let a = Asset { name: "stormstorage".into(), running: true, restarts: 0, age_secs: 60 };
+        let down = crate::node_health::ServiceHealth { ready: false, failures: 3, reason: "http://127.0.0.1:9093/api/v1/health: connection refused".into() };
+        let p = mirror_pod_with(&a, "n1", "u", "2026-10-08T00:00:00Z", Some(&down));
+        assert_eq!(p["status"]["phase"], "Running");
+        assert_eq!(p["status"]["containerStatuses"][0]["ready"], false);
+        let ready = p["status"]["conditions"].as_array().unwrap().iter().find(|c| c["type"] == "Ready").unwrap();
+        assert_eq!((ready["status"].as_str(), ready["reason"].as_str()), (Some("False"), Some("Unhealthy")));
+        assert!(ready["message"].as_str().unwrap().contains("connection refused"));
+        // The status changes, so it is written.
+        assert!(!status_current(&mirror_pod(&a, "n1", "u", "2026-10-08T00:00:00Z"), &p));
+        let up = crate::node_health::ServiceHealth { ready: true, ..Default::default() };
+        assert_eq!(mirror_pod_with(&a, "n1", "u", "x", Some(&up))["status"]["containerStatuses"][0]["ready"], true);
+        assert_eq!(mirror_pod_with(&a, "n1", "u", "x", None)["status"]["containerStatuses"][0]["ready"], true);
     }
 
     /// A stopped asset is not Ready, and does not claim an exit code PID 1

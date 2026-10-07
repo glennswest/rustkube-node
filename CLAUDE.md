@@ -57,6 +57,15 @@ by #51.
 
 ## Work plan
 
+### In progress: #96, a node service's mirror pod is Ready only while it answers
+
+2026-10-08. Each service golden's stormd config declares its liveness (`[process.liveness] type = "http"`, `url =
+http://127.0.0.1:<port><health>`, stormcos `service_golden`); its boot unit names the golden (`root <volume>`) and
+`profile host`. `node_health.rs`: the URLs from boot.d + the goldens under `/hostroot`; probed every 10 s (2 s);
+3 failures → not ready, one answer → ready; a flip queues a mirror pass. `mirror_pod_with`: Running, ready false,
+Ready/ContainersReady False, reason Unhealthy; a Warning `Unhealthy` Event on the flip.
+1. [ ] Code + tests (5) + README, CHANGELOG; sc-build (stormcentral#536).
+
 ### Waiting on stormcentral#536 (builds): #94, the VMI verbs on :10250 (`PUT /vmVerb/{ns}/{name}/{verb}`)
 
 2026-10-08. stormvm's router (lock 180fa13) serves `PUT /api/v1/vms/{ns}/{name}/{verb}`: pause, unpause,

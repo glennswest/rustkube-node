@@ -2,6 +2,12 @@
 
 ## 2026-10-08
 
+- **fix:** A node service's mirror pod is Ready only while the service answers (#96). It read Running and Ready
+  whenever PID 1 had the process up, so stormstorage refusing `:9093` on 11.50 looked healthy to the console, test
+  runs and release gates. The kubelet now reads each host-network service's own liveness URL from its golden's
+  stormd config (the check stormd restarts it by) and asks it every 10 s; three failures in a row make the pod
+  Running but not ready (`Ready=False`, reason `Unhealthy` with the failure, a Warning Event), one answer ready
+  again.
 - **feat:** A VM's verbs on `:10250` (#94): `PUT /vmVerb/{ns}/{name}/{verb}` hands `pause`, `unpause`, `softreboot`,
   `reset`, `status`, `freeze`, `thaw` (KubeVirt's `unfreeze` accepted) and `snapshot` to stormvm's mounted router,
   behind the server's auth with the same handover as the console doors (now one `to_console`), the verb's query
