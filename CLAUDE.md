@@ -1070,6 +1070,10 @@ Steps:
 2. [x] Tests, docs (README), CHANGELOG. sc-build at 7f4f3d1: all pass (kubelet 203). Not run on a node.
 3. [ ] registry/stormblock/timesync logs: after stormpump#55 names each asset's `w<id>.log`, serve it (and the
        previous incarnation's for `--previous`) from `/hostrun/stormpump/logs`. Then close #87.
+       2026-10-08: landed as stormpump#90 (17407fc, #55 left open): assets.json `runs` (last 5, oldest first, the
+       running one last), each with `log` (`w<id>.log`) and `log_rotated`, or `stdout`/`stderr`. Doing: `Record.runs`;
+       current = the running run's files (rotated first), `-f` follows the live one; `--previous` = stormd's
+       `.failed.log`, else the newest ended run's files, else `last_output`. Tests, README/api.md, CHANGELOG.
 
 ### Done: #72, `kubectl logs` on a node service's mirror pod reads its stormd log volume
 
