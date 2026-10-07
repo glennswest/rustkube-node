@@ -57,6 +57,16 @@ not the release path.
 
 ## Work plan
 
+### In progress: #156 (P3), /vmInstance refuses metadata from a cache past a staleness bound
+
+2026-10-07. A VMI cache answer is fresh only while the apiserver has been heard from within a bound: the node
+Lease renewed (heartbeat, 10 s) or a VMI LIST (`cache_specs`, a live LIST). Past `--metadata-max-staleness`
+(default 40 s, the Lease duration; 0 disables) a machine found here answers 503 + Retry-After, not its identity.
+An address with no machine here stays 404 (the local record is the truth for "not here"); the token path (#122)
+is live GETs already.
+1. [ ] `heartbeat` returns whether the Lease was renewed; VmManager `note_apiserver_contact`, bound, stale → 503.
+2. [ ] Flag/env/config, tests, docs (README, api.md, configuration.md, status.md), CHANGELOG; sc-build; close.
+
 ### Done: #155, docs: no stormcos edition runs kube-proxy
 
 2026-10-07. de51950: README, BUILD.md, status.md, presentation, CLAUDE.md (flowsdn owns Services in its edition,
