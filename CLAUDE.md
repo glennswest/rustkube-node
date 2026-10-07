@@ -230,6 +230,9 @@ every suite needs to resolve STORM_NODE). Pods are pinned with `spec.nodeName` (
        All three errored on the machines (pvetest2: no VM 3102; server1: a stormcentral restart). No test machine
        works (pvetest1/2 VMs missing, the Dell down; blades are off 19:00–06:00 Chicago). #61 proposed after
        stormcos#337. Resume: `stormcentral test run rustkube-node short|medium --tag C2NR0Q2` once it is reinstalled.
+       2026-10-08: the Dell is back (11.89) but test images are still built on the retired dev.g8.lo (stormcentral#521;
+       stormcos_qa turbomode 630379c31b failed there). Test crate passes on a build VM (28 tests). #97 proposed after
+       stormcentral#521; fff1f4d9d9 reached `running` but its log was lost with the Dell's apiserver.
 
 ### Waiting on stormpump#47: #118 (P2), pod capabilities onto the ring
 
