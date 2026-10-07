@@ -2,6 +2,12 @@
 
 ## 2026-10-08
 
+- **fix:** A VMI placed by hand with `spec.nodeName` is started (#85). The kubelet listed and watched VMIs by
+  `status.nodeName` only, and filtered what came back on it too, so the `spec.nodeName` half of its own
+  assignment rule never saw anything. It now lists and watches both fields, merges them by uid and keeps what
+  rustkube's scheduler places here (`status.nodeName` when set, else `spec.nodeName`: a stale `spec.nodeName` no
+  longer claims a VMI the scheduler put elsewhere). A hand-placed VMI gets `status.nodeName` written when it is
+  taken (status merge patch, uid-guarded). The unused `watch_for_node` built its watch URL with spaces in it.
 - **fix:** A renewed client certificate is presented without a restart (#77). The apiserver client took
   `--client-certificate`/`--client-key` once, so a kubelet that ran past stormcert's renewal (80% of 365 days)
   kept presenting the old one until it expired. With a CA and verification on, the client's TLS now asks a

@@ -359,8 +359,11 @@ See [service volume objects](docs/node-volumes.md) for the PV/PVC mirror.
 ### Virtual machine disks
 
 With `--runtime=stormpump` the kubelet also runs the VirtualMachineInstances
-assigned to its node (`pkg/kubelet/src/vm_manager.rs`). Each volume of a VMI
-becomes a stormblock volume attached here:
+assigned to its node (`pkg/kubelet/src/vm_manager.rs`). Assigned is rustkube's
+scheduler's rule: `status.nodeName` (what the scheduler writes) when it is set, else
+`spec.nodeName` (a VMI placed by hand, which the scheduler leaves alone). The kubelet lists
+and watches both, and writes `status.nodeName` on a hand-placed VMI when it takes it (#85).
+Each volume of a VMI becomes a stormblock volume attached here:
 
 | VMI volume | Disk | Deleted with the VM |
 |---|---|---|

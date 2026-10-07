@@ -32,7 +32,8 @@ and bounded concurrency. Partial failure records completed stages for retry;
 cancellation must not leak a mount, sandbox, or container. Teardown and Pod
 admission need per-claim serialization to preserve ReadWriteOncePod.
 
-A Pod watch uses spec.nodeName; a VMI watch uses status.nodeName, with local
+A Pod watch uses spec.nodeName; VMIs are watched twice, by status.nodeName and by
+spec.nodeName (a VMI placed by hand, #85), merged by uid, with local
 assignment checks as defense against a server ignoring selectors. Page every
 LIST. Watch from its revision, frame bounded NDJSON, resume on disconnect,
 relist on 410, back off failures. Apply observed state before waking work.

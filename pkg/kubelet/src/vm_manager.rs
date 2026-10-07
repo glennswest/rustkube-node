@@ -755,7 +755,7 @@ fn placed_here(obj: &Value, uid: &str, node: &str) -> bool {
     if obj["metadata"]["uid"].as_str() != Some(uid) || terminating(obj) {
         return false;
     }
-    if obj["status"]["nodeName"].as_str() != Some(node) {
+    if !assigned_to(obj, node) {
         return false;
     }
     // KubeVirt's migration state: once a migration has completed to another
@@ -3634,6 +3634,9 @@ fn hypervisor_said(log_dir: &str) -> Option<String> {
 /// `on_set` is called with the full set after each change, so the caller sees
 /// the same shape a poll gave it and nothing downstream has to understand
 /// events.
+///
+/// Two watches, one per [`PLACEMENTS`] selector (#85), each keeping its own
+/// set; `on_set` gets their union by uid, narrowed by [`assigned_to`].
 pub async fn watch_for_node<F>(
     api: reqwest::Client,
     api_url: String,
@@ -3642,9 +3645,41 @@ pub async fn watch_for_node<F>(
 ) where
     F: Fn(Vec<Value>) + Send + Sync + 'static,
 {
+    let sets: Arc<std::sync::Mutex<Vec<HashMap<String, Value>>>> =
+        Arc::new(std::sync::Mutex::new(vec![HashMap::new(); PLACEMENTS.len()]));
+    let on_set = Arc::new(on_set);
+    let watches = PLACEMENTS.iter().enumerate().map(|(slot, field)| {
+        let (sets, on_set, node) = (sets.clone(), on_set.clone(), node.clone());
+        let publish = move |have: &HashMap<String, Value>| {
+            let mut sets = sets.lock().unwrap();
+            sets[slot] = have.clone();
+            let mut all: HashMap<&str, &Value> = HashMap::new();
+            for set in sets.iter() {
+                for (uid, o) in set {
+                    all.insert(uid.as_str(), o);
+                }
+            }
+            let all: Vec<Value> =
+                all.into_values().filter(|o| assigned_to(o, &node)).cloned().collect();
+            on_set(all);
+        };
+        watch_selector(api.clone(), api_url.clone(), node.clone(), field, publish)
+    });
+    futures::future::join_all(watches).await;
+}
+
+async fn watch_selector<F>(
+    api: reqwest::Client,
+    api_url: String,
+    node: String,
+    field: &str,
+    on_set: F,
+) where
+    F: Fn(&HashMap<String, Value>),
+{
     use futures::StreamExt;
     let base = api_url.trim_end_matches('/').to_string();
-    let selector = format!("fieldSelector=status.nodeName%3D{node}");
+    let selector = format!("fieldSelector={field}%3D{node}");
     // What this node believes it should be running, by uid — the set the
     // watch maintains and hands back whole.
     let mut have: HashMap<String, Value> = HashMap::new();
@@ -3684,12 +3719,12 @@ pub async fn watch_for_node<F>(
             .as_str()
             .unwrap_or("")
             .to_string();
-        on_set(have.values().cloned().collect());
+        on_set(&have);
 
         // 2. WATCH.
         loop {
             let watch_url = format!(
-                "{base}/apis/kubevirt.io/v1/virtualmachineinstances                 ?watch=true&{selector}&resourceVersion={version}&timeoutSeconds=300"
+                "{base}/apis/kubevirt.io/v1/virtualmachineinstances?watch=true&{selector}&resourceVersion={version}&timeoutSeconds=300"
             );
             let Ok(resp) = api.get(&watch_url).send().await else {
                 break;
@@ -3739,7 +3774,7 @@ pub async fn watch_for_node<F>(
                         }
                         _ => continue,
                     }
-                    on_set(have.values().cloned().collect());
+                    on_set(&have);
                 }
                 if gone {
                     break;
@@ -3778,37 +3813,89 @@ pub async fn list_for_node(api: &reqwest::Client, api_url: &str, node: &str) -> 
     // needs resourceVersion tracking and re-establishment on disconnect —
     // but a filtered poll is correct now and is the difference between
     // O(cluster) and O(node) per tick.
-    let url = format!(
-        "{}/apis/kubevirt.io/v1/virtualmachineinstances?fieldSelector=status.nodeName%3D{node}",
-        api_url.trim_end_matches('/')
-    );
-    let resp = api.get(&url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let v = resp.json::<Value>().await.ok()?;
-    if !v["items"].is_array() {
-        return None;
-    }
-    // Filtered again locally, deliberately.
     //
-    // An apiserver that does not implement this field selector answers with
-    // everything rather than an error, and silently running every machine in
-    // the cluster on one node is a worse failure than a slow list. The check
-    // is cheap and it is the one that decides.
-    v["items"]
-        .as_array()
-        .map(|items| items.iter().filter(|o| assigned_to(o, node)).cloned().collect())
+    // One list per placement field (#85); either failing fails the whole.
+    let mut lists = Vec::new();
+    for url in placement_urls(api_url, node).ok()? {
+        let resp = api.get(url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let v = resp.json::<Value>().await.ok()?;
+        if !v["items"].is_array() {
+            return None;
+        }
+        lists.push(v);
+    }
+    Some(placed_on(&lists, node))
 }
 
-/// Whether a VMI is this node's.
+/// The fields a VMI is placed on a node by, in rustkube's scheduler's order
+/// (`pkg/scheduler/src/virtualmachine.rs`): `status.nodeName`, which it
+/// writes, then `spec.nodeName`, which a person sets and it then leaves alone.
+pub const PLACEMENTS: [&str; 2] = ["status.nodeName", "spec.nodeName"];
+
+/// This node's VMI list URLs, one per [`PLACEMENTS`] field (#85). Listing
+/// by `status.nodeName` alone never saw a VMI placed by hand.
+pub fn placement_urls(api_url: &str, node: &str) -> anyhow::Result<Vec<reqwest::Url>> {
+    PLACEMENTS
+        .iter()
+        .map(|field| {
+            let mut url = reqwest::Url::parse(&format!(
+                "{}/apis/kubevirt.io/v1/virtualmachineinstances",
+                api_url.trim_end_matches('/')
+            ))?;
+            url.query_pairs_mut().append_pair("fieldSelector", &format!("{field}={node}"));
+            Ok(url)
+        })
+        .collect()
+}
+
+/// This node's VMIs from the [`placement_urls`] lists: merged by uid (one
+/// placed by hand and then given `status.nodeName` is in both) and narrowed by
+/// [`assigned_to`].
 ///
-/// `status.nodeName` first, because that is what the scheduler writes, then
-/// `spec.nodeName` for one placed by hand. Anything unassigned is not this
-/// node's business — a kubelet that started unscheduled work would start it on
-/// every node at once.
-fn assigned_to(obj: &Value, node: &str) -> bool {
-    obj["status"]["nodeName"].as_str() == Some(node) || obj["spec"]["nodeName"].as_str() == Some(node)
+/// Filtered again locally, deliberately. An apiserver that does not implement
+/// a field selector answers with everything rather than an error, and silently
+/// running every machine in the cluster on one node is a worse failure than a
+/// slow list. The check is cheap and it is the one that decides. It also drops
+/// a VMI whose `spec.nodeName` names this node while the scheduler's
+/// `status.nodeName` names another.
+pub fn placed_on(lists: &[Value], node: &str) -> Vec<Value> {
+    let mut seen = std::collections::HashSet::new();
+    lists
+        .iter()
+        .flat_map(|l| l["items"].as_array().into_iter().flatten())
+        .filter(|o| assigned_to(o, node))
+        .filter(|o| seen.insert(o["metadata"]["uid"].as_str().unwrap_or("").to_string()))
+        .cloned()
+        .collect()
+}
+
+/// Whether a VMI is this node's: rustkube's scheduler's rule.
+///
+/// `status.nodeName` when it is set, because that is what the scheduler
+/// writes (and a migration moves); `spec.nodeName` only for a VMI with none,
+/// one placed by hand. Anything unassigned is not this node's business — a
+/// kubelet that started unscheduled work would start it on every node at once.
+pub fn assigned_to(obj: &Value, node: &str) -> bool {
+    let placed = |v: &Value| v.as_str().filter(|s| !s.is_empty());
+    placed(&obj["status"]["nodeName"]).or_else(|| placed(&obj["spec"]["nodeName"])) == Some(node)
+}
+
+/// The status merge patch that takes a hand-placed VMI: `status.nodeName`,
+/// guarded by its uid so a VMI deleted and recreated under the same name is
+/// not the one written.
+pub fn take_body(uid: &str, node: &str) -> Value {
+    json!({ "metadata": { "uid": uid }, "status": { "nodeName": node } })
+}
+
+/// A VMI placed here by hand that does not say so yet: `spec.nodeName` is
+/// this node and `status.nodeName` is unset. The kubelet writes
+/// `status.nodeName` when it takes one, as the scheduler would have (#85).
+pub fn hand_placed_here(obj: &Value, node: &str) -> bool {
+    obj["status"]["nodeName"].as_str().filter(|s| !s.is_empty()).is_none()
+        && obj["spec"]["nodeName"].as_str() == Some(node)
 }
 
 #[cfg(test)]
@@ -4506,6 +4593,62 @@ mod tests {
         assert!(assigned_to(&scheduled, "n1"), "status.nodeName is what the scheduler writes");
         let unassigned = json!({ "kind": "VirtualMachineInstance", "spec": {} });
         assert!(!assigned_to(&unassigned, "n1"));
+        // rustkube's scheduler's rule (#85): the status decides when it is set.
+        let mut moved = vmi("n1");
+        moved["status"] = json!({ "nodeName": "n2" });
+        assert!(!assigned_to(&moved, "n1"), "spec.nodeName does not override the scheduler's answer");
+        assert!(assigned_to(&moved, "n2"));
+        let mut empty_status = vmi("n1");
+        empty_status["status"] = json!({ "nodeName": "" });
+        assert!(assigned_to(&empty_status, "n1"), "an empty status.nodeName is no placement");
+    }
+
+    /// #85: a VMI placed with `spec.nodeName` alone was never listed, because
+    /// the kubelet asked only for `status.nodeName`.
+    #[test]
+    fn a_hand_placed_vmi_is_listed_and_taken() {
+        let urls = placement_urls("http://api:6443/", "n1").unwrap();
+        let selectors: Vec<String> = urls
+            .iter()
+            .map(|u| u.query_pairs().find(|(k, _)| k == "fieldSelector").unwrap().1.into_owned())
+            .collect();
+        assert_eq!(selectors, ["status.nodeName=n1", "spec.nodeName=n1"]);
+        assert!(urls.iter().all(|u| u.path() == "/apis/kubevirt.io/v1/virtualmachineinstances"));
+
+        let named = |name: &str, uid: &str, spec: Option<&str>, status: Option<&str>| {
+            let mut v = json!({ "metadata": { "namespace": "default", "name": name, "uid": uid }, "spec": {} });
+            if let Some(n) = spec {
+                v["spec"]["nodeName"] = json!(n);
+            }
+            if let Some(n) = status {
+                v["status"] = json!({ "nodeName": n });
+            }
+            v
+        };
+        let scheduled = named("a", "u-a", None, Some("n1"));
+        let hand = named("b", "u-b", Some("n1"), None);
+        let both = named("c", "u-c", Some("n1"), Some("n1"));
+        let elsewhere = named("d", "u-d", Some("n1"), Some("n2"));
+        let by_status = json!({ "items": [scheduled, both] });
+        let by_spec = json!({ "items": [hand, both, elsewhere] });
+        let got: Vec<String> = placed_on(&[by_status, by_spec], "n1")
+            .iter()
+            .map(|v| v["metadata"]["uid"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(got, ["u-a", "u-c", "u-b"], "merged by uid; the one the scheduler placed on n2 dropped");
+
+        assert!(hand_placed_here(&hand, "n1"));
+        assert!(!hand_placed_here(&both, "n1"), "already says so: nothing to write");
+        assert!(!hand_placed_here(&scheduled, "n1"));
+        assert!(!hand_placed_here(&hand, "n2"));
+        assert_eq!(
+            take_body("u-b", "n1"),
+            json!({ "metadata": { "uid": "u-b" }, "status": { "nodeName": "n1" } })
+        );
+        // Once written, the metadata service answers for it here too (#119).
+        let mut taken = hand.clone();
+        taken["status"] = json!({ "nodeName": "n1" });
+        assert!(placed_here(&taken, "u-b", "n1"));
     }
 
     /// The exit status packing the engine uses: `aux & 0xff == 2` means

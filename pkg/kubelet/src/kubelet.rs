@@ -709,14 +709,12 @@ impl Kubelet {
         };
         let worker = self.watches.worker("kubelet-vmis");
         let mut volumes = Some(self.pod_manager.subscribe_volume_changes());
-        let mut url = reqwest::Url::parse(&format!(
-            "{}/apis/kubevirt.io/v1/virtualmachineinstances",
-            self.config.api_server_url
-        ))?;
-        url.query_pairs_mut().append_pair(
-            "fieldSelector",
-            &format!("status.nodeName={}", self.config.node_name),
-        );
+        // Two lists, as rustkube's scheduler places a VMI (#85): by
+        // `status.nodeName` (what it writes), or, for one placed by hand, by
+        // `spec.nodeName`, which it then leaves alone. Listing the first alone
+        // never saw a hand-placed VMI at all.
+        let urls = crate::vm_manager::placement_urls(&self.config.api_server_url, &self.config.node_name)?;
+        let url = urls[0].clone();
         loop {
             let work = tokio::select! {
                 work = worker.next() => work,
@@ -724,20 +722,20 @@ impl Kubelet {
             };
             worker
                 .run(async {
-                    self.watches.observe(&self.api_client, url.to_string());
-                    match apimachinery::reactor::check(
-                        apimachinery::reflector::list(&self.api_client, url.as_str()).await,
-                    ) {
-                        Ok(list) => {
-                            let want: Vec<_> = list["items"]
-                                .as_array()
-                                .unwrap()
-                                .iter()
-                                .filter(|v| {
-                                    v["status"]["nodeName"].as_str() == Some(&self.config.node_name)
-                                })
-                                .cloned()
-                                .collect();
+                    for url in &urls {
+                        self.watches.observe(&self.api_client, url.to_string());
+                    }
+                    let lists = futures::future::join_all(urls.iter().map(|url| async {
+                        apimachinery::reactor::check(
+                            apimachinery::reflector::list(&self.api_client, url.as_str()).await,
+                        )
+                    }))
+                    .await;
+                    // Both, or neither: a list that failed is not an empty one (#35).
+                    match lists.into_iter().collect::<Result<Vec<_>, _>>() {
+                        Ok(lists) => {
+                            let want = crate::vm_manager::placed_on(&lists, &self.config.node_name);
+                            self.take_hand_placed(&want);
                             self.observe_volume_dependencies();
                             vms.cache_specs(&want).await;
                             match self.seed_claims(Kind::VirtualMachine, &want).await {
@@ -768,6 +766,45 @@ impl Kubelet {
                 })
                 .await;
             drop(work);
+        }
+    }
+
+    /// Write `status.nodeName` on each VMI placed here by hand (#85), as the
+    /// scheduler would have, so everything that reads the placement from the
+    /// status (the metadata service, a console, migration) sees this node.
+    /// Off the worker; a write that fails is tried again on the next pass,
+    /// which still lists it by `spec.nodeName`.
+    fn take_hand_placed(&self, want: &[Value]) {
+        let node = &self.config.node_name;
+        for vmi in want.iter().filter(|v| crate::vm_manager::hand_placed_here(v, node)) {
+            let (Some(ns), Some(name), Some(uid)) = (
+                vmi["metadata"]["namespace"].as_str(),
+                vmi["metadata"]["name"].as_str(),
+                vmi["metadata"]["uid"].as_str(),
+            ) else {
+                continue;
+            };
+            let url = format!(
+                "{}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{name}/status",
+                self.config.api_server_url
+            );
+            let body = crate::vm_manager::take_body(uid, node);
+            let (api, name) = (self.api_client.clone(), format!("{ns}/{name}"));
+            tokio::spawn(async move {
+                match api
+                    .patch(&url)
+                    .header("content-type", "application/merge-patch+json")
+                    .json(&body)
+                    .send()
+                    .await
+                {
+                    Ok(r) if r.status().is_success() => {
+                        info!(vmi = %name, "placed here by spec.nodeName: status.nodeName written")
+                    }
+                    Ok(r) => warn!(vmi = %name, status = %r.status(), "could not write status.nodeName"),
+                    Err(error) => warn!(vmi = %name, %error, "could not write status.nodeName"),
+                }
+            });
         }
     }
 
