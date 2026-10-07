@@ -2,6 +2,11 @@
 
 ## 2026-10-08
 
+- **feat:** Each stormpump workload's cgroup → pod/container identity, for cadvisor (#84): one JSON file per workload in
+  `/run/rustkube/workloads/<cgroup>.json` (cgroup from `/proc/<pid>/cgroup`, init pid from QUERY's info block, kind
+  container | sandbox, `reports_network` on the pod-network sandbox, namespace/pod/uid/container/id/image, CRI labels
+  with upstream's `io.kubernetes.*`, annotations), written at start, removed at removal, stale ones swept at start.
+  cadvisor had only an opaque `id` for every stormcos pod. `RingClient::query_info`.
 - **feat:** A pod waiting on the network says why in an Event too (#3), as upstream: Warning `NetworkNotReady` with no
   CNI config, Warning `FailedCreatePodSandBox` with the plugin's words when CNI ADD fails. Only the container's waiting
   message (and the kubelet's log) said it before.

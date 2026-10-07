@@ -370,7 +370,9 @@ async fn main() -> anyhow::Result<()> {
                     let rt = Arc::new(
                         rt.with_cni(cni_invoker)
                             .with_image_configs(configs.clone())
-                            .with_roots(kubelet::container_roots::Roots::new(engine.clone(), node_name.clone())),
+                            .with_roots(kubelet::container_roots::Roots::new(engine.clone(), node_name.clone()))
+                            // Each workload's identity for cadvisor (#84).
+                            .with_identities(kubelet::workload_identity::Publisher::default()),
                     );
                     engine_ring = rt.ring_client();
                     // Roots a kubelet that died mid-create or mid-removal left.

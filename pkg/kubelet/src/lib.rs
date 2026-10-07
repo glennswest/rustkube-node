@@ -53,3 +53,4 @@ pub use vm_runtime::{VmRuntime, VmConfig, VmmBackend};
 mod fs_watch;
 
 pub mod workload;
+pub mod workload_identity;

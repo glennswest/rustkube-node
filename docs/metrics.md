@@ -63,5 +63,25 @@ here would drift from the object, and the object is the one that is right.
 `/stats/summary` reports container CPU/memory and sums those values for the
 node CPU/memory fields; those sums exclude unreported host work. Node filesystem
 usage comes from statfs. Machine/PSI/imagefs-aware eviction integration is still
-#21. The runtime container ID in `id` is not a cgroup path (#84).
+#21. The runtime container ID in `id` is not a cgroup path; the cgroup is in the workload identity below (#84).
 These endpoints do not establish full metrics-server/HPA conformance.
+
+## Workload identity for cadvisor (#84)
+
+cadvisor finds each stormpump workload's cgroup (`/stormpump/w<tag>-<n>`) but learns a container's pod only from
+containerd or CRI-O, which stormcos does not run. So the stormpump runtime publishes, per workload, one JSON file in
+`/run/rustkube/workloads/` (the node's `/run`), named after the cgroup's last component (`w<tag>-<n>.json`):
+
+| field | |
+|---|---|
+| `cgroup` | the cgroup v2 path, from `/proc/<pid>/cgroup` (the engine does not report it; the kubelet shares the host pid namespace) |
+| `pid` | the workload's init process, for `/proc/<pid>/net/dev` inside its namespaces |
+| `kind` | `container`, or `sandbox`: the process holding a pod-network pod's namespaces |
+| `reports_network` | `true` for the sandbox only, as a CRI pause container: a pod's network is counted once |
+| `namespace`, `pod`, `pod_uid`, `container`, `container_id`, `image` | the CRI identity (`image` as the pod wrote it) |
+| `labels`, `annotations` | the CRI ones, plus upstream's `io.kubernetes.pod.{name,namespace,uid}` and `io.kubernetes.container.name` (`io.cri-containerd.kind: sandbox` on a sandbox) |
+
+Written atomically (tmp + rename) when a container starts or a pod-network sandbox is made, removed when the
+container is removed or the sandbox's holder released; at start the kubelet removes records whose pid no longer
+runs in that cgroup. A host-network pod has no sandbox record (its network is the node's). VMIs (cadvisor#15)
+are next. cadvisor reads the directory once stormcos mounts the host's `/run` into it.

@@ -117,6 +117,10 @@ struct Container {
     /// The engine volume that is this container's own root (#104): one CoW
     /// clone of its image's sealed golden, deleted with the container.
     root_volume: Option<String>,
+    /// Who this container is, for cadvisor (#84): filled with its pid and
+    /// cgroup at start, published as a file, withdrawn at removal.
+    identity: Option<crate::workload_identity::Record>,
+    identity_file: Option<std::path::PathBuf>,
     /// The directory this container's log file is opened in:
     /// `<sandbox log_directory>/<container>`. Kubernetes reads
     /// `<that>/<restart>.log` and nowhere else.
@@ -193,6 +197,9 @@ struct Sandbox {
     /// The acquire and the CNI ADD that made it (#139); `None` for one adopted
     /// rather than made by this process.
     made: Option<crate::cri::SandboxSteps>,
+    /// Its namespace holder's identity file (#84): the workload that reports
+    /// the pod's network.
+    identity_file: Option<std::path::PathBuf>,
 }
 
 /// A sandbox whose CNI ADD failed and whose DEL has not succeeded yet (#100).
@@ -236,6 +243,8 @@ pub struct StormpumpRuntime {
     roots: Option<Arc<crate::container_roots::Roots>>,
     /// Root volumes being made, which the orphan sweep must not take.
     making: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Publishes each workload's identity for cadvisor (#84); `None` in tests.
+    identities: Option<crate::workload_identity::Publisher>,
 }
 
 impl StormpumpRuntime {
@@ -263,6 +272,7 @@ impl StormpumpRuntime {
             image_configs: Arc::default(),
             roots: None,
             making: Default::default(),
+            identities: None,
         })
     }
 
@@ -334,6 +344,32 @@ impl StormpumpRuntime {
             image_configs: Arc::default(),
             roots: None,
             making: Default::default(),
+            identities: None,
+        }
+    }
+
+    /// Publish each workload's cgroup → pod/container identity (#84), and
+    /// sweep the records whose workload is gone.
+    pub fn with_identities(mut self, publisher: crate::workload_identity::Publisher) -> Self {
+        let gone = publisher.sweep(crate::workload_identity::cgroup_of);
+        if gone > 0 {
+            tracing::info!(gone, "workload identities of workloads no longer running removed");
+        }
+        self.identities = Some(publisher);
+        self
+    }
+
+    /// Publish `record` for the workload whose init process is `pid`.
+    fn publish_identity(&self, mut record: crate::workload_identity::Record, pid: i32) -> Option<std::path::PathBuf> {
+        let publisher = self.identities.as_ref()?;
+        record.cgroup = crate::workload_identity::cgroup_of(pid)?;
+        record.pid = pid;
+        publisher.publish(&record)
+    }
+
+    fn withdraw_identity(&self, path: Option<std::path::PathBuf>) {
+        if let (Some(p), Some(publisher)) = (path, &self.identities) {
+            publisher.withdraw(&p);
         }
     }
 
@@ -495,7 +531,9 @@ impl StormpumpRuntime {
                 c.root_volume = None;
             }
         }
-        self.containers.lock().await.remove(container_id);
+        if let Some(c) = self.containers.lock().await.remove(container_id) {
+            self.withdraw_identity(c.identity_file);
+        }
         Ok(())
     }
 
@@ -918,6 +956,25 @@ impl RuntimeService for StormpumpRuntime {
             }
         }
 
+        // Its namespace holder reports the pod's network to cadvisor (#84).
+        let holder = netns.as_deref().and_then(|n| n.strip_prefix("/proc/")?.split('/').next()?.parse::<i32>().ok());
+        let identity_file = holder.and_then(|pid| {
+            self.publish_identity(
+                crate::workload_identity::Record {
+                    kind: "sandbox".into(),
+                    reports_network: true,
+                    namespace: config.namespace.clone(),
+                    pod: config.name.clone(),
+                    pod_uid: config.uid.clone(),
+                    container_id: id.clone(),
+                    labels: config.labels.clone().into_iter().collect(),
+                    annotations: config.annotations.clone().into_iter().collect(),
+                    ..Default::default()
+                }
+                .with_kubernetes_labels(),
+                pid,
+            )
+        });
         let sb = Sandbox {
             id: id.clone(),
             handle,
@@ -927,6 +984,7 @@ impl RuntimeService for StormpumpRuntime {
             netns,
             ip,
             made: Some(steps),
+            identity_file,
         };
         self.sandboxes.lock().await.insert(id.clone(), sb);
         tracing::info!(
@@ -974,13 +1032,16 @@ impl RuntimeService for StormpumpRuntime {
             },
             None => true,
         };
+        let mut withdrawn = None;
         if let Some(sb) = self.sandboxes.lock().await.get_mut(sandbox_id) {
             sb.state = PodSandboxState::NotReady;
             sb.netns = None;
             if released {
                 sb.handle = None;
+                withdrawn = sb.identity_file.take();
             }
         }
+        self.withdraw_identity(withdrawn);
         Ok(())
     }
 
@@ -1002,7 +1063,9 @@ impl RuntimeService for StormpumpRuntime {
         if let Some(sb)=existing {
             if let Some(handle)=sb.handle {self.on_ring(move |r|r.sandbox_release(handle)).await?;}
         }
-        self.sandboxes.lock().await.remove(sandbox_id);
+        if let Some(sb) = self.sandboxes.lock().await.remove(sandbox_id) {
+            self.withdraw_identity(sb.identity_file);
+        }
         Ok(())
     }
 
@@ -1184,6 +1247,20 @@ impl RuntimeService for StormpumpRuntime {
             volume_handles: Vec::new(),
             root_handle: Some(root),
             root_volume: Some(made.volume_id.clone()),
+            identity: Some(crate::workload_identity::Record {
+                kind: "container".into(),
+                namespace: namespace.clone(),
+                pod: pod.clone(),
+                pod_uid: pod_uid.clone(),
+                container: config.name.clone(),
+                container_id: id.clone(),
+                // The reference the pod wrote, not its golden's.
+                image: self.image_configs.image_of(&config.image).unwrap_or_else(|| config.image.clone()),
+                labels: config.labels.clone().into_iter().collect(),
+                annotations: config.annotations.clone().into_iter().collect(),
+                ..Default::default()
+            }.with_kubernetes_labels()),
+            identity_file: None,
             root_path: Some(mount.clone()),
             state: ContainerState::Created,
             created_at: now_nanos(),
@@ -1331,6 +1408,20 @@ impl RuntimeService for StormpumpRuntime {
         c.workload_handle = Some(workload);
         c.state = ContainerState::Running;
         c.started_at = now_nanos();
+        let identity = c.identity.clone();
+        drop(containers);
+        // Who it is, for cadvisor (#84), from its pid's cgroup.
+        if let (Some(record), true) = (identity, self.identities.is_some()) {
+            let pid = self.on_ring(move |r| r.query_info(workload)).await.ok().flatten().map(|i| i.pid).unwrap_or(0);
+            let file = self.publish_identity(record, pid);
+            if let Some(c) = self.containers.lock().await.get_mut(container_id) {
+                c.identity_file = file;
+            }
+        }
+        let containers = self.containers.lock().await;
+        let c = containers
+            .get(container_id)
+            .ok_or_else(|| CriError::NotFound(format!("container {container_id}")))?;
         tracing::info!(
             container = %c.id, name = %format!("{}/{}/{}", c.namespace, c.pod, c.name),
             workload = ?workload, "stormpump: container started"
@@ -1993,6 +2084,7 @@ mod tests {
                 netns: None,
                 ip: String::new(),
                 made: None,
+                identity_file: None,
             },
         );
         let mut c = bare("ct-1", "sb-1");
@@ -2018,6 +2110,7 @@ mod tests {
                 netns: None,
                 ip: String::new(),
                 made: None,
+                identity_file: None,
             },
         );
         for (id, sb) in [("ct-1", "sb-1"), ("ct-2", "sb-1"), ("ct-3", "sb-other")] {
@@ -2037,6 +2130,8 @@ mod tests {
             volume_handles: Vec::new(),
                     root_handle: None,
                     root_volume: None,
+                    identity: None,
+                    identity_file: None,
                     root_path: None,
                     state: ContainerState::Created,
                     created_at: 0,
@@ -2177,6 +2272,7 @@ mod tests {
                     netns: None,
                     ip: String::new(),
                     made: None,
+                    identity_file: None,
                 },
             );
         }
@@ -2206,6 +2302,8 @@ mod tests {
             volume_handles: Vec::new(),
                     root_handle: None,
                     root_volume: None,
+                    identity: None,
+                    identity_file: None,
                     root_path: None,
                     state: ContainerState::Created,
                     created_at: 0,
@@ -2627,6 +2725,8 @@ mod tests {
             volume_handles: Vec::new(),
             root_handle: None,
             root_volume: None,
+            identity: None,
+            identity_file: None,
             log_dir: String::new(),
             mount_sources: Vec::new(),
             root_path: None,
@@ -2694,6 +2794,7 @@ mod tests {
                 netns: None,
                 ip: String::new(),
                 made: None,
+                identity_file: None,
             },
         );
         r.remove_pod_sandbox("sb-1").await.unwrap();

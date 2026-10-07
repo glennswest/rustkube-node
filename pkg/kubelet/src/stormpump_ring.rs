@@ -619,6 +619,24 @@ impl RingClient {
         Ok(stormpump_abi::query::stats(r.cqe.flags, &r.arena))
     }
 
+    /// A workload's pid, state and exit, from QUERY's info block (#84).
+    /// `Ok(None)` when the engine wrote none.
+    pub fn query_info(
+        &self,
+        workload: Handle,
+    ) -> Result<Option<stormpump_abi::query::Info>, RingError> {
+        let r = self.request(
+            Sqe {
+                opcode: Op::Query as u8,
+                primary: workload,
+                ..Default::default()
+            },
+            Some(vec![0u8; stormpump_abi::query::REPLY_LEN]),
+            true,
+        )?;
+        Ok(stormpump_abi::query::info(r.cqe.flags, &r.arena))
+    }
+
     /// Ask about a workload without changing it.
     pub fn query(&self, workload: Handle) -> Result<Cqe, RingError> {
         self.submit(
