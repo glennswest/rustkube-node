@@ -23,7 +23,7 @@
 //! | `claim/<volume>/lookup` | a claim's PVC, PV and existing volume read, its room checked (#95) |
 //! | `claim/<volume>/<made>` | the volume made: `blank` (clone of the class's sealed blank), `clone` (of a source), `raw` (a Block claim); absent when it already existed |
 //! | `claim/<volume>/attach` | the ublk attach |
-//! | `claim/<volume>/bind`   | the PV written and the claim bound |
+//! | `claim/<volume>/bind`   | the PV written and the claim bound, when the start waited for it (the VM path; a pod's start no longer does, #95) |
 //! | `init`       | init containers, run to completion |
 //! | `containers` | every app container created and started (each also as `container/<name>`) |
 //! | `report`     | the `Running` status sent → acknowledged |
@@ -88,7 +88,9 @@ pub struct ClaimSteps {
     /// `None` when it already existed.
     pub made: Option<(&'static str, Duration)>,
     pub attach: Duration,
-    pub bind: Duration,
+    /// `None` when the bind ran after the start path rather than in it (the
+    /// pod path since #95's 11.91 numbers): it is not part of the start.
+    pub bind: Option<Duration>,
 }
 
 /// `sandbox` taken apart (#139).
@@ -276,8 +278,10 @@ impl StartTiming {
                 }
                 text.push(format!("claim/{name}/attach={}", ms(c.attach)));
                 phases.push(("claim/attach", c.attach));
-                text.push(format!("claim/{name}/bind={}", ms(c.bind)));
-                phases.push(("claim/bind", c.bind));
+                if let Some(b) = c.bind {
+                    text.push(format!("claim/{name}/bind={}", ms(b)));
+                    phases.push(("claim/bind", b));
+                }
             }
             for (name, d) in &a.per_container {
                 text.push(format!("container/{name}={}", ms(*d)));
@@ -382,7 +386,7 @@ mod tests {
             lookup: Duration::from_micros(2_500),
             made: Some(("blank", Duration::from_millis(12))),
             attach: Duration::from_millis(60),
-            bind: Duration::from_micros(5_400),
+            bind: Some(Duration::from_micros(5_400)),
         });
         // One that already existed: nothing made.
         a.claim("old", ClaimSteps { attach: Duration::from_millis(30), ..Default::default() });
@@ -391,13 +395,14 @@ mod tests {
         assert!(
             f.text.ends_with(
                 "volume/data=80ms claim/data/lookup=2.5ms claim/data/blank=12ms claim/data/attach=60ms \
-                 claim/data/bind=5.4ms claim/old/lookup=0.0ms claim/old/attach=30ms claim/old/bind=0.0ms"
+                 claim/data/bind=5.4ms claim/old/lookup=0.0ms claim/old/attach=30ms"
             ),
             "{}",
             f.text
         );
         let claims: Vec<_> = f.phases.iter().map(|(n, _)| *n).filter(|n| n.starts_with("claim/")).collect();
-        assert_eq!(claims, [CLAIM_STEPS, &["claim/lookup", "claim/attach", "claim/bind"]].concat());
+        // The second claim's bind ran off the start path: no `bind` for it.
+        assert_eq!(claims, [CLAIM_STEPS, &["claim/lookup", "claim/attach"]].concat());
     }
 
     #[test]

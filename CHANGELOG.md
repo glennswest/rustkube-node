@@ -2,6 +2,12 @@
 
 ## 2026-10-08
 
+- **perf:** A pod's claim no longer waits for its PV and binding to be written (#95). On 11.91 (pvetest1,
+  server3) the kubelet's claim start was 0.5–0.7 s cold and 1.5–1.7 s warm, and its `bind` (an engine volume
+  listing, the PVC read, the PV written, the claim written) was 150–220 ms of it. The pod needs the attached
+  device, not the objects, and the control plane's binder has normally bound the claim already, so the bind now
+  runs as its own task after the attach. The VM path still binds before it returns. `claim/<volume>/bind` is
+  absent from a pod's start timing.
 - **feat:** `--max-pods` / `MAX_PODS` (#165, owner's option A on rustkube#205): the node's `capacity.pods` and
   `allocatable.pods`, fixed at 110 before, are configurable (default 110, upstream's). stormcos sets 250. On
   pvetest1 a 100-Pod burst waited ~60 s on the 110 the scheduler held the node to.

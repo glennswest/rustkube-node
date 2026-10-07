@@ -255,6 +255,163 @@ pub struct NodeService {
     pub record: Option<crate::node_logs::Record>,
 }
 
+/// The claim's binding (its PV and the claim bound to it), with only what it
+/// needs, so the pod path can run it after the attach without waiting for it
+/// (#95: 150–220 ms of a claim's start on 11.91). The pod does not need it:
+/// the control plane's binder has normally bound the claim already, and this
+/// brings the PV to the class's capacity and source.
+#[derive(Clone)]
+struct ClaimBinder {
+    api_url: String,
+    api_client: reqwest::Client,
+    storage_url: String,
+    engine: crate::engine::EngineClient,
+    node_name: String,
+}
+
+impl ClaimBinder {
+    async fn api_get(&self, path: &str) -> Option<Value> {
+        if self.api_url.is_empty() {
+            return None;
+        }
+        let r = self.api_client.get(format!("{}{path}", self.api_url)).send().await.ok()?;
+        if !r.status().is_success() {
+            return None;
+        }
+        r.json().await.ok()
+    }
+
+    async fn api_post(&self, path: &str, body: &Value) -> Option<Value> {
+        if self.api_url.is_empty() {
+            return None;
+        }
+        let r = self.api_client.post(format!("{}{path}", self.api_url)).json(body).send().await.ok()?;
+        if !r.status().is_success() {
+            return None;
+        }
+        r.json().await.ok()
+    }
+
+    async fn api_put(&self, path: &str, body: &Value) -> Option<Value> {
+        if self.api_url.is_empty() {
+            return None;
+        }
+        let r = self.api_client.put(format!("{}{path}", self.api_url)).json(body).send().await.ok()?;
+        if !r.status().is_success() {
+            return None;
+        }
+        r.json().await.ok()
+    }
+
+    async fn storage_get(&self, path: &str) -> Option<Value> {
+        let r = self.engine.get(&format!("{}{path}", self.storage_url)).await.ok()?;
+        if !r.status().is_success() {
+            return None;
+        }
+        r.json::<Value>().await.ok()
+    }
+
+    async fn bind(&self, namespace: &str, claim: &str, volume: &str, bytes: u64) {
+        // **The PV is named after the volume**, which is the contract with the
+        // control plane's provisioner (rustkube `stormblock.rs`): both derive
+        // `pvc-<ns>-<claim>`. This wrote `pvc-` + that, so every claim got two
+        // PVs, one from each side, and the claim was repointed away from the
+        // one the binder had matched.
+        let pv_name = volume.to_string();
+
+        // What the engine knows of the clone: its filesystem and uuid, and
+        // what it was cloned from, for the PV's CSI source (#59). The size is
+        // the class's, which is what was provisioned.
+        let list = self
+            .storage_get("/api/v1/volumes")
+            .await
+            .unwrap_or_default();
+        let items = list["items"].as_array().cloned().unwrap_or_default();
+        let names: std::collections::HashMap<String, String> = items
+            .iter()
+            .filter_map(|v| {
+                Some((
+                    v["id"].as_str()?.to_string(),
+                    v["name"].as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        let mut facts = items
+            .iter()
+            .find(|v| v["name"].as_str() == Some(volume))
+            .map(|v| crate::system_claims::VolumeFacts::of(v, &names))
+            .unwrap_or_else(|| crate::system_claims::VolumeFacts {
+                name: volume.to_string(),
+                ..Default::default()
+            });
+        facts.bytes = bytes;
+
+        // The claim first, so the volume's claimRef can carry its uid: a PV
+        // naming a claim by name alone reads as bound to whichever claim of
+        // that name exists, including one made again after a delete.
+        let path = format!("/api/v1/namespaces/{namespace}/persistentvolumeclaims/{claim}");
+        let Some(mut pvc) = self.api_get(&path).await else {
+            return;
+        };
+        facts.block = crate::storage::is_block(&pvc);
+
+        let mut pv = crate::system_claims::stormblock_pv(
+            &facts,
+            &pv_name,
+            &self.node_name,
+            crate::system_claims::claim_ref(&pvc),
+            "Delete",
+        );
+        pv["status"] = serde_json::json!({ "phase": "Bound" });
+        if self
+            .api_post("/api/v1/persistentvolumes", &pv)
+            .await
+            .is_none()
+        {
+            // **It exists: bring it up to what was provisioned** (#64). The
+            // control plane's provisioner (rustkube `stormblock.rs`) writes
+            // the PV once the scheduler picks a node, before the pod starts
+            // here, with the claim's *request* as its capacity: it leaves the
+            // class to the node. This did nothing when the PV was there, so a
+            // 3.5Gi claim on a 4 GiB volume said 3.5Gi for good.
+            let pv_path = format!("/api/v1/persistentvolumes/{pv_name}");
+            if let Some(existing) = self.api_get(&pv_path).await {
+                if let Some(updated) =
+                    crate::system_claims::reconcile_pv(&existing, &pv, Some(&pvc))
+                {
+                    if self.api_put(&pv_path, &updated).await.is_none() {
+                        warn!("PV {pv_name}: could not record its capacity and source");
+                    }
+                }
+            }
+        }
+
+        // Bind the claim to it. Read-modify-write rather than a patch,
+        // because the claim carries a resourceVersion and losing a concurrent
+        // edit here would be a claim pointing at the wrong volume.
+        let before = pvc.clone();
+        crate::system_claims::bind_pvc(&mut pvc, &pv_name, &self.node_name, volume);
+        let capacity = serde_json::json!({ "storage": crate::system_claims::quantity(bytes) });
+        if pvc["status"]["phase"].as_str() != Some("Bound") {
+            pvc["status"] = serde_json::json!({
+                "phase": "Bound",
+                "accessModes": ["ReadWriteOnce"],
+                "capacity": capacity,
+            });
+        } else {
+            // Bound by the binder to the request-sized PV: the capacity is
+            // the class's, which is what `df` in the pod shows.
+            pvc["status"]["capacity"] = capacity;
+        }
+        if pvc == before {
+            return;
+        }
+        if self.api_put(&path, &pvc).await.is_some() {
+            info!("PVC {namespace}/{claim} bound to {pv_name}");
+        }
+    }
+}
+
 pub struct PodManager {
     runtime: Arc<dyn RuntimeService>,
     images: Arc<dyn ImageService>,
@@ -721,102 +878,18 @@ impl PodManager {
     /// failing a running workload because a status write did not land would
     /// be the reporting path breaking the thing it reports on.
     async fn bind_claim(&self, namespace: &str, claim: &str, volume: &str, bytes: u64) {
-        // **The PV is named after the volume**, which is the contract with the
-        // control plane's provisioner (rustkube `stormblock.rs`): both derive
-        // `pvc-<ns>-<claim>`. This wrote `pvc-` + that, so every claim got two
-        // PVs, one from each side, and the claim was repointed away from the
-        // one the binder had matched.
-        let pv_name = volume.to_string();
+        self.binder().bind(namespace, claim, volume, bytes).await
+    }
 
-        // What the engine knows of the clone: its filesystem and uuid, and
-        // what it was cloned from, for the PV's CSI source (#59). The size is
-        // the class's, which is what was provisioned.
-        let list = self
-            .storage_get("/api/v1/volumes")
-            .await
-            .unwrap_or_default();
-        let items = list["items"].as_array().cloned().unwrap_or_default();
-        let names: std::collections::HashMap<String, String> = items
-            .iter()
-            .filter_map(|v| {
-                Some((
-                    v["id"].as_str()?.to_string(),
-                    v["name"].as_str()?.to_string(),
-                ))
-            })
-            .collect();
-        let mut facts = items
-            .iter()
-            .find(|v| v["name"].as_str() == Some(volume))
-            .map(|v| crate::system_claims::VolumeFacts::of(v, &names))
-            .unwrap_or_else(|| crate::system_claims::VolumeFacts {
-                name: volume.to_string(),
-                ..Default::default()
-            });
-        facts.bytes = bytes;
-
-        // The claim first, so the volume's claimRef can carry its uid: a PV
-        // naming a claim by name alone reads as bound to whichever claim of
-        // that name exists, including one made again after a delete.
-        let path = format!("/api/v1/namespaces/{namespace}/persistentvolumeclaims/{claim}");
-        let Some(mut pvc) = self.api_get(&path).await else {
-            return;
-        };
-        facts.block = crate::storage::is_block(&pvc);
-
-        let mut pv = crate::system_claims::stormblock_pv(
-            &facts,
-            &pv_name,
-            &self.node_name,
-            crate::system_claims::claim_ref(&pvc),
-            "Delete",
-        );
-        pv["status"] = serde_json::json!({ "phase": "Bound" });
-        if self
-            .api_post("/api/v1/persistentvolumes", &pv)
-            .await
-            .is_none()
-        {
-            // **It exists: bring it up to what was provisioned** (#64). The
-            // control plane's provisioner (rustkube `stormblock.rs`) writes
-            // the PV once the scheduler picks a node, before the pod starts
-            // here, with the claim's *request* as its capacity: it leaves the
-            // class to the node. This did nothing when the PV was there, so a
-            // 3.5Gi claim on a 4 GiB volume said 3.5Gi for good.
-            let pv_path = format!("/api/v1/persistentvolumes/{pv_name}");
-            if let Some(existing) = self.api_get(&pv_path).await {
-                if let Some(updated) =
-                    crate::system_claims::reconcile_pv(&existing, &pv, Some(&pvc))
-                {
-                    if self.api_put(&pv_path, &updated).await.is_none() {
-                        warn!("PV {pv_name}: could not record its capacity and source");
-                    }
-                }
-            }
-        }
-
-        // Bind the claim to it. Read-modify-write rather than a patch,
-        // because the claim carries a resourceVersion and losing a concurrent
-        // edit here would be a claim pointing at the wrong volume.
-        let before = pvc.clone();
-        crate::system_claims::bind_pvc(&mut pvc, &pv_name, &self.node_name, volume);
-        let capacity = serde_json::json!({ "storage": crate::system_claims::quantity(bytes) });
-        if pvc["status"]["phase"].as_str() != Some("Bound") {
-            pvc["status"] = serde_json::json!({
-                "phase": "Bound",
-                "accessModes": ["ReadWriteOnce"],
-                "capacity": capacity,
-            });
-        } else {
-            // Bound by the binder to the request-sized PV: the capacity is
-            // the class's, which is what `df` in the pod shows.
-            pvc["status"]["capacity"] = capacity;
-        }
-        if pvc == before {
-            return;
-        }
-        if self.api_put(&path, &pvc).await.is_some() {
-            info!("PVC {namespace}/{claim} bound to {pv_name}");
+    /// What [`ClaimBinder`] needs, cloned out of this manager so a bind can
+    /// run as a task of its own (#95).
+    fn binder(&self) -> ClaimBinder {
+        ClaimBinder {
+            api_url: self.api_url.clone(),
+            api_client: self.api_client.clone(),
+            storage_url: self.storage_url.clone(),
+            engine: self.engine.clone(),
+            node_name: self.node_name.clone(),
         }
     }
 
@@ -1533,7 +1606,9 @@ impl PodManager {
         claim: &str,
         pod_uid: &str,
     ) -> Result<(String, Option<&'static str>), ClaimError> {
-        self.provision_claim_timed(namespace, claim, pod_uid, &mut Default::default()).await
+        self.provision_claim_volume(namespace, claim, pod_uid, &mut Default::default(), false)
+            .await
+            .map(|(_, dev, fs)| (dev, fs))
     }
 
     /// [`Self::provision_claim`], with its steps (#95).
@@ -1544,7 +1619,7 @@ impl PodManager {
         pod_uid: &str,
         steps: &mut crate::start_timing::ClaimSteps,
     ) -> Result<(String, Option<&'static str>), ClaimError> {
-        self.provision_claim_volume(namespace, claim, pod_uid, steps)
+        self.provision_claim_volume(namespace, claim, pod_uid, steps, true)
             .await
             .map(|(_, dev, fs)| (dev, fs))
     }
@@ -1574,7 +1649,7 @@ impl PodManager {
             Ok(None) => {}
             Err(e) => return Err(format!("claim {namespace}/{claim}: {e}")),
         }
-        self.provision_claim_volume(namespace, claim, "", &mut Default::default())
+        self.provision_claim_volume(namespace, claim, "", &mut Default::default(), false)
             .await
             .map(|(id, dev, _)| (id, dev))
             .map_err(|e| match e {
@@ -1592,6 +1667,7 @@ impl PodManager {
         claim: &str,
         pod_uid: &str,
         steps: &mut crate::start_timing::ClaimSteps,
+        bind_later: bool,
     ) -> Result<(String, String, Option<&'static str>), ClaimError> {
         let name = crate::storage::volume_name(namespace, claim);
         // Each step timed for the pod's start timing (#95).
@@ -1768,8 +1844,17 @@ impl PodManager {
             // Here rather than earlier so the object never names a volume
             // that was not made, and after the attach so a bound claim means
             // storage a pod can actually use.
-            self.bind_claim(namespace, claim, &name, class_bytes).await;
-            steps.bind = step.elapsed();
+            if bind_later {
+                // Off the start path (#95): the pod needs the device, not
+                // the objects. Not timed; its own log line says when.
+                let binder = self.binder();
+                let (ns, c, v) = (namespace.to_string(), claim.to_string(), name.clone());
+                tokio::spawn(async move { binder.bind(&ns, &c, &v, class_bytes).await });
+                steps.bind = None;
+            } else {
+                self.bind_claim(namespace, claim, &name, class_bytes).await;
+                steps.bind = Some(step.elapsed());
+            }
             return Ok((vol_id, dev.to_string(), fstype));
         }
         Err(ClaimError::Failed(format!(
@@ -6428,9 +6513,20 @@ pub(crate) mod tests {
         mgr.provision_claim_timed("default", "raw", "uid-1", &mut steps).await.unwrap();
         let (how, made) = steps.made.expect("a new volume was made");
         assert_eq!(how, "raw");
-        for (step, d) in [("lookup", steps.lookup), ("raw", made), ("attach", steps.attach), ("bind", steps.bind)] {
+        for (step, d) in [("lookup", steps.lookup), ("raw", made), ("attach", steps.attach)] {
             assert!(d > std::time::Duration::ZERO, "{step} was not timed: {steps:?}");
         }
+        // The bind runs after the start path returns, not in it, and still
+        // happens: the claim's PV reaches the apiserver.
+        assert_eq!(steps.bind, None, "the pod path does not wait for the bind");
+        let posted = || w.calls.lock().unwrap().iter().any(|(m, p, _)| m == "POST" && p == "/api/v1/persistentvolumes");
+        for _ in 0..200 {
+            if posted() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(posted(), "the bind ran in the background");
     }
 
     #[tokio::test]
