@@ -57,7 +57,7 @@ by #51.
 
 ## Work plan
 
-### In progress: #56 (P1), exec, attach and portForward on :10250
+### Waiting on stormpump#103: #56 (P1), exec, attach and portForward on :10250
 
 2026-10-08. rustkube's apiserver splices the upgrade transparently (streaming.rs: headers and bytes as they are,
 query translated to `input/output/error/tty/command`, `port=`), so the kubelet speaks SPDY/3.1 itself, and
@@ -71,8 +71,12 @@ it: the kubelet connects inside the sandbox's netns (as health.rs dials) and spl
 2. [x] `portforward.rs` + `/portForward/{ns}/{pod}`: streams paired by requestID (error + data), connect to the
        port in the pod's netns (host network: the node's), splice; errors on the error stream.
 3. [x] WebSocket: port-forward's `SPDY/3.1+portforward.k8s.io` tunnel; exec/attach answer 501 naming stormpump#103.
-4. [ ] Tests (a SPDY client, fixtures compressed with the dictionary), docs, CHANGELOG; sc-build; golden.
-       Then #56 waits on stormpump#103 for exec/attach.
+4. [x] Tests (10 new), docs (README, api.md, status.md), CHANGELOG (886ce15, 82769d2; lock 8224957; #173/#175
+       were the build/test failures on the way). sc-build 82769d2: 363 kubelet unit pass. Golden
+       golden-rustkube-node-ff480857443c (stormcos#366). #127 closed. Not run with a real kubectl/node.
+5. [ ] After stormpump#103: exec (and exec_sync) through the engine's op; SPDY `v4.channel.k8s.io` streams
+       (stdin/stdout/stderr/error/resize) and WebSocket `v5.channel.k8s.io`; attach on a container's stdin; live
+       `kubectl exec -it` / `port-forward` on a node; close #56. #56 proposed after stormpump#103.
 
 ### Done: #98 (P1), the image config applied under the pod spec
 
