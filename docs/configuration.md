@@ -188,8 +188,14 @@ refused or malformed answer leaves the node's rules alone. Rules go through
 applied set, and again every 60 s; after each restore, the jumps
 PREROUTING/OUTPUT → `KUBE-SERVICES` and POSTROUTING → `KUBE-POSTROUTING` are
 checked (`iptables -C`) and inserted when missing. It needs `iptables` and
-`iptables-restore` on PATH, hostNetwork and NET_ADMIN (privileged). It does not
-flush conntrack entries, and leaves the chains of a deleted Service in place
+`iptables-restore` on PATH, hostNetwork and NET_ADMIN (privileged). After an apply
+it deletes the UDP conntrack entries the change left stale (#147), as upstream:
+for each endpoint that left a UDP Service port, `conntrack -D -p udp --orig-dst
+<clusterIP> --dst-nat <ip>` (and `--dport <nodePort> --dst-nat <ip>` for a NodePort),
+and `--orig-dst <clusterIP>` alone when the port gains its first endpoint. It needs
+the `conntrack` binary (conntrack-tools) for that; without it a stale UDP flow (a
+DNS client of a replaced CoreDNS) ages out in 30–120 s and the log says so once.
+TCP entries are left alone. It leaves the chains of a deleted Service in place
 (empty of jumps). No serving port, no kubeconfig flag, no EndpointSlices and no
 eBPF backend.
 

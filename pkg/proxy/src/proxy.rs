@@ -5,6 +5,7 @@
 //! minute, so rules removed behind its back come back).
 
 use crate::client::{ApiAuth, ApiClient};
+use crate::conntrack::{self, Conntrack, UdpBackends};
 use crate::endpoints::sync_services_and_endpoints;
 use crate::iptables::{self, IptablesRules, RuleApplier, RuleOptions};
 use crate::service_map::ServiceMap;
@@ -49,6 +50,10 @@ pub struct ServiceProxy {
     applier: Box<dyn RuleApplier>,
     /// The rules last applied successfully, and when.
     applied: Mutex<Option<(IptablesRules, Instant)>>,
+    /// Stale UDP flows are deleted through this (#147).
+    conntrack: Box<dyn Conntrack>,
+    /// The UDP backends the last applied rules sent to (#147).
+    udp_applied: Mutex<UdpBackends>,
 }
 
 impl ServiceProxy {
@@ -69,7 +74,15 @@ impl ServiceProxy {
             client,
             applier,
             applied: Mutex::new(None),
+            conntrack: conntrack::default_conntrack(),
+            udp_applied: Mutex::new(UdpBackends::default()),
         })
+    }
+
+    /// With an explicit conntrack seam (tests).
+    pub fn with_conntrack(mut self, conntrack: Box<dyn Conntrack>) -> Self {
+        self.conntrack = conntrack;
+        self
     }
 
     /// Run the proxy. Blocks forever.
@@ -99,7 +112,8 @@ impl ServiceProxy {
         let opts = RuleOptions {
             cluster_cidr: self.config.cluster_cidr.clone(),
         };
-        let rules = iptables::generate_rules_with(&self.service_map.get_all(), &opts);
+        let services = self.service_map.get_all();
+        let rules = iptables::generate_rules_with(&services, &opts);
         let mut applied = self.applied.lock().await;
         let due = match applied.as_ref() {
             None => true,
@@ -116,7 +130,22 @@ impl ServiceProxy {
             );
         }
         match self.applier.apply(&rules).await {
-            Ok(()) => *applied = Some((rules, Instant::now())),
+            Ok(()) => {
+                *applied = Some((rules, Instant::now()));
+                drop(applied);
+                // Now that new flows go to the new backends: the old flows
+                // to the ones that left (#147).
+                let now = UdpBackends::of(&services);
+                let deletes = {
+                    let mut udp = self.udp_applied.lock().await;
+                    let d = conntrack::stale(&udp, &now);
+                    *udp = now;
+                    d
+                };
+                for d in &deletes {
+                    self.conntrack.delete(d).await;
+                }
+            }
             // Not recorded: the next pass tries again.
             Err(e) => error!("Failed to apply iptables rules: {e}"),
         }
@@ -169,6 +198,62 @@ mod tests {
             }
         });
         url
+    }
+
+    #[derive(Clone, Default)]
+    struct Deletes(Arc<std::sync::Mutex<Vec<Vec<String>>>>);
+
+    #[async_trait::async_trait]
+    impl Conntrack for Deletes {
+        async fn delete(&self, args: &Vec<String>) {
+            self.0.lock().unwrap().push(args.clone());
+        }
+    }
+
+    /// #147: kube-dns's backend is replaced; once the new rules are applied,
+    /// the UDP flows NATed to the old one are deleted, and the TCP port's are not.
+    #[tokio::test]
+    async fn a_replaced_kube_dns_backend_has_its_udp_flows_deleted_after_the_apply() {
+        let backend = Arc::new(std::sync::Mutex::new("10.0.1.5".to_string()));
+        let b = backend.clone();
+        let url = fake_apiserver(move |path| {
+            let ip = b.lock().unwrap().clone();
+            let body = if path.starts_with("/api/v1/services") {
+                r#"{"items":[{"metadata":{"name":"kube-dns","namespace":"kube-system"},
+                    "spec":{"clusterIP":"10.96.0.10","ports":[
+                        {"name":"dns","port":53,"protocol":"UDP"},
+                        {"name":"dns-tcp","port":53,"protocol":"TCP"}]}}]}"#.to_string()
+            } else {
+                format!(r#"{{"items":[{{"metadata":{{"name":"kube-dns","namespace":"kube-system"}},
+                    "subsets":[{{"addresses":[{{"ip":"{ip}"}}],"ports":[
+                        {{"name":"dns","port":53,"protocol":"UDP"}},
+                        {{"name":"dns-tcp","port":53,"protocol":"TCP"}}]}}]}}]}}"#)
+            };
+            ("200 OK".into(), body)
+        });
+        let deletes = Deletes::default();
+        let proxy = ServiceProxy::with_applier(
+            ProxyConfig { api_server_url: url, ..Default::default() },
+            Box::new(Counting::default()),
+        )
+        .unwrap()
+        .with_conntrack(Box::new(deletes.clone()));
+
+        proxy.sync_once().await;
+        // The first apply: the UDP Service has its first endpoint.
+        assert_eq!(*deletes.0.lock().unwrap(), vec![vec!["-D", "-p", "udp", "--orig-dst", "10.96.0.10"]]);
+        deletes.0.lock().unwrap().clear();
+
+        proxy.sync_once().await;
+        assert!(deletes.0.lock().unwrap().is_empty(), "nothing changed, nothing deleted");
+
+        *backend.lock().unwrap() = "10.0.1.9".into();
+        proxy.sync_once().await;
+        assert_eq!(
+            *deletes.0.lock().unwrap(),
+            vec![vec!["-D", "-p", "udp", "--orig-dst", "10.96.0.10", "--dst-nat", "10.0.1.5"]],
+            "the old backend's UDP flows only"
+        );
     }
 
     #[derive(Clone, Default)]

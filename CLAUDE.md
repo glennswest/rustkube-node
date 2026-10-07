@@ -64,7 +64,7 @@ by #51.
 the binary ships and this is its correctness.) Upstream: `conntrack -D -p udp --orig-dst <svc> --dst-nat <ep>`
 per removed UDP endpoint, `--dport <nodePort>` for NodePorts, and `--orig-dst <svc>` when a UDP Service gains its
 first endpoint.
-1. [ ] `conntrack.rs`: the stale set from the last applied and new UDP backends; a `Conntrack` seam (the
+1. [x] `conntrack.rs`: the stale set from the last applied and new UDP backends; a `Conntrack` seam (the
        `conntrack` binary: exit 1 with "0 flow entries" is fine, a missing binary warns once). Deletes after a
        successful apply. Tests (fake apiserver: endpoint replaced, NodePort, first endpoint, TCP untouched); docs
        (configuration.md, README), CHANGELOG; sc-build (blocked: stormcentral#536).

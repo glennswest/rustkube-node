@@ -5,6 +5,7 @@
 
 #[allow(unexpected_cfgs)]
 pub mod client;
+pub mod conntrack;
 pub mod ebpf;
 pub mod endpoints;
 pub mod iptables;

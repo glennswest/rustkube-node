@@ -2,6 +2,12 @@
 
 ## 2026-10-08
 
+- **fix:** kube-proxy deletes stale UDP conntrack entries (#147). It rewrote the DNAT when a Service's backend went
+  but left conntrack, so a long-lived UDP socket to a ClusterIP (a DNS client of kube-dns) kept reaching the
+  replaced pod for 30–120 s. After an apply it now runs, as upstream, `conntrack -D -p udp --orig-dst <clusterIP>
+  --dst-nat <old ip>` per removed UDP endpoint (and `--dport <nodePort>` for NodePorts), and clears a UDP
+  ClusterIP when it gains its first endpoint. "0 flow entries" is not an error; a node without the `conntrack`
+  binary warns once. (No stormcos edition runs kube-proxy, #145/#155; the binary ships.)
 - **docs:** README: `stormvm serve` on `127.0.0.1:9095` is not a developer-only convenience (#123, stormcos#65). It
   ships on every node as a stormcos service golden, and stormconsole's VM plugin uses it for serial and VNC
   consoles; it reads the same `/run/stormvm` registrations as the kubelet's `vmConsole` route.
