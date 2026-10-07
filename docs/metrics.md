@@ -76,12 +76,13 @@ containerd or CRI-O, which stormcos does not run. So the stormpump runtime publi
 |---|---|
 | `cgroup` | the cgroup v2 path, from `/proc/<pid>/cgroup` (the engine does not report it; the kubelet shares the host pid namespace) |
 | `pid` | the workload's init process, for `/proc/<pid>/net/dev` inside its namespaces |
-| `kind` | `container`, or `sandbox`: the process holding a pod-network pod's namespaces |
-| `reports_network` | `true` for the sandbox only, as a CRI pause container: a pod's network is counted once |
+| `kind` | `container`; `sandbox`, the process holding a pod-network pod's namespaces; or `vm`, a VMI's hypervisor (`container_id` `vm-<vmi uid>`, `pod` the VMI's name, labels `kubevirt.io/domain` and `kubevirt.io/created-by`) |
+| `reports_network` | `true` for a pod's sandbox, as a CRI pause container (a pod's network is counted once), and for a VM on the pod network (#88); a VM on a node bridge or SLIRP has no network of its own to count |
 | `namespace`, `pod`, `pod_uid`, `container`, `container_id`, `image` | the CRI identity (`image` as the pod wrote it) |
 | `labels`, `annotations` | the CRI ones, plus upstream's `io.kubernetes.pod.{name,namespace,uid}` and `io.kubernetes.container.name` (`io.cri-containerd.kind: sandbox` on a sandbox) |
 
 Written atomically (tmp + rename) when a container starts or a pod-network sandbox is made, removed when the
 container is removed or the sandbox's holder released; at start the kubelet removes records whose pid no longer
-runs in that cgroup. A host-network pod has no sandbox record (its network is the node's). VMIs (cadvisor#15)
-are next. cadvisor reads the directory once stormcos mounts the host's `/run` into it.
+runs in that cgroup. A host-network pod has no sandbox record (its network is the node's). A VM's record is
+written when its machine starts and removed when it ends or is removed (cadvisor#15). cadvisor reads the directory
+once stormcos mounts the host's `/run` into it (stormcos#391).

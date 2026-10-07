@@ -871,6 +871,8 @@ pub struct VmManager {
     /// Each bridged guest's DHCP responder, held for the machine's life (#88).
     /// Not in [`Vm`], which is cloned freely, and a responder is a thread.
     responders: std::sync::Mutex<HashMap<String, Vec<stormvm_net::Responder>>>,
+    /// Publishes each machine's hypervisor identity for cadvisor (#84).
+    identities: Option<crate::workload_identity::Publisher>,
 }
 
 /// What making a machine's NICs produced (#88 adds the leases and their
@@ -1015,6 +1017,45 @@ impl VmManager {
             net_store: crate::vm_network::Store::default(),
             pod_nets: Default::default(),
             responders: Default::default(),
+            identities: None,
+        }
+    }
+
+    /// Publish each machine's hypervisor identity for cadvisor (#84).
+    pub fn with_identities(mut self, publisher: crate::workload_identity::Publisher) -> VmManager {
+        self.identities = Some(publisher);
+        self
+    }
+
+    /// The record of a machine's hypervisor (#84): its VMI's identity, the
+    /// network reported from it when it is on the pod network (#88).
+    async fn publish_identity(&self, uid: &str, ns: &str, vm: &VmSpec, handle: Handle, on_pod_network: bool) {
+        let (Some(publisher), Some(ring)) = (self.identities.clone(), self.ring.clone()) else { return };
+        let info = tokio::task::spawn_blocking(move || ring.query_info(handle)).await;
+        let Some(pid) = info.ok().and_then(|r| r.ok()).flatten().map(|i| i.pid) else { return };
+        let Some(cgroup) = crate::workload_identity::cgroup_of(pid) else { return };
+        let mut record = crate::workload_identity::Record {
+            cgroup,
+            pid,
+            kind: "vm".into(),
+            reports_network: on_pod_network,
+            namespace: ns.to_string(),
+            pod: vm.name.clone(),
+            pod_uid: uid.to_string(),
+            container: "hypervisor".into(),
+            container_id: format!("vm-{uid}"),
+            ..Default::default()
+        }
+        .with_kubernetes_labels();
+        // KubeVirt's names for a VMI, as a virt-launcher pod carries them.
+        record.labels.insert("kubevirt.io/domain".into(), vm.name.clone());
+        record.labels.insert("kubevirt.io/created-by".into(), uid.to_string());
+        publisher.publish(&record);
+    }
+
+    fn withdraw_identity(&self, uid: &str) {
+        if let Some(p) = &self.identities {
+            p.withdraw_id(&format!("vm-{uid}"));
         }
     }
 
@@ -1470,6 +1511,7 @@ impl VmManager {
             if let Some(vm) = vm {
                 anyhow::ensure!(self.stop(&vm).await, "VM cleanup pending for {uid}");
                 self.vms.lock().await.remove(uid);
+                self.withdraw_identity(uid);
             }
             self.retries.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
             self.waiting_since.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
@@ -1537,6 +1579,7 @@ impl VmManager {
         for vm in gone {
             if self.stop(&vm).await {
                 self.vms.lock().await.remove(&vm.uid);
+                self.withdraw_identity(&vm.uid);
             }
         }
         // The machine is gone, so its object may go too.
@@ -1850,6 +1893,7 @@ impl VmManager {
         }
 
         info!(vm = %vm.name, namespace = %ns, ?handle, "vm started");
+        self.publish_identity(uid, &ns, &vm, handle, on_pod_network).await;
         // The record a restarted kubelet finds it by (#35): the engine keeps
         // the machine across a restart, and this process's memory does not.
         // Without the handle, deleting its object stopped nothing.
@@ -2136,6 +2180,7 @@ impl VmManager {
                 (c, _) => format!("the hypervisor exited with {c}"),
             };
             info!(vm = %done.name, code, "vm ended");
+            self.withdraw_identity(&done.uid);
             // A machine that exits 0 asked to; anything else did not.
             if code == 0 {
                 self.event_of(&done, "Normal", "Stopped",

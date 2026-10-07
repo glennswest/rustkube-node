@@ -262,7 +262,9 @@ impl Kubelet {
             .with_storage(self.config.engine.clone())
             .with_claims(self.pod_manager.clone())
             .with_cni(cni)
-            .with_max_staleness(self.config.metadata_max_staleness),
+            .with_max_staleness(self.config.metadata_max_staleness)
+            // Each machine's hypervisor identity for cadvisor (#84).
+            .with_identities(crate::workload_identity::Publisher::default()),
         ));
         self.snapshots = Some(Arc::new(crate::vm_snapshot::Snapshots::new(
             self.api_client.clone(),

@@ -42,7 +42,7 @@ pub struct Record {
     /// The cgroup v2 path, as `/proc/<pid>/cgroup` names it.
     pub cgroup: String,
     pub pid: i32,
-    /// `container` or `sandbox`.
+    /// `container`, `sandbox`, or `vm` (a VMI's hypervisor).
     pub kind: String,
     /// The pod's network is counted from this one alone.
     pub reports_network: bool,
@@ -67,11 +67,15 @@ impl Record {
         ] {
             self.labels.insert(k.to_string(), v.clone());
         }
-        if self.kind == "container" {
-            self.labels.insert("io.kubernetes.container.name".into(), self.container.clone());
-        } else {
+        match self.kind.as_str() {
+            "container" => {
+                self.labels.insert("io.kubernetes.container.name".into(), self.container.clone());
+            }
             // What containerd marks a pause container with.
-            self.labels.insert("io.cri-containerd.kind".into(), "sandbox".into());
+            "sandbox" => {
+                self.labels.insert("io.cri-containerd.kind".into(), "sandbox".into());
+            }
+            _ => {}
         }
         self
     }
@@ -150,6 +154,22 @@ impl Publisher {
         if let Err(e) = std::fs::remove_file(path) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 tracing::debug!(path = %path.display(), "workload identity not removed: {e}");
+            }
+        }
+    }
+
+    /// Remove the records whose `container_id` is `id` (a VM's, whose cgroup
+    /// file name a restarted kubelet does not know).
+    pub fn withdraw_id(&self, id: &str) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else { return };
+        for e in entries.flatten() {
+            let path = e.path();
+            let matches = std::fs::read(&path)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .is_some_and(|v| v["container_id"].as_str() == Some(id));
+            if matches {
+                self.withdraw(&path);
             }
         }
     }
@@ -236,6 +256,10 @@ mod tests {
         assert_eq!(swept, 2);
         let left: Vec<_> = std::fs::read_dir(dir.path().join("workloads")).unwrap().flatten().map(|e| e.file_name()).collect();
         assert_eq!(left, vec![std::ffi::OsString::from("w1-1.json")]);
+        let vm = Record { cgroup: "/stormpump/w1-4".into(), pid: 14, kind: "vm".into(), container_id: "vm-u1".into(), ..Default::default() };
+        p.publish(&vm).unwrap();
+        p.withdraw_id("vm-u1");
+        assert!(!dir.path().join("workloads/w1-4.json").exists(), "a VM's record found by its id");
         p.withdraw(&a);
         p.withdraw(&a);
         assert!(std::fs::read_dir(dir.path().join("workloads")).unwrap().next().is_none());
