@@ -57,7 +57,7 @@ by #51.
 
 ## Work plan
 
-### In progress: #85, a VMI placed with spec.nodeName is never started
+### Waiting on stormcentral#541 (builds): #85, a VMI placed with spec.nodeName is never started
 
 2026-10-07. Found: vm_loop lists VMIs with `fieldSelector=status.nodeName=<node>` and filters `want` on
 status.nodeName, so a hand-placed VMI (spec.nodeName only) never reaches `assigned_to`. rustkube's scheduler
@@ -71,6 +71,8 @@ status.nodeName, so a hand-placed VMI (spec.nodeName only) never reaches `assign
        Job a8e2791d84 cancelled while queued: the master's deliberate drain (1 slot, queued jobs cancelled until
        stormcentral's bootstrap job 03e9cbfde9 installs; said on stormcentral#536). `tmp/wait-drain.sh` reruns
        the build once that job is done or the slots come back.
+       The bootstrap job was cancelled too; 5fd1caed32 (ee08d48) cancelled the same way. Filed stormcentral#541,
+       #85 proposed after it. Rerun `SC_BUILD_VM=1 sc-build 'cargo build --locked && cargo test --locked'`, close.
 
 ### Waiting on stormcentral#536 (builds): #77, the client certificate reloaded when stormcert renews it
 
