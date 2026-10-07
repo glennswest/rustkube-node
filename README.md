@@ -137,6 +137,19 @@ retried on a backoff from its own first failure, 1 s at first (#148).
 Host-network Pods, the CNI agent's own among them, bypass this. CRI delegates networking to the external runtime. Node Ready
 is not yet gated on CNI readiness (#3/#32).
 
+**The image's config is applied under the pod spec** on stormpump (#98), as a CRI runtime does. When an image
+resolves (a pallet or a pull), the kubelet asks sbregistry for its golden record (`GET /v1/goldens/{image}`,
+2 s bound; a miss is asked again after 5 min) and keeps its `config`: `command` replaces the image's
+`Entrypoint` and `args` its `Cmd` (`args` alone run after the `Entrypoint`); the image's `Env` is under the
+pod's `env`; `WorkingDir` applies when `workingDir` is unset; `User` (a number or a name from the image's
+`/etc/passwd`/`/etc/group`) when `runAsUser`/`runAsGroup` are unset. `runAsUser`, `runAsGroup` and
+`runAsNonRoot` (container, else pod) are applied (every container ran as root before). `PATH` and `HOME`
+default when neither side sets them; argv[0] is looked up on the container's `PATH`. The node's boot goldens
+carry no config yet (stormblock-registry#58): a container of one whose argv would be empty or start with a flag
+is refused, naming the image, instead of exec'ing the flag. emptyDir volumes are 0777, as upstream, so a
+non-root uid can write them. Not yet: an image's declared `Volumes` (not recorded by the registry, #58) and
+`fsGroup` (a claim's filesystem is root's).
+
 An overview deck is [docs/presentation.md](docs/presentation.md) (Marp).
 See [configuration and defaults](docs/configuration.md), [ports and APIs](docs/api.md),
 and [build and shipping](docs/BUILD.md). The binaries share upstream names;

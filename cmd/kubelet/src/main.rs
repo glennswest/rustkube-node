@@ -357,7 +357,10 @@ async fn main() -> anyhow::Result<()> {
                     tracing::info!("kubelet using stormpump runtime (ring at {socket})");
                     // The runtime asks per pod whether a network exists, so it
                     // is given the invoker even when none is configured yet.
-                    let rt = Arc::new(rt.with_cni(cni_invoker));
+                    // The images found and the containers created share each
+                    // image's config (#98).
+                    let configs = Arc::new(kubelet::image_config::ImageConfigs::default());
+                    let rt = Arc::new(rt.with_cni(cni_invoker).with_image_configs(configs.clone()));
                     engine_ring = rt.ring_client();
                     // The ring goes to the image service too: a pull ends in
                     // a mount, and only the engine can make one the rest of
@@ -367,7 +370,8 @@ async fn main() -> anyhow::Result<()> {
                             cli.registry.clone(),
                         )
                         .with_engine(rt.ring_client(), node_name.clone())
-                        .with_storage(engine.clone()),
+                        .with_storage(engine.clone())
+                        .with_image_configs(configs),
                     );
                     let mig = Arc::new(NativeRuntime::new())
                         as Arc<dyn kubelet::cri::MigrationService>;

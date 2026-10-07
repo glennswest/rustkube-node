@@ -2,6 +2,15 @@
 
 ## 2026-10-08
 
+- **fix:** The image's config is applied under the pod spec on stormpump (#98). argv was `command` + `args`
+  only, so an args-only container (CoreDNS's `-conf …`) exec'd its first argument, a container with no `env`
+  got no image `PATH`, and every container ran as root. Now, from sbregistry's golden record (`config`, asked
+  once per image root): `command`/`args` over `Entrypoint`/`Cmd` by CRI's rules, the image's `Env` under the
+  pod's, `WorkingDir` and `User` (numbers or names from the image's `/etc/passwd`/`/etc/group`) when the pod
+  leaves them unset. `runAsUser`/`runAsGroup`/`runAsNonRoot` are read (container, else pod) and applied; the CRI
+  gRPC path forwards the first two. An image with no known config (the boot goldens, until
+  stormblock-registry#58) whose argv would be empty or start with a flag is refused, naming the image. emptyDir
+  is created 0777, as upstream.
 - **feat:** Start timing takes a claim apart (#95): `claim/<volume>/lookup` (PVC, PV, existing volume, room),
   `claim/<volume>/blank|clone|raw` (how its volume was made, absent when it existed), `claim/<volume>/attach`
   (ublk) and `claim/<volume>/bind` (PV written, claim bound), in the annotation, Event and log line, with

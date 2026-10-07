@@ -97,6 +97,13 @@ pub struct ContainerConfig {
     pub cpu_quota: i64,
     pub cpu_shares: i64,
     pub memory_limit_bytes: i64,
+    /// securityContext.runAsUser (the container's, else the pod's; #98). `None`:
+    /// the image's `User`, else root.
+    pub run_as_user: Option<i64>,
+    /// securityContext.runAsGroup, likewise.
+    pub run_as_group: Option<i64>,
+    /// securityContext.runAsNonRoot: refuse to start as uid 0.
+    pub run_as_non_root: Option<bool>,
     /// securityContext.privileged — full host access (Cilium agent needs this).
     pub privileged: bool,
     /// securityContext.readOnlyRootFilesystem.

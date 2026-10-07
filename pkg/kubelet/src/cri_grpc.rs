@@ -281,6 +281,10 @@ fn to_proto_container_config(config: &ContainerConfig) -> proto::ContainerConfig
                 }),
                 selinux_options: config.selinux_options.as_ref().map(to_proto_selinux),
                 seccomp: config.seccomp_profile.as_ref().map(to_proto_seccomp),
+                // A CRI runtime applies the image's User itself when these
+                // are unset (#98).
+                run_as_user: config.run_as_user.map(|value| proto::Int64Value { value }),
+                run_as_group: config.run_as_group.map(|value| proto::Int64Value { value }),
                 ..Default::default()
             }),
         }),

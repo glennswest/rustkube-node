@@ -1194,6 +1194,13 @@ impl PodManager {
                 // What emptyDir means: per-pod scratch.
                 let dir = pod_volume_dir(&self.state_root, uid, "empty-dir", &name);
                 std::fs::create_dir_all(&dir).map_err(|e| pod_dir_error(&name, &dir, e))?;
+                // 0777, as upstream: a container that runs as its image's
+                // User or its runAsUser (#98) must be able to write it.
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777))
+                        .map_err(|e| pod_dir_error(&name, &dir, e))?;
+                }
                 dir
             } else {
                 // Any other volume type (in-tree nfs, iscsi, and the rest)
@@ -5264,6 +5271,11 @@ fn build_container_config(
         cpu_quota: parse_cpu_quota(cpu_limit),
         cpu_shares: parse_cpu_shares(cpu_request),
         memory_limit_bytes: parse_memory_bytes(mem_limit),
+        // The pod's values fill in what the container leaves unset
+        // (`apply_pod_namespaces`), and the image's User what both do (#98).
+        run_as_user: sc["runAsUser"].as_i64(),
+        run_as_group: sc["runAsGroup"].as_i64(),
+        run_as_non_root: sc["runAsNonRoot"].as_bool(),
         privileged: sc["privileged"].as_bool().unwrap_or(false),
         readonly_rootfs: sc["readOnlyRootFilesystem"].as_bool().unwrap_or(false),
         add_capabilities,
@@ -5331,6 +5343,18 @@ fn apply_pod_namespaces(config: &mut ContainerConfig, pod: &Value) {
     // container that sets its own overrides it (rustkube-node#26).
     if config.selinux_options.is_none() {
         config.selinux_options = parse_selinux_options(&spec["securityContext"]);
+    }
+    // runAsUser / runAsGroup / runAsNonRoot: the container's own, else the
+    // pod's (#98). An explicit `runAsNonRoot: false` on the container wins.
+    let pod_sc = &spec["securityContext"];
+    if config.run_as_user.is_none() {
+        config.run_as_user = pod_sc["runAsUser"].as_i64();
+    }
+    if config.run_as_group.is_none() {
+        config.run_as_group = pod_sc["runAsGroup"].as_i64();
+    }
+    if config.run_as_non_root.is_none() {
+        config.run_as_non_root = pod_sc["runAsNonRoot"].as_bool();
     }
 }
 
@@ -6823,6 +6847,27 @@ pub(crate) mod tests {
             .ends_with("/pods/uid-9/volumes/kubernetes.io~empty-dir/scratch"));
         // A directory to bind carries no filesystem — only a claim does.
         assert!(v.get("bpf").unwrap().fstype.is_none());
+        // Writable by any uid (#98), as upstream makes it.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&v.get("scratch").unwrap().path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o777, "{mode:o}");
+    }
+
+    /// #98: runAsUser / runAsGroup / runAsNonRoot from the container, else the pod.
+    #[test]
+    fn run_as_comes_from_the_container_else_the_pod() {
+        let mut c = simple_container();
+        c["securityContext"] = json!({"runAsUser": 1000, "runAsNonRoot": false});
+        let mut cfg = build_container_config(&c, "img", vec![], vec![]);
+        let pod = json!({"spec": {"securityContext": {"runAsUser": 2000, "runAsGroup": 3000, "runAsNonRoot": true}}});
+        apply_pod_namespaces(&mut cfg, &pod);
+        assert_eq!((cfg.run_as_user, cfg.run_as_group, cfg.run_as_non_root), (Some(1000), Some(3000), Some(false)));
+        let mut bare = build_container_config(&simple_container(), "img", vec![], vec![]);
+        apply_pod_namespaces(&mut bare, &pod);
+        assert_eq!((bare.run_as_user, bare.run_as_non_root), (Some(2000), Some(true)));
+        let mut none = build_container_config(&simple_container(), "img", vec![], vec![]);
+        apply_pod_namespaces(&mut none, &json!({"spec": {}}));
+        assert_eq!((none.run_as_user, none.run_as_group, none.run_as_non_root), (None, None, None));
     }
 
     #[test]

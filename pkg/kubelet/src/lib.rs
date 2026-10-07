@@ -25,6 +25,7 @@ pub mod cri_grpc;
 pub mod csi;
 pub mod csi_plugins;
 pub mod health;
+pub mod image_config;
 pub mod kubeconfig;
 pub mod kubelet;
 pub mod node_status;

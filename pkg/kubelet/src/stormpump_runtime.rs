@@ -225,6 +225,8 @@ pub struct StormpumpRuntime {
     /// Monotonic, so two containers created in the same millisecond do not
     /// collide the way a timestamp-derived id would.
     next_id: std::sync::atomic::AtomicU64,
+    /// Image configs by image root, filled by [`StormpumpImages`] (#98).
+    image_configs: Arc<crate::image_config::ImageConfigs>,
 }
 
 impl StormpumpRuntime {
@@ -317,7 +319,15 @@ impl StormpumpRuntime {
             containers: Mutex::new(HashMap::new()),
             failed_networks: Mutex::new(Vec::new()),
             next_id: std::sync::atomic::AtomicU64::new(1),
+            image_configs: Arc::default(),
         }
+    }
+
+    /// The image configs the image service finds (#98): the same `Arc` both
+    /// are given.
+    pub fn with_image_configs(mut self, configs: Arc<crate::image_config::ImageConfigs>) -> Self {
+        self.image_configs = configs;
+        self
     }
 
     /// The ring, or an error naming what is missing.
@@ -474,15 +484,43 @@ impl StormpumpRuntime {
 ///
 /// The two models line up more than they differ, and where they differ the
 /// comment says which way it went and why.
-fn spec_for(config: &ContainerConfig, sandbox: &PodSandboxConfig) -> stormpump::spec::Spec {
+/// The container's argv, env, working directory and user: the pod spec over
+/// the image's own config (#98, `image_config::compose`), with `HOSTNAME`.
+fn compose_for(
+    config: &ContainerConfig,
+    image: Option<&crate::image_config::ImageConfig>,
+    image_name: Option<&str>,
+) -> Result<crate::image_config::Composed, String> {
+    let env: Vec<String> = config.envs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let root = image_root(&config.image);
+    let pod = crate::image_config::PodSide {
+        // The reference the pod wrote, when known, rather than its mount.
+        image: image_name.unwrap_or(&config.image),
+        command: &config.command,
+        args: &config.args,
+        env: &env,
+        working_dir: &config.working_dir,
+        run_as_user: config.run_as_user,
+        run_as_group: config.run_as_group,
+        run_as_non_root: config.run_as_non_root.unwrap_or(false),
+    };
+    let mut run = crate::image_config::compose(&pod, image, root.as_deref())?;
+    // Upstream's kubelet sets HOSTNAME to the pod name, and plenty of software
+    // reads it rather than calling uname.
+    if !config.name.is_empty() && !run.env.iter().any(|e| e.starts_with("HOSTNAME=")) {
+        run.env.push(format!("HOSTNAME={}", config.name));
+    }
+    Ok(run)
+}
+
+fn spec_for(
+    config: &ContainerConfig,
+    sandbox: &PodSandboxConfig,
+    run: crate::image_config::Composed,
+) -> stormpump::spec::Spec {
     use stormpump::spec::{Logs, Root, Share, Spec};
 
-    let mut argv: Vec<String> = config.command.clone();
-    argv.extend(config.args.iter().cloned());
-    // A spec with nothing to run is refused at define time (`EmptyArgv`), and
-    // an image's entrypoint is not something this side knows. Falling back to a
-    // shell would run the wrong thing silently; an empty argv fails loudly at
-    // the moment the spec is defined, naming the container.
+    let crate::image_config::Composed { mut argv, env, cwd, uid, gid } = run;
 
     // **argv[0] is resolved here, because the engine will not do it.**
     //
@@ -498,7 +536,7 @@ fn spec_for(config: &ContainerConfig, sandbox: &PodSandboxConfig) -> stormpump::
     if let Some(first) = argv.first().cloned() {
         if !first.starts_with('/') {
             match image_root(&config.image) {
-                Some(root) => match resolve_in_image(&root, &first) {
+                Some(root) => match resolve_in_image(&root, &first, &crate::image_config::path_of(&env)) {
                     Some(abs) => argv[0] = abs,
                     None => tracing::warn!(
                         image = %config.image, argv0 = %first,
@@ -576,12 +614,10 @@ fn spec_for(config: &ContainerConfig, sandbox: &PodSandboxConfig) -> stormpump::
             Profile::Routed
         },
         argv,
-        env: container_env(config),
-        cwd: if config.working_dir.is_empty() {
-            "/".to_string()
-        } else {
-            config.working_dir.clone()
-        },
+        env,
+        cwd,
+        uid,
+        gid,
         share: Share {
             // A container asking for hostPID in a sandbox not built for it is
             // the mismatch every runtime rejects, so the sandbox's answer wins
@@ -975,7 +1011,14 @@ impl RuntimeService for StormpumpRuntime {
             }
         }
         self.probe()?;
-        let encoded = spec_for(config, _sandbox_config).encode();
+        // The image's own config under the pod spec (#98). Known when the
+        // image service found it for this root; a refusal names the image.
+        let image = self.image_configs.get(&config.image);
+        let name = self.image_configs.image_of(&config.image);
+        let run = compose_for(config, image.as_ref(), name.as_deref()).map_err(|e| {
+            CriError::Runtime(format!("container {}: {e}", config.name))
+        })?;
+        let encoded = spec_for(config, _sandbox_config, run).encode();
         let spec = self.on_ring(move |r| r.spec_define(encoded)).await?;
 
         let (namespace, pod) = {
@@ -1357,49 +1400,8 @@ pub struct StormpumpImages {
     /// One pull of an image at a time (#143): two concurrent pulls would mint
     /// two clones, and a bound clone is never reaped, so the loser would leak.
     pulling: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-}
-
-/// The container's environment: what the pod asked for, plus the defaults an
-/// OCI runtime would have taken from the image config.
-///
-/// **A golden has no image config**, so `HOME`, `PATH` and `HOSTNAME` — which
-/// every other runtime derives from the image or the pod — arrive unset unless
-/// something puts them there. Real programs assume them: Cilium's operator got
-/// as far as starting its hive and then died on
-/// `unable to get current user home directory: os/user lookup failed; $HOME is
-/// empty`, which is a missing environment variable wearing the costume of a
-/// user-lookup failure.
-///
-/// The pod always wins. These are defaults, not overrides: a spec that sets
-/// `HOME` means it, and this must never quietly replace it.
-fn container_env(config: &ContainerConfig) -> Vec<String> {
-    let mut env: Vec<String> = config
-        .envs
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect();
-
-    let has = |env: &Vec<String>, key: &str| {
-        let prefix = format!("{key}=");
-        env.iter().any(|e| e.starts_with(&prefix))
-    };
-
-    // HOME=/root because a container without a user database runs as root,
-    // and that is the home an image would declare for it.
-    if !has(&env, "HOME") {
-        env.push("HOME=/root".to_string());
-    }
-    if !has(&env, "PATH") {
-        env.push(
-            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
-        );
-    }
-    // Upstream's kubelet sets HOSTNAME to the pod name, and plenty of software
-    // reads it rather than calling uname.
-    if !has(&env, "HOSTNAME") && !config.name.is_empty() {
-        env.push(format!("HOSTNAME={}", config.name));
-    }
-    env
+    /// Each image root's config, from the registry's golden record (#98).
+    configs: Arc<crate::image_config::ImageConfigs>,
 }
 
 /// Find `argv0` on the standard PATH *inside* an image root.
@@ -1409,26 +1411,16 @@ fn container_env(config: &ContainerConfig) -> Vec<String> {
 /// `/pallets/cilium/usr/bin/cilium-agent` on this side is `/usr/bin/cilium-agent`
 /// on that one.
 ///
-/// The directory list is the conventional PATH, in the conventional order. An
-/// image that puts its binary somewhere else and relies on an `ENV PATH` is not
-/// handled: a golden is a filesystem and carries no image config, so there is
-/// no PATH to read. That case is a miss, and a miss is reported rather than
-/// guessed at.
-fn resolve_in_image(root: &std::path::Path, argv0: &str) -> Option<String> {
+/// The directories are the container's `PATH` (the image's `Env` under the
+/// pod's, #98), else the conventional one. A miss is reported, not guessed at.
+fn resolve_in_image(root: &std::path::Path, argv0: &str, path: &[String]) -> Option<String> {
     // A command with a slash in it is a path already, just not an absolute
     // one — `./foo` or `bin/foo`. PATH is not consulted for those, the same as
     // a shell.
     if argv0.contains('/') {
         return None;
     }
-    for dir in [
-        "/usr/local/sbin",
-        "/usr/local/bin",
-        "/usr/sbin",
-        "/usr/bin",
-        "/sbin",
-        "/bin",
-    ] {
+    for dir in path {
         let candidate = root.join(dir.trim_start_matches('/')).join(argv0);
         if candidate.is_file() {
             return Some(format!("{dir}/{argv0}"));
@@ -1436,6 +1428,9 @@ fn resolve_in_image(root: &std::path::Path, argv0: &str) -> Option<String> {
     }
     None
 }
+
+/// How long the registry is given to answer for an image's config (#98).
+const CONFIG_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Where a pulled image is mounted. Under `/run` because it does not survive a
 /// reboot: the clone does, and is found again by name.
@@ -1489,7 +1484,48 @@ impl StormpumpImages {
             pulled: Mutex::new(HashMap::new()),
             unbound: Mutex::new(HashMap::new()),
             pulling: Mutex::new(HashMap::new()),
+            configs: Arc::default(),
         }
+    }
+
+    /// Where the image configs it finds go (#98): the runtime reads them.
+    pub fn with_image_configs(mut self, configs: Arc<crate::image_config::ImageConfigs>) -> StormpumpImages {
+        self.configs = configs;
+        self
+    }
+
+    /// Learn the config of `image`, rooted at `root`, from the registry's
+    /// golden record (#98), unless it is known (or a miss is recent). Bounded:
+    /// a pallet starts without the registry, and a slow answer must not hold
+    /// it. Anything but a record with a config is a miss.
+    async fn learn_config(&self, image: &str, root: &str) {
+        if !self.configs.needs_lookup(root) {
+            return;
+        }
+        let Ok(mut url) = reqwest::Url::parse(&self.registry) else {
+            self.configs.put(root, image, None);
+            return;
+        };
+        if let Ok(mut path) = url.path_segments_mut() {
+            path.pop_if_empty().extend(["v1", "goldens", image]);
+        }
+        let config = match self.http.get(url.clone()).timeout(CONFIG_LOOKUP_TIMEOUT).send().await {
+            Ok(r) if r.status().is_success() => r
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| crate::image_config::from_golden(&v)),
+            Ok(r) => {
+                tracing::debug!(image = %image, status = %r.status(), "registry has no golden record for the image");
+                None
+            }
+            Err(e) => {
+                tracing::debug!(image = %image, "registry not asked for the image's config: {e}");
+                None
+            }
+        };
+        tracing::info!(image = %image, root = %root, known = config.is_some(), "image config");
+        self.configs.put(root, image, config);
     }
 
     /// The engine and the node identity, without which a pull can get as far
@@ -1738,9 +1774,12 @@ impl ImageService for StormpumpImages {
     async fn pull_image(&self, image: &str) -> Result<String, CriError> {
         if let Some(path) = Self::local_path(image) {
             tracing::info!(image = %image, path = %path.display(), "image is a golden on this node");
-            return Ok(path.to_string_lossy().into_owned());
+            let path = path.to_string_lossy().into_owned();
+            self.learn_config(image, &path).await;
+            return Ok(path);
         }
         if let Some(path) = self.pulled_path(image).await {
+            self.learn_config(image, &path).await;
             return Ok(path);
         }
         // One pull of this image at a time; the one that waited finds the
@@ -1748,6 +1787,7 @@ impl ImageService for StormpumpImages {
         let gate = self.pulling.lock().await.entry(image.to_string()).or_default().clone();
         let _gate = gate.lock().await;
         if let Some(path) = self.pulled_path(image).await {
+            self.learn_config(image, &path).await;
             return Ok(path);
         }
 
@@ -1796,6 +1836,7 @@ impl ImageService for StormpumpImages {
 
         tracing::info!(image = %image, %device, %mount, clone = %clone_id, found_again = bound, "pulled");
         self.pulled.lock().await.insert(image.to_string(), mount.clone());
+        self.learn_config(image, &mount).await;
         Ok(mount)
     }
 
@@ -1888,6 +1929,23 @@ mod tests {
     }
     use super::*;
 
+    fn std_path() -> Vec<String> {
+        crate::image_config::path_of(&[])
+    }
+
+    /// `spec_for` with the pod's own argv (no image config), and an empty one
+    /// allowed: these tests are about the spec's other fields.
+    fn spec_of(cc: &ContainerConfig, sb: &PodSandboxConfig) -> stormpump::spec::Spec {
+        let run = compose_for(cc, None, None).unwrap_or_else(|_| crate::image_config::Composed {
+            argv: Vec::new(),
+            env: Vec::new(),
+            cwd: "/".into(),
+            uid: 0,
+            gid: 0,
+        });
+        spec_for(cc, sb, run)
+    }
+
     fn rt() -> StormpumpRuntime {
         StormpumpRuntime::new("/nonexistent/stormpump.sock")
     }
@@ -1905,7 +1963,7 @@ mod tests {
             cpu_shares: 512,
             ..Default::default()
         };
-        let spec = spec_for(&cc, &PodSandboxConfig::default());
+        let spec = spec_of(&cc, &PodSandboxConfig::default());
         assert_eq!(spec.limits.memory_max, Some(512 * 1024 * 1024));
         assert_eq!(spec.limits.swap_max, Some(0));
         assert_eq!(
@@ -1929,7 +1987,7 @@ mod tests {
             cpu_period: 100_000,
             ..Default::default()
         };
-        assert!(spec_for(&cc, &PodSandboxConfig::default()).limits.is_empty());
+        assert!(spec_of(&cc, &PodSandboxConfig::default()).limits.is_empty());
         // A quota with no period gets the kernel's.
         let cc = ContainerConfig { cpu_quota: 25_000, cpu_period: 0, ..cc };
         assert_eq!(
@@ -2085,11 +2143,11 @@ mod tests {
         // hostNetwork means — and what Cilium's agent runs with.
         let sandbox = PodSandboxConfig { host_network: true, ..Default::default() };
         let cc = ContainerConfig { name: "cilium".into(), ..Default::default() };
-        let spec = spec_for(&cc, &sandbox);
+        let spec = spec_of(&cc, &sandbox);
         assert_eq!(spec.profile, Profile::Host);
 
         // And an ordinary pod is routed: east-west plus a default route.
-        let spec = spec_for(&cc, &PodSandboxConfig::default());
+        let spec = spec_of(&cc, &PodSandboxConfig::default());
         assert_eq!(spec.profile, Profile::Routed);
     }
 
@@ -2132,10 +2190,10 @@ mod tests {
         // folded together rather than allowed to disagree.
         let sandbox = PodSandboxConfig { host_pid: true, ..Default::default() };
         let cc = ContainerConfig { name: "c".into(), ..Default::default() };
-        assert!(spec_for(&cc, &sandbox).share.pid);
+        assert!(spec_of(&cc, &sandbox).share.pid);
 
         let cc = ContainerConfig { host_pid: true, ..Default::default() };
-        assert!(spec_for(&cc, &PodSandboxConfig::default()).share.pid);
+        assert!(spec_of(&cc, &PodSandboxConfig::default()).share.pid);
     }
 
     #[tokio::test]
@@ -2224,7 +2282,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let spec = spec_for(&cc, &PodSandboxConfig::default());
+        let spec = spec_of(&cc, &PodSandboxConfig::default());
         assert_eq!(spec.mounts.len(), 2);
         assert_eq!(spec.mounts[0].dst, "/data");
         assert!(!spec.mounts[0].readonly);
@@ -2243,8 +2301,12 @@ mod tests {
     /// after getting all the way to starting its hive.
     #[test]
     fn the_container_gets_the_environment_an_image_would_have_given_it() {
-        let cfg = ContainerConfig { name: "cilium-operator".into(), ..Default::default() };
-        let env = container_env(&cfg);
+        let cfg = ContainerConfig {
+            name: "cilium-operator".into(),
+            command: vec!["/usr/bin/cilium-operator".into()],
+            ..Default::default()
+        };
+        let env = compose_for(&cfg, None, None).unwrap().env;
         assert!(env.iter().any(|e| e == "HOME=/root"), "{env:?}");
         assert!(env.iter().any(|e| e.starts_with("PATH=/usr/local/sbin:")), "{env:?}");
         assert!(env.iter().any(|e| e == "HOSTNAME=cilium-operator"), "{env:?}");
@@ -2255,13 +2317,14 @@ mod tests {
     fn the_pod_environment_wins_over_the_defaults() {
         let cfg = ContainerConfig {
             name: "c".into(),
+            command: vec!["/bin/app".into()],
             envs: vec![
                 ("HOME".to_string(), "/home/app".to_string()),
                 ("PATH".to_string(), "/opt/bin".to_string()),
             ],
             ..Default::default()
         };
-        let env = container_env(&cfg);
+        let env = compose_for(&cfg, None, None).unwrap().env;
         assert!(env.iter().any(|e| e == "HOME=/home/app"), "{env:?}");
         assert!(env.iter().any(|e| e == "PATH=/opt/bin"), "{env:?}");
         // And exactly once each — a duplicate would leave which one wins to
@@ -2323,28 +2386,28 @@ mod tests {
 
         // Found on PATH, and reported as the *container* sees it.
         assert_eq!(
-            resolve_in_image(&root, "cilium-agent"),
+            resolve_in_image(&root, "cilium-agent", &std_path()),
             Some("/usr/bin/cilium-agent".to_string())
         );
         // Not there at all.
-        assert_eq!(resolve_in_image(&root, "nonesuch"), None);
+        assert_eq!(resolve_in_image(&root, "nonesuch", &std_path()), None);
         // A command containing a slash is a path, not a PATH lookup — same as
         // a shell.
-        assert_eq!(resolve_in_image(&root, "./cilium-agent"), None);
-        assert_eq!(resolve_in_image(&root, "usr/bin/cilium-agent"), None);
+        assert_eq!(resolve_in_image(&root, "./cilium-agent", &std_path()), None);
+        assert_eq!(resolve_in_image(&root, "usr/bin/cilium-agent", &std_path()), None);
 
         // Order matters: /usr/local/bin wins over /usr/bin.
         let local = root.join("usr/local/bin");
         std::fs::create_dir_all(&local).unwrap();
         std::fs::write(local.join("cilium-agent"), b"x").unwrap();
         assert_eq!(
-            resolve_in_image(&root, "cilium-agent"),
+            resolve_in_image(&root, "cilium-agent", &std_path()),
             Some("/usr/local/bin/cilium-agent".to_string())
         );
 
         // A directory of the right name is not a command.
         std::fs::create_dir_all(root.join("usr/bin/adir")).unwrap();
-        assert_eq!(resolve_in_image(&root, "adir"), None);
+        assert_eq!(resolve_in_image(&root, "adir", &std_path()), None);
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2355,7 +2418,7 @@ mod tests {
             args: vec!["--config-dir".into(), "/tmp/cilium".into()],
             ..Default::default()
         };
-        let spec = spec_for(&cc, &PodSandboxConfig::default());
+        let spec = spec_of(&cc, &PodSandboxConfig::default());
         assert_eq!(
             spec.argv,
             vec!["/usr/bin/cilium-agent", "--config-dir", "/tmp/cilium"]
@@ -2370,6 +2433,8 @@ mod tests {
         minted: usize,
         refuse_bind: bool,
         refuse_list: bool,
+        /// Golden records asked for, by name as the registry decoded it (#98).
+        golden_lookups: Vec<String>,
     }
 
     async fn fake_registry() -> (String, Arc<std::sync::Mutex<FakeRegistry>>) {
@@ -2425,11 +2490,64 @@ mod tests {
                     },
                 ),
             )
+            // A golden record (#98): only the coredns image has a config.
+            .route(
+                "/v1/goldens/{name}",
+                axum::routing::get(|State(s): State<S>, Path(name): Path<String>| async move {
+                    s.lock().unwrap().golden_lookups.push(name.clone());
+                    if name == "registry.k8s.io/coredns/coredns:v1.11.1" {
+                        Ok(Json(serde_json::json!({"name": name, "config": {
+                            "Entrypoint": ["/coredns"], "User": "65532:65532", "WorkingDir": "/"}})))
+                    } else {
+                        Err((StatusCode::NOT_FOUND, format!("no golden {name}")))
+                    }
+                }),
+            )
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (url, state)
+    }
+
+    /// #98: the image service learns an image's config from its golden record
+    /// once per root (a miss is believed for a while), and the runtime applies
+    /// it under the pod spec: CoreDNS's args run after its Entrypoint, as its
+    /// image's User.
+    #[tokio::test]
+    async fn the_images_config_is_learned_once_and_applied_under_the_pod_spec() {
+        let (url, reg) = fake_registry().await;
+        let configs = Arc::new(crate::image_config::ImageConfigs::default());
+        let img = StormpumpImages::new(&url).with_image_configs(configs.clone());
+        let coredns = "registry.k8s.io/coredns/coredns:v1.11.1";
+        let root = "/run/stormpump/images/img-clone-1";
+        img.learn_config(coredns, root).await;
+        img.learn_config(coredns, root).await;
+        img.learn_config("busybox", "/pallets/busybox").await;
+        img.learn_config("busybox", "/pallets/busybox").await;
+        assert_eq!(
+            reg.lock().unwrap().golden_lookups,
+            vec![coredns.to_string(), "busybox".to_string()],
+            "the name reaches the registry whole (slashes and all), once per root"
+        );
+
+        let cc = ContainerConfig {
+            name: "coredns".into(),
+            image: root.into(),
+            args: vec!["-conf".into(), "/etc/coredns/Corefile".into()],
+            ..Default::default()
+        };
+        let run = compose_for(&cc, configs.get(root).as_ref(), configs.image_of(root).as_deref()).unwrap();
+        let spec = spec_for(&cc, &PodSandboxConfig::default(), run);
+        assert_eq!(spec.argv, vec!["/coredns", "-conf", "/etc/coredns/Corefile"]);
+        assert_eq!((spec.uid, spec.gid), (65532, 65532));
+
+        // The pallet has no config: the same args-only container is refused,
+        // naming the image, instead of exec'ing `-conf`.
+        let cc = ContainerConfig { image: "/pallets/busybox".into(), ..cc };
+        let e = compose_for(&cc, configs.get("/pallets/busybox").as_ref(), configs.image_of("/pallets/busybox").as_deref())
+            .unwrap_err();
+        assert!(e.contains("image busybox ") && e.contains("-conf"), "{e}");
     }
 
     /// A pull's clone is bound to this node and image, and a kubelet that

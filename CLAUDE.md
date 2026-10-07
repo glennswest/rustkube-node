@@ -63,11 +63,11 @@ by #51.
 `config` on `GET /v1/goldens/{name}`; boot pallets have none until stormblock-registry#58 (open; `Volumes` too).
 stormpump's Spec has `uid`/`gid` and the engine drops to them (exec.rs). Found: `runAsUser`/`runAsGroup`/
 `runAsNonRoot` are read nowhere, so every container is root; no stormcos manifest sets them or `fsGroup`.
-1. [ ] `image_config.rs`: the config, a cache by image root (a miss re-asked after 5 min), `compose` (CRI rules:
+1. [x] `image_config.rs`: the config, a cache by image root (a miss re-asked after 5 min), `compose` (CRI rules:
        command replaces Entrypoint, args replaces Cmd, args alone after Entrypoint; image Env under the pod's;
        WorkingDir/User when the pod leaves them unset; user names via the image's /etc/passwd and /etc/group).
        No config and an empty argv or one starting with `-`: an error naming the image.
-2. [ ] StormpumpImages fetches the config when it resolves a root (pallet or pull); the runtime composes in
+2. [x] StormpumpImages fetches the config when it resolves a root (pallet or pull); the runtime composes in
        `create_container`. ContainerConfig `run_as_user`/`run_as_group`/`run_as_non_root` (container, else pod),
        forwarded on CRI gRPC too. emptyDir 0777 as upstream (a non-root user must write it).
 3. [ ] Tests, docs (README, status.md), CHANGELOG; sc-build; golden; file fsGroup (claims writable by a non-root
