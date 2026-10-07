@@ -4802,6 +4802,11 @@ impl PodManager {
         });
     }
 
+    /// The pod whose container ran as engine workload `handle` (#115).
+    pub async fn pod_of_workload(&self, handle: u64) -> Option<String> {
+        self.runtime.pod_of_workload(handle).await
+    }
+
     pub async fn pod_uid(&self, namespace: &str, name: &str) -> Option<String> {
         let pods = self.pods.read().await;
         pods.values()

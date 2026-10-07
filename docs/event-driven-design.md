@@ -301,7 +301,7 @@ node.
 | no-op status echoes | `workload::intent` and the reflector's semantic compare; the mirrors write only what differs (#101) |
 | cancellation during runtime/CSI I/O | #100 (VM partial-start unwind, CNI DEL, reclaim handler, CSI teardown records) |
 | static-pod API outage | `source_replacement_never_deletes_another_sources_work` |
-| container exit / delayed volume readiness without API change | stormpump exit wake and deadlines (#101); `mint_completion_notifies_without_an_api_edit_or_sync_tick` |
+| container exit / delayed volume readiness without API change | stormpump exit routed to its own Pod/VMI worker (#115; `one_exit_wakes_its_own_uid_only`) and deadlines (#101); `mint_completion_notifies_without_an_api_edit_or_sync_tick` |
 | real-node latency (write → bind → sandbox → process → Ready, p50–max), idle CPU, burst, disconnect recovery | **not done**: #102 on C2NR0Q2 (owner's choice, #110), after the release with this code is installed |
 
 Control-plane halves still open in rustkube: #144, #147 and #149.

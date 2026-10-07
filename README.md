@@ -51,10 +51,11 @@ only on an event or its own deadline (a probe period, a backoff, a pending
 retry, a guest-agent poll), and the service mirror, system claims, reclaim,
 CSI sweep and VM maintenance run on file, API-watch and stormblock volume-watch
 events. What still polls is counted in `kubelet_timed_reconciles_total`
-(see [configuration](docs/configuration.md)). Still open: a stormpump exit
-wakes every workload rather than its own UID (#115), and the CRI backend keeps
-the counted `sync_interval` fallback instead of following container events
-(#116).
+(see [configuration](docs/configuration.md)). A stormpump exit wakes its own
+Pod or VMI worker only (#115): the exiting handle is mapped to its pod (container,
+then sandbox) or its VMI, and only a handle no record names (or a lagged
+channel) wakes every workload. Still open: the CRI backend keeps the counted
+`sync_interval` fallback instead of following container events (#116).
 See [the design and baseline](docs/event-driven-design.md) and
 [#102](https://github.com/glennswest/rustkube-node/issues/102) for validation.
 Builds run on dev only after pushing. Main's tap address pump, snapshot

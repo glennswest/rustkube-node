@@ -61,7 +61,7 @@ by #51.
 
 2026-10-08. An unsolicited exit bumps the ring's counter; `pod_loop`/`vm_loop` answer with `wake_kind` **and**
 `worker.enqueue()` (a full list sync), so one exit wakes every Pod and VMI worker and re-syncs every pod.
-1. [ ] Ring: a broadcast of exiting handles beside the drained queue. Router task: the Pod runtime maps handle →
+1. [x] Ring: a broadcast of exiting handles beside the drained queue. Router task: the Pod runtime maps handle →
        container → sandbox → pod uid (`RuntimeService::pod_of_workload`), the VM manager handle → VMI uid; wake that
        uid only (`wake_where`). Unknown handle or a lagged channel: wake both kinds (the old behaviour). The loops'
        exit arms go (the counter stays: it says the runtime has exit events).

@@ -138,6 +138,8 @@ pub struct Kubelet {
     last_claims: std::sync::Mutex<crate::workload::VolumeIndex>,
     static_read_complete: std::sync::atomic::AtomicBool,
     runtime_changes: Option<tokio::sync::watch::Receiver<u64>>,
+    /// The engine's exits by workload handle (#115), taken by the router.
+    exit_routes: std::sync::Mutex<Option<tokio::sync::broadcast::Receiver<u64>>>,
     workloads: Arc<Executor>,
     pods_synced: AtomicBool,
     vmis_synced: AtomicBool,
@@ -206,6 +208,7 @@ impl Kubelet {
             last_claims: Default::default(),
             static_read_complete: std::sync::atomic::AtomicBool::new(true),
             runtime_changes: None,
+            exit_routes: std::sync::Mutex::new(None),
             workloads,
             pods_synced: AtomicBool::new(false),
             vmis_synced: AtomicBool::new(false),
@@ -231,6 +234,7 @@ impl Kubelet {
         cni: Option<cni::CniInvoker>,
     ) -> Self {
         self.runtime_changes = Some(ring.subscribe_exits());
+        *self.exit_routes.lock().unwrap_or_else(|e| e.into_inner()) = Some(ring.subscribe_exit_handles());
         self.vms = Some(Arc::new(
             crate::vm_manager::VmManager::new(
                 Some(ring),
@@ -389,6 +393,9 @@ impl Kubelet {
         // table changes, and when a mirror pod is edited or deleted (#101).
         tokio::spawn(self.clone().service_mirror_loop());
 
+        // Each engine exit wakes its own Pod or VMI worker (#115).
+        tokio::spawn(self.clone().exit_router());
+
         // stormblock's volume changes, for the workers below (#101).
         {
             let engine = self.config.engine.clone();
@@ -442,9 +449,41 @@ impl Kubelet {
         Ok(())
     }
 
+    /// Route each engine exit to the one worker it concerns (#115). It used
+    /// to wake every Pod and VMI worker and re-sync every pod's list, so the
+    /// work grew with the node's workloads rather than with what changed.
+    async fn exit_router(self: Arc<Self>) {
+        let Some(mut exits) = self.exit_routes.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return;
+        };
+        loop {
+            let wake = match exits.recv().await {
+                Ok(handle) => {
+                    let pod = self.pod_manager.pod_of_workload(handle).await;
+                    let vm = match &self.vms {
+                        Some(v) => v.uid_of_handle(handle).await,
+                        None => None,
+                    };
+                    exit_wake(pod, vm)
+                }
+                // Missed some: nobody knows whose, so everyone looks.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => ExitWake::Everyone,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            };
+            match wake {
+                ExitWake::Pod(uid) => self.workloads.wake_where(Kind::Pod, |k| k.uid == uid),
+                ExitWake::Vm(uid) => self.workloads.wake_where(Kind::VirtualMachine, |k| k.uid == uid),
+                ExitWake::Everyone => {
+                    debug!("an engine exit no workload here claims: waking every Pod and VMI");
+                    self.workloads.wake_kind(Kind::Pod);
+                    self.workloads.wake_kind(Kind::VirtualMachine);
+                }
+            }
+        }
+    }
+
     async fn pod_loop(&self) -> anyhow::Result<()> {
         let worker = self.watches.worker("kubelet-pods");
-        let mut exits = self.runtime_changes.clone();
         let mut volumes = Some(self.pod_manager.subscribe_volume_changes());
         let mut drivers = Some(self.csi.subscribe_changes());
         let mut images = self.pod_manager.subscribe_image_changes();
@@ -485,7 +524,7 @@ impl Kubelet {
                 },
                 _ = runtime_changed(&mut volumes) => { self.workloads.wake_kind(Kind::Pod); worker.enqueue(); continue; },
                 _ = runtime_changed(&mut drivers) => { self.workloads.wake_kind(Kind::Pod); worker.enqueue(); continue; },
-                _ = runtime_changed(&mut exits) => { self.workloads.wake_kind(Kind::Pod); worker.enqueue(); continue; },
+                // An engine exit is routed to its own worker (`exit_router`, #115).
             };
             worker
                 .run(async {
@@ -634,7 +673,6 @@ impl Kubelet {
             return std::future::pending().await;
         };
         let worker = self.watches.worker("kubelet-vmis");
-        let mut exits = self.runtime_changes.clone();
         let mut volumes = Some(self.pod_manager.subscribe_volume_changes());
         let mut url = reqwest::Url::parse(&format!(
             "{}/apis/kubevirt.io/v1/virtualmachineinstances",
@@ -648,7 +686,6 @@ impl Kubelet {
             let work = tokio::select! {
                 work = worker.next() => work,
                 _ = runtime_changed(&mut volumes) => { self.workloads.wake_kind(Kind::VirtualMachine); worker.enqueue(); continue; },
-                _ = runtime_changed(&mut exits) => { self.workloads.wake_kind(Kind::VirtualMachine); worker.enqueue(); continue; },
             };
             worker
                 .run(async {
@@ -1529,6 +1566,40 @@ impl Kubelet {
             None => Next::AwaitEvent,
         }
     }
+}
+
+/// Whom an engine exit wakes (#115).
+#[derive(Debug, PartialEq, Eq)]
+enum ExitWake {
+    Pod(String),
+    Vm(String),
+    /// A handle no record here names (an adopted workload, a race with its
+    /// removal): every Pod and VMI looks, as every exit used to make them.
+    Everyone,
+}
+
+/// Its own pod, else its own VMI, else everyone.
+fn exit_wake(pod: Option<String>, vm: Option<String>) -> ExitWake {
+    match (pod, vm) {
+        (Some(uid), _) => ExitWake::Pod(uid),
+        (None, Some(uid)) => ExitWake::Vm(uid),
+        (None, None) => ExitWake::Everyone,
+    }
+}
+
+#[cfg(test)]
+mod exit_wake_tests {
+    use super::*;
+
+    /// #115: one exit wakes its own workload's worker, and only it.
+    #[test]
+    fn one_exit_wakes_its_own_uid_only() {
+        assert_eq!(exit_wake(Some("pod-a".into()), None), ExitWake::Pod("pod-a".into()));
+        assert_eq!(exit_wake(None, Some("vmi-b".into())), ExitWake::Vm("vmi-b".into()));
+        assert_eq!(exit_wake(None, None), ExitWake::Everyone, "unknown: the old behaviour");
+    }
+    // That `wake_where` queues the picked key alone is `workload::tests::
+    // wake_where_wakes_only_the_picked_keys`.
 }
 
 /// A claim still mounted here, or a stormblock that refused, is looked at

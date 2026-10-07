@@ -1433,6 +1433,11 @@ impl VmManager {
         self.restore_pod_networks().await;
     }
 
+    /// The VMI whose machine ran as engine workload `handle` (#115).
+    pub async fn uid_of_handle(&self, handle: u64) -> Option<String> {
+        self.vms.lock().await.values().find(|v| v.handle.0 == handle).map(|v| v.uid.clone())
+    }
+
     pub async fn cache_specs(&self, objects: &[Value]) {
         // A LIST just answered (#156).
         self.note_apiserver_contact();
@@ -4181,6 +4186,17 @@ mod tests {
         m.remove("a");
         assert!(m.at("10.0.0.6").is_none());
         assert!(m.by_address.is_empty(), "nothing left behind: {:?}", m.by_address);
+    }
+
+    /// #115: an exiting workload's handle names its VMI.
+    #[tokio::test]
+    async fn an_exiting_machine_names_its_vmi() {
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), "");
+        let mut vm = vm_at("vmi-1", &[], Phase::Running);
+        vm.handle = Handle(42);
+        m.vms.lock().await.insert("vmi-1".into(), vm);
+        assert_eq!(m.uid_of_handle(42).await.as_deref(), Some("vmi-1"));
+        assert_eq!(m.uid_of_handle(43).await, None);
     }
 
     #[test]

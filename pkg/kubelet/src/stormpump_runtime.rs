@@ -1357,6 +1357,15 @@ impl RuntimeService for StormpumpRuntime {
             .collect())
     }
 
+    async fn pod_of_workload(&self, handle: u64) -> Option<String> {
+        let sandbox = {
+            let containers = self.containers.lock().await;
+            containers.values().find(|c| c.workload_handle.map(|h| h.0) == Some(handle))?.sandbox_id.clone()
+        };
+        let sandboxes = self.sandboxes.lock().await;
+        Some(sandboxes.get(&sandbox)?.config.uid.clone()).filter(|u| !u.is_empty())
+    }
+
     async fn exec_sync(
         &self,
         _container_id: &str,
@@ -2052,6 +2061,31 @@ mod tests {
     /// one — a sandbox is acquired from stormpump's pool and a container is a
     /// spawn — so what is tested here is the bookkeeping either side of the
     /// ring, and the failures a node without stormpump should give.
+
+    /// #115: an exiting workload's handle names its pod, through its
+    /// container and sandbox; an unknown one names none.
+    #[tokio::test]
+    async fn an_exiting_workload_names_its_pod() {
+        let r = StormpumpRuntime::new("/run/stormpump.sock");
+        r.sandboxes.lock().await.insert(
+            "sb-1".into(),
+            Sandbox {
+                id: "sb-1".into(),
+                handle: None,
+                config: PodSandboxConfig { uid: "pod-uid-1".into(), ..Default::default() },
+                state: PodSandboxState::Ready,
+                created_at: 0,
+                netns: None,
+                ip: String::new(),
+                made: None,
+            },
+        );
+        let mut c = bare("ct-1", "sb-1");
+        c.workload_handle = Some(Handle(77));
+        r.containers.lock().await.insert("ct-1".into(), c);
+        assert_eq!(r.pod_of_workload(77).await.as_deref(), Some("pod-uid-1"));
+        assert_eq!(r.pod_of_workload(78).await, None);
+    }
 
     #[tokio::test]
     async fn sandbox_cleanup_waits_for_container_records() {

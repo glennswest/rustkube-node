@@ -2,6 +2,11 @@
 
 ## 2026-10-08
 
+- **perf:** A stormpump exit wakes only its own workload (#115). Each exit woke every Pod and VMI worker and queued
+  a full list sync of the node's pods, so the work grew with the workloads on the node rather than with the one that
+  ended. The ring now broadcasts the exiting handle; a router maps it to its pod (container → sandbox → uid,
+  `RuntimeService::pod_of_workload`) or its VMI (`VmManager::uid_of_handle`) and wakes that worker alone. A handle no
+  record names (an adopted workload) or a lagged channel wakes every workload, as before.
 - **fix:** An init container runs until it exits (#126). The kubelet stopped any init still running after a fixed
   120 s (`DeadlineExceeded`, exit -1), so a migration or a long copy could never finish. Now the pod's
   `activeDeadlineSeconds` (from its startTime) is the only deadline; past it the init is stopped and reported

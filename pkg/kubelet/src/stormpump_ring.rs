@@ -199,6 +199,9 @@ pub struct RingClient {
     deposits: std::sync::Mutex<mpsc::Sender<Deposit>>,
     exits: std::sync::Mutex<mpsc::Receiver<Exited>>,
     exit_changes: tokio::sync::watch::Sender<u64>,
+    /// Which workload each exit was (#115), for routing it to its own
+    /// worker. Beside the drained queue, which the runtime's status path reads.
+    exit_handles: tokio::sync::broadcast::Sender<u64>,
 }
 
 impl std::fmt::Debug for RingClient {
@@ -230,6 +233,8 @@ impl RingClient {
         let (exit_tx, exits) = mpsc::channel::<Exited>();
         let (exit_changes, _) = tokio::sync::watch::channel(0_u64);
         let notify_exits = exit_changes.clone();
+        let (exit_handles, _) = tokio::sync::broadcast::channel::<u64>(1024);
+        let routed_exits = exit_handles.clone();
         let submit = attached.submit;
         let complete = attached.complete;
         let ring_fd = attached.ring;
@@ -259,6 +264,7 @@ impl RingClient {
                     &stream,
                     exit_tx,
                     notify_exits,
+                    routed_exits,
                     submit,
                     complete,
                 );
@@ -270,6 +276,7 @@ impl RingClient {
             deposits: std::sync::Mutex::new(dep_tx),
             exits: std::sync::Mutex::new(exits),
             exit_changes,
+            exit_handles,
         })
     }
 
@@ -576,6 +583,11 @@ impl RingClient {
         self.exit_changes.subscribe()
     }
 
+    /// Each exiting workload's handle, as it arrives (#115).
+    pub fn subscribe_exit_handles(&self) -> tokio::sync::broadcast::Receiver<u64> {
+        self.exit_handles.subscribe()
+    }
+
     pub fn drain_exits(&self) -> Vec<Exited> {
         let mut out = Vec::new();
         if let Ok(rx) = self.exits.lock() {
@@ -736,6 +748,7 @@ fn run(
     stream: &std::os::unix::net::UnixStream,
     exits: mpsc::Sender<Exited>,
     exit_changes: tokio::sync::watch::Sender<u64>,
+    exit_handles: tokio::sync::broadcast::Sender<u64>,
     submit: i32,
     complete: i32,
 ) {
@@ -856,6 +869,7 @@ fn run(
                     status: cqe.aux,
                 });
                 exit_changes.send_modify(|revision| *revision = revision.wrapping_add(1));
+                let _ = exit_handles.send(cqe.handle().0);
                 continue;
             }
             // The arena is free again, once what the engine answered in it

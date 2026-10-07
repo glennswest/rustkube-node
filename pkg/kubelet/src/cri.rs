@@ -319,6 +319,13 @@ pub trait RuntimeService: Send + Sync + 'static {
         Ok(vec![])
     }
 
+    /// The pod (its uid) whose container ran as engine workload `handle`
+    /// (#115), to wake that pod's worker alone when it exits. Default: not
+    /// known, and the exit wakes every pod.
+    async fn pod_of_workload(&self, _handle: u64) -> Option<String> {
+        None
+    }
+
     /// Network counters per pod sandbox. Default: none.
     async fn list_pod_network_stats(&self) -> Result<Vec<PodNetworkStats>, CriError> {
         Ok(vec![])
