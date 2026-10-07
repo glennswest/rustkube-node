@@ -170,7 +170,7 @@ catalog lists forge goldens but "nothing is copied" (#43), and cross-engine clon
 Asked on #86: A copy on demand (recommended), B remote attach, C node-local only. A tag/digest matching no known
 golden version keeps running the pallet (upstream OCI tags/digests, Cilium's `@sha256:`).
 
-### Waiting on stormcentral#536 (builds): #147 (P2), kube-proxy clears stale UDP conntrack entries
+### Waiting on stormcentral#541 (builds): #147 (P2), kube-proxy clears stale UDP conntrack entries
 
 2026-10-08. kube-proxy rewrites the DNAT when an endpoint goes but leaves conntrack: a UDP flow to a ClusterIP
 (kube-dns) keeps its NAT to the old backend for 30–120 s. (No stormcos edition runs kube-proxy since #145/#155;
@@ -182,6 +182,7 @@ first endpoint.
        successful apply. Tests (fake apiserver: endpoint replaced, NodePort, first endpoint, TCP untouched); docs
        (configuration.md, README), CHANGELOG; sc-build (blocked: stormcentral#536).
        Done: 033a05a (4 tests). NOT yet built: the SC_BUILD_VM job was cancelled while queued. Rerun, close.
+       2026-10-08: e58d5ed7fc (97801bc) cancelled the same way; #147 proposed after stormcentral#541.
 
 ### Waiting on stormcentral#541 (builds): #115 (P2), a stormpump exit wakes its own workload only
 
