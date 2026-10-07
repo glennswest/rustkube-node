@@ -57,6 +57,23 @@ by #51.
 
 ## Work plan
 
+### In progress: #111 (P2), restartable init containers (native sidecars, restartPolicy: Always)
+
+2026-10-08. `run_init_containers` runs each init to exit 0 (120 s deadline) and removes it; a sidecar blocks the
+start and is killed. Upstream (KEP-753): a sidecar is started in its init slot, the next init waits only until it
+has *started* (running; its startupProbe passed, if it has one), it runs and restarts (Always, whatever the pod's
+policy) for the pod's life, its readiness counts toward Ready, it does not count toward the phase, it is stopped
+after the app containers finish (Never/OnFailure) and torn down after them, in reverse order.
+1. [ ] `InitContainerStatusReport` + restartable/started/ready/restart_count, `initialized()`; status JSON (ready,
+       started, restartCount, waiting); `pod_initialized` and ContainersReady/Ready count sidecars.
+2. [ ] `run_init_containers`: a sidecar is started and kept (no removal, no deadline); exit before started =
+       restart with backoff (Pending), never Failed; startupProbe run from the init path.
+3. [ ] `start_pod` carries sidecar records into the tracked state; `check_pod_status` probes/restarts sidecars
+       (Always), reports them as init statuses, leaves them out of the phase, stops them once the apps finished.
+4. [ ] `stop_pod`: apps first, then sidecars in reverse declaration order.
+5. [ ] Tests (sidecar → init → app order; sidecar stays and restarts under restartPolicy Never; phase ignores it
+       and it is stopped after; teardown order; readiness), docs (README, status.md), CHANGELOG; SC_BUILD_VM sc-build.
+
 ### Waiting on stormcentral#527 (golden): #174, a stop's grace goes where STOP reads it
 
 2026-10-08. `RingClient::stop` put the grace in `inline_a` (seconds); STOP reads `inline_b` in ms (0 = 30 s) and
