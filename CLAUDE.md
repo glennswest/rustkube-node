@@ -57,17 +57,20 @@ by #51.
 
 ## Work plan
 
-### In progress: #82 (P2), a node service's last exit and output on its mirror pod
+### Shipped (golden 670219fd054b): #82 (P2), a node service's last exit and output on its mirror pod
 
 2026-10-08. stormpump#51 (adc64f8) writes `last_exit_code` | `last_exit_signal`, `last_exit` and `last_output` (20
 lines) per asset in assets.json, once it has exited, kept across the restart. fc867c1 (#124) reads `last_exit` /
 `last_output` for pods/log only (`node_logs.rs`). `container_failing` is stormd's own event (stormd README,
 "Events"), not the kubelet's: the kubelet's counterpart is the mirror's BackOff/Stopped Event.
-1. [ ] `mirror::Asset.last_exit` (code, signal, text, output); `mirror_pod_with`: `lastState.terminated`
+1. [x] `mirror::Asset.last_exit` (code, signal, text, output); `mirror_pod_with`: `lastState.terminated`
        (exitCode, or 128+signal, signal, reason Error, message = output tail ≤ 80 lines / 4 KiB) and the same on a
        stopped service's `state.terminated`; `status_current` and `table_key` see a new exit.
-2. [ ] BackOff/Stopped Events carry the exit and the tail.
-3. [ ] Tests, README, CHANGELOG; sc-build; close.
+2. [x] BackOff/Stopped Events carry the exit and the tail.
+3. [x] Tests (2), README, CHANGELOG (8a8007e). sc-build 8a8007e (job 2eb0ae2979, submitted once the slot was free:
+       queued jobs are cancelled, stormcentral#541): 400 kubelet unit pass. Stage golden
+       golden-rustkube-node-670219fd054b (stormcos#366; the first stage try hit a transient GitHub fetch error),
+       `stormcentral shipped`.
 
 ### 2026-10-08: the build backlog ran
 
