@@ -2,6 +2,9 @@
 
 ## 2026-10-08
 
+- **docs:** README: `stormvm serve` on `127.0.0.1:9095` is not a developer-only convenience (#123, stormcos#65). It
+  ships on every node as a stormcos service golden, and stormconsole's VM plugin uses it for serial and VNC
+  consoles; it reads the same `/run/stormvm` registrations as the kubelet's `vmConsole` route.
 - **perf:** A stormpump exit wakes only its own workload (#115). Each exit woke every Pod and VMI worker and queued
   a full list sync of the node's pods, so the work grew with the workloads on the node rather than with the one that
   ended. The ring now broadcasts the exiting handle; a router maps it to its pod (container → sandbox → uid,

@@ -210,9 +210,15 @@ verb can take a VM's disks as one group snapshot; it finds the engine token
 itself, in the same places the kubelet does. Only the console doors are routed
 onto `:10250` so far: the control verbs (`pause`, `snapshot`, …) wait on #94.
 
-`stormvm serve` still mounts the same router on `:9095` for a developer at a
-terminal. That is a convenience for debugging a guest that will not boot, not
-a deployment shape, and nothing in a cluster depends on it.
+`stormvm serve` mounts the same router on `127.0.0.1:9095`, and it ships: stormcos
+runs it on every node as a service golden (`stormvm`, port 9095, loopback only;
+stormcos `deploy/build-goldens.sh`, `serve --addr 127.0.0.1:9095 --run-dir
+/run/stormvm`), and stormconsole's VM plugin reaches the serial and VNC consoles
+through it (`[vm] url = http://127.0.0.1:9095`, stormconsole
+`crates/plugins/vm/src/console.rs`). It reads the same `/run/stormvm`
+registrations this kubelet writes, so both doors answer for the same machines.
+From outside the node the apiserver's `vmConsole` proxy to `:10250` (above) is the
+way in; `:9095` is the node-local one (#123, stormcos#65).
 
 `DELETE /volumes` is what makes `reclaimPolicy: Delete` finish instead of
 leaking: `204` when the clone is gone or was never there, `409` while a pod
