@@ -450,7 +450,7 @@ filesystem mount is PID 1's, at container create (in `containers`).
 4. [ ] Golden (stormcentral#527); then the claim target behind stormpump#107, stormblock#327, rustkube#147. #95
        proposed after stormcentral#527.
 
-### Waiting on the owner: #3 (P1), the node side Cilium needs
+### Done: #3 (P1), the node side Cilium needs
 
 2026-10-08. Already on main (validated 09-29): CNI ADD with the sandbox's netns, `K8S_POD_*` CNI_ARGS, the IP into
 status, a failed ADD fails the sandbox (DEL first), DEL at stop (#137), host network skips it. Item 1 holds: stormcos
@@ -466,6 +466,10 @@ healthy. stormcos registers no `node.cilium.io/agent-not-ready` taint. Options p
        Cilium's agent-not-ready taint; C kubelet-managed network-unavailable taint), `stormcentral wait-owner`. Live checks (pod CIDR address, coredns leaves Pending, endpoint
        released, agent stopped → sandbox fails) wait on a test machine (stormcos#337). Resume from the answer.
 
+**Owner (2026-10-07): no NotReady gating** ("we want to get working early"). 2026-10-08: verified live on server3
+(11.91, lease c5ccab77ea): pod-to-pod, endpoint released on delete, sandbox fails with the agent gone and starts by
+itself when it is back; coredns on the Dell left Pending by itself. Gap found and fixed: network waits had no Event
+(02a5b2e, NetworkNotReady / FailedCreatePodSandBox; build waits on stormcentral#544 with #104/#79/#70). Closed.
 ### Done: #69, a named credential that is missing is waited for, then fatal (never anonymous)
 
 2026-10-08. `main.rs` waited (60 s, then fatal) only for `--apiserver-ca`; `--client-certificate`, `--client-key`,
