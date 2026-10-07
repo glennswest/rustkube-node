@@ -194,7 +194,7 @@ first endpoint.
 2. [ ] Tests (3), README, event-driven-design.md, CHANGELOG (92cd9ef). NOT yet built: the SC_BUILD_VM job was
        cancelled while queued (stormcentral#535/#536). Rerun, then golden (stormcentral#527) and close.
 
-### Waiting on stormcentral#536 (builds): #126 (P2), no fixed init deadline; activeDeadlineSeconds bounds it
+### Waiting on stormcentral#541 (builds): #126 (P2), no fixed init deadline; activeDeadlineSeconds bounds it
 
 2026-10-08. `run_init_containers` stops an init still running after 120 s (`DeadlineExceeded`, exit -1). Upstream:
 an init runs until it exits; only the pod's `activeDeadlineSeconds` (from its startTime) limits it. The admission
@@ -206,6 +206,7 @@ path (production) already waits on the exit event; the non-admission path slept 
        Done: 9a39a40 (3 tests), #185 filed. NOT yet built: both SC_BUILD_VM runs cancelled while queued (platform-wide,
        stormcentral#535/#536). Rerun `SC_BUILD_VM=1 sc-build 'cargo build --locked && cargo test --locked'`, then
        golden (stormcentral#527) and close.
+       2026-10-08: e58d5ed7fc (97801bc) cancelled too; #126 proposed after stormcentral#541.
 
 ### Waiting on stormcentral#527/#526: #141 (P2), the probe pass's status PUT skipped when nothing changed
 
