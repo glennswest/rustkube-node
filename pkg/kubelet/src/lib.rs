@@ -30,7 +30,6 @@ pub mod health;
 pub mod image_config;
 pub mod kubeconfig;
 pub mod kubelet;
-pub mod node_stats;
 pub mod node_status;
 pub mod pod_manager;
 pub mod pv_placement;

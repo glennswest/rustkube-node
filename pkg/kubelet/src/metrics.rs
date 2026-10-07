@@ -226,39 +226,24 @@ fn state_label(s: ContainerState) -> &'static str {
 /// runtime here reports). Network is per pod, as cAdvisor reports it, with
 /// `container=""` and an `interface` label.
 pub fn render_cadvisor(containers: &[ContainerStatsInfo], pods: &[PodNetworkStats]) -> String {
-    render_cadvisor_with_node(containers, pods, None)
-}
-
-/// [`render_cadvisor`], with the node's own root container (`id="/"`, #21)
-/// in the same families, as upstream's cAdvisor reports it.
-pub fn render_cadvisor_with_node(
-    containers: &[ContainerStatsInfo],
-    pods: &[PodNetworkStats],
-    node: Option<&crate::node_stats::NodeUsage>,
-) -> String {
-    const ROOT: &str = r#"container="",id="/",namespace="",pod="""#;
     let mut out = String::new();
     family(
         &mut out,
         "container_cpu_usage_seconds_total",
         "counter",
         "Cumulative cpu time consumed in seconds.",
-        node.and_then(|n| n.cpu_usage_ns).map(|n| (ROOT.to_string(), n as f64 / 1e9)).into_iter().chain(
-            containers.iter().filter_map(|c| {
-                c.cpu_usage_core_nanos.map(|n| (container_labels(c), n as f64 / 1e9))
-            }),
-        ),
+        containers.iter().filter_map(|c| {
+            c.cpu_usage_core_nanos.map(|n| (container_labels(c), n as f64 / 1e9))
+        }),
     );
     family(
         &mut out,
         "container_memory_working_set_bytes",
         "gauge",
         "Current working set in bytes.",
-        node.and_then(|n| n.memory_working_set_bytes).map(|b| (ROOT.to_string(), b as f64)).into_iter().chain(
-            containers
-                .iter()
-                .filter_map(|c| c.memory_working_set_bytes.map(|b| (container_labels(c), b as f64))),
-        ),
+        containers
+            .iter()
+            .filter_map(|c| c.memory_working_set_bytes.map(|b| (container_labels(c), b as f64))),
     );
     family(
         &mut out,
