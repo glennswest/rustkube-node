@@ -602,6 +602,8 @@ waits on the master installing the release (stormcos#164) = #102.
        behind short 7f911d561b (at "wait for the node to settle", media import: stormblock-registry#95 may hold it).
        vm-waves 845557b202 queued too (#91/#92's check). Read with `stormcentral test show <id>`; compare with the
        11.50/11.51 baseline (container start 20.8/21.2 s, claim 75.5/67.2 s) and post on #102.
+       630379c31b: error at the test-image build on dev.g8.lo (retired; stormcentral#521), after the node settled.
+       #102 proposed after stormcentral#521; rerun then.
    Stage golden golden-rustkube-node-e8bca700a793 (bba7d54), release request stormcos#164.
 
 ### Done: #101, events and explicit deadlines instead of sync ticks
