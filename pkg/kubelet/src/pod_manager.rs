@@ -112,6 +112,24 @@ impl InitContainerStatusReport {
     }
 }
 
+/// What is left of the pod's `activeDeadlineSeconds` (#126), from its
+/// `status.startTime`, else from when this kubelet first saw it. `None`: no
+/// deadline. Zero: passed.
+fn active_deadline_left(
+    pod: &Value,
+    seen: Option<Instant>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<std::time::Duration> {
+    let deadline = std::time::Duration::from_secs(pod["spec"]["activeDeadlineSeconds"].as_u64()?);
+    let active = pod["status"]["startTime"]
+        .as_str()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .and_then(|t| (now - t.with_timezone(&chrono::Utc)).to_std().ok())
+        .or_else(|| seen.map(|s| s.elapsed()))
+        .unwrap_or_default();
+    Some(deadline.saturating_sub(active))
+}
+
 /// Is this init container a native sidecar (#111)?
 pub fn is_restartable_init(spec: &Value) -> bool {
     spec["restartPolicy"].as_str() == Some("Always")
@@ -3080,11 +3098,8 @@ impl PodManager {
             }
             info!("Init container {ns}/{name}/{cname} started, waiting for completion");
 
-            // Poll until the init container exits (bounded).
-            let mut waited = self.pods.read().await.get(uid).and_then(|p|p.started.get(cname))
-                .map(|t|t.elapsed().as_millis() as u64).unwrap_or(0);
-            const POLL_MS: u64 = 500;
-            const MAX_WAIT_MS: u64 = 120_000;
+            // It runs until it exits (#126): no fixed bound, as upstream. The
+            // pod's activeDeadlineSeconds, when set, is the only deadline.
             loop {
                 let status = self.runtime.container_status(&cid).await?;
                 match status.state {
@@ -3136,7 +3151,11 @@ impl PodManager {
                         break;
                     }
                     _ => {
-                        if waited >= MAX_WAIT_MS {
+                        let seen = self.first_seen.lock().unwrap_or_else(|e| e.into_inner()).get(uid).copied();
+                        let left = active_deadline_left(pod, seen, chrono::Utc::now());
+                        if left.is_some_and(|l| l.is_zero()) {
+                            let deadline = pod["spec"]["activeDeadlineSeconds"].as_u64().unwrap_or(0);
+                            warn!("Pod {ns}/{name}: activeDeadlineSeconds ({deadline}s) passed with init container {cname} running");
                             out.push(InitContainerStatusReport {
                                 name: cname.to_string(),
                                 container_id: cid.clone(),
@@ -3144,8 +3163,7 @@ impl PodManager {
                                 exit_code: -1,
                                 reason: "DeadlineExceeded".into(),
                                 message: format!(
-                                    "init container did not exit within {}s",
-                                    MAX_WAIT_MS / 1000
+                                    "Pod was active on the node longer than the specified deadline (activeDeadlineSeconds {deadline})"
                                 ),
                                 image: image.to_string(),
                                 image_ref: image_ref.clone(),
@@ -3153,19 +3171,26 @@ impl PodManager {
                                 finished_at: 0,
                                 ..Default::default()
                             });
-                            let _ = self.runtime.stop_container(&cid, 5).await;
+                            let grace = pod["spec"]["terminationGracePeriodSeconds"].as_i64().unwrap_or(30);
+                            let _ = self.runtime.stop_container(&cid, grace).await;
                             let _ = self.runtime.remove_container(&cid).await;
-                            return Err(CriError::Timeout);
+                            return Err(CriError::Runtime(format!(
+                                "DeadlineExceeded: Pod was active on the node longer than the specified deadline (activeDeadlineSeconds {deadline})"
+                            )));
                         }
+                        // Its exit is an event, so nothing waits on a worker
+                        // (#126); the deadline, when there is one, is the due
+                        // time. A runtime with no exit events is looked at
+                        // again on the recheck.
                         if self.admission.is_some() {
-                            // Its exit is an event; only the deadline is not.
-                            let left = std::time::Duration::from_millis(MAX_WAIT_MS.saturating_sub(waited));
-                            self.due_in(uid, left);
                             self.event_waits.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string());
-                            return Err(CriError::Pending(format!("init container {cname} is running")));
+                            if let Some(left) = left {
+                                self.due_in(uid, left);
+                            }
+                        } else {
+                            self.due_in(uid, left.map_or(deadlines::RECHECK, |l| l.min(deadlines::RECHECK)));
                         }
-                        tokio::time::sleep(std::time::Duration::from_millis(POLL_MS)).await;
-                        waited += POLL_MS;
+                        return Err(CriError::Pending(format!("init container {cname} is running")));
                     }
                 }
             }
@@ -7430,6 +7455,62 @@ pub(crate) mod tests {
         // App container is created; init container was removed after completing.
         assert_eq!(rt.created_names(), vec!["app".to_string()]);
         assert!(rt.removed_containers.lock().unwrap().iter().any(|_| true));
+    }
+
+    /// #126: an init container runs until it exits; past two minutes it is
+    /// still waited for, not killed DeadlineExceeded.
+    #[tokio::test]
+    async fn an_init_container_still_running_after_two_minutes_is_waited_for() {
+        let (rt, mgr) = manager();
+        let mut p = pod("uid-mig", "mig", "Never", simple_container());
+        p["spec"]["initContainers"] = json!([{"name": "migrate", "image": "busybox:latest"}]);
+        match mgr.start_pod(&p).await {
+            Err(CriError::Pending(m)) => assert!(m.contains("init container migrate is running"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        // Long past the old 120 s bound.
+        if let Some(earlier) = Instant::now().checked_sub(std::time::Duration::from_secs(600)) {
+            mgr.first_seen.lock().unwrap().insert("uid-mig".into(), earlier);
+            mgr.pods.write().await.get_mut("uid-mig").unwrap().started.insert("migrate".into(), earlier);
+        }
+        assert!(matches!(mgr.start_pod(&p).await, Err(CriError::Pending(_))), "still waited for");
+        let cid = mgr.pods.read().await["uid-mig"].container_ids["migrate"].clone();
+        rt.set_container_state(&cid, ContainerState::Exited, 0);
+        assert_eq!(mgr.start_pod(&p).await.unwrap().phase, "Running");
+    }
+
+    /// #126: the pod's activeDeadlineSeconds is the one deadline an init
+    /// container meets.
+    #[tokio::test]
+    async fn active_deadline_seconds_ends_a_running_init_container() {
+        let (rt, mgr) = manager();
+        let mut p = pod("uid-ads", "ads", "Never", simple_container());
+        p["spec"]["initContainers"] = json!([{"name": "migrate", "image": "busybox:latest"}]);
+        p["spec"]["activeDeadlineSeconds"] = json!(60);
+        p["status"]["startTime"] = json!((chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339());
+        let u = mgr.sync_pods(&[p]).await.updates.remove(0);
+        assert_eq!(u.phase, "Failed");
+        assert!(u.message.contains("DeadlineExceeded"), "{}", u.message);
+        let r = u.init_container_statuses.iter().find(|r| r.name == "migrate").expect("reported");
+        assert_eq!((r.reason.as_str(), r.exit_code), ("DeadlineExceeded", -1));
+        assert_eq!(u.container_statuses[0].reason, "PodInitializing");
+        assert!(rt.removed_containers.lock().unwrap().iter().any(|c| c.contains("-migrate-")), "stopped and removed");
+    }
+
+    #[test]
+    fn the_active_deadline_counts_from_start_time_else_first_seen() {
+        let now = chrono::Utc::now();
+        let mut p = json!({"spec": {}, "status": {}});
+        assert_eq!(active_deadline_left(&p, None, now), None, "no deadline");
+        p["spec"]["activeDeadlineSeconds"] = json!(100);
+        p["status"]["startTime"] = json!((now - chrono::Duration::seconds(30)).to_rfc3339());
+        let left = active_deadline_left(&p, None, now).unwrap().as_secs();
+        assert!((69..=70).contains(&left), "{left}");
+        p["status"]["startTime"] = json!((now - chrono::Duration::seconds(300)).to_rfc3339());
+        assert!(active_deadline_left(&p, None, now).unwrap().is_zero(), "passed");
+        // No startTime: from when the kubelet first saw it.
+        p["status"] = json!({});
+        assert!(active_deadline_left(&p, Some(Instant::now()), now).unwrap().as_secs() >= 99);
     }
 
     #[tokio::test]

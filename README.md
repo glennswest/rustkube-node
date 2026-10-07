@@ -150,6 +150,11 @@ is refused, naming the image, instead of exec'ing the flag. emptyDir volumes are
 non-root uid can write them. Not yet: an image's declared `Volumes` (not recorded by the registry, #58) and
 `fsGroup` (a claim's filesystem is root's).
 
+**An init container runs until it exits** (#126), as upstream: there is no fixed bound (it was 120 s, then
+`DeadlineExceeded`), and its wait holds no worker (its exit is an event). The pod's `activeDeadlineSeconds`, counted
+from its `startTime`, is the only deadline: past it the init container is stopped and reported `DeadlineExceeded`
+and the pod is Failed. A running pod's `activeDeadlineSeconds` is not enforced yet (#185).
+
 **Native sidecars** (`initContainers[].restartPolicy: Always`, #111) run as upstream runs them: started in their
 init slot, the next init container goes once the sidecar has *started* (running, and its `startupProbe` passed if
 it has one), not when it exits, and there is no init deadline for it. It then runs for the pod's life: probed like

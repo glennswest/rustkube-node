@@ -62,7 +62,7 @@ by #51.
 2026-10-08. `run_init_containers` stops an init still running after 120 s (`DeadlineExceeded`, exit -1). Upstream:
 an init runs until it exits; only the pod's `activeDeadlineSeconds` (from its startTime) limits it. The admission
 path (production) already waits on the exit event; the non-admission path slept 500 ms on the worker.
-1. [ ] Drop MAX_WAIT; `active_deadline_left` (startTime, else first seen); past it the init is stopped and reported
+1. [x] Drop MAX_WAIT; `active_deadline_left` (startTime, else first seen); past it the init is stopped and reported
        DeadlineExceeded ("Pod was active on the node longer than the specified deadline"); both paths Pending
        (deadline as the due time when set). Tests; README/status.md/CHANGELOG; sc-build. File: activeDeadlineSeconds
        for a running pod is enforced nowhere (follow-up).

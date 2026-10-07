@@ -2,6 +2,11 @@
 
 ## 2026-10-08
 
+- **fix:** An init container runs until it exits (#126). The kubelet stopped any init still running after a fixed
+  120 s (`DeadlineExceeded`, exit -1), so a migration or a long copy could never finish. Now the pod's
+  `activeDeadlineSeconds` (from its startTime) is the only deadline; past it the init is stopped and reported
+  `DeadlineExceeded` and the pod is Failed. The wait holds no worker on either path (the non-admission one slept
+  500 ms at a time). A running pod's `activeDeadlineSeconds` is #185.
 - **perf:** A pod's probe pass no longer rewrites an unchanged status (#141, #138 follow-up). The skip compared with
   the watch's copy of the pod, which a second after a start was still the pre-Running object, so the unchanged
   Running status was written again, on a worker, on a stale revision. The kubelet now keeps per pod the status the
