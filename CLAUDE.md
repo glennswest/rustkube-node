@@ -824,7 +824,7 @@ Steps:
        Failed for good only when the owning VM's runStrategy is Once or Manual. Standalone VMI: retried.
 3. [x] Tests, docs (README), CHANGELOG. sc-build at 20036bf: all pass (kubelet 210). Not run on a node. Unreleased.
 
-### In progress: #92, a VMI's accessCredentials (keys into the seed and through the agent)
+### Waiting on stormblock-registry#95 / stormcentral#521 / stormcos_qa#52: #92, a VMI's accessCredentials (keys into the seed and through the agent)
 
 stormvm e5b4d16 (in the dc1b7ea lock): `VmSpec.access_credentials`, `access::keys_in_secret`, `Seed.public_keys`,
 `qga::set_authorized_keys` (reset: true), `access::condition`.
@@ -843,6 +843,8 @@ Steps:
        C2NR0Q2 get 507 on the image push (stormcentral#376); #92 proposed after it. Then run vm-waves, close.
        2026-10-07: #376 closed; vm-waves 18d8dc0653 died on the Dell's apiserver (stormcos#337). #92 proposed after
        stormcos#337; half 2 still needs stormcos_qa#52.
+       2026-10-08: stormcos#337 closed; vm-waves still can't run (test images: stormcentral#521; fresh-node media
+       import: stormblock-registry#95). Tests pass on a build VM (fb94c9a). #92 proposed after stormblock-registry#95.
 
 ### Done: #55, a presentation of rustkube-node (`docs/presentation.md`, Marp)
 
