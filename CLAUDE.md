@@ -57,6 +57,21 @@ by #51.
 
 ## Work plan
 
+### In progress: #133 (P2), a start error is never "terminal with no container state"
+
+2026-10-08. The 10-02 trigger was #103 (a pulled image's root unresolved → start_container failed; fixed 4263d80,
+shipped). The behaviour it exposed stands: every start error not matched as a wait (image pull, create, start,
+runtime unreachable, init failure) made the pod **Failed with no container statuses**, and `logs` 404'd. A failed
+pull was also cached for the pod for good. Upstream: image/create errors are waits with the container's reason
+(ErrImagePull → ImagePullBackOff, CreateContainerError), a start failure under restartPolicy Never is Failed with
+the container terminated `StartError` (exit 128).
+1. [ ] `CriError::Container{container, reason, message}` from start_pod's create/start; sync arms: ImagePull (forget
+       the cached failure; ErrImagePull → ImagePullBackOff; 10 s–5 min back-off), Container (Never + StartError:
+       Failed with the terminated status; else Pending with the reason, partial start torn down, first_seen kept so
+       the back-off grows), Connection (a wait); the rest Failed *with* init statuses and app containers
+       PodInitializing/StartError. `WaitingPod.kind`; logs answer 400 with it (never 404 for an admitted pod).
+2. [ ] Tests (fake: missing image, create/start failures), docs, CHANGELOG; SC_BUILD_VM sc-build; close.
+
 ### Waiting on stormcentral#527 (golden): #111 (P2), restartable init containers (native sidecars, restartPolicy: Always)
 
 2026-10-08. `run_init_containers` runs each init to exit 0 (120 s deadline) and removes it; a sidecar blocks the
