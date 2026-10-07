@@ -57,6 +57,34 @@ by #51.
 
 ## Work plan
 
+### In progress: #104 (P0), every container its own CoW root (owner: A, no exceptions)
+
+2026-10-08. Owner (#104, 10-07): every container's root is its own CoW clone of the image's **sealed golden**,
+writable, deleted with the container; a restart gets a fresh clone; never shared; exactly one layer between
+golden and what the workload writes (no image-level clone, no clone of a clone). `readOnlyRootFilesystem` mounts
+the container's own clone read-only. Found:
+- Today: `create_container` roots every container at the image *path* (`/pallets/<x>`, or the pull's shared
+  mount `/run/stormpump/images/<clone>`), and `start_container` registers that directory: shared roots.
+- Pallets: the slab holds `<vol>.golden` (sealed) and its first clone `<vol>`, mounted at `/p/<path>` by
+  `rd.stormblock.mount=<vol>:/p/<path>` on the kernel command line (`/pallets` → `/p`; e.g.
+  `cilium-operator:/p/operator-generic`). Engine listing: `parent`, `sealed`, `in_use`, `owner`.
+- Pulls: sbregistry's golden record (`GET /v1/goldens/{image}`) names `template_name`, an fstemplate in this
+  node's engine; `POST /v1/clones` minted the per-image clone that every container shared (#143's binding).
+- stormpump (lock 795b92e) has no read-only root: VOLUME_REGISTER takes no flag, `Root` is Inherit|Chroot.
+Steps:
+1. [ ] Image service: a pull only makes sure the golden is ready (registry record → `template:<name>`); no clone,
+       no attach, no mount, no bind. Pallets resolve as before (`/pallets/<x>`).
+2. [ ] Runtime (engine client + node): `create_container` clones the golden (`template:` → fstemplate clone;
+       pallet → `<vol>.golden` via /proc/cmdline, else `<vol>`'s sealed parent), attaches (ublk), has PID 1 mount
+       it at `/run/stormpump/roots/<cid>` (the root handle); argv[0] and user names are read from that mount.
+       `start_container` spawns on that handle. Removal (and a failed create) releases the handle, detaches and
+       deletes the volume; a refusal is retried (#90). Orphan sweep: `ctr-*` volumes not in use and not ours.
+3. [ ] readOnlyRootFilesystem: file stormpump (read-only device mount / root); until then the clone is private
+       and writable, said in the log.
+4. [ ] Tests (one clone per container start, two containers of one image get two roots, removal deletes it,
+       failed create cleans up), docs (README, status.md, configuration.md), CHANGELOG; sc-build; golden; close.
+       Supersedes #143's image-level clone and #161 (image GC: nothing image-level is held any more).
+
 ### Paused (P0 #104 first): #71 (P2), built-in driver: redundancy / spread / tier from the StorageClass
 
 2026-10-08. Stopped before code at stormcentral's word (P0 #104 waited 40 h). Findings:
