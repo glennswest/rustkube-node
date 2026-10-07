@@ -57,7 +57,7 @@ by #51.
 
 ## Work plan
 
-### In progress: #141 (P2), the probe pass's status PUT skipped when nothing changed
+### Waiting on stormcentral#527/#526: #141 (P2), the probe pass's status PUT skipped when nothing changed
 
 2026-10-08. `report_pod_status` skips when the merged status equals `source["status"]`, but `source` is the
 watch's copy, which can still be the version before this kubelet's own last PUT: the comparison runs against the
@@ -65,7 +65,10 @@ pre-Running status and an unchanged status is written again (and with a stale re
 1. [x] Keep, per UID, what this kubelet last had acknowledged (the RV it wrote on, the RV the PUT returned, the
        status). `status_base`: while the watch's copy is still at the RV our write was based on, compare and write
        against the acknowledged status and RV; otherwise the watch's copy. Skip when unchanged. Forgotten on delete.
-2. [ ] `kubelet_pod_status_writes_total{result="written|skipped"}`; tests; docs (metrics.md), CHANGELOG; sc-build.
+2. [x] `kubelet_pod_status_writes_total{result="written|skipped"}`; tests (2); metrics.md, CHANGELOG (743c0f6).
+       SC_BUILD_VM sc-build: 376 kubelet unit pass.
+3. [ ] Golden (stormcentral#527), then a turbomode burst on pvetest1 (stormcentral#526): no second PUT, wait p90
+       < 100 ms. #141 proposed after stormcentral#527.
 
 ### Waiting on stormcentral#527 (golden): #133 (P2), a start error is never "terminal with no container state"
 
