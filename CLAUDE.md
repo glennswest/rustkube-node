@@ -57,7 +57,7 @@ by #51.
 
 ## Work plan
 
-### In progress: #95 (P1), pod/claim start toward ≤2 s / ≤1 s: the claim's own steps timed
+### Waiting on stormcos#337: #95 (P1), pod/claim start toward ≤2 s / ≤1 s: the claim's own steps timed
 
 2026-10-08. Done elsewhere: phases on the pod (#132), `sandbox` split (#139); the traced causes (2 s pass, serial
 starts, unbounded CNI, inline events, per-pass PUTs) by #99/#100/#101/#134/#138. Still undone from item 1: "the same
@@ -66,7 +66,11 @@ of the class blank / of a source / raw volume; none when reused), attach (ublk),
 filesystem mount is PID 1's, at container create (in `containers`).
 1. [x] `ClaimSteps` from `provision_claim_volume`; `claim/<volume>/{lookup,blank|clone|raw,attach,bind}` in the
        annotation, Event and log line. Tests, docs (README, status.md), CHANGELOG; sc-build; golden.
-2. [ ] Targets measured on a node: C2NR0Q2 down (stormcos#337), as #102. Then propose #95 after it.
+       Done: 9d7b454; sc-build `cargo build --locked && cargo test --locked`: 345 kubelet unit pass (2 new). Stage
+       golden golden-rustkube-node-a259ec6b4c3d (stormcos#366). Status commented on #95.
+2. [ ] Targets measured on a node: C2NR0Q2 down (stormcos#337). #95 proposed after it. Then read the Performance
+       samples / `storm.io/start-timing` of a release with a259ec6b4c3d; a phase over target gets its own issue;
+       close #95 when both targets hold.
 
 ### Waiting on the owner: #3 (P1), the node side Cilium needs
 
