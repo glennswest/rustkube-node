@@ -57,6 +57,17 @@ by #51.
 
 ## Work plan
 
+### In progress: #57 step 4, CPU requests as Pod cgroup weights (stormpump#68's Pod group, OpenShift's shape)
+
+2026-10-08. stormpump#68 done (golden-stormpump-accd1a3e8e61, stormpump@13cf2c9, release request stormcos#309):
+`Spec.group` (node | pods | pods/burstable | pods/besteffort, payload v8) and `GROUP_SET` (a Pod group's cpu.weight
+/ memory.max). Also QUERY `MEMORY` (anon, file, inactive_file, working_set; stormpump#64).
+1. [ ] Lock: stormpump 795b92e → 13cf2c9 (`--precise`), stormvm stays 180fa13; build on the build box.
+2. [ ] `spec_for`: group by the pod's QoS class; `cpu_weight` from `cpu_shares` by upstream's conversion;
+       `GROUP_SET pods` weight from allocatable CPU at start. Working set from QUERY MEMORY when the engine has it.
+3. [ ] Tests, docs, CHANGELOG; sc-build; golden (ships with stormpump's accd1a3e8e61: an older engine refuses a v8
+       spec, so the release must carry both); close.
+
 ### Done: #50 (P2), node services' lifecycle Events
 
 2026-10-08. Done before: Started/Stopped/BackOff on transitions (7e6f4b0), NotStarted (7f4f3d1), exit and tail on
