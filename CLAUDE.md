@@ -57,6 +57,25 @@ by #51.
 
 ## Work plan
 
+### In progress: #69, a named credential that is missing is waited for, then fatal (never anonymous)
+
+2026-10-08. `main.rs` waited (60 s, then fatal) only for `--apiserver-ca`; `--client-certificate`, `--client-key`,
+`--token-file` were read once and skipped when missing, so the kubelet ran as `system:anonymous` (cluster-admin on
+sno). The serving pair (`--tls-cert-file`/`--tls-private-key-file`, else self-signed) and `--server-token-file`
+had the same silent fallback; stormcos names the client and serving pairs under /data/stormcert, all minted by
+the boot (build-goldens.sh:5353), so a wait is safe for them.
+1. [ ] `wait_for_ca` → `wait_for_file(flag, path, limit)` for every named credential file and `--kubeconfig`;
+       absent after 60 s: exit naming the flag. Unit tests (appears late, never appears, empty = not yet).
+2. [ ] Docs (configuration.md, README), CHANGELOG; sc-build; stage golden; close.
+
+### In progress: #139, start timing: `sandbox` split into acquire / cni / status
+
+2026-10-08. `start_pod` times `sandbox` around `run_pod_sandbox` + `pod_sandbox_status`; on stormpump that is
+SandboxAcquire, network_ready and the CNI ADD (no stormblock call). Wanted: `acquire`, `cni`, `status` sub-phases
+in `storm.io/start-timing`, so the blade's next measurement names the slow step.
+1. [ ] Runtime reports the sandbox's own split; start timing records it; annotation/Event/histogram/log.
+2. [ ] Tests, docs (README, metrics.md, status.md), CHANGELOG; sc-build; stage golden; close.
+
 ### Done: #51, retire `scripts/build-golden.sh` (the second golden builder)
 
 2026-10-07. Authority is decided: `stormcentral component stage rustkube-node` (stormcos `deploy/build-goldens.sh`
