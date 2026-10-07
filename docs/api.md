@@ -43,8 +43,12 @@ their reason. stormd mirror logs are discovered through boot-unit log mounts;
 `previous` selects the newest failed-run log. Non-stormd service logs remain
 #87, and successful init-container log retention remains #47.
 
-There are no `/exec`, `/attach`, `/portForward` or `/vmVerb` routes (#56/#94).
-An internal exec used for probes is not an interactive streaming API.
+| POST, GET | `/portForward/{namespace}/{pod}` | `kubectl port-forward` (#56): SPDY/3.1 (`portforward.k8s.io`) or a WebSocket tunnel of it (`SPDY/3.1+portforward.k8s.io`); connects to `localhost:<port>` in the pod's network namespace (the node's for hostNetwork). 404 unknown pod, 403 another protocol, 503 no namespace found |
+| POST, GET | `/exec/{namespace}/{pod}/{container}`, `/attach/…` | 501 naming stormpump#103: the engine cannot yet run a process in a running container. Exec probes wait on the same |
+
+There is no `/vmVerb` route (#94). The SPDY session (`spdy.rs`) answers each stream with a SYN_REPLY, echoes
+PINGs and does no flow control (client-go's spdystream does none either); the WebSocket channel protocols for
+exec/attach (`v5.channel.k8s.io`) come with stormpump#103.
 The console router knows the stormblock URL but its control verbs are not
 exposed by the kubelet route table.
 

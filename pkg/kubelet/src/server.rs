@@ -2,9 +2,11 @@
 //!
 //! Liveness, a Prometheus `/metrics` endpoint, `/stats/summary`, `/pods` (the
 //! pods this kubelet manages) and `/containerLogs` — the endpoint the
-//! apiserver proxies `kubectl logs` to (rustkube-node#34). Exec, attach and
-//! portforward are follow-ups (rustkube-node#7). Served over HTTPS with
-//! bearer-token auth (rustkube-node#9).
+//! apiserver proxies `kubectl logs` to (rustkube-node#34). `/portForward`
+//! speaks SPDY/3.1 (`spdy.rs`) or a WebSocket tunnel of it (#56); `/exec` and
+//! `/attach` answer 501 until the engine can run a process inside a running
+//! container (stormpump#103). Served over HTTPS with bearer-token auth
+//! (rustkube-node#9).
 //!
 //! Two routes are here because the thing they reach is on the node and the
 //! control plane cannot get to it: `/vmConsole` (stormvm's console doors) and
@@ -144,6 +146,12 @@ fn router_with_console(
         // handler proxies to (rustkube#61), answered by stormvm's own router
         // mounted below (rustkube-node#43).
         .route("/vmConsole/{namespace}/{name}/{door}", get(vm_console))
+        // The streaming subresources the apiserver splices through (#56):
+        // `kubectl port-forward`, `exec`, `attach`. GET for a WebSocket
+        // handshake, POST for SPDY.
+        .route("/portForward/{namespace}/{pod}", get(port_forward).post(port_forward))
+        .route("/exec/{namespace}/{pod}/{container}", get(exec_refused).post(exec_refused))
+        .route("/attach/{namespace}/{pod}/{container}", get(attach_refused).post(attach_refused))
         // Who is at this address.
         //
         // Meant for the metadata service. The kubelet already holds the VMI,
@@ -361,6 +369,170 @@ async fn vm_instance(
         )
             .into_response(),
     }
+}
+
+/// The subprotocol `kubectl port-forward` asks for over SPDY.
+const PORT_FORWARD_PROTOCOL: &str = "portforward.k8s.io";
+/// ... and over a WebSocket: SPDY/3.1 tunnelled in binary messages (KEP-4006).
+const PORT_FORWARD_TUNNEL: &str = "SPDY/3.1+portforward.k8s.io";
+
+/// `/portForward/{namespace}/{pod}` (#56): upgrade to SPDY/3.1, or to a
+/// WebSocket carrying SPDY, and forward each requested connection into the
+/// pod's network namespace (`portforward.rs`).
+///
+/// A request this cannot serve is answered without a 101, which is what makes
+/// client-go fall back from its WebSocket attempt to plain SPDY.
+async fn port_forward(
+    State(pm): State<Arc<PodManager>>,
+    Path((namespace, pod)): Path<(String, String)>,
+    mut req: Request,
+) -> Response {
+    let target = match pm.pod_network(&namespace, &pod).await {
+        None => {
+            return (StatusCode::NOT_FOUND, format!("pod {namespace}/{pod} not found on this node\n"))
+                .into_response()
+        }
+        Some(Err(e)) => return (StatusCode::SERVICE_UNAVAILABLE, format!("{e}\n")).into_response(),
+        Some(Ok((uid, netns))) => crate::portforward::Target { pod: format!("{namespace}/{pod}"), uid, netns },
+    };
+    let header = |name: &str| -> Vec<String> {
+        req.headers()
+            .get_all(name)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .collect()
+    };
+    let upgrade = header("upgrade");
+    let websocket = upgrade.iter().any(|u| u.eq_ignore_ascii_case("websocket"));
+    let spdy = upgrade.iter().any(|u| u.eq_ignore_ascii_case("SPDY/3.1"));
+    let protocols = header(if websocket { "sec-websocket-protocol" } else { "x-stream-protocol-version" });
+    let key = header("sec-websocket-key").into_iter().next();
+    let wanted = if websocket { PORT_FORWARD_TUNNEL } else { PORT_FORWARD_PROTOCOL };
+    if !websocket && !spdy {
+        return (StatusCode::BAD_REQUEST, "port-forward needs an upgrade to SPDY/3.1 or a WebSocket\n").into_response();
+    }
+    if !protocols.iter().any(|p| p == wanted) {
+        return (
+            StatusCode::FORBIDDEN,
+            format!("unable to upgrade: port-forward speaks {wanted}; the client offered {protocols:?}\n"),
+        )
+            .into_response();
+    }
+    let Some(on_upgrade) = req.extensions_mut().remove::<hyper::upgrade::OnUpgrade>() else {
+        return (StatusCode::BAD_REQUEST, "the connection cannot be upgraded\n").into_response();
+    };
+    let mut resp = Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header("connection", "Upgrade");
+    if websocket {
+        let Some(key) = key else {
+            return (StatusCode::BAD_REQUEST, "a WebSocket handshake needs Sec-WebSocket-Key\n").into_response();
+        };
+        resp = resp
+            .header("upgrade", "websocket")
+            .header("sec-websocket-accept", websocket_accept(&key))
+            .header("sec-websocket-protocol", PORT_FORWARD_TUNNEL);
+    } else {
+        resp = resp.header("upgrade", "SPDY/3.1").header("x-stream-protocol-version", PORT_FORWARD_PROTOCOL);
+    }
+    tokio::spawn(async move {
+        let io = match on_upgrade.await {
+            Ok(u) => hyper_util::rt::TokioIo::new(u),
+            Err(e) => {
+                warn!("port-forward {}: upgrade failed: {e}", target.pod);
+                return;
+            }
+        };
+        let streams = if websocket {
+            use tokio_tungstenite::tungstenite::protocol::Role;
+            let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(io, Role::Server, None).await;
+            crate::spdy::serve(websocket_bytes(ws))
+        } else {
+            crate::spdy::serve(io)
+        };
+        crate::portforward::serve(streams, target).await;
+    });
+    resp.body(axum::body::Body::empty()).unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// `Sec-WebSocket-Accept` for a key (RFC 6455).
+fn websocket_accept(key: &str) -> String {
+    use base64::Engine;
+    use sha1::Digest;
+    let mut h = sha1::Sha1::new();
+    h.update(key.as_bytes());
+    h.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    base64::engine::general_purpose::STANDARD.encode(h.finalize())
+}
+
+/// A WebSocket's binary messages as one byte stream, both ways: what a
+/// SPDY tunnel is (client-go's `TunnelingConnection`).
+fn websocket_bytes<S>(ws: tokio_tungstenite::WebSocketStream<S>) -> tokio::io::DuplexStream
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use futures::{SinkExt, StreamExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let (ours, theirs) = tokio::io::duplex(256 * 1024);
+    let (mut from_spdy, mut to_spdy) = tokio::io::split(theirs);
+    let (mut sink, mut stream) = ws.split();
+    tokio::spawn(async move {
+        while let Some(Ok(m)) = stream.next().await {
+            match m {
+                Message::Binary(d) => {
+                    if to_spdy.write_all(&d).await.is_err() {
+                        break;
+                    }
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        let _ = to_spdy.shutdown().await;
+    });
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 32 * 1024];
+        loop {
+            match from_spdy.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if sink.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        let _ = sink.send(Message::Close(None)).await;
+    });
+    ours
+}
+
+/// `kubectl exec` (#56). Not served yet on stormpump: the engine has no way
+/// to run a process inside a running container (stormpump#103). Refused with
+/// the reason, before any upgrade, so `kubectl` prints it.
+async fn exec_refused(Path((namespace, pod, container)): Path<(String, String, String)>) -> Response {
+    streaming_refused("exec", &namespace, &pod, &container)
+}
+
+/// `kubectl attach` (#56): as exec, a container's stdin needs the engine (stormpump#103).
+async fn attach_refused(Path((namespace, pod, container)): Path<(String, String, String)>) -> Response {
+    streaming_refused("attach", &namespace, &pod, &container)
+}
+
+fn streaming_refused(verb: &str, namespace: &str, pod: &str, container: &str) -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        format!(
+            "{verb} into {namespace}/{pod}/{container} is not supported on this node yet: its runtime \
+             (stormpump) cannot run a process inside a running container (stormpump#103). \
+             `kubectl port-forward` and `kubectl logs` work.\n"
+        ),
+    )
+        .into_response()
 }
 
 async fn pods(State(pm): State<Arc<PodManager>>) -> impl IntoResponse {
@@ -591,6 +763,132 @@ mod tests {
         let rt = Arc::new(NoopRt);
         let pm = Arc::new(PodManager::new(rt.clone(), rt, "test-node"));
         router(pm)
+    }
+
+    /// #56: the router on a real socket (an upgrade needs one), with a
+    /// hostNetwork pod `default/web` running, and a TCP echo server standing
+    /// in for its port.
+    async fn streaming_world() -> (std::net::SocketAddr, u16) {
+        let rt = Arc::new(NoopRt);
+        let pm = Arc::new(PodManager::new(rt.clone(), rt, "test-node"));
+        let pod = serde_json::json!({
+            "metadata": {"name": "web", "namespace": "default", "uid": "u-web"},
+            "spec": {"hostNetwork": true, "nodeName": "test-node",
+                     "containers": [{"name": "app", "image": "busybox", "command": ["/bin/sleep", "1d"]}]}
+        });
+        pm.sync_pods(&[pod]).await;
+        assert!(pm.pod_network("default", "web").await.is_some(), "the pod runs here");
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, router(pm)).await.unwrap() });
+
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut c, _)) = echo.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = c.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+        (addr, port)
+    }
+
+    /// Send a request head and read the response head.
+    async fn upgrade(addr: std::net::SocketAddr, head: &str) -> (tokio::net::TcpStream, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        c.write_all(head.as_bytes()).await.unwrap();
+        let mut got = Vec::new();
+        let mut b = [0u8; 1];
+        while !got.ends_with(b"\r\n\r\n") {
+            c.read_exact(&mut b).await.unwrap();
+            got.push(b[0]);
+        }
+        (c, String::from_utf8(got).unwrap())
+    }
+
+    /// Forward one connection over a SPDY byte stream and check the echo.
+    async fn forward_once<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(mut io: S, port: u16) {
+        use crate::spdy::client::{read_frame, Client, Frame};
+        use tokio::io::AsyncWriteExt;
+        let port = port.to_string();
+        let mut c = Client::new();
+        let h = |t: &'static str| [("streamType", t), ("port", port.as_str()), ("requestID", "0")];
+        io.write_all(&c.syn_stream(1, &h("error"), true)).await.unwrap();
+        io.write_all(&c.syn_stream(3, &h("data"), false)).await.unwrap();
+        io.write_all(&Client::data(3, b"through the kubelet", false)).await.unwrap();
+        loop {
+            match read_frame(&mut io).await.expect("session ended before the echo") {
+                Frame::Data(3, _, b) => {
+                    assert_eq!(b, b"through the kubelet");
+                    break;
+                }
+                Frame::Data(1, _, b) if !b.is_empty() => panic!("{}", String::from_utf8_lossy(&b)),
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn port_forward_over_spdy_reaches_the_pods_port() {
+        let (addr, port) = streaming_world().await;
+        let (io, head) = upgrade(
+            addr,
+            "POST /portForward/default/web HTTP/1.1\r\nHost: n\r\nConnection: Upgrade\r\n\
+             Upgrade: SPDY/3.1\r\nX-Stream-Protocol-Version: portforward.k8s.io\r\n\r\n",
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        let lower = head.to_ascii_lowercase();
+        assert!(lower.contains("upgrade: spdy/3.1") && lower.contains("x-stream-protocol-version: portforward.k8s.io"), "{head}");
+        forward_once(io, port).await;
+    }
+
+    #[tokio::test]
+    async fn port_forward_over_a_websocket_tunnel_reaches_the_pods_port() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        let (addr, port) = streaming_world().await;
+        let (io, head) = upgrade(
+            addr,
+            "GET /portForward/default/web HTTP/1.1\r\nHost: n\r\nConnection: Upgrade\r\n\
+             Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Protocol: SPDY/3.1+portforward.k8s.io\r\n\r\n",
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        // RFC 6455's own example key and answer.
+        assert!(head.to_ascii_lowercase().contains("sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo="), "{head}");
+        let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(io, Role::Client, None).await;
+        forward_once(websocket_bytes(ws), port).await;
+    }
+
+    #[tokio::test]
+    async fn port_forward_refusals_say_why_and_never_upgrade() {
+        let (addr, _) = streaming_world().await;
+        let (_, head) = upgrade(addr, "POST /portForward/default/nope HTTP/1.1\r\nHost: n\r\nUpgrade: SPDY/3.1\r\nConnection: Upgrade\r\n\r\n").await;
+        assert!(head.starts_with("HTTP/1.1 404"), "{head}");
+        let (_, head) = upgrade(addr, "POST /portForward/default/web HTTP/1.1\r\nHost: n\r\nUpgrade: SPDY/3.1\r\nConnection: Upgrade\r\nX-Stream-Protocol-Version: v4.channel.k8s.io\r\n\r\n").await;
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        // A WebSocket without the tunnel subprotocol: refused, so client-go
+        // falls back to SPDY.
+        let (_, head) = upgrade(addr, "GET /portForward/default/web HTTP/1.1\r\nHost: n\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: v5.channel.k8s.io\r\n\r\n").await;
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn exec_and_attach_answer_why_not_rather_than_404() {
+        for path in ["/exec/default/web/app?command=sh&input=1&output=1&tty=1", "/attach/default/web/app?output=1"] {
+            let resp = app()
+                .oneshot(Request::builder().method("POST").uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED, "{path}");
+            let body = axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+            assert!(String::from_utf8_lossy(&body).contains("stormpump#103"));
+        }
     }
 
     #[tokio::test]

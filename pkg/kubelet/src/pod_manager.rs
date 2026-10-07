@@ -4224,6 +4224,35 @@ impl PodManager {
             .map(|w| w.reason.clone())
     }
 
+    /// Where to reach a pod's ports from (#56): its uid and the sandbox's
+    /// network namespace, `None` for a hostNetwork pod (the node's). `None`
+    /// overall when no pod of that name runs here; an error when it does but
+    /// its namespace cannot be found, never the node's network in its place.
+    pub async fn pod_network(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Option<Result<(String, Option<String>), String>> {
+        let (uid, host, sandbox) = {
+            let pods = self.pods.read().await;
+            let p = pods.values().find(|p| p.namespace == namespace && p.name == name)?;
+            (p.uid.clone(), p.pod["spec"]["hostNetwork"].as_bool() == Some(true), p.sandbox_id.clone())
+        };
+        if host {
+            return Some(Ok((uid, None)));
+        }
+        let Some(sid) = sandbox else {
+            return Some(Err(format!("pod {namespace}/{name} has no sandbox yet")));
+        };
+        Some(match self.runtime.pod_sandbox_status(&sid).await {
+            Ok(st) => st
+                .netns_path
+                .map(|n| (uid, Some(n)))
+                .ok_or_else(|| format!("pod {namespace}/{name}: the runtime reports no network namespace")),
+            Err(e) => Err(format!("pod {namespace}/{name}: {e}")),
+        })
+    }
+
     pub async fn pod_uid(&self, namespace: &str, name: &str) -> Option<String> {
         let pods = self.pods.read().await;
         pods.values()

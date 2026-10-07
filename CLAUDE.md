@@ -65,12 +65,12 @@ WebSocket for a newer kubectl (client-go falls back to SPDY when the WebSocket u
 Found: stormpump has no op that runs a process inside a running workload, and deposited fds reach only VM domains,
 so exec/attach (and `exec_sync`, exec probes) need the engine: filed stormpump#103. Port-forward needs nothing from
 it: the kubelet connects inside the sandbox's netns (as health.rs dials) and splices.
-1. [ ] `spdy.rs`: SPDY/3.1 server session (frames, zlib header blocks with the SPDY/3 dictionary: inflate via
+1. [x] `spdy.rs`: SPDY/3.1 server session (frames, zlib header blocks with the SPDY/3 dictionary: inflate via
        miniz_oxide's core with the window preloaded, deflate as stored blocks; PING, WINDOW_UPDATE sent as data
        is read, RST, GOAWAY).
-2. [ ] `portforward.rs` + `/portForward/{ns}/{pod}`: streams paired by requestID (error + data), connect to the
+2. [x] `portforward.rs` + `/portForward/{ns}/{pod}`: streams paired by requestID (error + data), connect to the
        port in the pod's netns (host network: the node's), splice; errors on the error stream.
-3. [ ] WebSocket: port-forward's `SPDY/3.1+portforward.k8s.io` tunnel; exec/attach answer 501 naming stormpump#103.
+3. [x] WebSocket: port-forward's `SPDY/3.1+portforward.k8s.io` tunnel; exec/attach answer 501 naming stormpump#103.
 4. [ ] Tests (a SPDY client, fixtures compressed with the dictionary), docs, CHANGELOG; sc-build; golden.
        Then #56 waits on stormpump#103 for exec/attach.
 

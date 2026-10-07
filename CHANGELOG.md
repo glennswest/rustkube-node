@@ -2,6 +2,14 @@
 
 ## 2026-10-08
 
+- **feat:** `kubectl port-forward` is served (#56): `/portForward/{ns}/{pod}` upgrades to SPDY/3.1
+  (`portforward.k8s.io`) or to a WebSocket tunnelling SPDY (`SPDY/3.1+portforward.k8s.io`, a newer kubectl's
+  first try), pairs each request's error and data streams, connects to `localhost:<port>` inside the pod's network
+  namespace (the node's for hostNetwork) and splices. New `spdy.rs`: a SPDY/3.1 server session (header blocks
+  inflated with the SPDY/3 dictionary through miniz_oxide's core, written as stored blocks; SYN_REPLY per stream,
+  PING echo, RST, GOAWAY; no flow control, as spdystream does none). `/exec` and `/attach` now answer 501 naming
+  stormpump#103 (the engine cannot run a process in a running container) instead of 404. server.rs's module doc
+  no longer points them at #7 (#127).
 - **fix:** The image's config is applied under the pod spec on stormpump (#98). argv was `command` + `args`
   only, so an args-only container (CoreDNS's `-conf …`) exec'd its first argument, a container with no `env`
   got no image `PATH`, and every container ran as root. Now, from sbregistry's golden record (`config`, asked
