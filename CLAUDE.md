@@ -57,6 +57,16 @@ by #51.
 
 ## Work plan
 
+### Waiting on the owner: #68 (P2), replicated claims (a StorageClass asks for replicas on other servers)
+
+2026-10-08. Since the issue (09-25) replicated claims went to stormblock-csi (owner, stormblock-csi#29, 10-06):
+class `stormblock-csi`, params `replicaSlaves`/`pool`/`tier`/`spread`, a stormstorage distributed volume served
+over NVMe/TCP, operator failover. stormstorage has `prefer_node` (#50) and the RAID shape is decided (#41, option
+1). The kubelet already runs third-party CSI (#52, propagation #81). Multi-node blockers either way: one cluster
+stormstorage (stormstorage#56, stormcos#354), NVMe/TCP attach from a non-head node (#142). Asked on #68: A
+stormblock-csi owns it (recommended; built-in stays node-local, #71 for in-node redundancy), B the built-in driver
+too (head-local only), C the built-in class sends replicas>1 to stormblock-csi. `wait-owner` run. No code.
+
 ### Waiting on stormcentral#541 (builds): #80 (P2), a Pod blocked on a claim a VM here holds says why
 
 2026-10-08. The two-writer case is closed by admission since #100/#114: a VMI's claims are reserved Exclusive
