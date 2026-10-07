@@ -1526,6 +1526,7 @@ impl PodManager {
     /// name-idempotent, so a restarted pod is reunited with its data rather than
     /// given a fresh volume. That is the whole difference between a claim and a
     /// scratch directory, and it is why the name cannot include the pod UID.
+    #[cfg(test)]
     async fn provision_claim(
         &self,
         namespace: &str,
