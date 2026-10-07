@@ -57,6 +57,15 @@ by #51.
 
 ## Work plan
 
+### In progress: #94, the VMI verbs on :10250 (`PUT /vmVerb/{ns}/{name}/{verb}`)
+
+2026-10-08. stormvm's router (lock 180fa13) serves `PUT /api/v1/vms/{ns}/{name}/{verb}`: pause, unpause,
+softreboot, reset, status, freeze, thaw, snapshot (and migrate/receive, not for here: migration is #40's, by the
+VMI's status). rustkube#141 (the apiserver's verb proxy) is open and has not fixed a path: this route is the one #94
+proposed, said on rustkube#141. KubeVirt says `unfreeze` where stormvm says `thaw`: both accepted.
+1. [ ] `vm_verb`: verb allow-list, query forwarded without `token`, the console's handover (`to_console`, shared
+       with `/vmConsole`). Tests through the kubelet router; docs (api.md, README), CHANGELOG; sc-build.
+
 ### Waiting on stormcentral#536 (builds): #89, the serving pair: never a silent self-signed fallback; reloaded when renewed
 
 2026-10-08. The wait-then-fatal half was #69 (5d869b9): `--tls-cert-file`/`--tls-private-key-file` wait 60 s, then
