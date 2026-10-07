@@ -219,6 +219,8 @@ fn token_text(bytes: Vec<u8>) -> anyhow::Result<String> {
     Ok(String::from_utf8(bytes)?.trim().to_string())
 }
 
+const DEFAULT_APISERVER: &str = "http://127.0.0.1:6443";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
