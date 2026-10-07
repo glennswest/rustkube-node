@@ -57,6 +57,12 @@ by #51.
 
 ## Work plan
 
+### 2026-10-08: the build backlog ran
+
+The build-VM slot came free; sc-build 134fd60 (job 9161dda65c) `cargo build --locked && cargo test --locked`: 398 kubelet unit pass, plus 34 proxy, 25 CNI and the integration tests; every waiting issue's own
+tests by name. First run 924aaaa811 found two #85 compile errors (#188, fixed 134fd60). Closed: #89, #147, #87, #94,
+#96, #77, #85, #65, #80, #188. #126 and #115 wait on the stage golden (requested; stormcentral#527).
+
 ### Waiting on the owner: #68 (P2), replicated claims (a StorageClass asks for replicas on other servers)
 
 2026-10-08. Since the issue (09-25) replicated claims went to stormblock-csi (owner, stormblock-csi#29, 10-06):
@@ -67,7 +73,7 @@ stormstorage (stormstorage#56, stormcos#354), NVMe/TCP attach from a non-head no
 stormblock-csi owns it (recommended; built-in stays node-local, #71 for in-node redundancy), B the built-in driver
 too (head-local only), C the built-in class sends replicas>1 to stormblock-csi. `wait-owner` run. No code.
 
-### Waiting on stormcentral#541 (builds): #80 (P2), a Pod blocked on a claim a VM here holds says why
+### Done: #80 (P2), a Pod blocked on a claim a VM here holds says why
 
 2026-10-08. The two-writer case is closed by admission since #100/#114: a VMI's claims are reserved Exclusive
 (`claims_for`), so a Pod wanting the same claim is not admitted (`reconcile` → `AwaitEvent`). Left (owner's recheck
@@ -80,7 +86,7 @@ missing.
 3. [ ] Tests (blockers; a Pod after a VM), README/status.md, CHANGELOG; sc-build; close.
        Done: 43ab0e9 (1 test). Job 560e7c6206 cancelled while queued (stormcentral#541); #80 proposed after it.
 
-### Waiting on stormcentral#541 (builds): #65 (P2), the Node advertises KVM
+### Done: #65 (P2), the Node advertises KVM
 
 2026-10-08. `node_status.rs` reports no KVM, so a test Job (no /dev/kvm in its container) cannot tell a VM-capable
 node (`requires: [kvm]`, stormcos_qa vm-lifecycle). VMs run only with the stormpump engine (`Kubelet.vms`). The
@@ -94,7 +100,7 @@ the kernel: `/sys/class/misc/kvm` (the kernel registered the device), or /dev/kv
 2. [ ] Tests, docs (README, configuration.md), CHANGELOG (8fb1461); sc-build; close (tell stormcos_qa#16 how to
        check: `-l storm.io/kvm=true`). Job d23dc7b9a5 cancelled while queued (stormcentral#541); #65 proposed after it.
 
-### Waiting on stormcentral#541 (builds): #85, a VMI placed with spec.nodeName is never started
+### Done: #85, a VMI placed with spec.nodeName is never started
 
 2026-10-07. Found: vm_loop lists VMIs with `fieldSelector=status.nodeName=<node>` and filters `want` on
 status.nodeName, so a hand-placed VMI (spec.nodeName only) never reaches `assigned_to`. rustkube's scheduler
@@ -111,7 +117,7 @@ status.nodeName, so a hand-placed VMI (spec.nodeName only) never reaches `assign
        The bootstrap job was cancelled too; 5fd1caed32 (ee08d48) cancelled the same way. Filed stormcentral#541,
        #85 proposed after it. Rerun `SC_BUILD_VM=1 sc-build 'cargo build --locked && cargo test --locked'`, close.
 
-### Waiting on stormcentral#536 (builds): #77, the client certificate reloaded when stormcert renews it
+### Done: #77, the client certificate reloaded when stormcert renews it
 
 2026-10-08. The apiserver client (one `reqwest::Client`, cloned into every module) takes the client pair once.
 Rather than rebuild it everywhere: a rustls `ClientConfig` (CA roots + a `ResolvesClientCert` whose pair can be
@@ -122,7 +128,7 @@ Only with a CA and verification on (stormcos); insecure / no-CA keep the static 
        task; tests (rcgen pairs: swap, unchanged, mismatched key refused); docs, CHANGELOG; sc-build.
        Done: d1ad901 (2 tests). NOT yet built: the SC_BUILD_VM job was cancelled while queued. Rerun, close.
 
-### Waiting on stormcentral#536 (builds): #96, a node service's mirror pod is Ready only while it answers
+### Done: #96, a node service's mirror pod is Ready only while it answers
 
 2026-10-08. Each service golden's stormd config declares its liveness (`[process.liveness] type = "http"`, `url =
 http://127.0.0.1:<port><health>`, stormcos `service_golden`); its boot unit names the golden (`root <volume>`) and
@@ -132,7 +138,7 @@ Ready/ContainersReady False, reason Unhealthy; a Warning `Unhealthy` Event on th
 1. [ ] Code + tests (5) + README, CHANGELOG (ff7000c; the push needed 11 tries, GitHub 500s). NOT yet built: the
        SC_BUILD_VM job was cancelled while queued (stormcentral#536). Rerun, close; live check on a node.
 
-### Waiting on stormcentral#536 (builds): #94, the VMI verbs on :10250 (`PUT /vmVerb/{ns}/{name}/{verb}`)
+### Done: #94, the VMI verbs on :10250 (`PUT /vmVerb/{ns}/{name}/{verb}`)
 
 2026-10-08. stormvm's router (lock 180fa13) serves `PUT /api/v1/vms/{ns}/{name}/{verb}`: pause, unpause,
 softreboot, reset, status, freeze, thaw, snapshot (and migrate/receive, not for here: migration is #40's, by the
@@ -143,7 +149,7 @@ proposed, said on rustkube#141. KubeVirt says `unfreeze` where stormvm says `tha
        Done: 8674302 (2 tests; contract on rustkube#141). NOT yet built: the SC_BUILD_VM job was cancelled while
        queued. Rerun, close; real-node snapshot check after rustkube#141.
 
-### Waiting on stormcentral#536 (builds): #89, the serving pair: never a silent self-signed fallback; reloaded when renewed
+### Done: #89, the serving pair: never a silent self-signed fallback; reloaded when renewed
 
 2026-10-08. The wait-then-fatal half was #69 (5d869b9): `--tls-cert-file`/`--tls-private-key-file` wait 60 s, then
 exit naming the flag. Left: say which pair :10250 serves, and reload it when stormcert renews it (at boot,
@@ -170,7 +176,7 @@ catalog lists forge goldens but "nothing is copied" (#43), and cross-engine clon
 Asked on #86: A copy on demand (recommended), B remote attach, C node-local only. A tag/digest matching no known
 golden version keeps running the pallet (upstream OCI tags/digests, Cilium's `@sha256:`).
 
-### Waiting on stormcentral#541 (builds): #147 (P2), kube-proxy clears stale UDP conntrack entries
+### Done: #147 (P2), kube-proxy clears stale UDP conntrack entries
 
 2026-10-08. kube-proxy rewrites the DNAT when an endpoint goes but leaves conntrack: a UDP flow to a ClusterIP
 (kube-dns) keeps its NAT to the old backend for 30–120 s. (No stormcos edition runs kube-proxy since #145/#155;
@@ -184,7 +190,7 @@ first endpoint.
        Done: 033a05a (4 tests). NOT yet built: the SC_BUILD_VM job was cancelled while queued. Rerun, close.
        2026-10-08: e58d5ed7fc (97801bc) cancelled the same way; #147 proposed after stormcentral#541.
 
-### Waiting on stormcentral#541 (builds): #115 (P2), a stormpump exit wakes its own workload only
+### Waiting on stormcentral#527 (golden): #115 (P2), a stormpump exit wakes its own workload only
 
 2026-10-08. An unsolicited exit bumps the ring's counter; `pod_loop`/`vm_loop` answer with `wake_kind` **and**
 `worker.enqueue()` (a full list sync), so one exit wakes every Pod and VMI worker and re-syncs every pod.
@@ -196,7 +202,7 @@ first endpoint.
        cancelled while queued (stormcentral#535/#536). Rerun, then golden (stormcentral#527) and close.
        2026-10-08: e58d5ed7fc (97801bc) cancelled the same way; #115 proposed after stormcentral#541.
 
-### Waiting on stormcentral#541 (builds): #126 (P2), no fixed init deadline; activeDeadlineSeconds bounds it
+### Waiting on stormcentral#527 (golden): #126 (P2), no fixed init deadline; activeDeadlineSeconds bounds it
 
 2026-10-08. `run_init_containers` stops an init still running after 120 s (`DeadlineExceeded`, exit -1). Upstream:
 an init runs until it exits; only the pod's `activeDeadlineSeconds` (from its startTime) limits it. The admission
@@ -1145,7 +1151,7 @@ Steps:
        18d8dc0653 (#91, #92 half 1), rustkube-node medium fff1f4d9d9 (#64, #59, #62, #67) and short c7e24520ec,
        at 65e3c3c. Read with `stormcentral test show <id>`; close what passes.
 
-### Waiting on stormcentral#536 (builds): #87, static (mirror) pods: logs and stale status
+### Done: #87, static (mirror) pods: logs and stale status
 
 Logs: stormd services answered by #72. registry/stormblock/timesync wait on stormpump#55 (assets.json names no log).
 Stale status, found 2026-09-28: stormpump lists every asset it tried to start (refused ones too, with
