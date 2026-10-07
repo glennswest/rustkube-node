@@ -68,8 +68,10 @@ own agent off the node: never Ready. And rustkube's node controller removes `not
 healthy. stormcos registers no `node.cilium.io/agent-not-ready` taint. Options posted on #3.
 1. [x] Test: run_pod_sandbox for a host-network pod with a CNI but no config succeeds with no address; a pod-network
        one is NetworkNotConfigured. `--no-cni` help: pods get an isolated namespace with loopback only (#54 audit).
-2. [ ] Question on #3, `stormcentral wait-owner`. Live checks (pod CIDR address, coredns leaves Pending, endpoint
-       released, agent stopped → sandbox fails) wait on a test machine (stormcos#337).
+       Done: 2a2b463; sc-build `cargo build --locked && cargo test --locked`: 343 kubelet unit pass.
+2. [x] Question on #3 (A upstream shape + rustkube scheduler/taint change, recommended; B stormcos registers
+       Cilium's agent-not-ready taint; C kubelet-managed network-unavailable taint), `stormcentral wait-owner`. Live checks (pod CIDR address, coredns leaves Pending, endpoint
+       released, agent stopped → sandbox fails) wait on a test machine (stormcos#337). Resume from the answer.
 
 ### Done: #69, a named credential that is missing is waited for, then fatal (never anonymous)
 
