@@ -57,7 +57,7 @@ by #51.
 
 ## Work plan
 
-### In progress: #133 (P2), a start error is never "terminal with no container state"
+### Waiting on stormcentral#527 (golden): #133 (P2), a start error is never "terminal with no container state"
 
 2026-10-08. The 10-02 trigger was #103 (a pulled image's root unresolved → start_container failed; fixed 4263d80,
 shipped). The behaviour it exposed stands: every start error not matched as a wait (image pull, create, start,
@@ -70,7 +70,8 @@ the container terminated `StartError` (exit 128).
        Failed with the terminated status; else Pending with the reason, partial start torn down, first_seen kept so
        the back-off grows), Connection (a wait); the rest Failed *with* init statuses and app containers
        PodInitializing/StartError. `WaitingPod.kind`; logs answer 400 with it (never 404 for an admitted pod).
-2. [ ] Tests (fake: missing image, create/start failures), docs, CHANGELOG; SC_BUILD_VM sc-build; close.
+2. [x] Tests (3 new, 1 extended), README, CHANGELOG (dc3eed0, 2910b5a: a failed init's report kept, #183).
+       SC_BUILD_VM sc-build: 374 kubelet unit pass. Golden after stormcentral#527 (with #165, #95, #174, #111).
 
 ### Waiting on stormcentral#527 (golden): #111 (P2), restartable init containers (native sidecars, restartPolicy: Always)
 
