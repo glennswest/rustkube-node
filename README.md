@@ -274,7 +274,10 @@ exit in assets.json (`last_exit_code` or `last_exit_signal`, `last_exit`, the la
 stormpump#51), and the mirror's container carries it as `lastState.terminated` (`exitCode`, 128 + the signal
 when a signal ended it, `signal`, reason `Error`, `message` = the output's tail within upstream's 80 lines /
 4 KiB). A service that stays down has the same on `state.terminated`; one that never exited invents no exit
-code. The `BackOff` and `Stopped` Events end with the exit and that tail. For a service run by stormd the
+code. **Its lifecycle is Events on the mirror pod** (#50): `Started` (with the service's own start time), `Stopped`,
+`Failed` (a non-zero exit or a signal, Warning), `BackOff` (PID 1 restarted it), the last three ending with the exit
+and that tail. First sight is judged against the mirror pod the API has, so a service started since it was last
+written is announced and a kubelet restart re-announces nothing. For a service run by stormd the
 output is stormd's own until stormd#29. A mirror whose asset is not in the
 table on this boot (its unit was not started) becomes Pending, with its container waiting `NotStarted`, no
 `startTime`, and one Warning Event. It used to keep the previous boot's Running status. Mirrors are never

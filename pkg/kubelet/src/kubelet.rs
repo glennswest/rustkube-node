@@ -1929,68 +1929,6 @@ async fn mirror_node_services(
     // changes — and reported none of them. A service that stopped, or
     // started, or has been restarting for four minutes is exactly what an
     // event is for, and rustkube-node#50 is this.
-    {
-        let seen =
-            LAST_SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-        let mut changes: Vec<(String, &'static str, String)> = Vec::new();
-        {
-            let mut last = match seen.lock() {
-                Ok(l) => l,
-                Err(e) => e.into_inner(),
-            };
-            for a in &assets {
-                match last.get(&a.name).copied() {
-                    None => {
-                        // First sight is not an event: every service would
-                        // announce itself on every kubelet restart.
-                    }
-                    Some((was_running, was_restarts)) => {
-                        // How it ended and what it said last (#82): the
-                        // node-console reason, through the API.
-                        let exit = a.last_exit.as_ref().map(|e| format!(": {}", e.summary())).unwrap_or_default();
-                        if a.restarts > was_restarts {
-                            changes.push((
-                                a.name.clone(),
-                                "BackOff",
-                                format!(
-                                    "restarted {} time(s); PID 1 has restarted it {} times{exit}",
-                                    a.restarts - was_restarts,
-                                    a.restarts
-                                ),
-                            ));
-                        } else if was_running && !a.running {
-                            changes.push((
-                                a.name.clone(),
-                                "Stopped",
-                                format!("the service is no longer running{exit}"),
-                            ));
-                        } else if !was_running && a.running {
-                            changes.push((
-                                a.name.clone(),
-                                "Started",
-                                "the service is running".into(),
-                            ));
-                        }
-                    }
-                }
-                last.insert(a.name.clone(), (a.running, a.restarts));
-            }
-        }
-        for (name, reason, message) in changes {
-            let etype = if reason == "Started" {
-                "Normal"
-            } else {
-                "Warning"
-            };
-            let pod = serde_json::json!({
-                "metadata": { "name": format!("{name}-{node}"), "namespace": "kube-system", "uid": "" }
-            });
-            if let Some(r) = &events {
-                r.pod_event(&pod, etype, reason, &message).await;
-            }
-        }
-    }
-
     // Mirrors of assets PID 1 did not list on this boot (#87): not running,
     // said once, never deleted.
     // The mirrors there are, read once: what exists is compared rather than
@@ -2007,6 +1945,43 @@ async fn mirror_node_services(
         apimachinery::reactor::failed();
         return;
     };
+
+    // What changed since the last pass, as events on the mirror pods (#50):
+    // Started (with when), Stopped, Failed (a non-zero exit, with its tail),
+    // BackOff. First sight is judged against the mirror pod the API has, so a
+    // kubelet restart announces nothing that already happened.
+    {
+        let seen =
+            LAST_SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let now = chrono::Utc::now();
+        let mut changes = Vec::new();
+        {
+            let mut last = seen.lock().unwrap_or_else(|e| e.into_inner());
+            for a in &assets {
+                let started = (now - chrono::Duration::seconds(a.age_secs as i64))
+                    .format("%Y-%m-%dT%H:%M:%SZ")
+                    .to_string();
+                let name = crate::mirror::mirror_name(&a.name, node);
+                let existing = list["items"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|p| p["metadata"]["name"].as_str() == Some(name.as_str()));
+                if let Some(t) = crate::mirror::transition(last.get(&a.name).copied(), a, existing, &started) {
+                    changes.push((existing.cloned(), name, t));
+                }
+                last.insert(a.name.clone(), (a.running, a.restarts));
+            }
+        }
+        for (existing, name, (etype, reason, message)) in changes {
+            let pod = existing.unwrap_or_else(|| serde_json::json!({
+                "metadata": { "name": name, "namespace": "kube-system", "uid": "" }
+            }));
+            if let Some(r) = &events {
+                r.pod_event(&pod, etype, reason, &message).await;
+            }
+        }
+    }
     for pod in crate::mirror::stale_mirrors(&list, node, &assets) {
         let name = pod["metadata"]["name"].as_str().unwrap_or("");
         let marked = crate::mirror::not_started(pod);

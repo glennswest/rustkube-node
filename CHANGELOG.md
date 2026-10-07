@@ -2,6 +2,10 @@
 
 ## 2026-10-08
 
+- **feat:** A node service's lifecycle as Events, completed (#50): a service seen for the first time is `Started`
+  (with its own start time) unless its mirror pod already shows that run, so one started since the pod was written
+  is announced and a kubelet restart re-announces nothing; a non-zero exit or a signal is a Warning `Failed` with the
+  exit and output tail (a clean one stays `Stopped`); down at first sight while the API says running is reported.
 - **feat:** The node half of volume expansion (#42): a claim the control plane grew (`NodeResizePending` /
   `FileSystemResizePending`, PV past the claim's capacity) has its filesystem grown by `NodeExpandVolume` on the
   published path, then its status finished as upstream's kubelet does (new capacity, `Resizing` and

@@ -315,6 +315,66 @@ pub fn status_current(existing: &Value, want: &Value) -> bool {
         && start_same
 }
 
+/// What a node service's change is, as an Event on its mirror pod (#50):
+/// `(type, reason, message)`, or `None` when nothing changed.
+///
+/// `last` is what this kubelet saw on its previous pass (`None` the first
+/// time), `existing` the mirror pod as the API has it, `started` the service's
+/// start time (from its age). **First sight is judged against the API**, not
+/// skipped: a service whose mirror pod already shows this run (its start time
+/// and restart count) is not new, so a kubelet restart announces nothing, but
+/// one started since the pod was last written is `Started`, with when.
+pub fn transition(
+    last: Option<(bool, u32)>,
+    a: &Asset,
+    existing: Option<&Value>,
+    started: &str,
+) -> Option<(&'static str, &'static str, String)> {
+    let exit = a.last_exit.as_ref().map(|e| format!(": {}", e.summary())).unwrap_or_default();
+    let failed = a.last_exit.as_ref().is_some_and(|e| e.code.is_some_and(|c| c != 0) || e.signal.is_some());
+    let ended = || {
+        if failed {
+            ("Warning", "Failed", format!("the service exited{exit}"))
+        } else {
+            ("Warning", "Stopped", format!("the service is no longer running{exit}"))
+        }
+    };
+    let up = || ("Normal", "Started", format!("the service is running (started {started})"));
+    match last {
+        Some((was_running, was_restarts)) => {
+            if a.restarts > was_restarts {
+                Some(("Warning", "BackOff", format!(
+                    "restarted {} time(s); PID 1 has restarted it {} times{exit}",
+                    a.restarts - was_restarts,
+                    a.restarts
+                )))
+            } else if was_running && !a.running {
+                Some(ended())
+            } else if !was_running && a.running {
+                Some(up())
+            } else {
+                None
+            }
+        }
+        None => {
+            let cs = existing.map(|p| &p["status"]["containerStatuses"][0]);
+            let said_running = cs.is_some_and(|c| c["state"]["running"].is_object());
+            if a.running {
+                let same_run = cs.is_some_and(|c| {
+                    said_running
+                        && c["restartCount"].as_u64() == Some(u64::from(a.restarts))
+                        && seconds_apart(&c["state"]["running"]["startedAt"], &json!(started)).is_some_and(|d| d <= 5)
+                });
+                (!same_run).then(up)
+            } else if said_running {
+                Some(ended())
+            } else {
+                None
+            }
+        }
+    }
+}
+
 /// The reason a mirror pod carries when its asset is not in PID 1's table.
 pub const NOT_STARTED: &str = "NotStarted";
 
@@ -554,6 +614,47 @@ mod tests {
         assert!(!status_current(&before, &mirror_pod(&again, "n1", "u", "2026-10-08T00:00:00Z")));
         assert!(status_current(&before, &mirror_pod(&a[0], "n1", "u", "2026-10-08T00:00:01Z")));
         assert_ne!(table_key(&a[..1]), table_key(&[again]));
+    }
+
+    /// #50: a node service's lifecycle as Events. First sight is judged
+    /// against the API's mirror pod: the same run is not re-announced after a
+    /// kubelet restart, a new one is `Started` with when; a non-zero exit is
+    /// `Failed` with its tail, a clean one `Stopped`; restarts are `BackOff`.
+    #[test]
+    fn a_services_changes_are_events_and_a_kubelet_restart_announces_nothing() {
+        let a = Asset { name: "fastetcd".into(), running: true, restarts: 2, age_secs: 60, ..Default::default() };
+        let t0 = "2026-10-08T10:00:00Z";
+        let pod = mirror_pod(&a, "n1", "u", t0);
+
+        // A kubelet restart: the API already shows this run (±5 s): nothing.
+        assert_eq!(transition(None, &a, Some(&pod), "2026-10-08T10:00:03Z"), None);
+        // No mirror yet, or the API shows an earlier run: Started, with when.
+        let (t, why, m) = transition(None, &a, None, t0).unwrap();
+        assert_eq!((t, why), ("Normal", "Started"));
+        assert!(m.contains(t0), "{m}");
+        assert!(transition(None, &a, Some(&pod), "2026-10-08T11:00:00Z").is_some(), "a later start");
+        let restarted = Asset { restarts: 3, ..a.clone() };
+        assert!(transition(None, &restarted, Some(&pod), t0).is_some(), "another restart count");
+
+        // Down, while the API still says running: it ended.
+        let dead = Asset {
+            running: false,
+            last_exit: Some(LastExit { code: Some(1), text: "exited 1".into(), output: vec!["Error: DB corrupted".into()], ..Default::default() }),
+            ..a.clone()
+        };
+        let (t, why, m) = transition(None, &dead, Some(&pod), t0).unwrap();
+        assert_eq!((t, why), ("Warning", "Failed"));
+        assert!(m.contains("exited 1") && m.contains("DB corrupted"), "{m}");
+        // Already shown as down: nothing.
+        assert_eq!(transition(None, &dead, Some(&mirror_pod(&dead, "n1", "u", t0)), t0), None);
+
+        // Seen before: the edges.
+        assert_eq!(transition(Some((true, 2)), &dead, None, t0).unwrap().1, "Failed");
+        let clean = Asset { running: false, last_exit: Some(LastExit { code: Some(0), text: "exited 0".into(), ..Default::default() }), ..a.clone() };
+        assert_eq!(transition(Some((true, 2)), &clean, None, t0).unwrap().1, "Stopped");
+        assert_eq!(transition(Some((true, 2)), &restarted, None, t0).unwrap().1, "BackOff");
+        assert_eq!(transition(Some((false, 2)), &a, None, t0).unwrap().1, "Started");
+        assert_eq!(transition(Some((true, 2)), &a, None, t0), None, "no change, no event");
     }
 
     /// Upstream's cap on `message`: the newest lines, at most 80 and 4 KiB.
