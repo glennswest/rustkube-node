@@ -57,6 +57,16 @@ by #51.
 
 ## Work plan
 
+### In progress: #77, the client certificate reloaded when stormcert renews it
+
+2026-10-08. The apiserver client (one `reqwest::Client`, cloned into every module) takes the client pair once.
+Rather than rebuild it everywhere: a rustls `ClientConfig` (CA roots + a `ResolvesClientCert` whose pair can be
+swapped) via `use_preconfigured_tls`; every clone's next handshake presents the current pair. The pair's directory
+is watched (+ hourly); a new pair that does not parse or whose key does not match is refused, the old one kept.
+Only with a CA and verification on (stormcos); insecure / no-CA keep the static identity, said in the log.
+1. [ ] client.rs `ReloadingClientCert` + `build_authed_client_reloadable`; KubeletConfig cert/key paths; reload
+       task; tests (rcgen pairs: swap, unchanged, mismatched key refused); docs, CHANGELOG; sc-build.
+
 ### Waiting on stormcentral#536 (builds): #96, a node service's mirror pod is Ready only while it answers
 
 2026-10-08. Each service golden's stormd config declares its liveness (`[process.liveness] type = "http"`, `url =
