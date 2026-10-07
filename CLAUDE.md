@@ -95,7 +95,7 @@ auth, inotify-watchable, survives a kubelet restart.
        Done: dcdc68c (pods), 728c185 (VMs: kind vm, withdraw by id); stormcos#391 filed (cadvisor mounts host /run);
        cadvisor#3/#15 told. sc-build refused (stormcentral#544); #84 proposed after it. Then golden, live check, close.
 
-### Waiting on stormcentral#544 (builds): #70 (P2), Events on the claim while its blank mints, and when a mint or clone fails
+### Done: #70 (P2), Events on the claim while its blank mints, and when a mint or clone fails
 
 2026-10-08. Done before: a blank not `ready` is a wait (c78baf0, #63), the mint is background and bounded by
 `MINT_TIMEOUT` and found again by name (db9b783, #99); the pod gets FailedMount. Left: Events on the **PVC**.
@@ -105,7 +105,7 @@ auth, inotify-watchable, survives a kubelet restart.
 2. [ ] Tests (fake apiserver + stormblock: the claim's Events), README, CHANGELOG; sc-build (stormcentral#544); close.
        Done: ad70ee9 (1 test). sc-build refused (409 build VMs are off, stormcentral#544); #70 proposed after it.
 
-### Waiting on stormcentral#544 (builds): #79 (P2), an image the node's registry has no golden of: ask the cluster, else a pull failure
+### Done: #79 (P2), an image the node's registry has no golden of: ask the cluster, else a pull failure
 
 2026-10-08. The kubelet sent `POST /v1/clones {golden, remote_image}`; sbregistry dropped `remote_image` (f9bcfdd), so
 an unknown image 404'd. Since #104 (0241211) a pull is `GET /v1/goldens/{image}` and a miss is ErrImagePull with
