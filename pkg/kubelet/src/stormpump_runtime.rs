@@ -1228,8 +1228,8 @@ impl RuntimeService for StormpumpRuntime {
             id: id.clone(),
             sandbox_id: sandbox_id.to_string(),
             name: config.name.clone(),
-            namespace,
-            pod,
+            namespace: namespace.clone(),
+            pod: pod.clone(),
             mount_sources: config
                 .mounts
                 .iter()
