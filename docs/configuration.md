@@ -93,8 +93,8 @@ incomplete (#13). It does not activate the stormvm VMI reconciler.
 `--no-cni` removes the kubelet's invoker. It does not rewrite Pod hostNetwork,
 change CRI runtime configuration or force stormpump to use the host namespace.
 A non-hostNetwork stormpump Pod can therefore get an isolated namespace with
-no plugin wiring. Use `spec.hostNetwork` when that is the intended workload
-contract; do not rely on the CLI help's host-network shorthand (#3).
+no plugin wiring: loopback only, no address. The help text says so since #3; use
+`spec.hostNetwork` when host networking is the intended workload contract.
 
 ### Credential precedence and failure behavior
 

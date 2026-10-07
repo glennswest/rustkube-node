@@ -66,7 +66,7 @@ mounts the host's /etc/cni/net.d and /opt/cni/bin at the kubelet's defaults (bui
 (filter.rs:65, no toleration helps), so a kubelet that posts Ready=False without a CNI config would keep Cilium's
 own agent off the node: never Ready. And rustkube's node controller removes `not-ready` taints while the Lease is
 healthy. stormcos registers no `node.cilium.io/agent-not-ready` taint. Options posted on #3.
-1. [ ] Test: run_pod_sandbox for a host-network pod with a CNI but no config succeeds with no address; a pod-network
+1. [x] Test: run_pod_sandbox for a host-network pod with a CNI but no config succeeds with no address; a pod-network
        one is NetworkNotConfigured. `--no-cni` help: pods get an isolated namespace with loopback only (#54 audit).
 2. [ ] Question on #3, `stormcentral wait-owner`. Live checks (pod CIDR address, coredns leaves Pending, endpoint
        released, agent stopped → sandbox fails) wait on a test machine (stormcos#337).

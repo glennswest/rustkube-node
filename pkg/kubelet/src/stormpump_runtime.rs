@@ -2093,6 +2093,37 @@ mod tests {
         assert_eq!(spec.profile, Profile::Routed);
     }
 
+    /// #3 item 5: a host-network pod needs no CNI at all, which is what keeps the
+    /// control plane and the CNI's own agent up while the pod network is broken.
+    /// The same node's pod-network pod waits for the config instead of starting
+    /// without an address.
+    #[tokio::test]
+    async fn a_host_network_pod_needs_no_cni_and_a_pod_network_one_waits_for_it() {
+        let dir = std::env::temp_dir().join(format!("sp-hostnet-{}", std::process::id()));
+        let conf = dir.join("net.d");
+        std::fs::create_dir_all(&conf).unwrap();
+        // `probe` asks only that the socket's path exists; neither path below
+        // reaches the ring.
+        let socket = dir.join("stormpump.sock");
+        std::fs::write(&socket, b"").unwrap();
+        let r = StormpumpRuntime::new(socket.to_str().unwrap())
+            .with_cni(Some(cni::CniInvoker::new(&conf, vec![dir.join("bin")])));
+
+        let host = PodSandboxConfig { name: "cilium".into(), host_network: true, ..Default::default() };
+        let id = r.run_pod_sandbox(&host).await.expect("no CNI config is no reason to refuse the host network");
+        let st = r.pod_sandbox_status(&id).await.unwrap();
+        assert!(st.netns_path.is_none() && st.ip.is_empty(), "no namespace, no CNI address");
+        assert_eq!(st.made, Some(crate::cri::SandboxSteps::default()), "no acquire, no ADD");
+
+        let pod = PodSandboxConfig { name: "coredns".into(), ..Default::default() };
+        match r.run_pod_sandbox(&pod).await {
+            Err(CriError::NetworkNotConfigured(m)) => assert!(m.contains("no CNI network configured"), "{m}"),
+            other => panic!("a pod-network pod must wait for the config, got {other:?}"),
+        }
+        assert_eq!(r.sandboxes.lock().await.len(), 1, "nothing made for the waiting pod");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn the_sandbox_decides_the_namespaces() {
         // A container asking for hostPID in a sandbox not built for it is the

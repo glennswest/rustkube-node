@@ -87,7 +87,9 @@ struct Cli {
     #[arg(long, env = "CNI_BIN_DIR", default_value = "/opt/cni/bin")]
     cni_bin_dir: String,
 
-    /// Disable CNI networking (pods use host networking). For dev only.
+    /// Run no CNI plugin (dev only). Pods do not get host networking: a
+    /// pod that is not hostNetwork still gets its own network namespace, with
+    /// loopback only and no address.
     #[arg(long, default_value_t = false)]
     no_cni: bool,
 
@@ -278,7 +280,7 @@ async fn main() -> anyhow::Result<()> {
     // a healthy Cilium sat beside it. `CniInvoker` reloads its config on every
     // call precisely so this decision does not have to be final.
     let cni_invoker = if cli.no_cni {
-        tracing::warn!("CNI disabled (--no-cni) — pods will use host networking");
+        tracing::warn!("CNI disabled (--no-cni) — pods get an isolated namespace with loopback only and no address");
         None
     } else if runtime_owns_networking && !cni_configured {
         tracing::info!(

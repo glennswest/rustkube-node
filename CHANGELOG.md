@@ -2,6 +2,10 @@
 
 ## 2026-10-08
 
+- **docs:** `--no-cni`'s help no longer says pods use host networking (#3): a pod that is not hostNetwork still
+  gets an isolated namespace, with loopback only and no address. The startup warning says the same.
+- **test:** A host-network pod's sandbox is made with a CNI configured and no config present (no namespace, no
+  ADD), and a pod-network pod on the same node waits with `NetworkNotConfigured`, making nothing (#3, item 5).
 - **feat:** Start timing takes `sandbox` apart (#139): `sandbox/acquire` (stormpump `SandboxAcquire`),
   `sandbox/cni` (the CNI ADD with the plugin's exec), `sandbox/status` (the address read) and `sandbox/other`
   (the rest), in `storm.io/start-timing`, the Event, the log line and
