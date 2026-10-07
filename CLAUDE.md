@@ -57,6 +57,17 @@ by #51.
 
 ## Work plan
 
+### In progress: #85, a VMI placed with spec.nodeName is never started
+
+2026-10-07. Found: vm_loop lists VMIs with `fieldSelector=status.nodeName=<node>` and filters `want` on
+status.nodeName, so a hand-placed VMI (spec.nodeName only) never reaches `assigned_to`. rustkube's scheduler
+(`virtualmachine.rs`) places by status.nodeName, else spec.nodeName, and skips a VMI that has either.
+1. [ ] One rule (`assigned_to`, rustkube's): status.nodeName when set, else spec.nodeName.
+2. [ ] vm_loop and `list_for_node`/`watch_for_node`: a second list (and watch) by `spec.nodeName`, merged by
+       uid, narrowed by `assigned_to`.
+3. [ ] A hand-placed VMI taken here gets `status.nodeName` written (status merge patch, uid precondition).
+4. [ ] Tests, docs, CHANGELOG; sc-build; close.
+
 ### Waiting on stormcentral#536 (builds): #77, the client certificate reloaded when stormcert renews it
 
 2026-10-08. The apiserver client (one `reqwest::Client`, cloned into every module) takes the client pair once.
