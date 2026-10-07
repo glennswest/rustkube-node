@@ -57,14 +57,15 @@ by #51.
 
 ## Work plan
 
-### In progress: #81, pod mount propagation onto stormpump's `Mount.propagation`
+### Done: #81, pod mount propagation onto stormpump's `Mount.propagation`
 
 2026-10-08. Unblocked: stormvm#65 closed (stormvm main builds against stormpump main f466116, stormcast bba68c9).
 The lock pins stormpump 30a76d3, stormvm dc1b7ea, stormcast 801f822; all three move together.
 1. [x] Lock: `cargo update -p stormpump -p stormvm-node -p stormcast` on dev (CARGO_NET_GIT_FETCH_WITH_CLI), diff
        applied here; fix what the newer stormvm/stormpump APIs break.
-2. [ ] `spec_for`: `propagation` from `cri::MountPropagation`; test; docs (csi.md, README), CHANGELOG; sc-build;
-       golden; close. Then #52's step 6 is done (its end-to-end stays).
+2. [x] `spec_for` maps it (599a86e; lock as cargo resolved it f4de851; tests 4545e23, which also covers #164's
+       byte-sized emptyDisk). sc-build 4545e23: 364 kubelet unit pass. Golden golden-rustkube-node-a97563b0a5c7
+       (stormcos#366). #81 closed, #164 shipped. #52's step 6 is done; its end-to-end with a real driver stays.
 
 ### Waiting on stormpump#103: #56 (P1), exec, attach and portForward on :10250
 
@@ -1132,7 +1133,7 @@ Steps:
        (when the CSIDriver has `attachRequired`), then NodeStage and NodePublish, and the published directory is bound in.
        Write `vol_data.json` beside the mount so teardown survives a kubelet restart.
 5. [x] Unmount: NodeUnpublish when the pod goes, NodeUnstage when it is the last pod on the node.
-6. [ ] Pass `mountPropagation` through to stormpump once it has the field. Filed as stormpump#35. Until then the mountinfo check keeps pods waiting instead of giving them an empty directory.
+6. [x] Pass `mountPropagation` through to stormpump (#81, 599a86e). Was stormpump#35. Until then the mountinfo check keeps pods waiting instead of giving them an empty directory.
 7. [x] Tests: a mock driver and registrar on a real Unix socket, the full round trip.
 8. [x] Docs (`docs/csi.md`), CHANGELOG.
 9. [ ] End to end with csi-driver-host-path: blocked on step 6 (stormpump#35).
