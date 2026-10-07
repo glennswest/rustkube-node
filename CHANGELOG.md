@@ -2,6 +2,14 @@
 
 ## 2026-10-08
 
+- **feat:** Native sidecars (#111): an init container with `restartPolicy: Always` is started in its slot and the
+  next init goes once it has started (running, startupProbe passed), with no init deadline; it runs for the pod's
+  life, probed and restarted (Always, whatever the pod's policy; an early exit is a restart with back-off, never a
+  failed pod), and is reported in `initContainerStatuses` with `started`, `ready`, `restartCount` (and a `waiting`
+  state). It counts in `Initialized` once started and in `ContainersReady`/`Ready`, but not in the phase: a
+  Never/OnFailure pod finishes with its apps and its sidecars are then stopped, last declared first. Deletion
+  stops the apps first, then the sidecars in reverse order. Before, a sidecar blocked the start until the 120 s
+  init deadline killed it.
 - **fix:** A container's stop grace reaches the engine (#174). `RingClient::stop` put it in `inline_a`, in seconds;
   stormpump's STOP reads `inline_b`, in milliseconds (0 = its 30 s default), so every stop waited 30 s before the
   SIGKILL whatever `terminationGracePeriodSeconds` said (seen in stormpump's medium suite: a 5 s grace killed at

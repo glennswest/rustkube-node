@@ -73,7 +73,7 @@ pub struct PodState {
 /// same. An app container is asked whether it is ready and how often it has
 /// restarted; an init container runs once, and what is wanted is whether it
 /// finished, with what code, and when.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct InitContainerStatusReport {
     pub name: String,
     pub container_id: String,
@@ -88,6 +88,15 @@ pub struct InitContainerStatusReport {
     /// Epoch nanoseconds, as the runtime reports them. Zero when unknown.
     pub started_at: i64,
     pub finished_at: i64,
+    /// A restartable init container (`restartPolicy: Always`, a native
+    /// sidecar, #111): it runs for the pod's life rather than to completion.
+    pub restartable: bool,
+    /// A sidecar has started: running, and its startupProbe passed if it has
+    /// one. What lets the next init container go.
+    pub started: bool,
+    /// A sidecar's readiness, which counts toward the pod's.
+    pub ready: bool,
+    pub restart_count: u32,
 }
 
 impl InitContainerStatusReport {
@@ -95,6 +104,30 @@ impl InitContainerStatusReport {
     pub fn succeeded(&self) -> bool {
         self.state == "terminated" && self.exit_code == 0
     }
+
+    /// Has its init step been done: finished (an ordinary init) or started
+    /// (a sidecar)?
+    pub fn initialized(&self) -> bool {
+        self.succeeded() || (self.restartable && self.started)
+    }
+}
+
+/// Is this init container a native sidecar (#111)?
+pub fn is_restartable_init(spec: &Value) -> bool {
+    spec["restartPolicy"].as_str() == Some("Always")
+}
+
+/// The pod's sidecars' names, in declaration order.
+fn sidecar_names(pod: &Value) -> Vec<String> {
+    pod["spec"]["initContainers"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|c| is_restartable_init(c))
+                .filter_map(|c| c["name"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// What [`PodManager::release_claim_volume`] did.
@@ -2908,7 +2941,20 @@ impl PodManager {
         for spec in &inits {
             let cname = spec["name"].as_str().unwrap_or("init");
             if out.iter().any(|r| r.name==cname && r.succeeded()) {continue;}
+            // A native sidecar (#111) is looked at on every pass, started or
+            // not: one that died while a later init runs is restarted here.
+            let restartable = is_restartable_init(spec);
             let existing=self.pods.read().await.get(uid).and_then(|p|p.container_ids.get(cname).cloned());
+            if restartable && existing.is_none() {
+                let key = crate::crashloop::CrashLoopBackoff::key(uid, cname);
+                if let Some(left) = self.backoff.wait(&key) {
+                    self.due_in(uid, left);
+                    return Err(CriError::Pending(format!(
+                        "sidecar {cname}: back-off {}s before restarting it",
+                        left.as_secs()
+                    )));
+                }
+            }
             let image = spec["image"].as_str().unwrap_or("");
             info!("Init container {ns}/{name}/{cname}: ensuring image {image}");
             let image_ref = self.startup_image(pod,image, spec).await?;
@@ -2929,6 +2975,10 @@ impl PodManager {
             if let Some(state)=self.pods.write().await.get_mut(uid) {state.started.insert(cname.into(),Instant::now());}
             cid
             };
+            if restartable {
+                self.sidecar_step(pod, uid, sandbox_id, spec, &cid, &image_ref, pod_ip, out).await?;
+                continue;
+            }
             info!("Init container {ns}/{name}/{cname} started, waiting for completion");
 
             // Poll until the init container exits (bounded).
@@ -2955,6 +3005,7 @@ impl PodManager {
                                 image_ref: image_ref.clone(),
                                 started_at: status.started_at,
                                 finished_at: status.finished_at,
+                                ..Default::default()
                             });
                             let _ = self.runtime.remove_container(&cid).await;
                             return Err(CriError::Runtime(format!(
@@ -2979,6 +3030,7 @@ impl PodManager {
                             image_ref: image_ref.clone(),
                             started_at: status.started_at,
                             finished_at: status.finished_at,
+                            ..Default::default()
                         });
                         if let Some(state)=self.pods.write().await.get_mut(uid) {state.init_statuses=out.clone();}
                         let _ = self.runtime.remove_container(&cid).await;
@@ -3000,6 +3052,7 @@ impl PodManager {
                                 image_ref: image_ref.clone(),
                                 started_at: status.started_at,
                                 finished_at: 0,
+                                ..Default::default()
                             });
                             let _ = self.runtime.stop_container(&cid, 5).await;
                             let _ = self.runtime.remove_container(&cid).await;
@@ -3019,6 +3072,123 @@ impl PodManager {
             }
         }
         Ok(())
+    }
+
+    /// One pass over a native sidecar (#111): started and kept, the next init
+    /// container allowed once it has *started* (running, and its startupProbe
+    /// passed if it has one). No completion and no deadline: it runs for the
+    /// pod's life. An exit before it started is a restart with back-off,
+    /// never a failed pod, because its restartPolicy is Always whatever the
+    /// pod's is.
+    #[allow(clippy::too_many_arguments)]
+    async fn sidecar_step(
+        &self,
+        pod: &Value,
+        uid: &str,
+        sandbox_id: &str,
+        spec: &Value,
+        cid: &str,
+        image_ref: &str,
+        pod_ip: Option<&str>,
+        out: &mut Vec<InitContainerStatusReport>,
+    ) -> Result<(), CriError> {
+        let cname = spec["name"].as_str().unwrap_or("init");
+        let (ns, name) = (
+            pod["metadata"]["namespace"].as_str().unwrap_or("default"),
+            pod["metadata"]["name"].as_str().unwrap_or(""),
+        );
+        let restart_count = self.pods.read().await.get(uid)
+            .and_then(|p| p.restart_counts.get(cname).copied()).unwrap_or(0);
+        let mut report = InitContainerStatusReport {
+            name: cname.to_string(),
+            container_id: cid.to_string(),
+            image: spec["image"].as_str().unwrap_or("").to_string(),
+            image_ref: image_ref.to_string(),
+            restartable: true,
+            restart_count,
+            ..Default::default()
+        };
+        let status = self.runtime.container_status(cid).await?;
+        report.started_at = status.started_at;
+        match status.state {
+            ContainerState::Exited => {
+                let _ = self.runtime.remove_container(cid).await;
+                let restarts = {
+                    let mut pods = self.pods.write().await;
+                    match pods.get_mut(uid) {
+                        Some(st) => {
+                            st.container_ids.remove(cname);
+                            st.started.remove(cname);
+                            st.startup_passed.remove(cname);
+                            let c = st.restart_counts.entry(cname.to_string()).or_insert(0);
+                            *c += 1;
+                            *c
+                        }
+                        None => restart_count + 1,
+                    }
+                };
+                self.restarted_backoff(uid, &crate::crashloop::CrashLoopBackoff::key(uid, cname));
+                warn!("Sidecar {ns}/{name}/{cname} exited with code {}; restarting it", status.exit_code);
+                report.state = "waiting".into();
+                report.reason = "CrashLoopBackOff".into();
+                report.exit_code = status.exit_code;
+                report.message = format!("exited with code {}; restarting", status.exit_code);
+                report.restart_count = restarts;
+                self.record_init(uid, out, report).await;
+                Err(CriError::Pending(format!(
+                    "sidecar {cname} exited with code {}; restarting it",
+                    status.exit_code
+                )))
+            }
+            ContainerState::Running => {
+                let startup = &spec["startupProbe"];
+                let passed = self.pods.read().await.get(uid)
+                    .is_some_and(|p| p.startup_passed.get(cname).copied().unwrap_or(false));
+                if !startup.is_null() && !passed {
+                    let netns = self.runtime.pod_sandbox_status(sandbox_id).await.ok().and_then(|s| s.netns_path);
+                    let result = run_probe(startup, spec, cid, pod_ip.unwrap_or(""), netns.as_deref(), &self.runtime).await;
+                    if !matches!(result, ProbeResult::Success) {
+                        report.state = "running".into();
+                        self.record_init(uid, out, report).await;
+                        let period = startup["periodSeconds"].as_u64().unwrap_or(10).max(1);
+                        self.due_in(uid, std::time::Duration::from_secs(period));
+                        return Err(CriError::Pending(format!("sidecar {cname}: waiting for its startupProbe")));
+                    }
+                    if let Some(st) = self.pods.write().await.get_mut(uid) {
+                        st.startup_passed.insert(cname.to_string(), true);
+                    }
+                }
+                let already = out.iter().any(|r| r.name == cname && r.started);
+                if !already {
+                    info!("Sidecar {ns}/{name}/{cname} started");
+                }
+                report.state = "running".into();
+                report.started = true;
+                // Ready at once without a readinessProbe, as an app container.
+                report.ready = spec["readinessProbe"].is_null()
+                    || out.iter().any(|r| r.name == cname && r.ready);
+                self.record_init(uid, out, report).await;
+                Ok(())
+            }
+            _ => {
+                report.state = "running".into();
+                self.record_init(uid, out, report).await;
+                self.due_in(uid, deadlines::RECHECK);
+                Err(CriError::Pending(format!("sidecar {cname} is starting")))
+            }
+        }
+    }
+
+    /// Put `report` in `out` (replacing the one of its name) and in the pod's
+    /// record, which is what survives later passes.
+    async fn record_init(&self, uid: &str, out: &mut Vec<InitContainerStatusReport>, report: InitContainerStatusReport) {
+        match out.iter_mut().find(|r| r.name == report.name) {
+            Some(r) => *r = report,
+            None => out.push(report),
+        }
+        if let Some(state) = self.pods.write().await.get_mut(uid) {
+            state.init_statuses = out.clone();
+        }
     }
 
     /// Ensure a container image is available per its `imagePullPolicy`:
@@ -3148,7 +3318,7 @@ impl PodManager {
             )
             .await;
         if let Err(e) = init_outcome {
-            if let Some(failed) = init_statuses.iter().find(|s| !s.succeeded()) {
+            if let Some(failed) = init_statuses.iter().find(|s| !s.initialized()) {
                 warn!(
                     "Pod {namespace}/{name}: init container {} {} (exit {})",
                     failed.name, failed.reason, failed.exit_code
@@ -3325,6 +3495,34 @@ impl PodManager {
             });
         }
 
+        // The sidecars started during init keep running with the apps (#111):
+        // their containers, start times, restarts and startup state carry
+        // into the pod's record, and their readiness counts.
+        let mut restart_counts = HashMap::new();
+        let mut startup_passed = HashMap::new();
+        {
+            let pods = self.pods.read().await;
+            if let Some(prev) = pods.get(uid) {
+                for n in sidecar_names(pod) {
+                    if let Some(c) = prev.container_ids.get(&n) {
+                        container_ids.insert(n.clone(), c.clone());
+                    }
+                    if let Some(t) = prev.started.get(&n) {
+                        started_map.insert(n.clone(), *t);
+                    }
+                    if let Some(r) = prev.restart_counts.get(&n) {
+                        restart_counts.insert(n.clone(), *r);
+                    }
+                    if let Some(p) = prev.startup_passed.get(&n) {
+                        startup_passed.insert(n.clone(), *p);
+                    }
+                }
+            }
+        }
+        for r in init_statuses.iter().filter(|r| r.restartable) {
+            ready_map.insert(r.name.clone(), r.ready);
+        }
+
         // Track the pod
         {
             let mut pods = self.pods.write().await;
@@ -3339,10 +3537,10 @@ impl PodManager {
                     phase: "Running".to_string(),
                     pod: pod.clone(),
                     pod_ip: pod_ip.clone(),
-                    restart_counts: HashMap::new(),
+                    restart_counts,
                     ready: ready_map,
                     liveness_failures: HashMap::new(),
-                    startup_passed: HashMap::new(),
+                    startup_passed,
                     started: started_map,
                     terminated: HashMap::new(),
                     init_statuses: init_statuses.clone(),
@@ -3373,11 +3571,11 @@ impl PodManager {
         }
         .ok_or_else(|| CriError::NotFound(uid.to_string()))?;
 
-        let restart_policy = state.pod["spec"]["restartPolicy"]
+        let pod_restart_policy = state.pod["spec"]["restartPolicy"]
             .as_str()
             .unwrap_or("Always")
             .to_string();
-        let container_specs: HashMap<String, Value> = state.pod["spec"]["containers"]
+        let mut container_specs: HashMap<String, Value> = state.pod["spec"]["containers"]
             .as_array()
             .map(|a| {
                 a.iter()
@@ -3390,6 +3588,14 @@ impl PodManager {
                     .collect()
             })
             .unwrap_or_default();
+        // Native sidecars (#111) are probed, restarted and reported like app
+        // containers once the pod is running, with their own policy (Always).
+        let sidecars = sidecar_names(&state.pod);
+        for c in state.pod["spec"]["initContainers"].as_array().into_iter().flatten() {
+            if let Some(n) = c["name"].as_str().filter(|n| sidecars.iter().any(|s| s == n)) {
+                container_specs.insert(n.to_string(), c.clone());
+            }
+        }
         let sandbox_config = build_sandbox_config(&state.pod);
         let pod_ip = state.pod_ip.clone().unwrap_or_default();
         // The pod's network namespace, so http/tcp probes run inside it and can
@@ -3415,6 +3621,12 @@ impl PodManager {
 
         for (name, cid) in container_ids {
             let spec = container_specs.get(&name).cloned().unwrap_or(Value::Null);
+            // A sidecar comes back whatever the pod's policy (#111).
+            let restart_policy = if sidecars.contains(&name) {
+                "Always".to_string()
+            } else {
+                pod_restart_policy.clone()
+            };
             let restart_count = *state.restart_counts.get(&name).unwrap_or(&0);
 
             // Already terminated for good — report and move on.
@@ -3895,11 +4107,43 @@ impl PodManager {
         // cilium-agent DaemonSet pod sat Failed for hours and deleting it was
         // the only way out. A node that strands a recoverable pod has failed
         // at the one thing the kubelet is for.
-        let total = state.container_ids.len();
-        let phase = if restart_policy == "Always" {
+        // Sidecars are reported among the init containers (#111), with what
+        // the loop above found for them.
+        let (side, apps): (Vec<_>, Vec<_>) =
+            container_statuses.into_iter().partition(|cs| sidecars.contains(&cs.name));
+        let container_statuses = apps;
+        for cs in side {
+            let passed = state.pod["spec"]["initContainers"].as_array().into_iter().flatten()
+                .find(|c| c["name"].as_str() == Some(cs.name.as_str()))
+                .is_some_and(|c| c["startupProbe"].is_null())
+                || state.startup_passed.get(&cs.name).copied().unwrap_or(false);
+            if let Some(r) = state.init_statuses.iter_mut().find(|r| r.name == cs.name) {
+                r.container_id = cs.container_id;
+                r.state = cs.state;
+                r.ready = cs.ready;
+                r.restart_count = cs.restart_count;
+                r.exit_code = cs.exit_code;
+                r.reason = cs.reason;
+                r.message = cs.message;
+                r.started = r.state == "running" && passed;
+                if cs.started_at != 0 {
+                    r.started_at = cs.started_at;
+                }
+                r.finished_at = cs.finished_at;
+            }
+        }
+
+        // The phase is the app containers' (#111): a sidecar running on does
+        // not keep a Never/OnFailure pod from finishing.
+        let app_names: Vec<&String> =
+            state.container_ids.keys().filter(|n| !sidecars.contains(*n)).collect();
+        let total = app_names.len();
+        let app_codes: Vec<i32> =
+            app_names.iter().filter_map(|n| state.terminated.get(*n).copied()).collect();
+        let phase = if pod_restart_policy == "Always" {
             "Running"
-        } else if total > 0 && state.terminated.len() == total {
-            if state.terminated.values().all(|&code| code == 0) {
+        } else if total > 0 && app_codes.len() == total {
+            if app_codes.iter().all(|&code| code == 0) {
                 "Succeeded"
             } else {
                 "Failed"
@@ -3909,6 +4153,31 @@ impl PodManager {
         };
         state.phase = phase.to_string();
         let finished = phase != "Running";
+        if finished {
+            // The apps are done: the sidecars are stopped, last declared
+            // first, as upstream does (#111).
+            for n in sidecars.iter().rev() {
+                let Some(cid) = state.container_ids.get(n).cloned() else { continue };
+                if state.terminated.contains_key(n) {
+                    continue;
+                }
+                let grace = state.pod["spec"]["terminationGracePeriodSeconds"].as_i64().unwrap_or(30);
+                match self.runtime.stop_container(&cid, grace).await {
+                    Ok(()) | Err(CriError::NotFound(_)) => {
+                        info!("Sidecar {}/{}/{n} stopped: the pod's containers finished", state.namespace, state.name);
+                        state.terminated.insert(n.clone(), 0);
+                        state.ready.insert(n.clone(), false);
+                        if let Some(r) = state.init_statuses.iter_mut().find(|r| &r.name == n) {
+                            r.state = "terminated".into();
+                            r.reason = "Completed".into();
+                            r.ready = false;
+                            r.started = false;
+                        }
+                    }
+                    Err(e) => warn!("Sidecar {}/{}/{n} did not stop (retried): {e}", state.namespace, state.name),
+                }
+            }
+        }
 
         let update = PodStatusUpdate {
             namespace: state.namespace.clone(),
@@ -4445,7 +4714,18 @@ impl PodManager {
         // must leave enough state to retry rather than forgetting a live Pod.
         let state = self.pods.read().await.get(uid).cloned();
         if let Some(state) = state {
-            for (name, cid) in &state.container_ids {
+            // The app containers first, then the sidecars, last declared
+            // first (#111): a sidecar (a proxy, a log shipper) outlives what
+            // it serves, as upstream orders it.
+            let sidecars = sidecar_names(&state.pod);
+            let mut order: Vec<(&String, &String)> =
+                state.container_ids.iter().filter(|(n, _)| !sidecars.contains(*n)).collect();
+            for n in sidecars.iter().rev() {
+                if let Some((name, cid)) = state.container_ids.get_key_value(n) {
+                    order.push((name, cid));
+                }
+            }
+            for (name, cid) in order {
                 info!("Stopping container {name} ({cid})");
                 stopped(self.runtime.stop_container(cid, 30).await)?;
                 stopped(self.runtime.remove_container(cid).await)?;
@@ -6825,6 +7105,115 @@ pub(crate) mod tests {
         assert_eq!(result.init_container_statuses.len(),1);
         assert_eq!(rt.sandboxes.lock().unwrap().len(),1);
         assert_eq!(mgr.pods.read().await["staged-done"].container_ids.len(),1);
+    }
+
+    /// #111: a pod with two native sidecars around an ordinary init.
+    fn sidecar_pod(uid: &str, restart_policy: &str) -> Value {
+        let mut p = pod(uid, uid, restart_policy, simple_container());
+        p["spec"]["initContainers"] = json!([
+            {"name": "proxy", "image": "busybox:latest", "restartPolicy": "Always"},
+            {"name": "setup", "image": "busybox:latest"},
+            {"name": "logs", "image": "busybox:latest", "restartPolicy": "Always"}
+        ]);
+        p
+    }
+
+    fn serial(cid: &str) -> u32 {
+        cid.rsplit('-').next().unwrap().parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_sidecar_starts_before_the_next_init_and_runs_with_the_app() {
+        let (rt, mgr) = manager();
+        rt.set_exit_on_start("setup", 0);
+        let p = sidecar_pod("uid-sc", "Always");
+        let result = mgr.start_pod(&p).await.unwrap();
+        assert_eq!(result.phase, "Running");
+
+        let init: Vec<_> = result.init_container_statuses.iter()
+            .map(|r| (r.name.as_str(), r.state.as_str(), r.restartable, r.started, r.initialized()))
+            .collect();
+        assert_eq!(init, [
+            ("proxy", "running", true, true, true),
+            ("setup", "terminated", false, false, true),
+            ("logs", "running", true, true, true),
+        ]);
+        assert!(result.init_container_statuses.iter().filter(|r| r.restartable).all(|r| r.ready), "no readinessProbe: ready");
+
+        let ids = mgr.pods.read().await["uid-sc"].container_ids.clone();
+        assert!(ids.contains_key("proxy") && ids.contains_key("logs") && ids.contains_key("app"), "{ids:?}");
+        assert!(!ids.contains_key("setup"), "an ordinary init is removed once done");
+        // Order: proxy, then setup (once proxy started), then logs, then the app.
+        let removed = rt.removed_containers.lock().unwrap().clone();
+        let setup = removed.iter().find(|c| c.contains("-setup-")).expect("setup ran and was removed");
+        assert!(serial(&ids["proxy"]) < serial(setup) && serial(setup) < serial(&ids["logs"]));
+        assert!(serial(&ids["logs"]) < serial(&ids["app"]));
+        assert!(!removed.iter().any(|c| c == &ids["proxy"] || c == &ids["logs"]), "sidecars keep running");
+    }
+
+    #[tokio::test]
+    async fn a_sidecar_that_exits_before_it_started_is_restarted_not_failed() {
+        let (rt, mgr) = manager();
+        rt.set_exit_on_start("proxy", 1);
+        let p = sidecar_pod("uid-sc-crash", "Never");
+        match mgr.start_pod(&p).await {
+            Err(CriError::Pending(m)) => assert!(m.contains("sidecar proxy exited with code 1"), "{m}"),
+            other => panic!("a sidecar crash is a restart, not a failure: {other:?}"),
+        }
+        let state = mgr.pods.read().await["uid-sc-crash"].clone();
+        assert_eq!(state.restart_counts.get("proxy"), Some(&1));
+        assert!(!state.container_ids.contains_key("proxy"), "made again on the next try");
+        let r = &state.init_statuses[0];
+        assert_eq!((r.state.as_str(), r.reason.as_str(), r.restart_count), ("waiting", "CrashLoopBackOff", 1));
+        // Inside its back-off the next try waits rather than recreating it.
+        assert!(matches!(mgr.start_pod(&p).await, Err(CriError::Pending(m)) if m.contains("back-off")));
+    }
+
+    #[tokio::test]
+    async fn a_sidecar_restarts_under_restart_policy_never_and_does_not_hold_the_phase() {
+        let (rt, mgr) = manager();
+        rt.set_exit_on_start("setup", 0);
+        let p = sidecar_pod("uid-sc-never", "Never");
+        mgr.start_pod(&p).await.unwrap();
+        let before = mgr.pods.read().await["uid-sc-never"].container_ids["proxy"].clone();
+
+        // The sidecar dies: restarted, whatever the pod's policy says.
+        rt.set_container_state(&before, ContainerState::Exited, 2);
+        let u = mgr.check_pod_status("uid-sc-never").await.unwrap();
+        assert_eq!(u.phase, "Running");
+        let after = mgr.pods.read().await["uid-sc-never"].container_ids["proxy"].clone();
+        assert_ne!(before, after, "a new proxy container");
+        assert_eq!(mgr.pods.read().await["uid-sc-never"].restart_counts.get("proxy"), Some(&1));
+        assert!(u.container_statuses.iter().all(|cs| cs.name == "app"), "sidecars are not app containers");
+        assert!(u.init_container_statuses.iter().any(|r| r.name == "proxy" && r.restart_count == 1));
+
+        // The app finishes: the pod is Succeeded with its sidecars still
+        // running, and they are stopped (last declared first).
+        let app = mgr.pods.read().await["uid-sc-never"].container_ids["app"].clone();
+        rt.set_container_state(&app, ContainerState::Exited, 0);
+        let u = mgr.check_pod_status("uid-sc-never").await.unwrap();
+        assert_eq!(u.phase, "Succeeded");
+        for n in ["proxy", "logs"] {
+            let r = u.init_container_statuses.iter().find(|r| r.name == n).unwrap();
+            assert_eq!((r.state.as_str(), r.ready), ("terminated", false), "{n}");
+        }
+        let containers = rt.containers.lock().unwrap();
+        let ids = mgr.pods.read().await["uid-sc-never"].container_ids.clone();
+        assert!(matches!(containers[&ids["proxy"]].state, ContainerState::Exited));
+        assert!(matches!(containers[&ids["logs"]].state, ContainerState::Exited));
+    }
+
+    #[tokio::test]
+    async fn a_pod_is_torn_down_apps_first_then_sidecars_last_declared_first() {
+        let (rt, mgr) = manager();
+        rt.set_exit_on_start("setup", 0);
+        let p = sidecar_pod("uid-sc-down", "Always");
+        mgr.start_pod(&p).await.unwrap();
+        let ids = mgr.pods.read().await["uid-sc-down"].container_ids.clone();
+        rt.removed_containers.lock().unwrap().clear();
+        mgr.stop_pod("uid-sc-down").await.unwrap();
+        let removed = rt.removed_containers.lock().unwrap().clone();
+        assert_eq!(removed, vec![ids["app"].clone(), ids["logs"].clone(), ids["proxy"].clone()]);
     }
 
     #[tokio::test]

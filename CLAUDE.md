@@ -64,13 +64,13 @@ start and is killed. Upstream (KEP-753): a sidecar is started in its init slot, 
 has *started* (running; its startupProbe passed, if it has one), it runs and restarts (Always, whatever the pod's
 policy) for the pod's life, its readiness counts toward Ready, it does not count toward the phase, it is stopped
 after the app containers finish (Never/OnFailure) and torn down after them, in reverse order.
-1. [ ] `InitContainerStatusReport` + restartable/started/ready/restart_count, `initialized()`; status JSON (ready,
+1. [x] `InitContainerStatusReport` + restartable/started/ready/restart_count, `initialized()`; status JSON (ready,
        started, restartCount, waiting); `pod_initialized` and ContainersReady/Ready count sidecars.
-2. [ ] `run_init_containers`: a sidecar is started and kept (no removal, no deadline); exit before started =
+2. [x] `run_init_containers`: a sidecar is started and kept (no removal, no deadline); exit before started =
        restart with backoff (Pending), never Failed; startupProbe run from the init path.
-3. [ ] `start_pod` carries sidecar records into the tracked state; `check_pod_status` probes/restarts sidecars
+3. [x] `start_pod` carries sidecar records into the tracked state; `check_pod_status` probes/restarts sidecars
        (Always), reports them as init statuses, leaves them out of the phase, stops them once the apps finished.
-4. [ ] `stop_pod`: apps first, then sidecars in reverse declaration order.
+4. [x] `stop_pod`: apps first, then sidecars in reverse declaration order.
 5. [ ] Tests (sidecar → init → app order; sidecar stays and restarts under restartPolicy Never; phase ignores it
        and it is stopped after; teardown order; readiness), docs (README, status.md), CHANGELOG; SC_BUILD_VM sc-build.
 

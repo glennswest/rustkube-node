@@ -36,7 +36,7 @@ or local CNI subprocesses. Those gaps are recorded in #99.
   accepted write → assignment → sandbox → process start → Ready, separating
   cold image/template work from warm startup. No subsecond claim is established.
 - #103/#98/#86: image-root resolution, image config and version selection.
-- #111: restartable init sidecars. Main waits for every init to exit.
+- #111: restartable init sidecars: implemented (started in their slot, kept, restarted, stopped after the apps).
 - #112: persist/reconstruct backoff across kubelet restarts.
 
 The existing metrics measure first observation → start and known-Pod sync

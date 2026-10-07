@@ -150,6 +150,15 @@ is refused, naming the image, instead of exec'ing the flag. emptyDir volumes are
 non-root uid can write them. Not yet: an image's declared `Volumes` (not recorded by the registry, #58) and
 `fsGroup` (a claim's filesystem is root's).
 
+**Native sidecars** (`initContainers[].restartPolicy: Always`, #111) run as upstream runs them: started in their
+init slot, the next init container goes once the sidecar has *started* (running, and its `startupProbe` passed if
+it has one), not when it exits, and there is no init deadline for it. It then runs for the pod's life: probed like
+an app container, restarted whatever the pod's `restartPolicy` (an exit before it started is a restart with
+back-off, never a failed pod), reported in `initContainerStatuses` with `started`, `ready` and `restartCount`, and
+counted in `Initialized` (once started) and `ContainersReady`/`Ready`. It does not count toward the phase: a
+`Never`/`OnFailure` pod finishes with its app containers, and its sidecars are stopped then, last declared first.
+On deletion the app containers stop first, then the sidecars in reverse order.
+
 An overview deck is [docs/presentation.md](docs/presentation.md) (Marp).
 See [configuration and defaults](docs/configuration.md), [ports and APIs](docs/api.md),
 and [build and shipping](docs/BUILD.md). The binaries share upstream names;

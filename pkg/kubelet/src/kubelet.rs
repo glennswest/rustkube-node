@@ -1223,7 +1223,10 @@ impl Kubelet {
             .init_container_statuses
             .iter()
             .map(|cs| {
-                let state = if cs.state == "terminated" {
+                let state = if cs.state == "waiting" {
+                    // A sidecar between restarts (#111).
+                    serde_json::json!({"waiting": {"reason": cs.reason, "message": cs.message}})
+                } else if cs.state == "terminated" {
                     serde_json::json!({"terminated": {
                         "exitCode": cs.exit_code,
                         "reason": cs.reason,
@@ -1237,19 +1240,24 @@ impl Kubelet {
                         "startedAt": nanos_to_rfc3339(cs.started_at)
                     }})
                 };
-                serde_json::json!({
+                let mut s = serde_json::json!({
                     "name": cs.name,
                     "state": state,
-                    // An init container is never "ready" — it is finished or
-                    // it is not. Kubernetes reports ready=true for a
-                    // successfully completed one, which is what lets a reader
-                    // tell it apart from one still going.
-                    "ready": cs.succeeded(),
-                    "restartCount": 0,
+                    // An ordinary init container is never "ready": it is
+                    // finished or it is not. Kubernetes reports ready=true for
+                    // a successfully completed one, which is what lets a reader
+                    // tell it apart from one still going. A sidecar is ready by
+                    // its probe, like an app container (#111).
+                    "ready": if cs.restartable { cs.ready } else { cs.succeeded() },
+                    "restartCount": cs.restart_count,
                     "image": cs.image,
                     "imageID": cs.image_ref,
                     "containerID": format!("containerd://{}", cs.container_id)
-                })
+                });
+                if cs.restartable {
+                    s["started"] = serde_json::json!(cs.started);
+                }
+                s
             })
             .collect();
 
@@ -1285,8 +1293,10 @@ impl Kubelet {
         // started reported Ready=True with no containers — which is how a
         // Failed pod came back looking healthy to everything that reads
         // conditions.
+        // Sidecars' readiness counts too, as upstream's does (#111).
         let all_ready = !update.container_statuses.is_empty()
-            && update.container_statuses.iter().all(|cs| cs.ready);
+            && update.container_statuses.iter().all(|cs| cs.ready)
+            && update.init_container_statuses.iter().filter(|cs| cs.restartable).all(|cs| cs.ready);
         conditions.push(serde_json::json!({
             "type": "ContainersReady",
             "status": if all_ready { "True" } else { "False" }
@@ -1801,7 +1811,8 @@ fn pod_initialized(declared: usize, reports: &[InitContainerStatusReport]) -> bo
     if declared == 0 {
         return true;
     }
-    reports.len() == declared && reports.iter().all(|cs| cs.succeeded())
+    // A sidecar counts once it has started (#111).
+    reports.len() == declared && reports.iter().all(|cs| cs.initialized())
 }
 
 #[cfg(test)]
@@ -1824,7 +1835,19 @@ mod init_condition_tests {
             image_ref: "sha256:x".into(),
             started_at: 1,
             finished_at: 2,
+            ..Default::default()
         }
+    }
+
+    /// #111: a sidecar is initialized once it has started, not once it exits.
+    #[test]
+    fn a_started_sidecar_counts_as_initialized() {
+        let mut sc = report("proxy", 0);
+        sc.state = "running".into();
+        sc.restartable = true;
+        assert!(!pod_initialized(2, &[report("setup", 0), sc.clone()]), "not started yet");
+        sc.started = true;
+        assert!(pod_initialized(2, &[report("setup", 0), sc]));
     }
 
     #[test]
