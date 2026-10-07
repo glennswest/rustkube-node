@@ -2,6 +2,9 @@
 
 ## 2026-10-08
 
+- **feat:** `--max-pods` / `MAX_PODS` (#165, owner's option A on rustkube#205): the node's `capacity.pods` and
+  `allocatable.pods`, fixed at 110 before, are configurable (default 110, upstream's). stormcos sets 250. On
+  pvetest1 a 100-Pod burst waited ~60 s on the 110 the scheduler held the node to.
 - **feat:** A pod mount's `mountPropagation` reaches the engine (#81): `spec_for` maps `cri::MountPropagation`
   onto stormpump's `Mount.propagation` (stormpump#35), so Cilium's HostToContainer mounts are `rslave` and a CSI
   node plugin's Bidirectional `/var/lib/kubelet` is `rshared` (privileged only, as before). Lock: stormpump

@@ -118,6 +118,11 @@ struct Cli {
     #[arg(long, env = "METADATA_MAX_STALENESS", default_value_t = 40)]
     metadata_max_staleness: u64,
 
+    /// Pods this node takes: its capacity and allocatable `pods`, which the
+    /// scheduler holds it to (#165). Upstream's default; stormcos sets 250.
+    #[arg(long, env = "MAX_PODS", default_value_t = kubelet::node_status::DEFAULT_MAX_PODS)]
+    max_pods: u32,
+
     /// Port for the kubelet's inbound HTTP server (/healthz, /metrics, /pods).
     #[arg(long, env = "KUBELET_PORT", default_value_t = 10250)]
     kubelet_port: u16,
@@ -498,6 +503,7 @@ async fn main() -> anyhow::Result<()> {
             Some(std::path::PathBuf::from(&cli.pod_manifest_path))
         },
         kubelet_port: cli.kubelet_port,
+        max_pods: cli.max_pods,
         apiserver_ca,
         bearer_token,
         client_cert,

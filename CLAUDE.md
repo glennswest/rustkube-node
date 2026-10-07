@@ -61,7 +61,7 @@ by #51.
 
 2026-10-08. `node_status.rs` reports a fixed `pods: "110"` in capacity and allocatable. The kubelet reads no
 KubeletConfiguration file and admits Pods against no count of its own, so the flag and the status are all.
-1. [ ] `--max-pods` / `MAX_PODS` (default 110) → `KubeletConfig.max_pods` → `NodeReporter::with_max_pods` →
+1. [x] `--max-pods` / `MAX_PODS` (default 110) → `KubeletConfig.max_pods` → `NodeReporter::with_max_pods` →
        capacity and allocatable `pods`; test; docs (configuration.md, README, status.md), CHANGELOG; sc-build;
        golden; close; tell stormcos it can set 250 (its /24 pod range note stays theirs).
 

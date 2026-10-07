@@ -34,6 +34,7 @@ An em dash means there is no environment binding or the value is unset.
 | `--storage-alert-percent` | `STORAGE_ALERT_PERCENT` | `85`: percent of the data slabs written past which a `SlabFilling` Warning goes on this node's stormblock PVs (#62) |
 | `--pod-workers` | `POD_WORKERS` | 16 per CPU, at least 32, at most 256: Pod/VMI passes (starts, checks, teardowns) run at once (#138) |
 | `--kubelet-port` | `KUBELET_PORT` | `10250`; HTTPS on `0.0.0.0` |
+| `--max-pods` | `MAX_PODS` | `110` (upstream's); the node's `capacity.pods` and `allocatable.pods`, which the scheduler holds it to (#165). stormcos sets 250 (rustkube#205). The kubelet itself admits by no count |
 | `--apiserver-ca` | `APISERVER_CA` | Unset; PEM trust anchor, otherwise kubeconfig CA |
 | `--token-file` | `KUBELET_TOKEN_FILE` | Unset; outbound bearer token file, otherwise kubeconfig token |
 | `--kubeconfig` | `KUBECONFIG` | Unset; explicit file, not automatic `~/.kube/config` discovery |
@@ -52,9 +53,9 @@ file is waited for up to 60 s, with one warning; if it is still absent the kubel
 and path. It never falls back to the kubeconfig's value, anonymous access or a self-signed serving pair
 for a file it was told to use. An unset flag still falls back as described above.
 
-Clap also provides `--help`. No `--max-pods`, `--system-reserved`,
-`--kube-reserved` or `--cgroup-driver` flag exists (#24). Node reporting uses
-110 Pods and a fixed 256 MiB memory reservation; these are not tunable flags.
+Clap also provides `--help`. No `--system-reserved`, `--kube-reserved` or
+`--cgroup-driver` flag exists (#24), and no KubeletConfiguration file is read.
+Node reporting uses a fixed 256 MiB memory reservation.
 
 ### Runtime details
 

@@ -63,6 +63,9 @@ pub fn parse_taints(spec: &str) -> Vec<Value> {
     out
 }
 
+/// Upstream's default `--max-pods`. stormcos sets its own (250, rustkube#205).
+pub const DEFAULT_MAX_PODS: u32 = 110;
+
 /// What a status PUT did, for the one case the caller must tell apart.
 ///
 /// `NodeGone` is a 404 from the `/status` subresource: the Node object this
@@ -83,6 +86,9 @@ pub struct NodeReporter {
     runtime_version: String,
     /// Kubelet server port, reported in daemonEndpoints.kubeletEndpoint.
     kubelet_port: u16,
+    /// Pods this node takes (`--max-pods`, #165): capacity and allocatable
+    /// `pods`, which the scheduler holds a node to.
+    max_pods: u32,
     /// Extra labels applied at registration (`--node-labels`).
     labels: Vec<(String, String)>,
     /// Annotations applied at registration (`--node-annotations`).
@@ -116,6 +122,7 @@ impl NodeReporter {
             pod_cidr,
             runtime_version: "cri-o://unknown".to_string(),
             kubelet_port: 10250,
+            max_pods: DEFAULT_MAX_PODS,
             labels: Vec::new(),
             annotations: Vec::new(),
             taints: Vec::new(),
@@ -142,6 +149,12 @@ impl NodeReporter {
         self.labels = labels;
         self.annotations = annotations;
         self.taints = taints;
+        self
+    }
+
+    /// The node's Pod capacity (#165).
+    pub fn with_max_pods(mut self, max_pods: u32) -> Self {
+        self.max_pods = max_pods;
         self
     }
 
@@ -393,13 +406,13 @@ impl NodeReporter {
             "capacity": {
                 "cpu": cpu_count.to_string(),
                 "memory": format!("{total_mem_ki}Ki"),
-                "pods": "110",
+                "pods": self.max_pods.to_string(),
                 "ephemeral-storage": format!("{eph_cap_ki}Ki")
             },
             "allocatable": {
                 "cpu": cpu_count.to_string(),
                 "memory": format!("{}Ki", total_mem_ki.saturating_sub(256 * 1024)),
-                "pods": "110",
+                "pods": self.max_pods.to_string(),
                 "ephemeral-storage": format!("{eph_alloc_ki}Ki")
             },
             "conditions": merge_owned_conditions(
@@ -709,6 +722,19 @@ fn statvfs_bytes(_path: &str) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #165: capacity and allocatable `pods` are `--max-pods`, 110 unless set.
+    #[test]
+    fn the_node_reports_its_configured_pod_capacity() {
+        let pods = |r: &NodeReporter| {
+            let st = r.build_status(&[]);
+            (st["capacity"]["pods"].clone(), st["allocatable"]["pods"].clone())
+        };
+        let r = NodeReporter::new("http://x", "n1");
+        assert_eq!(pods(&r), (json!("110"), json!("110")));
+        let r = r.with_max_pods(250);
+        assert_eq!(pods(&r), (json!("250"), json!("250")));
+    }
 
     fn types(v: &Value) -> Vec<String> {
         v.as_array()

@@ -33,6 +33,9 @@ pub struct KubeletConfig {
     pub pod_workers: usize,
     /// Port for the kubelet's inbound HTTP server (upstream 10250).
     pub kubelet_port: u16,
+    /// Pods this node takes, reported as capacity and allocatable `pods`
+    /// (`--max-pods`, #165).
+    pub max_pods: u32,
     /// Cluster CA (PEM) to trust for an HTTPS apiserver. None → no custom root.
     pub apiserver_ca: Option<Vec<u8>>,
     /// Bearer token for authenticating to the apiserver (SA/JWT). None → none.
@@ -81,6 +84,7 @@ impl Default for KubeletConfig {
             sync_interval: Duration::from_secs(2),
             pod_workers: crate::workload::default_workers(),
             kubelet_port: 10250,
+            max_pods: crate::node_status::DEFAULT_MAX_PODS,
             apiserver_ca: None,
             bearer_token: None,
             client_cert: None,
@@ -290,6 +294,7 @@ impl Kubelet {
             let pod_cidr = self.config.pod_cidr.clone();
             let rv = runtime_version.clone();
             let port = self.config.kubelet_port;
+            let max_pods = self.config.max_pods;
             let client = self.api_client.clone();
             let labels = self.config.node_labels.clone();
             let annotations = self.config.node_annotations.clone();
@@ -298,6 +303,7 @@ impl Kubelet {
                 let reporter = NodeReporter::with_pod_cidr(&url, &node_name, pod_cidr)
                     .with_runtime_version(rv)
                     .with_kubelet_port(port)
+                    .with_max_pods(max_pods)
                     // Registration only. The heartbeat reporter below is
                     // deliberately built without these: it writes status
                     // through the /status subresource, and re-asserting taints
@@ -350,12 +356,14 @@ impl Kubelet {
         let pod_cidr = self.config.pod_cidr.clone();
         let heartbeat_interval = self.config.heartbeat_interval;
         let kubelet_port = self.config.kubelet_port;
+        let max_pods = self.config.max_pods;
         let hb_client = self.api_client.clone();
         let hb_vms = self.vms.clone();
         tokio::spawn(async move {
             let reporter = NodeReporter::with_pod_cidr(&reporter_url, &node_name, pod_cidr)
                 .with_runtime_version(runtime_version)
                 .with_kubelet_port(kubelet_port)
+                .with_max_pods(max_pods)
                 .with_client(hb_client);
             let mut interval = time::interval(heartbeat_interval);
             loop {

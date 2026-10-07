@@ -85,7 +85,7 @@ Each gap has an owning issue. These are limitations, not supported features.
 | Missing configured credentials fail closed; client certificate reload | [#69](https://github.com/glennswest/rustkube-node/issues/69), [#89](https://github.com/glennswest/rustkube-node/issues/89), [#77](https://github.com/glennswest/rustkube-node/issues/77) |
 | Explicit default-valued apiserver flag overriding kubeconfig | [#113](https://github.com/glennswest/rustkube-node/issues/113) |
 | Destructive engine calls with a separate admin token | [#105](https://github.com/glennswest/rustkube-node/issues/105) |
-| Tunable max-pods/reservations/cgroup-driver | [#24](https://github.com/glennswest/rustkube-node/issues/24) |
+| Tunable reservations/cgroup-driver (max-pods is `--max-pods` since #165) | [#24](https://github.com/glennswest/rustkube-node/issues/24) |
 | Subsecond startup measured on a node; a stormpump exit routed to its own UID; CRI container events instead of the `sync_interval` fallback | [#95](https://github.com/glennswest/rustkube-node/issues/95), [#99](https://github.com/glennswest/rustkube-node/issues/99), [#115](https://github.com/glennswest/rustkube-node/issues/115), [#116](https://github.com/glennswest/rustkube-node/issues/116) |
 | Complete short/medium/long live acceptance and runner image injection | [#61](https://github.com/glennswest/rustkube-node/issues/61), [#64](https://github.com/glennswest/rustkube-node/issues/64), [#97](https://github.com/glennswest/rustkube-node/issues/97), [#102](https://github.com/glennswest/rustkube-node/issues/102) |
 | Legacy bin-only builder as a supported release path | [#51](https://github.com/glennswest/rustkube-node/issues/51) |
