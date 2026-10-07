@@ -57,14 +57,15 @@ by #51.
 
 ## Work plan
 
-### In progress: #70 (P2), Events on the claim while its blank mints, and when a mint or clone fails
+### Waiting on stormcentral#544 (builds): #70 (P2), Events on the claim while its blank mints, and when a mint or clone fails
 
 2026-10-08. Done before: a blank not `ready` is a wait (c78baf0, #63), the mint is background and bounded by
 `MINT_TIMEOUT` and found again by name (db9b783, #99); the pod gets FailedMount. Left: Events on the **PVC**.
-1. [ ] `clone_blank(class, name, claim)`: Normal `Provisioning` (minting / waiting for the blank's format and
+1. [x] `clone_blank(class, name, claim)`: Normal `Provisioning` (minting / waiting for the blank's format and
        seal), Warning `ProvisioningFailed` (a refused mint or clone, the engine's words), Normal
        `ProvisioningSucceeded` (cloned). External-provisioner's reasons; the recorder aggregates repeats.
 2. [ ] Tests (fake apiserver + stormblock: the claim's Events), README, CHANGELOG; sc-build (stormcentral#544); close.
+       Done: ad70ee9 (1 test). sc-build refused (409 build VMs are off, stormcentral#544); #70 proposed after it.
 
 ### Waiting on stormcentral#544 (builds): #79 (P2), an image the node's registry has no golden of: ask the cluster, else a pull failure
 
