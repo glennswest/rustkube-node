@@ -883,7 +883,7 @@ primitive for in-use local volumes (migrate → synced → cut over / abort): fi
 it. Kubelet side then: target waits all disks synced → receiving start on its copies → targetNodeAddress; source
 sends → completed/failed; cut over or abort each disk.
 
-### In progress: #91, a bridged VM's IP from its tap (stormvm_net::snoop_tap)
+### Waiting on stormblock-registry#95 / stormcentral#521: #91, a bridged VM's IP from its tap (stormvm_net::snoop_tap)
 
 stormvm 2be5900 (lock moves 1b0d941 → dc1b7ea, `cargo update -p stormvm-net` on dev with
 `CARGO_NET_GIT_FETCH_WITH_CLI=true`; the lock diff applied here). `snoop_tap(tap, mac, changed)` → `Snooper`
@@ -911,6 +911,9 @@ Steps:
        --locked`: 19 pass. #97 also proposed after stormcentral#376 for its live run.
        2026-10-07: stormcentral#376 closed; vm-waves 18d8dc0653 died on the Dell's apiserver (stormcos#337, down since
        20:55Z, reinstall queued). #91 proposed after stormcos#337.
+       2026-10-08: stormcos#337 closed (C2NR0Q2 on 11.89). Still no live run: test images are built on the retired
+       dev.g8.lo (stormcentral#521) and a fresh node's media import fails (stormblock-registry#95, P0), which the
+       Fedora VMs need. Unit tests pass on a build VM (fb94c9a). #91 proposed after stormblock-registry#95.
        2026-10-06: 11.88 on C2NR0Q2 has the 4 GiB registry (stormcos#122, no more 507). Queued: vm-waves
        18d8dc0653 (#91, #92 half 1), rustkube-node medium fff1f4d9d9 (#64, #59, #62, #67) and short c7e24520ec,
        at 65e3c3c. Read with `stormcentral test show <id>`; close what passes.
