@@ -49,6 +49,16 @@ prost-types = { workspace = true }
 # `csi-<sha256(handle+driver+node)>` and a staging directory is
 # `<sha256(handle)>`. The attacher computes the first too, so both sides must agree.
 sha2 = "0.10"
+# The streaming server (#56). SPDY/3 header blocks are zlib with a preset
+# dictionary, which flate2's Rust backend cannot load; miniz_oxide's core
+# inflater can, by starting its window with the dictionary in it.
+miniz_oxide = "0.8"
+# WebSocket framing for port-forward's SPDY tunnel and the channel protocols.
+# The handshake is answered here (sha1 + base64 for Sec-WebSocket-Accept), so
+# only the framing is taken. All three are already in the lock.
+tokio-tungstenite = { version = "0.29", default-features = false }
+sha1 = "0.10"
+base64 = "0.22"
 tower = { version = "0.5" }
 hyper-util = { version = "0.1" }
 # The console doors themselves — serial and VNC — mounted in this server
