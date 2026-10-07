@@ -77,7 +77,7 @@ never refreshed, so placement is its own pass over every PV of this node's storm
        live on server3, read-only: wwn `naa.…`, no shelf/bay on a blade). 4 tests. Paused for P0 #104; the sc-build of
        b1e91d6 (which carries #104) is running. Resume: read that build, then a live PV check, close.
 
-### Waiting on stormcentral#544 (builds): #84 (P2), each stormpump workload's cgroup → pod/container identity, for cadvisor
+### Waiting on stormcentral#362 (stage golden): #84 (P2), each stormpump workload's cgroup → pod/container identity, for cadvisor
 
 2026-10-08. cadvisor (cadvisor#3, #15) waits on this repo to pick the shape. Found: stormpump does not report a
 workload's cgroup name, but QUERY's info block gives its pid (`stormpump_abi::query::info`) and the kubelet shares the
@@ -94,6 +94,8 @@ auth, inotify-watchable, survives a kubelet restart.
        sc-build (stormcentral#544); close. VMs (cadvisor#15) next: same record, kind vm, from the VM manager.
        Done: dcdc68c (pods), 728c185 (VMs: kind vm, withdraw by id); stormcos#391 filed (cadvisor mounts host /run);
        cadvisor#3/#15 told. sc-build refused (stormcentral#544); #84 proposed after it. Then golden, live check, close.
+       2026-10-08: built at c8256ac (job 61569b65c2), 413 kubelet unit pass incl. the 3 identity tests. Stage golden
+       aborts (stormcentral#362); #84 proposed after it. Live check then: files in /run/rustkube/workloads on a node.
 
 ### Done: #70 (P2), Events on the claim while its blank mints, and when a mint or clone fails
 
