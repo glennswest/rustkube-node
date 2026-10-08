@@ -71,14 +71,15 @@ among them (stormcos#368 will enforce).
        stormcos#402 filed (kubelet SA token + `STORMBLOCK_ADMIN_TOKEN_FILE`, before #368). Stage golden
        golden-rustkube-node-dc81277f6b12 (stormcos#366). Closed. Live check is stormcos#402/#368's audit log.
 
-### In progress: #24 (P3), --system-reserved, --kube-reserved, --cgroup-driver
+### Done: #24 (P3), --system-reserved, --kube-reserved, --cgroup-driver
 
 2026-10-08. Labels/taints done before, max-pods #165. Left: reservations (allocatable was capacity − 256Mi, CPU and
 ephemeral none) and the cgroup driver (the CRI path sent no cgroup_parent). Done in code (63029cc): `Reserved` (cpu,
 memory, ephemeral-storage; pid refused), `allocatable()` (− reserved − 100Mi / 10%); `cgroups.rs` (driver, upstream
 parent names); CriGrpcClient `resolve_cgroup_driver` (RuntimeConfig wins, then the flag, then cgroupfs) and the
-sandbox's cgroup_parent from `PodSandboxConfig.qos_class`. Tests (unit 3, CRI double 1), docs, CHANGELOG; sc-build;
-golden; tell stormcos it can set --system-reserved (its node services are outside Pods); close.
+sandbox's cgroup_parent from `PodSandboxConfig.qos_class`. Tests (unit 3, CRI double 1), docs, CHANGELOG (d1b4e09).
+SC_BUILD_VM sc-build: 433 kubelet unit + CRI round trip pass. Stage golden golden-rustkube-node-1ff1325fb538
+(stormcos#366); stormcos#403 (size --system-reserved). Closed.
 
 ### Done: #32 (P3), the node/CNI networking contract (docs only)
 
