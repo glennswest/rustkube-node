@@ -131,7 +131,9 @@ passes the sandbox network namespace to CNI ADD and invokes DEL when the
 sandbox stops. A Pod that finishes (`restartPolicy` Never or OnFailure, every
 container terminated for good, Succeeded or Failed) has its sandbox stopped in
 that pass, so its address goes back to the CNI at once; its container records,
-status and logs stay until the Pod object is deleted (#137).
+status and logs stay until the Pod object is deleted (#137). What the node owns for networking and what the CNI
+(Cilium via network-operator) owns, and why a node with no gateway is never "the CNI is not up yet", are in
+[node networking](docs/networking.md) (#32).
 A Pod with no CNI configuration yet waits Pending ("network is not ready")
 without a sandbox: the config is checked before one is acquired, and the
 kubelet watches `--cni-conf-dir` (inotify), so the Pods waiting on it are

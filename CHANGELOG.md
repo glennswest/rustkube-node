@@ -2,6 +2,11 @@
 
 ## 2026-10-08
 
+- **docs:** `docs/networking.md`, the node/CNI networking contract (#32): what the node's boot (`ip=dhcp`: address,
+  default route, DNS) and the kubelet (registration, sandboxes, CNI ADD/DEL) own, what network-operator and Cilium own
+  (install, conflist, Pod routes, masquerade, Services, `NetworkUnavailable`), the pre-CNI sequence under #3's
+  decision (Ready at once, host-network Pods start, Pod-network Pods wait on the conflist), and how to tell pre-CNI
+  from broken (a node without a gateway is a DHCP/lab matter, never the CNI). Linked from the README.
 - **feat:** With `--runtime cri` the kubelet follows the runtime's `GetContainerEvents` stream (#116, upstream's
   evented PLEG) instead of looking at every Pod each `sync_interval`: an event wakes the Pod named by its sandbox
   status (else the Pod holding that container id), every Pod looks once whenever the stream opens (what happened
