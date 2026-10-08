@@ -7561,7 +7561,10 @@ pub(crate) mod tests {
         assert!(!ids.contains_key("setup"), "an ordinary init is removed once done");
         // Order: proxy, then setup (once proxy started), then logs, then the app.
         let removed = rt.removed_containers.lock().unwrap().clone();
-        let setup = removed.iter().find(|c| c.contains("-setup-")).expect("setup ran and was removed");
+        // Completed, and kept for its log until the pod stops (#47).
+        let kept = mgr.kept_inits.lock().unwrap()["uid-sc"].clone();
+        let setup = kept.iter().find(|c| c.contains("-setup-")).expect("setup ran and was kept");
+        assert!(!removed.contains(setup), "not removed while the pod runs");
         assert!(serial(&ids["proxy"]) < serial(setup) && serial(setup) < serial(&ids["logs"]));
         assert!(serial(&ids["logs"]) < serial(&ids["app"]));
         assert!(!removed.iter().any(|c| c == &ids["proxy"] || c == &ids["logs"]), "sidecars keep running");
@@ -7626,10 +7629,12 @@ pub(crate) mod tests {
         let p = sidecar_pod("uid-sc-down", "Always");
         mgr.start_pod(&p).await.unwrap();
         let ids = mgr.pods.read().await["uid-sc-down"].container_ids.clone();
+        let setup = mgr.kept_inits.lock().unwrap()["uid-sc-down"][0].clone();
         rt.removed_containers.lock().unwrap().clear();
         mgr.stop_pod("uid-sc-down").await.unwrap();
         let removed = rt.removed_containers.lock().unwrap().clone();
-        assert_eq!(removed, vec![ids["app"].clone(), ids["logs"].clone(), ids["proxy"].clone()]);
+        // Then the completed init kept for its log (#47).
+        assert_eq!(removed, vec![ids["app"].clone(), ids["logs"].clone(), ids["proxy"].clone(), setup]);
     }
 
     #[tokio::test]
@@ -7645,7 +7650,7 @@ pub(crate) mod tests {
         // App container is created. The completed init container is kept, so
         // its log still answers `kubectl logs -c setup` (#47): this runtime's
         // removal would take the log with it.
-        assert_eq!(rt.created_names(), vec!["app".to_string()]);
+        assert_eq!(rt.created_names(), vec!["app".to_string(), "setup".to_string()]);
         assert!(rt.removed_containers.lock().unwrap().is_empty(), "kept while the pod runs");
         // The pod stops: the init container goes with it.
         mgr.stop_pod("uid-1").await.unwrap();
