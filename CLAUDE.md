@@ -64,12 +64,13 @@ by #51.
 choke point, `EngineClient::send_within`, retries only a 401 token re-read), registry (stormpump_runtime image service),
 stormdrive (pv_placement), CSI/CRI gRPC (local sockets), probes (must not retry), watches (own reconnect loops),
 kube-proxy's apiserver client, the test container's `Api`.
-1. [ ] `pkg/retry` crate (shared by kubelet, proxy, test): `Policy` (attempts, first/max delay, deadline; API, ENGINE,
+1. [x] `pkg/retry` crate (shared by kubelet, proxy, test): `Policy` (attempts, first/max delay, deadline; API, ENGINE,
        REGISTRY, PEER, LOCAL), `Class` Infra|Real (408/429/500/502/503/504, timeout/connect/reset = infra), `send`
        (reqwest; GET/PUT/DELETE/PATCH repeat, POST only when never sent or 429; `send_repeatable` for named
        creates/reviews), `with_backoff` (generic), Retry-After, jitter, attempts logged. Lock entries by hand.
-2. [ ] Route every site through it; a site that must not retry says why in a comment.
-3. [ ] docs/retries.md (every site, before/after), README/CHANGELOG; tests (fake fails N then succeeds per policy).
+2. [x] Route every site through it; a site that must not retry says why in a comment (0a7bc7c, 27fb11e, test 2fa…).
+3. [x] docs/retries.md (every site, before/after), README/CHANGELOG (8253c0c); 13 retry tests (15ab836: 11 passed
+       on a build VM; blocking + message tests added after).
 4. [ ] sc-build, close.
 
 ### Waiting on stormvm#82 (after stormpump#123): #210, git dependencies pinned by rev (stormcentral#571's SBOM refusal)
