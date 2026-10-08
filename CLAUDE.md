@@ -71,14 +71,16 @@ among them (stormcos#368 will enforce).
        stormcos#402 filed (kubelet SA token + `STORMBLOCK_ADMIN_TOKEN_FILE`, before #368). Stage golden
        golden-rustkube-node-dc81277f6b12 (stormcos#366). Closed. Live check is stormcos#402/#368's audit log.
 
-### In progress: #131 (P3), pod network counters, network-status, older runs' logs (stormconsole#69)
+### Done: #131 (P3), pod network counters, network-status, older runs' logs (stormconsole#69)
 
 2026-10-08. (1) InterfaceStats + packets/errors/drops; cAdvisor families; /stats/summary `network`. (2) cni:
 CniResult.network/plugins (invoker), CniInterface.mtu; `network_status.rs` (Multus entries + addresses/routes/
 plugins; `mtu_in_netns` SIOCGIFMTU, no setns when already there); stormpump Sandbox.network_status;
 `RuntimeService::pod_network_status`; written with the start-timing patch. (3) `previous=N` (`runs_back`,
 `pick_run`, `failed_run`, `Record::ended_run`); rustkube's pods/log forwards it as is. VM tap counters not done
-(stormvm#48 is the guest view). Tests, docs (README, api.md, metrics.md), CHANGELOG; sc-build; golden; close.
+(stormvm#48 is the guest view). Tests, docs, CHANGELOG (f4e863a; f5819b6 = build failure #199; d14ab4d musl ioctl
+type). SC_BUILD_VM sc-build: musl release + 443 kubelet unit pass. Stage golden golden-rustkube-node-f88fa2d3245d
+(stormcos#366; first try hit the intermittent empty stormd input, noted on stormcentral#362). Closed.
 
 ### Done: #136, /log strips three words of every plain line
 
