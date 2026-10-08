@@ -58,6 +58,17 @@ still declared (HELP and TYPE), so a scraper can see the name exists.
 is derived from `status.containerStatuses[].restartCount`. A second count kept
 here would drift from the object, and the object is the one that is right.
 
+## Pod CPU weights and memory working set (#57)
+
+On stormpump a Pod's containers run in its QoS class's cgroup group (stormpump#68, the owner's choice on #106:
+OpenShift's `kubepods` shape): `stormpump/pods/` (Guaranteed), `pods/burstable/`, `pods/besteffort/`, beside the node
+services rather than among them. A container's CPU request becomes its `cpu.weight` by upstream's conversion
+(`1 + (shares − 2) × 9999 / 262142`: no request → 1, one CPU → 39), so it is small or large relative to other Pods
+only. At start the kubelet sizes `pods` as the node's CPUs in shares and `pods/besteffort` at the floor (1)
+(`GROUP_SET`). The QoS class is upstream's (BestEffort: no requests or limits; Guaranteed: every container limits CPU
+and memory and asks exactly that; else Burstable). Container memory is the engine's working set (`memory.current −
+inactive_file`, QUERY's memory block, stormpump#64) when it has one, else `memory.current`.
+
 ## Summary and node limits
 
 `/stats/summary` reports container CPU/memory and sums those values for the

@@ -57,16 +57,18 @@ by #51.
 
 ## Work plan
 
-### In progress: #57 step 4, CPU requests as Pod cgroup weights (stormpump#68's Pod group, OpenShift's shape)
+### Done from this side: #57 step 4, CPU requests as Pod cgroup weights (stormpump#68's Pod group, OpenShift's shape)
 
 2026-10-08. stormpump#68 done (golden-stormpump-accd1a3e8e61, stormpump@13cf2c9, release request stormcos#309):
 `Spec.group` (node | pods | pods/burstable | pods/besteffort, payload v8) and `GROUP_SET` (a Pod group's cpu.weight
 / memory.max). Also QUERY `MEMORY` (anon, file, inactive_file, working_set; stormpump#64).
-1. [ ] Lock: stormpump 795b92e → 13cf2c9 (`--precise`), stormvm stays 180fa13; build on the build box.
-2. [ ] `spec_for`: group by the pod's QoS class; `cpu_weight` from `cpu_shares` by upstream's conversion;
+1. [x] Lock: stormpump 795b92e → 13cf2c9 (`--precise`), stormvm stays 180fa13; build on the build box.
+2. [x] `spec_for`: group by the pod's QoS class; `cpu_weight` from `cpu_shares` by upstream's conversion;
        `GROUP_SET pods` weight from allocatable CPU at start. Working set from QUERY MEMORY when the engine has it.
-3. [ ] Tests, docs, CHANGELOG; sc-build; golden (ships with stormpump's accd1a3e8e61: an older engine refuses a v8
+3. [x] Tests, docs, CHANGELOG; sc-build; golden (ships with stormpump's accd1a3e8e61: an older engine refuses a v8
        spec, so the release must carry both); close.
+       Done on wip/57-pod-groups (f6312e9 code, f2163fd lock; lock diff from build job 15d6107177, whole workspace built
+       against stormvm 180fa13), fast-forwarded to main. sc-build fe6f90d674: 418 kubelet unit pass (3 new/changed).
 
 ### Done: #50 (P2), node services' lifecycle Events
 
@@ -1484,7 +1486,7 @@ Steps:
 2. [x] Ring client: one request owns the arena at a time (payloads all go at offset 0), and a request can
        have its region copied back after completion. `query_stats`.
 3. [x] `list_container_stats`: `QUERY` stats → CPU (exact) and memory (`memory_current`, includes page cache).
-4. [ ] **Decided (#106): Pods under one parent cgroup (OpenShift), engine side stormpump#68.** `cpu_shares` → `cpu_weight`. stormpump workloads are flat siblings, node services
+4. [x] **Decided (#106): Pods under one parent cgroup (OpenShift), engine side stormpump#68 (done 2026-10-08, see above).** `cpu_shares` → `cpu_weight`. stormpump workloads are flat siblings, node services
        included (default weight 100). Upstream's conversion puts every pod below them (1 CPU → 39, no request → 1).
 5. [x] Tests, docs, CHANGELOG. sc-build at 4245b8f: all pass (kubelet 177). Issue stays open on step 4.
 

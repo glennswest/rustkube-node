@@ -2,6 +2,12 @@
 
 ## 2026-10-08
 
+- **feat:** Pod CPU requests are cgroup weights among Pods (#57, the owner's choice on #106: OpenShift's shape):
+  each container runs in its pod's QoS group (stormpump#68: `pods`, `pods/burstable`, `pods/besteffort`), its
+  `cpu.weight` upstream's conversion of its request, and the kubelet sizes the `pods` group from the node's CPUs and
+  `besteffort` at the floor at start. Container memory is the engine's working set (stormpump#64) when given.
+- **build:** the lock moves stormpump 795b92e → 13cf2c9 and stormcast 2bcdafc → 3cec734 (stormvm unchanged). An
+  engine before stormpump#68 refuses a spec with a group, so this ships with golden-stormpump-accd1a3e8e61.
 - **feat:** A node service's lifecycle as Events, completed (#50): a service seen for the first time is `Started`
   (with its own start time) unless its mirror pod already shows that run, so one started since the pod was written
   is announced and a kubelet restart re-announces nothing; a non-zero exit or a signal is a Warning `Failed` with the
