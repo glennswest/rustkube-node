@@ -57,15 +57,18 @@ by #51.
 
 ## Work plan
 
-### In progress: #210, git dependencies pinned by rev (stormcentral#571's SBOM refusal)
+### Waiting on stormvm#82 (after stormpump#123): #210, git dependencies pinned by rev (stormcentral#571's SBOM refusal)
 
 2026-10-08. stormcentral's `sbom` reads `cargo metadata` and refuses any resolved git package whose source has no
 `rev=`, transitive ones included. Ours: stormpump 13cf2c9, stormvm 180fa13 (direct, `branch = "main"`), stormcast
 3cec734 (only through stormvm/stormpump, whose own manifests say `branch = "main"`).
-1. [ ] pkg/kubelet/Cargo.toml: `rev =` the lock's sha for every stormpump/stormvm crate; root `[patch]` for the
-       stormpump and stormcast URLs (same revs) so stormvm's own references resolve to the pinned source too.
-2. [ ] Lock regenerated on the build box (`cargo metadata`, diff applied); no duplicate stormpump; every git
-       source `?rev=`. sc-build; README/BUILD note on bumping; CHANGELOG; close.
+Tried (8774f06, reverted 4f3ef17): `rev` on the direct deps + root `[patch]` for the stormpump/stormcast URLs. Cargo
+refuses it: "patch for `stormcast` points to the same source, but patches must point to different sources" (it
+compares canonical URLs, not the ref; build job becd99d679). Without the patch the graph has two stormpump sources
+(our rev, stormvm's branch). So the pins have to come from upstream: stormpump#123 (stormcast by rev, filed),
+stormvm#82 (stormpump by rev, asked to name the rev). Resume: pin stormpump + stormvm at those commits (stormpump
+equal to stormvm's), `cargo metadata` lock job on the build box, check every git source `?rev=` and one stormpump,
+fix what the newer stormvm/stormpump APIs break (the stormvm move is #181's lock step too), sc-build, CHANGELOG, close.
 
 ### Done: #209 (P2), a class blank being minted is charged as committed; medium's 1Ti case starts late
 

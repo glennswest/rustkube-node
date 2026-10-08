@@ -2,6 +2,9 @@
 
 ## 2026-10-08
 
+- **chore:** #210 (git dependencies pinned by `rev`, stormcentral#571) tried and reverted (8774f06, 4f3ef17).
+  Cargo refuses a `[patch]` that points at a dependency's own URL, so the transitive stormpump/stormcast
+  references can only be pinned in stormvm and stormpump (stormvm#82, stormpump#123). No change to the build.
 - **fix:** A class blank still being minted is no longer charged against the data slabs (#209). stormblock formats
   a template on `fstemplate-<name>-raw` (unsealed until the seal) and seals it as `fstemplate-<fs>-<name>`; only the
   bare blank name and sealed volumes were treated as sources, so a 1 TiB blank being formatted counted 1 TiB and
