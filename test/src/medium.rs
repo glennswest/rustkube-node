@@ -4,7 +4,7 @@
 //! **Sizes.** One claim at every class of the ladder the kubelet offers
 //! (`pkg/kubelet/src/storage.rs` `SIZE_CLASSES`), and arbitrary sizes: the
 //! smallest request (1 byte), just over a class (1Mi+1, 17Mi), decimal and
-//! fractional units (1500M, 3.5Gi), and 600Gi. Each, in parallel:
+//! fractional units (1500M, 3.5Gi), and 600Gi. Each, [`SIZE_CASES_AT_ONCE`] at a time, the largest first:
 //!
 //! 1. a claim and a pod that mounts it, writes 64 KiB, reads it back, and
 //!    checks that the filesystem's size is in (the class below, the class the
@@ -133,12 +133,24 @@ pub async fn record_pod_cases(cases: PodCases, r: &mut Report) {
     }
 }
 
+/// Size cases running at once (#64). All twenty at once (every class blank a
+/// format, claims up to 16Ti and 1Pi) took the node's apiserver down twice
+/// (fff1f4d9d9 on the Dell, 63a3c5201b on server3): this suite checks
+/// behaviour, it is not a stress test. The `ms` of a case counts from when it
+/// started, not from when it was queued.
+pub const SIZE_CASES_AT_ONCE: usize = 3;
+
 pub async fn run(env: Arc<Env>, api: Api, r: &mut Report, pod_cases: PodCases) {
-    // All at once: the budget is 30 minutes and a 1 TiB mint may take most of it.
+    // A few at a time, the largest first: a 1 TiB mint may take much of the
+    // 30 minutes, and it should not wait behind the small classes.
+    let gate = Arc::new(tokio::sync::Semaphore::new(SIZE_CASES_AT_ONCE));
+    let mut ordered: Vec<(usize, Case)> = cases().into_iter().enumerate().collect();
+    ordered.sort_by_key(|(_, c)| std::cmp::Reverse(api::quantity_bytes(&c.request).unwrap_or(0)));
     let mut tasks = Vec::new();
-    for (i, c) in cases().into_iter().enumerate() {
-        let (env, api) = (env.clone(), api.clone());
+    for (i, c) in ordered {
+        let (env, api, gate) = (env.clone(), api.clone(), gate.clone());
         tasks.push(tokio::spawn(async move {
+            let _turn = gate.acquire_owned().await;
             let t = Instant::now();
             let o = size_case(&env, &api, &c, i as u64 + 1).await;
             (format!("pvc-size-{}", c.name), o, t.elapsed().as_millis())

@@ -1389,6 +1389,12 @@ Steps:
 
 ### In progress: #64, PVC size test (the medium suite's first test)
 
+2026-10-08: medium ran at c8256ac on server3 (63a3c5201b, 19:08–19:43Z): image built and pushed, the Job ran, and 90 s
+into the size cases the node's apiserver stopped answering (delete of sz-class-1mi, then cleanup, timed out): the
+second time after the Dell's fff1f4d9d9. The Dell's 4d4721131e: the Job never got a pod. All twenty size cases ran at
+once (every class blank a format, up to 16Ti and 1Pi). Doing: `SIZE_CASES_AT_ONCE = 3`, largest first (the test is
+not a stress test); file stormcos (the control plane starved by storage load) with the two runs; rerun medium.
+
 Started 2026-09-27. No `test/` existed (that is #61), so this adds the container, modelled on
 stormblock-csi's `test/` (own workspace, static musl binary, scratch image, the image doubles as
 the workload pods' program). Short and long report one skip pointing at #61.

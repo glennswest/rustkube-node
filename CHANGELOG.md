@@ -2,6 +2,8 @@
 
 ## 2026-10-08
 
+- **test:** medium's size cases run three at a time, the largest first (#64): all twenty at once (every class blank
+  a format, claims up to 16Ti and 1Pi) took the node's apiserver down on two runs (fff1f4d9d9, 63a3c5201b).
 - **feat:** Pod CPU requests are cgroup weights among Pods (#57, the owner's choice on #106: OpenShift's shape):
   each container runs in its pod's QoS group (stormpump#68: `pods`, `pods/burstable`, `pods/besteffort`), its
   `cpu.weight` upstream's conversion of its request, and the kubelet sizes the `pods` group from the node's CPUs and
