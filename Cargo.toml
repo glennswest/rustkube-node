@@ -118,3 +118,17 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 
 # Testing
 tempfile = { version = "3" }
+
+# Every git dependency is pinned by `rev` (#210, stormcentral#571: a golden
+# build refuses a resolved git package with no `rev`, transitive ones too).
+# stormvm's and stormpump's own manifests name stormpump and stormcast by
+# `branch = "main"`; these patches resolve those references to the same pinned
+# commits, so there is one stormpump in the graph and no unpinned source.
+# Moving a dependency forward is a `rev` bump here and in pkg/kubelet/Cargo.toml
+# (keep stormpump's equal in both).
+[patch."https://github.com/glennswest/stormpump"]
+stormpump = { git = "https://github.com/glennswest/stormpump", rev = "13cf2c913ef5d5400bfc6398667d927866ae0416" }
+stormpump-abi = { git = "https://github.com/glennswest/stormpump", rev = "13cf2c913ef5d5400bfc6398667d927866ae0416" }
+
+[patch."https://github.com/glennswest/stormcast"]
+stormcast = { git = "https://github.com/glennswest/stormcast", rev = "3cec734ee0239604e9ce6e203cda403ab49aba75" }
