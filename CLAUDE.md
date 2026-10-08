@@ -57,6 +57,13 @@ by #51.
 
 ## Work plan
 
+### Waiting on stormstorage#49: #157 (P3), VM restore from a RAID twin on another node
+
+2026-10-08. #68 superseded (owner: replicated volumes are stormblock-csi's; stormstorage/stormblock/stormdrive do the
+work; the built-in class stays node-local). A twin exists only for VM disks that are stormblock-csi claims, so: CSI
+group snapshots of them (stormstorage#49, needs-owner), a VM disk on another driver's claim (NVMe/TCP, #142), then
+#53's restore from VolumeSnapshots (dataSource). Commented; proposed after stormstorage#49. No code.
+
 ### Waiting on stormpump#56 + a build: #181 (P2), a VM stopped gracefully: Machine::shut_down(grace) before the engine's stop
 
 2026-10-08. `stop` sends the engine's stop (SIGTERM to the hypervisor = a power cut) at once when there is a handle;
