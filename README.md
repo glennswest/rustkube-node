@@ -416,7 +416,8 @@ clones keep the class size, and the overcommit ratio is 1.0:
 - **Room** = `min(data total × --storage-overcommit − committed, data free) −
   reserve`, where `committed` is the virtual size of every writable data-role
   volume (claims, node service volumes, VM disks; not goldens, sealed volumes or
-  the class blanks) and `reserve` is `--storage-reserve-percent` (5) of the data
+  the class blanks: stormblock's `fstemplate-*` volumes, still formatting or
+  sealed, #209) and `reserve` is `--storage-reserve-percent` (5) of the data
   slabs.
 - **Published:** `CSIStorageCapacity` `kube-system/stormblock-<node>` (class
   `stormblock`, topology `kubernetes.io/hostname`), `capacity` = the room and

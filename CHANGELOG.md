@@ -2,6 +2,14 @@
 
 ## 2026-10-08
 
+- **fix:** A class blank still being minted is no longer charged against the data slabs (#209). stormblock formats
+  a template on `fstemplate-<name>-raw` (unsealed until the seal) and seals it as `fstemplate-<fs>-<name>`; only the
+  bare blank name and sealed volumes were treated as sources, so a 1 TiB blank being formatted counted 1 TiB and
+  the 1Ti claim that asked for it was refused "not enough room" on a 1.8 TB slab. Every `fstemplate-` volume is
+  now a source.
+- **test:** `medium`: a size case whose class is above the node's published `maximumVolumeSize` is checked as a
+  refusal ("not enough room", pod pinned to the node) instead of waiting the whole mint budget for room that cannot
+  appear; four such cases on a 1.8 TB node held the slots for 20 minutes and the 1Ti mint started late (#209).
 - **fix:** A node service's mirror pod takes its `startTime` from PID 1's `started_secs` (`CLOCK_BOOTTIME`) against
   `/proc/uptime`, not from `age_secs` (#193): since stormpump#67 assets.json is written only when the table
   changes, so `age_secs` goes stale between writes and the start time would drift and be rewritten every pass.

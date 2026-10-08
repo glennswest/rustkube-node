@@ -27,6 +27,13 @@
 //! which for 1 TiB is minutes of formatting (stormblock#141). Every case has
 //! [`Env::mint_budget`] to finish; the `ms` of the 1Ti case is that time.
 //!
+//! **Larger than the node.** A case whose class is above the node's published
+//! `maximumVolumeSize` (read once, before the size cases) is checked as a
+//! refusal instead: the pod waits with "not enough room" and the claim is
+//! never Bound. Waiting the whole mint budget for room that cannot appear
+//! held a slot for 20 minutes per such case, and the 1Ti mint, behind the
+//! larger ones, began 20 minutes into the run (#209).
+//!
 //! **Overcommit refused** (#62): the test node's published CSIStorageCapacity
 //! (`kube-system/stormblock-<node>`) says the largest class that still fits;
 //! a claim one class above it, for a pod pinned to that node, must wait with
@@ -144,15 +151,22 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report, pod_cases: PodCases) {
     // A few at a time, the largest first: a 1 TiB mint may take much of the
     // 30 minutes, and it should not wait behind the small classes.
     let gate = Arc::new(tokio::sync::Semaphore::new(SIZE_CASES_AT_ONCE));
+    let max = Arc::new(node_max(&env, &api).await);
     let mut ordered: Vec<(usize, Case)> = cases().into_iter().enumerate().collect();
     ordered.sort_by_key(|(_, c)| std::cmp::Reverse(api::quantity_bytes(&c.request).unwrap_or(0)));
     let mut tasks = Vec::new();
     for (i, c) in ordered {
-        let (env, api, gate) = (env.clone(), api.clone(), gate.clone());
+        let (env, api, gate, max) = (env.clone(), api.clone(), gate.clone(), max.clone());
         tasks.push(tokio::spawn(async move {
             let _turn = gate.acquire_owned().await;
             let t = Instant::now();
-            let o = size_case(&env, &api, &c, i as u64 + 1).await;
+            let o = match too_large(&c, &max) {
+                Some(why) => match refused(&env, &api, &format!("sz-{}", c.name.replace('.', "-")), &c.request, &ROOM, c.block, true).await {
+                    Outcome::Pass(d) => Outcome::Pass(format!("{why}: {d}")),
+                    other => other,
+                },
+                None => size_case(&env, &api, &c, i as u64 + 1).await,
+            };
             (format!("pvc-size-{}", c.name), o, t.elapsed().as_millis())
         }));
     }
@@ -169,7 +183,7 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report, pod_cases: PodCases) {
         let (env, api) = (env.clone(), api.clone());
         tokio::spawn(async move {
             let t = Instant::now();
-            let o = refused(&env, &api, "sz-fs-20ti", "20Ti", &["volumeMode: Block"], false).await;
+            let o = refused(&env, &api, "sz-fs-20ti", "20Ti", &["volumeMode: Block"], false, false).await;
             ("pvc-size-filesystem-past-ext4-classes".to_string(), o, t.elapsed().as_millis())
         })
     };
@@ -207,6 +221,32 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report, pod_cases: PodCases) {
 
 fn within(env: &Env, want: Duration) -> Duration {
     env.budget(want, MARGIN)
+}
+
+/// What a refusal for room says: the kubelet's words, or the scheduler's.
+const ROOM: [&str; 2] = ["not enough room", "no published storage capacity"];
+
+/// The node's published `maximumVolumeSize` (#62), or why it is not known.
+async fn node_max(env: &Env, api: &Api) -> Result<(String, u64), String> {
+    let path = format!("/apis/storage.k8s.io/v1/namespaces/kube-system/csistoragecapacities/stormblock-{}", env.node_name);
+    let cap = api.get(&path).await?.ok_or_else(|| format!("node {} publishes no CSIStorageCapacity ({path})", env.node_name))?;
+    let q = s(&cap, "/maximumVolumeSize").to_string();
+    let b = api::quantity_bytes(&q).ok_or_else(|| format!("maximumVolumeSize {q:?} is not a quantity"))?;
+    Ok((q, b))
+}
+
+/// Why `c` cannot fit on the test node (its class is above the published
+/// maximum), or `None` when it can, or when the maximum is not known: then
+/// the case runs as a size case, as before #209.
+pub fn too_large(c: &Case, max: &Result<(String, u64), String>) -> Option<String> {
+    let (q, max) = max.as_ref().ok()?;
+    let (_, hi) = class_range(&c.request, c.block)?;
+    (hi > *max).then(|| format!("class {} is above the node's maximumVolumeSize {q}, so refused", k8s_q(hi)))
+}
+
+/// A class's bytes as the ladder writes it (`1Ti`).
+fn k8s_q(b: u64) -> String {
+    LADDER.iter().chain(BLOCK_ONLY).find(|(_, x)| *x == b).map(|(q, _)| q.to_string()).unwrap_or_else(|| b.to_string())
 }
 
 /// Claim `request`, mount, write, check the size, delete, check reclaimed.
@@ -287,7 +327,7 @@ async fn size_case(env: &Env, api: &Api, c: &Case, seed: u64) -> Outcome {
 
 /// 2Pi: the pod waits with the reason, and the claim is never Bound.
 async fn above_ladder(env: &Env, api: &Api) -> Outcome {
-    refused(env, api, "sz-above-ladder", "2Pi", &["larger than the largest size class"], false).await
+    refused(env, api, "sz-above-ladder", "2Pi", &["larger than the largest size class"], false, false).await
 }
 
 /// One class above what the test node says it can still take (#62).
@@ -305,29 +345,28 @@ async fn overcommit_refused(env: &Env, api: &Api) -> Outcome {
     };
     // Block, so a class past the ext4 ones is refused for room, not for
     // having no filesystem.
-    let why = ["not enough room", "no published storage capacity"];
-    match refused(env, api, "sz-overcommit", request, &why, true).await {
+    match refused(env, api, "sz-overcommit", request, &ROOM, true, true).await {
         Outcome::Pass(d) => Outcome::Pass(format!("{request} with maximumVolumeSize {}: {d}", s(&cap, "/maximumVolumeSize"))),
         other => other,
     }
 }
 
 /// A claim of `request` that the node refuses: the pod waits with a reason
-/// containing one of `why`, and the claim is never Bound. `pinned_block`: a
-/// Block claim, its pod pinned to the test node (so a scheduler that does not
-/// read capacity cannot place it elsewhere).
-async fn refused(env: &Env, api: &Api, name: &str, request: &str, why: &[&str], pinned_block: bool) -> Outcome {
-    let claim = if pinned_block { k8s::block_claim(env, name, request) } else { k8s::claim(env, name, request) };
+/// containing one of `why`, and the claim is never Bound. `block`: a Block
+/// claim. `pinned`: its pod pinned to the test node (so a scheduler that does
+/// not read capacity cannot place it elsewhere).
+async fn refused(env: &Env, api: &Api, name: &str, request: &str, why: &[&str], block: bool, pinned: bool) -> Outcome {
+    let claim = if block { k8s::block_claim(env, name, request) } else { k8s::claim(env, name, request) };
     if let Err(e) = api.create(&k8s::pvcs(env), &claim).await {
         return Outcome::Infra(e);
     }
     let args = ["1".to_string(), BYTES.to_string(), "0".to_string(), u64::MAX.to_string()];
-    let mut pod = if pinned_block {
+    let mut pod = if block {
         k8s::work_device(env, name, name, "sized", &args)
     } else {
         k8s::work(env, name, name, "sized", &args)
     };
-    if pinned_block {
+    if pinned {
         pod["spec"]["nodeSelector"] = serde_json::json!({ "kubernetes.io/hostname": env.node_name });
     }
     if let Err(e) = api.create(&k8s::pods(env), &pod).await {
@@ -386,6 +425,20 @@ mod tests {
         assert_eq!(class_range("20Ti", true), Some((16 << 40, 64 << 40)));
         assert_eq!(class_range("1Pi", true), Some((256 << 40, 1 << 50)));
         assert_eq!(class_range("2Pi", true), None);
+    }
+
+    #[test]
+    fn a_case_above_the_node_is_a_refusal_check() {
+        let case = |r: &str, block| Case { name: "x".into(), request: r.into(), block };
+        // C2NR0Q2: a 1.8 TB slab publishes 1Ti.
+        let max = Ok(("1Ti".to_string(), 1u64 << 40));
+        assert!(too_large(&case("600Gi", false), &max).is_none());
+        assert!(too_large(&case("1Ti", false), &max).is_none());
+        let why = too_large(&case("4Ti", false), &max).unwrap();
+        assert!(why.contains("class 4Ti") && why.contains("maximumVolumeSize 1Ti"), "{why}");
+        assert!(too_large(&case("1Pi", true), &max).is_some());
+        // Not known: every case runs as a size case.
+        assert!(too_large(&case("1Pi", true), &Err("none".into())).is_none());
     }
 
     #[test]

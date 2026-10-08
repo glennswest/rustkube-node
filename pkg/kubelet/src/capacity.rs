@@ -11,7 +11,11 @@
 //!   bytes (`/api/v1/slabs`, role `data`), and what is committed: the virtual
 //!   size of every writable data volume (claims, node service volumes, VM
 //!   disks). Not sealed volumes, goldens or the class blanks (`pvc-ext4j-*`),
-//!   which are what claims are cloned *from* and are never written.
+//!   which are what claims are cloned *from* and are never written. A blank
+//!   is stormblock's fstemplate: formatted on `fstemplate-<name>-raw`, sealed
+//!   as `fstemplate-<fs>-<name>`; both are sources, sealed yet or not, so a
+//!   1 TiB blank being minted does not crowd out the claim that asked for it
+//!   (#209).
 //! - **What is left for a claim**: `min(total × ratio − committed, free) −
 //!   reserve`. Both halves: the commitment rule, and the physical space that
 //!   goldens and blanks also use.
@@ -58,10 +62,15 @@ pub struct Capacity {
     pub available: u64,
 }
 
+/// stormblock's prefix for a template's own volumes (its `TEMPLATE_PREFIX`):
+/// `fstemplate-<name>-raw` while it formats, `fstemplate-<fs>-<name>` sealed.
+const FSTEMPLATE_PREFIX: &str = "fstemplate-";
+
 /// Is this volume what a claim is cloned from rather than a writable one?
 fn is_source(v: &Value) -> bool {
     let name = v["name"].as_str().unwrap_or("");
     v["sealed"].as_bool().unwrap_or(false)
+        || name.starts_with(FSTEMPLATE_PREFIX)
         || name.ends_with(".golden")
         || name.starts_with("standby-")
         || crate::storage::SIZE_CLASSES
@@ -308,6 +317,25 @@ mod tests {
         let why = c.refusal("1T", TI, &Policy::default()).unwrap();
         assert!(why.contains("not enough room") && why.contains("1T class (1Ti)"), "{why}");
         assert!(c.refusal("256G", 256 * GI, &Policy::default()).is_none());
+    }
+
+    #[test]
+    fn a_class_blank_still_formatting_is_not_charged() {
+        // C2NR0Q2 (#209): 1800428Mi data slab, the 1T blank minting, ~13 GiB
+        // of service volumes. Before, the raw template volume was charged
+        // 1 TiB and the 1Ti claim that asked for the blank did not fit.
+        const MI: u64 = 1 << 20;
+        let slabs = [slab("data", 1_800_428 * MI, 1_784_859 * MI)];
+        let vols = [
+            vol("fstemplate-pvc-ext4j-1048576m-raw", "data", TI, false), // formatting
+            vol("fstemplate-ext4-pvc-ext4j-262144m", "data", 256 * GI, true), // a sealed blank
+            vol("fstemplate-pvc-ext4j-262144m-raw", "data", 256 * GI, false), // its formatted base
+            vol("fastetcd-data", "data", 13_504 * MI, false),
+        ];
+        let c = Capacity::of(&slabs, &vols, &Policy::default());
+        assert_eq!(c.committed, 13_504 * MI, "template volumes are sources, sealed or not");
+        assert!(c.refusal("1T", TI, &Policy::default()).is_none(), "the 1Ti claim fits beside its blank");
+        assert_eq!(c.largest_class(), Some(("1T", TI)));
     }
 
     #[test]
