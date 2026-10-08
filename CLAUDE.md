@@ -57,6 +57,13 @@ by #51.
 
 ## Work plan
 
+### Closed: #142 (P3), the kubelet's own NVMe/TCP connect: not planned
+
+2026-10-08. Nothing on the current path needs it: replicated claims are stormblock-csi's (owner on #68; its node
+plugin connects in NodeStage), migration is a RAID leg on the destination (owner on #159, stormstorage#44), #157 goes
+through CSI snapshots. Only #86's option B (remote golden attach) would; reopen then (and a connect would be the
+engine's, PID 1 holds /dev/nvme-fabrics). The explicit refusal stays.
+
 ### Done: #112 (P3), restart backoff across a kubelet restart
 
 2026-10-08. `crashloop.rs` was memory only. Done in code: `persist_to(<state root>/crashloop.json)` from
@@ -77,7 +84,8 @@ completed init kept in `PodManager::kept_inits` until `stop_pod` where removal w
 
 2026-10-08. #68 superseded (owner: replicated volumes are stormblock-csi's; stormstorage/stormblock/stormdrive do the
 work; the built-in class stays node-local). A twin exists only for VM disks that are stormblock-csi claims, so: CSI
-group snapshots of them (stormstorage#49, needs-owner), a VM disk on another driver's claim (NVMe/TCP, #142), then
+group snapshots of them (stormstorage#49, needs-owner), a VM disk on another driver's claim (CSI Block; the driver
+connects it in NodeStage, #142 closed), then
 #53's restore from VolumeSnapshots (dataSource). Commented; proposed after stormstorage#49. No code.
 
 ### Waiting on stormpump#56 + a build: #181 (P2), a VM stopped gracefully: Machine::shut_down(grace) before the engine's stop
