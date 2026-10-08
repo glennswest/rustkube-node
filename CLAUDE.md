@@ -57,6 +57,23 @@ by #51.
 
 ## Work plan
 
+### In progress: #216, per-container logs at upstream parity (stormconsole#124, stormcos_qa#48)
+
+2026-10-08. Found: each container has its dir and `<restart>.log` (app restarts), `previous=N` (#131), init logs kept
+(#47), mirror pods serve stormd's volume (#72/#87/#124). Gaps: (a) init containers and native sidecars always write
+`0.log`, so a retried init / restarted sidecar has no `--previous` (and a kubelet restart resets a crash-looping
+container's count to the last file's number); (b) runs are never pruned (a crash loop leaves a file per restart);
+(c) no rotation (`containerLogMaxSize`/`MaxFiles`); (d) stormpump writes raw output (Logs::Combined, "a writer is a
+process": no timestamps, no stream, no P/F), so `timestamps`/`sinceSeconds` cannot apply to a stormpump container:
+engine work, filed on stormpump (CRI-format log + reopen); this repo serves CRI lines already (filter_log).
+1. [ ] `container_logs.rs`: `next_run(dir, at_least)` (max existing N + 1, ≥ the restart count) used at every create
+       (apps, restarts, inits, sidecars); `prune_runs` keeps the current + 5 previous (#131's window; upstream keeps 1).
+2. [ ] Rotation as upstream's ContainerLogManager: every 10 s, the live `<N>.log` of each running container past
+       `--container-log-max-size` (10Mi) → `<N>.log.<YYYYMMDD-HHMMSS>`, older rotations gzip'd, at most
+       `--container-log-max-files` (5) files incl. the live one. Copy-truncate (the engine holds an O_APPEND fd and has
+       no reopen); the window between copy and truncate named in docs, gone with the stormpump op.
+3. [ ] Tests, docs (configuration.md, api.md, README), CHANGELOG; stormpump issue; sc-build; golden; close (or ship).
+
 ### Done: #211 (P1), every remote call retries (code review)
 
 2026-10-08. Owner: "sounds like it doesn't retry … needs a code review". Inventory: ~90 call sites; apiserver
