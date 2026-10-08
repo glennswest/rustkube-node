@@ -57,7 +57,7 @@ by #51.
 
 ## Work plan
 
-### In progress: #215 (P0), mirror pods carry stormd's probe state, restarts/CrashLoopBackOff and events (stormd#48)
+### Done: #215 (P0), mirror pods carry stormd's probe state, restarts/CrashLoopBackOff and events (stormd#48)
 
 2026-10-08. stormd#48 done (golden-stormd-9bd45189d9a8): `GET /api/v1/processes` (state running | CrashLoopBackOff |
 stopped | failed | starting…, ready from the readiness probe, restarts, exit_code, started_at, stopped_at) and
@@ -70,7 +70,11 @@ stopped | failed | starting…, ready from the readiness probe, restarts, exit_c
        PID 1's), lastState, Ready = readiness with ContainersNotReady; status_current sees a waiting reason change.
 3. [x] kubelet `stormd_poll` (5 s): processes → map (change = mirror pass), events since the last written seq (reset on
        a PID 1 restart of the service) → Events on the mirror pod. node_health probe only where stormd does not answer.
-4. [ ] Tests, docs (README "The node's services as pods", api.md?), CHANGELOG; sc-build; stage golden; close.
+4. [x] Tests (6 new: endpoint parse, boot.d roots, representative, event object identity, status mapping incl.
+       status_current, create-then-patch against a fake apiserver), README/api.md, CHANGELOG (0aae9a3). SC_BUILD_VM
+       sc-build 304926a (P0 slot): 463 kubelet unit, all suites pass. Stage golden golden-rustkube-node-8ebdf0576fd2
+       (stormcos#424; needs golden-stormd-9bd45189d9a8 in the same release for the events route). Closed. Live check
+       after the release: `kubectl describe pod -n kube-system fastetcd-<node>`.
 
 ### Done: #216, per-container logs at upstream parity (stormconsole#124, stormcos_qa#48)
 
