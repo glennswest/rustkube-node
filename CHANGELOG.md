@@ -2,6 +2,10 @@
 
 ## 2026-10-08
 
+- **fix:** A crash-looping container keeps its restart backoff across a kubelet restart (#112): CrashLoopBackOff is
+  written to `<state root>/crashloop.json` (wall-clock seconds, atomically, on every change) and read back by the
+  restarted kubelet's state recovery. An entry past the 10-minute stable window is forgiven, so not carried; a Pod
+  recreated under the same name has a new uid and inherits nothing; a deleted pod's entries go with it.
 - **fix:** An init container's log stays readable after it completes (#47): on a runtime whose `remove_container`
   takes the log with it (a CRI runtime), a completed init container is kept until its pod stops, as upstream keeps
   it; on stormpump, whose removal releases the workload and its root but never the log file, it is removed at once.

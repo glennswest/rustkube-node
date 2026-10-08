@@ -75,7 +75,6 @@ Each gap has an owning issue. These are limitations, not supported features.
 | Guest metadata (`/vmInstance`) as the metadata service's single source (stormimds keeps its own store; undecided), and stormimds forwarding a host-network workload's token as `X-Storm-Workload-Token` (#122 is the kubelet's side). (Indexed by address and gated on the object's placement since #119; a node cut off from the apiserver for longer than `--metadata-max-staleness`, 40 s, answers 503 since #156.) | [stormimds#12](https://github.com/glennswest/stormimds/issues/12) |
 | End-to-end legacy microVM Pods | [#13](https://github.com/glennswest/rustkube-node/issues/13) |
 | Successful init-container log retention (restartable init sidecars are served since #111) | [#47](https://github.com/glennswest/rustkube-node/issues/47) |
-| Restart backoff persistence across kubelet restart | [#112](https://github.com/glennswest/rustkube-node/issues/112) |
 | Missing configured credentials fail closed; client certificate reload | [#69](https://github.com/glennswest/rustkube-node/issues/69), [#89](https://github.com/glennswest/rustkube-node/issues/89), [#77](https://github.com/glennswest/rustkube-node/issues/77) |
 | Explicit default-valued apiserver flag overriding kubeconfig | [#113](https://github.com/glennswest/rustkube-node/issues/113) |
 | Destructive engine calls with a separate admin token | [#105](https://github.com/glennswest/rustkube-node/issues/105) |

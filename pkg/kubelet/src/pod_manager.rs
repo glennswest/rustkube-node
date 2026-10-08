@@ -2629,6 +2629,9 @@ impl PodManager {
     /// container runtime. Called once at startup so a kubelet restart adopts
     /// the pods it was already running instead of creating duplicate sandboxes.
     pub async fn recover_state(&self) -> Result<(), CriError> {
+        // The restart backoff an earlier kubelet left (#112): a crash-looping
+        // container adopted below keeps its delay.
+        self.backoff.persist_to(std::path::Path::new(&self.state_root).join("crashloop.json"));
         let sandboxes = match self.runtime.list_pod_sandbox().await {
             Ok(s) => s,
             Err(e) => {

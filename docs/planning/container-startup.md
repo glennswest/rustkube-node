@@ -37,7 +37,9 @@ or local CNI subprocesses. Those gaps are recorded in #99.
   cold image/template work from warm startup. No subsecond claim is established.
 - #103/#98/#86: image-root resolution, image config and version selection.
 - #111: restartable init sidecars: implemented (started in their slot, kept, restarted, stopped after the apps).
-- #112: persist/reconstruct backoff across kubelet restarts.
+- #112 (done): the backoff is kept in `<state root>/crashloop.json` (wall-clock seconds, written on every change) and
+  read back by a restarted kubelet's state recovery; forgiven entries are not carried, a recreated Pod (new uid)
+  inherits nothing.
 
 The existing metrics measure first observation → start and known-Pod sync
 passes; they do not by themselves measure accepted API write → process start.

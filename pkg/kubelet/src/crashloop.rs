@@ -15,10 +15,18 @@
 //! Keyed by `<pod uid>/<container name>` rather than by container id, because
 //! the id changes on every restart and the thing being backed off is the
 //! container's *identity*, which does not.
+//!
+//! **Kept across a kubelet restart** (#112): with a file
+//! ([`CrashLoopBackoff::persist_to`]), every change is written there in wall-
+//! clock seconds, and a restarted kubelet reads it back, so a crash-looping
+//! container it adopts keeps its delay instead of restarting at once. Entries
+//! past the stable window are forgiven anyway and are not kept; a recreated
+//! Pod has a new uid, so nothing transfers to it.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The first wait, and the factor between waits.
 const BASE: Duration = Duration::from_secs(10);
@@ -45,11 +53,107 @@ struct Entry {
 #[derive(Debug, Default)]
 pub struct CrashLoopBackoff {
     entries: Mutex<HashMap<String, Entry>>,
+    /// Where the entries are kept across a kubelet restart (#112).
+    file: Mutex<Option<PathBuf>>,
+}
+
+/// One entry as written: wall-clock seconds, which survive the process.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Saved {
+    delay_secs: u64,
+    ready_at: u64,
+    restarted_at: u64,
+}
+
+fn unix(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// The wall-clock time an `Instant` was, now.
+fn wall(i: Instant, now: Instant, now_wall: u64) -> u64 {
+    if i >= now {
+        now_wall + (i - now).as_secs()
+    } else {
+        now_wall.saturating_sub((now - i).as_secs())
+    }
+}
+
+/// The `Instant` a wall-clock time is, now.
+fn instant(w: u64, now: Instant, now_wall: u64) -> Instant {
+    if w >= now_wall {
+        now + Duration::from_secs(w - now_wall)
+    } else {
+        now.checked_sub(Duration::from_secs(now_wall - w)).unwrap_or(now)
+    }
 }
 
 impl CrashLoopBackoff {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Keep the entries in `path` from now on, and take back what an earlier
+    /// kubelet left there (#112). Entries past the stable window are
+    /// forgiven, so dropped. An unreadable file is a fresh start.
+    pub fn persist_to(&self, path: PathBuf) {
+        let now = Instant::now();
+        let now_wall = unix(SystemTime::now());
+        let saved: HashMap<String, Saved> = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        let mut restored = 0;
+        if let Ok(mut entries) = self.entries.lock() {
+            for (k, s) in saved {
+                if now_wall.saturating_sub(s.restarted_at) >= STABLE.as_secs() {
+                    continue;
+                }
+                entries.entry(k).or_insert_with(|| {
+                    restored += 1;
+                    Entry {
+                        delay: Duration::from_secs(s.delay_secs),
+                        ready_at: instant(s.ready_at, now, now_wall),
+                        restarted_at: instant(s.restarted_at, now, now_wall),
+                    }
+                });
+            }
+        }
+        if restored > 0 {
+            tracing::info!(restored, "crash-loop backoff carried over from the last kubelet");
+        }
+        if let Ok(mut f) = self.file.lock() {
+            *f = Some(path);
+        }
+        self.save();
+    }
+
+    /// Write the entries, when there is a file (tmp + rename). A failure is
+    /// logged, never fatal: the backoff still works, only in memory.
+    fn save(&self) {
+        let Some(path) = self.file.lock().ok().and_then(|f| f.clone()) else { return };
+        let now = Instant::now();
+        let now_wall = unix(SystemTime::now());
+        let saved: HashMap<String, Saved> = match self.entries.lock() {
+            Ok(entries) => entries
+                .iter()
+                .map(|(k, e)| {
+                    (k.clone(), Saved {
+                        delay_secs: e.delay.as_secs(),
+                        ready_at: wall(e.ready_at, now, now_wall),
+                        restarted_at: wall(e.restarted_at, now, now_wall),
+                    })
+                })
+                .collect(),
+            Err(_) => return,
+        };
+        let tmp = path.with_extension("json.tmp");
+        let written = serde_json::to_vec(&saved)
+            .map_err(std::io::Error::other)
+            .and_then(|b| std::fs::write(&tmp, b))
+            .and_then(|()| std::fs::rename(&tmp, &path));
+        if let Err(e) = written {
+            tracing::debug!(path = %path.display(), "crash-loop backoff not saved: {e}");
+        }
     }
 
     /// The key for one container of one pod.
@@ -86,6 +190,8 @@ impl CrashLoopBackoff {
             None => BASE,
         };
         entries.insert(key.to_string(), Entry { delay, ready_at: now + delay, restarted_at: now });
+        drop(entries);
+        self.save();
     }
 
     /// The container is up. Forget its backoff once it has been up long
@@ -94,6 +200,8 @@ impl CrashLoopBackoff {
         let Ok(mut entries) = self.entries.lock() else { return };
         if entries.get(key).is_some_and(|e| e.restarted_at.elapsed() >= STABLE) {
             entries.remove(key);
+            drop(entries);
+            self.save();
         }
     }
 
@@ -102,7 +210,13 @@ impl CrashLoopBackoff {
     pub fn forget_pod(&self, pod_uid: &str) {
         let Ok(mut entries) = self.entries.lock() else { return };
         let prefix = format!("{pod_uid}/");
+        let before = entries.len();
         entries.retain(|k, _| !k.starts_with(&prefix));
+        let changed = entries.len() != before;
+        drop(entries);
+        if changed {
+            self.save();
+        }
     }
 }
 
@@ -125,6 +239,49 @@ mod tests {
         b.restarted(&k);
         let second = b.wait(&k).expect("still waiting");
         assert!(second > BASE, "the wait must grow: {second:?}");
+    }
+
+    /// #112: a restarted kubelet keeps a crash-looping container's delay, a
+    /// recreated Pod (new uid) does not inherit it, and a forgiven entry is
+    /// not carried over.
+    #[test]
+    fn the_backoff_survives_a_kubelet_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crashloop.json");
+        let k = CrashLoopBackoff::key("u-1", "app");
+
+        let first = CrashLoopBackoff::new();
+        first.persist_to(path.clone());
+        first.restarted(&k);
+        first.restarted(&k); // 20 s
+        let waiting = first.wait(&k).unwrap();
+        assert!(waiting > Duration::from_secs(18), "{waiting:?}");
+
+        // A new kubelet, same file.
+        let second = CrashLoopBackoff::new();
+        second.persist_to(path.clone());
+        let carried = second.wait(&k).expect("still backing off");
+        assert!(carried <= waiting + Duration::from_secs(1) && carried > Duration::from_secs(15), "{carried:?}");
+        // The doubling continues from where it was.
+        second.restarted(&k);
+        assert!(second.wait(&k).unwrap() > Duration::from_secs(35), "40 s next");
+        // Another Pod of the same name has a new uid: nothing to inherit.
+        assert!(second.wait(&CrashLoopBackoff::key("u-2", "app")).is_none());
+        // Gone with its pod, on disk too.
+        second.forget_pod("u-1");
+        let third = CrashLoopBackoff::new();
+        third.persist_to(path.clone());
+        assert!(third.wait(&k).is_none());
+
+        // An entry past the stable window is forgiven, not carried.
+        let old = unix(SystemTime::now()) - STABLE.as_secs() - 5;
+        std::fs::write(&path, serde_json::json!({"u-9/app": {"delay_secs": 300, "ready_at": old + 300, "restarted_at": old}}).to_string()).unwrap();
+        let fourth = CrashLoopBackoff::new();
+        fourth.persist_to(path.clone());
+        assert!(fourth.wait("u-9/app").is_none());
+        // An unreadable file is a fresh start.
+        std::fs::write(&path, "garbage").unwrap();
+        CrashLoopBackoff::new().persist_to(path);
     }
 
     #[test]
