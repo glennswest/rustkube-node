@@ -459,7 +459,9 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e.is_timeout(), "{e}");
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // Each attempt is bounded; the retries (#211) are too: five attempts
+        // and their backoff, well under the engine policy's deadline.
+        assert!(started.elapsed() < std::time::Duration::from_secs(15));
     }
 
     /// Every event line is a change; a connect is one too, and the stream
