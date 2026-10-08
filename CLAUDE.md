@@ -57,7 +57,7 @@ by #51.
 
 ## Work plan
 
-### In progress: #211 (P1), every remote call retries (code review)
+### Done: #211 (P1), every remote call retries (code review)
 
 2026-10-08. Owner: "sounds like it doesn't retry … needs a code review". Inventory: ~90 call sites; apiserver
 (raw reqwest in each module, 30 s timeout, no retry: the reconcile pass is the only retry), stormblock engine (one
@@ -68,10 +68,13 @@ kube-proxy's apiserver client, the test container's `Api`.
        REGISTRY, PEER, LOCAL), `Class` Infra|Real (408/429/500/502/503/504, timeout/connect/reset = infra), `send`
        (reqwest; GET/PUT/DELETE/PATCH repeat, POST only when never sent or 429; `send_repeatable` for named
        creates/reviews), `with_backoff` (generic), Retry-After, jitter, attempts logged. Lock entries by hand.
-2. [x] Route every site through it; a site that must not retry says why in a comment (0a7bc7c, 27fb11e, test 2fa…).
+2. [x] Route every site through it; a site that must not retry says why in a comment (0a7bc7c, 27fb11e; test container and its lock a333c3a).
 3. [x] docs/retries.md (every site, before/after), README/CHANGELOG (8253c0c); 13 retry tests (15ab836: 11 passed
        on a build VM; blocking + message tests added after).
-4. [ ] sc-build, close.
+4. [x] SC_BUILD_VM sc-build 2d92875 `cargo build --locked && cargo test --locked`: 453 kubelet unit, 13 retry, 34 proxy,
+       25 CNI, integration pass (first run: #212, a VM test reading its backoff after the now-retried API calls;
+       fixed). `cd test && cargo test --locked && cargo build --release --locked` at a333c3a: 29 pass, release builds.
+       Stage golden, close.
 
 ### Waiting on stormvm#82 (after stormpump#123): #210, git dependencies pinned by rev (stormcentral#571's SBOM refusal)
 
