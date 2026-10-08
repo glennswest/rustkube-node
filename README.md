@@ -190,6 +190,11 @@ profile). A `gitRepo` volume waits with a message naming its 1.36 removal (clone
 emptyDir). With `--runtime cri`, containerd before 2.0 stops the kubelet at startup (1.36 dropped containerd 1.7);
 CRI-O is not checked. cgroups are v2 only; kube-proxy has no IPVS mode.
 
+**Node allocatable and cgroups** (#24): allocatable is upstream's, capacity less `--system-reserved`,
+`--kube-reserved` and the hard-eviction line (memory 100Mi, nodefs 10%); it was a fixed capacity − 256 MiB. With
+`--runtime cri` each sandbox gets upstream's per-QoS `kubepods` cgroup parent, spelled for the runtime's cgroup driver
+(its `RuntimeConfig`, else `--cgroup-driver`, else cgroupfs). stormpump keeps its own Pod groups (#57).
+
 **An init container runs until it exits** (#126), as upstream: there is no fixed bound (it was 120 s, then
 `DeadlineExceeded`), and its wait holds no worker (its exit is an event). The pod's `activeDeadlineSeconds`, counted
 from its `startTime`, is the only deadline: past it the init container is stopped and reported `DeadlineExceeded`

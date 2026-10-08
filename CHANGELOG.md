@@ -2,6 +2,12 @@
 
 ## 2026-10-08
 
+- **feat:** `--system-reserved`, `--kube-reserved` and `--cgroup-driver`, upstream's flags (#24; `--max-pods` was #165,
+  `--node-labels`/`--register-with-taints` earlier). Allocatable is now upstream's: capacity less both reservations
+  and the hard-eviction line (memory 100Mi, nodefs 10%), CPU in millicores when fractional. **Changed default:** with
+  no reservation, allocatable memory is capacity − 100Mi (it was a fixed capacity − 256Mi). With `--runtime cri`
+  the cgroup driver is the runtime's (`RuntimeConfig`; a disagreeing flag is ignored with a warning), else the flag,
+  else cgroupfs, and every sandbox carries upstream's per-QoS `kubepods` cgroup parent in that spelling (it sent none).
 - **docs:** `docs/networking.md`, the node/CNI networking contract (#32): what the node's boot (`ip=dhcp`: address,
   default route, DNS) and the kubelet (registration, sandboxes, CNI ADD/DEL) own, what network-operator and Cilium own
   (install, conflist, Pod routes, masquerade, Services, `NetworkUnavailable`), the pre-CNI sequence under #3's
