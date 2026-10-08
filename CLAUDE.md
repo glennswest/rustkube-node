@@ -57,6 +57,18 @@ by #51.
 
 ## Work plan
 
+### In progress: #181 (P2), a VM stopped gracefully: Machine::shut_down(grace) before the engine's stop
+
+2026-10-08. `stop` sends the engine's stop (SIGTERM to the hypervisor = a power cut) at once when there is a handle;
+only `stop_by_control` asks the guest. stormvm main (409e0fc, has 94004b7) offers `Machine::shut_down(grace) ->
+PoweredOff | AlreadyGone | StillRunning(why)`; the lock has stormvm 180fa13 (without it).
+1. [ ] Lock: stormvm 180fa13 → 409e0fc (all its crates), on branch wip/181-graceful-stop, built on the build box
+       against stormpump 13cf2c9.
+2. [ ] `stop`: shut_down(grace) in the background (grace = the VMI's terminationGracePeriodSeconds, default 30),
+       the engine's stop only on StillRunning; `stop_by_control` uses shut_down too.
+3. [ ] Node shutdown (item 3) waits on stormpump#56 (the engine stops the kubelet before the hypervisors; the guest's
+       grace is an owner decision there). Tests, docs, CHANGELOG; sc-build; golden; leave #181 open on item 3.
+
 ### Done from this side: #57 step 4, CPU requests as Pod cgroup weights (stormpump#68's Pod group, OpenShift's shape)
 
 2026-10-08. stormpump#68 done (golden-stormpump-accd1a3e8e61, stormpump@13cf2c9, release request stormcos#309):
