@@ -29,10 +29,34 @@ pub struct Asset {
     pub running: bool,
     pub restarts: u32,
     pub age_secs: u64,
+    /// When its running incarnation started, in `CLOCK_BOOTTIME` seconds, the
+    /// clock `/proc/uptime` reads (stormpump#67). Unlike `age_secs` it does not
+    /// go stale between writes of assets.json. `None` from an older PID 1.
+    pub started_secs: Option<f64>,
     /// How it last ended (stormpump#51), once it has: kept across the
     /// restart, so a crash-looping service carries its reason while it is
     /// briefly running again (#82).
     pub last_exit: Option<LastExit>,
+}
+
+impl Asset {
+    /// How long its running incarnation has been up, in whole seconds (#193):
+    /// the node's uptime (`/proc/uptime`, same clock) less `started_secs`,
+    /// which holds still while assets.json is not rewritten; else
+    /// `age_secs`, the age as of that file's last write (an older PID 1,
+    /// which rewrites it often enough).
+    pub fn age(&self, uptime: Option<f64>) -> u64 {
+        match (self.started_secs, uptime) {
+            (Some(started), Some(up)) => (up - started).max(0.0) as u64,
+            _ => self.age_secs,
+        }
+    }
+}
+
+/// The node's uptime in seconds, `CLOCK_BOOTTIME` (`/proc/uptime`'s first
+/// field): the clock stormpump's `started_secs` is in.
+pub fn node_uptime() -> Option<f64> {
+    std::fs::read_to_string("/proc/uptime").ok()?.split_whitespace().next()?.parse().ok()
 }
 
 /// A node service's last exit, from assets.json (stormpump#51).
@@ -137,6 +161,7 @@ pub fn parse_assets(text: &str) -> Vec<Asset> {
                 running: a["running"].as_bool().unwrap_or(false),
                 restarts: a["restarts"].as_u64().unwrap_or(0) as u32,
                 age_secs: a["age_secs"].as_u64().unwrap_or(0),
+                started_secs: a["started_secs"].as_f64(),
                 last_exit: LastExit::of(a),
             })
         })
@@ -747,5 +772,22 @@ mod tests {
         let mut q = plain.clone();
         with_provenance(&mut q, None, "192.168.8.10");
         assert!(q["status"]["containerStatuses"][0].get("imageID").is_none());
+    }
+
+    /// #193: a service's age from started_secs and the node's uptime (which
+    /// does not go stale between file writes), else age_secs.
+    #[test]
+    fn age_is_uptime_less_started_secs_else_age_secs() {
+        let text = r#"{"assets":[
+            {"name":"stormblock","running":true,"restarts":0,"age_secs":812,"node_uptime_secs":840,"started_secs":28},
+            {"name":"old","running":true,"restarts":0,"age_secs":7}]}"#;
+        let a = parse_assets(text);
+        assert_eq!(a[0].started_secs, Some(28.0));
+        // Ten minutes after the file was written, the age has moved with it.
+        assert_eq!(a[0].age(Some(1440.5)), 1412);
+        assert_eq!(a[0].age(None), 812, "no uptime: the file's age");
+        assert_eq!(a[1].age(Some(1440.5)), 7, "an older PID 1: age_secs");
+        assert_eq!(Asset { started_secs: Some(50.0), ..Default::default() }.age(Some(40.0)), 0, "never negative");
+        assert!(node_uptime().is_some_and(|u| u > 0.0));
     }
 }

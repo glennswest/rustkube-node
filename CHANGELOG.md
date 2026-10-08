@@ -2,6 +2,10 @@
 
 ## 2026-10-08
 
+- **fix:** A node service's mirror pod takes its `startTime` from PID 1's `started_secs` (`CLOCK_BOOTTIME`) against
+  `/proc/uptime`, not from `age_secs` (#193): since stormpump#67 assets.json is written only when the table
+  changes, so `age_secs` goes stale between writes and the start time would drift and be rewritten every pass.
+  `age_secs` stays the fallback for a PID 1 without `started_secs`.
 - **feat:** An image's declared `Volumes` are made (#172): read from the registry's golden config, each path no pod
   mount covers becomes a directory in the container's own root, CRI-O's default `mkdir` behaviour (the root is the
   container's private writable clone since #104). Made component by component, never through a symlink.

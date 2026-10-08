@@ -2138,11 +2138,12 @@ async fn mirror_node_services(
         let seen =
             LAST_SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
         let now = chrono::Utc::now();
+        let uptime = crate::mirror::node_uptime();
         let mut changes = Vec::new();
         {
             let mut last = seen.lock().unwrap_or_else(|e| e.into_inner());
             for a in &assets {
-                let started = (now - chrono::Duration::seconds(a.age_secs as i64))
+                let started = (now - chrono::Duration::seconds(a.age(uptime) as i64))
                     .format("%Y-%m-%dT%H:%M:%SZ")
                     .to_string();
                 let name = crate::mirror::mirror_name(&a.name, node);
@@ -2190,6 +2191,7 @@ async fn mirror_node_services(
     // Asked only when there is one to create.
     let mut node_uid: Option<String> = None;
     let now = chrono::Utc::now();
+    let uptime = crate::mirror::node_uptime();
     // Each service's golden, from the release the node booted (#130).
     let release = crate::image_config::RELEASE_MANIFESTS
         .iter()
@@ -2197,9 +2199,10 @@ async fn mirror_node_services(
         .unwrap_or_default();
     for a in &assets {
         let golden = crate::image_config::release_golden_in(&release, &a.name);
-        // startTime from the age PID 1 reported: the two ends share no clock,
-        // so an age is portable where an instant is not.
-        let started = (now - chrono::Duration::seconds(a.age_secs as i64))
+        // startTime from the service's age (#193): the node's uptime less PID
+        // 1's `started_secs` (one clock, CLOCK_BOOTTIME), which stays right
+        // between writes of assets.json; else the `age_secs` the file says.
+        let started = (now - chrono::Duration::seconds(a.age(uptime) as i64))
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
         let name = crate::mirror::mirror_name(&a.name, node);

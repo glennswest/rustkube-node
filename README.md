@@ -303,6 +303,9 @@ data.
 When PID 1's asset table (`/run/stormpump/assets.json`) changes, and when a mirror pod is edited or deleted,
 the kubelet mirrors each asset as a
 read-only pod, `kube-system/<asset>-<node>` (labels `storm.io/asset`, `storm.io/component=node-service`).
+Its `startTime` is now less the service's age: the node's uptime (`/proc/uptime`) less PID 1's `started_secs`
+(the same `CLOCK_BOOTTIME`), which holds still while assets.json is written only on a change (stormpump#67);
+an older PID 1 without it gives `age_secs` (#193).
 A running asset's pod is Running and Ready, and a stopped one is Failed. **Ready means it answers** (#96): for a
 host-network service the kubelet reads the liveness URL its golden's stormd config declares
 (`[process.liveness] type = "http"`, `url = …`; the golden is the boot unit's `root` volume, under `/hostroot`)

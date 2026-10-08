@@ -71,6 +71,12 @@ among them (stormcos#368 will enforce).
        stormcos#402 filed (kubelet SA token + `STORMBLOCK_ADMIN_TOKEN_FILE`, before #368). Stage golden
        golden-rustkube-node-dc81277f6b12 (stormcos#366). Closed. Live check is stormcos#402/#368's audit log.
 
+### In progress: #193, mirror startTime from started_secs
+
+2026-10-08. stormpump#67 (golden 07243f4976bd, stormcos#309): assets.json written on change only, `started_secs`
+(CLOCK_BOOTTIME). `Asset.started_secs`, `Asset::age(uptime)`, `node_uptime()`; both mirror sites. Test, README,
+CHANGELOG; sc-build; golden; close; tell stormpump#110 (its 3 s refresh can go once a release carries this).
+
 ### Done: #172, image Volumes become mount points
 
 2026-10-08. stormblock-registry#58 closed; its ImageConfig has `Volumes`. Chosen: CRI-O's default (`mkdir` in the
