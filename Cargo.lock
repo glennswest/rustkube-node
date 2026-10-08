@@ -2919,12 +2919,12 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "stormcast"
 version = "0.1.1"
-source = "git+https://github.com/glennswest/stormcast?branch=main#2bcdafc5e23c7daaf666012436ec08b64061124c"
+source = "git+https://github.com/glennswest/stormcast?branch=main#3cec734ee0239604e9ce6e203cda403ab49aba75"
 
 [[package]]
 name = "stormpump"
 version = "0.1.0"
-source = "git+https://github.com/glennswest/stormpump?branch=main#795b92e0b3198ab8191d83312b570e149f8fcc80"
+source = "git+https://github.com/glennswest/stormpump?branch=main#13cf2c913ef5d5400bfc6398667d927866ae0416"
 dependencies = [
  "libc",
  "stormcast",
@@ -2934,7 +2934,7 @@ dependencies = [
 [[package]]
 name = "stormpump-abi"
 version = "0.1.0"
-source = "git+https://github.com/glennswest/stormpump?branch=main#795b92e0b3198ab8191d83312b570e149f8fcc80"
+source = "git+https://github.com/glennswest/stormpump?branch=main#13cf2c913ef5d5400bfc6398667d927866ae0416"
 
 [[package]]
 name = "stormvm-block"
