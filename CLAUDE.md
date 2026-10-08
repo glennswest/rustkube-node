@@ -71,6 +71,15 @@ among them (stormcos#368 will enforce).
        stormcos#402 filed (kubelet SA token + `STORMBLOCK_ADMIN_TOKEN_FILE`, before #368). Stage golden
        golden-rustkube-node-dc81277f6b12 (stormcos#366). Closed. Live check is stormcos#402/#368's audit log.
 
+### Waiting on the owner: #13 (P3), microVM Pods (`--runtime vm`)
+
+2026-10-08. Stopped before code. Found: stormvisor (created 07-16, minutes before #13) is the platform's microVM-Pod
+runtime (OCI RuntimeClass shim, stormfork microVMs, guest agent + youki; stormcos kubernetes edition ships
+`stormvisor-shim`, cloud-hypervisor, firecracker), and #13's items 2-4 are its scope. `--runtime vm` is node-wide
+(no stormpump Pods/VMIs on that node), start/stop are Phase-1 stubs, one rootfs template; the kubelet ignores
+`runtimeClassName` (CRI `runtime_handler` always ""). Asked on #13: A RuntimeClass dispatch to stormvisor, retire
+vm_runtime (recommended); B finish `--runtime vm`; C microVM Pods via stormvm on stormpump. `wait-owner` run.
+
 ### Closed: #142 (P3), the kubelet's own NVMe/TCP connect: not planned
 
 2026-10-08. Nothing on the current path needs it: replicated claims are stormblock-csi's (owner on #68; its node
