@@ -69,6 +69,8 @@ by #51.
        spec, so the release must carry both); close.
        Done on wip/57-pod-groups (f6312e9 code, f2163fd lock; lock diff from build job 15d6107177, whole workspace built
        against stormvm 180fa13), fast-forwarded to main. sc-build fe6f90d674: 418 kubelet unit pass (3 new/changed).
+       Stage golden golden-rustkube-node-2842aefdb2cf (a87d82e), stormcos#366; must ship with golden-stormpump-accd1a3e8e61
+       (stormcos#309), said on both. #57 closed.
 
 ### Done: #50 (P2), node services' lifecycle Events
 
@@ -1478,7 +1480,7 @@ Steps:
        the release (the test machine's kubelet writes the old names) and the test pipeline (#64).
 6. [x] Tests (fake apiserver + engine end to end), docs (`docs/node-volumes.md`), CHANGELOG. sc-build at 30bb887: all pass (kubelet 185).
 
-### In progress: #57, pod limits onto stormpump `Spec.limits`, container stats from `QUERY`
+### Done: #57, pod limits onto stormpump `Spec.limits`, container stats from `QUERY`
 
 Steps:
 1. [x] `spec_for`: `memory_limit_bytes` → `memory_max` (+ `swap_max = 0`), `cpu_quota`/`cpu_period` → `cpu_max`.
