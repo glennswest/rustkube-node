@@ -22,6 +22,22 @@
 //! makes the client read it again and, if it changed, retry once. The engine
 //! keeps its token across restarts, so a 401 with an unchanged token is
 //! returned to the caller as it is.
+//!
+//! **The admin token (#105).** Since stormblock#274 (`admin_gate = enforce`)
+//! the node token no longer covers destructive verbs: deleting a template
+//! (`DELETE /api/v1/fstemplates/{t}`, #140's rebuild of a broken blank), a
+//! sealed volume, and the rest stormblock classifies so. Those need the
+//! engine's admin token. It is found as stormblock finds it:
+//! `$STORMBLOCK_ADMIN_TOKEN`, then the file at `$STORMBLOCK_ADMIN_TOKEN_FILE`
+//! (default `/run/stormblock-admin/admin_token`). The kubelet presents the
+//! node token first, always; only a call that changes something (not a GET)
+//! and is still refused with 401 after the node token's own re-read is sent
+//! once more with the admin token. What is destructive stays the engine's
+//! decision (a volume delete is, or is not, by whether the volume is sealed).
+//! The admin token is read again at every such call, so a rotated one is used
+//! at once, and is never cached, logged or shown by `{:?}`. With no admin
+//! token, or on an engine with one token for everything, nothing changes: the
+//! 401 goes back to the caller, which reports it and retries on its next pass.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,6 +64,10 @@ pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// that outlives this is found again by name, not made twice.
 pub const MINT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// Where stormblock keeps its admin token unless told otherwise (stormblock
+/// `mgmt::auth::admin_token_file`).
+pub const DEFAULT_ADMIN_TOKEN_FILE: &str = "/run/stormblock-admin/admin_token";
+
 const FALLBACK_TOKEN_FILES: [&str; 2] = ["/etc/stormblock/api_token", "/var/lib/stormblock/api_token"];
 
 /// Where the engine's token can come from, in order. Not `Debug`: it can
@@ -58,6 +78,8 @@ pub struct TokenSource {
     explicit: Option<String>,
     /// Files, first readable non-empty one wins.
     files: Vec<PathBuf>,
+    /// The variable `explicit` came from, for messages.
+    env: &'static str,
 }
 
 impl TokenSource {
@@ -73,12 +95,27 @@ impl TokenSource {
             .unwrap_or_else(|| DEFAULT_TOKEN_FILE.to_string());
         let mut files = vec![PathBuf::from(first)];
         files.extend(FALLBACK_TOKEN_FILES.iter().map(PathBuf::from));
-        TokenSource { explicit, files }
+        TokenSource { explicit, files, env: "$STORMBLOCK_API_TOKEN" }
+    }
+
+    /// The admin token's lookup (#105), as stormblock resolves it:
+    /// `$STORMBLOCK_ADMIN_TOKEN`, then `$STORMBLOCK_ADMIN_TOKEN_FILE`, else
+    /// [`DEFAULT_ADMIN_TOKEN_FILE`].
+    pub fn admin_from_env() -> TokenSource {
+        let explicit = std::env::var("STORMBLOCK_ADMIN_TOKEN")
+            .ok()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        let file = std::env::var("STORMBLOCK_ADMIN_TOKEN_FILE")
+            .ok()
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_ADMIN_TOKEN_FILE.to_string());
+        TokenSource { explicit, files: vec![PathBuf::from(file)], env: "$STORMBLOCK_ADMIN_TOKEN" }
     }
 
     /// Only these files, and no environment. For tests.
     pub fn files(files: impl IntoIterator<Item = impl Into<PathBuf>>) -> TokenSource {
-        TokenSource { explicit: None, files: files.into_iter().map(Into::into).collect() }
+        TokenSource { explicit: None, files: files.into_iter().map(Into::into).collect(), env: "" }
     }
 
     /// No token at all: for an engine that runs with `require_auth = false`,
@@ -103,7 +140,7 @@ impl TokenSource {
     fn describe(&self) -> String {
         let mut places = Vec::new();
         if self.explicit.is_some() {
-            places.push("$STORMBLOCK_API_TOKEN".to_string());
+            places.push(self.env.to_string());
         }
         places.extend(self.files.iter().map(|p| p.display().to_string()));
         places.join(", ")
@@ -114,6 +151,10 @@ struct Inner {
     http: reqwest::Client,
     url: String,
     source: TokenSource,
+    /// The admin token's source (#105). Read at each use, never cached.
+    admin: TokenSource,
+    /// Whether "no admin token" has been logged.
+    said_no_admin: AtomicBool,
     /// The token last read. `None` until one is found.
     token: Mutex<Option<String>>,
     /// Whether "no token found" has been logged, so a node whose engine has
@@ -136,6 +177,7 @@ impl std::fmt::Debug for EngineClient {
         f.debug_struct("EngineClient")
             .field("url", &self.inner.url)
             .field("token_from", &self.inner.source.describe())
+            .field("admin_token_from", &self.inner.admin.describe())
             .finish()
     }
 }
@@ -150,10 +192,18 @@ impl EngineClient {
     /// The engine at `url`, with the token found the way stormblock's CLI
     /// finds it.
     pub fn from_env(url: &str) -> EngineClient {
-        EngineClient::new(url, TokenSource::from_env())
+        EngineClient::with_admin(url, TokenSource::from_env(), TokenSource::admin_from_env())
     }
 
+    /// The node token only: destructive verbs are refused on an enforcing
+    /// engine.
     pub fn new(url: &str, source: TokenSource) -> EngineClient {
+        EngineClient::with_admin(url, source, TokenSource::none())
+    }
+
+    /// The node token, and the admin token for what the node token is
+    /// refused (#105).
+    pub fn with_admin(url: &str, source: TokenSource, admin: TokenSource) -> EngineClient {
         EngineClient {
             inner: Arc::new(Inner {
                 // No client-wide timeout: each request carries its own, and
@@ -164,6 +214,8 @@ impl EngineClient {
                     .unwrap_or_default(),
                 url: url.trim_end_matches('/').to_string(),
                 source,
+                admin,
+                said_no_admin: AtomicBool::new(false),
                 token: Mutex::new(None),
                 said_none: AtomicBool::new(false),
             }),
@@ -231,14 +283,42 @@ impl EngineClient {
             return Ok(resp);
         }
         let fresh = self.reload();
+        let mut resp = resp;
         if fresh.is_some() && fresh != used {
             info!("stormblock refused the engine token; retrying with the one now on disk");
-            return self.once(method, url, body, fresh.as_deref(), timeout).await;
+            resp = self.once(method.clone(), url, body, fresh.as_deref(), timeout).await?;
+            if resp.status() != StatusCode::UNAUTHORIZED {
+                return Ok(resp);
+            }
         }
         if fresh.is_none() {
             self.say_none();
+            return Ok(resp);
         }
-        Ok(resp)
+        // The node token is current and still refused: a destructive verb
+        // on an engine that gates them (stormblock#274). Reads never are.
+        if method == Method::GET {
+            return Ok(resp);
+        }
+        match self.inner.admin.read() {
+            Some(admin) if Some(&admin) != fresh.as_ref() => {
+                info!(%method, url = %path_of(url), "stormblock wants the admin token for this call; presenting it");
+                self.inner.said_no_admin.store(false, Ordering::Relaxed);
+                self.once(method, url, body, Some(&admin), timeout).await
+            }
+            Some(_) => Ok(resp),
+            None => {
+                if !self.inner.said_no_admin.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        %method, url = %path_of(url),
+                        "stormblock refused this call to the node token and no admin token was found \
+                         (looked in {}); it is refused until one is provided, and retried by its caller",
+                        self.inner.admin.describe()
+                    );
+                }
+                Ok(resp)
+            }
+        }
     }
 
     async fn once(
@@ -290,6 +370,11 @@ impl EngineClient {
             );
         }
     }
+}
+
+/// A URL without its query, for a log line.
+fn path_of(url: &str) -> &str {
+    url.split('?').next().unwrap_or(url)
 }
 
 /// stormblock's watch on its volumes (stormblock#80): newline-delimited
@@ -505,6 +590,120 @@ mod tests {
         assert_eq!(other.token().as_deref(), Some("b"));
     }
 
+    /// stormblock#274's gate, in small: GET and POST take the node token (or
+    /// the admin's); a template DELETE takes only the admin token. Records the
+    /// bearer each request carried.
+    async fn gated(node: &str, admin: Option<Arc<Mutex<String>>>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        let node = node.to_string();
+        let app = axum::Router::new().route(
+            "/api/v1/fstemplates/{t}",
+            axum::routing::any(move |method: axum::http::Method, headers: axum::http::HeaderMap| {
+                let (node, admin, log) = (node.clone(), admin.clone(), log.clone());
+                async move {
+                    let got = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("Bearer "))
+                        .unwrap_or("")
+                        .to_string();
+                    log.lock().unwrap().push(got.clone());
+                    let is_admin = admin.as_ref().is_some_and(|a| *a.lock().unwrap() == got);
+                    let is_node = got == node;
+                    // No admin token configured: one token covers everything.
+                    let ok = if method == axum::http::Method::DELETE && admin.is_some() {
+                        is_admin
+                    } else {
+                        is_node || is_admin
+                    };
+                    if ok {
+                        axum::http::StatusCode::OK
+                    } else {
+                        axum::http::StatusCode::UNAUTHORIZED
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// Distinct tokens (#105): the node token first; the delete it is refused
+    /// is sent again with the admin token; a read never carries the admin's.
+    #[tokio::test]
+    async fn a_destructive_call_refused_to_the_node_token_presents_the_admin_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let (nf, af) = (dir.path().join("api_token"), dir.path().join("admin_token"));
+        std::fs::write(&nf, "node").unwrap();
+        std::fs::write(&af, "admin1\n").unwrap();
+        let admin = Arc::new(Mutex::new("admin1".to_string()));
+        let (url, seen) = gated("node", Some(admin.clone())).await;
+        let c = EngineClient::with_admin(&url, TokenSource::files([&nf]), TokenSource::files([&af]));
+        let path = format!("{url}/api/v1/fstemplates/pvc-ext4j-64m");
+
+        assert_eq!(c.get(&path).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(c.delete(&path).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(*seen.lock().unwrap(), ["node", "node", "admin1"]);
+
+        // Rotation: the new admin token is read at the next such call.
+        *admin.lock().unwrap() = "admin2".into();
+        std::fs::write(&af, "admin2").unwrap();
+        seen.lock().unwrap().clear();
+        assert_eq!(c.delete(&path).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(*seen.lock().unwrap(), ["node", "admin2"]);
+
+        // A read refused to the node token is not escalated.
+        let (url2, seen2) = gated("other", Some(admin)).await;
+        let c2 = EngineClient::with_admin(&url2, TokenSource::files([&nf]), TokenSource::files([&af]));
+        let p2 = format!("{url2}/api/v1/fstemplates/x");
+        assert_eq!(c2.get(&p2).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(*seen2.lock().unwrap(), ["node"]);
+    }
+
+    /// No admin token: the refusal goes back to the caller as it is (it
+    /// reports it and retries on its next pass), once the token appears the
+    /// same call succeeds.
+    #[tokio::test]
+    async fn a_missing_admin_token_leaves_the_refusal_visible_and_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (nf, af) = (dir.path().join("api_token"), dir.path().join("admin_token"));
+        std::fs::write(&nf, "node").unwrap();
+        let (url, seen) = gated("node", Some(Arc::new(Mutex::new("adm".into())))).await;
+        let c = EngineClient::with_admin(&url, TokenSource::files([&nf]), TokenSource::files([&af]));
+        let path = format!("{url}/api/v1/fstemplates/t");
+
+        assert_eq!(c.delete(&path).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(*seen.lock().unwrap(), ["node"]);
+
+        std::fs::write(&af, "adm").unwrap();
+        assert_eq!(c.delete(&path).await.unwrap().status(), StatusCode::OK);
+
+        // A wrong admin token is refused once and returned, not looped on.
+        std::fs::write(&af, "stale").unwrap();
+        seen.lock().unwrap().clear();
+        assert_eq!(c.delete(&path).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(*seen.lock().unwrap(), ["node", "stale"]);
+    }
+
+    /// One token for everything (an engine before stormblock#274, or
+    /// `admin_gate = audit`): the admin token is never presented.
+    #[tokio::test]
+    async fn a_single_token_engine_never_sees_the_admin_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let (nf, af) = (dir.path().join("api_token"), dir.path().join("admin_token"));
+        std::fs::write(&nf, "node").unwrap();
+        std::fs::write(&af, "adm").unwrap();
+        let (url, seen) = gated("node", None).await;
+        let c = EngineClient::with_admin(&url, TokenSource::files([&nf]), TokenSource::files([&af]));
+        let path = format!("{url}/api/v1/fstemplates/t");
+        assert_eq!(c.delete(&path).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(c.post(&path, &serde_json::json!({})).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(*seen.lock().unwrap(), ["node", "node"]);
+    }
+
     #[test]
     fn the_first_readable_file_wins_and_blank_files_are_skipped() {
         let dir = tempfile::tempdir().unwrap();
@@ -517,9 +716,11 @@ mod tests {
 
     #[test]
     fn debug_does_not_print_the_token() {
-        let src = TokenSource { explicit: Some("secret".into()), files: vec![] };
-        let c = EngineClient::new(DEFAULT_URL, src);
+        let src = TokenSource { explicit: Some("secret".into()), files: vec![], env: "$X" };
+        let admin = TokenSource { explicit: Some("root-secret".into()), files: vec![], env: "$Y" };
+        let c = EngineClient::with_admin(DEFAULT_URL, src, admin);
         let _ = c.token();
-        assert!(!format!("{c:?}").contains("secret"));
+        let shown = format!("{c:?}");
+        assert!(!shown.contains("secret"), "{shown}");
     }
 }

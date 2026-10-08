@@ -119,7 +119,20 @@ Engine token lookup: nonempty `STORMBLOCK_API_TOKEN`, then
 `STORMBLOCK_TOKEN_FILE` (default `/run/stormblock/engine/api_token`), then
 `/etc/stormblock/api_token`, then `/var/lib/stormblock/api_token`.
 It retries discovery while absent, caches a found token, and rereads on 401,
-retrying once only if changed. No separate admin-token source exists (#105).
+retrying once only if changed.
+
+Admin credential (#105), for what stormblock's admin gate (stormblock#274)
+refuses to the node token: deleting a template (#140's rebuild of a broken
+blank) or a sealed volume. Nonempty `STORMBLOCK_ADMIN_TOKEN`, then the file at
+`STORMBLOCK_ADMIN_TOKEN_FILE` (default `/run/stormblock-admin/admin_token`,
+stormblock's own default). The file can hold the engine's admin token or a
+Kubernetes ServiceAccount token that the engine's SubjectAccessReview allows
+(`storage.storm.io`, the stormcos#296 route). The node token is always sent
+first; only a non-GET call still refused with 401 after the node token's reread
+is sent once more with the admin credential. It is read at each such call
+(rotation needs no restart), never cached or logged. Absent: the 401 reaches the
+caller, which reports it (the claim's ProvisioningFailed Event) and retries on
+its next pass; one warning names where it was looked for.
 
 ### Library-only defaults and fixed paths
 

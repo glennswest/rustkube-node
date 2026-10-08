@@ -297,7 +297,7 @@ or else from the file at `$STORMBLOCK_TOKEN_FILE` (default
 `/etc/stormblock/api_token`, then `/var/lib/stormblock/api_token`. The engine
 mints the token when it starts, and the kubelet may start first, so while no
 token is found the kubelet looks again on every call. After a 401 it reads the
-token again and retries once if the token changed. Separate admin-token support is missing (#105). Every other StorageClass goes
+token again and retries once if the token changed. A change the engine refuses to the node token (a destructive verb under stormblock#274's admin gate, such as deleting a broken template) is sent once more with the admin credential from `$STORMBLOCK_ADMIN_TOKEN` or the file at `$STORMBLOCK_ADMIN_TOKEN_FILE` (the engine's admin token, or a ServiceAccount token its SubjectAccessReview allows), read at each use (#105). Every other StorageClass goes
 through its CSI driver. The kubelet registers node plugins from
 `/var/lib/kubelet/plugins_registry`, writes `CSINode`, and stages and
 publishes volumes. It will not give a pod a volume whose mount has not reached

@@ -2,6 +2,12 @@
 
 ## 2026-10-08
 
+- **feat:** The stormblock engine client carries an admin credential for destructive verbs (#105). Since
+  stormblock#274 the node token no longer covers deleting a template or a sealed volume; such a call (any non-GET)
+  that is still refused with 401 after the node token's reread is sent once more with `$STORMBLOCK_ADMIN_TOKEN` or
+  the file at `$STORMBLOCK_ADMIN_TOKEN_FILE` (default `/run/stormblock-admin/admin_token`): the engine's admin token
+  or a ServiceAccount token its SubjectAccessReview allows. Read at each use (rotation), never cached or logged;
+  absent, the refusal reaches the caller as before and is retried on its next pass. Single-token engines see no change.
 - **fix:** A crash-looping container keeps its restart backoff across a kubelet restart (#112): CrashLoopBackOff is
   written to `<state root>/crashloop.json` (wall-clock seconds, atomically, on every change) and read back by the
   restarted kubelet's state recovery. An entry past the 10-minute stable window is forgiven, so not carried; a Pod
