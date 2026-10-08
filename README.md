@@ -80,7 +80,7 @@ histogram `kubelet_pod_start_phase_duration_seconds{phase}` and one INFO log lin
 
 | phase | from → to |
 |---|---|
-| `scheduled` | the pod's `PodScheduled` transition (else its `creationTimestamp`) → seen here. Wall clocks of two machines: negative when they disagree by more than the gap |
+| `scheduled` | the bind → seen here. The bind is rustkube's `storm.io/scheduled-at` annotation (microseconds, written with `spec.nodeName`, rustkube#190), else the pod's `PodScheduled` transition, else its `creationTimestamp`; those two are whole seconds and carry up to a second of truncation (#135). Wall clocks of two machines (exact when the scheduler is on this node): negative when they disagree by more than the gap |
 | `wait` | seen → the start attempt that succeeded began: admission, image and volume waits, earlier attempts |
 | `image` | the pod's images first asked for → the last resolved. A pallet is ~0; a pull is one registry lookup of the image's golden record (no clone: #104) |
 | `volumes` | the pod's volumes in that attempt: claims cloned and attached, configMaps, secrets, projected, the ServiceAccount token, resolv.conf and log dirs. Each spec volume also as `volume/<name>` |

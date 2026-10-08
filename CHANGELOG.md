@@ -2,6 +2,10 @@
 
 ## 2026-10-08
 
+- **fix:** Start timing's `scheduled` phase is timed from rustkube's `storm.io/scheduled-at` annotation (the bind time
+  in microseconds, rustkube#190) when the pod carries it, and kept in microseconds (`scheduled=4.3ms`), #135. The
+  `PodScheduled` transition and `creationTimestamp` (whole seconds, up to 999 ms of truncation: pvetest1's
+  "growing" 156→393 ms) remain the fallbacks.
 - **feat:** `--system-reserved`, `--kube-reserved` and `--cgroup-driver`, upstream's flags (#24; `--max-pods` was #165,
   `--node-labels`/`--register-with-taints` earlier). Allocatable is now upstream's: capacity less both reservations
   and the hard-eviction line (memory 100Mi, nodefs 10%), CPU in millicores when fractional. **Changed default:** with

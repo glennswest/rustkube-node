@@ -11,7 +11,7 @@
 //!
 //! | phase        | from → to |
 //! |--------------|-----------|
-//! | `scheduled`  | the pod's `PodScheduled` transition (else `creationTimestamp`) → seen here; wall clocks of two machines |
+//! | `scheduled`  | the bind (`storm.io/scheduled-at`, microseconds, rustkube#190; else the `PodScheduled` transition; else `creationTimestamp`, both whole seconds) → seen here; wall clocks of two machines |
 //! | `wait`       | seen → the start attempt that succeeded began (admission, image and volume waits, retries) |
 //! | `image`      | this pod's images first asked for → the last of them resolved; a pull is the registry's clone, its attach and its mount |
 //! | `volumes`    | every volume of the pod (each also as `volume/<name>`), claims cloned and attached included |
@@ -67,9 +67,10 @@ pub const SANDBOX_STEPS: &[&str] = &["sandbox/acquire", "sandbox/cni", "sandbox/
 #[derive(Debug, Clone)]
 pub struct StartTiming {
     seen: Instant,
-    /// Milliseconds from scheduling to seen, by wall clock. Negative when the
-    /// two machines' clocks disagree by more than the gap; reported as is.
-    scheduled_ms: Option<i64>,
+    /// Microseconds from scheduling to seen, by wall clock (#135: the bind
+    /// time has microseconds). Negative when the two machines' clocks
+    /// disagree by more than the gap; reported as is.
+    scheduled_us: Option<i64>,
     attempts: u32,
     image_asked: Option<Instant>,
     image: Option<Duration>,
@@ -178,7 +179,7 @@ impl StartTiming {
     fn seen_at(pod: &Value, seen: Instant, now: chrono::DateTime<chrono::Utc>) -> Self {
         Self {
             seen,
-            scheduled_ms: scheduled_at(pod).map(|t| (now - t).num_milliseconds()),
+            scheduled_us: scheduled_at(pod).and_then(|t| (now - t).num_microseconds()),
             attempts: 0,
             image_asked: None,
             image: None,
@@ -223,10 +224,13 @@ impl StartTiming {
         let total = acked.saturating_duration_since(self.seen);
         let mut phases: Vec<(&'static str, Duration)> = Vec::new();
         let mut text: Vec<String> = Vec::new();
-        if let Some(ms) = self.scheduled_ms {
-            text.push(format!("scheduled={ms}ms"));
-            if ms >= 0 {
-                phases.push(("scheduled", Duration::from_millis(ms as u64)));
+        if let Some(us) = self.scheduled_us {
+            let d = Duration::from_micros(us.unsigned_abs());
+            if us >= 0 {
+                text.push(format!("scheduled={}", ms(d)));
+                phases.push(("scheduled", d));
+            } else {
+                text.push(format!("scheduled=-{}", ms(d)));
             }
         }
         let mut put = |name: &'static str, d: Duration| {
@@ -310,10 +314,19 @@ fn ms(d: Duration) -> String {
     }
 }
 
-/// When the pod was bound to a node: its `PodScheduled` condition's
-/// transition, else its creation (a pod made with `nodeName` set never
-/// passes the scheduler).
+/// The annotation rustkube's scheduler writes with the bind, in the same
+/// write as `spec.nodeName`: RFC3339 with microseconds (rustkube#190).
+pub const SCHEDULED_AT: &str = "storm.io/scheduled-at";
+
+/// When the pod was bound to a node (#135): [`SCHEDULED_AT`] when it parses;
+/// else its `PodScheduled` condition's transition; else its creation (a pod
+/// made with `nodeName` set never passes the scheduler). The last two are
+/// metav1.Time, whole seconds, so they carry up to a second of truncation.
 fn scheduled_at(pod: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    let parse = |t: &str| chrono::DateTime::parse_from_rfc3339(t).ok().map(|t| t.with_timezone(&chrono::Utc));
+    if let Some(t) = pod["metadata"]["annotations"][SCHEDULED_AT].as_str().and_then(parse) {
+        return Some(t);
+    }
     let scheduled = pod["status"]["conditions"].as_array().and_then(|cs| {
         cs.iter()
             .find(|c| c["type"] == "PodScheduled" && c["status"] == "True")
@@ -340,12 +353,34 @@ mod tests {
             "status": {"conditions": [{"type": "PodScheduled", "status": "True",
                 "lastTransitionTime": "2026-10-02T10:00:01Z"}]}});
         let t = StartTiming::seen_at(&pod, Instant::now(), at("2026-10-02T10:00:01.250Z"));
-        assert_eq!(t.scheduled_ms, Some(250));
+        assert_eq!(t.scheduled_us, Some(250_000));
         let bare = json!({"metadata": {"creationTimestamp": "2026-10-02T10:00:00Z"}});
         let t = StartTiming::seen_at(&bare, Instant::now(), at("2026-10-02T10:00:02Z"));
-        assert_eq!(t.scheduled_ms, Some(2000));
+        assert_eq!(t.scheduled_us, Some(2_000_000));
         let t = StartTiming::seen_at(&json!({}), Instant::now(), at("2026-10-02T10:00:02Z"));
-        assert_eq!(t.scheduled_ms, None);
+        assert_eq!(t.scheduled_us, None);
+    }
+
+    /// #135: the scheduler's microsecond bind time wins over the whole-second
+    /// condition, and a sub-10 ms gap reads in tenths.
+    #[test]
+    fn scheduled_from_the_bind_annotation_first() {
+        let pod = json!({"metadata": {"creationTimestamp": "2026-10-02T10:00:00Z",
+                "annotations": {"storm.io/scheduled-at": "2026-10-02T10:00:01.123456Z"}},
+            "status": {"conditions": [{"type": "PodScheduled", "status": "True",
+                "lastTransitionTime": "2026-10-02T10:00:01Z"}]}});
+        let seen = Instant::now();
+        let mut t = StartTiming::seen_at(&pod, seen, at("2026-10-02T10:00:01.127756Z"));
+        assert_eq!(t.scheduled_us, Some(4_300));
+        t.started(Attempt::begin());
+        let f = t.finish(Duration::ZERO, seen);
+        assert!(f.text.starts_with("scheduled=4.3ms "), "{}", f.text);
+        assert!(f.phases.contains(&("scheduled", Duration::from_micros(4_300))));
+        // Unparseable: the condition, as before.
+        let mut bad = pod.clone();
+        bad["metadata"]["annotations"]["storm.io/scheduled-at"] = json!("soon");
+        let t = StartTiming::seen_at(&bad, seen, at("2026-10-02T10:00:01.127756Z"));
+        assert_eq!(t.scheduled_us, Some(127_756));
     }
 
     #[test]
