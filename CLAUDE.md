@@ -71,13 +71,14 @@ among them (stormcos#368 will enforce).
        stormcos#402 filed (kubelet SA token + `STORMBLOCK_ADMIN_TOKEN_FILE`, before #368). Stage golden
        golden-rustkube-node-dc81277f6b12 (stormcos#366). Closed. Live check is stormcos#402/#368's audit log.
 
-### In progress: #172, image Volumes become mount points
+### Done: #172, image Volumes become mount points
 
 2026-10-08. stormblock-registry#58 closed; its ImageConfig has `Volumes`. Chosen: CRI-O's default (`mkdir` in the
 container's root), not containerd's copied volume: since #104 the root is private and writable, so a directory there
 keeps the image's content and dies with the container; an empty bind would hide it. `ImageConfig.volumes`,
 `declared_volumes` (mount at/above covers), `make_in_root` (no symlink followed); create_container. Tests (2),
-README, CHANGELOG; sc-build; golden; close.
+README, CHANGELOG (d104cb5). SC_BUILD_VM sc-build: musl release + 451 kubelet unit pass. Stage golden
+golden-rustkube-node-c3b4f7e086ea (stormcos#366). Closed.
 
 ### Done: #130 (P3), lastState, terminated reason, imageID, image provenance (stormconsole#69/#75)
 
