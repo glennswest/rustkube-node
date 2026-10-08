@@ -1363,6 +1363,14 @@ impl PodManager {
                     .as_object()
                     .and_then(|o| o.keys().find(|k| k.as_str() != "name").cloned())
                     .unwrap_or_else(|| "unknown".into());
+                if kind == "gitRepo" {
+                    // Removed upstream in 1.36 (#23); upstream's pod waits with
+                    // FailedMount too.
+                    return Err(CriError::VolumeNotReady(format!(
+                        "volume {name} is of type gitRepo, which Kubernetes 1.36 removed; \
+                         clone into an emptyDir from an init container instead"
+                    )));
+                }
                 return Err(CriError::VolumeNotReady(format!(
                     "volume {name} is of type {kind}, which this node does not provide; \
                      use a CSI driver for it (docs/csi.md)"
@@ -2758,6 +2766,11 @@ impl PodManager {
             // is the recovery: the pod is started or re-checked like any
             // other, and its phase is corrected on the next status write.
             let restart_policy = pod["spec"]["restartPolicy"].as_str().unwrap_or("Always");
+            // A pod this node refused at admission (#23) is terminal whatever
+            // its policy, as upstream's: its controller replaces it.
+            if phase == "Failed" && pod["status"]["reason"].as_str() == Some(APPARMOR_REASON) {
+                continue;
+            }
             if (phase == "Succeeded" || phase == "Failed") && restart_policy != "Always" {
                 // Its sandbox may still hold the network: the stop at the
                 // terminal pass failed, or this is that pass's own write
@@ -2796,6 +2809,25 @@ impl PodManager {
                 let holdoff = self.start_holdoff.lock().unwrap_or_else(|e| e.into_inner()).get(uid).copied();
                 if let Some(at) = holdoff.filter(|at| Instant::now() < *at) {
                     self.due_at(uid, at);
+                    continue;
+                }
+                // Refused at admission (#23): upstream's AppArmor check. No
+                // runtime here applies a profile, so a pod that asks for one
+                // is refused rather than run unconfined.
+                if let Some(why) = apparmor_refusal(pod) {
+                    warn!("Pod {namespace}/{name} refused: {why}");
+                    self.event(pod, "Warning", APPARMOR_REASON, &why).await;
+                    outcome.updates.push(PodStatusUpdate {
+                        reason: APPARMOR_REASON.to_string(),
+                        namespace: namespace.to_string(),
+                        name: name.to_string(),
+                        phase: "Failed".to_string(),
+                        message: why,
+                        container_statuses: vec![],
+                        init_container_statuses: vec![],
+                        declared_init_containers: declared_init_containers(pod),
+                        pod_ip: None,
+                    });
                     continue;
                 }
                 // New pod — start it
@@ -2941,6 +2973,7 @@ impl PodManager {
                             error!("Pod {namespace}/{name}: container {container} failed to start: {message}");
                             self.note_waiting(pod, "StartError", &message);
                             outcome.updates.push(PodStatusUpdate {
+                                reason: String::new(),
                                 namespace: namespace.to_string(),
                                 name: name.to_string(),
                                 phase: "Failed".to_string(),
@@ -2987,6 +3020,7 @@ impl PodManager {
                         };
                         self.note_waiting(pod, "StartError", &message);
                         outcome.updates.push(PodStatusUpdate {
+                            reason: String::new(),
                             namespace: namespace.to_string(),
                             name: name.to_string(),
                             phase: "Failed".to_string(),
@@ -3737,6 +3771,7 @@ impl PodManager {
 
         self.timing(pod, |t| t.started(attempt));
         Ok(PodStatusUpdate {
+            reason: String::new(),
             namespace: namespace.to_string(),
             name: name.to_string(),
             phase: "Running".to_string(),
@@ -4366,6 +4401,7 @@ impl PodManager {
         }
 
         let update = PodStatusUpdate {
+            reason: String::new(),
             namespace: state.namespace.clone(),
             name: state.name.clone(),
             phase: phase.to_string(),
@@ -4748,6 +4784,7 @@ impl PodManager {
                 },
             );
         PodStatusUpdate {
+            reason: String::new(),
             namespace,
             name,
             phase: "Pending".to_string(),
@@ -5188,6 +5225,59 @@ fn excerpt(text: &str) -> String {
     format!("{}…", t.chars().take(300).collect::<String>())
 }
 
+/// `status.reason` of a pod refused for an AppArmor profile (upstream's).
+pub const APPARMOR_REASON: &str = "AppArmor";
+
+/// Why this pod cannot run here, when it asks for AppArmor (#23).
+///
+/// Upstream's admission: a pod that asks for any profile other than
+/// `Unconfined` (pod or container `securityContext.appArmorProfile`, or the
+/// deprecated `container.apparmor.security.beta.kubernetes.io/<container>`
+/// annotation, which 1.34 deprecated for the field) is refused on a node that
+/// cannot enforce it. No runtime here applies one (stormpump has no LSM
+/// profile, the native runtime none, and the CRI path does not forward it), so
+/// such a pod is refused rather than run unconfined in silence.
+pub fn apparmor_refusal(pod: &Value) -> Option<String> {
+    let asks = |sc: &Value| {
+        sc["appArmorProfile"]["type"]
+            .as_str()
+            .is_some_and(|t| t != "Unconfined")
+    };
+    let mut wants = Vec::new();
+    if asks(&pod["spec"]["securityContext"]) {
+        wants.push("the pod".to_string());
+    }
+    for list in ["initContainers", "containers", "ephemeralContainers"] {
+        for c in pod["spec"][list].as_array().into_iter().flatten() {
+            if asks(&c["securityContext"]) {
+                wants.push(format!("container {}", c["name"].as_str().unwrap_or("?")));
+            }
+        }
+    }
+    const PREFIX: &str = "container.apparmor.security.beta.kubernetes.io/";
+    if let Some(a) = pod["metadata"]["annotations"].as_object() {
+        let mut keys: Vec<_> = a.iter().collect();
+        keys.sort_by(|x, y| x.0.cmp(y.0));
+        for (k, v) in keys {
+            if let Some(c) = k.strip_prefix(PREFIX) {
+                if v.as_str().is_some_and(|v| v != "unconfined") {
+                    let who = format!("container {c}");
+                    if !wants.contains(&who) {
+                        wants.push(who);
+                    }
+                }
+            }
+        }
+    }
+    (!wants.is_empty()).then(|| {
+        format!(
+            "Cannot enforce AppArmor: this node's runtime applies no AppArmor profile, and {} asks for one",
+            wants.join(", ")
+        )
+    })
+}
+
+
 /// Status update to send back to the API server.
 #[derive(Debug)]
 pub struct PodStatusUpdate {
@@ -5195,6 +5285,9 @@ pub struct PodStatusUpdate {
     pub name: String,
     pub phase: String,
     pub message: String,
+    /// `status.reason` when it is upstream's own word for the outcome (an
+    /// admission refusal: `AppArmor`, #23); empty: the kubelet's default.
+    pub reason: String,
     pub container_statuses: Vec<ContainerStatusReport>,
     /// What the pod's init containers did. Empty for a pod that has none —
     /// which the emitter distinguishes from a pod whose inits are unreported,
@@ -7638,6 +7731,46 @@ pub(crate) mod tests {
         let removed = rt.removed_containers.lock().unwrap().clone();
         // Then the completed init kept for its log (#47).
         assert_eq!(removed, vec![ids["app"].clone(), ids["logs"].clone(), ids["proxy"].clone(), setup]);
+    }
+
+    /// #23: a pod that asks for an AppArmor profile is refused, upstream's
+    /// way (Failed, reason AppArmor), and nothing is started; Unconfined runs.
+    #[tokio::test]
+    async fn a_pod_asking_for_apparmor_is_refused_and_never_started() {
+        let (rt, mgr) = manager();
+        let mut p = pod("uid-aa", "confined", "Always", simple_container());
+        p["spec"]["containers"][0]["securityContext"] = json!({"appArmorProfile": {"type": "RuntimeDefault"}});
+        let outcome = mgr.sync_pods(&[p.clone()]).await;
+        let u = &outcome.updates[0];
+        assert_eq!((u.phase.as_str(), u.reason.as_str()), ("Failed", APPARMOR_REASON));
+        assert!(u.message.contains("container app asks for one"), "{}", u.message);
+        assert!(rt.created_names().is_empty(), "nothing started");
+
+        // Its own Failed write coming back: terminal, even under Always.
+        p["status"] = json!({"phase": "Failed", "reason": "AppArmor"});
+        assert!(mgr.sync_pods(&[p]).await.updates.is_empty());
+        assert!(rt.created_names().is_empty());
+
+        // Cilium's agent shape: Unconfined is admitted.
+        let mut ok = pod("uid-un", "agent", "Always", simple_container());
+        ok["spec"]["securityContext"] = json!({"appArmorProfile": {"type": "Unconfined"}});
+        assert_eq!(mgr.sync_pods(&[ok]).await.updates[0].phase, "Running");
+    }
+
+    #[test]
+    fn apparmor_profiles_are_read_from_the_field_and_the_old_annotation() {
+        let base = json!({"metadata": {}, "spec": {"containers": [{"name": "a"}, {"name": "b"}]}});
+        assert_eq!(apparmor_refusal(&base), None);
+        let mut p = base.clone();
+        p["spec"]["securityContext"] = json!({"appArmorProfile": {"type": "Localhost", "localhostProfile": "k8s-x"}});
+        assert!(apparmor_refusal(&p).unwrap().contains("the pod asks"));
+        let mut p = base.clone();
+        p["metadata"]["annotations"] = json!({
+            "container.apparmor.security.beta.kubernetes.io/a": "unconfined",
+            "container.apparmor.security.beta.kubernetes.io/b": "runtime/default"
+        });
+        let why = apparmor_refusal(&p).unwrap();
+        assert!(why.contains("container b") && !why.contains("container a"), "{why}");
     }
 
     #[tokio::test]

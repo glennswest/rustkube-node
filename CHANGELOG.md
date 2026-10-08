@@ -2,6 +2,13 @@
 
 ## 2026-10-08
 
+- **feat:** The node side of the Kubernetes 1.36 posture (#23, rustkube#37): `nodeInfo.kubeletVersion` reports
+  `v1.36.0-rustkube+…` and `kubeProxyVersion` is no longer written (removed in 1.33). A pod asking for an AppArmor
+  profile other than `Unconfined` (field or the deprecated annotation) is refused at admission as upstream refuses it
+  on a node that cannot enforce one: `Failed`, reason `AppArmor`, Warning Event, nothing started, terminal whatever
+  its restartPolicy. A `gitRepo` volume's wait names its 1.36 removal. containerd before 2.0 is refused at startup.
+  The unused workspace `k8s-openapi` (v1_32) dependency is dropped (apimachinery keeps its own).
+- **docs:** status.md gap rows for #47, #69/#89/#77 and #105 removed (done).
 - **fix:** A given `--apiserver` / `APISERVER_URL` wins over the kubeconfig's server even when it equals the default
   `http://127.0.0.1:6443` (#113). The flag has no clap default any more; precedence is decided by whether it was
   given (given → kubeconfig server → default), not by comparing its value with the default.

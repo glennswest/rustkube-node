@@ -513,8 +513,9 @@ impl NodeReporter {
                 "kernelVersion": first_value(&KERNEL_VERSION_FILES),
                 "osImage": os_image(),
                 "containerRuntimeVersion": &self.runtime_version,
-                "kubeletVersion": format!("v1.32.0-rustkube+{}", apimachinery::VERSION),
-                "kubeProxyVersion": format!("v1.32.0-rustkube+{}", apimachinery::VERSION),
+                // The control plane's posture (rustkube#37, #23). No
+                // kubeProxyVersion: 1.33 removed it from nodeInfo.
+                "kubeletVersion": kubelet_version(),
                 "operatingSystem": go_os(),
                 "architecture": go_arch()
             },
@@ -547,6 +548,15 @@ const KUBELET_OWNED_CONDITIONS: [&str; 4] =
 ///   * each owned condition's `lastTransitionTime` is carried forward from the
 ///     previous value when its `status` is unchanged, and only stamped `now` on
 ///     an actual flip — `lastHeartbeatTime` always advances.
+
+/// The Kubernetes version this kubelet reports, matching the control plane's
+/// posture (rustkube#37): 1.36 since #23.
+pub const KUBERNETES_POSTURE: &str = "v1.36.0";
+
+/// `nodeInfo.kubeletVersion`: the posture, then this build's apimachinery.
+pub fn kubelet_version() -> String {
+    format!("{KUBERNETES_POSTURE}-rustkube+{}", apimachinery::VERSION)
+}
 
 /// `nodeInfo.kernelVersion`: `uname -r` (#78). The kernel is the node's,
 /// whatever domain the kubelet runs in.
@@ -846,6 +856,15 @@ fn statvfs_bytes(_path: &str) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #23: the 1.36 posture; no kubeProxyVersion (removed in 1.33).
+    #[test]
+    fn node_info_reports_the_1_36_posture() {
+        let st = NodeReporter::new("http://x", "n1").build_status(&[]);
+        let info = &st["nodeInfo"];
+        assert!(info["kubeletVersion"].as_str().unwrap().starts_with("v1.36.0-rustkube+"), "{info}");
+        assert!(info.get("kubeProxyVersion").is_none(), "{info}");
+    }
 
     /// #78: the first readable non-empty file wins, trimmed; none is "".
     #[test]

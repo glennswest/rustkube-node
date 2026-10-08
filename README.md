@@ -176,6 +176,15 @@ is refused, naming the image, instead of exec'ing the flag. emptyDir volumes are
 non-root uid can write them. Not yet: an image's declared `Volumes` (not recorded by the registry, #58) and
 `fsGroup` (a claim's filesystem is root's).
 
+**Kubernetes 1.36 posture** (#23, the control plane's since rustkube#37): `nodeInfo.kubeletVersion` is
+`v1.36.0-rustkube+<apimachinery>` and `kubeProxyVersion` is not reported (1.33 removed it). A pod that asks for
+an AppArmor profile other than `Unconfined` (pod or container `securityContext.appArmorProfile`, or the old
+`container.apparmor.security.beta.kubernetes.io/<c>` annotation) is refused as upstream refuses it on a node that
+cannot enforce one: `Failed`, reason `AppArmor`, a Warning Event, nothing started (no runtime here applies a
+profile). A `gitRepo` volume waits with a message naming its 1.36 removal (clone from an init container into an
+emptyDir). With `--runtime cri`, containerd before 2.0 stops the kubelet at startup (1.36 dropped containerd 1.7);
+CRI-O is not checked. cgroups are v2 only; kube-proxy has no IPVS mode.
+
 **An init container runs until it exits** (#126), as upstream: there is no fixed bound (it was 120 s, then
 `DeadlineExceeded`), and its wait holds no worker (its exit is an event). The pod's `activeDeadlineSeconds`, counted
 from its `startTime`, is the only deadline: past it the init container is stopped and reported `DeadlineExceeded`

@@ -55,9 +55,6 @@ kubelet = { path = "pkg/kubelet" }
 proxy = { path = "pkg/proxy" }
 cni = { path = "pkg/cni" }
 
-# Kubernetes types — pinned to K8s 1.32 (must match rustkube/apimachinery)
-k8s-openapi = { version = "0.24", features = ["v1_32"] }
-
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["full"] }

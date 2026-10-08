@@ -287,7 +287,12 @@ impl Kubelet {
 
         // Query the container runtime version for nodeInfo (e.g. cri-o://1.32.0).
         let runtime_version = match self.runtime.version().await {
-            Ok((name, version, _)) => format!("{name}://{version}"),
+            Ok((name, version, _)) => {
+                if let Some(why) = unsupported_runtime(&name, &version) {
+                    anyhow::bail!(why);
+                }
+                format!("{name}://{version}")
+            }
             Err(e) => {
                 warn!("Could not get runtime version: {e}");
                 "cri-o://unknown".to_string()
@@ -1488,6 +1493,7 @@ impl Kubelet {
         if !update.message.is_empty() {
             status["message"] = serde_json::json!(&update.message);
             status["reason"] = serde_json::json!(match update.phase.as_str() {
+                _ if !update.reason.is_empty() => update.reason.as_str(),
                 "Failed" => "StartFailed",
                 _ => "Kubelet",
             });
@@ -1787,6 +1793,41 @@ fn exit_wake(pod: Option<String>, vm: Option<String>) -> ExitWake {
         (Some(uid), _) => ExitWake::Pod(uid),
         (None, Some(uid)) => ExitWake::Vm(uid),
         (None, None) => ExitWake::Everyone,
+    }
+}
+
+/// A container runtime the 1.36 posture no longer supports (#23): containerd
+/// before 2.0, which Kubernetes 1.36 dropped. The kubelet refuses to start on
+/// it rather than run against a runtime nothing tests it with. Anything else
+/// (CRI-O, stormpump, the native runtime, a version that does not parse) is
+/// accepted.
+fn unsupported_runtime(name: &str, version: &str) -> Option<String> {
+    if !name.eq_ignore_ascii_case("containerd") {
+        return None;
+    }
+    let major: u32 = version.trim().trim_start_matches('v').split('.').next()?.parse().ok()?;
+    (major < 2).then(|| {
+        format!(
+            "containerd {version} is not supported: Kubernetes 1.36 requires containerd 2.0 or later \
+             (this kubelet reports the 1.36 posture, rustkube-node#23)"
+        )
+    })
+}
+
+#[cfg(test)]
+mod runtime_support_tests {
+    use super::*;
+
+    /// #23: containerd 1.x is refused; 2.x, CRI-O and stormpump are not.
+    #[test]
+    fn containerd_before_2_is_refused() {
+        assert!(unsupported_runtime("containerd", "v1.7.22").unwrap().contains("2.0 or later"));
+        assert!(unsupported_runtime("containerd", "1.6.0").is_some());
+        assert_eq!(unsupported_runtime("containerd", "v2.0.1"), None);
+        assert_eq!(unsupported_runtime("containerd", "2.1.0"), None);
+        assert_eq!(unsupported_runtime("cri-o", "1.30.0"), None);
+        assert_eq!(unsupported_runtime("stormpump", "0.1.0"), None);
+        assert_eq!(unsupported_runtime("containerd", "unknown"), None);
     }
 }
 
