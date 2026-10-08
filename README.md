@@ -320,7 +320,20 @@ read-only pod, `kube-system/<asset>-<node>` (labels `storm.io/asset`, `storm.io/
 Its `startTime` is now less the service's age: the node's uptime (`/proc/uptime`) less PID 1's `started_secs`
 (the same `CLOCK_BOOTTIME`), which holds still while assets.json is written only on a change (stormpump#67);
 an older PID 1 without it gives `age_secs` (#193).
-A running asset's pod is Running and Ready, and a stopped one is Failed. **Ready means it answers** (#96): for a
+A running asset's pod is Running and Ready, and a stopped one is Failed. **A service run by stormd shows what
+stormd's own supervision says** (#215, stormd#48): every 5 s the kubelet asks each host-network service's stormd
+(its `[api] bind` port from the golden's config: 9081 fastetcd, 9082–9084 the control plane, 9085 rustkube-node, a
+service's port + 100) for `GET /api/v1/processes`. The container is the process named after the service (else the
+worst of its processes, their restarts summed, ready only if all are): Running since its start, Waiting
+`CrashLoopBackOff` while stormd backs off, Waiting `ContainerCreating` while it starts, Terminated with its exit
+(`Completed`/`Error`) once stopped; `restartCount` is stormd's restarts plus PID 1's; a restarted process carries its
+last exit as `lastState.terminated`; Ready is its readiness probe, and not ready gives upstream's
+`ContainersNotReady` conditions (the pod stays Running, as upstream's does while a container restarts). stormd's
+**Kubernetes events** (`GET /api/v1/events?since=<seq>`: `Created`, `Started`, `Unhealthy`, `Killing`, `BackOff`)
+become Events on the mirror pod (`involvedObject.fieldPath` the container, named by the event's identity so stormd's
+`count`/`lastTimestamp` bumps patch the same Event, and a kubelet restart re-reading from 0 doubles nothing). A
+stormd whose `[api]` asks for TLS or a credential (stormd#32) is not read (said once): its mirror keeps PID 1's view
+below. **Without stormd's answer, ready means it answers** (#96): for a
 host-network service the kubelet reads the liveness URL its golden's stormd config declares
 (`[process.liveness] type = "http"`, `url = …`; the golden is the boot unit's `root` volume, under `/hostroot`)
 and asks it every 10 s (2 s timeout). Three failures in a row make the pod Running but not ready: container

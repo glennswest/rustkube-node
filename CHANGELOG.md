@@ -2,6 +2,13 @@
 
 ## 2026-10-08
 
+- **feat:** Node services' mirror pods show stormd's supervision (#215, stormd#48). The kubelet reads each
+  host-network service's stormd API (port from the golden's `[api] bind`) every 5 s: `/api/v1/processes` gives the
+  container status (Running; Waiting `CrashLoopBackOff` / `ContainerCreating`; Terminated with its exit),
+  `restartCount` (stormd's + PID 1's), `lastState.terminated`, and Ready from the readiness probe (upstream's
+  `ContainersNotReady` when not); `/api/v1/events?since=<seq>` becomes Events on the mirror pod (`Created`,
+  `Started`, `Unhealthy`, `Killing`, `BackOff`), one object per stormd event, its count and lastTimestamp patched.
+  The #96 health-URL probe is now only the fallback for a service whose stormd does not answer.
 - **feat:** Per-container logs at upstream parity (#216). Every container run gets its own `<N>.log` (the next number
   on disk, at least the restart count): init containers and native sidecars no longer reuse `0.log`, so `--previous`
   works for a retried init, a restarted sidecar and across a kubelet restart. The current run and five previous are
