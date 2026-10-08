@@ -10,7 +10,7 @@ use crate::cri::{
     CheckpointRef, ContainerConfig, ContainerState, ContainerStatsInfo, ContainerStatusInfo,
     CriError,
     ExecSyncResult, ImageInfo, ImageService, MigrationProgress, MigrationService,
-    MigrationStrategy, PodSandboxConfig, PodSandboxState, PodSandboxStatusInfo, PodSandboxSummary,
+    EventStream, MigrationStrategy, PodSandboxConfig, RuntimeEvent, PodSandboxState, PodSandboxStatusInfo, PodSandboxSummary,
     RuntimeService,
 };
 use async_trait::async_trait;
@@ -85,6 +85,17 @@ fn rpc_err(e: tonic::Status) -> CriError {
         tonic::Code::DeadlineExceeded => CriError::Timeout,
         _ => CriError::Runtime(format!("{}: {}", e.code(), e.message())),
     }
+}
+
+/// A CRI container event as the kubelet routes it (#116): the pod's uid from
+/// the sandbox status the event carries (empty: unknown), and the container.
+fn container_event(ev: proto::ContainerEventResponse) -> RuntimeEvent {
+    let pod_uid = ev
+        .pod_sandbox_status
+        .and_then(|s| s.metadata)
+        .map(|m| m.uid)
+        .filter(|u| !u.is_empty());
+    RuntimeEvent::Container { pod_uid, container_id: ev.container_id }
 }
 
 fn to_proto_sandbox_config(config: &PodSandboxConfig) -> proto::PodSandboxConfig {
@@ -347,6 +358,24 @@ fn from_proto_container_status(s: proto::ContainerStatus) -> ContainerStatusInfo
 
 #[async_trait]
 impl RuntimeService for CriGrpcClient {
+    /// `GetContainerEvents` (#116): one long-lived stream. The channel's
+    /// 120 s bound covers the call until the runtime answers, not the stream.
+    async fn follow_container_events(&self, on: &(dyn Fn(RuntimeEvent) + Send + Sync)) -> EventStream {
+        let mut stream = match self.runtime.clone().get_container_events(proto::GetEventsRequest {}).await {
+            Ok(r) => r.into_inner(),
+            Err(e) if e.code() == tonic::Code::Unimplemented => return EventStream::Unsupported,
+            Err(e) => return EventStream::Ended(format!("{}: {}", e.code(), e.message())),
+        };
+        on(RuntimeEvent::Connected);
+        loop {
+            match stream.message().await {
+                Ok(Some(ev)) => on(container_event(ev)),
+                Ok(None) => return EventStream::Ended("the runtime closed the stream".into()),
+                Err(e) => return EventStream::Ended(format!("{}: {}", e.code(), e.message())),
+            }
+        }
+    }
+
     async fn version(&self) -> Result<(String, String, String), CriError> {
         let resp = self
             .runtime

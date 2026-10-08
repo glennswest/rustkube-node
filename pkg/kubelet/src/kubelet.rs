@@ -153,6 +153,9 @@ pub struct Kubelet {
     last_claims: std::sync::Mutex<crate::workload::VolumeIndex>,
     static_read_complete: std::sync::atomic::AtomicBool,
     runtime_changes: Option<tokio::sync::watch::Receiver<u64>>,
+    /// A CRI runtime's container-event stream is open (#116): its Pods wait
+    /// on events, not on `sync_interval`.
+    runtime_events_live: AtomicBool,
     /// The engine's exits by workload handle (#115), taken by the router.
     exit_routes: std::sync::Mutex<Option<tokio::sync::broadcast::Receiver<u64>>>,
     workloads: Arc<Executor>,
@@ -223,6 +226,7 @@ impl Kubelet {
             last_claims: Default::default(),
             static_read_complete: std::sync::atomic::AtomicBool::new(true),
             runtime_changes: None,
+            runtime_events_live: AtomicBool::new(false),
             exit_routes: std::sync::Mutex::new(None),
             workloads,
             pods_synced: AtomicBool::new(false),
@@ -429,6 +433,10 @@ impl Kubelet {
 
         // Each engine exit wakes its own Pod or VMI worker (#115).
         tokio::spawn(self.clone().exit_router());
+        // A CRI runtime's container events, the same way (#116).
+        if self.runtime_changes.is_none() {
+            tokio::spawn(self.clone().runtime_event_router());
+        }
 
         // A renewed client certificate is presented without a restart (#77).
         match (&self.client_cert, &self.config.client_cert_path, &self.config.client_key_path) {
@@ -531,6 +539,67 @@ impl Kubelet {
                 }
             }
         }
+    }
+
+    /// Follow a CRI runtime's container events (#116) and wake the Pod each
+    /// names. While the stream is open the Pods wait on events instead of
+    /// `sync_interval`; when it opens (again), every Pod looks once, because
+    /// what happened while it was closed was not reported (upstream's evented
+    /// PLEG relists the same way). A runtime without the stream keeps the
+    /// timed fallback; a stream that drops is reopened on a backoff.
+    async fn runtime_event_router(self: Arc<Self>) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = self.runtime.clone();
+        let follow = tokio::spawn(async move {
+            let mut backoff = Duration::from_secs(1);
+            loop {
+                let sent = tx.clone();
+                let ended = runtime
+                    .follow_container_events(&move |e: crate::cri::RuntimeEvent| {
+                        let _ = sent.send(Some(e));
+                    })
+                    .await;
+                // `None`: the stream is closed, the Pods go back to the clock.
+                let _ = tx.send(None);
+                match ended {
+                    crate::cri::EventStream::Unsupported => {
+                        info!("the container runtime has no event stream (GetContainerEvents); Pods are looked at every sync_interval");
+                        return;
+                    }
+                    crate::cri::EventStream::Ended(why) => {
+                        warn!("container runtime event stream ended ({why}); reopening in {backoff:?}");
+                    }
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        });
+        while let Some(event) = rx.recv().await {
+            match event {
+                Some(crate::cri::RuntimeEvent::Connected) => {
+                    info!("following the container runtime's events (GetContainerEvents)");
+                    self.runtime_events_live.store(true, Ordering::Release);
+                    self.workloads.wake_kind(Kind::Pod);
+                }
+                Some(crate::cri::RuntimeEvent::Container { pod_uid, container_id }) => {
+                    let uid = match pod_uid {
+                        Some(uid) => Some(uid),
+                        None => self.pod_manager.pod_of_container(&container_id).await,
+                    };
+                    match uid {
+                        Some(uid) => self.workloads.wake_where(Kind::Pod, |k| k.uid == uid),
+                        None => debug!("a runtime event for container {container_id}, which no pod here names"),
+                    }
+                }
+                None => {
+                    if self.runtime_events_live.swap(false, Ordering::AcqRel) {
+                        // Back on the clock: each Pod's next pass sets it.
+                        self.workloads.wake_kind(Kind::Pod);
+                    }
+                }
+            }
+        }
+        let _ = follow.await;
     }
 
     async fn pod_loop(&self) -> anyhow::Result<()> {
@@ -1731,12 +1800,12 @@ impl Kubelet {
     }
 
     /// When a live workload is next looked at with no event (#101): its own
-    /// deadline, else only an event. A runtime that reports no exits (a CRI
-    /// runtime, not stormpump) cannot say a container ended, so its workloads
-    /// keep `sync_interval` as a counted fallback.
+    /// deadline, else only an event. A runtime that reports no exits keeps
+    /// `sync_interval` as a counted fallback: a CRI runtime without an open
+    /// `GetContainerEvents` stream (#116), or one that has none.
     fn next_look(&self, kind: Kind, due: Option<Duration>) -> Next {
         let worker = match kind { Kind::Pod => "pod", Kind::VirtualMachine => "vmi" };
-        if self.runtime_changes.is_none() {
+        if !evented(kind, self.runtime_changes.is_some(), self.runtime_events_live.load(Ordering::Acquire)) {
             let retry = self.config.sync_interval.max(Duration::from_millis(100));
             crate::metrics::observe_timed(worker, "fallback");
             return Next::After(due.map_or(retry, |d| d.min(retry)));
@@ -1775,6 +1844,14 @@ async fn reload_client_cert(
             Err(e) => warn!("apiserver client certificate {} changed but does not load yet ({e}); still presenting the previous one", cert.display()),
         }
     }
+}
+
+/// Whether a workload of `kind` waits on events rather than the clock (#101,
+/// #116): every kind on an engine that reports exits (stormpump); Pods while a
+/// CRI runtime's `GetContainerEvents` stream is open. VMIs run only on the
+/// engine.
+fn evented(kind: Kind, engine_exits: bool, cri_events_live: bool) -> bool {
+    engine_exits || (kind == Kind::Pod && cri_events_live)
 }
 
 /// Whom an engine exit wakes (#115).
@@ -1817,6 +1894,17 @@ fn unsupported_runtime(name: &str, version: &str) -> Option<String> {
 #[cfg(test)]
 mod runtime_support_tests {
     use super::*;
+
+    /// #116: a CRI runtime's Pods leave the clock only while its event
+    /// stream is open; the engine's exits cover every kind.
+    #[test]
+    fn pods_wait_on_events_only_while_a_stream_reports_them() {
+        assert!(evented(Kind::Pod, true, false));
+        assert!(evented(Kind::VirtualMachine, true, false));
+        assert!(evented(Kind::Pod, false, true));
+        assert!(!evented(Kind::Pod, false, false), "no stream: sync_interval");
+        assert!(!evented(Kind::VirtualMachine, false, true));
+    }
 
     /// #23: containerd 1.x is refused; 2.x, CRI-O and stormpump are not.
     #[test]

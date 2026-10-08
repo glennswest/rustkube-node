@@ -24,6 +24,9 @@ struct Recorded {
 #[derive(Default, Clone)]
 struct MockCri {
     recorded: Arc<Mutex<Recorded>>,
+    /// Answer GetContainerEvents with these, then end the stream (#116);
+    /// `None`: Unimplemented, as a runtime without evented PLEG answers.
+    events: Option<Vec<proto::ContainerEventResponse>>,
 }
 
 fn unimplemented<T>() -> Result<T> {
@@ -230,7 +233,8 @@ impl proto::runtime_service_server::RuntimeService for MockCri {
         &self,
         _: Request<proto::GetEventsRequest>,
     ) -> Result<Self::GetContainerEventsStream> {
-        unimplemented()
+        let Some(events) = self.events.clone() else { return unimplemented() };
+        Ok(Response::new(Box::pin(tokio_stream::iter(events.into_iter().map(Ok)))))
     }
     async fn list_metric_descriptors(
         &self,
@@ -298,8 +302,11 @@ impl proto::image_service_server::ImageService for MockCri {
 /// Start the mock runtime on a Unix socket; returns the socket path and the
 /// recorder handle.
 async fn start_mock(dir: &std::path::Path) -> (String, Arc<Mutex<Recorded>>) {
+    start_mock_with(dir, MockCri::default()).await
+}
+
+async fn start_mock_with(dir: &std::path::Path, mock: MockCri) -> (String, Arc<Mutex<Recorded>>) {
     let socket_path = dir.join("crio.sock");
-    let mock = MockCri::default();
     let recorded = mock.recorded.clone();
 
     let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
@@ -451,4 +458,57 @@ async fn connection_error_when_socket_missing() {
     let err = client.version().await.unwrap_err();
     // Must surface as an error, not hang or panic.
     assert!(!err.to_string().is_empty());
+}
+
+/// #116: the runtime's container events reach the kubelet: `Connected` once
+/// the stream is open, then each event with its pod's uid (from the sandbox
+/// status), and the stream's end says so. A runtime without the RPC is
+/// `Unsupported`, which keeps the timed fallback.
+#[tokio::test]
+async fn container_events_are_followed_with_their_pod() {
+    use kubelet::cri::{EventStream, RuntimeEvent};
+    let event = |id: &str, uid: &str, kind: proto::ContainerEventType| proto::ContainerEventResponse {
+        container_id: id.into(),
+        container_event_type: kind as i32,
+        pod_sandbox_status: Some(proto::PodSandboxStatus {
+            metadata: Some(proto::PodSandboxMetadata { uid: uid.into(), ..Default::default() }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mock = MockCri {
+        events: Some(vec![
+            event("ctr-1", "uid-1", proto::ContainerEventType::ContainerStoppedEvent),
+            event("ctr-2", "", proto::ContainerEventType::ContainerDeletedEvent),
+        ]),
+        ..Default::default()
+    };
+    let (socket, _) = start_mock_with(dir.path(), mock).await;
+    let client = CriGrpcClient::new(&socket);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let ended = client
+        .follow_container_events(&move |e| sink.lock().unwrap().push(e))
+        .await;
+    assert!(matches!(ended, EventStream::Ended(_)), "{ended:?}");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            RuntimeEvent::Connected,
+            RuntimeEvent::Container { pod_uid: Some("uid-1".into()), container_id: "ctr-1".into() },
+            RuntimeEvent::Container { pod_uid: None, container_id: "ctr-2".into() },
+        ]
+    );
+
+    // No GetContainerEvents: Unsupported, and nothing reported.
+    let other = tempfile::tempdir().unwrap();
+    let (socket, _) = start_mock(other.path()).await;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let ended = CriGrpcClient::new(&socket)
+        .follow_container_events(&move |e| sink.lock().unwrap().push(e))
+        .await;
+    assert_eq!(ended, EventStream::Unsupported);
+    assert!(seen.lock().unwrap().is_empty());
 }

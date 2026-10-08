@@ -76,7 +76,7 @@ Each gap has an owning issue. These are limitations, not supported features.
 | End-to-end legacy microVM Pods | [#13](https://github.com/glennswest/rustkube-node/issues/13) |
 | AppArmor profiles applied (a pod that asks for one is refused since #23, upstream's admission; no runtime here applies one) | [#197](https://github.com/glennswest/rustkube-node/issues/197) |
 | Tunable reservations/cgroup-driver (max-pods is `--max-pods` since #165) | [#24](https://github.com/glennswest/rustkube-node/issues/24) |
-| Subsecond startup measured on a node; a stormpump exit routed to its own UID; CRI container events instead of the `sync_interval` fallback | [#95](https://github.com/glennswest/rustkube-node/issues/95), [#99](https://github.com/glennswest/rustkube-node/issues/99), [#115](https://github.com/glennswest/rustkube-node/issues/115), [#116](https://github.com/glennswest/rustkube-node/issues/116) |
+| Subsecond startup measured on a node; a stormpump exit routed to its own UID | [#95](https://github.com/glennswest/rustkube-node/issues/95), [#99](https://github.com/glennswest/rustkube-node/issues/99), [#115](https://github.com/glennswest/rustkube-node/issues/115) |
 | Complete short/medium/long live acceptance and runner image injection | [#61](https://github.com/glennswest/rustkube-node/issues/61), [#64](https://github.com/glennswest/rustkube-node/issues/64), [#97](https://github.com/glennswest/rustkube-node/issues/97), [#102](https://github.com/glennswest/rustkube-node/issues/102) |
 | Legacy bin-only builder as a supported release path | [#51](https://github.com/glennswest/rustkube-node/issues/51) |
 

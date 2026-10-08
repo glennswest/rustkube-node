@@ -71,6 +71,15 @@ among them (stormcos#368 will enforce).
        stormcos#402 filed (kubelet SA token + `STORMBLOCK_ADMIN_TOKEN_FILE`, before #368). Stage golden
        golden-rustkube-node-dc81277f6b12 (stormcos#366). Closed. Live check is stormcos#402/#368's audit log.
 
+### In progress: #116 (P3), the CRI backend follows GetContainerEvents
+
+2026-10-08. `next_look` gave every Pod `sync_interval` unless the engine reports exits; nothing called CRI
+`GetContainerEvents`. Done in code: `RuntimeService::follow_container_events` (RuntimeEvent Connected/Container,
+EventStream Unsupported/Ended), the gRPC client's stream (pod uid from the sandbox status metadata), kubelet
+`runtime_event_router` (live flag; Connected → every Pod once; event → that Pod's worker, else by container id via
+`pod_of_container`; end → back on the clock, reopened 1–30 s; Unimplemented → stays on the clock), `evented()`.
+Tests (CRI double: events + Unimplemented; evented truth table), docs, CHANGELOG; sc-build; golden; close.
+
 ### Done: #23 (P3), the node side of the 1.36 posture
 
 2026-10-08. Audit: kubeProxyVersion written and kubeletVersion v1.32 (fix); AppArmor read nowhere, so a confined pod

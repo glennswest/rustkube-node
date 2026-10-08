@@ -152,8 +152,8 @@ from its `initialDelaySeconds`, a CrashLoopBackOff's end, a waiting start
 (backoff of a quarter of the wait, 1–10 s for Pods, 1–30 s for VMIs), an init
 container's 120 s limit, and a VM guest-agent poll (2 s while booting, backing
 off to 30 s; 10 s for a machine adopted without an engine handle).
-`sync_interval` applies only to a runtime without exit events (CRI), as a
-counted fallback. Image pulls use four separate slots. The service mirror
+`sync_interval` applies only to Pods on a CRI runtime with no open
+`GetContainerEvents` stream (#116), as a counted fallback. Image pulls use four separate slots. The service mirror
 follows `/run/stormpump` (inotify, at most one read a second while PID 1
 rewrites the file every pass, stormpump#67) and its own mirror pods' watch.
 System claims and the disk-owner sweep follow stormblock's volume watch (30 s

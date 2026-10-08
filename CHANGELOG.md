@@ -2,6 +2,11 @@
 
 ## 2026-10-08
 
+- **feat:** With `--runtime cri` the kubelet follows the runtime's `GetContainerEvents` stream (#116, upstream's
+  evented PLEG) instead of looking at every Pod each `sync_interval`: an event wakes the Pod named by its sandbox
+  status (else the Pod holding that container id), every Pod looks once whenever the stream opens (what happened
+  while it was closed is not reported), and a dropped stream is reopened on a 1–30 s backoff. Only while no stream
+  is open (the RPC `Unimplemented`, or between reconnects) do Pods keep the counted fallback.
 - **feat:** The node side of the Kubernetes 1.36 posture (#23, rustkube#37): `nodeInfo.kubeletVersion` reports
   `v1.36.0-rustkube+…` and `kubeProxyVersion` is no longer written (removed in 1.33). A pod asking for an AppArmor
   profile other than `Unconfined` (field or the deprecated annotation) is refused at admission as upstream refuses it

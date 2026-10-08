@@ -262,7 +262,7 @@ fixed schedule left.
 
 | Work | Was | Now |
 |---|---|---|
-| Live Pod | every `sync_interval` (2 s) | stormpump exits, volume/image/API events; deadlines: each probe's `periodSeconds` from `initialDelaySeconds` (a probe not due keeps its last result), CrashLoopBackOff end, waiting-start retry (¼ of the wait, 1–10 s), init-container limit |
+| Live Pod | every `sync_interval` (2 s) | stormpump exits (or a CRI runtime's `GetContainerEvents`, #116), volume/image/API events; deadlines: each probe's `periodSeconds` from `initialDelaySeconds` (a probe not due keeps its last result), CrashLoopBackOff end, waiting-start retry (¼ of the wait, 1–10 s), init-container limit |
 | Live VMI | every `sync_interval` | ring exits, API/volume events; deadlines: start backoff, waiting retry (1–30 s), guest-agent poll (2 s while booting → 30 s; 10 s handle-less). The agent has no push, so its poll is a per-machine probe period |
 | Service mirror | 15 s | inotify on `/run/stormpump`, gated on the parsed table (read at most once a second while PID 1 rewrites it every pass: stormpump#67), plus the mirror pods' watch; writes only what differs |
 | System claims | 30 s | stormblock volume watch + PV/PVC watches |

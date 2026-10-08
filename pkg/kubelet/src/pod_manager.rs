@@ -4910,6 +4910,14 @@ impl PodManager {
         self.runtime.pod_of_workload(handle).await
     }
 
+    /// The pod one of whose containers (or whose sandbox) has this id (#116).
+    pub async fn pod_of_container(&self, id: &str) -> Option<String> {
+        let pods = self.pods.read().await;
+        pods.values()
+            .find(|p| p.sandbox_id.as_deref() == Some(id) || p.container_ids.values().any(|c| c == id))
+            .map(|p| p.uid.clone())
+    }
+
     pub async fn pod_uid(&self, namespace: &str, name: &str) -> Option<String> {
         let pods = self.pods.read().await;
         pods.values()

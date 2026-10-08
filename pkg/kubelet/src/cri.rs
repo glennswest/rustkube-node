@@ -322,9 +322,6 @@ pub trait RuntimeService: Send + Sync + 'static {
         Ok(vec![])
     }
 
-    /// The pod (its uid) whose container ran as engine workload `handle`
-    /// (#115), to wake that pod's worker alone when it exits. Default: not
-    /// known, and the exit wakes every pod.
     /// Whether a container's log file outlives `remove_container` (#47).
     /// When it does not (a CRI runtime may take it with the container), a
     /// completed init container is kept until its pod stops, as upstream
@@ -333,8 +330,19 @@ pub trait RuntimeService: Send + Sync + 'static {
         false
     }
 
+    /// The pod (its uid) whose container ran as engine workload `handle`
+    /// (#115), to wake that pod's worker alone when it exits. Default: not
+    /// known, and the exit wakes every pod.
     async fn pod_of_workload(&self, _handle: u64) -> Option<String> {
         None
+    }
+
+    /// Follow the runtime's container events (#116, CRI `GetContainerEvents`,
+    /// upstream's evented PLEG), calling `on` for each, until the stream ends.
+    /// `Connected` comes first, once the runtime has accepted the stream:
+    /// what changed before it was not reported. Default: [`EventStream::Unsupported`].
+    async fn follow_container_events(&self, _on: &(dyn Fn(RuntimeEvent) + Send + Sync)) -> EventStream {
+        EventStream::Unsupported
     }
 
     /// Network counters per pod sandbox. Default: none.
@@ -462,6 +470,25 @@ pub trait MigrationService: Send + Sync + 'static {
 }
 
 /// CRI error type.
+/// One of the runtime's container events (#116).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeEvent {
+    /// The stream is open; nothing before this was reported.
+    Connected,
+    /// A container was created, started, stopped or deleted: its pod's uid
+    /// (from the event's sandbox status, when it carries one) and its id.
+    Container { pod_uid: Option<String>, container_id: String },
+}
+
+/// How following the runtime's events ended (#116).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventStream {
+    /// The runtime has no event stream (`Unimplemented`, or not a CRI runtime).
+    Unsupported,
+    /// It had one and it ended (or could not be opened): try again.
+    Ended(String),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CriError {
     /// A staged operation yielded; its recorded resources remain owned.

@@ -54,8 +54,11 @@ events. What still polls is counted in `kubelet_timed_reconciles_total`
 (see [configuration](docs/configuration.md)). A stormpump exit wakes its own
 Pod or VMI worker only (#115): the exiting handle is mapped to its pod (container,
 then sandbox) or its VMI, and only a handle no record names (or a lagged
-channel) wakes every workload. Still open: the CRI backend keeps the counted
-`sync_interval` fallback instead of following container events (#116).
+channel) wakes every workload. With `--runtime cri` the kubelet follows the runtime's
+`GetContainerEvents` stream (#116, upstream's evented PLEG): each event wakes the Pod its sandbox names (else
+the Pod holding that container), every Pod looks once when the stream opens, and only while no stream is open
+(a runtime without the RPC, CRI-O without `enable_pod_events`, or a dropped stream being reopened on a 1–30 s
+backoff) do Pods keep the counted `sync_interval` fallback.
 See [the design and baseline](docs/event-driven-design.md) and
 [#102](https://github.com/glennswest/rustkube-node/issues/102) for validation.
 Builds run on dev only after pushing. Main's tap address pump, snapshot
