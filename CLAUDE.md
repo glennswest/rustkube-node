@@ -57,7 +57,7 @@ by #51.
 
 ## Work plan
 
-### In progress: #181 (P2), a VM stopped gracefully: Machine::shut_down(grace) before the engine's stop
+### Waiting on stormpump#56 + a build: #181 (P2), a VM stopped gracefully: Machine::shut_down(grace) before the engine's stop
 
 2026-10-08. `stop` sends the engine's stop (SIGTERM to the hypervisor = a power cut) at once when there is a handle;
 only `stop_by_control` asks the guest. stormvm main (409e0fc, has 94004b7) offers `Machine::shut_down(grace) ->
@@ -68,6 +68,13 @@ PoweredOff | AlreadyGone | StillRunning(why)`; the lock has stormvm 180fa13 (wit
        the engine's stop only on StillRunning; `stop_by_control` uses shut_down too.
 3. [ ] Node shutdown (item 3) waits on stormpump#56 (the engine stops the kubelet before the hypervisors; the guest's
        grace is an owner decision there). Tests, docs, CHANGELOG; sc-build; golden; leave #181 open on item 3.
+       2026-10-08: items 1+2 coded on branch wip/181-graceful-stop (37a5843): `graceful_then_forced` (shut_down → force
+       only on StillRunning, or on PoweredOff/AlreadyGone when the engine still sees it running 5 s later), `grace_from`
+       (terminationGracePeriodSeconds, default 30), `stopping` an Arc, `stop_by_control` uses shut_down; 1 test. NOT
+       built: the lock job (`sc-build 'cargo update -p stormvm-control --precise 409e0fc…; git diff Cargo.lock; cargo
+       build'` on the branch) waited out its hour behind the master's build drain for the 11.95 test (owner: builds
+       off). Resume: rerun it on the branch, apply the diff, build/test the branch, docs + CHANGELOG, merge, golden.
+       Item 3 (node shutdown) after stormpump#56's grace decision. #181 proposed after stormpump#56.
 
 ### Done from this side: #57 step 4, CPU requests as Pod cgroup weights (stormpump#68's Pod group, OpenShift's shape)
 
