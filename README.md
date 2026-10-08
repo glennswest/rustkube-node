@@ -66,6 +66,20 @@ reconciler, VM startup backoff and disk-owner sweep remain active. A failed
 VMI LIST retains the last desired set; stopping a VMI detaches its disks,
 while the owner sweep decides when to delete them.
 
+## Retries on remote calls
+
+Every call to another process (the apiserver, the node's stormblock engine,
+the registry, stormdrive, CSI drivers, and the test container's apiserver
+calls) goes through one helper, `pkg/retry` (#211): a transient failure
+(timeout, connection refused or reset, 408/429/500/502/503/504) is retried with
+jittered exponential backoff under a per-dependency policy (attempts and a
+whole-operation deadline), a real answer (any other 4xx/5xx) comes back at
+once, a POST that may have been applied is not repeated unless it is a named
+create or a review, and every retried call logs its attempts ("succeeded on
+attempt 3 after 4.1 s" / "gave up after 4 attempts / 6.2 s: …"). Probes, CRI
+calls, PID 1's ring and CNI execs are not retried at the call, each for a stated
+reason. The policies and every call site are in [docs/retries.md](docs/retries.md).
+
 ## Pod start timing
 
 Every pod start says where its time went (#132). The kubelet keeps one record per pod

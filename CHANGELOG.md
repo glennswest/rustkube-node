@@ -2,6 +2,15 @@
 
 ## 2026-10-08
 
+- **feat:** Every remote call retries (#211, code review). New `pkg/retry` crate, shared by the kubelet, kube-proxy
+  and the test container: bounded retry with jittered exponential backoff and a whole-operation deadline per
+  dependency (`API`, `ENGINE`, `REGISTRY`, `PEER`, `LOCAL`), `Retry-After` honoured, no retry on a real answer
+  (4xx other than 408/429, 501), a POST repeated only when it never left or on 429 unless the caller marks it
+  repeatable (named creates, TokenReview/TokenRequest), every retried call's attempts logged, failures classified
+  infrastructure vs refused. Routed through it: every apiserver call (kubelet, kube-proxy, test container), the
+  stormblock engine client, the registry, stormdrive, CSI node RPCs (idempotent by the spec), stormvm's restore
+  client and the snapshot take. Probes, CRI, the ring and CNI exec say why they are not retried. Every call site
+  and its before/after: docs/retries.md.
 - **chore:** #210 (git dependencies pinned by `rev`, stormcentral#571) tried and reverted (8774f06, 4f3ef17).
   Cargo refuses a `[patch]` that points at a dependency's own URL, so the transitive stormpump/stormcast
   references can only be pinned in stormvm and stormpump (stormvm#82, stormpump#123). No change to the build.
