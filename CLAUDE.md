@@ -71,12 +71,13 @@ among them (stormcos#368 will enforce).
        stormcos#402 filed (kubelet SA token + `STORMBLOCK_ADMIN_TOKEN_FILE`, before #368). Stage golden
        golden-rustkube-node-dc81277f6b12 (stormcos#366). Closed. Live check is stormcos#402/#368's audit log.
 
-### In progress: #32 (P3), the node/CNI networking contract (docs only)
+### Done: #32 (P3), the node/CNI networking contract (docs only)
 
 2026-10-08. Readiness half decided by #3 (no NotReady gating; verified live). Left: the written contract. Facts
 checked: stormcos `ip=dhcp` (kernel DHCP: address, gateway, DNS), Cilium tunnel/VXLAN + masquerade + kube-proxy
 replacement (50-cilium-config.yaml), network-operator 0.3.0 (Network CR), CLUSTER.md "Choosing the network".
-docs/networking.md, README link, CHANGELOG; sc-build (build only, docs); no golden (nothing shipped changes); close.
+docs/networking.md, README link, CHANGELOG (c93fb49, 7d7dbac: NetworkUnavailable is cilium-operator's, from Cilium's
+node_taint.go). sc-build `cargo build --locked` ok. No golden (docs only). Closed.
 
 ### Done: #116 (P3), the CRI backend follows GetContainerEvents
 
