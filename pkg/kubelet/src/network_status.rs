@@ -56,7 +56,7 @@ pub fn entries(result: &cni::CniResult, mtu_of: &dyn Fn(&str) -> Option<u32>) ->
         .map(|(n, (index, name, mac, mtu))| {
             // An address with no interface index belongs to the only (or
             // first) pod interface.
-            let ips: Vec<&cni::CniIpConfig> = result
+            let ips: Vec<&cni::cni_types::CniIpConfig> = result
                 .ips
                 .iter()
                 .filter(|ip| match (ip.interface, index) {
