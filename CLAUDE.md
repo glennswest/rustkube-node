@@ -71,13 +71,13 @@ among them (stormcos#368 will enforce).
        stormcos#402 filed (kubelet SA token + `STORMBLOCK_ADMIN_TOKEN_FILE`, before #368). Stage golden
        golden-rustkube-node-dc81277f6b12 (stormcos#366). Closed. Live check is stormcos#402/#368's audit log.
 
-### In progress: #136, /log strips three words of every plain line
+### Done: #136, /log strips three words of every plain line
 
 2026-10-08. `filter_log` took any 4-way split as `<ts> <stream> <tag> <msg>`. Now `cri_line`: RFC 3339 first field
 and CRI's stdout|stderr + P|F, or stormd's stream + severity words (node-service logs go through the same filter);
 else whole. P lines joined; a final unterminated line returned (plain read; `rest_from` when a follow ends). Tests
-(the issue's lines, partials, unterminated), api.md, CHANGELOG; sc-build; golden; tell stormcos_qa/stormlb/stormpump
-their `\u0020` workarounds can go after the release; close.
+(the issue's lines, partials, unterminated), api.md, CHANGELOG (9f39b3f). SC_BUILD_VM sc-build: 436 kubelet unit pass.
+Stage golden golden-rustkube-node-1a2f55a3b2f5 (stormcos#366). Closed; stormcos_qa#26 told.
 
 ### Done: #135, start timing's `scheduled` from storm.io/scheduled-at
 
