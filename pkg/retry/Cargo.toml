@@ -1,0 +1,18 @@
+[package]
+name = "retry"
+description = "Bounded retry with backoff for every call that leaves the process (#211)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Plain versions, not `workspace = true`, and only what is used: the test
+# container (`test/`, its own workspace and lock) links this crate too, and
+# must not be handed the root workspace's feature set.
+[dependencies]
+reqwest = { version = "0.12", default-features = false }
+tokio = { version = "1", features = ["time"] }
+tracing = { version = "0.1" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

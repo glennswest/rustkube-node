@@ -1464,6 +1464,7 @@ dependencies = [
  "prost-types",
  "rcgen",
  "reqwest",
+ "retry",
  "rustls",
  "serde",
  "serde_json",
@@ -2212,6 +2213,7 @@ dependencies = [
  "dashmap",
  "rand 0.8.7",
  "reqwest",
+ "retry",
  "serde",
  "serde_json",
  "tempfile",
@@ -2516,6 +2518,15 @@ dependencies = [
  "wasm-streams",
  "web-sys",
  "webpki-roots 1.0.8",
+]
+
+[[package]]
+name = "retry"
+version = "0.13.0"
+dependencies = [
+ "reqwest",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

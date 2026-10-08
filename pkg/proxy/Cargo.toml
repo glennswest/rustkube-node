@@ -16,6 +16,7 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
+retry = { workspace = true }
 chrono = { workspace = true }
 dashmap = { workspace = true }
 rand = { workspace = true }

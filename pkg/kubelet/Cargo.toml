@@ -41,6 +41,7 @@ apimachinery = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 cni = { workspace = true }
+retry = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
 # google.protobuf.Timestamp and the wrappers, which csi.proto uses.

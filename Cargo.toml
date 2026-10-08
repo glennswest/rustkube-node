@@ -4,6 +4,7 @@ members = [
     "pkg/kubelet",
     "pkg/proxy",
     "pkg/cni",
+    "pkg/retry",
     "cmd/kubelet",
     "cmd/kube-proxy",
 ]
@@ -54,6 +55,8 @@ apimachinery = { git = "https://github.com/glennswest/rustkube", rev = "2b3f2c16
 kubelet = { path = "pkg/kubelet" }
 proxy = { path = "pkg/proxy" }
 cni = { path = "pkg/cni" }
+# One retry helper for every remote call (#211).
+retry = { path = "pkg/retry" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
