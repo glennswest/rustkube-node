@@ -71,11 +71,12 @@ among them (stormcos#368 will enforce).
        stormcos#402 filed (kubelet SA token + `STORMBLOCK_ADMIN_TOKEN_FILE`, before #368). Stage golden
        golden-rustkube-node-dc81277f6b12 (stormcos#366). Closed. Live check is stormcos#402/#368's audit log.
 
-### In progress: #113 (P3), a given --apiserver equal to the default overrides the kubeconfig
+### Done: #113 (P3), a given --apiserver equal to the default overrides the kubeconfig
 
 2026-10-08. main.rs chose the CLI URL only when `!= DEFAULT_APISERVER`. Now `apiserver: Option<String>` (no clap
 default) and `api_server_url(given, kubeconfig)`: given → kubeconfig → default. Test (omitted, non-default, explicit
-default, and the CLI parse). Docs (configuration.md, status.md), CHANGELOG; sc-build; golden; close.
+default, and the CLI parse). Docs (configuration.md, status.md), CHANGELOG (46510b2). SC_BUILD_VM sc-build: passes
+(main.rs 5, kubelet 425). Stage golden golden-rustkube-node-163852d29fad (stormcos#366). Closed.
 
 ### Done: #78 (P3), nodeInfo kernelVersion / bootID / machineID / systemUUID
 
