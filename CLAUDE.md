@@ -57,6 +57,16 @@ by #51.
 
 ## Work plan
 
+### In progress: #210, git dependencies pinned by rev (stormcentral#571's SBOM refusal)
+
+2026-10-08. stormcentral's `sbom` reads `cargo metadata` and refuses any resolved git package whose source has no
+`rev=`, transitive ones included. Ours: stormpump 13cf2c9, stormvm 180fa13 (direct, `branch = "main"`), stormcast
+3cec734 (only through stormvm/stormpump, whose own manifests say `branch = "main"`).
+1. [ ] pkg/kubelet/Cargo.toml: `rev =` the lock's sha for every stormpump/stormvm crate; root `[patch]` for the
+       stormpump and stormcast URLs (same revs) so stormvm's own references resolve to the pinned source too.
+2. [ ] Lock regenerated on the build box (`cargo metadata`, diff applied); no duplicate stormpump; every git
+       source `?rev=`. sc-build; README/BUILD note on bumping; CHANGELOG; close.
+
 ### Done: #209 (P2), a class blank being minted is charged as committed; medium's 1Ti case starts late
 
 2026-10-08. Found: stormblock formats a template on `fstemplate-<name>-raw` and seals it as `fstemplate-<fs>-<name>`
