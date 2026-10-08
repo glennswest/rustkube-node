@@ -1,5 +1,11 @@
 //! Talking to stormpump over its ring.
 //!
+//! **Not retried here (#211).** The ring is shared memory with PID 1 on this
+//! node, not a network call: it is never "unreachable", only slow, and a
+//! request is bounded by its `DEADLINE` (#99). Most ops are not safe to repeat
+//! (SPAWN, CLONE, SANDBOX_ACQUIRE make a new thing each time); their callers
+//! read back what exists and retry on the workload's own backoff.
+//!
 //! # Why a thread and a channel
 //!
 //! The ring is a shared-memory structure with one producer on this side. Its

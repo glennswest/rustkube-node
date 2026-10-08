@@ -11,6 +11,7 @@
 //! body with no `items`, is an error, never an empty set (an empty set would
 //! remove every Service's rules).
 
+use retry::RetryExt;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -122,7 +123,7 @@ impl ApiClient {
             req = req.bearer_auth(t);
         }
         let resp = req
-            .send()
+            .send_retrying(retry::Policy::API)
             .await
             .map_err(|e| anyhow::anyhow!("GET {url}: {e}"))?;
         let status = resp.status();

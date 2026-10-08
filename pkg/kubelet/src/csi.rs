@@ -181,13 +181,27 @@ impl CsiDriverClient {
         self.socket.display().to_string()
     }
 
+    /// One node-plugin call, retried while the driver is away (#211): every
+    /// CSI node RPC is idempotent by the spec, so a repeat is safe. A
+    /// driver's real answer (InvalidArgument, NotFound, …) comes back at once.
+    async fn call<T, F, Fut>(&self, what: &str, op: F) -> std::result::Result<T, tonic::Status>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<tonic::Response<T>, tonic::Status>>,
+    {
+        retry::with_backoff(retry::Policy::LOCAL.named("csi"), &format!("{what} on {}", self.at()), grpc_class, op)
+            .await
+            .map(tonic::Response::into_inner)
+    }
+
     pub async fn plugin_info(&self) -> Result<PluginInfo> {
         let r = self
-            .identity()
-            .get_plugin_info(proto::GetPluginInfoRequest {})
+            .call("GetPluginInfo", || {
+                let mut c = self.identity();
+                async move { c.get_plugin_info(proto::GetPluginInfoRequest {}).await }
+            })
             .await
-            .with_context(|| format!("GetPluginInfo on {}", self.at()))?
-            .into_inner();
+            .with_context(|| format!("GetPluginInfo on {}", self.at()))?;
         Ok(PluginInfo { name: r.name, vendor_version: r.vendor_version })
     }
 
@@ -195,21 +209,23 @@ impl CsiDriverClient {
     /// per the spec.
     pub async fn probe(&self) -> Result<bool> {
         let r = self
-            .identity()
-            .probe(proto::ProbeRequest {})
+            .call("Probe", || {
+                let mut c = self.identity();
+                async move { c.probe(proto::ProbeRequest {}).await }
+            })
             .await
-            .with_context(|| format!("Probe on {}", self.at()))?
-            .into_inner();
+            .with_context(|| format!("Probe on {}", self.at()))?;
         Ok(r.ready.unwrap_or(true))
     }
 
     pub async fn node_info(&self) -> Result<NodeInfo> {
         let r = self
-            .node()
-            .node_get_info(proto::NodeGetInfoRequest {})
+            .call("NodeGetInfo", || {
+                let mut c = self.node();
+                async move { c.node_get_info(proto::NodeGetInfoRequest {}).await }
+            })
             .await
-            .with_context(|| format!("NodeGetInfo on {}", self.at()))?
-            .into_inner();
+            .with_context(|| format!("NodeGetInfo on {}", self.at()))?;
         if r.node_id.is_empty() {
             return Err(anyhow!("NodeGetInfo on {} returned an empty node_id", self.at()));
         }
@@ -222,11 +238,12 @@ impl CsiDriverClient {
 
     pub async fn node_capabilities(&self) -> Result<NodeCapabilities> {
         let r = self
-            .node()
-            .node_get_capabilities(proto::NodeGetCapabilitiesRequest {})
+            .call("NodeGetCapabilities", || {
+                let mut c = self.node();
+                async move { c.node_get_capabilities(proto::NodeGetCapabilitiesRequest {}).await }
+            })
             .await
-            .with_context(|| format!("NodeGetCapabilities on {}", self.at()))?
-            .into_inner();
+            .with_context(|| format!("NodeGetCapabilities on {}", self.at()))?;
         let mut caps = NodeCapabilities::default();
         for c in r.capabilities {
             if let Some(proto::node_service_capability::Type::Rpc(rpc)) = c.r#type {
@@ -242,46 +259,55 @@ impl CsiDriverClient {
     }
 
     pub async fn stage(&self, v: &VolumeSpec, staging: &str) -> Result<()> {
-        self.node()
-            .node_stage_volume(proto::NodeStageVolumeRequest {
-                volume_id: v.volume_id.clone(),
-                publish_context: v.publish_context.clone(),
-                staging_target_path: staging.to_string(),
-                volume_capability: Some(v.capability()),
-                secrets: v.stage_secrets.clone(),
-                volume_context: v.volume_context.clone(),
-            })
-            .await
-            .map_err(|s| status_error("NodeStageVolume", &v.volume_id, s))?;
+        let req = proto::NodeStageVolumeRequest {
+            volume_id: v.volume_id.clone(),
+            publish_context: v.publish_context.clone(),
+            staging_target_path: staging.to_string(),
+            volume_capability: Some(v.capability()),
+            secrets: v.stage_secrets.clone(),
+            volume_context: v.volume_context.clone(),
+        };
+        self.call("NodeStageVolume", || {
+            let (mut c, req) = (self.node(), req.clone());
+            async move { c.node_stage_volume(req).await }
+        })
+        .await
+        .map_err(|s| status_error("NodeStageVolume", &v.volume_id, s))?;
         Ok(())
     }
 
     pub async fn unstage(&self, volume_id: &str, staging: &str) -> Result<()> {
-        self.node()
-            .node_unstage_volume(proto::NodeUnstageVolumeRequest {
-                volume_id: volume_id.to_string(),
-                staging_target_path: staging.to_string(),
-            })
-            .await
-            .map_err(|s| status_error("NodeUnstageVolume", volume_id, s))?;
+        let req = proto::NodeUnstageVolumeRequest {
+            volume_id: volume_id.to_string(),
+            staging_target_path: staging.to_string(),
+        };
+        self.call("NodeUnstageVolume", || {
+            let (mut c, req) = (self.node(), req.clone());
+            async move { c.node_unstage_volume(req).await }
+        })
+        .await
+        .map_err(|s| status_error("NodeUnstageVolume", volume_id, s))?;
         Ok(())
     }
 
     /// `staging` is `None` for a driver without STAGE_UNSTAGE_VOLUME.
     pub async fn publish(&self, v: &VolumeSpec, staging: Option<&str>, target: &str) -> Result<()> {
-        self.node()
-            .node_publish_volume(proto::NodePublishVolumeRequest {
-                volume_id: v.volume_id.clone(),
-                publish_context: v.publish_context.clone(),
-                staging_target_path: staging.unwrap_or("").to_string(),
-                target_path: target.to_string(),
-                volume_capability: Some(v.capability()),
-                readonly: v.readonly,
-                secrets: v.publish_secrets.clone(),
-                volume_context: v.volume_context.clone(),
-            })
-            .await
-            .map_err(|s| status_error("NodePublishVolume", &v.volume_id, s))?;
+        let req = proto::NodePublishVolumeRequest {
+            volume_id: v.volume_id.clone(),
+            publish_context: v.publish_context.clone(),
+            staging_target_path: staging.unwrap_or("").to_string(),
+            target_path: target.to_string(),
+            volume_capability: Some(v.capability()),
+            readonly: v.readonly,
+            secrets: v.publish_secrets.clone(),
+            volume_context: v.volume_context.clone(),
+        };
+        self.call("NodePublishVolume", || {
+            let (mut c, req) = (self.node(), req.clone());
+            async move { c.node_publish_volume(req).await }
+        })
+        .await
+        .map_err(|s| status_error("NodePublishVolume", &v.volume_id, s))?;
         Ok(())
     }
 
@@ -294,31 +320,48 @@ impl CsiDriverClient {
         staging: Option<&str>,
         required_bytes: i64,
     ) -> Result<Option<i64>> {
+        let req = proto::NodeExpandVolumeRequest {
+            volume_id: v.volume_id.clone(),
+            volume_path: volume_path.to_string(),
+            capacity_range: Some(proto::CapacityRange { required_bytes, limit_bytes: 0 }),
+            staging_target_path: staging.unwrap_or("").to_string(),
+            volume_capability: Some(v.capability()),
+            secrets: HashMap::new(),
+        };
         let r = self
-            .node()
-            .node_expand_volume(proto::NodeExpandVolumeRequest {
-                volume_id: v.volume_id.clone(),
-                volume_path: volume_path.to_string(),
-                capacity_range: Some(proto::CapacityRange { required_bytes, limit_bytes: 0 }),
-                staging_target_path: staging.unwrap_or("").to_string(),
-                volume_capability: Some(v.capability()),
-                secrets: HashMap::new(),
+            .call("NodeExpandVolume", || {
+                let (mut c, req) = (self.node(), req.clone());
+                async move { c.node_expand_volume(req).await }
             })
             .await
-            .map_err(|s| status_error("NodeExpandVolume", &v.volume_id, s))?
-            .into_inner();
+            .map_err(|s| status_error("NodeExpandVolume", &v.volume_id, s))?;
         Ok((r.capacity_bytes > 0).then_some(r.capacity_bytes))
     }
 
     pub async fn unpublish(&self, volume_id: &str, target: &str) -> Result<()> {
-        self.node()
-            .node_unpublish_volume(proto::NodeUnpublishVolumeRequest {
-                volume_id: volume_id.to_string(),
-                target_path: target.to_string(),
-            })
-            .await
-            .map_err(|s| status_error("NodeUnpublishVolume", volume_id, s))?;
+        let req = proto::NodeUnpublishVolumeRequest {
+            volume_id: volume_id.to_string(),
+            target_path: target.to_string(),
+        };
+        self.call("NodeUnpublishVolume", || {
+            let (mut c, req) = (self.node(), req.clone());
+            async move { c.node_unpublish_volume(req).await }
+        })
+        .await
+        .map_err(|s| status_error("NodeUnpublishVolume", volume_id, s))?;
         Ok(())
+    }
+}
+
+/// A gRPC answer's class (#211): the driver away (restarting, its socket not
+/// there yet), out of time, overloaded, or busy with the same volume
+/// (Aborted, which the CSI spec says to retry) is infrastructure; anything
+/// else is the driver's answer.
+pub fn grpc_class(s: &tonic::Status) -> retry::Class {
+    use tonic::Code;
+    match s.code() {
+        Code::Unavailable | Code::DeadlineExceeded | Code::ResourceExhausted | Code::Aborted => retry::Class::Infra,
+        _ => retry::Class::Real,
     }
 }
 

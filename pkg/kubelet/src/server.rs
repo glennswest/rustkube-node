@@ -21,6 +21,7 @@
 //! has a kubelet, and a daemon whose only job was to serve consoles was a
 //! process that never needed to exist.
 
+use retry::RetryExt;
 use crate::pod_manager::{PodManager, VolumeRelease};
 use axum::extract::{ConnectInfo, FromRef, Path, Query, Request, State};
 use axum::http::{header::AUTHORIZATION, StatusCode};
@@ -292,7 +293,7 @@ async fn token_review(auth: &AuthState, token: &str) -> bool {
         "kind": "TokenReview",
         "spec": { "token": token }
     });
-    match auth.api_client.post(&url).json(&body).send().await {
+    match auth.api_client.post(&url).json(&body).send_repeatable(retry::Policy::API).await {
         Ok(resp) => resp
             .json::<serde_json::Value>()
             .await

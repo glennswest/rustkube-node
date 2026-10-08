@@ -189,6 +189,9 @@ async fn http_get_probe(
         Err(e) => return ProbeResult::Failure(e.to_string()),
     };
 
+    // Not retried (#211): a probe is asked once per period, and its
+    // failureThreshold is the retry. Retrying here would hide a failing
+    // container behind the policy's backoff.
     match client.get(&url).send().await {
         Ok(resp) => {
             let status = resp.status().as_u16();

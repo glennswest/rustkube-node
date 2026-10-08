@@ -7,6 +7,7 @@
 //! are restarted per the pod restartPolicy, and liveness/readiness probes
 //! drive container restarts and readiness.
 
+use retry::RetryExt;
 use crate::cri::{
     ContainerConfig, ContainerState, CriError, ImageInfo, ImageService, Mount, MountPropagation,
     PodSandboxConfig, RuntimeService, SeLinuxOptions, SeccompProfile,
@@ -327,7 +328,7 @@ impl ClaimBinder {
         if self.api_url.is_empty() {
             return None;
         }
-        let r = self.api_client.get(format!("{}{path}", self.api_url)).send().await.ok()?;
+        let r = self.api_client.get(format!("{}{path}", self.api_url)).send_retrying(retry::Policy::API).await.ok()?;
         if !r.status().is_success() {
             return None;
         }
@@ -338,7 +339,7 @@ impl ClaimBinder {
         if self.api_url.is_empty() {
             return None;
         }
-        let r = self.api_client.post(format!("{}{path}", self.api_url)).json(body).send().await.ok()?;
+        let r = self.api_client.post(format!("{}{path}", self.api_url)).json(body).send_repeatable(retry::Policy::API).await.ok()?;
         if !r.status().is_success() {
             return None;
         }
@@ -349,7 +350,7 @@ impl ClaimBinder {
         if self.api_url.is_empty() {
             return None;
         }
-        let r = self.api_client.put(format!("{}{path}", self.api_url)).json(body).send().await.ok()?;
+        let r = self.api_client.put(format!("{}{path}", self.api_url)).json(body).send_retrying(retry::Policy::API).await.ok()?;
         if !r.status().is_success() {
             return None;
         }
@@ -868,7 +869,7 @@ impl PodManager {
         let resp = self
             .api_client
             .get(format!("{}{path}", self.api_url))
-            .send()
+            .send_retrying(retry::Policy::API)
             .await
             .ok()?;
         if !resp.status().is_success() {
@@ -918,7 +919,7 @@ impl PodManager {
             .api_client
             .post(format!("{}{path}", self.api_url))
             .json(body)
-            .send()
+            .send_repeatable(retry::Policy::API)
             .await
             .ok()?;
         if !resp.status().is_success() {
@@ -936,7 +937,7 @@ impl PodManager {
             .api_client
             .put(format!("{}{path}", self.api_url))
             .json(body)
-            .send()
+            .send_retrying(retry::Policy::API)
             .await
             .ok()?;
         if !resp.status().is_success() {
@@ -1017,7 +1018,7 @@ impl PodManager {
             "{}/api/v1/namespaces/{namespace}/configmaps/{name}",
             self.api_url
         );
-        let resp = self.api_client.get(&url).send().await.ok()?;
+        let resp = self.api_client.get(&url).send_retrying(retry::Policy::API).await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -1037,7 +1038,7 @@ impl PodManager {
             "{}/api/v1/namespaces/{namespace}/secrets/{name}",
             self.api_url
         );
-        let resp = self.api_client.get(&url).send().await.ok()?;
+        let resp = self.api_client.get(&url).send_retrying(retry::Policy::API).await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -1555,7 +1556,7 @@ impl PodManager {
                     match self.api_client.delete(url).json(&serde_json::json!({
                         "apiVersion":"v1", "kind":"DeleteOptions",
                         "preconditions":{"uid":pv_uid,"resourceVersion":pv["metadata"]["resourceVersion"]}
-                    })).send().await {
+                    })).send_retrying(retry::Policy::API).await {
                         Ok(r) if r.status().is_success() || r.status().as_u16() == 404 => {
                             info!("reclaimed {pv_name}: the volume for {ns}/{claim} is deleted")
                         }
@@ -2414,7 +2415,7 @@ impl PodManager {
             "{}/api/v1/namespaces/{namespace}/serviceaccounts/{sa}/token",
             self.api_url
         );
-        let resp = self.api_client.post(&url).json(&body).send().await.ok()?;
+        let resp = self.api_client.post(&url).json(&body).send_repeatable(retry::Policy::API).await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -4776,7 +4777,7 @@ impl PodManager {
             .json(&serde_json::json!({"metadata": {"uid": uid, "annotations": annotations}}));
         let pod_name = format!("{namespace}/{name}");
         tokio::spawn(async move {
-            if let Err(error) = request.send().await.and_then(|r| r.error_for_status()) {
+            if let Err(error) = request.send_retrying(retry::Policy::API).await.and_then(|r| r.error_for_status()) {
                 warn!(%error, "Pod {pod_name}: container annotations not written");
             }
         });
@@ -4836,7 +4837,7 @@ impl PodManager {
             .json(&patch);
         let pod_name = format!("{namespace}/{name}");
         tokio::spawn(async move {
-            if let Err(error) = request.send().await.and_then(|r| r.error_for_status()) {
+            if let Err(error) = request.send_retrying(retry::Policy::API).await.and_then(|r| r.error_for_status()) {
                 warn!(%error, "Pod {pod_name}: start timing annotation not written");
             }
         });

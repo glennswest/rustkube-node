@@ -30,6 +30,7 @@
 //! Every step is find-or-create (stormblock is idempotent by name, objects
 //! are looked up first), so a pass interrupted anywhere finishes on the next.
 
+use retry::RetryExt;
 use serde_json::{json, Value};
 use stormvm_spec::snapshot::{self as spec, Restored};
 use tracing::{debug, info, warn};
@@ -54,15 +55,21 @@ pub trait RestoreEngine: Send + Sync {
 /// stormvm's client against this node's stormblock, with the engine's token.
 pub struct Stormblock(pub String);
 
+// Both retried while the engine is away (#211): a read, and a create by name
+// that answers the one already made when asked again.
 impl RestoreEngine for Stormblock {
     fn group(&self, id: &str) -> Result<Option<stormvm_block::GroupSnapshot>, String> {
-        stormvm_block::Client::new(&self.0).group_snapshot_by_id(id).map_err(|e| e.to_string())
+        retry::blocking(retry::Policy::ENGINE, &format!("group snapshot {id}"), |e: &String| retry::class_of_message(e), || {
+            stormvm_block::Client::new(&self.0).group_snapshot_by_id(id).map_err(|e| e.to_string())
+        })
     }
     fn from_snapshot(&self, name: &str, member: &stormvm_block::Snapshot) -> Result<String, String> {
-        stormvm_block::Client::new(&self.0)
-            .volume_from_snapshot(name, member)
-            .map(|v| if v.name.is_empty() { name.to_string() } else { v.name })
-            .map_err(|e| e.to_string())
+        retry::blocking(retry::Policy::ENGINE, &format!("volume {name} from snapshot"), |e: &String| retry::class_of_message(e), || {
+            stormvm_block::Client::new(&self.0)
+                .volume_from_snapshot(name, member)
+                .map(|v| if v.name.is_empty() { name.to_string() } else { v.name })
+                .map_err(|e| e.to_string())
+        })
     }
 }
 
@@ -111,7 +118,7 @@ impl Snapshots {
         if url.is_empty() {
             return;
         }
-        let list = match api.get(format!("{url}/apis/{API}/virtualmachinerestores")).send().await {
+        let list = match api.get(format!("{url}/apis/{API}/virtualmachinerestores")).send_retrying(retry::Policy::API).await {
             Ok(r) if r.status().is_success() => r.json::<Value>().await.ok(),
             Ok(_) => None, // no CRD, or no answer: nothing to do this pass
             Err(e) => {
@@ -233,7 +240,7 @@ impl Snapshots {
         // The VM's disks are the restored claims (option A).
         if let Some(updated) = rewired(&vm, &claims) {
             let (api, url, _) = self.api();
-            let r = api.put(format!("{url}{vm_path}")).json(&updated).send().await;
+            let r = api.put(format!("{url}{vm_path}")).json(&updated).send_retrying(retry::Policy::API).await;
             match r {
                 Ok(r) if r.status().is_success() => {}
                 Ok(r) => return Err(Step::Wait(format!("VirtualMachine {} not updated: {}", req.vm, r.status()))),
@@ -267,7 +274,7 @@ impl Snapshots {
                 let r = api
                     .post(format!("{url}/api/v1/namespaces/{ns}/persistentvolumeclaims"))
                     .json(&pvc)
-                    .send()
+                    .send_repeatable(retry::Policy::API)
                     .await
                     .map_err(|e| format!("claim {claim}: {e}"))?;
                 if !r.status().is_success() {
@@ -283,7 +290,7 @@ impl Snapshots {
             let r = api
                 .post(format!("{url}/api/v1/persistentvolumes"))
                 .json(&pv)
-                .send()
+                .send_repeatable(retry::Policy::API)
                 .await
                 .map_err(|e| format!("PV {volume}: {e}"))?;
             if !r.status().is_success() && r.status().as_u16() != 409 {
@@ -295,7 +302,7 @@ impl Snapshots {
 
     async fn api_object(&self, path: &str) -> Option<Value> {
         let (api, url, _) = self.api();
-        match api.get(format!("{url}{path}")).send().await {
+        match api.get(format!("{url}{path}")).send_retrying(retry::Policy::API).await {
             Ok(r) if r.status().is_success() => r.json().await.ok(),
             _ => None,
         }
@@ -310,7 +317,7 @@ impl Snapshots {
             .patch(&path)
             .header("content-type", "application/merge-patch+json")
             .json(&json!({ "status": status }))
-            .send()
+            .send_retrying(retry::Policy::API)
             .await
         {
             Ok(r) if r.status().is_success() => true,

@@ -20,6 +20,7 @@
 //! absorbs exits, already owns the restart decision and already serves the pod
 //! log path. A VM manager beside `PodManager` reuses all of it.
 
+use retry::RetryExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -1264,7 +1265,7 @@ impl VmManager {
             return Err(format!("Secret {name}: no apiserver to read it from"));
         }
         let url = format!("{}/api/v1/namespaces/{ns}/secrets/{name}", self.api_url);
-        let r = self.api.get(&url).send().await.map_err(|e| format!("Secret {name}: {e}"))?;
+        let r = self.api.get(&url).send_retrying(retry::Policy::API).await.map_err(|e| format!("Secret {name}: {e}"))?;
         match r.status().as_u16() {
             200 => {}
             404 => return Err(format!("Secret {ns}/{name} not found")),
@@ -1753,7 +1754,7 @@ impl VmManager {
                 "{}/api/v1/namespaces/{ns}/secrets/{name}",
                 self.api_url.trim_end_matches('/')
             );
-            let secret = match self.api.get(&url).send().await {
+            let secret = match self.api.get(&url).send_retrying(retry::Policy::API).await {
                 Ok(r) => match r.json::<Value>().await {
                     Ok(v) => v,
                     Err(e) => {
@@ -2624,7 +2625,7 @@ impl VmManager {
             self.api_url,
             crate::vm_network::CREATED_BY.replace('/', "%2F")
         );
-        let r = self.api.get(&url).send().await.map_err(|e| format!("listing pods: {e}"))?;
+        let r = self.api.get(&url).send_retrying(retry::Policy::API).await.map_err(|e| format!("listing pods: {e}"))?;
         if !r.status().is_success() {
             return Err(format!("listing pods: {}", r.status()));
         }
@@ -2642,7 +2643,7 @@ impl VmManager {
             return;
         }
         let path = format!("{}/api/v1/namespaces/{}/pods/{}", self.api_url, net.namespace, net.pod_name);
-        let Ok(r) = self.api.get(&path).send().await else { return };
+        let Ok(r) = self.api.get(&path).send_retrying(retry::Policy::API).await else { return };
         let Ok(mut pod) = r.json::<Value>().await else { return };
         if pod["metadata"]["uid"].as_str() != Some(net.pod_uid.as_str()) {
             return; // another Pod of the name: not this machine's
@@ -2652,7 +2653,7 @@ impl VmManager {
             return;
         }
         pod["status"] = status;
-        match self.api.put(format!("{path}/status")).json(&pod).send().await {
+        match self.api.put(format!("{path}/status")).json(&pod).send_retrying(retry::Policy::API).await {
             Ok(r) if r.status().is_success() => info!(pod = %net.pod_name, %phase, ip = %net.ip, "launcher Pod status written"),
             Ok(r) => warn!(pod = %net.pod_name, "launcher Pod status not written: {}", r.status()),
             Err(e) => warn!(pod = %net.pod_name, "launcher Pod status not written: {e}"),
@@ -3049,7 +3050,7 @@ impl VmManager {
             if held.contains(id) || v["in_use"].as_bool() == Some(true) {
                 continue;
             }
-            let (status, obj) = match self.api.get(format!("{}{path}", self.api_url)).send().await {
+            let (status, obj) = match self.api.get(format!("{}{path}", self.api_url)).send_retrying(retry::Policy::API).await {
                 Ok(r) => {
                     let status = r.status().as_u16();
                     (status, r.json::<Value>().await.ok())
@@ -3170,7 +3171,7 @@ impl VmManager {
             .api
             .post(format!("{}/apis/authentication.k8s.io/v1/tokenreviews", self.api_url))
             .json(&review)
-            .send()
+            .send_repeatable(retry::Policy::API)
             .await
             .ok()?;
         let review: Value = r.json().await.ok()?;
@@ -3181,7 +3182,7 @@ impl VmManager {
         let pod: Value = self
             .api
             .get(format!("{}/api/v1/namespaces/{}/pods/{}", self.api_url, b.namespace, b.name))
-            .send()
+            .send_retrying(retry::Policy::API)
             .await
             .ok()?
             .json()
@@ -3423,7 +3424,7 @@ impl VmManager {
             .patch(&url)
             .header("content-type", "application/merge-patch+json")
             .json(&body)
-            .send()
+            .send_retrying(retry::Policy::API)
             .await
         {
             Ok(r) if r.status().is_success() => {
@@ -3490,7 +3491,7 @@ impl VmManager {
             return None;
         }
         let url = format!("{}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}", self.api_url);
-        let r = self.api.get(&url).send().await.ok()?;
+        let r = self.api.get(&url).send_retrying(retry::Policy::API).await.ok()?;
         if !r.status().is_success() {
             return None;
         }
@@ -3522,7 +3523,7 @@ impl VmManager {
             .patch(&url)
             .header("content-type", "application/merge-patch+json")
             .json(&body)
-            .send()
+            .send_retrying(retry::Policy::API)
             .await
         {
             warn!("could not report {ns}/{name} as pending: {e}");
@@ -3603,7 +3604,7 @@ impl VmManager {
             .patch(&url)
             .header("content-type", "application/merge-patch+json")
             .json(&body)
-            .send()
+            .send_retrying(retry::Policy::API)
             .await
         {
             warn!("could not report {}/{}: {e}", vm.namespace, vm.name);
@@ -3733,7 +3734,7 @@ async fn watch_selector<F>(
         // 1. LIST.
         let list_url =
             format!("{base}/apis/kubevirt.io/v1/virtualmachineinstances?{selector}");
-        let Ok(resp) = api.get(&list_url).send().await else {
+        let Ok(resp) = api.get(&list_url).send_retrying(retry::Policy::API).await else {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             continue;
         };
@@ -3771,7 +3772,7 @@ async fn watch_selector<F>(
             let watch_url = format!(
                 "{base}/apis/kubevirt.io/v1/virtualmachineinstances?watch=true&{selector}&resourceVersion={version}&timeoutSeconds=300"
             );
-            let Ok(resp) = api.get(&watch_url).send().await else {
+            let Ok(resp) = api.get(&watch_url).send_retrying(retry::Policy::API).await else {
                 break;
             };
             if resp.status().as_u16() == 410 {
@@ -3862,7 +3863,7 @@ pub async fn list_for_node(api: &reqwest::Client, api_url: &str, node: &str) -> 
     // One list per placement field (#85); either failing fails the whole.
     let mut lists = Vec::new();
     for url in placement_urls(api_url, node).ok()? {
-        let resp = api.get(url).send().await.ok()?;
+        let resp = api.get(url).send_retrying(retry::Policy::API).await.ok()?;
         if !resp.status().is_success() {
             return None;
         }

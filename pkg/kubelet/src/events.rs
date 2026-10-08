@@ -17,6 +17,7 @@
 //! | `Pulling` / `Pulled` / `Failed` | image resolution |
 //! | `Created` / `Started` | the ordinary lifecycle |
 
+use retry::RetryExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -229,7 +230,7 @@ async fn send(client: &reqwest::Client, write: Write) {
                 .patch(&url)
                 .header("content-type", "application/strategic-merge-patch+json")
                 .json(&body)
-                .send()
+                .send_retrying(retry::Policy::API)
                 .await;
             return;
         }
@@ -248,7 +249,7 @@ async fn send(client: &reqwest::Client, write: Write) {
     // `warn`, not `debug`: events are how a node explains itself, and a
     // node that cannot explain itself has a problem worth a line at the
     // level somebody reads.
-    match client.post(&url).json(&event).send().await {
+    match client.post(&url).json(&event).send_repeatable(retry::Policy::API).await {
         Err(e) => {
             warn!("could not record event {reason} for {namespace}/{name}: {e}");
         }

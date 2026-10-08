@@ -339,7 +339,11 @@ impl EngineClient {
         if let Some(b) = body {
             req = req.json(b);
         }
-        req.send().await
+        // Retried on a transient failure (#211): the engine is away only
+        // while it (re)starts. A POST is repeated only when it never reached
+        // the engine; one that may have been applied (a clone, an attach, a
+        // mint) is checked by its caller, which finds it again by name.
+        retry::send(req, retry::Policy::ENGINE).await
     }
 
     /// The cached token, or a fresh read while there is none.

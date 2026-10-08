@@ -5,6 +5,12 @@
 //! from the vendored kubernetes/cri-api proto (release-1.32) by build.rs.
 //!
 //! This supersedes the Phase-1 crictl bridge in `cri_client.rs`.
+//!
+//! **Not retried here (#211).** CRI calls are not all safe to repeat
+//! (RunPodSandbox and CreateContainer make a new object each time), and an
+//! Unavailable runtime is mapped to `CriError::Connection`, which the pod
+//! worker treats as a wait and retries on its own backoff (#133), after
+//! reading back what exists. A call-level retry would make duplicates.
 
 use crate::cri::{
     CheckpointRef, ContainerConfig, ContainerState, ContainerStatsInfo, ContainerStatusInfo,

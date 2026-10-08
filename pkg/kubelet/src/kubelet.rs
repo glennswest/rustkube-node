@@ -2,6 +2,7 @@
 //!
 //! Registers the node, sends heartbeats, syncs pods, runs probes.
 
+use retry::RetryExt;
 use crate::cri::{ImageService, MigrationService, RuntimeService};
 use crate::node_status::NodeReporter;
 use crate::workload::{self, Access, Dependency, Executor, Key, Kind, Next, Resource};
@@ -886,7 +887,7 @@ impl Kubelet {
                             // No CRD is a supported Pod-only cluster. Never
                             // treat this as deletion of registered machines.
                             if vms.running().await.is_empty() {
-                                if let Ok(response)=self.api_client.get(url.clone()).send().await {
+                                if let Ok(response)=self.api_client.get(url.clone()).send_retrying(retry::Policy::API).await {
                                     if response.status().as_u16()==404 {
                                         // No VMIs can exist: metadata answers
                                         // "no such machine", not "cold" (#119).
@@ -929,7 +930,7 @@ impl Kubelet {
                     .patch(&url)
                     .header("content-type", "application/merge-patch+json")
                     .json(&body)
-                    .send()
+                    .send_retrying(retry::Policy::API)
                     .await
                 {
                     Ok(r) if r.status().is_success() => {
@@ -1103,7 +1104,7 @@ impl Kubelet {
             let body = serde_json::json!({"apiVersion":"v1","kind":"DeleteOptions","gracePeriodSeconds":0,
                 "preconditions":{"uid":p["metadata"]["uid"]}});
             match self.api_client.delete(format!("{}/api/v1/namespaces/{ns}/pods/{name}", self.config.api_server_url))
-                .json(&body).send().await
+                .json(&body).send_retrying(retry::Policy::API).await
             {
                 Ok(r) if r.status().is_success() || matches!(r.status().as_u16(), 404 | 409) => {
                     info!(pod = %name, namespace = %ns, "launcher Pod let go: no machine of its VMI runs here")
@@ -1140,7 +1141,7 @@ impl Kubelet {
         let mut claims=Vec::new();
         for dependency in workload::dependencies(key,object) {
             let Dependency::Claim(ns,name)=dependency else {continue};
-            let response=self.api_client.get(format!("{}/api/v1/namespaces/{ns}/persistentvolumeclaims/{name}",self.config.api_server_url)).send().await?;
+            let response=self.api_client.get(format!("{}/api/v1/namespaces/{ns}/persistentvolumeclaims/{name}",self.config.api_server_url)).send_retrying(retry::Policy::API).await?;
             let pvc:Value=response.error_for_status()?.json().await?;
             let mode=if key.kind==Kind::VirtualMachine || crate::storage::is_rwop(&pvc) {Access::Exclusive} else {Access::SharedFilesystem};
             claims.push((Resource::Claim(ns,name),mode));
@@ -1222,7 +1223,7 @@ impl Kubelet {
                                     }
                                 }
                             }))
-                            .send()
+                            .send_retrying(retry::Policy::API)
                             .await;
                         info!("Migration: checkpoint complete for {namespace}/{name}");
                     }
@@ -1244,7 +1245,7 @@ impl Kubelet {
                                     }
                                 }
                             }))
-                            .send()
+                            .send_retrying(retry::Policy::API)
                             .await;
                     }
                 }
@@ -1289,7 +1290,7 @@ impl Kubelet {
                                     }
                                 }
                             }))
-                            .send()
+                            .send_retrying(retry::Policy::API)
                             .await;
                         info!("Migration: target ready at {endpoint}");
                     }
@@ -1329,7 +1330,7 @@ impl Kubelet {
                                     }
                                 }
                             }))
-                            .send()
+                            .send_retrying(retry::Policy::API)
                             .await;
                         info!("Migration: live migration complete for {namespace}/{name}");
                     }
@@ -1633,7 +1634,7 @@ impl Kubelet {
                 "metadata": {"name": &update.name, "namespace": &update.namespace,
                     "uid": source["metadata"]["uid"], "resourceVersion": revision},
                 "status": status
-            })).send().await?.error_for_status()?.json().await.unwrap_or(Value::Null);
+            })).send_retrying(retry::Policy::API).await?.error_for_status()?.json().await.unwrap_or(Value::Null);
         crate::metrics::observe_status_write("written");
         // What the apiserver now holds, and at which revision, for the next
         // pass that runs before the watch delivers it.
@@ -1664,7 +1665,7 @@ impl workload::Adapter for Kubelet {
                         // Never acknowledge deletion of a same-name successor.
                         let response=self.api_client.delete(format!("{}/api/v1/namespaces/{}/pods/{}",self.config.api_server_url,key.namespace,key.name))
                             .json(&serde_json::json!({"apiVersion":"v1","kind":"DeleteOptions","gracePeriodSeconds":0,
-                                "preconditions":{"uid":object["metadata"]["uid"]}})).send().await?;
+                                "preconditions":{"uid":object["metadata"]["uid"]}})).send_retrying(retry::Policy::API).await?;
                         anyhow::ensure!(response.status().is_success() || matches!(response.status().as_u16(),404|409),"Pod deletion acknowledgement failed: {}",response.status());
                     }
                 }
@@ -2121,7 +2122,7 @@ async fn mirror_node_services(
     let list_url = format!(
         "{api_url}/api/v1/namespaces/kube-system/pods?labelSelector=storm.io%2Fcomponent%3Dnode-service"
     );
-    let listed = match client.get(&list_url).send().await {
+    let listed = match client.get(&list_url).send_retrying(retry::Policy::API).await {
         Ok(r) if r.status().is_success() => r.json::<Value>().await.ok(),
         _ => None,
     };
@@ -2173,7 +2174,7 @@ async fn mirror_node_services(
         let put = client
             .put(format!("{api_url}/api/v1/namespaces/kube-system/pods/{name}/status"))
             .json(&marked)
-            .send()
+            .send_retrying(retry::Policy::API)
             .await;
         match put {
             Ok(r) if r.status().is_success() => {
@@ -2227,7 +2228,7 @@ async fn mirror_node_services(
                         .patch(format!("{base}/{name}"))
                         .header("content-type", "application/merge-patch+json")
                         .json(&serde_json::json!({"metadata": {"annotations": want}}))
-                        .send()
+                        .send_retrying(retry::Policy::API)
                         .await;
                     if !matches!(patched, Ok(ref r) if r.status().is_success()) {
                         apimachinery::reactor::failed();
@@ -2243,14 +2244,14 @@ async fn mirror_node_services(
                 }
                 let mut pod = pod;
                 pod["metadata"] = existing["metadata"].clone();
-                let put = client.put(format!("{base}/{name}/status")).json(&pod).send().await;
+                let put = client.put(format!("{base}/{name}/status")).json(&pod).send_retrying(retry::Policy::API).await;
                 if !matches!(put, Ok(ref r) if r.status().is_success() || r.status() == 409) {
                     apimachinery::reactor::failed();
                 }
             }
             None => {
                 if node_uid.is_none() {
-                    node_uid = match client.get(format!("{api_url}/api/v1/nodes/{node}")).send().await {
+                    node_uid = match client.get(format!("{api_url}/api/v1/nodes/{node}")).send_retrying(retry::Policy::API).await {
                         Ok(r) if r.status().is_success() => r
                             .json::<Value>()
                             .await
@@ -2268,7 +2269,7 @@ async fn mirror_node_services(
                 };
                 let mut pod = crate::mirror::mirror_pod_with(a, node, uid, &started, health.get(&a.name));
                 crate::mirror::with_provenance(&mut pod, golden.as_ref(), host_ip);
-                let created = client.post(&base).json(&pod).send().await;
+                let created = client.post(&base).json(&pod).send_repeatable(retry::Policy::API).await;
                 if !matches!(created, Ok(ref r) if r.status().is_success() || r.status() == 409) {
                     apimachinery::reactor::failed();
                 }

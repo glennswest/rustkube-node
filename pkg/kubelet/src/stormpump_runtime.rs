@@ -48,6 +48,7 @@
 //! narrows to the runtime's standard set, or every pod that adds one (Cilium's
 //! NET_ADMIN, BPF, …) loses it as an EPERM rather than a refused start.
 
+use retry::RetryExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -1815,7 +1816,7 @@ impl StormpumpImages {
         if let Ok(mut path) = url.path_segments_mut() {
             path.pop_if_empty().extend(["v1", "goldens", image]);
         }
-        let config = match self.http.get(url.clone()).timeout(CONFIG_LOOKUP_TIMEOUT).send().await {
+        let config = match self.http.get(url.clone()).timeout(CONFIG_LOOKUP_TIMEOUT).send_retrying(retry::Policy::REGISTRY).await {
             Ok(r) if r.status().is_success() => r
                 .json::<serde_json::Value>()
                 .await
@@ -1844,7 +1845,7 @@ impl StormpumpImages {
             .http
             .post(&url)
             .json(&serde_json::json!({ "golden": image }))
-            .send()
+            .send_retrying(retry::Policy::REGISTRY)
             .await
             .map_err(|e| format!("registry {url} did not answer for {image}: {e}"))?;
         let status = resp.status();
@@ -1856,7 +1857,7 @@ impl StormpumpImages {
         }
         // Ready in the meantime: the clone is not wanted (#104).
         if let Some(id) = answer["id"].as_str() {
-            let gone = self.http.delete(format!("{url}/{id}")).send().await;
+            let gone = self.http.delete(format!("{url}/{id}")).send_retrying(retry::Policy::REGISTRY).await;
             if !matches!(gone, Ok(ref r) if r.status().is_success() || r.status().as_u16() == 404) {
                 tracing::warn!(image = %image, clone = %id, "a registry clone minted by the demand was not deleted (the registry reaps it)");
             }
@@ -1865,7 +1866,7 @@ impl StormpumpImages {
         if let Ok(mut path) = again.path_segments_mut() {
             path.pop_if_empty().extend(["v1", "goldens", image]);
         }
-        let record = match self.http.get(again).send().await {
+        let record = match self.http.get(again).send_retrying(retry::Policy::REGISTRY).await {
             Ok(r) if r.status().is_success() => r.json().await.ok(),
             _ => None,
         };
@@ -1955,7 +1956,7 @@ impl ImageService for StormpumpImages {
         let resp = self
             .http
             .get(url.clone())
-            .send()
+            .send_retrying(retry::Policy::REGISTRY)
             .await
             .map_err(|e| CriError::ImagePull(format!("registry {url} did not answer for {image}: {e}")))?;
         let status = resp.status();

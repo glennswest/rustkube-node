@@ -21,6 +21,7 @@
 //!
 //! `VirtualMachineRestore` is `vm_restore.rs` (#53, option A of #109).
 
+use retry::RetryExt;
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
@@ -81,15 +82,38 @@ pub fn stormvm_take(stormblock: String) -> TakeFn {
     Arc::new(move |reg: Registration, name: String| {
         let stormblock = stormblock.clone();
         Box::pin(async move {
-            let opts = stormvm_control::snapshot::Options::default();
-            let out = stormvm_console::snapshot::take(&reg, &stormblock, &name, opts).await;
-            Taken {
-                group: out.disks.as_ref().ok().map(|g| g.id.clone()),
-                indications: out.indications.iter().map(|s| s.to_string()).collect(),
-                error: out.error(),
-            }
+            // Taken again while stormblock is away (#211): stormvm's take is
+            // idempotent by name, and only a take whose disks were not taken
+            // for a transport reason is repeated (a refusal, or a guest left
+            // paused or frozen, is reported as it is).
+            let what = format!("snapshot {name}");
+            let (reg, stormblock, name) = (&reg, &stormblock, &name);
+            let taken = retry::with_backoff(retry::Policy::ENGINE.named("snapshot"), &what, |_| retry::Class::Infra, || async move {
+                let opts = stormvm_control::snapshot::Options::default();
+                let out = stormvm_console::snapshot::take(reg, stormblock, name, opts).await;
+                let taken = Taken {
+                    group: out.disks.as_ref().ok().map(|g| g.id.clone()),
+                    indications: out.indications.iter().map(|s| s.to_string()).collect(),
+                    error: out.error(),
+                };
+                match (&out.disks, &taken.error) {
+                    (Err(_), Some(e)) if retry::class_of_message(e) == retry::Class::Infra => Err(Unreached(taken)),
+                    _ => Ok(taken),
+                }
+            })
+            .await;
+            taken.unwrap_or_else(|Unreached(t)| t)
         })
     })
+}
+
+/// A take that failed before its disks were taken, for a transport reason.
+struct Unreached(Taken);
+
+impl std::fmt::Display for Unreached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.error.as_deref().unwrap_or("not taken"))
+    }
 }
 
 /// What to do with one snapshot object this pass.
@@ -269,7 +293,7 @@ impl Snapshots {
             return None;
         }
         let url = format!("{}/apis/{API}/virtualmachinesnapshots", self.api_url);
-        let r = match self.api.get(&url).send().await {
+        let r = match self.api.get(&url).send_retrying(retry::Policy::API).await {
             Ok(r) => r,
             Err(e) => {
                 debug!("virtualmachinesnapshots not listed: {e}");
@@ -309,7 +333,7 @@ impl Snapshots {
             .patch(&url)
             .header("content-type", "application/merge-patch+json")
             .json(&json!({ "metadata": meta }))
-            .send()
+            .send_retrying(retry::Policy::API)
             .await
         {
             Ok(r) if r.status().is_success() => true,
@@ -360,7 +384,7 @@ impl Snapshots {
             "{}/apis/kubevirt.io/v1/namespaces/{}/virtualmachines/{}",
             self.api_url, reg.namespace, reg.name
         );
-        let vm: Option<Value> = match self.api.get(&url).send().await {
+        let vm: Option<Value> = match self.api.get(&url).send_retrying(retry::Policy::API).await {
             Ok(r) if r.status().is_success() => r.json().await.ok(),
             _ => None,
         };
@@ -404,7 +428,7 @@ impl Snapshots {
             .patch(&url)
             .header("content-type", "application/merge-patch+json")
             .json(&json!({ "status": spec::snapshot_status(r) }))
-            .send()
+            .send_retrying(retry::Policy::API)
             .await
         {
             Ok(resp) if resp.status().is_success() => {}

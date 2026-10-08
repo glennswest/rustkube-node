@@ -14,6 +14,7 @@
 //! failed half-way, is still unpublished, and unstaged when the last one on
 //! the node goes.
 
+use retry::RetryExt;
 use super::{ClaimError, PodManager};
 use crate::csi::{self, VolumeSpec};
 use serde::{Deserialize, Serialize};
@@ -653,7 +654,7 @@ impl PodManager {
                         .patch(&url)
                         .header("content-type", "application/merge-patch+json")
                         .json(&resized_status(&pvc, &quantity))
-                        .send()
+                        .send_retrying(retry::Policy::API)
                         .await
                         .is_ok_and(|r| r.status().is_success());
                     if !patched {

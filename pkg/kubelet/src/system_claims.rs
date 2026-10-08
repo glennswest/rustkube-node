@@ -46,6 +46,7 @@
 //! mirror's label and `storm.io/node` names this node. Anything else under the
 //! same name is left alone, never overwritten.
 
+use retry::RetryExt;
 use std::collections::HashMap;
 
 use serde_json::{json, Map, Value};
@@ -386,7 +387,7 @@ fn by_name(list: &Value) -> HashMap<String, Value> {
 }
 
 async fn get_json(client: &reqwest::Client, url: &str) -> Option<Value> {
-    match client.get(url).send().await {
+    match client.get(url).send_retrying(retry::Policy::API).await {
         Ok(r) if r.status().is_success() => r.json().await.ok(),
         _ => None,
     }
@@ -394,7 +395,7 @@ async fn get_json(client: &reqwest::Client, url: &str) -> Option<Value> {
 
 /// POST, and the object as the apiserver stored it.
 async fn create(client: &reqwest::Client, url: &str, obj: &Value) -> Option<Value> {
-    match client.post(url).json(obj).send().await {
+    match client.post(url).json(obj).send_repeatable(retry::Policy::API).await {
         Ok(r) if r.status().is_success() => r.json().await.ok(),
         Ok(r) => {
             debug!("create {url}: {}", r.status());
@@ -408,7 +409,7 @@ async fn create(client: &reqwest::Client, url: &str, obj: &Value) -> Option<Valu
 }
 
 async fn replace(client: &reqwest::Client, url: &str, obj: &Value) -> Option<Value> {
-    match client.put(url).json(obj).send().await {
+    match client.put(url).json(obj).send_retrying(retry::Policy::API).await {
         Ok(r) if r.status().is_success() => r.json().await.ok(),
         Ok(r) => {
             debug!("update {url}: {}", r.status());
@@ -462,7 +463,7 @@ pub async fn mirror(
     let ns_path = format!("{api_url}/api/v1/namespaces/{NAMESPACE}");
     if get_json(client, &ns_path).await.is_none() {
         let ns = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": NAMESPACE}});
-        let _ = client.post(format!("{api_url}/api/v1/namespaces")).json(&ns).send().await;
+        let _ = client.post(format!("{api_url}/api/v1/namespaces")).json(&ns).send_repeatable(retry::Policy::API).await;
     }
 
     // Everything there is, read once: two lists a pass rather than two GETs a
@@ -560,7 +561,7 @@ pub async fn mirror(
         if !is_ours(c, node) || !c["metadata"]["deletionTimestamp"].is_null() || present.contains(volume) {
             continue;
         }
-        match client.delete(format!("{pvc_base}/{name}")).send().await {
+        match client.delete(format!("{pvc_base}/{name}")).send_retrying(retry::Policy::API).await {
             Ok(r) if r.status().is_success() => {
                 info!("volume {volume} is gone from this node: claim {NAMESPACE}/{name} deleted, its PV kept")
             }

@@ -31,6 +31,7 @@
 //! drives changed), `RaidPartnerChanged`. The first sight of a PV writes the
 //! annotations and says nothing.
 
+use retry::RetryExt;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -352,7 +353,7 @@ pub async fn pass(
     let mut drives = None;
     let mut why = Vec::new();
     for base in stormdrive {
-        match client.get(format!("{}/api/v1/placement", base.trim_end_matches('/'))).send().await {
+        match client.get(format!("{}/api/v1/placement", base.trim_end_matches('/'))).send_retrying(retry::Policy::PEER).await {
             Ok(r) if r.status().is_success() => {
                 drives = Some(drive_index(&r.json().await.unwrap_or(Value::Null)));
                 break;
@@ -369,7 +370,7 @@ pub async fn pass(
         HashMap::new()
     });
 
-    let pvs: Value = match client.get(format!("{api_url}/api/v1/persistentvolumes")).send().await {
+    let pvs: Value = match client.get(format!("{api_url}/api/v1/persistentvolumes")).send_retrying(retry::Policy::API).await {
         Ok(r) if r.status().is_success() => r.json().await.map_err(|e| format!("PV list: {e}"))?,
         Ok(r) => return Err(format!("PV list: {}", r.status())),
         Err(e) => return Err(format!("PV list: {e}")),
@@ -389,7 +390,7 @@ pub async fn pass(
             .patch(&url)
             .header("content-type", "application/merge-patch+json")
             .json(&patch)
-            .send()
+            .send_retrying(retry::Policy::API)
             .await
             .is_ok_and(|r| r.status().is_success());
         if !ok {

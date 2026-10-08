@@ -215,18 +215,35 @@ pub fn retry_after(r: &Response) -> Option<Duration> {
 /// rules say (a POST only when it never left, or on 429). Returns what the
 /// last attempt got: a response (any status, the caller reads it as before)
 /// or the transport error.
-pub async fn send(req: RequestBuilder, policy: &Policy) -> reqwest::Result<Response> {
+pub async fn send(req: RequestBuilder, policy: Policy) -> reqwest::Result<Response> {
     send_inner(req, policy, false).await
 }
 
 /// [`send`] for a POST the caller knows is safe to repeat: a create with a
 /// fixed name (the repeat is a 409 the caller already reads as "exists"), a
 /// review or token request that changes nothing.
-pub async fn send_repeatable(req: RequestBuilder, policy: &Policy) -> reqwest::Result<Response> {
+pub async fn send_repeatable(req: RequestBuilder, policy: Policy) -> reqwest::Result<Response> {
     send_inner(req, policy, true).await
 }
 
-async fn send_inner(req: RequestBuilder, policy: &Policy, repeatable_post: bool) -> reqwest::Result<Response> {
+/// [`send`] and [`send_repeatable`] as methods, so a call site reads
+/// `client.get(url).send_retrying(Policy::API).await` where it read
+/// `.send().await`.
+pub trait RetryExt {
+    fn send_retrying(self, policy: Policy) -> impl Future<Output = reqwest::Result<Response>> + Send;
+    fn send_repeatable(self, policy: Policy) -> impl Future<Output = reqwest::Result<Response>> + Send;
+}
+
+impl RetryExt for RequestBuilder {
+    fn send_retrying(self, policy: Policy) -> impl Future<Output = reqwest::Result<Response>> + Send {
+        send_inner(self, policy, false)
+    }
+    fn send_repeatable(self, policy: Policy) -> impl Future<Output = reqwest::Result<Response>> + Send {
+        send_inner(self, policy, true)
+    }
+}
+
+async fn send_inner(req: RequestBuilder, policy: Policy, repeatable_post: bool) -> reqwest::Result<Response> {
     // The method and URL, for the rules and the log; a body that cannot be
     // cloned (a stream) cannot be sent twice.
     let Some((method, what)) = req.try_clone().and_then(|r| r.build().ok()).map(|r| {
@@ -302,7 +319,7 @@ async fn send_inner(req: RequestBuilder, policy: &Policy, repeatable_post: bool)
 /// (gRPC to a CSI driver, another crate's client). `class` says which errors
 /// are worth another attempt; `op` must be safe to repeat (the caller decides,
 /// and says so where it calls this). Attempts are logged as for [`send`].
-pub async fn with_backoff<T, E, F, Fut>(policy: &Policy, what: &str, class: impl Fn(&E) -> Class, mut op: F) -> Result<T, E>
+pub async fn with_backoff<T, E, F, Fut>(policy: Policy, what: &str, class: impl Fn(&E) -> Class, mut op: F) -> Result<T, E>
 where
     E: Display,
     F: FnMut() -> Fut,
@@ -338,6 +355,60 @@ where
                 tokio::time::sleep(delay).await;
             }
         }
+    }
+}
+
+/// [`with_backoff`] for a blocking call (another crate's synchronous client,
+/// already run off the async threads). Sleeps the calling thread between
+/// attempts.
+pub fn blocking<T, E, F>(policy: Policy, what: &str, class: impl Fn(&E) -> Class, mut op: F) -> Result<T, E>
+where
+    E: Display,
+    F: FnMut() -> Result<T, E>,
+{
+    let started = Instant::now();
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match op() {
+            Ok(v) => {
+                if attempt > 1 {
+                    info!(target: "retry", call = %what, policy = policy.name,
+                          "{what}: succeeded on attempt {attempt} after {:.1} s", started.elapsed().as_secs_f64());
+                }
+                return Ok(v);
+            }
+            Err(e) => {
+                if class(&e) == Class::Real {
+                    return Err(e);
+                }
+                let delay = policy.delay(attempt);
+                if attempt >= policy.attempts || started.elapsed() + delay > policy.deadline {
+                    warn!(target: "retry", call = %what, policy = policy.name, class = "infrastructure",
+                          "{what}: gave up after {attempt} attempts / {:.1} s: {e}", started.elapsed().as_secs_f64());
+                    return Err(e);
+                }
+                debug!(target: "retry", call = %what, policy = policy.name, "{what}: attempt {attempt} failed ({e}); retrying in {delay:?}");
+                std::thread::sleep(delay);
+            }
+        }
+    }
+}
+
+/// The class of an error known only by its text: another crate's client that
+/// hands back a string. Infrastructure when it reads as a transport failure
+/// or a transient HTTP status; otherwise a real answer.
+pub fn class_of_message(m: &str) -> Class {
+    let m = m.to_ascii_lowercase();
+    const INFRA: [&str; 14] = [
+        "timed out", "timeout", "connection refused", "connection reset", "broken pipe",
+        "error sending request", "error trying to connect", "unexpected eof", "dns error",
+        " 408", " 429", " 502", " 503", " 504",
+    ];
+    if INFRA.iter().any(|w| m.contains(w)) || m.starts_with("408") || m.starts_with("429") || (m.starts_with("50") && !m.starts_with("501")) {
+        Class::Infra
+    } else {
+        Class::Real
     }
 }
 
@@ -437,7 +508,7 @@ mod tests {
             let mut script = vec![UNAVAILABLE; fails];
             script.push(OK);
             let (url, seen) = fake(script).await;
-            let r = send(client().get(format!("{url}/x")), &p).await.unwrap();
+            let r = send(client().get(format!("{url}/x")), p).await.unwrap();
             assert_eq!(r.status(), 200, "{}", p.name);
             assert_eq!(seen.load(Ordering::SeqCst), fails + 1, "{}", p.name);
         }
@@ -446,7 +517,7 @@ mod tests {
     #[tokio::test]
     async fn a_real_answer_is_not_retried() {
         let (url, seen) = fake(vec![Answer(404, "", Duration::ZERO)]).await;
-        let r = send(client().get(format!("{url}/x")), &FAST).await.unwrap();
+        let r = send(client().get(format!("{url}/x")), FAST).await.unwrap();
         assert_eq!(r.status(), 404);
         assert_eq!(seen.load(Ordering::SeqCst), 1);
     }
@@ -454,7 +525,7 @@ mod tests {
     #[tokio::test]
     async fn gives_up_after_the_attempts_with_the_last_answer() {
         let (url, seen) = fake(vec![UNAVAILABLE]).await;
-        let r = send(client().delete(format!("{url}/x")), &FAST).await.unwrap();
+        let r = send(client().delete(format!("{url}/x")), FAST).await.unwrap();
         assert_eq!(r.status(), 503);
         assert_eq!(seen.load(Ordering::SeqCst), FAST.attempts as usize);
     }
@@ -464,7 +535,7 @@ mod tests {
         let (url, seen) = fake(vec![UNAVAILABLE]).await;
         let p = Policy { attempts: 100, first_delay: Duration::from_millis(50), max_delay: Duration::from_millis(50), deadline: Duration::from_millis(120), ..FAST };
         let started = Instant::now();
-        let r = send(client().get(format!("{url}/x")), &p).await.unwrap();
+        let r = send(client().get(format!("{url}/x")), p).await.unwrap();
         assert_eq!(r.status(), 503);
         assert!(seen.load(Ordering::SeqCst) < 6, "{}", seen.load(Ordering::SeqCst));
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -473,7 +544,7 @@ mod tests {
     #[tokio::test]
     async fn a_timeout_is_retried_for_a_get() {
         let (url, seen) = fake(vec![Answer(200, "", Duration::from_secs(2)), OK]).await;
-        let r = send(client().get(format!("{url}/x")), &FAST).await.unwrap();
+        let r = send(client().get(format!("{url}/x")), FAST).await.unwrap();
         assert_eq!(r.status(), 200);
         assert_eq!(seen.load(Ordering::SeqCst), 2);
     }
@@ -482,17 +553,17 @@ mod tests {
     async fn a_post_that_may_have_landed_is_not_repeated() {
         // A 503 after a POST: maybe applied, so not sent again.
         let (url, seen) = fake(vec![UNAVAILABLE, OK]).await;
-        let r = send(client().post(format!("{url}/x")).body("{}"), &FAST).await.unwrap();
+        let r = send(client().post(format!("{url}/x")).body("{}"), FAST).await.unwrap();
         assert_eq!(r.status(), 503);
         assert_eq!(seen.load(Ordering::SeqCst), 1);
         // A 429 said it did nothing: sent again.
         let (url, seen) = fake(vec![Answer(429, "", Duration::ZERO), OK]).await;
-        let r = send(client().post(format!("{url}/x")).body("{}"), &FAST).await.unwrap();
+        let r = send(client().post(format!("{url}/x")).body("{}"), FAST).await.unwrap();
         assert_eq!(r.status(), 200);
         assert_eq!(seen.load(Ordering::SeqCst), 2);
         // A caller that knows the POST is safe to repeat.
         let (url, seen) = fake(vec![UNAVAILABLE, OK]).await;
-        let r = send_repeatable(client().post(format!("{url}/x")).body("{}"), &FAST).await.unwrap();
+        let r = send_repeatable(client().post(format!("{url}/x")).body("{}"), FAST).await.unwrap();
         assert_eq!(r.status(), 200);
         assert_eq!(seen.load(Ordering::SeqCst), 2);
     }
@@ -515,7 +586,7 @@ mod tests {
             let _ = s.write_all(b"HTTP/1.1 201 X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
         });
         let p = Policy { attempts: 20, first_delay: Duration::from_millis(10), max_delay: Duration::from_millis(10), ..FAST };
-        let r = send(client().post(format!("http://{addr}/x")).body("{}"), &p).await.unwrap();
+        let r = send(client().post(format!("http://{addr}/x")).body("{}"), p).await.unwrap();
         assert_eq!(r.status(), 201);
         assert_eq!(seen.load(Ordering::SeqCst), 1);
     }
@@ -524,7 +595,7 @@ mod tests {
     async fn retry_after_is_honoured() {
         let (url, seen) = fake(vec![Answer(503, "retry-after: 1\r\n", Duration::ZERO), OK]).await;
         let started = Instant::now();
-        let r = send(client().get(format!("{url}/x")), &FAST).await.unwrap();
+        let r = send(client().get(format!("{url}/x")), FAST).await.unwrap();
         assert_eq!(r.status(), 200);
         assert_eq!(seen.load(Ordering::SeqCst), 2);
         assert!(started.elapsed() >= Duration::from_millis(950), "{:?}", started.elapsed());
@@ -533,7 +604,7 @@ mod tests {
     #[tokio::test]
     async fn with_backoff_retries_infra_and_returns_real_at_once() {
         let calls = AtomicUsize::new(0);
-        let r: Result<u32, String> = with_backoff(&FAST, "op", |_| Class::Infra, || {
+        let r: Result<u32, String> = with_backoff(FAST, "op", |_| Class::Infra, || {
             let n = calls.fetch_add(1, Ordering::SeqCst);
             async move { if n < 3 { Err(format!("down {n}")) } else { Ok(7) } }
         })
@@ -542,7 +613,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 4);
 
         let calls = AtomicUsize::new(0);
-        let r: Result<u32, String> = with_backoff(&FAST, "op", |_| Class::Real, || {
+        let r: Result<u32, String> = with_backoff(FAST, "op", |_| Class::Real, || {
             calls.fetch_add(1, Ordering::SeqCst);
             async { Err("no".to_string()) }
         })
@@ -551,12 +622,40 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let calls = AtomicUsize::new(0);
-        let r: Result<u32, String> = with_backoff(&FAST, "op", |_| Class::Infra, || {
+        let r: Result<u32, String> = with_backoff(FAST, "op", |_| Class::Infra, || {
             calls.fetch_add(1, Ordering::SeqCst);
             async { Err("down".to_string()) }
         })
         .await;
         assert!(r.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), FAST.attempts as usize);
+    }
+
+    #[test]
+    fn blocking_retries_infra_then_succeeds() {
+        let mut n = 0;
+        let r: Result<u32, String> = blocking(FAST, "op", |e: &String| class_of_message(e), || {
+            n += 1;
+            if n < 3 { Err("error sending request: connection refused".into()) } else { Ok(1) }
+        });
+        assert_eq!(r, Ok(1));
+        assert_eq!(n, 3);
+        let mut n = 0;
+        let r: Result<u32, String> = blocking(FAST, "op", |e: &String| class_of_message(e), || {
+            n += 1;
+            Err("409 Conflict: volume exists".into())
+        });
+        assert!(r.is_err());
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn messages_are_classified() {
+        for m in ["operation timed out", "Connection refused (os error 111)", "HTTP 503 Service Unavailable", "502 Bad Gateway"] {
+            assert_eq!(class_of_message(m), Class::Infra, "{m}");
+        }
+        for m in ["404 Not Found: no such group", "volume is not sealed", "501 Not Implemented", "HTTP 400"] {
+            assert_eq!(class_of_message(m), Class::Real, "{m}");
+        }
     }
 }

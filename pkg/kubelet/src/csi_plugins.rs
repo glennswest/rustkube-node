@@ -24,6 +24,7 @@
 //! Filesystem changes enqueue a scan. Failed registrations and API publication
 //! receive explicit retry deadlines; an idle registered driver causes no scans.
 
+use retry::RetryExt;
 use crate::csi::{self, CsiDriverClient, NodeCapabilities, NodeInfo};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
@@ -348,7 +349,7 @@ impl CsiPlugins {
                 .patch(format!("{url}/api/v1/nodes/{}", self.node_name))
                 .header("content-type", "application/merge-patch+json")
                 .json(&json!({"metadata": {"labels": labels}}))
-                .send()
+                .send_retrying(retry::Policy::API)
                 .await;
             if !matches!(&r, Ok(r) if r.status().is_success()) {
                 debug!(
@@ -412,7 +413,7 @@ async fn write_csinode(
     drivers: Vec<Value>,
 ) -> Result<(), String> {
     let path = format!("{url}/apis/storage.k8s.io/v1/csinodes/{node}");
-    let existing = client.get(&path).send().await.map_err(|e| e.to_string())?;
+    let existing = client.get(&path).send_retrying(retry::Policy::API).await.map_err(|e| e.to_string())?;
     let status = existing.status();
     if status.is_success() {
         let mut obj: Value = existing.json().await.map_err(|e| e.to_string())?;
@@ -420,7 +421,7 @@ async fn write_csinode(
         let r = client
             .put(&path)
             .json(&obj)
-            .send()
+            .send_retrying(retry::Policy::API)
             .await
             .map_err(|e| e.to_string())?;
         return if r.status().is_success() {
@@ -435,7 +436,7 @@ async fn write_csinode(
     // Owned by the Node, as upstream does, so deleting the node deletes it.
     let owner = match client
         .get(format!("{url}/api/v1/nodes/{node}"))
-        .send()
+        .send_retrying(retry::Policy::API)
         .await
     {
         Ok(r) if r.status().is_success() => r
@@ -458,7 +459,7 @@ async fn write_csinode(
     let r = client
         .post(format!("{url}/apis/storage.k8s.io/v1/csinodes"))
         .json(&obj)
-        .send()
+        .send_repeatable(retry::Policy::API)
         .await
         .map_err(|e| e.to_string())?;
     if r.status().is_success() {

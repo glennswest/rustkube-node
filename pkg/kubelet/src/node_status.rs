@@ -3,6 +3,7 @@
 //! Reports node capacity, allocatable resources, and conditions.
 //! Sends heartbeats via Lease objects in kube-node-lease.
 
+use retry::RetryExt;
 use serde_json::{json, Value};
 use tracing::info;
 
@@ -290,7 +291,7 @@ impl NodeReporter {
             .client
             .post(format!("{}/api/v1/nodes", self.api_url))
             .json(&node)
-            .send()
+            .send_repeatable(retry::Policy::API)
             .await?;
 
         let code = resp.status().as_u16();
@@ -314,7 +315,7 @@ impl NodeReporter {
     /// read — a heartbeat then just re-asserts the kubelet-owned conditions.
     async fn current_conditions(&self) -> Vec<Value> {
         let url = format!("{}/api/v1/nodes/{}", self.api_url, self.node_name);
-        match self.client.get(&url).send().await {
+        match self.client.get(&url).send_retrying(retry::Policy::API).await {
             Ok(resp) if resp.status().is_success() => resp
                 .json::<Value>()
                 .await
@@ -345,7 +346,7 @@ impl NodeReporter {
             .client
             .put(format!("{}/api/v1/nodes/{}/status", self.api_url, self.node_name))
             .json(&node_update)
-            .send()
+            .send_retrying(retry::Policy::API)
             .await?;
 
         if resp.status().is_success() {
@@ -400,7 +401,7 @@ impl NodeReporter {
             self.api_url, self.node_name
         );
 
-        let resp = self.client.put(&path).json(&lease).send().await;
+        let resp = self.client.put(&path).json(&lease).send_retrying(retry::Policy::API).await;
         let renewed = match resp {
             Ok(r) if r.status().is_success() => true,
             _ => {
@@ -410,7 +411,7 @@ impl NodeReporter {
                     self.api_url
                 );
                 matches!(
-                    self.client.post(&create_path).json(&lease).send().await,
+                    self.client.post(&create_path).json(&lease).send_repeatable(retry::Policy::API).await,
                     Ok(r) if r.status().is_success()
                 )
             }
@@ -461,7 +462,7 @@ impl NodeReporter {
             .patch(&url)
             .header("content-type", "application/merge-patch+json")
             .json(&kvm_labels_patch(on))
-            .send()
+            .send_retrying(retry::Policy::API)
             .await
         {
             Ok(r) if r.status().is_success() => {

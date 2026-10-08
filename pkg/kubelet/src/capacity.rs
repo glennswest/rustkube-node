@@ -29,6 +29,7 @@
 //! - **Alerted**: gauges, and a Warning Event on this node's stormblock PVs
 //!   when the data slabs pass the alert percentage.
 
+use retry::RetryExt;
 use serde_json::{json, Value};
 
 /// How a claim is charged, and when to warn.
@@ -219,7 +220,7 @@ pub async fn publish(
             crate::system_claims::NAMESPACE
         );
         let path = format!("{base}/{}", object_name(node));
-        let have = match client.get(&path).send().await {
+        let have = match client.get(&path).send_retrying(retry::Policy::API).await {
             Ok(r) if r.status().is_success() => r.json::<Value>().await.ok(),
             Ok(r) if r.status().as_u16() == 404 => None,
             Ok(r) => return Err(format!("GET {path}: {}", r.status())),
@@ -231,13 +232,13 @@ pub async fn publish(
                 h["capacity"] = want["capacity"].clone();
                 h["maximumVolumeSize"] = want["maximumVolumeSize"].clone();
                 h["nodeTopology"] = want["nodeTopology"].clone();
-                let r = client.put(&path).json(&h).send().await.map_err(|e| format!("PUT {path}: {e}"))?;
+                let r = client.put(&path).json(&h).send_retrying(retry::Policy::API).await.map_err(|e| format!("PUT {path}: {e}"))?;
                 if !r.status().is_success() {
                     return Err(format!("PUT {path}: {}", r.status()));
                 }
             }
             None => {
-                let r = client.post(&base).json(&want).send().await.map_err(|e| format!("POST {base}: {e}"))?;
+                let r = client.post(&base).json(&want).send_repeatable(retry::Policy::API).await.map_err(|e| format!("POST {base}: {e}"))?;
                 if !r.status().is_success() && r.status().as_u16() != 409 {
                     return Err(format!("POST {base}: {}", r.status()));
                 }
@@ -266,7 +267,7 @@ pub async fn publish(
 /// This node's stormblock PVs: the built-in driver's, annotated with this
 /// node.
 async fn node_pvs(client: &reqwest::Client, api_url: &str, node: &str) -> Vec<Value> {
-    let Ok(r) = client.get(format!("{api_url}/api/v1/persistentvolumes")).send().await else {
+    let Ok(r) = client.get(format!("{api_url}/api/v1/persistentvolumes")).send_retrying(retry::Policy::API).await else {
         return Vec::new();
     };
     let Ok(list) = r.json::<Value>().await else { return Vec::new() };

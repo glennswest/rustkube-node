@@ -1,6 +1,11 @@
 //! Standard CNI plugin invoker — the caller side of the CNI spec (what
 //! libcni does for containerd/CRI-O).
 //!
+//! **Not retried here (#211).** A plugin exec is bounded (60 s, #99) and an
+//! ADD is not safe to repeat blindly (it allocates an address); a failed ADD
+//! is followed by a DEL and the pod's start is retried on its CNI backoff
+//! (#148), as libcni's callers do.
+//!
 //! Loads the network configuration from a conf dir (`/etc/cni/net.d`),
 //! executes plugin binaries from a bin dir (`/opt/cni/bin`) using the CNI
 //! exec protocol (env vars + JSON on stdin/stdout), chains conflist plugins

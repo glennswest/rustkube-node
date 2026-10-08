@@ -145,6 +145,8 @@ pub fn observe(h: &mut ServiceHealth, result: Result<(), String>) -> bool {
 
 /// Ask `url` once: any 2xx is an answer.
 pub async fn probe(client: &reqwest::Client, url: &str) -> Result<(), String> {
+    // Not retried (#211): this is a liveness probe; three failures in a row
+    // are the threshold (`FAILURES`), which is the retry.
     match client.get(url).timeout(TIMEOUT).send().await {
         Ok(r) if r.status().is_success() => Ok(()),
         Ok(r) => Err(format!("{url}: HTTP {}", r.status())),
