@@ -228,6 +228,49 @@ fn vm_of(reg: &stormvm_node::console::Registration) -> Vm {
 /// A connect, not a command: QMP serves one client at a time, and a console
 /// holding it must not make the machine look dead. A dead hypervisor leaves
 /// its socket file behind, and a connect to it is refused.
+/// How long a VMI's guest is given to power off (#181): its
+/// `terminationGracePeriodSeconds`, else 30 s.
+pub fn grace_from(obj: Option<&Value>) -> std::time::Duration {
+    let secs = obj
+        .and_then(|o| o["spec"]["terminationGracePeriodSeconds"].as_u64())
+        .unwrap_or(30);
+    std::time::Duration::from_secs(secs)
+}
+
+/// The machine's control, from its registration: what `shut_down` asks.
+fn machine_of(vm: &Vm) -> Option<stormvm_control::Machine> {
+    let reg = stormvm_node::console::find(RUN_ROOT, &vm.namespace, &vm.name)?;
+    let control = reg.control_socket.clone()?;
+    Some(stormvm_control::Machine { kind: stormvm_control::Kind::parse(&reg.vmm), control: Some(control), agent: None })
+}
+
+/// Stop a running machine (#181): ask the guest to power off within its
+/// grace; the engine's stop only when it is still running, or when it said it
+/// powered off and the engine still sees it running a moment later. What
+/// happened, for the log.
+pub async fn graceful_then_forced<S, SF, E, EF, F, FF>(shut_down: S, exited: E, force: F) -> &'static str
+where
+    S: FnOnce() -> SF,
+    SF: std::future::Future<Output = stormvm_control::ShutDown>,
+    E: FnOnce() -> EF,
+    EF: std::future::Future<Output = bool>,
+    F: FnOnce() -> FF,
+    FF: std::future::Future<Output = bool>,
+{
+    use stormvm_control::ShutDown;
+    let forced = |ok: bool| if ok { "the engine stopped it" } else { "the engine's stop was refused; retried" };
+    match shut_down().await {
+        ShutDown::StillRunning(_) => forced(force().await),
+        ShutDown::PoweredOff | ShutDown::AlreadyGone => {
+            if exited().await {
+                "the guest powered off"
+            } else {
+                forced(force().await)
+            }
+        }
+    }
+}
+
 fn control_alive(reg: &stormvm_node::console::Registration) -> bool {
     reg.control_socket
         .as_deref()
@@ -796,7 +839,7 @@ pub struct VmManager {
     /// different machines, and treating them as one is how the second finds
     /// the first's disks.
     vms: Mutex<Machines>,
-    stopping: Mutex<std::collections::HashSet<String>>,
+    stopping: Arc<Mutex<std::collections::HashSet<String>>>,
     /// The VMIs the apiserver last gave this node, by uid.
     ///
     /// **The object is the truth; this is a cache of it.** Metadata is
@@ -996,7 +1039,7 @@ impl VmManager {
             claims: None,
             events,
             vms: Mutex::new(Machines::default()),
-            stopping: Mutex::new(Default::default()),
+            stopping: Arc::new(Mutex::new(Default::default())),
             desired: Mutex::new(HashMap::new()),
             disk_lifecycle: tokio::sync::RwLock::new(()),
             watched: Mutex::new(None),
@@ -2220,13 +2263,35 @@ impl VmManager {
             let Ok(Ok(cqe)) = observed else { return false };
             if !exited(cqe.aux) {
                 if self.stopping.lock().await.insert(vm.uid.clone()) {
-                    let r = ring.clone();
-                    if !matches!(tokio::task::spawn_blocking(move || r.stop(handle, 30)).await, Ok(Ok(_))) {
-                        self.stopping.lock().await.remove(&vm.uid);
-                    }
+                    // The guest is asked first (#181): the engine's stop is a
+                    // SIGTERM to the hypervisor, which to qemu is a power cut,
+                    // and a disk kept for the next start (#75) is left dirty.
+                    // In the background, so this worker yields while it runs.
+                    let grace = self.grace_of(&vm.uid).await;
+                    let machine = machine_of(vm);
+                    let (stopping, uid, name) = (self.stopping.clone(), vm.uid.clone(), vm.name.clone());
+                    tokio::spawn(async move {
+                        let (r1, r2) = (ring.clone(), ring.clone());
+                        let how = graceful_then_forced(
+                            || async move {
+                                match machine {
+                                    Some(m) => m.shut_down(grace).await,
+                                    None => stormvm_control::ShutDown::StillRunning("no control socket to ask the guest".into()),
+                                }
+                            },
+                            || async move {
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                matches!(tokio::task::spawn_blocking(move || r1.query(handle)).await, Ok(Ok(c)) if exited(c.aux))
+                            },
+                            || async move { matches!(tokio::task::spawn_blocking(move || r2.stop(handle, 10)).await, Ok(Ok(_))) },
+                        )
+                        .await;
+                        info!(vm = %name, grace_secs = grace.as_secs(), "vm stop: {how}");
+                        // Looked at again on the next pass either way: an
+                        // exit lets it finish, anything else asks again.
+                        stopping.lock().await.remove(&uid);
+                    });
                 }
-                // The engine owns the grace/kill deadline. Yield this worker
-                // while it runs so eight stopping guests do not occupy the pool.
                 return false;
             }
         }
@@ -3363,6 +3428,11 @@ impl VmManager {
     ///
     /// Only for a machine started by a kubelet that kept no handle. Every
     /// start now records one, and the engine's stop is the one to use.
+    /// The guest's grace from the VMI as last seen (#181).
+    async fn grace_of(&self, uid: &str) -> std::time::Duration {
+        grace_from(self.desired.lock().await.get(uid))
+    }
+
     async fn stop_by_control(&self, vm: &Vm) {
         use stormvm_control::{Kind, Machine};
         let Some(reg) = stormvm_node::console::find(RUN_ROOT, &vm.namespace, &vm.name) else { return };
@@ -3373,8 +3443,10 @@ impl VmManager {
         let Some(sock) = reg.control_socket.clone() else { return };
         let m = Machine { kind, control: Some(sock.clone()), agent: None };
         let short = std::time::Duration::from_secs(5);
-        if let Ok(Err(e)) = tokio::time::timeout(short, m.softreboot()).await {
-            warn!(vm = %vm.name, "ACPI shutdown not delivered: {e}");
+        // The guest is asked to power off and given its grace (#181).
+        let grace = self.grace_of(&vm.uid).await;
+        if let stormvm_control::ShutDown::StillRunning(why) = m.shut_down(grace).await {
+            warn!(vm = %vm.name, "did not power off within {}s: {why}", grace.as_secs());
         }
         let gone_within = |secs: u64| {
             let reg = reg.clone();
@@ -3389,7 +3461,7 @@ impl VmManager {
                 true
             }
         };
-        if gone_within(30).await {
+        if gone_within(5).await {
             return;
         }
         warn!(vm = %vm.name, "did not shut down within its grace period; telling the hypervisor to quit");
@@ -4626,6 +4698,36 @@ mod tests {
         // Still inside the kernel's 15-byte interface-name limit, which is
         // what the hash is for.
         assert!(a_tap.len() <= 15, "{a_tap}");
+    }
+
+    /// #181: the guest is asked first; the engine's stop (a power cut to the
+    /// hypervisor) only when it is still running, or when it said it powered
+    /// off and the engine still sees it running.
+    #[tokio::test]
+    async fn a_vm_is_powered_off_by_its_guest_and_forced_only_when_it_will_not() {
+        use stormvm_control::ShutDown;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        async fn run(answer: ShutDown, exited: bool) -> (&'static str, bool) {
+            let forced = Arc::new(AtomicBool::new(false));
+            let f = forced.clone();
+            let how = graceful_then_forced(
+                || async move { answer },
+                || async move { exited },
+                || async move {
+                    f.store(true, Ordering::SeqCst);
+                    true
+                },
+            )
+            .await;
+            (how, forced.load(Ordering::SeqCst))
+        }
+        assert_eq!(run(ShutDown::PoweredOff, true).await, ("the guest powered off", false));
+        assert_eq!(run(ShutDown::AlreadyGone, true).await, ("the guest powered off", false));
+        assert_eq!(run(ShutDown::StillRunning("grace ran out".into()), false).await, ("the engine stopped it", true));
+        assert_eq!(run(ShutDown::PoweredOff, false).await.1, true, "said off, still running: forced");
+
+        assert_eq!(grace_from(None), std::time::Duration::from_secs(30));
+        assert_eq!(grace_from(Some(&json!({"spec": {"terminationGracePeriodSeconds": 120}}))), std::time::Duration::from_secs(120));
     }
 
     /// A kubelet that started unscheduled work would start it on every node at
