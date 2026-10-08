@@ -4693,6 +4693,12 @@ impl PodManager {
     /// start went (#132): one INFO line, the histograms, and, for a pod the
     /// apiserver has, the `storm.io/start-timing` annotation and a
     /// `StartTiming` Event. Anything else: nothing.
+    /// The pod's `network-status` entries, from its sandbox (#131).
+    async fn network_status_of(&self, uid: &str) -> Option<Value> {
+        let sandbox = self.pods.read().await.get(uid).and_then(|p| p.sandbox_id.clone())?;
+        self.runtime.pod_network_status(&sandbox).await
+    }
+
     pub async fn start_reported(&self, pod: &Value, report: std::time::Duration) {
         let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
         let acked = Instant::now();
@@ -4718,8 +4724,14 @@ impl PodManager {
             return;
         }
         self.event_later(pod, crate::start_timing::REASON, &finished.text).await;
-        let patch = serde_json::json!({"metadata": {"uid": uid, "annotations": {
+        let mut patch = serde_json::json!({"metadata": {"uid": uid, "annotations": {
             crate::start_timing::ANNOTATION: finished.text}}});
+        // What the CNI wired (#131), in the same write: Multus's annotation,
+        // a JSON string as Multus writes it.
+        if let Some(status) = self.network_status_of(uid).await {
+            patch["metadata"]["annotations"][crate::network_status::ANNOTATION] =
+                serde_json::json!(serde_json::to_string_pretty(&status).unwrap_or_default());
+        }
         // Off the worker (#138): the pod is running and reported, and its
         // pass held a worker another pod's start was queued for while this
         // write went to the apiserver.
@@ -6333,6 +6345,10 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl RuntimeService for FakeRuntime {
+        async fn pod_network_status(&self, sandbox_id: &str) -> Option<Value> {
+            Some(json!([{"name": "fake", "interface": "eth0", "sandbox": sandbox_id}]))
+        }
+
         async fn version(&self) -> Result<(String, String, String), CriError> {
             Ok(("fake".into(), "0.1".into(), "v1".into()))
         }
@@ -8878,6 +8894,19 @@ pub(crate) mod tests {
         assert!(!mgr.timings.lock().unwrap().contains_key("uid-timed"));
         // A later Running report (a check, not a start) publishes nothing.
         mgr.start_reported(&p, std::time::Duration::ZERO).await;
+    }
+
+    /// #131: a started pod's network-status entries come from its sandbox,
+    /// for the annotation written with its start timing.
+    #[tokio::test]
+    async fn a_started_pods_network_status_is_its_sandboxs() {
+        let (_rt, mgr) = manager();
+        let p = pod("uid-net", "net", "Always", simple_container());
+        assert_eq!(mgr.network_status_of("uid-net").await, None, "no sandbox yet");
+        assert_eq!(mgr.sync_pods(&[p]).await.updates[0].phase, "Running");
+        let status = mgr.network_status_of("uid-net").await.unwrap();
+        let sandbox = mgr.pods.read().await["uid-net"].sandbox_id.clone().unwrap();
+        assert_eq!(status[0]["sandbox"], json!(sandbox));
     }
 
     /// #138: a start says what it queued behind, the executor's pool and the

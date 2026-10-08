@@ -271,6 +271,19 @@ pub fn render_cadvisor(containers: &[ContainerStatsInfo], pods: &[PodNetworkStat
         "Cumulative count of bytes transmitted.",
         ifaces().map(|(p, i)| (network_labels(p, &i.name), i.tx_bytes as f64)),
     );
+    // Packets, errors and drops (#131), under cAdvisor's names.
+    type Pick = fn(&crate::cri::InterfaceStats) -> u64;
+    let counters: [(&str, &str, Pick); 6] = [
+        ("container_network_receive_packets_total", "Cumulative count of packets received.", |i| i.rx_packets),
+        ("container_network_receive_errors_total", "Cumulative count of errors encountered while receiving.", |i| i.rx_errors),
+        ("container_network_receive_packets_dropped_total", "Cumulative count of packets dropped while receiving.", |i| i.rx_dropped),
+        ("container_network_transmit_packets_total", "Cumulative count of packets transmitted.", |i| i.tx_packets),
+        ("container_network_transmit_errors_total", "Cumulative count of errors encountered while transmitting.", |i| i.tx_errors),
+        ("container_network_transmit_packets_dropped_total", "Cumulative count of packets dropped while transmitting.", |i| i.tx_dropped),
+    ];
+    for (name, help, pick) in counters {
+        family(&mut out, name, "counter", help, ifaces().map(|(p, i)| (network_labels(p, &i.name), pick(i) as f64)));
+    }
     out
 }
 
@@ -334,7 +347,13 @@ pub fn parse_net_dev(text: &str) -> Vec<crate::cri::InterfaceStats> {
             Some(crate::cri::InterfaceStats {
                 name: name.to_string(),
                 rx_bytes: *f.first()?,
+                rx_packets: *f.get(1)?,
+                rx_errors: *f.get(2)?,
+                rx_dropped: *f.get(3)?,
                 tx_bytes: *f.get(8)?,
+                tx_packets: *f.get(9)?,
+                tx_errors: *f.get(10)?,
+                tx_dropped: *f.get(11)?,
             })
         })
         .collect()
@@ -365,7 +384,14 @@ mod tests {
                 sandbox_id: "sb-1".into(),
                 pod: "web".into(),
                 namespace: "default".into(),
-                interfaces: vec![InterfaceStats { name: "eth0".into(), rx_bytes: 10, tx_bytes: 20 }],
+                interfaces: vec![InterfaceStats {
+                    name: "eth0".into(),
+                    rx_bytes: 10,
+                    tx_bytes: 20,
+                    rx_errors: 3,
+                    tx_dropped: 4,
+                    ..Default::default()
+                }],
             }],
         );
         let l = r#"container="app",id="c-app",namespace="default",pod="web""#;
@@ -375,6 +401,10 @@ mod tests {
         let n = r#"container="",id="sb-1",interface="eth0",namespace="default",pod="web""#;
         assert!(out.contains(&format!("container_network_receive_bytes_total{{{n}}} 10\n")), "{out}");
         assert!(out.contains(&format!("container_network_transmit_bytes_total{{{n}}} 20\n")), "{out}");
+        // #131: packets, errors and drops beside the bytes.
+        assert!(out.contains(&format!("container_network_receive_errors_total{{{n}}} 3\n")), "{out}");
+        assert!(out.contains(&format!("container_network_transmit_packets_dropped_total{{{n}}} 4\n")), "{out}");
+        assert!(out.contains("# TYPE container_network_receive_packets_total counter\n"), "{out}");
         assert!(out.contains("# TYPE container_cpu_usage_seconds_total counter\n"));
         assert!(out.contains("# TYPE container_memory_working_set_bytes gauge\n"));
     }
@@ -403,12 +433,16 @@ mod tests {
         let text = "Inter-|   Receive                                                |  Transmit\n \
                     face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n    \
                     lo:     100       1    0    0    0     0          0         0      100       1    0    0    0     0       0          0\n  \
-                    eth0:    5000      40    0    0    0     0          0         0     7000      50    0    0    0     0       0          0\n";
+                    eth0:    5000      40    2    3    0     0          0         0     7000      50    4    5    0     0       0          0\n";
         let got = parse_net_dev(text);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "eth0");
         assert_eq!(got[0].rx_bytes, 5000);
         assert_eq!(got[0].tx_bytes, 7000);
+        // #131: packets, errs, drop each way.
+        let i = &got[0];
+        assert_eq!((i.rx_packets, i.rx_errors, i.rx_dropped), (40, 2, 3));
+        assert_eq!((i.tx_packets, i.tx_errors, i.tx_dropped), (50, 4, 5));
     }
 
     #[test]

@@ -191,15 +191,22 @@ pub fn live_files(dir: &Path) -> Vec<(String, PathBuf)> {
 /// newest. A clean exit is not a previous run worth reading here: the owner's
 /// ask (#72) is the last run that failed.
 pub fn previous_failed(dir: &Path) -> Option<PathBuf> {
-    std::fs::read_dir(dir)
+    failed_run(dir, 1)
+}
+
+/// The failed run `back` runs back, newest first (1 = [`previous_failed`]),
+/// for `previous=N` (#131).
+pub fn failed_run(dir: &Path, back: usize) -> Option<PathBuf> {
+    let mut failed: Vec<_> = std::fs::read_dir(dir)
         .ok()?
         .flatten()
         .filter_map(|e| match classify(e.file_name().to_str()?) {
             Some((_, Kind::Failed(run))) => Some((run, e.path())),
             _ => None,
         })
-        .max_by(|a, b| a.0.cmp(&b.0))
-        .map(|(_, p)| p)
+        .collect();
+    failed.sort_by(|a, b| b.0.cmp(&a.0));
+    failed.into_iter().nth(back.checked_sub(1)?).map(|(_, p)| p)
 }
 
 /// Lines from several processes, merged in time order.
@@ -302,7 +309,17 @@ impl Record {
 
     /// The newest run that ended and left output: `--previous`.
     pub fn previous_run(&self) -> Option<&Run> {
-        self.runs.iter().rev().find(|r| r.ended_at.is_some() && !r.files.is_empty())
+        self.ended_run(1)
+    }
+
+    /// The ended run with output `back` runs back (1 = [`Self::previous_run`]),
+    /// for `previous=N` (#131); PID 1 keeps the last five runs.
+    pub fn ended_run(&self, back: usize) -> Option<&Run> {
+        self.runs
+            .iter()
+            .rev()
+            .filter(|r| r.ended_at.is_some() && !r.files.is_empty())
+            .nth(back.checked_sub(1)?)
     }
 }
 
@@ -468,6 +485,31 @@ spec    rustkube-node
         std::fs::write(d.join("etcd.20260829T000000.exited.log"), "clean\n").unwrap();
         std::fs::write(d.join("etcd.log"), "live\n").unwrap();
         assert_eq!(previous_failed(d), Some(d.join("etcd.20260828T000000.failed.log")));
+    }
+
+    /// #131: `previous=N` walks the failed runs back, newest first; past the
+    /// oldest is nothing. PID 1's ended runs the same.
+    #[test]
+    fn older_runs_are_found_n_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        for t in ["20260826", "20260827", "20260828"] {
+            std::fs::write(d.join(format!("etcd.{t}T000000.failed.log")), t).unwrap();
+        }
+        assert_eq!(failed_run(d, 1), Some(d.join("etcd.20260828T000000.failed.log")));
+        assert_eq!(failed_run(d, 3), Some(d.join("etcd.20260826T000000.failed.log")));
+        assert_eq!(failed_run(d, 4), None);
+        assert_eq!(failed_run(d, 0), None);
+
+        let json = r#"{"assets":[{"name":"registry","running":true,"runs":[
+            {"started_at":1,"ended_at":2,"log":"w1.log"},
+            {"started_at":3,"ended_at":4,"log":"w2.log"},
+            {"started_at":5,"ended_at":6,"error":"no root"},
+            {"started_at":7,"log":"w3.log"}]}]}"#;
+        let r = record(json, "registry").unwrap();
+        assert_eq!(r.ended_run(1).unwrap().files, ["w2.log"]);
+        assert_eq!(r.ended_run(2).unwrap().files, ["w1.log"]);
+        assert!(r.ended_run(3).is_none());
     }
 
     /// The table as stormpump#51 writes it: the exit, the refusal and the

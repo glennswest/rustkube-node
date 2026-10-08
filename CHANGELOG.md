@@ -2,6 +2,13 @@
 
 ## 2026-10-08
 
+- **feat:** Pod network detail for stormconsole#69 (#131). (1) Packets, errors and drops each way beside the bytes:
+  `container_network_{receive,transmit}_{packets,errors,packets_dropped}_total` in `/metrics/cadvisor`, and each
+  pod's `network` in `/stats/summary` (upstream's shape plus packets/drops). (2) The CNI ADD's result written as
+  `k8s.v1.cni.cncf.io/network-status` (Multus's shape, plus prefixes, routes and the plugin chain; the MTU read in
+  the pod's namespace when the plugin does not report it); the CNI invoker now records the network and plugins on
+  its result. (3) `containerLogs?previous=N`, the run N back (`true`/`1` stays the previous one), for regular pods
+  and node-service mirror pods (stormd's failed runs, PID 1's last five).
 - **fix:** `pods/log` no longer drops the first three words of every plain line with three or more spaces (#136): a
   line is taken apart only when its first field is an RFC 3339 time and the next two are CRI's (`stdout|stderr`,
   `P|F`) or stormd's (stream, severity); stormpump's lines, which carry neither, come back whole, so test runners'

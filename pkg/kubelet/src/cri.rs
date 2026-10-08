@@ -223,6 +223,13 @@ pub struct InterfaceStats {
     pub name: String,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    /// Packets, errors and drops each way (#131), the same `/proc/net/dev` line.
+    pub rx_packets: u64,
+    pub rx_errors: u64,
+    pub rx_dropped: u64,
+    pub tx_packets: u64,
+    pub tx_errors: u64,
+    pub tx_dropped: u64,
 }
 
 /// A pod's network counters. Network belongs to the pod's sandbox, not to any
@@ -337,6 +344,12 @@ pub trait RuntimeService: Send + Sync + 'static {
     /// (#115), to wake that pod's worker alone when it exits. Default: not
     /// known, and the exit wakes every pod.
     async fn pod_of_workload(&self, _handle: u64) -> Option<String> {
+        None
+    }
+
+    /// What the CNI wired into this sandbox, as `network-status` entries
+    /// (#131). Default: not known.
+    async fn pod_network_status(&self, _sandbox_id: &str) -> Option<serde_json::Value> {
         None
     }
 

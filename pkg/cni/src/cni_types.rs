@@ -100,7 +100,7 @@ pub struct RouteConfig {
 }
 
 /// CNI result (output to stdout).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CniResult {
     #[serde(default)]
@@ -113,6 +113,12 @@ pub struct CniResult {
     pub routes: Vec<RouteConfig>,
     #[serde(default)]
     pub dns: CniDns,
+    /// The network (conflist) that made it, and its plugin chain by `type`
+    /// (rustkube-node#131): filled in by the invoker, not a plugin's output.
+    #[serde(skip)]
+    pub network: String,
+    #[serde(skip)]
+    pub plugins: Vec<String>,
 }
 
 /// CNI interface info.
@@ -123,6 +129,9 @@ pub struct CniInterface {
     pub mac: String,
     #[serde(default)]
     pub sandbox: String,
+    /// CNI 1.1's interface MTU, when the plugin reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u32>,
 }
 
 /// CNI IP configuration.
@@ -223,6 +232,7 @@ mod tests {
                 name: "eth0".into(),
                 mac: "aa:bb:cc:dd:ee:ff".into(),
                 sandbox: "/var/run/netns/pod".into(),
+                mtu: Some(1450),
             }],
             ips: vec![CniIpConfig {
                 address: "10.244.1.2/24".into(),
@@ -234,6 +244,7 @@ mod tests {
                 gw: "10.244.1.1".into(),
             }],
             dns: CniDns::default(),
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&result).unwrap();

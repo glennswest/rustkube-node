@@ -198,7 +198,14 @@ impl CniInvoker {
         }
 
         let final_result = prev_result.unwrap_or_else(|| json!({}));
-        let result: CniResult = serde_json::from_value(final_result)?;
+        let mut result: CniResult = serde_json::from_value(final_result)?;
+        // Which network and plugins wired it (rustkube-node#131).
+        result.network = config.name.clone();
+        result.plugins = config
+            .plugins
+            .iter()
+            .filter_map(|p| p["type"].as_str().map(str::to_string))
+            .collect();
         Ok(result)
     }
 

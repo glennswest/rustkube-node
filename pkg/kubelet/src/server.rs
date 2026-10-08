@@ -643,13 +643,24 @@ async fn stats_summary(State(pm): State<Arc<PodManager>>) -> impl IntoResponse {
                 "memory": s.memory_working_set_bytes.map(|b| serde_json::json!({"workingSetBytes": b})),
             }));
     }
+    // Each pod's network (#131), upstream's `NetworkStats`: the default
+    // interface's counters at the top, every interface listed.
+    let mut networks: BTreeMap<(String, String), serde_json::Value> = BTreeMap::new();
+    for p in pm.pod_network_stats().await {
+        by_pod.entry((p.namespace.clone(), p.pod.clone())).or_default();
+        networks.insert((p.namespace.clone(), p.pod.clone()), network_summary(&p.interfaces));
+    }
     let pods: Vec<serde_json::Value> = by_pod
         .into_iter()
-        .map(|((ns, name), containers)| {
-            serde_json::json!({
-                "podRef": {"name": name, "namespace": ns},
+        .map(|(key, containers)| {
+            let mut pod = serde_json::json!({
+                "podRef": {"name": key.1, "namespace": key.0},
                 "containers": containers,
-            })
+            });
+            if let Some(net) = networks.remove(&key) {
+                pod["network"] = net;
+            }
+            pod
         })
         .collect();
     // Real node filesystem stats (ephemeral storage) for eviction/monitoring.
@@ -668,6 +679,25 @@ async fn stats_summary(State(pm): State<Arc<PodManager>>) -> impl IntoResponse {
         },
         "pods": pods,
     }))
+}
+
+/// A pod's `network` in `/stats/summary` (#131): upstream's shape (`name`,
+/// `rxBytes`, `rxErrors`, `txBytes`, `txErrors` of the default interface, `eth0`
+/// when there is one, and `interfaces`), with packets and drops beside them.
+fn network_summary(interfaces: &[crate::cri::InterfaceStats]) -> serde_json::Value {
+    let one = |i: &crate::cri::InterfaceStats| {
+        serde_json::json!({
+            "name": i.name,
+            "rxBytes": i.rx_bytes, "rxErrors": i.rx_errors,
+            "rxPackets": i.rx_packets, "rxDropped": i.rx_dropped,
+            "txBytes": i.tx_bytes, "txErrors": i.tx_errors,
+            "txPackets": i.tx_packets, "txDropped": i.tx_dropped,
+        })
+    };
+    let default = interfaces.iter().find(|i| i.name == "eth0").or(interfaces.first());
+    let mut net = default.map(one).unwrap_or_else(|| serde_json::json!({}));
+    net["interfaces"] = interfaces.iter().map(one).collect();
+    net
 }
 
 /// `DELETE /volumes/{namespace}/{claim}` — delete the stormblock clone behind
@@ -1262,6 +1292,9 @@ async fn container_logs(
     Path((namespace, pod, container)): Path<(String, String, String)>,
     Query(opts): Query<LogOptions>,
 ) -> Response {
+    if let Err(why) = opts.runs_back() {
+        return (StatusCode::BAD_REQUEST, why).into_response();
+    }
     // A node service's mirror pod is no pod this kubelet runs (#72): its log
     // is on the service's stormd log volume, or in PID 1's record of its last
     // exit (#124).
@@ -1377,8 +1410,10 @@ async fn node_service_logs(
     let crate::pod_manager::NodeService { log_dir, record, runs_dir } = svc;
     let last_output = record.as_ref().map(|r| r.last_output.as_slice()).filter(|o| !o.is_empty());
 
-    if opts.previous.unwrap_or(false) {
-        if let Some(file) = log_dir.as_deref().and_then(node_logs::previous_failed) {
+    let back = opts.runs_back().unwrap_or(0);
+    if back > 0 {
+        // stormd's failed runs, newest first (#131: N back).
+        if let Some(file) = log_dir.as_deref().and_then(|d| node_logs::failed_run(d, back)) {
             return match std::fs::read_to_string(&file) {
                 Ok(t) => (StatusCode::OK, cap(filter_log(&t, &opts), &mut budget)).into_response(),
                 Err(e) => (StatusCode::NOT_FOUND, format!("cannot read {}: {e}\n", file.display()))
@@ -1387,14 +1422,15 @@ async fn node_service_logs(
         }
         // A service stormd does not run: its previous incarnation's own file
         // (#87, stormpump#90).
-        if let Some(run) = record.as_ref().and_then(|r| r.previous_run()) {
+        if let Some(run) = record.as_ref().and_then(|r| r.ended_run(back)) {
             let files = node_logs::run_files(&runs_dir, run);
             if !files.is_empty() {
                 let lines = node_logs::read_run(&files);
                 return (StatusCode::OK, cap(plain_log(&lines, &opts), &mut budget)).into_response();
             }
         }
-        if let Some(lines) = last_output {
+        // PID 1 keeps only the last exit's tail: one run back.
+        if let (Some(lines), 1) = (last_output, back) {
             return (StatusCode::OK, cap(plain_log(lines, &opts), &mut budget)).into_response();
         }
         return (
@@ -1612,24 +1648,26 @@ async fn log_file(
         Err(_) => return Err(none()),
     };
     runs.sort_unstable();
-    let want = if opts.previous.unwrap_or(false) {
-        match runs.len().checked_sub(2).and_then(|i| runs.get(i)) {
-            Some(r) => *r,
-            None => {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    format!("container {container} has no previous run\n"),
-                )
-                    .into_response())
-            }
-        }
-    } else {
-        match runs.last() {
-            Some(r) => *r,
-            None => return Err(none()),
-        }
-    };
-    Ok(format!("{dir}/{want}.log"))
+    if runs.is_empty() {
+        return Err(none());
+    }
+    match pick_run(&runs, opts.runs_back().unwrap_or(0)) {
+        Ok(want) => Ok(format!("{dir}/{want}.log")),
+        Err(why) => Err((StatusCode::BAD_REQUEST, format!("container {container} {why}\n")).into_response()),
+    }
+}
+
+/// Which `<restartCount>.log` to read (#131): of the runs on disk (ascending,
+/// not empty), the one `back` runs before the newest.
+fn pick_run(runs: &[u32], back: usize) -> Result<u32, String> {
+    match runs.len().checked_sub(1 + back).and_then(|i| runs.get(i)) {
+        Some(r) => Ok(*r),
+        None if back == 1 => Err("has no previous run".into()),
+        None => Err(format!(
+            "has no run {back} back (it has {} before the current one)",
+            runs.len().saturating_sub(1)
+        )),
+    }
 }
 
 /// Whole lines appended to `path` since `offset`, advancing `offset` past them.
@@ -1700,12 +1738,27 @@ struct LogOptions {
     since_time: Option<String>,
     /// Prefix each line with its timestamp.
     timestamps: Option<bool>,
-    /// The run before the current one.
-    previous: Option<bool>,
+    /// The run before the current one: `true`/`1`, as upstream parses it; `N`
+    /// for the run N back (#131: the console reads the last five).
+    previous: Option<String>,
     /// Keep the response open and send what is appended.
     follow: Option<bool>,
     /// A byte cap on the response, counted after filtering.
     limit_bytes: Option<usize>,
+}
+
+impl LogOptions {
+    /// How many runs back `previous` asks for (#131): 0 the current run, 1 the
+    /// one before (`true`, upstream's), N the run N back. Booleans as Go's
+    /// `ParseBool` reads them, so what upstream accepts means the same here.
+    fn runs_back(&self) -> Result<usize, String> {
+        let Some(v) = self.previous.as_deref() else { return Ok(0) };
+        match v {
+            "" | "false" | "f" | "F" | "FALSE" | "False" => Ok(0),
+            "true" | "t" | "T" | "TRUE" | "True" => Ok(1),
+            n => n.parse().map_err(|_| format!("previous={v}: true, false or a number of runs back\n")),
+        }
+    }
 }
 
 /// Apply the CRI log-format options to a chunk of a log file.
@@ -1900,6 +1953,40 @@ mod log_tests {
         let mut offset = 0u64;
         assert_eq!(tail_from(p, &mut offset).unwrap(), "one\n");
         assert_eq!(rest_from(p, offset).unwrap(), "crashed mid li");
+    }
+
+    /// #131: `previous` as upstream parses it, and N runs back.
+    #[test]
+    fn previous_reads_true_false_or_n_runs_back() {
+        let back = |v: Option<&str>| LogOptions { previous: v.map(String::from), ..Default::default() }.runs_back();
+        assert_eq!(back(None), Ok(0));
+        assert_eq!(back(Some("false")), Ok(0));
+        assert_eq!(back(Some("true")), Ok(1));
+        assert_eq!(back(Some("1")), Ok(1));
+        assert_eq!(back(Some("3")), Ok(3));
+        assert!(back(Some("yes")).is_err());
+
+        let runs = [0, 1, 2, 3];
+        assert_eq!(pick_run(&runs, 0), Ok(3));
+        assert_eq!(pick_run(&runs, 1), Ok(2));
+        assert_eq!(pick_run(&runs, 3), Ok(0));
+        assert_eq!(pick_run(&runs, 4).unwrap_err(), "has no run 4 back (it has 3 before the current one)");
+        assert_eq!(pick_run(&[0], 1).unwrap_err(), "has no previous run");
+    }
+
+    /// #131: a pod's network in /stats/summary, upstream's shape plus
+    /// packets and drops; eth0 is the default.
+    #[test]
+    fn a_pods_network_summary_names_eth0_and_lists_every_interface() {
+        use crate::cri::InterfaceStats;
+        let net = network_summary(&[
+            InterfaceStats { name: "net1".into(), rx_bytes: 1, ..Default::default() },
+            InterfaceStats { name: "eth0".into(), rx_bytes: 10, rx_errors: 2, tx_dropped: 3, ..Default::default() },
+        ]);
+        assert_eq!(net["name"], "eth0");
+        assert_eq!((net["rxBytes"].as_u64(), net["rxErrors"].as_u64(), net["txDropped"].as_u64()), (Some(10), Some(2), Some(3)));
+        assert_eq!(net["interfaces"].as_array().unwrap().len(), 2);
+        assert_eq!(network_summary(&[])["interfaces"], serde_json::json!([]));
     }
 
     #[test]

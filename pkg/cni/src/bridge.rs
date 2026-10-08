@@ -138,11 +138,13 @@ fn build_result(config: &CniConfig, plan: &BridgePlan) -> CniResult {
                 name: plan.bridge_name.clone(),
                 mac: String::new(),
                 sandbox: String::new(),
+                mtu: None,
             },
             CniInterface {
                 name: plan.pod_ifname.clone(),
                 mac: String::new(),
                 sandbox: plan.netns.clone(),
+                mtu: None,
             },
         ],
         ips: vec![CniIpConfig {
@@ -161,6 +163,7 @@ fn build_result(config: &CniConfig, plan: &BridgePlan) -> CniResult {
             ],
             options: vec!["ndots:5".to_string()],
         },
+        ..Default::default()
     }
 }
 

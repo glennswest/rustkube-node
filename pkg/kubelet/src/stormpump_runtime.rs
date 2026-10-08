@@ -200,6 +200,9 @@ struct Sandbox {
     /// Its namespace holder's identity file (#84): the workload that reports
     /// the pod's network.
     identity_file: Option<std::path::PathBuf>,
+    /// The CNI ADD's result as `network-status` entries (#131); `None` when
+    /// no CNI ran (host network, no invoker) or for an adopted sandbox.
+    network_status: Option<serde_json::Value>,
 }
 
 /// A sandbox whose CNI ADD failed and whose DEL has not succeeded yet (#100).
@@ -930,6 +933,7 @@ impl RuntimeService for StormpumpRuntime {
             "pod networking inputs"
         );
         let mut ip = String::new();
+        let mut network_status = None;
         if let (Some(invoker), Some(ns)) = (&self.cni, &netns) {
             match invoker.network_ready() {
                 Ok(_) => {
@@ -954,6 +958,11 @@ impl RuntimeService for StormpumpRuntime {
                                 sandbox = %id, pod = %config.name, %ip,
                                 "CNI attached the pod network"
                             );
+                            // What it wired, for the pod's annotation (#131).
+                            let netns_path = ns.clone();
+                            network_status = Some(crate::network_status::entries(&result, &|ifname| {
+                                crate::network_status::mtu_in_netns(&netns_path, ifname)
+                            }));
                         }
                         // Same reasoning as a missing config: a pod that
                         // asked for a network and did not get one must not
@@ -1031,6 +1040,7 @@ impl RuntimeService for StormpumpRuntime {
             ip,
             made: Some(steps),
             identity_file,
+            network_status,
         };
         self.sandboxes.lock().await.insert(id.clone(), sb);
         tracing::info!(
@@ -1619,6 +1629,10 @@ impl RuntimeService for StormpumpRuntime {
         true
     }
 
+    async fn pod_network_status(&self, sandbox_id: &str) -> Option<serde_json::Value> {
+        self.sandboxes.lock().await.get(sandbox_id).and_then(|s| s.network_status.clone())
+    }
+
     async fn pod_of_workload(&self, handle: u64) -> Option<String> {
         let sandbox = {
             let containers = self.containers.lock().await;
@@ -2168,6 +2182,7 @@ mod tests {
                 ip: String::new(),
                 made: None,
                 identity_file: None,
+                network_status: None,
             },
         );
         let mut c = bare("ct-1", "sb-1");
@@ -2194,6 +2209,7 @@ mod tests {
                 ip: String::new(),
                 made: None,
                 identity_file: None,
+                network_status: None,
             },
         );
         for (id, sb) in [("ct-1", "sb-1"), ("ct-2", "sb-1"), ("ct-3", "sb-other")] {
@@ -2356,6 +2372,7 @@ mod tests {
                     ip: String::new(),
                     made: None,
                     identity_file: None,
+                    network_status: None,
                 },
             );
         }
@@ -2897,6 +2914,7 @@ mod tests {
                 ip: String::new(),
                 made: None,
                 identity_file: None,
+                network_status: None,
             },
         );
         r.remove_pod_sandbox("sb-1").await.unwrap();

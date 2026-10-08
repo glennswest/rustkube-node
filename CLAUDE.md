@@ -71,6 +71,15 @@ among them (stormcos#368 will enforce).
        stormcos#402 filed (kubelet SA token + `STORMBLOCK_ADMIN_TOKEN_FILE`, before #368). Stage golden
        golden-rustkube-node-dc81277f6b12 (stormcos#366). Closed. Live check is stormcos#402/#368's audit log.
 
+### In progress: #131 (P3), pod network counters, network-status, older runs' logs (stormconsole#69)
+
+2026-10-08. (1) InterfaceStats + packets/errors/drops; cAdvisor families; /stats/summary `network`. (2) cni:
+CniResult.network/plugins (invoker), CniInterface.mtu; `network_status.rs` (Multus entries + addresses/routes/
+plugins; `mtu_in_netns` SIOCGIFMTU, no setns when already there); stormpump Sandbox.network_status;
+`RuntimeService::pod_network_status`; written with the start-timing patch. (3) `previous=N` (`runs_back`,
+`pick_run`, `failed_run`, `Record::ended_run`); rustkube's pods/log forwards it as is. VM tap counters not done
+(stormvm#48 is the guest view). Tests, docs (README, api.md, metrics.md), CHANGELOG; sc-build; golden; close.
+
 ### Done: #136, /log strips three words of every plain line
 
 2026-10-08. `filter_log` took any 4-way split as `<ts> <stream> <tag> <msg>`. Now `cri_line`: RFC 3339 first field

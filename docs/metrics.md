@@ -36,6 +36,9 @@ gone is gone from the next scrape.
 | `container_fs_usage_bytes` | gauge | same | CRI `ContainerStats.writable_layer` |
 | `container_network_receive_bytes_total` | counter | `container=""`, `id` (the sandbox), `interface`, `namespace`, `pod` | the pod's network namespace |
 | `container_network_transmit_bytes_total` | counter | same | same |
+| `container_network_{receive,transmit}_packets_total` | counter | same | same (#131) |
+| `container_network_{receive,transmit}_errors_total` | counter | same | same (#131) |
+| `container_network_{receive,transmit}_packets_dropped_total` | counter | same | same (#131) |
 
 `id` is the runtime's container id. cAdvisor puts the cgroup path there, which
 no runtime here reports. Network is per pod, as in cAdvisor, and loopback is
