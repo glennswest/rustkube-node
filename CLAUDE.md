@@ -74,7 +74,7 @@ kube-proxy's apiserver client, the test container's `Api`.
 4. [x] SC_BUILD_VM sc-build 2d92875 `cargo build --locked && cargo test --locked`: 453 kubelet unit, 13 retry, 34 proxy,
        25 CNI, integration pass (first run: #212, a VM test reading its backoff after the now-retried API calls;
        fixed). `cd test && cargo test --locked && cargo build --release --locked` at a333c3a: 29 pass, release builds.
-       Stage golden, close.
+       Stage golden golden-rustkube-node-00d7475efba3 (105be87), release request stormcos#424. Closed.
 
 ### Waiting on stormvm#82 (after stormpump#123): #210, git dependencies pinned by rev (stormcentral#571's SBOM refusal)
 
