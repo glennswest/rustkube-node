@@ -71,11 +71,12 @@ among them (stormcos#368 will enforce).
        stormcos#402 filed (kubelet SA token + `STORMBLOCK_ADMIN_TOKEN_FILE`, before #368). Stage golden
        golden-rustkube-node-dc81277f6b12 (stormcos#366). Closed. Live check is stormcos#402/#368's audit log.
 
-### In progress: #135, start timing's `scheduled` from storm.io/scheduled-at
+### Done: #135, start timing's `scheduled` from storm.io/scheduled-at
 
 2026-10-08. rustkube (5d74187) writes `storm.io/scheduled-at` (RFC3339, µs) with the bind. `scheduled_at` prefers
 it, then PodScheduled, then creationTimestamp; `scheduled_us` (µs) printed with `ms()` (tenths below 10 ms). Test,
-README, CHANGELOG; sc-build; golden; close. rustkube#190's burst acceptance is theirs, after the release.
+README, CHANGELOG (df4380a). SC_BUILD_VM sc-build: 434 kubelet unit pass. Stage golden golden-rustkube-node-c525fe79725a
+(stormcos#366). Closed. rustkube#190's burst acceptance is theirs, after the release.
 
 ### Done: #24 (P3), --system-reserved, --kube-reserved, --cgroup-driver
 
