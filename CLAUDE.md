@@ -57,6 +57,18 @@ by #51.
 
 ## Work plan
 
+### In progress: #105, an admin credential for the engine's destructive verbs
+
+2026-10-08. stormblock#274 gates DELETE of templates and sealed volumes (and array/slab verbs) behind the admin
+token or a Kubernetes bearer allowed by SubjectAccessReview; the kubelet's one such call is #140's template rebuild.
+stormcos#296 chose SA tokens for destructive callers (the admin token never leaves the engine); the kubelet is not
+among them (stormcos#368 will enforce).
+1. [x] engine.rs: `TokenSource::admin_from_env` (`STORMBLOCK_ADMIN_TOKEN`, `_FILE`), `EngineClient::with_admin`;
+       non-GET still 401 after the node token's reread → once with the admin credential, read at each use. Tests (3:
+       distinct tokens + rotation + GET not escalated; missing then provided, stale refused once; single token).
+       Docs (README, configuration.md), CHANGELOG (6cf96e1).
+2. [ ] sc-build; stormcos issue (kubelet SA token, `STORMBLOCK_ADMIN_TOKEN_FILE`, before #368); golden; close.
+
 ### Closed: #142 (P3), the kubelet's own NVMe/TCP connect: not planned
 
 2026-10-08. Nothing on the current path needs it: replicated claims are stormblock-csi's (owner on #68; its node
