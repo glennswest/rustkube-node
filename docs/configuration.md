@@ -35,6 +35,8 @@ An em dash means there is no environment binding or the value is unset.
 | `--storage-alert-percent` | `STORAGE_ALERT_PERCENT` | `85`: percent of the data slabs written past which a `SlabFilling` Warning goes on this node's stormblock PVs (#62) |
 | `--pod-workers` | `POD_WORKERS` | 16 per CPU, at least 32, at most 256: Pod/VMI passes (starts, checks, teardowns) run at once (#138) |
 | `--kubelet-port` | `KUBELET_PORT` | `10250`; HTTPS on `0.0.0.0` |
+| `--container-log-max-size` | `CONTAINER_LOG_MAX_SIZE` | `10Mi` (upstream's `containerLogMaxSize`): a container's live log file larger than this is rotated, checked every 10 s (#216). A positive quantity |
+| `--container-log-max-files` | `CONTAINER_LOG_MAX_FILES` | `5` (upstream's `containerLogMaxFiles`): files per container run, the live one included; older rotations are gzip'd, the oldest deleted. At least 2 (#216) |
 | `--max-pods` | `MAX_PODS` | `110` (upstream's); the node's `capacity.pods` and `allocatable.pods`, which the scheduler holds it to (#165). stormcos sets 250 (rustkube#205). The kubelet itself admits by no count |
 | `--system-reserved` | `SYSTEM_RESERVED` | Unset. `cpu=500m,memory=1Gi,ephemeral-storage=1Gi` (upstream's spelling) held back for the OS: allocatable is capacity less this, `--kube-reserved` and the hard-eviction line (memory 100Mi, nodefs 10%) (#24). `pid` and other resources refused at startup (no node-allocatable cgroup holds them) |
 | `--kube-reserved` | `KUBE_RESERVED` | Unset. Held back for the node's own components; as `--system-reserved` (#24) |

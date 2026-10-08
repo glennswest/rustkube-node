@@ -2,6 +2,13 @@
 
 ## 2026-10-08
 
+- **feat:** Per-container logs at upstream parity (#216). Every container run gets its own `<N>.log` (the next number
+  on disk, at least the restart count): init containers and native sidecars no longer reuse `0.log`, so `--previous`
+  works for a retried init, a restarted sidecar and across a kubelet restart. The current run and five previous are
+  kept, older runs pruned when a new one starts. Rotation as upstream's ContainerLogManager: `--container-log-max-size`
+  (10Mi) and `--container-log-max-files` (5), every 10 s, `<N>.log.<YYYYMMDD-HHMMSS>`, older rotations gzip'd, oldest
+  deleted; copy-truncate until stormpump offers a reopen. Timestamps and stream per line need stormpump to write
+  CRI-format logs: stormpump#129.
 - **feat:** Every remote call retries (#211, code review). New `pkg/retry` crate, shared by the kubelet, kube-proxy
   and the test container: bounded retry with jittered exponential backoff and a whole-operation deadline per
   dependency (`API`, `ENGINE`, `REGISTRY`, `PEER`, `LOCAL`), `Retry-After` honoured, no retry on a real answer
