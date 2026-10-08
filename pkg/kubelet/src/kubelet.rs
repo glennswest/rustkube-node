@@ -79,6 +79,9 @@ pub struct KubeletConfig {
     /// How long `/vmInstance` answers from the VMI cache without word from
     /// the apiserver (`--metadata-max-staleness`, #156). Zero: unbounded.
     pub metadata_max_staleness: Duration,
+    /// Container log rotation (`--container-log-max-size`,
+    /// `--container-log-max-files`, #216).
+    pub container_log: crate::container_logs::Rotation,
 }
 
 impl Default for KubeletConfig {
@@ -114,6 +117,7 @@ impl Default for KubeletConfig {
             engine: crate::engine::EngineClient::default(),
             storage: crate::capacity::Policy::default(),
             metadata_max_staleness: crate::vm_manager::METADATA_MAX_STALENESS,
+            container_log: Default::default(),
         }
     }
 }
@@ -478,6 +482,10 @@ impl Kubelet {
         // The data slabs' room for claims, published and watched (#62).
         tokio::spawn(self.clone().capacity_loop());
         tokio::spawn(self.clone().placement_loop());
+
+        // Containers' logs rotated as upstream's ContainerLogManager does
+        // (#216): every 10 s, past --container-log-max-size.
+        tokio::spawn(crate::container_logs::monitor("/var/log/pods".into(), self.config.container_log));
 
         // Pods' ServiceAccount tokens, written again at 80% of their life
         // (#122): on the earliest one's deadline, at most a minute apart so

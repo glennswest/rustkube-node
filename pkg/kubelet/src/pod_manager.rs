@@ -3174,6 +3174,9 @@ impl PodManager {
             apply_pod_namespaces(&mut config, pod);
             ensure_container_log_dir(&sandbox_config.log_directory, &config.name);
             let cid = if let Some(cid)=existing {cid} else {
+            // A retried init or a restarted sidecar is a new run with its own
+            // file, so `--previous` reads the one before (#216).
+            new_log_run(&mut config, &sandbox_config.log_directory, 0);
             let cid = self.runtime.create_container(sandbox_id, &config, sandbox_config).await?;
             if let Some(state)=self.pods.write().await.get_mut(pod["metadata"]["uid"].as_str().unwrap_or("")) {
                 state.container_ids.insert(cname.into(),cid.clone());
@@ -3646,6 +3649,7 @@ impl PodManager {
                 build_container_config(container_spec, &image_ref, envs, mounts);
             apply_pod_namespaces(&mut container_config, pod);
             ensure_container_log_dir(&sandbox_config.log_directory, &container_config.name);
+            new_log_run(&mut container_config, &sandbox_config.log_directory, 0);
 
             // Create container
             let container_id = match self
@@ -4549,8 +4553,10 @@ impl PodManager {
             let mut config = build_container_config(spec, &image_ref, envs, mounts);
             apply_pod_namespaces(&mut config, &pod_for_ns);
             config.attempt = restart_count;
-            config.log_path = format!("{}/{restart_count}.log", config.name);
             ensure_container_log_dir(&sandbox_config.log_directory, &config.name);
+            // After every run on disk, not only the restart count, which a
+            // kubelet restart resets (#216).
+            new_log_run(&mut config, &sandbox_config.log_directory, restart_count);
             let cid = self
                 .runtime
                 .create_container(&sandbox_id, &config, sandbox_config)
@@ -6075,6 +6081,14 @@ fn prepare_log_dirs(pod: &Value, log_directory: &str) -> Result<(), CriError> {
         }
     }
     Ok(())
+}
+
+/// Give a container about to be created its run's own log file (#216): the
+/// next `<N>.log` in its directory, old runs pruned
+/// ([`crate::container_logs::new_run`]).
+fn new_log_run(config: &mut ContainerConfig, log_directory: &str, at_least: u32) {
+    let n = crate::container_logs::new_run(log_directory, &config.name, at_least);
+    config.log_path = format!("{}/{n}.log", config.name);
 }
 
 fn ensure_container_log_dir(log_directory: &str, container_name: &str) {

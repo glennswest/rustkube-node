@@ -125,6 +125,16 @@ struct Cli {
     #[arg(long, env = "MAX_PODS", default_value_t = kubelet::node_status::DEFAULT_MAX_PODS)]
     max_pods: u32,
 
+    /// A container's log file is rotated once it is larger than this
+    /// (upstream's containerLogMaxSize), checked every 10 s (#216).
+    #[arg(long, env = "CONTAINER_LOG_MAX_SIZE", default_value = "10Mi")]
+    container_log_max_size: String,
+
+    /// Files kept per container run, the live one included (upstream's
+    /// containerLogMaxFiles); rotations past it are deleted, oldest first. At least 2.
+    #[arg(long, env = "CONTAINER_LOG_MAX_FILES", default_value_t = kubelet::container_logs::DEFAULT_MAX_FILES)]
+    container_log_max_files: usize,
+
     /// Held back from Pods for the OS (#24): `cpu=500m,memory=1Gi,ephemeral-storage=1Gi`.
     /// Allocatable is capacity less this, `--kube-reserved` and the hard
     /// eviction line (memory 100Mi, nodefs 10%).
@@ -232,6 +242,17 @@ async fn wait_for_file(flag: &str, path: &str, limit: std::time::Duration) -> an
 }
 
 /// [`wait_for_file`] for an optional flag.
+/// `--container-log-max-size` / `--container-log-max-files`, refused as
+/// upstream refuses them: a size that is not a positive quantity, fewer than 2
+/// files (#216).
+fn container_log_rotation(size: &str, files: usize) -> anyhow::Result<kubelet::container_logs::Rotation> {
+    let max_size = kubelet::storage::parse_quantity(size)
+        .filter(|b| *b > 0)
+        .ok_or_else(|| anyhow::anyhow!("--container-log-max-size {size:?}: a positive quantity, e.g. 10Mi"))?;
+    anyhow::ensure!(files >= 2, "--container-log-max-files {files}: at least 2 (the live file and one rotation)");
+    Ok(kubelet::container_logs::Rotation { max_size, max_files: files })
+}
+
 async fn named(flag: &str, path: Option<&str>) -> anyhow::Result<Option<Vec<u8>>> {
     match path {
         Some(p) => Ok(Some(wait_for_file(flag, p, CREDENTIAL_WAIT).await?)),
@@ -541,6 +562,7 @@ async fn main() -> anyhow::Result<()> {
         };
         parse("--system-reserved", &cli.system_reserved)?.plus(&parse("--kube-reserved", &cli.kube_reserved)?)
     };
+    let container_log = container_log_rotation(&cli.container_log_max_size, cli.container_log_max_files)?;
     if cli.runtime != "cri" {
         if let Some(d) = &cli.cgroup_driver {
             tracing::info!("--cgroup-driver={d} is not used by --runtime {} (only a CRI runtime takes a cgroup parent)", cli.runtime);
@@ -584,6 +606,7 @@ async fn main() -> anyhow::Result<()> {
             alert_percent: cli.storage_alert_percent,
         },
         metadata_max_staleness: std::time::Duration::from_secs(cli.metadata_max_staleness),
+        container_log,
         ..Default::default()
     };
     let mut kubelet = Kubelet::new(config, runtime, images, migration)?;
@@ -668,5 +691,19 @@ mod tests {
     #[test]
     fn a_token_file_is_trimmed() {
         assert_eq!(token_text(b"abc.def\n".to_vec()).unwrap(), "abc.def");
+    }
+
+    /// #216: upstream's defaults, and what upstream refuses.
+    #[test]
+    fn container_log_rotation_flags() {
+        let cli = Cli::try_parse_from(["kubelet"]).unwrap();
+        if std::env::var_os("CONTAINER_LOG_MAX_SIZE").is_none() && std::env::var_os("CONTAINER_LOG_MAX_FILES").is_none() {
+            let r = container_log_rotation(&cli.container_log_max_size, cli.container_log_max_files).unwrap();
+            assert_eq!(r, kubelet::container_logs::Rotation { max_size: 10 << 20, max_files: 5 });
+        }
+        assert_eq!(container_log_rotation("50Mi", 3).unwrap().max_size, 50 << 20);
+        assert!(container_log_rotation("0", 5).is_err());
+        assert!(container_log_rotation("lots", 5).is_err());
+        assert!(container_log_rotation("10Mi", 1).is_err());
     }
 }

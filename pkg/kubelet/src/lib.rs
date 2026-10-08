@@ -6,6 +6,7 @@
 
 pub mod capacity;
 pub mod cgroups;
+pub mod container_logs;
 pub mod container_roots;
 pub mod dns;
 pub mod engine;
