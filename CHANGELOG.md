@@ -8,7 +8,8 @@
   kept, older runs pruned when a new one starts. Rotation as upstream's ContainerLogManager: `--container-log-max-size`
   (10Mi) and `--container-log-max-files` (5), every 10 s, `<N>.log.<YYYYMMDD-HHMMSS>`, older rotations gzip'd, oldest
   deleted; copy-truncate until stormpump offers a reopen. Timestamps and stream per line need stormpump to write
-  CRI-format logs: stormpump#129.
+  CRI-format logs: stormpump#129. A node service's mirror pod: `--previous` is its newest finished stormd run, failed
+  or exited (upstream's last terminated instance), no longer the newest failed run only (#72).
 - **feat:** Every remote call retries (#211, code review). New `pkg/retry` crate, shared by the kubelet, kube-proxy
   and the test container: bounded retry with jittered exponential backoff and a whole-operation deadline per
   dependency (`API`, `ENGINE`, `REGISTRY`, `PEER`, `LOCAL`), `Retry-After` honoured, no retry on a real answer
