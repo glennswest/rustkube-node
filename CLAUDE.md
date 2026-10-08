@@ -71,13 +71,14 @@ among them (stormcos#368 will enforce).
        stormcos#402 filed (kubelet SA token + `STORMBLOCK_ADMIN_TOKEN_FILE`, before #368). Stage golden
        golden-rustkube-node-dc81277f6b12 (stormcos#366). Closed. Live check is stormcos#402/#368's audit log.
 
-### In progress: #23 (P3), the node side of the 1.36 posture
+### Done: #23 (P3), the node side of the 1.36 posture
 
 2026-10-08. Audit: kubeProxyVersion written and kubeletVersion v1.32 (fix); AppArmor read nowhere, so a confined pod
 ran unconfined (upstream admission refusal; stormcos's only user is Cilium's Unconfined); gitRepo already waits
 (message names the removal); containerd < 2.0 (refused at startup); cgroups v2 only (workload_identity skips v1);
 no IPVS mode; cgroup driver = #24; k8s-openapi unused here (apimachinery pins its own, rustkube's). Code, tests (4),
-README/status.md, CHANGELOG; sc-build; follow-up #197 (AppArmor applied); golden; close.
+README/status.md, CHANGELOG (91ca976). SC_BUILD_VM sc-build: 429 kubelet unit pass. Follow-up #197 (AppArmor
+applied). Stage golden golden-rustkube-node-1a6eef824e07 (stormcos#366). Closed.
 
 ### Done: #113 (P3), a given --apiserver equal to the default overrides the kubeconfig
 
