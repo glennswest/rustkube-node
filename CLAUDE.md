@@ -71,6 +71,12 @@ among them (stormcos#368 will enforce).
        stormcos#402 filed (kubelet SA token + `STORMBLOCK_ADMIN_TOKEN_FILE`, before #368). Stage golden
        golden-rustkube-node-dc81277f6b12 (stormcos#366). Closed. Live check is stormcos#402/#368's audit log.
 
+### In progress: #78 (P3), nodeInfo kernelVersion / bootID / machineID / systemUUID
+
+2026-10-08. node_status.rs hard-coded all four as "". Upstream's sources: osrelease, boot_id, machine-id (the node's
+at /hostroot first: the kubelet's root is its golden), DMI product_uuid. `first_value(paths)`; tests (2); docs
+(configuration.md), CHANGELOG; sc-build; golden; close. Live check: `kubectl get nodes -o wide` on a node after a release.
+
 ### Waiting on the owner: #13 (P3), microVM Pods (`--runtime vm`)
 
 2026-10-08. Stopped before code. Found: stormvisor (created 07-16, minutes before #13) is the platform's microVM-Pod

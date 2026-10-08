@@ -2,6 +2,10 @@
 
 ## 2026-10-08
 
+- **fix:** The Node's `nodeInfo` carries `kernelVersion` (`/proc/sys/kernel/osrelease`), `bootID`
+  (`/proc/sys/kernel/random/boot_id`), `machineID` (the node's `/etc/machine-id` at `/hostroot` first) and
+  `systemUUID` (`/sys/class/dmi/id/product_uuid`), each `""` only when its file is absent (#78). They were always
+  empty, so `kubectl get nodes -o wide` and `sc -o wide` showed no kernel.
 - **feat:** The stormblock engine client carries an admin credential for destructive verbs (#105). Since
   stormblock#274 the node token no longer covers deleting a template or a sealed volume; such a call (any non-GET)
   that is still refused with 401 after the node token's reread is sent once more with `$STORMBLOCK_ADMIN_TOKEN` or

@@ -507,10 +507,10 @@ impl NodeReporter {
                 existing, mem_pressure, disk_pressure, pid_pressure, &now,
             ),
             "nodeInfo": {
-                "machineID": "",
-                "systemUUID": "",
-                "bootID": "",
-                "kernelVersion": "",
+                "machineID": first_value(&MACHINE_ID_FILES),
+                "systemUUID": first_value(&SYSTEM_UUID_FILES),
+                "bootID": first_value(&BOOT_ID_FILES),
+                "kernelVersion": first_value(&KERNEL_VERSION_FILES),
                 "osImage": os_image(),
                 "containerRuntimeVersion": &self.runtime_version,
                 "kubeletVersion": format!("v1.32.0-rustkube+{}", apimachinery::VERSION),
@@ -547,6 +547,34 @@ const KUBELET_OWNED_CONDITIONS: [&str; 4] =
 ///   * each owned condition's `lastTransitionTime` is carried forward from the
 ///     previous value when its `status` is unchanged, and only stamped `now` on
 ///     an actual flip — `lastHeartbeatTime` always advances.
+
+/// `nodeInfo.kernelVersion`: `uname -r` (#78). The kernel is the node's,
+/// whatever domain the kubelet runs in.
+const KERNEL_VERSION_FILES: [&str; 1] = ["/proc/sys/kernel/osrelease"];
+/// `nodeInfo.bootID`: changes on every boot, as upstream reports it (#78).
+const BOOT_ID_FILES: [&str; 1] = ["/proc/sys/kernel/random/boot_id"];
+/// `nodeInfo.machineID` (#78): the node's, at /hostroot, before the kubelet's
+/// own root (its golden); upstream's two places in each.
+const MACHINE_ID_FILES: [&str; 4] = [
+    "/hostroot/etc/machine-id",
+    "/hostroot/var/lib/dbus/machine-id",
+    "/etc/machine-id",
+    "/var/lib/dbus/machine-id",
+];
+/// `nodeInfo.systemUUID`: the firmware's (SMBIOS) UUID, as upstream reads it
+/// (#78). Absent on machines without DMI.
+const SYSTEM_UUID_FILES: [&str; 1] = ["/sys/class/dmi/id/product_uuid"];
+
+/// The first of `paths` that reads non-empty, trimmed; `""` when none does
+/// (what the field said before, and what upstream leaves for an unknown).
+fn first_value<P: AsRef<std::path::Path>>(paths: &[P]) -> String {
+    paths
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .map(|v| v.trim().to_string())
+        .find(|v| !v.is_empty())
+        .unwrap_or_default()
+}
 
 /// What operating system this node is running, for `nodeInfo.osImage`.
 ///
@@ -818,6 +846,30 @@ fn statvfs_bytes(_path: &str) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #78: the first readable non-empty file wins, trimmed; none is "".
+    #[test]
+    fn node_info_values_come_from_the_first_file_that_has_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, c) = (dir.path().join("a"), dir.path().join("b"), dir.path().join("c"));
+        std::fs::write(&b, " \n").unwrap();
+        std::fs::write(&c, "6.12.7-stormcos\n").unwrap();
+        assert_eq!(first_value(&[&a, &b, &c]), "6.12.7-stormcos");
+        assert_eq!(first_value(&[&a, &b]), "");
+    }
+
+    /// #78: kernelVersion and bootID are this machine's (Linux, where tests
+    /// run); a status no longer carries them empty.
+    #[test]
+    fn the_node_reports_its_kernel_and_boot() {
+        let st = NodeReporter::new("http://x", "n1").build_status(&[]);
+        let info = &st["nodeInfo"];
+        let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap();
+        assert_eq!(info["kernelVersion"], kernel.trim());
+        assert!(!info["kernelVersion"].as_str().unwrap().is_empty());
+        assert_eq!(info["bootID"].as_str().unwrap().len(), 36, "{info}");
+        assert!(info["machineID"].is_string() && info["systemUUID"].is_string());
+    }
 
     /// #165: capacity and allocatable `pods` are `--max-pods`, 110 unless set.
     #[test]

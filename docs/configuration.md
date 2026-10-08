@@ -136,6 +136,13 @@ its next pass; one warning names where it was looked for.
 
 ### Library-only defaults and fixed paths
 
+The Node's `status.nodeInfo` reads fixed files, each trimmed, `""` when none
+is there (#78): `kernelVersion` from `/proc/sys/kernel/osrelease`, `bootID`
+from `/proc/sys/kernel/random/boot_id`, `machineID` from the node's
+`/hostroot/etc/machine-id` (else `/hostroot/var/lib/dbus/machine-id`, then the
+kubelet's own two), `systemUUID` from `/sys/class/dmi/id/product_uuid`, and
+`osImage` from `/etc/stormcos/release/version` (or `/hostroot`'s).
+
 `KubeletConfig::default()` has `heartbeat_interval = 10s`, `sync_interval = 2s`,
 and API URL `http://localhost:6443` (the CLI overrides that URL). These intervals
 are not CLI keys. The heartbeat is the only fixed schedule. Pods and VMIs share
