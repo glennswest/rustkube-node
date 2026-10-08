@@ -57,17 +57,18 @@ by #51.
 
 ## Work plan
 
-### In progress: #209 (P2), a class blank being minted is charged as committed; medium's 1Ti case starts late
+### Done: #209 (P2), a class blank being minted is charged as committed; medium's 1Ti case starts late
 
 2026-10-08. Found: stormblock formats a template on `fstemplate-<name>-raw` and seals it as `fstemplate-<fs>-<name>`
 (stormblock src/serve/reap.rs TEMPLATE_PREFIX). capacity.rs `is_source` knew only the bare blank name and sealed
 volumes, so the raw volume (unsealed while formatting) was charged its full size: 1 TiB + the 1Ti claim > 1.8 TB.
 Suite: cases larger than the node can hold (block 1Pi/20Ti, 16Ti, 4Ti on a 1.8 TB slab) sat in their slot for the
 whole 20-min mint budget each, so the 1Ti mint started 20 min in.
-1. [ ] capacity.rs: every `fstemplate-` volume is a source (raw and sealed); test with the issue's numbers.
-2. [ ] test/medium.rs: read the node's maximumVolumeSize first; a case whose class is above it is checked as a
+1. [x] capacity.rs: every `fstemplate-` volume is a source (raw and sealed); test with the issue's numbers.
+2. [x] test/medium.rs: read the node's maximumVolumeSize first; a case whose class is above it is checked as a
        refusal ("not enough room", 180 s), not a 20-min mint wait.
-3. [ ] Docs, CHANGELOG; sc-build (root + test crate); golden; close.
+3. [x] README, CHANGELOG (739fe93). SC_BUILD_VM sc-build: 453 kubelet unit pass, test crate tests + release build.
+       Stage golden golden-rustkube-node-16db12268fc3 (stormcos#424). Closed. Live: the next medium run on C2NR0Q2.
 
 ### Done: #105, an admin credential for the engine's destructive verbs
 
