@@ -11,31 +11,31 @@ license.workspace = true
 # encoding rather than for the engine itself — its whole dependency set is
 # libc plus two crates with none of their own, so this costs the kubelet
 # almost nothing.
-stormpump = { git = "https://github.com/glennswest/stormpump", rev = "13cf2c913ef5d5400bfc6398667d927866ae0416" }
-stormpump-abi = { git = "https://github.com/glennswest/stormpump", rev = "13cf2c913ef5d5400bfc6398667d927866ae0416" }
+stormpump = { git = "https://github.com/glennswest/stormpump", branch = "main" }
+stormpump-abi = { git = "https://github.com/glennswest/stormpump", branch = "main" }
 # The VM object, its conversion from a Kubernetes object, and the plan that
 # turns it into a stormpump spec. Libraries: the loop is this kubelet's.
-stormvm-spec = { git = "https://github.com/glennswest/stormvm", rev = "180fa138b4bf3be2c2e9855a044965bd9f266fbf" }
-stormvm-node = { git = "https://github.com/glennswest/stormvm", rev = "180fa138b4bf3be2c2e9855a044965bd9f266fbf" }
+stormvm-spec = { git = "https://github.com/glennswest/stormvm", branch = "main" }
+stormvm-node = { git = "https://github.com/glennswest/stormvm", branch = "main" }
 # Tap naming, MAC derivation and the ioctls that make one. Shared with the
 # standalone `stormvm start` path deliberately: the two must not derive
 # different names for one VM (rustkube-node#39).
-stormvm-net = { git = "https://github.com/glennswest/stormvm", rev = "180fa138b4bf3be2c2e9855a044965bd9f266fbf" }
+stormvm-net = { git = "https://github.com/glennswest/stormvm", branch = "main" }
 # The restore half of #53: a group snapshot by id, and a volume from one of
 # its members (`vm_restore.rs`).
-stormvm-block = { git = "https://github.com/glennswest/stormvm", rev = "180fa138b4bf3be2c2e9855a044965bd9f266fbf" }
+stormvm-block = { git = "https://github.com/glennswest/stormvm", branch = "main" }
 # For NicTransport, so a VMI can say *how* its address reaches the guest —
 # bridge, user or passt. Reported rather than inferred: the three are the
 # difference between a VM the cluster can route to and one only its own
 # hypervisor can see.
-stormvm-vmm = { git = "https://github.com/glennswest/stormvm", rev = "180fa138b4bf3be2c2e9855a044965bd9f266fbf" }
+stormvm-vmm = { git = "https://github.com/glennswest/stormvm", branch = "main" }
 # The QEMU guest agent client, for the one question only the guest can
 # answer: what address does it actually hold. With a bridge that comes from
 # a DHCP server the node does not run; with masquerade it is inside the
 # hypervisor's own stack. The socket has been wired since machines started
 # and nothing read it.
-stormvm-control = { git = "https://github.com/glennswest/stormvm", rev = "180fa138b4bf3be2c2e9855a044965bd9f266fbf" }
-stormvm-cloudinit = { git = "https://github.com/glennswest/stormvm", rev = "180fa138b4bf3be2c2e9855a044965bd9f266fbf" }
+stormvm-control = { git = "https://github.com/glennswest/stormvm", branch = "main" }
+stormvm-cloudinit = { git = "https://github.com/glennswest/stormvm", branch = "main" }
 apimachinery = { workspace = true }
 # The kubelet's /metrics (#36): the same recorder rustkube's components use.
 metrics = { workspace = true }
@@ -66,7 +66,7 @@ hyper-util = { version = "0.1" }
 # on it, and a second long-lived process to serve consoles is one that never
 # needs to exist. Mounted here the doors also inherit this server's TLS and
 # bearer auth instead of stormvm's weaker "loopback, or a token" rule.
-stormvm-console = { git = "https://github.com/glennswest/stormvm", rev = "180fa138b4bf3be2c2e9855a044965bd9f266fbf" }
+stormvm-console = { git = "https://github.com/glennswest/stormvm", branch = "main" }
 # `hyper::upgrade::OnUpgrade`, by name. Handing a request to the console's
 # router means rebuilding it without this server's path captures, and the
 # upgrade handle is the one extension that has to survive that — without it
