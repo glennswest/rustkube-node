@@ -2,6 +2,11 @@
 
 ## 2026-10-08
 
+- **fix:** `pods/log` no longer drops the first three words of every plain line with three or more spaces (#136): a
+  line is taken apart only when its first field is an RFC 3339 time and the next two are CRI's (`stdout|stderr`,
+  `P|F`) or stormd's (stream, severity); stormpump's lines, which carry neither, come back whole, so test runners'
+  spaced JSON results (stormcos_qa, stormlb, stormpump, stormraid) read again. CRI partial lines are joined to the
+  rest, and a last line with no newline is returned (a plain read; `-f` once the pod is gone).
 - **fix:** Start timing's `scheduled` phase is timed from rustkube's `storm.io/scheduled-at` annotation (the bind time
   in microseconds, rustkube#190) when the pod carries it, and kept in microseconds (`scheduled=4.3ms`), #135. The
   `PodScheduled` transition and `creationTimestamp` (whole seconds, up to 999 ms of truncation: pvetest1's

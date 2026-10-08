@@ -41,8 +41,15 @@ anonymous auth. See [credential behavior](configuration.md).
 Log query options: `follow`, `previous`, `tailLines`, `sinceSeconds`,
 `sinceTime`, `timestamps`, `limitBytes`. Waiting containers return 400 with
 their reason. stormd mirror logs are discovered through boot-unit log mounts;
-`previous` selects the newest failed-run log. Non-stormd service logs remain
-#87, and successful init-container log retention remains #47.
+`previous` selects the newest failed-run log; non-stormd services read PID 1's
+run files (#87); a completed init container's log is kept (#47).
+
+A line loses its time, stream and tag only when it carries them (#136): CRI
+(`<RFC 3339> <stdout|stderr> <P|F> <msg>`, partial `P` lines joined to the rest)
+or stormd's (`<RFC 3339> <stream> <severity> <msg>`). Every other line, which is
+every stormpump container's (no per-line metadata), comes back as written, so
+`timestamps`/`since*` have nothing to act on there. A last line with no newline
+is returned by a plain read, and by `follow` once the pod is gone.
 
 | POST, GET | `/portForward/{namespace}/{pod}` | `kubectl port-forward` (#56): SPDY/3.1 (`portforward.k8s.io`) or a WebSocket tunnel of it (`SPDY/3.1+portforward.k8s.io`); connects to `localhost:<port>` in the pod's network namespace (the node's for hostNetwork). 404 unknown pod, 403 another protocol, 503 no namespace found |
 | POST, GET | `/exec/{namespace}/{pod}/{container}`, `/attach/…` | 501 naming stormpump#103: the engine cannot yet run a process in a running container. Exec probes wait on the same |

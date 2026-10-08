@@ -1284,13 +1284,14 @@ async fn container_logs(
             return (StatusCode::NOT_FOUND, format!("cannot read {path}: {e}\n")).into_response()
         }
     };
-    let consumed = raw.rfind('\n').map(|i| i + 1).unwrap_or(0);
     let mut budget = opts.limit_bytes;
-    let head = cap(filter_log(&raw[..consumed], &opts), &mut budget);
-
+    // Not following: everything there is, a last line with no newline
+    // included (#136: a test that crashed mid-line kept that line from us).
     if !opts.follow.unwrap_or(false) {
-        return (StatusCode::OK, head).into_response();
+        return (StatusCode::OK, cap(filter_log(&raw, &opts), &mut budget)).into_response();
     }
+    let consumed = raw.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let head = cap(filter_log(&raw[..consumed], &opts), &mut budget);
     if budget == Some(0) {
         return (StatusCode::OK, head).into_response();
     }
@@ -1311,6 +1312,13 @@ async fn container_logs(
             // The container going away is what ends `-f` upstream; without
             // this the stream would hold open forever on a finished pod.
             if pm.pod_uid(&namespace, &pod).await.is_none() {
+                // Its last line, if the container ended mid-line (#136).
+                if let Ok(rest) = rest_from(&path, offset) {
+                    let out = cap(filter_log(&rest, &opts), &mut budget);
+                    if !out.is_empty() {
+                        let _ = tx.send(Ok(out.into_bytes())).await;
+                    }
+                }
                 return;
             }
             match tail_from(&path, &mut offset) {
@@ -1651,6 +1659,14 @@ fn tail_from(path: &str, offset: &mut u64) -> std::io::Result<String> {
     Ok(text[..whole].to_string())
 }
 
+/// Everything in `path` from `offset` on, a last line with no newline included:
+/// what a follow that is ending still owes the reader (#136).
+fn rest_from(path: &str, offset: u64) -> std::io::Result<String> {
+    let bytes = std::fs::read(path)?;
+    let from = (offset as usize).min(bytes.len());
+    Ok(String::from_utf8_lossy(&bytes[from..]).into_owned())
+}
+
 /// Trim `s` to what is left of the `limitBytes` budget, spending it.
 ///
 /// `None` is no limit. The cut is at a character boundary because the response
@@ -1704,12 +1720,48 @@ struct LogOptions {
 /// `sinceSeconds` and `sinceTime` have nothing to work from and are inert.
 /// `tailLines` is line-based and works regardless.
 ///
-/// Lines are passed through rather than dropped when they are not CRI format:
+/// Only a line in CRI format is taken apart (#136); every other line is the
+/// container's output as written. Lines are passed through rather than dropped
+/// when they are not CRI format:
 /// a log the reader cannot see is worse than one without a timestamp. The
 /// alternative — refusing `--timestamps` outright — would break the common
 /// invocation to signal something the caller cannot act on anyway. If per-line
 /// timestamps become worth having, they cost the zero-copy property, and that
 /// is the trade to weigh rather than a bug to fix.
+/// One line with per-line metadata: `<RFC 3339 time> <stream> <tag> <message>`.
+struct CriLine<'a> {
+    ts: &'a str,
+    full: bool,
+    msg: &'a str,
+}
+
+/// The line's time and message, when it carries them (#136). Two formats do:
+/// - CRI: `<time> <stdout|stderr> <P|F>[:flags] <message>`, `P` a partial
+///   line continued by the next;
+/// - stormd's log volume (a node service's mirror pod, #72): `<time>
+///   <stdout|stderr|syslog|ingest> <emerg|alert|crit|error|warn|notice|info|debug>
+///   <message>` (stormlog's `LogStream` and `Severity`).
+///
+/// The first field must parse as RFC 3339. Anything else is a plain line,
+/// every stormpump container's among them. Any four-way split used to count,
+/// so every plain line with three spaces lost its first three words.
+fn cri_line(line: &str) -> Option<CriLine<'_>> {
+    let mut it = line.splitn(4, ' ');
+    let (ts, stream, tag) = (it.next()?, it.next()?, it.next()?);
+    let msg = it.next().unwrap_or("");
+    let full = match (stream, tag.split(':').next()?) {
+        ("stdout" | "stderr", "F") => true,
+        ("stdout" | "stderr", "P") => false,
+        (
+            "stdout" | "stderr" | "syslog" | "ingest",
+            "emerg" | "alert" | "crit" | "error" | "warn" | "notice" | "info" | "debug",
+        ) => true,
+        _ => return None,
+    };
+    chrono::DateTime::parse_from_rfc3339(ts).ok()?;
+    Some(CriLine { ts, full, msg })
+}
+
 fn filter_log(body: &str, opts: &LogOptions) -> String {
     let cutoff: Option<chrono::DateTime<chrono::Utc>> = opts
         .since_time
@@ -1722,21 +1774,32 @@ fn filter_log(body: &str, opts: &LogOptions) -> String {
         });
 
     let mut out: Vec<String> = Vec::new();
+    // A CRI partial (`P`) line's text, waiting for the line that ends it.
+    let mut partial: Option<(String, String)> = None;
     for line in body.lines() {
-        // `<ts> <stream> <tag> <message>` — split off exactly three fields, so
-        // a message containing spaces survives intact.
-        let mut it = line.splitn(4, ' ');
-        let (ts, _stream, _tag, msg) = match (it.next(), it.next(), it.next(), it.next()) {
-            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
-            // Not CRI format: pass it through rather than drop it. A log the
-            // reader cannot see is worse than one with an odd prefix.
-            _ => {
-                out.push(line.to_string());
-                continue;
+        let Some(cri) = cri_line(line) else {
+            // Not CRI format (#136): every stormpump line, which has no
+            // per-line metadata. Passed through whole, spaces and all.
+            if let Some((_, text)) = partial.take() {
+                out.push(text);
             }
+            out.push(line.to_string());
+            continue;
         };
+        // A partial line is joined to the rest of it, as upstream reads them.
+        let (ts, msg) = match partial.take() {
+            Some((ts, mut text)) => {
+                text.push_str(cri.msg);
+                (ts, text)
+            }
+            None => (cri.ts.to_string(), cri.msg.to_string()),
+        };
+        if !cri.full {
+            partial = Some((ts, msg));
+            continue;
+        }
         if let Some(cut) = cutoff {
-            match chrono::DateTime::parse_from_rfc3339(ts) {
+            match chrono::DateTime::parse_from_rfc3339(&ts) {
                 Ok(t) if t.with_timezone(&chrono::Utc) < cut => continue,
                 _ => {}
             }
@@ -1744,8 +1807,12 @@ fn filter_log(body: &str, opts: &LogOptions) -> String {
         if opts.timestamps.unwrap_or(false) {
             out.push(format!("{ts} {msg}"));
         } else {
-            out.push(msg.to_string());
+            out.push(msg);
         }
+    }
+    // A partial line the log ends on is still the container's output.
+    if let Some((ts, text)) = partial {
+        out.push(if opts.timestamps.unwrap_or(false) { format!("{ts} {text}") } else { text });
     }
     if let Some(n) = opts.tail_lines {
         if out.len() > n {
@@ -1787,6 +1854,52 @@ mod log_tests {
         // because they have no timestamp would empty the log.
         let opts = LogOptions { timestamps: Some(true), ..Default::default() };
         assert_eq!(filter_log("raw line\n", &opts), "raw line\n");
+    }
+
+    /// #136: a plain line with spaces comes back whole; only a real CRI
+    /// line (time, stdout|stderr, P|F) loses its three fields.
+    #[test]
+    fn plain_lines_with_spaces_come_back_whole() {
+        let body = concat!(
+            "stormpump: /proc could not be mounted (is the directory in the image?)\n",
+            "{\"test\": \"start\", \"status\": \"pass\", \"ms\": 3}\n",
+            "not-a-time stdout F looks almost like CRI\n",
+            "2026-10-06T10:00:00Z stdin F wrong stream\n",
+            "2026-10-06T10:00:00Z stdout X wrong tag\n",
+            "2026-10-06T10:00:00Z stdout F a real CRI line\n",
+            "2026-10-06T10:00:01.5Z stderr warn a stormd line\n",
+        );
+        assert_eq!(
+            filter_log(body, &LogOptions::default()),
+            concat!(
+                "stormpump: /proc could not be mounted (is the directory in the image?)\n",
+                "{\"test\": \"start\", \"status\": \"pass\", \"ms\": 3}\n",
+                "not-a-time stdout F looks almost like CRI\n",
+                "2026-10-06T10:00:00Z stdin F wrong stream\n",
+                "2026-10-06T10:00:00Z stdout X wrong tag\n",
+                "a real CRI line\n",
+                "a stormd line\n",
+            )
+        );
+    }
+
+    /// CRI partial lines are joined to the line that ends them; a log that
+    /// ends on a partial, or on a plain line with no newline, still shows it.
+    #[test]
+    fn partial_and_unterminated_lines_are_kept() {
+        let body = "2026-10-06T10:00:00Z stdout P {\"test\": \n2026-10-06T10:00:00Z stderr F \"x\"}\n";
+        assert_eq!(filter_log(body, &LogOptions::default()), "{\"test\": \"x\"}\n");
+        let cut = "2026-10-06T10:00:00Z stdout P half a li";
+        assert_eq!(filter_log(cut, &LogOptions::default()), "half a li\n");
+        assert_eq!(filter_log("done\ncrashed mid li", &LogOptions::default()), "done\ncrashed mid li\n");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("0.log");
+        std::fs::write(&path, "one\ncrashed mid li").unwrap();
+        let p = path.to_str().unwrap();
+        let mut offset = 0u64;
+        assert_eq!(tail_from(p, &mut offset).unwrap(), "one\n");
+        assert_eq!(rest_from(p, offset).unwrap(), "crashed mid li");
     }
 
     #[test]
