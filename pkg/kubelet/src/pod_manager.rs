@@ -555,6 +555,9 @@ pub struct PodManager {
     /// Completed init containers kept until their pod stops, by pod uid (#47),
     /// on a runtime whose removal takes the log with it.
     kept_inits: std::sync::Mutex<HashMap<String, Vec<String>>>,
+    /// Each container's previous run, by pod uid then container (#130): what
+    /// `lastState.terminated` says once the next run has started.
+    last_terminated: std::sync::Mutex<HashMap<String, HashMap<String, LastTerminated>>>,
 }
 
 /// A pod this node has admitted and not started, and why.
@@ -654,6 +657,7 @@ impl PodManager {
             deadlines: Default::default(),
             event_waits: Default::default(),
             kept_inits: Default::default(),
+            last_terminated: Default::default(),
             waiting: std::sync::Mutex::new(HashMap::new()),
             start_holdoff: std::sync::Mutex::new(HashMap::new()),
             minting: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -4173,6 +4177,14 @@ impl PodManager {
                     };
 
                     if should_restart {
+                        // The run that ended, for `lastState` while it waits
+                        // and once the next one runs (#130).
+                        self.last_terminated
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .entry(uid.to_string())
+                            .or_default()
+                            .insert(name.clone(), LastTerminated::of(&status));
                         let key = crate::crashloop::CrashLoopBackoff::key(uid, &name);
                         if let Some(left) = self.backoff.wait(&key) {
                             self.due_in(uid, left);
@@ -4233,8 +4245,10 @@ impl PodManager {
                             exit_code: status.exit_code,
                             image: status.image.clone(),
                             image_ref: status.image_ref,
-                            reason: String::new(),
-                            message: String::new(),
+                            // The runtime's word (OOMKilled), else upstream's
+                            // Completed / Error (#130).
+                            reason: terminated_reason(&status.reason, status.exit_code).to_string(),
+                            message: status.message.clone(),
                         });
                     }
                 }
@@ -4567,6 +4581,8 @@ impl PodManager {
                     reason: String::new(),
                     message: String::new(),
                 });
+                // Its new run is on a new clone (#130).
+                self.annotate_containers(&state.pod, state.container_ids.clone()).await;
                 true
             }
             Err(e) => {
@@ -4693,6 +4709,79 @@ impl PodManager {
     /// start went (#132): one INFO line, the histograms, and, for a pod the
     /// apiserver has, the `storm.io/start-timing` annotation and a
     /// `StartTiming` Event. Anything else: nothing.
+    /// Each container's previous run in a pod (#130), for `lastState`.
+    pub fn last_terminated(&self, uid: &str) -> HashMap<String, LastTerminated> {
+        self.last_terminated.lock().unwrap_or_else(|e| e.into_inner()).get(uid).cloned().unwrap_or_default()
+    }
+
+    /// Each container's image provenance and instance, as pod annotations
+    /// (#130): `storm.io/image-resolved.<c>` (when its image's golden was last
+    /// checked and cloned for it), `storm.io/instance.<c>` (the engine volume
+    /// that is its own CoW root), `storm.io/golden.<c>` (what that was cloned
+    /// from) and `storm.io/image-build.<c>` (OCI build info, JSON). A key whose
+    /// name part would pass 63 characters is left out.
+    async fn container_annotations(&self, uid: &str) -> serde_json::Map<String, Value> {
+        let ids = match self.pods.read().await.get(uid) {
+            Some(p) => p.container_ids.clone(),
+            None => return Default::default(),
+        };
+        self.annotations_for(ids).await
+    }
+
+    /// [`Self::container_annotations`] for these containers (name → id).
+    async fn annotations_for(&self, ids: HashMap<String, String>) -> serde_json::Map<String, Value> {
+        let mut out = serde_json::Map::new();
+        for (name, cid) in ids {
+            let Some(info) = self.runtime.container_image_info(&cid).await else { continue };
+            let mut put = |what: &str, v: Value| {
+                let key = format!("{what}.{name}");
+                if key.len() <= 63 {
+                    out.insert(format!("storm.io/{key}"), v);
+                }
+            };
+            if let Some(t) = info.resolved_at {
+                put("image-resolved", serde_json::json!(t));
+            }
+            if let Some(v) = info.instance {
+                put("instance", serde_json::json!(v));
+            }
+            if let Some(g) = info.golden {
+                put("golden", serde_json::json!(g));
+            }
+            if !info.build.is_empty() {
+                put("image-build", serde_json::json!(Value::Object(info.build).to_string()));
+            }
+        }
+        out
+    }
+
+    /// Write [`Self::container_annotations`] now, off the worker: after a
+    /// restart, whose new run has its own clone (#130).
+    async fn annotate_containers(&self, pod: &Value, ids: HashMap<String, String>) {
+        let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
+        if self.api_url.is_empty() || pod["metadata"]["resourceVersion"].as_str().is_none() {
+            return;
+        }
+        let annotations = self.annotations_for(ids).await;
+        if annotations.is_empty() {
+            return;
+        }
+        let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default");
+        let name = pod["metadata"]["name"].as_str().unwrap_or("");
+        let request = self
+            .api_client
+            .patch(format!("{}/api/v1/namespaces/{namespace}/pods/{name}", self.api_url))
+            .header("content-type", "application/merge-patch+json")
+            .timeout(std::time::Duration::from_secs(10))
+            .json(&serde_json::json!({"metadata": {"uid": uid, "annotations": annotations}}));
+        let pod_name = format!("{namespace}/{name}");
+        tokio::spawn(async move {
+            if let Err(error) = request.send().await.and_then(|r| r.error_for_status()) {
+                warn!(%error, "Pod {pod_name}: container annotations not written");
+            }
+        });
+    }
+
     /// The pod's `network-status` entries, from its sandbox (#131).
     async fn network_status_of(&self, uid: &str) -> Option<Value> {
         let sandbox = self.pods.read().await.get(uid).and_then(|p| p.sandbox_id.clone())?;
@@ -4726,6 +4815,10 @@ impl PodManager {
         self.event_later(pod, crate::start_timing::REASON, &finished.text).await;
         let mut patch = serde_json::json!({"metadata": {"uid": uid, "annotations": {
             crate::start_timing::ANNOTATION: finished.text}}});
+        // Each container's image and its own clone (#130).
+        for (k, v) in self.container_annotations(uid).await {
+            patch["metadata"]["annotations"][k] = v;
+        }
         // What the CNI wired (#131), in the same write: Multus's annotation,
         // a JSON string as Multus writes it.
         if let Some(status) = self.network_status_of(uid).await {
@@ -5046,6 +5139,7 @@ impl PodManager {
                 }
             }
             self.kept_inits.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+            self.last_terminated.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
             if let Some(sandbox) = &state.sandbox_id {
                 stopped(self.runtime.stop_pod_sandbox(sandbox).await)?;
                 stopped(self.runtime.remove_pod_sandbox(sandbox).await)?;
@@ -5323,6 +5417,42 @@ pub struct PodStatusUpdate {
     /// three and no reports is not.
     pub declared_init_containers: usize,
     pub pod_ip: Option<String>,
+}
+
+/// A container's previous run (#130): `lastState.terminated`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastTerminated {
+    pub exit_code: i32,
+    pub reason: String,
+    pub message: String,
+    /// Epoch nanoseconds; 0 unknown.
+    pub started_at: i64,
+    pub finished_at: i64,
+}
+
+impl LastTerminated {
+    fn of(status: &crate::cri::ContainerStatusInfo) -> LastTerminated {
+        LastTerminated {
+            exit_code: status.exit_code,
+            reason: terminated_reason(&status.reason, status.exit_code).to_string(),
+            message: status.message.clone(),
+            started_at: status.started_at,
+            finished_at: status.finished_at,
+        }
+    }
+}
+
+/// A terminated container's `reason` (#130): the runtime's (`OOMKilled`,
+/// `StartError`), else upstream's `Completed` for exit 0 and `Error` for the
+/// rest.
+pub fn terminated_reason(runtime: &str, exit_code: i32) -> &str {
+    if !runtime.is_empty() {
+        runtime
+    } else if exit_code == 0 {
+        "Completed"
+    } else {
+        "Error"
+    }
 }
 
 /// Container status for API server reporting.
@@ -6345,6 +6475,18 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl RuntimeService for FakeRuntime {
+        async fn container_image_info(&self, container_id: &str) -> Option<crate::cri::ContainerImageInfo> {
+            let mut build = serde_json::Map::new();
+            build.insert("version".into(), json!("1.0"));
+            Some(crate::cri::ContainerImageInfo {
+                image_id: Some("sha256:00".into()),
+                golden: Some("img-0".into()),
+                instance: Some(format!("vol-{container_id}")),
+                resolved_at: Some("2026-10-08T00:00:00Z".into()),
+                build,
+            })
+        }
+
         async fn pod_network_status(&self, sandbox_id: &str) -> Option<Value> {
             Some(json!([{"name": "fake", "interface": "eth0", "sandbox": sandbox_id}]))
         }
@@ -8535,6 +8677,33 @@ pub(crate) mod tests {
         assert!(rt.removed_containers.lock().unwrap().contains(&old_cid));
     }
 
+    /// #130: the run that ended is the container's lastState (exit code and
+    /// upstream's reason); a run that ends for good says why in its state.
+    #[tokio::test]
+    async fn the_previous_run_is_kept_for_last_state() {
+        let (rt, mgr) = manager();
+        let p = pod("uid-1", "web", "Always", simple_container());
+        mgr.sync_pods(&[p.clone()]).await;
+        assert!(mgr.last_terminated("uid-1").is_empty());
+        let old_cid = rt.container_ids().pop().unwrap();
+        rt.set_container_state(&old_cid, ContainerState::Exited, 137);
+        mgr.sync_pods(&[p]).await;
+        let last = &mgr.last_terminated("uid-1")["app"];
+        assert_eq!((last.exit_code, last.reason.as_str()), (137, "Error"));
+        mgr.stop_pod("uid-1").await.unwrap();
+        assert!(mgr.last_terminated("uid-1").is_empty(), "forgotten with the pod");
+
+        let (rt, mgr) = manager();
+        let job = pod("uid-2", "job", "Never", simple_container());
+        mgr.sync_pods(&[job.clone()]).await;
+        let cid = rt.container_ids().pop().unwrap();
+        rt.set_container_state(&cid, ContainerState::Exited, 0);
+        let u = &mgr.sync_pods(&[job]).await.updates[0];
+        assert_eq!(u.container_statuses[0].reason, "Completed");
+        assert_eq!(terminated_reason("OOMKilled", 137), "OOMKilled");
+        assert_eq!(terminated_reason("", 2), "Error");
+    }
+
     #[tokio::test]
     async fn pod_succeeds_policy_never_exit_zero() {
         let (rt, mgr) = manager();
@@ -8894,6 +9063,24 @@ pub(crate) mod tests {
         assert!(!mgr.timings.lock().unwrap().contains_key("uid-timed"));
         // A later Running report (a check, not a start) publishes nothing.
         mgr.start_reported(&p, std::time::Duration::ZERO).await;
+    }
+
+    /// #130: each container's image and its own clone, as annotations; a
+    /// name too long for an annotation key is left out.
+    #[tokio::test]
+    async fn containers_are_annotated_with_their_image_and_instance() {
+        let (_rt, mgr) = manager();
+        let p = pod("uid-ann", "ann", "Always", simple_container());
+        assert!(mgr.container_annotations("uid-ann").await.is_empty());
+        mgr.sync_pods(&[p]).await;
+        let a = mgr.container_annotations("uid-ann").await;
+        let cid = mgr.pods.read().await["uid-ann"].container_ids["app"].clone();
+        assert_eq!(a["storm.io/instance.app"], json!(format!("vol-{cid}")));
+        assert_eq!(a["storm.io/image-resolved.app"], "2026-10-08T00:00:00Z");
+        assert_eq!(a["storm.io/golden.app"], "img-0");
+        assert_eq!(a["storm.io/image-build.app"], json!(r#"{"version":"1.0"}"#));
+        let long = HashMap::from([("c".repeat(60), "x".to_string())]);
+        assert!(mgr.annotations_for(long).await.is_empty());
     }
 
     /// #131: a started pod's network-status entries come from its sandbox,

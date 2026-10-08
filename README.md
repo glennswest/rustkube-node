@@ -193,6 +193,19 @@ profile). A `gitRepo` volume waits with a message naming its 1.36 removal (clone
 emptyDir). With `--runtime cri`, containerd before 2.0 stops the kubelet at startup (1.36 dropped containerd 1.7);
 CRI-O is not checked. cgroups are v2 only; kube-proxy has no IPVS mode.
 
+**Container status and image provenance** (#130). A container that ended carries upstream's
+`state.terminated.reason` (the runtime's, e.g. `OOMKilled`, else `Completed` for exit 0, `Error` otherwise) and
+`message`; once it is restarted (or while it backs off) its previous run is `lastState.terminated` (exit code,
+reason, start and finish), forgotten with the pod. On stormpump a container's `imageID` is its image's
+`sha256:`: the registry record's manifest digest for a pulled image, the release manifest's golden digest for a
+pallet (else the reference, as before). Each container's provenance is on the pod as annotations, written with
+the start timing and again after each restart: `storm.io/image-resolved.<c>` (when its golden was last checked
+and cloned for it), `storm.io/instance.<c>` (the engine volume that is its own CoW root), `storm.io/golden.<c>`
+and `storm.io/image-build.<c>` (JSON: OCI `created` and `org.opencontainers.image.*` labels once the registry
+keeps them, stormblock-registry#100; a pallet's release `provenance`/`version`). A node service's mirror pod
+carries its golden's digest as `imageID`, `storm.io/golden` and `storm.io/golden-provenance` from the release
+manifest, and `hostIP`.
+
 **Node allocatable and cgroups** (#24): allocatable is upstream's, capacity less `--system-reserved`,
 `--kube-reserved` and the hard-eviction line (memory 100Mi, nodefs 10%); it was a fixed capacity − 256 MiB. With
 `--runtime cri` each sandbox gets upstream's per-QoS `kubepods` cgroup parent, spelled for the runtime's cgroup driver

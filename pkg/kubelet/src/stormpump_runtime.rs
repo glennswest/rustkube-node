@@ -117,6 +117,12 @@ struct Container {
     /// The engine volume that is this container's own root (#104): one CoW
     /// clone of its image's sealed golden, deleted with the container.
     root_volume: Option<String>,
+    /// Where its image came from (#130): the registry's record for a pulled
+    /// image, the release manifest for a pallet. `None` when neither says.
+    provenance: Option<crate::image_config::Provenance>,
+    /// When its image's golden was last resolved for it (#130): its create,
+    /// which checks the golden and clones it. RFC 3339.
+    resolved_at: Option<String>,
     /// Who this container is, for cadvisor (#84): filled with its pid and
     /// cgroup at start, published as a file, withdrawn at removal.
     identity: Option<crate::workload_identity::Record>,
@@ -203,6 +209,15 @@ struct Sandbox {
     /// The CNI ADD's result as `network-status` entries (#131); `None` when
     /// no CNI ran (host network, no invoker) or for an adopted sandbox.
     network_status: Option<serde_json::Value>,
+}
+
+/// A container's `imageID` (#130): its image's digest when one is known,
+/// else the reference it was created from.
+fn image_id(c: &Container) -> String {
+    c.provenance
+        .as_ref()
+        .and_then(|p| p.digest.clone())
+        .unwrap_or_else(|| c.image.clone())
 }
 
 /// A sandbox whose CNI ADD failed and whose DEL has not succeeded yet (#100).
@@ -555,6 +570,20 @@ impl StormpumpRuntime {
     }
 
     /// Undo a root made for a container that will not be created (#104).
+    /// Where `image` (what `pull_image` returned) came from (#130): the
+    /// registry's record for a pulled image's golden, else, for a pallet, its
+    /// golden volume's entry in the node's release manifest.
+    fn provenance_for(&self, image: &str) -> Option<crate::image_config::Provenance> {
+        if let Some(p) = self.image_configs.provenance(image) {
+            return Some(p);
+        }
+        let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+        match crate::container_roots::golden_of(image, &cmdline)? {
+            crate::container_roots::Golden::Pallet(vol) => crate::image_config::release_golden(&vol),
+            crate::container_roots::Golden::Template(_) => None,
+        }
+    }
+
     async fn discard_root(&self, handle: Option<Handle>, volume: &str) {
         if let Some(h) = handle {
             if let Err(e) = self.on_ring(move |r| r.volume_release(h)).await {
@@ -1303,6 +1332,8 @@ impl RuntimeService for StormpumpRuntime {
             volume_handles: Vec::new(),
             root_handle: Some(root),
             root_volume: Some(made.volume_id.clone()),
+            provenance: self.provenance_for(&config.image),
+            resolved_at: Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
             identity: Some(crate::workload_identity::Record {
                 kind: "container".into(),
                 namespace: namespace.clone(),
@@ -1538,7 +1569,7 @@ impl RuntimeService for StormpumpRuntime {
             finished_at: c.finished_at,
             exit_code: c.exit_code,
             image: c.image.clone(),
-            image_ref: c.image.clone(),
+            image_ref: image_id(c),
             reason: String::new(),
             message: String::new(),
         })
@@ -1615,7 +1646,7 @@ impl RuntimeService for StormpumpRuntime {
                 finished_at: c.finished_at,
                 exit_code: c.exit_code,
                 image: c.image.clone(),
-                image_ref: c.image.clone(),
+                image_ref: image_id(c),
                 reason: String::new(),
                 message: String::new(),
             })
@@ -1627,6 +1658,19 @@ impl RuntimeService for StormpumpRuntime {
     /// an init container is removed at once, its log kept.
     fn logs_survive_removal(&self) -> bool {
         true
+    }
+
+    async fn container_image_info(&self, container_id: &str) -> Option<crate::cri::ContainerImageInfo> {
+        let containers = self.containers.lock().await;
+        let c = containers.get(container_id)?;
+        let p = c.provenance.clone().unwrap_or_default();
+        Some(crate::cri::ContainerImageInfo {
+            image_id: p.digest.clone(),
+            golden: p.golden,
+            instance: c.root_volume.clone(),
+            resolved_at: c.resolved_at.clone(),
+            build: p.build,
+        })
     }
 
     async fn pod_network_status(&self, sandbox_id: &str) -> Option<serde_json::Value> {
@@ -1916,6 +1960,8 @@ impl ImageService for StormpumpImages {
         })?;
         tracing::info!(image = %image, golden = %reference, "image's golden is on this node");
         self.configs.put(&reference, image, crate::image_config::from_golden(&record));
+        // What it is and where it came from (#130).
+        self.configs.put_provenance(&reference, crate::image_config::provenance_of_record(&record));
         self.pulled.lock().await.insert(image.to_string(), reference.clone());
         Ok(reference)
     }
@@ -2229,6 +2275,8 @@ mod tests {
             volume_handles: Vec::new(),
                     root_handle: None,
                     root_volume: None,
+                    provenance: None,
+                    resolved_at: None,
                     identity: None,
                     identity_file: None,
                     root_path: None,
@@ -2402,6 +2450,8 @@ mod tests {
             volume_handles: Vec::new(),
                     root_handle: None,
                     root_volume: None,
+                    provenance: None,
+                    resolved_at: None,
                     identity: None,
                     identity_file: None,
                     root_path: None,
@@ -2825,6 +2875,8 @@ mod tests {
             volume_handles: Vec::new(),
             root_handle: None,
             root_volume: None,
+            provenance: None,
+            resolved_at: None,
             identity: None,
             identity_file: None,
             log_dir: String::new(),

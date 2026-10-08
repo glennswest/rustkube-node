@@ -71,6 +71,17 @@ among them (stormcos#368 will enforce).
        stormcos#402 filed (kubelet SA token + `STORMBLOCK_ADMIN_TOKEN_FILE`, before #368). Stage golden
        golden-rustkube-node-dc81277f6b12 (stormcos#366). Closed. Live check is stormcos#402/#368's audit log.
 
+### In progress: #130 (P3), lastState, terminated reason, imageID, image provenance (stormconsole#69/#75)
+
+2026-10-08. (1/2) PodManager.last_terminated (uid → container → LastTerminated, recorded in the Exited branch before
+a restart/back-off, dropped at stop_pod) rendered as `lastState`; `terminated_reason`. (3) image_config::Provenance
+(`provenance_of_record`, `release_golden_in` on /etc/stormcos/release/manifest.json); runtime Container.provenance +
+resolved_at at create; `image_id(c)`; `RuntimeService::container_image_info`. (4/5 + instance) annotations
+`storm.io/{image-resolved,instance,golden,image-build}.<c>` (start patch + after restart). Mirror: `with_provenance`
+(imageID, hostIP, storm.io/golden, -provenance; metadata patched when different; status_current compares).
+stormblock-registry#100 filed (registry keeps no OCI created/Labels). Tests, README, CHANGELOG; sc-build (gnu +
+musl); golden; close.
+
 ### Done: #131 (P3), pod network counters, network-status, older runs' logs (stormconsole#69)
 
 2026-10-08. (1) InterfaceStats + packets/errors/drops; cAdvisor families; /stats/summary `network`. (2) cni:

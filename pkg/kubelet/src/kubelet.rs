@@ -1397,6 +1397,10 @@ impl Kubelet {
         source: &Value,
     ) -> anyhow::Result<()> {
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        // Each container's previous run (#130).
+        let last_runs = self
+            .pod_manager
+            .last_terminated(source["metadata"]["uid"].as_str().unwrap_or(""));
 
         let container_statuses: Vec<Value> = update
             .container_statuses
@@ -1415,13 +1419,20 @@ impl Kubelet {
                     "running" => serde_json::json!({
                         "running": {"startedAt": nanos_to_rfc3339(cs.started_at)}
                     }),
-                    "terminated" => serde_json::json!({
-                        "terminated": {
+                    "terminated" => {
+                        // Upstream's reason (#130): the runtime's, else
+                        // Completed / Error.
+                        let mut t = serde_json::json!({
                             "exitCode": cs.exit_code,
+                            "reason": crate::pod_manager::terminated_reason(&cs.reason, cs.exit_code),
                             "startedAt": nanos_to_rfc3339(cs.started_at),
                             "finishedAt": nanos_to_rfc3339(cs.finished_at)
+                        });
+                        if !cs.message.is_empty() {
+                            t["message"] = serde_json::json!(cs.message);
                         }
-                    }),
+                        serde_json::json!({ "terminated": t })
+                    }
                     // The reason is what `kubectl get pod` prints in the
                     // STATUS column, so "CrashLoopBackOff" here is the
                     // difference between a reader seeing a container that is
@@ -1454,6 +1465,10 @@ impl Kubelet {
                 if !cs.container_id.is_empty() {
                     status["containerID"] =
                         serde_json::json!(format!("containerd://{}", cs.container_id));
+                }
+                // Why the last run died, once the next has started (#130).
+                if let Some(last) = last_runs.get(&cs.name) {
+                    status["lastState"] = last_state(last);
                 }
                 status
             })
@@ -1799,7 +1814,7 @@ impl Kubelet {
                             "{url}/api/v1/namespaces/kube-system/pods?labelSelector=storm.io%2Fcomponent%3Dnode-service"));
                     }
                     let health = self.service_health.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    mirror_node_services(&self.api_client, &url, &node, &health).await;
+                    mirror_node_services(&self.api_client, &url, &node, &self.node_ip, &health).await;
                 })
                 .await;
             drop(work);
@@ -1861,6 +1876,20 @@ fn evented(kind: Kind, engine_exits: bool, cri_events_live: bool) -> bool {
     engine_exits || (kind == Kind::Pod && cri_events_live)
 }
 
+/// `lastState` for a container's previous run (#130).
+fn last_state(last: &crate::pod_manager::LastTerminated) -> Value {
+    let mut t = serde_json::json!({
+        "exitCode": last.exit_code,
+        "reason": last.reason,
+        "startedAt": nanos_to_rfc3339(last.started_at),
+        "finishedAt": nanos_to_rfc3339(last.finished_at),
+    });
+    if !last.message.is_empty() {
+        t["message"] = serde_json::json!(last.message);
+    }
+    serde_json::json!({ "terminated": t })
+}
+
 /// Whom an engine exit wakes (#115).
 #[derive(Debug, PartialEq, Eq)]
 enum ExitWake {
@@ -1911,6 +1940,24 @@ mod runtime_support_tests {
         assert!(evented(Kind::Pod, false, true));
         assert!(!evented(Kind::Pod, false, false), "no stream: sync_interval");
         assert!(!evented(Kind::VirtualMachine, false, true));
+    }
+
+    /// #130: a container's previous run as upstream's lastState.
+    #[test]
+    fn last_state_is_upstreams_terminated() {
+        let last = crate::pod_manager::LastTerminated {
+            exit_code: 137,
+            reason: "OOMKilled".into(),
+            message: String::new(),
+            started_at: 1_759_881_600_000_000_000,
+            finished_at: 0,
+        };
+        let v = last_state(&last);
+        assert_eq!(v["terminated"]["exitCode"], 137);
+        assert_eq!(v["terminated"]["reason"], "OOMKilled");
+        assert_eq!(v["terminated"]["startedAt"], "2025-10-08T00:00:00Z");
+        assert!(v["terminated"]["finishedAt"].is_null(), "unknown is null, not 1970");
+        assert!(v["terminated"].get("message").is_none());
     }
 
     /// #23: containerd 1.x is refused; 2.x, CRI-O and stormpump are not.
@@ -2024,6 +2071,7 @@ async fn mirror_node_services(
     client: &reqwest::Client,
     api_url: &str,
     node: &str,
+    host_ip: &str,
     health: &std::collections::HashMap<String, crate::node_health::ServiceHealth>,
 ) {
     // No cluster: nothing to mirror into, and nothing to retry.
@@ -2142,7 +2190,13 @@ async fn mirror_node_services(
     // Asked only when there is one to create.
     let mut node_uid: Option<String> = None;
     let now = chrono::Utc::now();
+    // Each service's golden, from the release the node booted (#130).
+    let release = crate::image_config::RELEASE_MANIFESTS
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
     for a in &assets {
+        let golden = crate::image_config::release_golden_in(&release, &a.name);
         // startTime from the age PID 1 reported: the two ends share no clock,
         // so an age is portable where an instant is not.
         let started = (now - chrono::Duration::seconds(a.age_secs as i64))
@@ -2160,7 +2214,22 @@ async fn mirror_node_services(
         // already says it is not written (#101).
         match existing {
             Some(existing) => {
-                let pod = crate::mirror::mirror_pod_with(a, node, "", &started, health.get(&a.name));
+                let mut pod = crate::mirror::mirror_pod_with(a, node, "", &started, health.get(&a.name));
+                crate::mirror::with_provenance(&mut pod, golden.as_ref(), host_ip);
+                // The golden's annotations (#130) are metadata, which the
+                // status write below does not carry: patched when they differ.
+                let want = golden.as_ref().map(crate::mirror::golden_annotations).unwrap_or_default();
+                if want.iter().any(|(k, v)| existing["metadata"]["annotations"][k] != *v) {
+                    let patched = client
+                        .patch(format!("{base}/{name}"))
+                        .header("content-type", "application/merge-patch+json")
+                        .json(&serde_json::json!({"metadata": {"annotations": want}}))
+                        .send()
+                        .await;
+                    if !matches!(patched, Ok(ref r) if r.status().is_success()) {
+                        apimachinery::reactor::failed();
+                    }
+                }
                 if crate::mirror::status_current(existing, &pod) {
                     continue;
                 }
@@ -2194,7 +2263,8 @@ async fn mirror_node_services(
                     apimachinery::reactor::failed();
                     return;
                 };
-                let pod = crate::mirror::mirror_pod_with(a, node, uid, &started, health.get(&a.name));
+                let mut pod = crate::mirror::mirror_pod_with(a, node, uid, &started, health.get(&a.name));
+                crate::mirror::with_provenance(&mut pod, golden.as_ref(), host_ip);
                 let created = client.post(&base).json(&pod).send().await;
                 if !matches!(created, Ok(ref r) if r.status().is_success() || r.status() == 409) {
                     apimachinery::reactor::failed();

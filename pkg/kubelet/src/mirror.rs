@@ -312,8 +312,42 @@ pub fn status_current(existing: &Value, want: &Value) -> bool {
         && state_kind(ec) == state_kind(wc)
         && ec["lastState"] == wc["lastState"]
         && ec["state"]["terminated"]["message"] == wc["state"]["terminated"]["message"]
+        && ec["imageID"] == wc["imageID"]
+        && e["hostIP"] == w["hostIP"]
         && start_same
 }
+
+/// The release manifest's word on a service's golden (#130): its device
+/// digest as the container's `imageID`, its name and provenance as the
+/// annotations `storm.io/golden` and `storm.io/golden-provenance` (so a
+/// console can look it up), and the node's address as `hostIP`.
+pub fn with_provenance(pod: &mut Value, golden: Option<&crate::image_config::Provenance>, host_ip: &str) {
+    pod["status"]["hostIP"] = json!(host_ip);
+    let Some(g) = golden else { return };
+    if let Some(d) = &g.digest {
+        pod["status"]["containerStatuses"][0]["imageID"] = json!(d);
+    }
+    for (key, v) in golden_annotations(g) {
+        pod["metadata"]["annotations"][key] = v;
+    }
+}
+
+/// The annotations [`with_provenance`] sets.
+pub fn golden_annotations(g: &crate::image_config::Provenance) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    if let Some(name) = &g.golden {
+        out.insert(GOLDEN.into(), json!(name));
+    }
+    if let Some(p) = g.build.get("provenance") {
+        out.insert(GOLDEN_PROVENANCE.into(), p.clone());
+    }
+    out
+}
+
+/// The golden a mirror pod's service runs from (#130).
+pub const GOLDEN: &str = "storm.io/golden";
+/// Its provenance, as the release manifest records it (`stormlb@b8ba1a7`).
+pub const GOLDEN_PROVENANCE: &str = "storm.io/golden-provenance";
 
 /// What a node service's change is, as an Event on its mirror pod (#50):
 /// `(type, reason, message)`, or `None` when nothing changed.
@@ -686,5 +720,32 @@ mod tests {
                 assert_eq!(c["status"], "False");
             }
         }
+    }
+
+    /// #130: a mirror pod names its golden, digest and host; an existing one
+    /// without them is not current.
+    #[test]
+    fn a_mirror_carries_its_goldens_provenance() {
+        let a = Asset { name: "stormlb".into(), running: true, ..Default::default() };
+        let plain = mirror_pod(&a, "n1", "u", "2026-10-08T00:00:00Z");
+        let mut build = serde_json::Map::new();
+        build.insert("provenance".into(), json!("stormlb@b8ba1a7"));
+        let g = crate::image_config::Provenance {
+            digest: Some(format!("sha256:{}", "c".repeat(64))),
+            golden: Some("stormlb".into()),
+            build,
+        };
+        let mut p = plain.clone();
+        with_provenance(&mut p, Some(&g), "192.168.8.10");
+        assert_eq!(p["status"]["hostIP"], "192.168.8.10");
+        assert_eq!(p["status"]["containerStatuses"][0]["imageID"], json!(g.digest));
+        assert_eq!(p["metadata"]["annotations"][GOLDEN], "stormlb");
+        assert_eq!(p["metadata"]["annotations"][GOLDEN_PROVENANCE], "stormlb@b8ba1a7");
+        assert!(!status_current(&plain, &p), "imageID and hostIP are news");
+        assert!(status_current(&p, &p));
+        // No manifest entry: the host only.
+        let mut q = plain.clone();
+        with_provenance(&mut q, None, "192.168.8.10");
+        assert!(q["status"]["containerStatuses"][0].get("imageID").is_none());
     }
 }

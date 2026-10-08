@@ -55,6 +55,8 @@ pub const MISS_TTL: Duration = Duration::from_secs(300);
 pub struct ImageConfigs {
     /// root → (config, when asked, the image reference it was asked for).
     by_root: std::sync::Mutex<HashMap<String, (Option<ImageConfig>, Instant, String)>>,
+    /// root → where the image came from (#130), from the registry's record.
+    provenance: std::sync::Mutex<HashMap<String, Provenance>>,
 }
 
 impl ImageConfigs {
@@ -84,6 +86,103 @@ impl ImageConfigs {
             .unwrap_or_else(|e| e.into_inner())
             .insert(root.to_string(), (config, Instant::now(), image.to_string()));
     }
+
+    /// Where the image rooted at `root` came from, when the registry said (#130).
+    pub fn provenance(&self, root: &str) -> Option<Provenance> {
+        self.provenance.lock().unwrap_or_else(|e| e.into_inner()).get(root).cloned()
+    }
+
+    pub fn put_provenance(&self, root: &str, p: Provenance) {
+        self.provenance.lock().unwrap_or_else(|e| e.into_inner()).insert(root.to_string(), p);
+    }
+}
+
+/// Where an image came from (#130): what a container status's `imageID` and
+/// the pod's per-container annotations say.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Provenance {
+    /// `sha256:<hex>`: the image's manifest digest (a pulled image), or the
+    /// sealed golden's device digest from the release manifest (a pallet).
+    pub digest: Option<String>,
+    /// The golden it is cloned from, by name.
+    pub golden: Option<String>,
+    /// Build information: OCI's `created` and `org.opencontainers.image.*`
+    /// labels (as `created`, `version`, `revision`, `source`, `title`,
+    /// `vendor`), or a release's `provenance` and `version`. Empty: none known.
+    pub build: serde_json::Map<String, serde_json::Value>,
+}
+
+/// A `sha256:` digest from what a record says: already prefixed, or 64 hex.
+fn sha256(d: &str) -> Option<String> {
+    let hex = d.strip_prefix("sha256:").unwrap_or(d);
+    (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| format!("sha256:{hex}"))
+}
+
+/// A registry golden record's provenance (#130): its manifest `digest`, its
+/// template, and the OCI build info its `config` carries when the registry
+/// keeps it (`created`, `Labels`; stormblock-registry#100).
+pub fn provenance_of_record(record: &serde_json::Value) -> Provenance {
+    let mut build = serde_json::Map::new();
+    let config = &record["config"];
+    if let Some(c) = config["created"].as_str().or(config["Created"].as_str()) {
+        build.insert("created".into(), c.into());
+    }
+    let labels = config["Labels"].as_object().or(config["labels"].as_object());
+    for (key, field) in [
+        ("org.opencontainers.image.created", "created"),
+        ("org.opencontainers.image.version", "version"),
+        ("org.opencontainers.image.revision", "revision"),
+        ("org.opencontainers.image.source", "source"),
+        ("org.opencontainers.image.title", "title"),
+        ("org.opencontainers.image.vendor", "vendor"),
+    ] {
+        if let Some(v) = labels.and_then(|l| l.get(key)).and_then(|v| v.as_str()) {
+            build.insert(field.into(), v.into());
+        }
+    }
+    Provenance {
+        digest: record["digest"].as_str().and_then(sha256),
+        golden: record["template_name"]
+            .as_str()
+            .or(record["name"].as_str())
+            .filter(|n| !n.is_empty())
+            .map(str::to_string),
+        build,
+    }
+}
+
+/// The release manifest a stormcos node carries (`assets[]`), as the kubelet
+/// sees it.
+pub const RELEASE_MANIFESTS: [&str; 2] =
+    ["/etc/stormcos/release/manifest.json", "/hostroot/etc/stormcos/release/manifest.json"];
+
+/// The provenance of the golden `name` in a release manifest's text (#130):
+/// its device digest, its name, and its `provenance` / `version`.
+pub fn release_golden_in(manifest: &str, name: &str) -> Option<Provenance> {
+    let doc: serde_json::Value = serde_json::from_str(manifest).ok()?;
+    let entry = doc["assets"]
+        .as_array()?
+        .iter()
+        .find(|a| a["kind"] == "golden" && a["name"].as_str() == Some(name))?;
+    let mut build = serde_json::Map::new();
+    for field in ["provenance", "version"] {
+        if let Some(v) = entry[field].as_str().filter(|v| !v.is_empty()) {
+            build.insert(field.into(), v.into());
+        }
+    }
+    Some(Provenance {
+        digest: entry["digest"].as_str().and_then(sha256),
+        golden: Some(name.to_string()),
+        build,
+    })
+}
+
+/// [`release_golden_in`] against the node's own manifest.
+pub fn release_golden(name: &str) -> Option<Provenance> {
+    RELEASE_MANIFESTS
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| release_golden_in(&t, name))
 }
 
 /// A golden record's `config`, if it carries a non-empty one.
@@ -414,5 +513,40 @@ mod tests {
         cache.put("/run/stormpump/images/v1", "registry.k8s.io/coredns/coredns:v1.11.1", Some(c.clone()));
         assert_eq!(cache.get("/run/stormpump/images/v1"), Some(c));
         assert_eq!(cache.image_of("/pallets/busybox").as_deref(), Some("busybox"));
+    }
+
+    /// #130: a registry record's digest, golden and OCI build info.
+    #[test]
+    fn a_records_provenance() {
+        let hex = "a".repeat(64);
+        let r = serde_json::json!({"name": "busybox:1.36", "digest": format!("sha256:{hex}"),
+            "template_name": "img-aaaaaaaaaaaa", "config": {"Entrypoint": ["sh"],
+            "created": "2026-09-01T00:00:00Z",
+            "Labels": {"org.opencontainers.image.version": "1.36", "org.opencontainers.image.revision": "abc",
+                       "org.opencontainers.image.source": "https://x", "other": "ignored"}}});
+        let p = provenance_of_record(&r);
+        assert_eq!(p.digest.as_deref(), Some(format!("sha256:{hex}").as_str()));
+        assert_eq!(p.golden.as_deref(), Some("img-aaaaaaaaaaaa"));
+        assert_eq!(p.build["created"], "2026-09-01T00:00:00Z");
+        assert_eq!(p.build["version"], "1.36");
+        assert!(!p.build.contains_key("other"));
+        // A record without them: no digest, no build.
+        let bare = provenance_of_record(&serde_json::json!({"name": "x", "digest": "unknown"}));
+        assert_eq!((bare.digest, bare.build.len()), (None, 0));
+    }
+
+    /// #130: a release manifest's golden entry.
+    #[test]
+    fn a_release_goldens_provenance() {
+        let hex = "b".repeat(64);
+        let m = format!(r#"{{"assets":[{{"kind":"binary","name":"stormlb","digest":"x"}},
+            {{"kind":"golden","name":"stormlb","digest":"{hex}","provenance":"stormlb@b8ba1a7","version":"1.2.0"}},
+            {{"kind":"golden","name":"cilium","digest":"unknown","provenance":"cilium/cilium@sha256:9d30"}}]}}"#);
+        let p = release_golden_in(&m, "stormlb").unwrap();
+        assert_eq!(p.digest, Some(format!("sha256:{hex}")));
+        assert_eq!((p.build["provenance"].as_str(), p.build["version"].as_str()), (Some("stormlb@b8ba1a7"), Some("1.2.0")));
+        let c = release_golden_in(&m, "cilium").unwrap();
+        assert_eq!(c.digest, None);
+        assert!(release_golden_in(&m, "absent").is_none());
     }
 }

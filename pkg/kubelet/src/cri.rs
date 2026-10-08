@@ -347,6 +347,11 @@ pub trait RuntimeService: Send + Sync + 'static {
         None
     }
 
+    /// A container's image provenance and its own root (#130). Default: not known.
+    async fn container_image_info(&self, _container_id: &str) -> Option<ContainerImageInfo> {
+        None
+    }
+
     /// What the CNI wired into this sandbox, as `network-status` entries
     /// (#131). Default: not known.
     async fn pod_network_status(&self, _sandbox_id: &str) -> Option<serde_json::Value> {
@@ -486,6 +491,21 @@ pub trait MigrationService: Send + Sync + 'static {
 }
 
 /// CRI error type.
+/// What a container runs from (#130), for its pod's annotations.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ContainerImageInfo {
+    /// `sha256:<hex>` of the image (manifest digest, or a pallet golden's).
+    pub image_id: Option<String>,
+    /// The golden it was cloned from.
+    pub golden: Option<String>,
+    /// The engine volume that is its own copy-on-write root.
+    pub instance: Option<String>,
+    /// When its image was last resolved for it, RFC 3339.
+    pub resolved_at: Option<String>,
+    /// OCI build info / release provenance.
+    pub build: serde_json::Map<String, serde_json::Value>,
+}
+
 /// One of the runtime's container events (#116).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeEvent {

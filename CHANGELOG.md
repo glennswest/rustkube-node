@@ -2,6 +2,13 @@
 
 ## 2026-10-08
 
+- **feat:** Container status and image provenance for stormconsole#69/#75 (#130): `lastState.terminated` (each
+  container's previous run, kept from its exit through its restart or back-off), `state.terminated.reason`
+  (runtime's, else `Completed`/`Error`) and `message`; on stormpump a real `imageID` (`sha256:` from the registry
+  record or the release manifest); per-container pod annotations `storm.io/image-resolved.<c>`,
+  `storm.io/instance.<c>` (its CoW root volume), `storm.io/golden.<c>`, `storm.io/image-build.<c>`, written at start
+  and after each restart; mirror pods get `imageID`, `storm.io/golden`, `storm.io/golden-provenance` and `hostIP`.
+  OCI build labels need stormblock-registry#100 (the registry keeps no `created`/`Labels` yet).
 - **feat:** Pod network detail for stormconsole#69 (#131). (1) Packets, errors and drops each way beside the bytes:
   `container_network_{receive,transmit}_{packets,errors,packets_dropped}_total` in `/metrics/cadvisor`, and each
   pod's `network` in `/stats/summary` (upstream's shape plus packets/drops). (2) The CNI ADD's result written as
