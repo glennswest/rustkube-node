@@ -57,12 +57,12 @@ by #51.
 
 ## Work plan
 
-### In progress: #112 (P3), restart backoff across a kubelet restart
+### Done: #112 (P3), restart backoff across a kubelet restart
 
 2026-10-08. `crashloop.rs` was memory only. Done in code: `persist_to(<state root>/crashloop.json)` from
 `recover_state` (loads, drops entries past STABLE), every change saved atomically in wall-clock seconds; keyed by pod
 uid, so a recreated Pod inherits nothing. 1 test (restart carries the delay and its doubling, new uid nothing, forget
-on disk, forgiven not carried, garbage file). Next: sc-build, golden, close.
+on disk, forgiven not carried, garbage file). sc-build 6a02fa0796: 420 pass. Golden 68e86077a3c7. Closed.
 
 ### Done: #47 (P3), the last part: an init container's log after it completes
 
