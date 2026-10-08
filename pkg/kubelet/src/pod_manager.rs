@@ -552,6 +552,9 @@ pub struct PodManager {
     /// Pods whose start waits only on an event (an init container's exit):
     /// no retry backoff for them, only their own deadline (#101).
     event_waits: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Completed init containers kept until their pod stops, by pod uid (#47),
+    /// on a runtime whose removal takes the log with it.
+    kept_inits: std::sync::Mutex<HashMap<String, Vec<String>>>,
 }
 
 /// A pod this node has admitted and not started, and why.
@@ -650,6 +653,7 @@ impl PodManager {
             timings: Default::default(),
             deadlines: Default::default(),
             event_waits: Default::default(),
+            kept_inits: Default::default(),
             waiting: std::sync::Mutex::new(HashMap::new()),
             start_holdoff: std::sync::Mutex::new(HashMap::new()),
             minting: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -3191,7 +3195,13 @@ impl PodManager {
                             ..Default::default()
                         });
                         if let Some(state)=self.pods.write().await.get_mut(uid) {state.init_statuses=out.clone();}
-                        let _ = self.runtime.remove_container(&cid).await;
+                        // Its log must still answer `kubectl logs -c` (#47):
+                        // removed now only where removal keeps the log.
+                        if self.runtime.logs_survive_removal() {
+                            let _ = self.runtime.remove_container(&cid).await;
+                        } else {
+                            self.kept_inits.lock().unwrap_or_else(|e| e.into_inner()).entry(uid.to_string()).or_default().push(cid.clone());
+                        }
                         break;
                     }
                     _ => {
@@ -4967,6 +4977,15 @@ impl PodManager {
                 stopped(self.runtime.stop_container(cid, 30).await)?;
                 stopped(self.runtime.remove_container(cid).await)?;
             }
+            // The completed init containers kept for their logs (#47).
+            let kept = self.kept_inits.lock().unwrap_or_else(|e| e.into_inner()).get(uid).cloned().unwrap_or_default();
+            for cid in kept {
+                stopped(self.runtime.remove_container(&cid).await)?;
+                if let Some(v) = self.kept_inits.lock().unwrap_or_else(|e| e.into_inner()).get_mut(uid) {
+                    v.retain(|c| c != &cid);
+                }
+            }
+            self.kept_inits.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
             if let Some(sandbox) = &state.sandbox_id {
                 stopped(self.runtime.stop_pod_sandbox(sandbox).await)?;
                 stopped(self.runtime.remove_pod_sandbox(sandbox).await)?;
@@ -7623,9 +7642,16 @@ pub(crate) mod tests {
         let outcome = mgr.sync_pods(&[p]).await;
         assert_eq!(outcome.updates.len(), 1);
         assert_eq!(outcome.updates[0].phase, "Running");
-        // App container is created; init container was removed after completing.
+        // App container is created. The completed init container is kept, so
+        // its log still answers `kubectl logs -c setup` (#47): this runtime's
+        // removal would take the log with it.
         assert_eq!(rt.created_names(), vec!["app".to_string()]);
-        assert!(rt.removed_containers.lock().unwrap().iter().any(|_| true));
+        assert!(rt.removed_containers.lock().unwrap().is_empty(), "kept while the pod runs");
+        // The pod stops: the init container goes with it.
+        mgr.stop_pod("uid-1").await.unwrap();
+        let removed = rt.removed_containers.lock().unwrap().clone();
+        assert_eq!(removed.len(), 2, "the app and the kept init container: {removed:?}");
+        assert!(mgr.kept_inits.lock().unwrap().is_empty());
     }
 
     /// #126: an init container runs until it exits; past two minutes it is

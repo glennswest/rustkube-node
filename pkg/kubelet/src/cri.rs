@@ -325,6 +325,14 @@ pub trait RuntimeService: Send + Sync + 'static {
     /// The pod (its uid) whose container ran as engine workload `handle`
     /// (#115), to wake that pod's worker alone when it exits. Default: not
     /// known, and the exit wakes every pod.
+    /// Whether a container's log file outlives `remove_container` (#47).
+    /// When it does not (a CRI runtime may take it with the container), a
+    /// completed init container is kept until its pod stops, as upstream
+    /// keeps it, so `kubectl logs -c <init>` still answers.
+    fn logs_survive_removal(&self) -> bool {
+        false
+    }
+
     async fn pod_of_workload(&self, _handle: u64) -> Option<String> {
         None
     }

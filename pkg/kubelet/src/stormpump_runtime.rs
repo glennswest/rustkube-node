@@ -1612,6 +1612,13 @@ impl RuntimeService for StormpumpRuntime {
             .collect())
     }
 
+    /// The engine writes a container's log into the pod's log directory and
+    /// a removal releases the workload and its root, never the file (#47):
+    /// an init container is removed at once, its log kept.
+    fn logs_survive_removal(&self) -> bool {
+        true
+    }
+
     async fn pod_of_workload(&self, handle: u64) -> Option<String> {
         let sandbox = {
             let containers = self.containers.lock().await;
@@ -2821,6 +2828,25 @@ mod tests {
     /// A removal the engine refuses is not dropped (#90): the record stays,
     /// hidden from the kubelet, and the runtime finishes it on the workload's
     /// exit, on the retry interval, or before its sandbox goes.
+    /// #47: on stormpump a removed container's log stays where `kubectl logs`
+    /// reads it, which is why an init container is removed as soon as it
+    /// completes.
+    #[tokio::test]
+    async fn a_removed_containers_log_stays_readable() {
+        let rt = rt();
+        assert!(rt.logs_survive_removal());
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("setup");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(log_dir.join("0.log"), "2026-10-08T00:00:00Z stdout F done\n").unwrap();
+        let mut c = bare("ct-init", "sb-1");
+        c.log_dir = log_dir.to_string_lossy().into_owned();
+        rt.containers.lock().await.insert("ct-init".into(), c);
+        rt.remove_container("ct-init").await.unwrap();
+        assert!(rt.containers.lock().await.get("ct-init").is_none(), "the record is gone");
+        assert!(log_dir.join("0.log").exists(), "the log is not");
+    }
+
     #[tokio::test]
     async fn a_refused_removal_is_kept_hidden_and_finished_later() {
         let r = rt();

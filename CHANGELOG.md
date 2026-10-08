@@ -2,6 +2,10 @@
 
 ## 2026-10-08
 
+- **fix:** An init container's log stays readable after it completes (#47): on a runtime whose `remove_container`
+  takes the log with it (a CRI runtime), a completed init container is kept until its pod stops, as upstream keeps
+  it; on stormpump, whose removal releases the workload and its root but never the log file, it is removed at once.
+  `RuntimeService::logs_survive_removal`. (The status half of #47 is since 4fefda1/ece4211.)
 - **test:** medium's size cases run three at a time, the largest first (#64): all twenty at once (every class blank
   a format, claims up to 16Ti and 1Pi) took the node's apiserver down on two runs (fff1f4d9d9, 63a3c5201b).
 - **feat:** Pod CPU requests are cgroup weights among Pods (#57, the owner's choice on #106: OpenShift's shape):
