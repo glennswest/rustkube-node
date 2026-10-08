@@ -20,6 +20,7 @@ pub mod start_timing;
 pub mod storage;
 pub mod system_claims;
 pub mod stormpump_ring;
+pub mod stormd_api;
 pub mod stormpump_runtime;
 pub mod checkpoint;
 pub mod client;

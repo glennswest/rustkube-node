@@ -269,6 +269,81 @@ pub fn mirror_pod_with(
     })
 }
 
+/// The container's status from the service's own stormd (#215, stormd#48):
+/// what its process is doing, not only whether PID 1 has stormd up. Applied to
+/// a mirror of a running service ([`mirror_pod_with`]); `pid1_restarts` are
+/// PID 1's restarts of the whole service, added to stormd's of the process.
+///
+/// - `running` (or `stopping`): Running since its `started_at`; ready from its
+///   readiness probe;
+/// - `CrashLoopBackOff`: Waiting, `CrashLoopBackOff`, upstream's message;
+/// - `pending`, `starting`, `restarting`: Waiting, `ContainerCreating`;
+/// - `stopped` / `failed`: Terminated with its exit (`Completed` for 0, else
+///   `Error`), started and finished times.
+///
+/// A process that has restarted carries its last exit as
+/// `lastState.terminated`. Not ready gives upstream's `ContainersNotReady`
+/// conditions. The pod's phase stays `Running`, as upstream's does for a
+/// container restarting under `restartPolicy: Always`.
+pub fn with_stormd(pod: &mut Value, container: &str, p: &crate::stormd_api::Process, pid1_restarts: u32) {
+    let terminated = |finished: Option<&str>| {
+        let code = p.exit_code.unwrap_or(0);
+        let mut t = json!({ "exitCode": code, "reason": if code == 0 { "Completed" } else { "Error" } });
+        if let Some(s) = &p.started_at {
+            t["startedAt"] = json!(rfc3339_secs(s));
+        }
+        if let Some(f) = finished {
+            t["finishedAt"] = json!(rfc3339_secs(f));
+        }
+        t
+    };
+    let (state, ready) = match p.state.as_str() {
+        "running" | "stopping" => {
+            let started = p.started_at.as_deref().map(rfc3339_secs).unwrap_or_default();
+            (json!({ "running": { "startedAt": started } }), p.ready)
+        }
+        "CrashLoopBackOff" => (
+            json!({ "waiting": { "reason": "CrashLoopBackOff",
+                "message": format!("back-off restarting failed container {container} in pod {}",
+                    pod["metadata"]["name"].as_str().unwrap_or("")) } }),
+            false,
+        ),
+        "stopped" | "failed" => (json!({ "terminated": terminated(p.stopped_at.as_deref()) }), false),
+        _ => (json!({ "waiting": { "reason": "ContainerCreating" } }), false),
+    };
+    let cs = &mut pod["status"]["containerStatuses"][0];
+    cs["state"] = state;
+    cs["ready"] = json!(ready);
+    cs["started"] = json!(matches!(p.state.as_str(), "running" | "stopping"));
+    cs["restartCount"] = json!(p.restarts + pid1_restarts);
+    if p.restarts > 0 && !matches!(p.state.as_str(), "stopped" | "failed") {
+        if p.exit_code.is_some() || p.stopped_at.is_some() {
+            cs["lastState"] = json!({ "terminated": terminated(p.stopped_at.as_deref()) });
+        }
+    }
+    let not_ready = |c: &mut Value| {
+        c["status"] = json!("False");
+        c["reason"] = json!("ContainersNotReady");
+        c["message"] = json!(format!("containers with unready status: [{container}]"));
+    };
+    for c in pod["status"]["conditions"].as_array_mut().into_iter().flatten() {
+        if c["type"] == "Ready" || c["type"] == "ContainersReady" {
+            if ready {
+                *c = json!({ "type": c["type"].clone(), "status": "True" });
+            } else {
+                not_ready(c);
+            }
+        }
+    }
+}
+
+/// An RFC 3339 time to the second, as status times are written.
+fn rfc3339_secs(t: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(t)
+        .map(|t| t.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|_| t.to_string())
+}
+
 /// The mirror's one container status: with `lastState.terminated` when PID 1
 /// has seen the service exit (#82), as upstream reports a restarted container.
 fn container_status(asset: &Asset, ready: bool, state: Value) -> Value {
@@ -335,6 +410,7 @@ pub fn status_current(existing: &Value, want: &Value) -> bool {
         && ec["ready"] == wc["ready"]
         && ec["restartCount"] == wc["restartCount"]
         && state_kind(ec) == state_kind(wc)
+        && ec["state"]["waiting"]["reason"] == wc["state"]["waiting"]["reason"]
         && ec["lastState"] == wc["lastState"]
         && ec["state"]["terminated"]["message"] == wc["state"]["terminated"]["message"]
         && ec["imageID"] == wc["imageID"]

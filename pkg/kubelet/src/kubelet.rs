@@ -1773,11 +1773,24 @@ impl Kubelet {
                 }
             });
         }
+        // Each running service's stormd (#215, stormd#48): its processes'
+        // state, restarts and readiness for the mirror's container status, and
+        // its Kubernetes events onto the mirror pod. A change is a mirror pass.
+        let stormd: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<crate::stormd_api::Process>>>> =
+            Arc::default();
+        {
+            let worker = worker.clone();
+            let stormd = stormd.clone();
+            let (api, url, node) = (self.api_client.clone(), self.config.api_server_url.clone(), self.config.node_name.clone());
+            tokio::spawn(stormd_poll(stormd, worker, api, url, node));
+        }
         // Each running service's own health endpoint, on its own clock (#96):
-        // a flip in readiness is a mirror pass.
+        // a flip in readiness is a mirror pass. Only for a service whose
+        // stormd does not answer: one that does reports its readiness itself.
         {
             let worker = worker.clone();
             let health = self.service_health.clone();
+            let stormd = stormd.clone();
             tokio::spawn(async move {
                 let probes = reqwest::Client::new();
                 loop {
@@ -1790,7 +1803,11 @@ impl Kubelet {
                         .map(|a| a.name)
                         .collect();
                     let mut flipped = false;
+                    let answered: Vec<String> = stormd.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
                     for name in &running {
+                        if answered.contains(name) {
+                            continue;
+                        }
                         let Some(url) = urls.get(name) else { continue };
                         let result = crate::node_health::probe(&probes, url).await;
                         let mut map = health.lock().unwrap_or_else(|e| e.into_inner());
@@ -1823,7 +1840,8 @@ impl Kubelet {
                             "{url}/api/v1/namespaces/kube-system/pods?labelSelector=storm.io%2Fcomponent%3Dnode-service"));
                     }
                     let health = self.service_health.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    mirror_node_services(&self.api_client, &url, &node, &self.node_ip, &health).await;
+                    let procs = stormd.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    mirror_node_services(&self.api_client, &url, &node, &self.node_ip, &health, &procs).await;
                 })
                 .await;
             drop(work);
@@ -2082,6 +2100,7 @@ async fn mirror_node_services(
     node: &str,
     host_ip: &str,
     health: &std::collections::HashMap<String, crate::node_health::ServiceHealth>,
+    stormd: &std::collections::HashMap<String, Vec<crate::stormd_api::Process>>,
 ) {
     // No cluster: nothing to mirror into, and nothing to retry.
     if api_url.is_empty() {
@@ -2228,6 +2247,7 @@ async fn mirror_node_services(
             Some(existing) => {
                 let mut pod = crate::mirror::mirror_pod_with(a, node, "", &started, health.get(&a.name));
                 crate::mirror::with_provenance(&mut pod, golden.as_ref(), host_ip);
+                let from_stormd = apply_stormd(&mut pod, a, stormd);
                 // The golden's annotations (#130) are metadata, which the
                 // status write below does not carry: patched when they differ.
                 let want = golden.as_ref().map(crate::mirror::golden_annotations).unwrap_or_default();
@@ -2247,7 +2267,10 @@ async fn mirror_node_services(
                 }
                 // Ready to not ready on its health endpoint: say so (#96).
                 let was_ready = existing["status"]["containerStatuses"][0]["ready"] == true;
-                if let (true, Some(h), Some(r)) = (was_ready, health.get(&a.name).filter(|h| a.running && !h.ready), &events) {
+                // (stormd's own Unhealthy events say it when stormd answers.)
+                if let (true, false, Some(h), Some(r)) =
+                    (was_ready, from_stormd, health.get(&a.name).filter(|h| a.running && !h.ready), &events)
+                {
                     r.pod_event(existing, "Warning", "Unhealthy", &format!("Readiness probe failed: {}", h.reason)).await;
                 }
                 let mut pod = pod;
@@ -2277,11 +2300,159 @@ async fn mirror_node_services(
                 };
                 let mut pod = crate::mirror::mirror_pod_with(a, node, uid, &started, health.get(&a.name));
                 crate::mirror::with_provenance(&mut pod, golden.as_ref(), host_ip);
+                apply_stormd(&mut pod, a, stormd);
                 let created = client.post(&base).json(&pod).send_repeatable(retry::Policy::API).await;
                 if !matches!(created, Ok(ref r) if r.status().is_success() || r.status() == 409) {
                     apimachinery::reactor::failed();
                 }
             }
+        }
+    }
+}
+
+/// A running service's container status from its stormd (#215), when stormd
+/// answered. Returns whether it did.
+fn apply_stormd(
+    pod: &mut Value,
+    a: &crate::mirror::Asset,
+    stormd: &std::collections::HashMap<String, Vec<crate::stormd_api::Process>>,
+) -> bool {
+    if !a.running {
+        return false;
+    }
+    match stormd.get(&a.name).and_then(|procs| crate::stormd_api::representative(&a.name, procs)) {
+        Some(p) => {
+            crate::mirror::with_stormd(pod, &a.name, &p, a.restarts);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Ask every running host-network service's stormd, every
+/// [`crate::stormd_api::PERIOD`], for its processes and its events (#215).
+///
+/// Processes: kept in `stormd` by service, a change enqueues a mirror pass. A
+/// stormd that does not answer is dropped from the map (its mirror falls back
+/// to PID 1's view and the #96 health probe). Events: read from the last
+/// `seq` written (0 after a kubelet restart, or when PID 1 has restarted the
+/// service, whose new stormd counts from 1), each written as an Event on the
+/// mirror pod; the seq moves past an event only once it is written.
+///
+/// Not retried within a pass: this is a poll, and the next one is the retry.
+async fn stormd_poll(
+    stormd: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<crate::stormd_api::Process>>>>,
+    worker: apimachinery::reactor::Worker,
+    api: reqwest::Client,
+    api_url: String,
+    node: String,
+) {
+    use crate::stormd_api::{self, Endpoint};
+    let http = reqwest::Client::builder().timeout(stormd_api::TIMEOUT).build().unwrap_or_default();
+    let mut endpoints = std::collections::HashMap::new();
+    let mut read_at: Option<std::time::Instant> = None;
+    let mut said: std::collections::HashSet<String> = Default::default();
+    // Per service: the last event seq written, and the service's run (PID 1's
+    // restarts, started_secs) it belongs to.
+    let mut seqs: std::collections::HashMap<String, (u64, (u32, Option<u64>))> = Default::default();
+    loop {
+        tokio::time::sleep(stormd_api::PERIOD).await;
+        if read_at.is_none_or(|t| t.elapsed() > Duration::from_secs(60)) {
+            endpoints = stormd_api::endpoints(std::path::Path::new(crate::node_logs::HOST_ROOT));
+            read_at = Some(std::time::Instant::now());
+        }
+        let text = std::fs::read_to_string("/run/stormpump/assets.json").unwrap_or_default();
+        let assets: Vec<_> = crate::mirror::parse_assets(&text).into_iter().filter(|a| a.running).collect();
+        let mut now: std::collections::HashMap<String, Vec<stormd_api::Process>> = Default::default();
+        for a in &assets {
+            let base = match endpoints.get(&a.name) {
+                Some(Endpoint::Plain(u)) => u.clone(),
+                Some(Endpoint::Guarded(why)) => {
+                    if said.insert(a.name.clone()) {
+                        info!("node service {}: its stormd API is not read ({why}): its mirror shows PID 1's view", a.name);
+                    }
+                    continue;
+                }
+                None => continue,
+            };
+            let procs = match http.get(format!("{base}/api/v1/processes")).send().await {
+                Ok(r) if r.status().is_success() => r.json::<Value>().await.ok().map(|v| stormd_api::parse_processes(&v)),
+                _ => None,
+            };
+            let Some(procs) = procs.filter(|p| !p.is_empty()) else { continue };
+            now.insert(a.name.clone(), procs);
+            if api_url.is_empty() {
+                continue;
+            }
+            let run = (a.restarts, a.started_secs.map(|s| s as u64));
+            let entry = seqs.entry(a.name.clone()).or_insert((0, run));
+            if entry.1 != run {
+                *entry = (0, run);
+            }
+            let events = match http.get(format!("{base}/api/v1/events?since={}", entry.0)).send().await {
+                Ok(r) if r.status().is_success() => r.json::<Value>().await.map(|v| stormd_api::parse_events(&v)).unwrap_or_default(),
+                // An older stormd (no events route): nothing to publish.
+                _ => Vec::new(),
+            };
+            if events.is_empty() {
+                continue;
+            }
+            let name = crate::mirror::mirror_name(&a.name, &node);
+            let pod_url = format!("{api_url}/api/v1/namespaces/kube-system/pods/{name}");
+            let pod = match api.get(&pod_url).send_retrying(retry::Policy::API).await {
+                Ok(r) if r.status().is_success() => r.json::<Value>().await.ok(),
+                _ => None,
+            };
+            // No mirror yet: its events wait for it.
+            let Some(pod) = pod else { continue };
+            for e in events {
+                let obj = stormd_api::event_object(&pod, &a.name, &node, &e);
+                if write_event(&api, &api_url, &obj).await {
+                    entry.0 = entry.0.max(e.seq);
+                } else {
+                    break;
+                }
+            }
+        }
+        let changed = {
+            let mut map = stormd.lock().unwrap_or_else(|e| e.into_inner());
+            let changed = *map != now;
+            *map = now;
+            changed
+        };
+        if changed {
+            worker.enqueue();
+        }
+    }
+}
+
+/// Create an Event, or bring an existing one's count and times up to date.
+async fn write_event(api: &reqwest::Client, api_url: &str, obj: &Value) -> bool {
+    let base = format!("{api_url}/api/v1/namespaces/kube-system/events");
+    match api.post(&base).json(obj).send_repeatable(retry::Policy::API).await {
+        Ok(r) if r.status().is_success() => true,
+        Ok(r) if r.status() == reqwest::StatusCode::CONFLICT => {
+            let name = obj["metadata"]["name"].as_str().unwrap_or("");
+            let patch = serde_json::json!({
+                "count": obj["count"], "lastTimestamp": obj["lastTimestamp"], "eventTime": obj["eventTime"],
+            });
+            matches!(
+                api.patch(format!("{base}/{name}"))
+                    .header("content-type", "application/merge-patch+json")
+                    .json(&patch)
+                    .send_retrying(retry::Policy::API)
+                    .await,
+                Ok(r) if r.status().is_success()
+            )
+        }
+        Ok(r) => {
+            warn!("apiserver refused a node service's event {}: {}", obj["reason"], r.status());
+            // A refusal of this event is not retried for ever.
+            true
+        }
+        Err(e) => {
+            debug!("node service event not written: {e}");
+            false
         }
     }
 }

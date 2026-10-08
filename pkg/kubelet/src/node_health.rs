@@ -20,6 +20,12 @@
 //! service on the host network (`profile host`): its `127.0.0.1` is the
 //! node's, and so the kubelet's.
 //!
+//! Since #215 this is the fallback: a service whose own stormd answers its API
+//! (stormd#48) reports its processes' readiness itself (`stormd_api.rs`), and
+//! goldens are moving off `[process.liveness]` to Kubernetes-style probes, which
+//! stormd runs. This probe is asked only of a service whose stormd does not
+//! answer.
+//!
 //! [`FAILURES`] failures in a row make the service not ready; one answer makes
 //! it ready again. Not ready is a readiness answer, not a crash: the pod stays
 //! `Running`, its container `ready: false`, `Ready=False` with the reason, as
@@ -40,49 +46,13 @@ pub const TIMEOUT: Duration = Duration::from_secs(2);
 /// Each host-network service's liveness URL, by asset (spec) name, from the
 /// boot units under `root` and the stormd config in each one's golden.
 pub fn health_urls(root: &Path) -> HashMap<String, String> {
-    let mut volumes: HashMap<String, String> = HashMap::new();
-    let mut specs: Vec<(String, Option<String>, bool)> = Vec::new();
-    let dir = root.join("etc/stormpump/boot.d");
-    let mut units: Vec<_> = std::fs::read_dir(&dir)
-        .map(|d| d.filter_map(|e| e.ok().map(|e| e.path())).collect())
-        .unwrap_or_default();
-    units.sort();
-    for unit in units {
-        let Ok(text) = std::fs::read_to_string(&unit) else { continue };
-        for line in text.lines() {
-            let line = line.split('#').next().unwrap_or("");
-            let words: Vec<&str> = line.split_whitespace().collect();
-            match words.as_slice() {
-                ["volume", name, path, ..] => {
-                    volumes.insert(name.to_string(), path.to_string());
-                }
-                ["spec", name, ..] => specs.push((name.to_string(), None, false)),
-                ["root", volume, ..] if line.starts_with(char::is_whitespace) => {
-                    if let Some(s) = specs.last_mut() {
-                        s.1 = Some(volume.to_string());
-                    }
-                }
-                ["profile", "host", ..] if line.starts_with(char::is_whitespace) => {
-                    if let Some(s) = specs.last_mut() {
-                        s.2 = true;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    let mut out = HashMap::new();
-    for (name, root_volume, host) in specs {
-        let Some(path) = root_volume.and_then(|v| volumes.get(&v).cloned()) else { continue };
-        if !host {
-            continue;
-        }
-        let config = root.join(path.trim_start_matches('/')).join("etc/stormd/config.toml");
-        if let Some(url) = std::fs::read_to_string(config).ok().and_then(|t| liveness_url(&t)) {
-            out.insert(name, url);
-        }
-    }
-    out
+    crate::stormd_api::host_service_roots(root)
+        .into_iter()
+        .filter_map(|(name, golden)| {
+            let text = std::fs::read_to_string(golden.join("etc/stormd/config.toml")).ok()?;
+            Some((name, liveness_url(&text)?))
+        })
+        .collect()
 }
 
 /// The first `[process.liveness]` of `type = "http"`'s `url`, from a stormd
