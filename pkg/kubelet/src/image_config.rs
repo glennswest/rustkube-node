@@ -42,6 +42,67 @@ pub struct ImageConfig {
     pub working_dir: String,
     #[serde(rename = "User", default)]
     pub user: String,
+    /// The image's declared volumes (#172): OCI spells it a map of path to
+    /// `{}`. Each becomes a directory in the container's own root when no
+    /// pod mount covers it ([`declared_volumes`]).
+    #[serde(rename = "Volumes", default)]
+    pub volumes: std::collections::BTreeMap<String, EmptyObject>,
+}
+
+/// The `{}` OCI uses as a set's value; anything inside it is ignored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct EmptyObject {}
+
+/// The image's declared volumes that need making (#172): absolute, normal
+/// paths (no `..`), not covered by one of the pod's mounts (`mounts`, the
+/// container paths): a mount at the path or above it already puts something
+/// there.
+pub fn declared_volumes(config: &ImageConfig, mounts: &[&str]) -> Vec<String> {
+    config
+        .volumes
+        .keys()
+        .map(|p| p.trim_end_matches('/').to_string())
+        .filter(|p| p.starts_with('/') && p.len() > 1)
+        .filter(|p| !p.split('/').any(|c| c == ".." || c == "."))
+        .filter(|p| {
+            !mounts.iter().any(|m| {
+                let m = m.trim_end_matches('/');
+                m.is_empty() || p == m || p.starts_with(&format!("{m}/"))
+            })
+        })
+        .collect()
+}
+
+/// Make `path` (absolute, as the container sees it) a directory inside the
+/// container root `root` (#172), as CRI-O's default `image_volumes = "mkdir"`
+/// does. Each component is made if missing; **a symlink is never followed**:
+/// the path comes from the image, and a link could point the walk out of the
+/// root and onto the node. `Ok(false)`: stopped at a symlink or a
+/// non-directory, nothing made past it.
+pub fn make_in_root(root: &Path, path: &str) -> std::io::Result<bool> {
+    let mut at = root.to_path_buf();
+    for part in path.split('/').filter(|c| !c.is_empty()) {
+        at.push(part);
+        match std::fs::symlink_metadata(&at) {
+            Ok(m) if m.file_type().is_symlink() || !m.is_dir() => return Ok(false),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                use std::os::unix::fs::DirBuilderExt;
+                match std::fs::DirBuilder::new().mode(0o755).create(&at) {
+                    Ok(()) => {}
+                    // Made meanwhile: look again on the next component.
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        if std::fs::symlink_metadata(&at)?.file_type().is_symlink() {
+                            return Ok(false);
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
 }
 
 /// How long "no config for this image" is believed before the registry is
@@ -548,5 +609,38 @@ mod tests {
         let c = release_golden_in(&m, "cilium").unwrap();
         assert_eq!(c.digest, None);
         assert!(release_golden_in(&m, "absent").is_none());
+    }
+
+    /// #172: the record's `Volumes` are read; a pod mount at or above a path
+    /// covers it; odd paths are dropped.
+    #[test]
+    fn declared_volumes_not_covered_by_a_mount() {
+        let r = serde_json::json!({"config": {"Cmd": ["x"], "Volumes": {
+            "/var/lib/postgresql/data": {}, "/cache/": {}, "/etc/conf": {}, "rel": {}, "/a/../b": {}}}});
+        let c = from_golden(&r).unwrap();
+        assert_eq!(c.volumes.len(), 5);
+        let mut got = declared_volumes(&c, &["/etc", "/cache"]);
+        got.sort();
+        assert_eq!(got, vec!["/var/lib/postgresql/data".to_string()]);
+        assert_eq!(declared_volumes(&c, &["/"]).len(), 0, "a mount at / covers all");
+    }
+
+    /// #172: made inside the root, existing content kept, never through a
+    /// symlink (one pointing out of the root stops the walk).
+    #[test]
+    fn a_declared_volume_is_made_in_the_root_never_through_a_link() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let r = root.path();
+        std::fs::create_dir_all(r.join("var/lib")).unwrap();
+        std::fs::write(r.join("var/lib/keep"), "x").unwrap();
+        assert!(make_in_root(r, "/var/lib/postgresql/data").unwrap());
+        assert!(r.join("var/lib/postgresql/data").is_dir());
+        assert!(r.join("var/lib/keep").is_file());
+        std::os::unix::fs::symlink(outside.path(), r.join("escape")).unwrap();
+        assert!(!make_in_root(r, "/escape/data").unwrap());
+        assert!(!outside.path().join("data").exists(), "nothing made outside the root");
+        std::fs::write(r.join("file"), "x").unwrap();
+        assert!(!make_in_root(r, "/file/sub").unwrap());
     }
 }

@@ -181,8 +181,13 @@ pod's `env`; `WorkingDir` applies when `workingDir` is unset; `User` (a number o
 default when neither side sets them; argv[0] is looked up on the container's `PATH`. The node's boot goldens
 carry no config yet (stormblock-registry#58): a container of one whose argv would be empty or start with a flag
 is refused, naming the image, instead of exec'ing the flag. emptyDir volumes are 0777, as upstream, so a
-non-root uid can write them. Not yet: an image's declared `Volumes` (not recorded by the registry, #58) and
-`fsGroup` (a claim's filesystem is root's).
+non-root uid can write them. An image's declared `Volumes` (the registry records them since
+stormblock-registry#58) are made as CRI-O's default `image_volumes = "mkdir"` makes them (#172): a directory in
+the container's own root for each path no pod mount covers (at it or above it). Since #104 that root is the
+container's private writable clone, so what the image has there is kept and it goes with the container; the walk
+never follows a symlink, and one on the path (or a file) leaves it unmade with a warning. With
+`readOnlyRootFilesystem` it is writable only while the root is (stormpump#108). Not yet: `fsGroup` (a claim's
+filesystem is root's).
 
 **Kubernetes 1.36 posture** (#23, the control plane's since rustkube#37): `nodeInfo.kubeletVersion` is
 `v1.36.0-rustkube+<apimachinery>` and `kubeProxyVersion` is not reported (1.33 removed it). A pod that asks for

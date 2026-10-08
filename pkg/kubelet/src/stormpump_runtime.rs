@@ -1294,6 +1294,23 @@ impl RuntimeService for StormpumpRuntime {
         // image service found it for this image; a refusal names the image.
         let image = self.image_configs.get(&config.image);
         let name = self.image_configs.image_of(&config.image);
+        // The image's declared volumes (#172), as CRI-O's default
+        // `image_volumes = "mkdir"`: a directory in this container's own root
+        // (private and writable since #104, so its image content stays and it
+        // goes with the container) for each path no pod mount covers.
+        if let Some(img) = image.as_ref() {
+            let covered: Vec<&str> = config.mounts.iter().map(|m| m.container_path.as_str()).collect();
+            for path in crate::image_config::declared_volumes(img, &covered) {
+                match crate::image_config::make_in_root(std::path::Path::new(&mount), &path) {
+                    Ok(true) => {}
+                    Ok(false) => tracing::warn!(
+                        container = %config.name, %path,
+                        "image volume not made: a symlink or a file is on its path in the image"
+                    ),
+                    Err(e) => tracing::warn!(container = %config.name, %path, "image volume not made: {e}"),
+                }
+            }
+        }
         let defined = match compose_for(config, image.as_ref(), name.as_deref(), Some(&read_root)) {
             Ok(run) => {
                 let encoded = spec_for(config, _sandbox_config, run, Some(&read_root)).encode();

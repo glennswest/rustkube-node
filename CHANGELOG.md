@@ -2,6 +2,9 @@
 
 ## 2026-10-08
 
+- **feat:** An image's declared `Volumes` are made (#172): read from the registry's golden config, each path no pod
+  mount covers becomes a directory in the container's own root, CRI-O's default `mkdir` behaviour (the root is the
+  container's private writable clone since #104). Made component by component, never through a symlink.
 - **feat:** Container status and image provenance for stormconsole#69/#75 (#130): `lastState.terminated` (each
   container's previous run, kept from its exit through its restart or back-off), `state.terminated.reason`
   (runtime's, else `Completed`/`Error`) and `message`; on stormpump a real `imageID` (`sha256:` from the registry
