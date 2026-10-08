@@ -34,7 +34,12 @@ impl Api {
         if let Some(b) = body {
             req = req.json(b);
         }
-        let resp = req.send().await.map_err(|e| format!("{method} {path}: {e}"))?;
+        // Retried while the apiserver is away (#211); a POST only when it
+        // never left. What still fails is an error here, which the cases
+        // report as Infra (could not run), never as a failed test.
+        let resp = retry::send(req, retry::Policy::API)
+            .await
+            .map_err(|e| format!("{method} {path}: {} ({e})", retry::class_of_error(&e)))?;
         let code = resp.status().as_u16();
         let text = resp.text().await.map_err(|e| format!("{method} {path}: body: {e}"))?;
         let v = serde_json::from_str(&text).unwrap_or(Value::String(text));

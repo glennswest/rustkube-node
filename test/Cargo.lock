@@ -597,6 +597,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "retry"
+version = "0.13.0"
+dependencies = [
+ "reqwest",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -622,6 +631,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "reqwest",
+ "retry",
  "serde_json",
  "tokio",
 ]
