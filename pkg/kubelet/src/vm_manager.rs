@@ -4920,7 +4920,10 @@ mod tests {
         // The failed start comes back when its backoff is up, with no event
         // and no tick (#101); inside the backoff, the same deadline.
         let due = m.take_due("u-1").expect("the retry");
-        assert!(due <= std::time::Duration::from_secs(10) && due > std::time::Duration::from_secs(8), "{due:?}");
+        // The pass's calls to the (absent) apiserver are retried inside it
+        // (#211, a few seconds of backoff), which the 10 s start backoff
+        // has partly run down by the time it is read.
+        assert!(due <= std::time::Duration::from_secs(10) && due > std::time::Duration::from_secs(3), "{due:?}");
         m.reconcile_one("u-1", Some(&obj)).await.unwrap();
         assert!(m.take_due("u-1").is_some(), "still due at the backoff's end");
         assert_eq!(m.retries.lock().unwrap()["u-1"].attempts, 1);
