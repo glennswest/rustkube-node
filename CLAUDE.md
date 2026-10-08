@@ -75,7 +75,8 @@ engine work, filed on stormpump (CRI-format log + reopen); this repo serves CRI 
 3. [x] Tests (5 new), docs (configuration.md, api.md, README), CHANGELOG (4d7619c, 226e6a0); stormpump#129 filed (CRI
        lines + reopen). Mirror pods: `--previous` = newest finished stormd run, failed or exited (owner's #216 rule
        supersedes #72's failed-only; 8705023). SC_BUILD_VM sc-build at 7a96a08: 457 kubelet unit, 6 main, all suites pass.
-       Stage golden, close. Timestamps/since on stormpump containers follow stormpump#129 (nothing more here).
+       Stage golden golden-rustkube-node-a779e87a8d78 (stormcos#424; first try hit stormcentral#549). Closed.
+       Timestamps/since on stormpump containers follow stormpump#129 (nothing more here).
 
 ### Done: #211 (P1), every remote call retries (code review)
 
