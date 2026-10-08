@@ -57,6 +57,21 @@ by #51.
 
 ## Work plan
 
+### In progress: #215 (P0), mirror pods carry stormd's probe state, restarts/CrashLoopBackOff and events (stormd#48)
+
+2026-10-08. stormd#48 done (golden-stormd-9bd45189d9a8): `GET /api/v1/processes` (state running | CrashLoopBackOff |
+stopped | failed | starting…, ready from the readiness probe, restarts, exit_code, started_at, stopped_at) and
+`GET /api/v1/events?since=<seq>` (upstream reasons, count bumps seq). stormcos's stormd APIs: plain HTTP, no auth,
+`[api] bind` per golden (9081–9085, service port + 100).
+1. [x] `stormd_api.rs`: endpoints from boot.d + golden config (`[api]` with TLS/credential = not read, said once),
+       processes/events parse, `representative` (process named as the asset, else the worst), `event_object` (named by
+       identity: process, reason, message, first time; count/lastTimestamp patched). 40aef87.
+2. [x] `mirror::with_stormd`: Running / Waiting CrashLoopBackOff|ContainerCreating / Terminated, restartCount (stormd's +
+       PID 1's), lastState, Ready = readiness with ContainersNotReady; status_current sees a waiting reason change.
+3. [x] kubelet `stormd_poll` (5 s): processes → map (change = mirror pass), events since the last written seq (reset on
+       a PID 1 restart of the service) → Events on the mirror pod. node_health probe only where stormd does not answer.
+4. [ ] Tests, docs (README "The node's services as pods", api.md?), CHANGELOG; sc-build; stage golden; close.
+
 ### Done: #216, per-container logs at upstream parity (stormconsole#124, stormcos_qa#48)
 
 2026-10-08. Found: each container has its dir and `<restart>.log` (app restarts), `previous=N` (#131), init logs kept

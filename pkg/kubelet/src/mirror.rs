@@ -866,4 +866,68 @@ mod tests {
         assert_eq!(Asset { started_secs: Some(50.0), ..Default::default() }.age(Some(40.0)), 0, "never negative");
         assert!(node_uptime().is_some_and(|u| u > 0.0));
     }
+
+    /// #215: the container is what stormd says its process is doing.
+    #[test]
+    fn stormd_state_becomes_the_container_status() {
+        use crate::stormd_api::Process;
+        let a = Asset { name: "fastetcd".into(), running: true, restarts: 1, age_secs: 60, ..Default::default() };
+        let base = mirror_pod(&a, "n1", "u", "2026-10-08T21:00:00Z");
+        let p = |state: &str, ready: bool| Process {
+            name: "fastetcd".into(),
+            state: state.into(),
+            ready,
+            restarts: 3,
+            exit_code: Some(137),
+            started_at: Some("2026-10-08T21:13:23.5Z".into()),
+            stopped_at: Some("2026-10-08T21:13:20Z".into()),
+        };
+        let cond = |pod: &Value, t: &str| {
+            pod["status"]["conditions"].as_array().unwrap().iter().find(|c| c["type"] == t).unwrap().clone()
+        };
+
+        // Running and ready: restarts counted (stormd's 3 + PID 1's 1), the
+        // last exit kept as lastState.
+        let mut pod = base.clone();
+        with_stormd(&mut pod, "fastetcd", &p("running", true), a.restarts);
+        let cs = &pod["status"]["containerStatuses"][0];
+        assert_eq!(cs["state"]["running"]["startedAt"], "2026-10-08T21:13:23Z");
+        assert_eq!((cs["ready"].clone(), cs["restartCount"].clone()), (json!(true), json!(4)));
+        assert_eq!(cs["lastState"]["terminated"]["exitCode"], 137);
+        assert_eq!(cs["lastState"]["terminated"]["reason"], "Error");
+        assert_eq!(cond(&pod, "Ready")["status"], "True");
+
+        // Running, readiness failing: not ready, not restarted, upstream's
+        // conditions.
+        let mut unready = base.clone();
+        with_stormd(&mut unready, "fastetcd", &p("running", false), a.restarts);
+        assert_eq!(unready["status"]["containerStatuses"][0]["ready"], false);
+        assert_eq!(unready["status"]["phase"], "Running");
+        let r = cond(&unready, "Ready");
+        assert_eq!((r["status"].clone(), r["reason"].clone()), (json!("False"), json!("ContainersNotReady")));
+        assert_eq!(r["message"], "containers with unready status: [fastetcd]");
+        assert!(!status_current(&pod, &unready), "readiness is a change");
+
+        // Backing off.
+        let mut crash = base.clone();
+        with_stormd(&mut crash, "fastetcd", &p("CrashLoopBackOff", false), a.restarts);
+        let cs = &crash["status"]["containerStatuses"][0];
+        assert_eq!(cs["state"]["waiting"]["reason"], "CrashLoopBackOff");
+        assert!(cs["state"]["waiting"]["message"].as_str().unwrap().starts_with("back-off restarting failed container fastetcd"));
+        assert_eq!(crash["status"]["phase"], "Running");
+        assert!(!status_current(&unready, &crash));
+
+        // Starting is another waiting reason, and that is a change too.
+        let mut starting = base.clone();
+        with_stormd(&mut starting, "fastetcd", &p("starting", false), a.restarts);
+        assert_eq!(starting["status"]["containerStatuses"][0]["state"]["waiting"]["reason"], "ContainerCreating");
+        assert!(!status_current(&crash, &starting));
+
+        // Stopped for good: terminated with its exit and times.
+        let mut down = base.clone();
+        with_stormd(&mut down, "fastetcd", &Process { exit_code: Some(0), ..p("stopped", false) }, a.restarts);
+        let t = &down["status"]["containerStatuses"][0]["state"]["terminated"];
+        assert_eq!((t["exitCode"].clone(), t["reason"].clone()), (json!(0), json!("Completed")));
+        assert_eq!(t["finishedAt"], "2026-10-08T21:13:20Z");
+    }
 }
