@@ -57,14 +57,14 @@ by #51.
 
 ## Work plan
 
-### In progress: #47 (P3), the last part: an init container's log after it completes
+### Done: #47 (P3), the last part: an init container's log after it completes
 
 2026-10-08. Status half done (4fefda1, ece4211); the fixed init deadline went with #126. Left: `run_init_containers`
 removes a completed init container at once. The native runtime writes no logs; stormpump's removal never deletes the
 log file (the engine writes it in the pod's log dir), so `kubectl logs -c <init>` already answers there; a CRI runtime
 may take the log with the container. Done in code: `RuntimeService::logs_survive_removal` (false; stormpump true); a
 completed init kept in `PodManager::kept_inits` until `stop_pod` where removal would lose the log. Tests (1 changed,
-1 new). Next: sc-build, golden, close.
+1 new). sc-build 90c291c0ec: 419 pass (after #196's test updates). Golden e3415aaa02e2. Closed.
 
 ### Waiting on stormstorage#49: #157 (P3), VM restore from a RAID twin on another node
 
