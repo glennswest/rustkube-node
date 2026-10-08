@@ -20,7 +20,7 @@ stormcos main (`deploy/image.toml`, `deploy/manifests/50-cilium-config.yaml`,
 | Writing the conflist, serving CNI ADD | the Cilium agent | a host-network DaemonSet Pod, so it starts before any Pod network exists |
 | Pod-to-Pod routes, Pod egress (masquerade to the node's address) | Cilium | the datapath; Pod egress then leaves by the **node's** default route |
 | Services (ClusterIP, NodePort) | Cilium (`kube-proxy-replacement: true`) | the packaged kube-proxy is not run in any stormcos edition (#145, #155) |
-| `NetworkUnavailable` condition | the CNI | Cilium sets it False (`CiliumIsUp`) on its node. The kubelet never writes it and keeps it across heartbeats, as it keeps every condition it does not own |
+| `NetworkUnavailable` condition | the CNI | cilium-operator sets it False (reason `CiliumIsUp`) once the node's Cilium agent Pod is up (`set-cilium-is-up-condition: 'true'` in stormcos's config; cilium `operator/watchers/node_taint.go`). The kubelet never writes it and keeps it across heartbeats, as it keeps every condition it does not own |
 
 In the flowsdn edition flowsdn takes Cilium's rows.
 
@@ -63,7 +63,7 @@ cluster whose network-operator brings the CNI up.
 | Host-network Pods not starting | not a CNI matter: the runtime, an image or a volume (their Events say which) |
 | **The node itself has no default route, or cannot reach its gateway** | **never "the CNI is not up yet"**. The node's gateway is the kernel's DHCP lease (router option) on its own interface. Look at the DHCP server's pool or reservation (`gateway`), the lease the node took, and the router. The CNI adds Pod routes and masquerades Pod egress *through* the node's route; it does not create it |
 | Pods have addresses and reach each other but nothing outside | Pod egress masquerades through the node's default route: check the node's own outbound first, then the `Network` CR's masquerade setting |
-| `NetworkUnavailable=True` on the Node | the CNI has said its network is not ready on this node (the kubelet does not set it) |
+| `NetworkUnavailable=True` on the Node | something other than the kubelet said the network is not ready here (a cloud provider sets it on some platforms; cilium-operator clears it once its agent is up). No `NetworkUnavailable` at all before the CNI is normal |
 
 What #32 saw on scmaster1–3 (local LAN and DNS fine, gateway 192.168.8.1
 unreachable, no cluster) is the gateway row: a lab gateway
