@@ -66,6 +66,9 @@ pub struct PodSandboxConfig {
     /// The sandbox holds the namespaces its containers join, so a pod-level
     /// label has to reach it as well as them (rustkube-node#26).
     pub selinux_options: Option<SeLinuxOptions>,
+    /// The pod's QoS class (`Guaranteed`, `Burstable`, `BestEffort`), for its
+    /// cgroup parent on a CRI runtime (#24). Empty: the runtime's default.
+    pub qos_class: String,
 }
 
 /// Port mapping for a pod sandbox.

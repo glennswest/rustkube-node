@@ -36,6 +36,9 @@ An em dash means there is no environment binding or the value is unset.
 | `--pod-workers` | `POD_WORKERS` | 16 per CPU, at least 32, at most 256: Pod/VMI passes (starts, checks, teardowns) run at once (#138) |
 | `--kubelet-port` | `KUBELET_PORT` | `10250`; HTTPS on `0.0.0.0` |
 | `--max-pods` | `MAX_PODS` | `110` (upstream's); the node's `capacity.pods` and `allocatable.pods`, which the scheduler holds it to (#165). stormcos sets 250 (rustkube#205). The kubelet itself admits by no count |
+| `--system-reserved` | `SYSTEM_RESERVED` | Unset. `cpu=500m,memory=1Gi,ephemeral-storage=1Gi` (upstream's spelling) held back for the OS: allocatable is capacity less this, `--kube-reserved` and the hard-eviction line (memory 100Mi, nodefs 10%) (#24). `pid` and other resources refused at startup (no node-allocatable cgroup holds them) |
+| `--kube-reserved` | `KUBE_RESERVED` | Unset. Held back for the node's own components; as `--system-reserved` (#24) |
+| `--cgroup-driver` | `CGROUP_DRIVER` | Unset; `systemd` or `cgroupfs`. `--runtime cri` only: the runtime's own answer (CRI `RuntimeConfig`) wins, as since 1.36 (a disagreeing flag is ignored with a warning), then this, then `cgroupfs`. Each sandbox's `cgroup_parent` is upstream's per-QoS `kubepods` place in that spelling (`kubepods-burstable-pod<uid>.slice`, `/kubepods/burstable/pod<uid>`) (#24). stormpump owns its groups (#57) |
 | `--apiserver-ca` | `APISERVER_CA` | Unset; PEM trust anchor, otherwise kubeconfig CA |
 | `--token-file` | `KUBELET_TOKEN_FILE` | Unset; outbound bearer token file, otherwise kubeconfig token |
 | `--kubeconfig` | `KUBECONFIG` | Unset; explicit file, not automatic `~/.kube/config` discovery |

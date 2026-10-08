@@ -36,6 +36,8 @@ pub struct KubeletConfig {
     /// Pods this node takes, reported as capacity and allocatable `pods`
     /// (`--max-pods`, #165).
     pub max_pods: u32,
+    /// `--system-reserved` + `--kube-reserved` (#24), held back from allocatable.
+    pub reserved: crate::node_status::Reserved,
     /// Cluster CA (PEM) to trust for an HTTPS apiserver. None → no custom root.
     pub apiserver_ca: Option<Vec<u8>>,
     /// Bearer token for authenticating to the apiserver (SA/JWT). None → none.
@@ -92,6 +94,7 @@ impl Default for KubeletConfig {
             pod_workers: crate::workload::default_workers(),
             kubelet_port: 10250,
             max_pods: crate::node_status::DEFAULT_MAX_PODS,
+            reserved: Default::default(),
             apiserver_ca: None,
             bearer_token: None,
             client_cert: None,
@@ -330,6 +333,7 @@ impl Kubelet {
             let rv = runtime_version.clone();
             let port = self.config.kubelet_port;
             let max_pods = self.config.max_pods;
+            let reserved = self.config.reserved.clone();
             let client = self.api_client.clone();
             let labels = self.config.node_labels.clone();
             let annotations = self.config.node_annotations.clone();
@@ -340,6 +344,7 @@ impl Kubelet {
                     .with_runtime_version(rv)
                     .with_kubelet_port(port)
                     .with_max_pods(max_pods)
+                    .with_reserved(reserved)
                     // Registration only. The heartbeat reporter below is
                     // deliberately built without these: it writes status
                     // through the /status subresource, and re-asserting taints
@@ -399,6 +404,7 @@ impl Kubelet {
         let heartbeat_interval = self.config.heartbeat_interval;
         let kubelet_port = self.config.kubelet_port;
         let max_pods = self.config.max_pods;
+        let hb_reserved = self.config.reserved.clone();
         let hb_client = self.api_client.clone();
         let hb_vms = self.vms.clone();
         tokio::spawn(async move {
@@ -406,6 +412,7 @@ impl Kubelet {
                 .with_runtime_version(runtime_version)
                 .with_kubelet_port(kubelet_port)
                 .with_max_pods(max_pods)
+                .with_reserved(hb_reserved)
                 .with_client(hb_client);
             if hb_vms.is_some() {
                 reporter = reporter.with_kvm(Arc::new(crate::node_status::kvm_available));

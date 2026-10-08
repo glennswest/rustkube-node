@@ -27,6 +27,8 @@ struct MockCri {
     /// Answer GetContainerEvents with these, then end the stream (#116);
     /// `None`: Unimplemented, as a runtime without evented PLEG answers.
     events: Option<Vec<proto::ContainerEventResponse>>,
+    /// Answer RuntimeConfig with this cgroup driver (#24); `None`: Unimplemented.
+    cgroup_driver: Option<proto::CgroupDriver>,
 }
 
 fn unimplemented<T>() -> Result<T> {
@@ -252,7 +254,10 @@ impl proto::runtime_service_server::RuntimeService for MockCri {
         &self,
         _: Request<proto::RuntimeConfigRequest>,
     ) -> Result<proto::RuntimeConfigResponse> {
-        unimplemented()
+        let Some(driver) = self.cgroup_driver else { return unimplemented() };
+        Ok(Response::new(proto::RuntimeConfigResponse {
+            linux: Some(proto::LinuxRuntimeConfiguration { cgroup_driver: driver as i32 }),
+        }))
     }
 }
 
@@ -511,4 +516,33 @@ async fn container_events_are_followed_with_their_pod() {
         .await;
     assert_eq!(ended, EventStream::Unsupported);
     assert!(seen.lock().unwrap().is_empty());
+}
+
+/// #24: the runtime's own cgroup driver wins over `--cgroup-driver`, the flag
+/// is the fallback, cgroupfs the default; each sandbox carries upstream's
+/// per-QoS parent in that driver's spelling.
+#[tokio::test]
+async fn sandboxes_get_a_cgroup_parent_in_the_runtimes_driver() {
+    use kubelet::cgroups::CgroupDriver;
+    // The runtime says systemd; the flag says cgroupfs: the runtime wins.
+    let dir = tempfile::tempdir().unwrap();
+    let mock = MockCri { cgroup_driver: Some(proto::CgroupDriver::Systemd), ..Default::default() };
+    let (socket, recorded) = start_mock_with(dir.path(), mock).await;
+    let client = CriGrpcClient::new(&socket);
+    assert_eq!(client.resolve_cgroup_driver(Some(CgroupDriver::Cgroupfs)).await, CgroupDriver::Systemd);
+    let config = PodSandboxConfig { qos_class: "Burstable".into(), uid: "ab-cd".into(), ..sandbox_config() };
+    client.run_pod_sandbox(&config).await.unwrap();
+    let parent = recorded.lock().unwrap().sandbox_config.clone().unwrap().linux.unwrap().cgroup_parent;
+    assert_eq!(parent, "kubepods-burstable-podab_cd.slice");
+
+    // No RuntimeConfig: the flag, else cgroupfs.
+    let other = tempfile::tempdir().unwrap();
+    let (socket, recorded) = start_mock(other.path()).await;
+    let client = CriGrpcClient::new(&socket);
+    assert_eq!(client.resolve_cgroup_driver(None).await, CgroupDriver::Cgroupfs);
+    assert_eq!(client.resolve_cgroup_driver(Some(CgroupDriver::Systemd)).await, CgroupDriver::Systemd);
+    let config = PodSandboxConfig { qos_class: "Guaranteed".into(), uid: "u1".into(), ..sandbox_config() };
+    client.run_pod_sandbox(&config).await.unwrap();
+    let parent = recorded.lock().unwrap().sandbox_config.clone().unwrap().linux.unwrap().cgroup_parent;
+    assert_eq!(parent, "kubepods-podu1.slice");
 }

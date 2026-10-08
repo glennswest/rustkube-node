@@ -89,6 +89,8 @@ pub struct NodeReporter {
     /// Pods this node takes (`--max-pods`, #165): capacity and allocatable
     /// `pods`, which the scheduler holds a node to.
     max_pods: u32,
+    /// `--system-reserved` + `--kube-reserved` (#24): taken off allocatable.
+    reserved: Reserved,
     /// Extra labels applied at registration (`--node-labels`).
     labels: Vec<(String, String)>,
     /// Annotations applied at registration (`--node-annotations`).
@@ -168,6 +170,7 @@ impl NodeReporter {
             runtime_version: "cri-o://unknown".to_string(),
             kubelet_port: 10250,
             max_pods: DEFAULT_MAX_PODS,
+            reserved: Reserved::default(),
             labels: Vec::new(),
             annotations: Vec::new(),
             taints: Vec::new(),
@@ -202,6 +205,12 @@ impl NodeReporter {
     /// The node's Pod capacity (#165).
     pub fn with_max_pods(mut self, max_pods: u32) -> Self {
         self.max_pods = max_pods;
+        self
+    }
+
+    /// What `--system-reserved` and `--kube-reserved` hold back (#24), summed.
+    pub fn with_reserved(mut self, reserved: Reserved) -> Self {
+        self.reserved = reserved;
         self
     }
 
@@ -488,7 +497,7 @@ impl NodeReporter {
         // ephemeral-storage capacity from the container/pod-storage filesystem;
         // allocatable reserves the 10% eviction headroom.
         let eph_cap_ki = fs_total / 1024;
-        let eph_alloc_ki = (fs_total / 1024) * 9 / 10;
+        let alloc = allocatable(cpu_count, total_mem_ki, eph_cap_ki, &self.reserved);
 
         let mut status = json!({
             "capacity": {
@@ -498,10 +507,10 @@ impl NodeReporter {
                 "ephemeral-storage": format!("{eph_cap_ki}Ki")
             },
             "allocatable": {
-                "cpu": cpu_count.to_string(),
-                "memory": format!("{}Ki", total_mem_ki.saturating_sub(256 * 1024)),
+                "cpu": alloc.cpu,
+                "memory": format!("{}Ki", alloc.memory_ki),
                 "pods": self.max_pods.to_string(),
-                "ephemeral-storage": format!("{eph_alloc_ki}Ki")
+                "ephemeral-storage": format!("{}Ki", alloc.ephemeral_ki)
             },
             "conditions": merge_owned_conditions(
                 existing, mem_pressure, disk_pressure, pid_pressure, &now,
@@ -556,6 +565,89 @@ pub const KUBERNETES_POSTURE: &str = "v1.36.0";
 /// `nodeInfo.kubeletVersion`: the posture, then this build's apimachinery.
 pub fn kubelet_version() -> String {
     format!("{KUBERNETES_POSTURE}-rustkube+{}", apimachinery::VERSION)
+}
+
+/// What `--system-reserved` / `--kube-reserved` hold back from Pods (#24).
+///
+/// Upstream's spelling, `cpu=500m,memory=1Gi,ephemeral-storage=1Gi`. Only
+/// the resources the kubelet reports are taken: `pid` and anything else is
+/// refused at startup rather than read and not applied.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Reserved {
+    pub cpu_milli: u64,
+    pub memory_bytes: u64,
+    pub ephemeral_bytes: u64,
+}
+
+impl Reserved {
+    /// `""` reserves nothing.
+    pub fn parse(spec: &str) -> Result<Reserved, String> {
+        let mut r = Reserved::default();
+        for item in spec.split(',').map(str::trim).filter(|i| !i.is_empty()) {
+            let (k, v) = item
+                .split_once('=')
+                .ok_or_else(|| format!("{item}: expected <resource>=<quantity>"))?;
+            let bad = || format!("{item}: not a quantity");
+            match k.trim() {
+                "cpu" => r.cpu_milli = parse_cpu_milli(v).ok_or_else(bad)?,
+                "memory" => r.memory_bytes = crate::storage::parse_quantity(v).ok_or_else(bad)?,
+                "ephemeral-storage" => r.ephemeral_bytes = crate::storage::parse_quantity(v).ok_or_else(bad)?,
+                other => {
+                    return Err(format!(
+                        "{other}: not reserved by this kubelet (cpu, memory, ephemeral-storage); \
+                         it enforces no node-allocatable cgroup to hold a pid reservation to"
+                    ))
+                }
+            }
+        }
+        Ok(r)
+    }
+
+    pub fn plus(&self, other: &Reserved) -> Reserved {
+        Reserved {
+            cpu_milli: self.cpu_milli + other.cpu_milli,
+            memory_bytes: self.memory_bytes + other.memory_bytes,
+            ephemeral_bytes: self.ephemeral_bytes + other.ephemeral_bytes,
+        }
+    }
+}
+
+/// `500m` → 500, `1.5` → 1500, `2` → 2000.
+fn parse_cpu_milli(v: &str) -> Option<u64> {
+    let v = v.trim();
+    if let Some(m) = v.strip_suffix('m') {
+        return m.parse().ok();
+    }
+    let (whole, frac) = v.split_once('.').unwrap_or((v, ""));
+    if frac.len() > 3 || (whole.is_empty() && frac.is_empty()) {
+        return None;
+    }
+    let whole: u64 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
+    let frac: u64 = if frac.is_empty() { 0 } else { format!("{frac:0<3}").parse().ok()? };
+    Some(whole * 1000 + frac)
+}
+
+/// Upstream's default hard eviction for memory (`memory.available<100Mi`),
+/// held back from allocatable as upstream does; the kubelet's own
+/// MemoryPressure uses the same line.
+pub const EVICTION_MEMORY_BYTES: u64 = 100 << 20;
+
+/// Allocatable, upstream's way (#24): capacity − system-reserved −
+/// kube-reserved − the hard-eviction threshold (memory 100Mi, nodefs 10%).
+pub struct Allocatable {
+    pub cpu: String,
+    pub memory_ki: u64,
+    pub ephemeral_ki: u64,
+}
+
+pub fn allocatable(cpus: u64, memory_ki: u64, ephemeral_ki: u64, reserved: &Reserved) -> Allocatable {
+    let cpu_milli = (cpus * 1000).saturating_sub(reserved.cpu_milli);
+    let cpu = if cpu_milli % 1000 == 0 { (cpu_milli / 1000).to_string() } else { format!("{cpu_milli}m") };
+    let memory_ki = memory_ki.saturating_sub((reserved.memory_bytes + EVICTION_MEMORY_BYTES).div_ceil(1024));
+    let ephemeral_ki = ephemeral_ki
+        .saturating_sub(reserved.ephemeral_bytes.div_ceil(1024))
+        .saturating_sub(ephemeral_ki / 10);
+    Allocatable { cpu, memory_ki, ephemeral_ki }
 }
 
 /// `nodeInfo.kernelVersion`: `uname -r` (#78). The kernel is the node's,
@@ -856,6 +948,39 @@ fn statvfs_bytes(_path: &str) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #24: upstream's flag spelling; pid and unknown resources refused.
+    #[test]
+    fn reservations_parse_upstreams_spelling() {
+        assert_eq!(Reserved::parse("").unwrap(), Reserved::default());
+        let r = Reserved::parse("cpu=500m, memory=1Gi,ephemeral-storage=2G").unwrap();
+        assert_eq!(r, Reserved { cpu_milli: 500, memory_bytes: 1 << 30, ephemeral_bytes: 2_000_000_000 });
+        assert_eq!(Reserved::parse("cpu=1.5").unwrap().cpu_milli, 1500);
+        assert_eq!(Reserved::parse("cpu=2").unwrap().cpu_milli, 2000);
+        assert!(Reserved::parse("pid=1000").unwrap_err().contains("pid"));
+        assert!(Reserved::parse("memory").is_err());
+        assert!(Reserved::parse("memory=lots").is_err());
+    }
+
+    /// #24: allocatable is capacity less both reservations and the hard
+    /// eviction line; a reporter applies it.
+    #[test]
+    fn allocatable_takes_off_the_reservations_and_eviction() {
+        let sys = Reserved::parse("cpu=500m,memory=1Gi").unwrap();
+        let kube = Reserved::parse("cpu=500m,memory=512Mi,ephemeral-storage=1Gi").unwrap();
+        let a = allocatable(4, 8 << 20, 100 << 20, &sys.plus(&kube));
+        assert_eq!(a.cpu, "3");
+        assert_eq!(a.memory_ki, (8 << 20) - (1 << 20) - (512 << 10) - (100 << 10));
+        assert_eq!(a.ephemeral_ki, (100 << 20) - (1 << 20) - (10 << 20));
+        assert_eq!(allocatable(4, 1 << 20, 0, &Reserved::parse("cpu=250m").unwrap()).cpu, "3750m");
+        // Nothing reserved: only the eviction line.
+        let none = allocatable(2, 4 << 20, 0, &Reserved::default());
+        assert_eq!((none.cpu.as_str(), none.memory_ki), ("2", (4 << 20) - (100 << 10)));
+
+        let st = NodeReporter::new("http://x", "n1").with_reserved(Reserved::parse("cpu=1").unwrap()).build_status(&[]);
+        let cap: u64 = st["capacity"]["cpu"].as_str().unwrap().parse().unwrap();
+        assert_eq!(st["allocatable"]["cpu"], json!((cap - 1).to_string()));
+    }
 
     /// #23: the 1.36 posture; no kubeProxyVersion (removed in 1.33).
     #[test]

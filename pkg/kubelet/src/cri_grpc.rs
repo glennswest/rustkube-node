@@ -31,6 +31,9 @@ pub struct CriGrpcClient {
     runtime: RuntimeServiceClient<Channel>,
     images: ImageServiceClient<Channel>,
     socket_path: String,
+    /// How the runtime names cgroups (#24), for each sandbox's cgroup parent.
+    /// Set once at startup by [`CriGrpcClient::resolve_cgroup_driver`].
+    cgroup_driver: std::sync::RwLock<crate::cgroups::CgroupDriver>,
 }
 
 impl CriGrpcClient {
@@ -65,7 +68,56 @@ impl CriGrpcClient {
             runtime: RuntimeServiceClient::new(channel.clone()),
             images: ImageServiceClient::new(channel),
             socket_path: path,
+            cgroup_driver: Default::default(),
         }
+    }
+
+    /// The cgroup driver, settled once at startup (#24): the runtime's, when
+    /// it answers `RuntimeConfig` (upstream's way since 1.36; a `--cgroup-driver`
+    /// that disagrees is ignored, said in the log), else `flag`, else cgroupfs.
+    pub async fn resolve_cgroup_driver(
+        &self,
+        flag: Option<crate::cgroups::CgroupDriver>,
+    ) -> crate::cgroups::CgroupDriver {
+        use crate::cgroups::CgroupDriver;
+        let said = match self.runtime.clone().runtime_config(proto::RuntimeConfigRequest {}).await {
+            Ok(r) => r.into_inner().linux.map(|l| {
+                if l.cgroup_driver == proto::CgroupDriver::Cgroupfs as i32 {
+                    CgroupDriver::Cgroupfs
+                } else {
+                    CgroupDriver::Systemd
+                }
+            }),
+            Err(e) => {
+                info!("the runtime does not say its cgroup driver ({}: {})", e.code(), e.message());
+                None
+            }
+        };
+        let driver = match (said, flag) {
+            (Some(rt), Some(f)) if rt != f => {
+                tracing::warn!(
+                    "--cgroup-driver={} ignored: the runtime uses {}",
+                    f.as_str(),
+                    rt.as_str()
+                );
+                rt
+            }
+            (Some(rt), _) => rt,
+            (None, Some(f)) => f,
+            (None, None) => CgroupDriver::default(),
+        };
+        info!("cgroup driver: {}", driver.as_str());
+        *self.cgroup_driver.write().unwrap_or_else(|e| e.into_inner()) = driver;
+        driver
+    }
+
+    fn sandbox_config(&self, config: &PodSandboxConfig) -> proto::PodSandboxConfig {
+        let driver = *self.cgroup_driver.read().unwrap_or_else(|e| e.into_inner());
+        let mut out = to_proto_sandbox_config(config);
+        if let Some(linux) = out.linux.as_mut() {
+            linux.cgroup_parent = crate::cgroups::pod_cgroup_parent(driver, &config.qos_class, &config.uid);
+        }
+        out
     }
 }
 
@@ -394,7 +446,7 @@ impl RuntimeService for CriGrpcClient {
             .runtime
             .clone()
             .run_pod_sandbox(proto::RunPodSandboxRequest {
-                config: Some(to_proto_sandbox_config(config)),
+                config: Some(self.sandbox_config(config)),
                 runtime_handler: String::new(),
             })
             .await
@@ -505,7 +557,7 @@ impl RuntimeService for CriGrpcClient {
             .create_container(proto::CreateContainerRequest {
                 pod_sandbox_id: sandbox_id.to_string(),
                 config: Some(to_proto_container_config(config)),
-                sandbox_config: Some(to_proto_sandbox_config(sandbox_config)),
+                sandbox_config: Some(self.sandbox_config(sandbox_config)),
             })
             .await
             .map_err(rpc_err)?

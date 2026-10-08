@@ -125,6 +125,22 @@ struct Cli {
     #[arg(long, env = "MAX_PODS", default_value_t = kubelet::node_status::DEFAULT_MAX_PODS)]
     max_pods: u32,
 
+    /// Held back from Pods for the OS (#24): `cpu=500m,memory=1Gi,ephemeral-storage=1Gi`.
+    /// Allocatable is capacity less this, `--kube-reserved` and the hard
+    /// eviction line (memory 100Mi, nodefs 10%).
+    #[arg(long = "system-reserved", env = "SYSTEM_RESERVED", default_value = "")]
+    system_reserved: String,
+
+    /// Held back from Pods for the node's own components (#24); as `--system-reserved`.
+    #[arg(long = "kube-reserved", env = "KUBE_RESERVED", default_value = "")]
+    kube_reserved: String,
+
+    /// The runtime's cgroup driver, for a Pod's cgroup parent on `--runtime cri`
+    /// (#24). The runtime's own answer (CRI RuntimeConfig) wins, as since 1.36;
+    /// this is the fallback, else cgroupfs. Not used by other runtimes.
+    #[arg(long = "cgroup-driver", env = "CGROUP_DRIVER", value_parser = ["systemd", "cgroupfs"])]
+    cgroup_driver: Option<String>,
+
     /// Port for the kubelet's inbound HTTP server (/healthz, /metrics, /pods).
     #[arg(long, env = "KUBELET_PORT", default_value_t = 10250)]
     kubelet_port: u16,
@@ -423,6 +439,9 @@ async fn main() -> anyhow::Result<()> {
             let socket = cli.cri_socket.clone().unwrap_or_else(detect_cri_socket);
             tracing::info!("kubelet using CRI runtime via gRPC ({})", socket);
             let rt = Arc::new(CriGrpcClient::new(&socket));
+            // Each sandbox's cgroup parent in the runtime's spelling (#24).
+            rt.resolve_cgroup_driver(cli.cgroup_driver.as_deref().and_then(kubelet::cgroups::CgroupDriver::parse))
+                .await;
             let mig = rt.clone() as Arc<dyn kubelet::cri::MigrationService>;
             (rt.clone() as _, rt as _, mig)
         }
@@ -514,6 +533,20 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
+    // Unparseable reservations stop the kubelet (#24): a node that reports
+    // more allocatable than it was told to keep is overcommitted by surprise.
+    let reserved = {
+        let parse = |flag: &str, v: &str| {
+            kubelet::node_status::Reserved::parse(v).map_err(|e| anyhow::anyhow!("{flag}: {e}"))
+        };
+        parse("--system-reserved", &cli.system_reserved)?.plus(&parse("--kube-reserved", &cli.kube_reserved)?)
+    };
+    if cli.runtime != "cri" {
+        if let Some(d) = &cli.cgroup_driver {
+            tracing::info!("--cgroup-driver={d} is not used by --runtime {} (only a CRI runtime takes a cgroup parent)", cli.runtime);
+        }
+    }
+
     let config = KubeletConfig {
         node_name,
         api_server_url,
@@ -528,6 +561,7 @@ async fn main() -> anyhow::Result<()> {
         },
         kubelet_port: cli.kubelet_port,
         max_pods: cli.max_pods,
+        reserved,
         apiserver_ca,
         bearer_token,
         client_cert,

@@ -5484,6 +5484,7 @@ fn build_sandbox_config(pod: &Value) -> PodSandboxConfig {
         // is the inconsistency that shows up as a denial on the shared
         // resource rather than on the container that was actually relabelled.
         selinux_options: parse_selinux_options(&pod["spec"]["securityContext"]),
+        qos_class: qos_class(pod).to_string(),
     }
 }
 
