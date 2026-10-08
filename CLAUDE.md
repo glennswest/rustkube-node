@@ -57,7 +57,7 @@ by #51.
 
 ## Work plan
 
-### In progress: #105, an admin credential for the engine's destructive verbs
+### Done: #105, an admin credential for the engine's destructive verbs
 
 2026-10-08. stormblock#274 gates DELETE of templates and sealed volumes (and array/slab verbs) behind the admin
 token or a Kubernetes bearer allowed by SubjectAccessReview; the kubelet's one such call is #140's template rebuild.
@@ -67,7 +67,9 @@ among them (stormcos#368 will enforce).
        non-GET still 401 after the node token's reread → once with the admin credential, read at each use. Tests (3:
        distinct tokens + rotation + GET not escalated; missing then provided, stale refused once; single token).
        Docs (README, configuration.md), CHANGELOG (6cf96e1).
-2. [ ] sc-build; stormcos issue (kubelet SA token, `STORMBLOCK_ADMIN_TOKEN_FILE`, before #368); golden; close.
+2. [x] SC_BUILD_VM sc-build 6cf96e1 `cargo build --locked && cargo test --locked`: 423 kubelet unit pass (3 new).
+       stormcos#402 filed (kubelet SA token + `STORMBLOCK_ADMIN_TOKEN_FILE`, before #368). Stage golden
+       golden-rustkube-node-dc81277f6b12 (stormcos#366). Closed. Live check is stormcos#402/#368's audit log.
 
 ### Closed: #142 (P3), the kubelet's own NVMe/TCP connect: not planned
 
