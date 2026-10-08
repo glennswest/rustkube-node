@@ -2640,3 +2640,69 @@ mod init_condition_tests {
         assert!(nanos_to_rfc3339(1_789_000_000_000_000_000).is_string());
     }
 }
+
+#[cfg(test)]
+mod stormd_event_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// #215: a stormd event is created once; read again (a kubelet restart,
+    /// stormd bumping its count) the existing Event is patched, not doubled.
+    #[tokio::test]
+    async fn a_stormd_event_is_created_then_patched() {
+        let seen: Arc<Mutex<Vec<(String, Value)>>> = Arc::default();
+        let store: Arc<Mutex<std::collections::HashSet<String>>> = Arc::default();
+        let (s1, s2, st1) = (seen.clone(), seen.clone(), store.clone());
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/namespaces/kube-system/events",
+                axum::routing::post(move |axum::Json(b): axum::Json<Value>| {
+                    let (seen, store) = (s1.clone(), st1.clone());
+                    async move {
+                        seen.lock().unwrap().push(("POST".into(), b.clone()));
+                        let name = b["metadata"]["name"].as_str().unwrap().to_string();
+                        if store.lock().unwrap().insert(name) {
+                            axum::http::StatusCode::CREATED
+                        } else {
+                            axum::http::StatusCode::CONFLICT
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/namespaces/kube-system/events/{name}",
+                axum::routing::patch(move |axum::Json(b): axum::Json<Value>| {
+                    let seen = s2.clone();
+                    async move {
+                        seen.lock().unwrap().push(("PATCH".into(), b));
+                        axum::http::StatusCode::OK
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let pod = serde_json::json!({"metadata": {"name": "fastetcd-n1", "uid": "u-1"}});
+        let e = crate::stormd_api::StormdEvent {
+            kind: "Warning".into(),
+            reason: "BackOff".into(),
+            message: "Back-off restarting failed container fastetcd".into(),
+            process: "fastetcd".into(),
+            count: 1,
+            first: "2026-10-08T21:13:23Z".into(),
+            last: "2026-10-08T21:13:23Z".into(),
+            seq: 4,
+        };
+        let client = reqwest::Client::new();
+        assert!(write_event(&client, &url, &crate::stormd_api::event_object(&pod, "fastetcd", "n1", &e)).await);
+        let bumped = crate::stormd_api::StormdEvent { count: 5, last: "2026-10-08T21:15:00Z".into(), seq: 9, ..e };
+        assert!(write_event(&client, &url, &crate::stormd_api::event_object(&pod, "fastetcd", "n1", &bumped)).await);
+        let seen = seen.lock().unwrap();
+        let kinds: Vec<&str> = seen.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(kinds, ["POST", "POST", "PATCH"]);
+        assert_eq!(seen[0].1["involvedObject"]["uid"], "u-1");
+        assert_eq!(seen[2].1["count"], 5);
+        assert_eq!(seen[2].1["lastTimestamp"], "2026-10-08T21:15:00Z");
+    }
+}
