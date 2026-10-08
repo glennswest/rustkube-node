@@ -47,7 +47,7 @@ forwards the value as given.
 Log query options: `follow`, `previous`, `tailLines`, `sinceSeconds`,
 `sinceTime`, `timestamps`, `limitBytes`. Waiting containers return 400 with
 their reason. stormd mirror logs are discovered through boot-unit log mounts;
-`previous` selects the newest failed-run log; non-stormd services read PID 1's
+`previous` selects the newest finished run, failed or exited (upstream's last terminated instance, #216; it was failed runs only, #72); non-stormd services read PID 1's
 run files (#87); a completed init container's log is kept (#47).
 
 A line loses its time, stream and tag only when it carries them (#136): CRI

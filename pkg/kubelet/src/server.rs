@@ -1389,7 +1389,8 @@ async fn container_logs(
 /// ([`crate::node_logs`]), else what PID 1 kept of its last exit (#124).
 ///
 /// The current run is every process stormd runs there, rotations included,
-/// merged in time order. `previous` is the newest failed run. `follow` polls
+/// merged in time order. `previous` is the newest finished run, failed or
+/// exited, as upstream (#216). `follow` polls
 /// the live files, as for a pod, until the directory goes or the client hangs
 /// up; a line written in the instant between a poll and a rotation is missed.
 ///
@@ -1414,7 +1415,7 @@ async fn node_service_logs(
     let back = opts.runs_back().unwrap_or(0);
     if back > 0 {
         // stormd's failed runs, newest first (#131: N back).
-        if let Some(file) = log_dir.as_deref().and_then(|d| node_logs::failed_run(d, back)) {
+        if let Some(file) = log_dir.as_deref().and_then(|d| node_logs::finished_run(d, back)) {
             return match std::fs::read_to_string(&file) {
                 Ok(t) => (StatusCode::OK, cap(filter_log(&t, &opts), &mut budget)).into_response(),
                 Err(e) => (StatusCode::NOT_FOUND, format!("cannot read {}: {e}\n", file.display()))
@@ -1437,7 +1438,7 @@ async fn node_service_logs(
         return (
             StatusCode::BAD_REQUEST,
             format!(
-                "container {container} has no previous failed run: {}\n",
+                "container {container} has no previous run: {}\n",
                 node_service_sources(log_dir.as_deref(), record.as_ref())
             ),
         )

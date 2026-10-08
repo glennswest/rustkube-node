@@ -121,7 +121,7 @@ enum Kind {
     /// `<proc>.<run>.failed.log`
     Failed(String),
     /// `<proc>.<run>.exited.log`
-    Exited,
+    Exited(String),
 }
 
 /// A file name, as a process and what the file is.
@@ -139,7 +139,9 @@ fn classify(name: &str) -> Option<(String, Kind)> {
         [p @ .., run, "failed"] if !p.is_empty() => {
             Some((p.join("."), Kind::Failed((*run).to_string())))
         }
-        [p @ .., _, "exited"] if !p.is_empty() => Some((p.join("."), Kind::Exited)),
+        [p @ .., run, "exited"] if !p.is_empty() => {
+            Some((p.join("."), Kind::Exited((*run).to_string())))
+        }
         _ => None,
     }
 }
@@ -185,23 +187,25 @@ pub fn live_files(dir: &Path) -> Vec<(String, PathBuf)> {
         .collect()
 }
 
-/// The newest failed run of any process: what `--previous` reads.
+/// The newest finished run of any process: what `--previous` reads.
 ///
 /// Run ids are UTC timestamps (`20260825T115009`), so the largest is the
-/// newest. A clean exit is not a previous run worth reading here: the owner's
-/// ask (#72) is the last run that failed.
-pub fn previous_failed(dir: &Path) -> Option<PathBuf> {
-    failed_run(dir, 1)
+/// newest. Failed or exited: upstream's `--previous` is the last terminated
+/// instance, whatever its exit, and the owner's per-container logs rule
+/// (#216, stormconsole#124) asks for it the same way for node services. Until
+/// #216 this was the last *failed* run only (#72).
+pub fn previous_run(dir: &Path) -> Option<PathBuf> {
+    finished_run(dir, 1)
 }
 
-/// The failed run `back` runs back, newest first (1 = [`previous_failed`]),
+/// The finished run `back` runs back, newest first (1 = [`previous_run`]),
 /// for `previous=N` (#131).
-pub fn failed_run(dir: &Path, back: usize) -> Option<PathBuf> {
+pub fn finished_run(dir: &Path, back: usize) -> Option<PathBuf> {
     let mut failed: Vec<_> = std::fs::read_dir(dir)
         .ok()?
         .flatten()
         .filter_map(|e| match classify(e.file_name().to_str()?) {
-            Some((_, Kind::Failed(run))) => Some((run, e.path())),
+            Some((_, Kind::Failed(run) | Kind::Exited(run))) => Some((run, e.path())),
             _ => None,
         })
         .collect();
@@ -431,7 +435,7 @@ spec    rustkube-node
             classify("etcd.20260825T120000.failed.log"),
             Some(("etcd".into(), Kind::Failed("20260825T120000".into())))
         );
-        assert_eq!(classify("etcd.20260825T100000.exited.log"), Some(("etcd".into(), Kind::Exited)));
+        assert_eq!(classify("etcd.20260825T100000.exited.log"), Some(("etcd".into(), Kind::Exited("20260825T100000".into()))));
         assert_eq!(classify(".cloudid"), None);
         assert_eq!(classify("notes.txt"), None);
     }
@@ -476,15 +480,18 @@ spec    rustkube-node
     }
 
     #[test]
-    fn previous_is_the_newest_failed_run_not_a_clean_exit() {
+    fn previous_is_the_newest_finished_run_failed_or_exited() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
-        assert_eq!(previous_failed(d), None);
+        assert_eq!(previous_run(d), None);
         std::fs::write(d.join("etcd.20260827T000000.failed.log"), "old\n").unwrap();
         std::fs::write(d.join("etcd.20260828T000000.failed.log"), "new\n").unwrap();
-        std::fs::write(d.join("etcd.20260829T000000.exited.log"), "clean\n").unwrap();
         std::fs::write(d.join("etcd.log"), "live\n").unwrap();
-        assert_eq!(previous_failed(d), Some(d.join("etcd.20260828T000000.failed.log")));
+        assert_eq!(previous_run(d), Some(d.join("etcd.20260828T000000.failed.log")));
+        // A clean exit is a terminated instance too (#216, upstream).
+        std::fs::write(d.join("etcd.20260829T000000.exited.log"), "clean\n").unwrap();
+        assert_eq!(previous_run(d), Some(d.join("etcd.20260829T000000.exited.log")));
+        assert_eq!(finished_run(d, 2), Some(d.join("etcd.20260828T000000.failed.log")));
     }
 
     /// #131: `previous=N` walks the failed runs back, newest first; past the
@@ -496,10 +503,10 @@ spec    rustkube-node
         for t in ["20260826", "20260827", "20260828"] {
             std::fs::write(d.join(format!("etcd.{t}T000000.failed.log")), t).unwrap();
         }
-        assert_eq!(failed_run(d, 1), Some(d.join("etcd.20260828T000000.failed.log")));
-        assert_eq!(failed_run(d, 3), Some(d.join("etcd.20260826T000000.failed.log")));
-        assert_eq!(failed_run(d, 4), None);
-        assert_eq!(failed_run(d, 0), None);
+        assert_eq!(finished_run(d, 1), Some(d.join("etcd.20260828T000000.failed.log")));
+        assert_eq!(finished_run(d, 3), Some(d.join("etcd.20260826T000000.failed.log")));
+        assert_eq!(finished_run(d, 4), None);
+        assert_eq!(finished_run(d, 0), None);
 
         let json = r#"{"assets":[{"name":"registry","running":true,"runs":[
             {"started_at":1,"ended_at":2,"log":"w1.log"},
