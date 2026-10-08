@@ -57,6 +57,21 @@ by #51.
 
 ## Work plan
 
+### In progress: #211 (P1), every remote call retries (code review)
+
+2026-10-08. Owner: "sounds like it doesn't retry … needs a code review". Inventory: ~90 call sites; apiserver
+(raw reqwest in each module, 30 s timeout, no retry: the reconcile pass is the only retry), stormblock engine (one
+choke point, `EngineClient::send_within`, retries only a 401 token re-read), registry (stormpump_runtime image service),
+stormdrive (pv_placement), CSI/CRI gRPC (local sockets), probes (must not retry), watches (own reconnect loops),
+kube-proxy's apiserver client, the test container's `Api`.
+1. [ ] `pkg/retry` crate (shared by kubelet, proxy, test): `Policy` (attempts, first/max delay, deadline; API, ENGINE,
+       REGISTRY, PEER, LOCAL), `Class` Infra|Real (408/429/500/502/503/504, timeout/connect/reset = infra), `send`
+       (reqwest; GET/PUT/DELETE/PATCH repeat, POST only when never sent or 429; `send_repeatable` for named
+       creates/reviews), `with_backoff` (generic), Retry-After, jitter, attempts logged. Lock entries by hand.
+2. [ ] Route every site through it; a site that must not retry says why in a comment.
+3. [ ] docs/retries.md (every site, before/after), README/CHANGELOG; tests (fake fails N then succeeds per policy).
+4. [ ] sc-build, close.
+
 ### Waiting on stormvm#82 (after stormpump#123): #210, git dependencies pinned by rev (stormcentral#571's SBOM refusal)
 
 2026-10-08. stormcentral's `sbom` reads `cargo metadata` and refuses any resolved git package whose source has no
