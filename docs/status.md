@@ -76,7 +76,6 @@ Each gap has an owning issue. These are limitations, not supported features.
 | End-to-end legacy microVM Pods | [#13](https://github.com/glennswest/rustkube-node/issues/13) |
 | Successful init-container log retention (restartable init sidecars are served since #111) | [#47](https://github.com/glennswest/rustkube-node/issues/47) |
 | Missing configured credentials fail closed; client certificate reload | [#69](https://github.com/glennswest/rustkube-node/issues/69), [#89](https://github.com/glennswest/rustkube-node/issues/89), [#77](https://github.com/glennswest/rustkube-node/issues/77) |
-| Explicit default-valued apiserver flag overriding kubeconfig | [#113](https://github.com/glennswest/rustkube-node/issues/113) |
 | Destructive engine calls with a separate admin token | [#105](https://github.com/glennswest/rustkube-node/issues/105) |
 | Tunable reservations/cgroup-driver (max-pods is `--max-pods` since #165) | [#24](https://github.com/glennswest/rustkube-node/issues/24) |
 | Subsecond startup measured on a node; a stormpump exit routed to its own UID; CRI container events instead of the `sync_interval` fallback | [#95](https://github.com/glennswest/rustkube-node/issues/95), [#99](https://github.com/glennswest/rustkube-node/issues/99), [#115](https://github.com/glennswest/rustkube-node/issues/115), [#116](https://github.com/glennswest/rustkube-node/issues/116) |

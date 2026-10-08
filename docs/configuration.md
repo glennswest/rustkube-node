@@ -13,7 +13,7 @@ An em dash means there is no environment binding or the value is unset.
 
 | Flag | Environment | Default / behavior |
 |---|---|---|
-| `--apiserver` | `APISERVER_URL` | `http://127.0.0.1:6443`; kubeconfig server may replace this default |
+| `--apiserver` | `APISERVER_URL` | Unset: the kubeconfig's server, else `http://127.0.0.1:6443`. Given, it wins over the kubeconfig, whatever its value (#113) |
 | `--node-name` | `NODE_NAME` | Detect NODE_NAME, HOSTNAME, system hostname, then `localhost` |
 | `--pod-cidr` | `POD_CIDR` | Unset; when set writes Node spec.podCIDR |
 | `--node-labels` | `NODE_LABELS` | Empty; comma-separated `key=value`. With the stormpump engine the kubelet also writes `storm.io/kvm` and `kubevirt.io/schedulable` itself, from whether KVM is there (#65) |
@@ -100,12 +100,12 @@ no plugin wiring: loopback only, no address. The help text says so since #3; use
 
 ### Credential precedence and failure behavior
 
-Kubeconfig load errors are fatal. A non-default apiserver argument wins over
-kubeconfig; an argument equal to `http://127.0.0.1:6443` is indistinguishable
-from the default, so kubeconfig still wins in that case (#113). Readable explicit
-credential files override kubeconfig values. Client cert/key/token read errors
-warn and fall back to kubeconfig, or leave credentials absent (#69).
-Client credentials are read at startup and not reloaded (#77).
+Kubeconfig load errors are fatal. A given `--apiserver` (flag or
+`APISERVER_URL`) wins over the kubeconfig's server, even when it is
+`http://127.0.0.1:6443`; only when neither is given is that the default (#113).
+Explicit credential files override kubeconfig values; a named one that is
+missing is waited for, then fatal (#69, above). With a CA and verification on,
+the client pair is reloaded when renewed (#77).
 An explicitly named CA is retried every 500 ms for up to 60 seconds; failure
 is fatal. This wait does not apply to every credential file.
 

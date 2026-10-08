@@ -2,6 +2,9 @@
 
 ## 2026-10-08
 
+- **fix:** A given `--apiserver` / `APISERVER_URL` wins over the kubeconfig's server even when it equals the default
+  `http://127.0.0.1:6443` (#113). The flag has no clap default any more; precedence is decided by whether it was
+  given (given → kubeconfig server → default), not by comparing its value with the default.
 - **fix:** The Node's `nodeInfo` carries `kernelVersion` (`/proc/sys/kernel/osrelease`), `bootID`
   (`/proc/sys/kernel/random/boot_id`), `machineID` (the node's `/etc/machine-id` at `/hostroot` first) and
   `systemUUID` (`/sys/class/dmi/id/product_uuid`), each `""` only when its file is absent (#78). They were always

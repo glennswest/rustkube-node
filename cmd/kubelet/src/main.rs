@@ -18,9 +18,11 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(name = "kubelet", about = "Kubernetes node agent (Rust)")]
 struct Cli {
-    /// API server URL to register with.
-    #[arg(long, env = "APISERVER_URL", default_value = "http://127.0.0.1:6443")]
-    apiserver: String,
+    /// API server URL to register with. Given (flag or env), it wins over a
+    /// kubeconfig's server; otherwise the kubeconfig's, else
+    /// http://127.0.0.1:6443 (#113).
+    #[arg(long, env = "APISERVER_URL")]
+    apiserver: Option<String>,
 
     /// Node name (defaults to hostname).
     #[arg(long, env = "NODE_NAME")]
@@ -228,6 +230,16 @@ fn token_text(bytes: Vec<u8>) -> anyhow::Result<String> {
 
 const DEFAULT_APISERVER: &str = "http://127.0.0.1:6443";
 
+/// The apiserver URL (#113): a given `--apiserver` / `APISERVER_URL` wins over
+/// the kubeconfig's server, which wins over [`DEFAULT_APISERVER`]. Decided by
+/// whether the flag was given, not by its value, so an explicit URL equal to
+/// the default still overrides the kubeconfig.
+fn api_server_url(given: Option<String>, kubeconfig_server: Option<String>) -> String {
+    given
+        .or(kubeconfig_server)
+        .unwrap_or_else(|| DEFAULT_APISERVER.to_string())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -244,7 +256,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         "kubelet starting — node={node_name} runtime={} apiserver={}",
         cli.runtime,
-        cli.apiserver
+        cli.apiserver.as_deref().unwrap_or("(kubeconfig, else the default)")
     );
 
     // Standard CNI for the native/VM-fallback runtimes. Cilium is the expected
@@ -482,14 +494,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Explicit --apiserver wins over kubeconfig's server, which wins over the default.
-    let api_server_url = if cli.apiserver != DEFAULT_APISERVER {
-        cli.apiserver
-    } else {
-        kubeconfig
-            .as_ref()
-            .and_then(|k| k.server.clone())
-            .unwrap_or(cli.apiserver)
-    };
+    let api_server_url = api_server_url(
+        cli.apiserver.clone(),
+        kubeconfig.as_ref().and_then(|k| k.server.clone()),
+    );
     let insecure_skip_tls_verify = cli.insecure_skip_tls_verify
         || kubeconfig
             .as_ref()
@@ -571,6 +579,26 @@ mod tests {
         let d = std::env::temp_dir().join(format!("kubelet-main-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// #113: whether `--apiserver` was given decides, not its value.
+    #[test]
+    fn a_given_apiserver_wins_over_the_kubeconfig_even_at_the_default() {
+        let kc = || Some("https://10.0.0.5:6443".to_string());
+        // Omitted: the kubeconfig's server, else the default.
+        assert_eq!(api_server_url(None, kc()), "https://10.0.0.5:6443");
+        assert_eq!(api_server_url(None, None), DEFAULT_APISERVER);
+        // Given, not the default.
+        assert_eq!(api_server_url(Some("https://api:6443".into()), kc()), "https://api:6443");
+        // Given, equal to the default: still given.
+        assert_eq!(api_server_url(Some(DEFAULT_APISERVER.into()), kc()), DEFAULT_APISERVER);
+
+        // And the CLI keeps "not given" apart from "given the default".
+        if std::env::var_os("APISERVER_URL").is_none() {
+            assert_eq!(Cli::try_parse_from(["kubelet"]).unwrap().apiserver, None);
+        }
+        let given = Cli::try_parse_from(["kubelet", "--apiserver", DEFAULT_APISERVER]).unwrap();
+        assert_eq!(given.apiserver.as_deref(), Some(DEFAULT_APISERVER));
     }
 
     #[tokio::test]
