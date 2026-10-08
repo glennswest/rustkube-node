@@ -141,7 +141,7 @@ pub fn mtu_in_netns(netns: &str, ifname: &str) -> Option<u32> {
             *d = *s as libc::c_char;
         }
         // SAFETY: SIOCGIFMTU fills ifr_ifru.ifru_mtu of the ifreq passed.
-        let rc = unsafe { libc::ioctl(sock, libc::SIOCGIFMTU, &mut req) };
+        let rc = unsafe { libc::ioctl(sock, libc::SIOCGIFMTU as _, &mut req) };
         let mtu = unsafe { req.ifr_ifru.ifru_mtu };
         unsafe { libc::close(sock) };
         (rc == 0 && mtu > 0).then_some(mtu as u32)
