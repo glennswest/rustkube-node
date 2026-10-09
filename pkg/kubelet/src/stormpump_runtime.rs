@@ -2161,6 +2161,58 @@ fn golden_reference(record: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
 
+    /// #233: extra networks are added in order, each on its interface with
+    /// what the pod asked for; DEL takes them last-first, then the default.
+    #[tokio::test]
+    async fn extra_networks_are_added_in_order_and_deleted_in_reverse() {
+        use std::os::unix::fs::PermissionsExt;
+        let conf = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        std::fs::write(conf.path().join("05-default.conflist"), r#"{"cniVersion":"1.0.0","name":"podnet","plugins":[{"type":"podnet"}]}"#).unwrap();
+        // Each plugin logs its command, interface and runtimeConfig.
+        for t in ["podnet", "bridge", "macvlan"] {
+            let script = format!(
+                "#!/bin/sh\nin=$(cat)\nrc=$(printf '%s' \"$in\" | grep -o '\"runtimeConfig\":{{[^}}]*}}' || true)\necho \"{t} $CNI_COMMAND $CNI_IFNAME $rc\" >> {dir}/calls\nprintf '%s' '{{\"cniVersion\":\"1.0.0\",\"ips\":[{{\"address\":\"10.9.0.2/24\"}}]}}'\n",
+                dir = bin.path().display()
+            );
+            let p = bin.path().join(t);
+            std::fs::write(&p, script).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let invoker = cni::CniInvoker::new(conf.path(), vec![bin.path().to_path_buf()]);
+        let rt = StormpumpRuntime::new("/nonexistent");
+        let att = |name: &str, ifname: &str, t: &str| crate::cri::NetworkAttachment {
+            name: name.into(),
+            ifname: ifname.into(),
+            config: format!(r#"{{"cniVersion":"1.0.0","name":"{name}","plugins":[{{"type":"{t}","capabilities":{{"mac":true}}}}]}}"#),
+            ips: vec![],
+            mac: (t == "macvlan").then(|| "02:00:00:00:00:07".to_string()),
+        };
+        let config = PodSandboxConfig {
+            name: "p".into(), namespace: "ns".into(), uid: "u".into(),
+            networks: vec![att("ns/lan", "net1", "bridge"), att("other/storage", "stor0", "macvlan")],
+            ..Default::default()
+        };
+        let base = cni::PodNetwork::new("sb-1", "/proc/1/ns/net", "ns", "p", "u");
+        let results = rt.add_attachments(&invoker, &base, &config).await.unwrap();
+        assert_eq!(results.len(), 2);
+        rt.del_networks(&invoker, "sb-1", "/proc/1/ns/net", &config).await.unwrap();
+        let calls = std::fs::read_to_string(bin.path().join("calls")).unwrap();
+        let lines: Vec<&str> = calls.lines().map(str::trim).collect();
+        assert_eq!(lines, [
+            "bridge ADD net1",
+            r#"macvlan ADD stor0 "runtimeConfig":{"mac":"02:00:00:00:00:07"}"#,
+            r#"macvlan DEL stor0 "runtimeConfig":{"mac":"02:00:00:00:00:07"}"#,
+            "bridge DEL net1",
+            "podnet DEL eth0",
+        ]);
+
+        // A NAD whose config is not one names itself.
+        let bad = PodSandboxConfig { networks: vec![crate::cri::NetworkAttachment { name: "ns/broken".into(), ifname: "net1".into(), config: "{}".into(), ..Default::default() }], ..config };
+        let e = rt.add_attachments(&invoker, &base, &bad).await.unwrap_err();
+        assert!(e.contains("ns/broken") && e.contains("net1"), "{e}");
+    }
+
     /// A failed ADD is followed by DEL, and a DEL that fails keeps the
     /// sandbox until a later one succeeds (#100).
     #[tokio::test]

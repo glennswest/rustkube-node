@@ -7690,6 +7690,47 @@ pub(crate) mod tests {
         None
     }
 
+    /// #233: the networks annotation resolves to its NADs (the pod's namespace
+    /// unless named), ifnames by position unless given; a missing NAD names
+    /// itself; default-network replaces eth0's.
+    #[tokio::test]
+    async fn a_pods_networks_resolve_to_their_nads() {
+        let app = axum::Router::new().fallback(|uri: axum::http::Uri| async move {
+            use axum::http::StatusCode;
+            let p = uri.path().to_string();
+            let nad = |cfg: &str| (StatusCode::OK, axum::Json(json!({"spec": {"config": cfg}})));
+            match p.as_str() {
+                "/apis/k8s.cni.cncf.io/v1/namespaces/default/network-attachment-definitions/lan" => nad(r#"{"cniVersion":"1.0.0","name":"lan","type":"bridge"}"#),
+                "/apis/k8s.cni.cncf.io/v1/namespaces/infra/network-attachment-definitions/storage" => nad(r#"{"cniVersion":"1.0.0","name":"storage","type":"macvlan"}"#),
+                "/apis/k8s.cni.cncf.io/v1/namespaces/kube-system/network-attachment-definitions/vlan248" => nad(r#"{"cniVersion":"1.0.0","name":"vlan248","type":"macvlan"}"#),
+                _ => (StatusCode::NOT_FOUND, axum::Json(json!({}))),
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let rt = Arc::new(FakeRuntime::default());
+        let mgr = PodManager::with_api(rt.clone(), rt, NODE, &url, "127.0.0.1", reqwest::Client::new());
+
+        let pod = |ann: Value| json!({"metadata": {"namespace": "default", "name": "p", "annotations": ann}});
+        let (nets, def) = mgr
+            .resolve_networks(&pod(json!({
+                "k8s.v1.cni.cncf.io/networks": "lan, infra/storage@stor0",
+                "v1.multus-cni.io/default-network": "kube-system/vlan248"})))
+            .await
+            .unwrap();
+        assert_eq!(nets.iter().map(|n| (n.name.as_str(), n.ifname.as_str())).collect::<Vec<_>>(),
+                   [("default/lan", "net1"), ("infra/storage", "stor0")]);
+        assert!(nets[1].config.contains("macvlan"));
+        let def = def.unwrap();
+        assert_eq!((def.name.as_str(), def.ifname.as_str()), ("kube-system/vlan248", "eth0"));
+
+        let e = mgr.resolve_networks(&pod(json!({"k8s.v1.cni.cncf.io/networks": "lan,ghost"}))).await.unwrap_err();
+        assert_eq!(e, "NetworkAttachmentDefinition default/ghost not found");
+        let (none, d) = mgr.resolve_networks(&pod(json!({}))).await.unwrap();
+        assert!(none.is_empty() && d.is_none(), "no annotation: no extra networks");
+    }
+
     /// #71: a filesystem claim of a mirrored class mints the blank for its
     /// size and policy, with the policy, and says the tier is not applied.
     #[tokio::test]
