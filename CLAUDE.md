@@ -496,7 +496,7 @@ Steps:
        #362 fixed: stage golden golden-rustkube-node-0fc1a74fff24 (7df677b = c8256ac code), stormcos#366 (asked the gate for
        the isolation / one-clone / pods-start checks); `stormcentral shipped`. Close #161 as superseded once released.
 
-### In progress: #71 (P2), built-in driver: redundancy / spread / tier from the StorageClass
+### Done: #71 (P2), built-in driver: redundancy / spread / tier from the StorageClass
 
 2026-10-09, resumed. stormblock#151 closed (golden-stormblock-abcd60bee6e2, stormcos#467): `POST /api/v1/fstemplates`
 takes `redundancy` + `spread` (= `@rung`), a clone inherits them, an unplaceable policy is 409 `conflict` (the same
@@ -504,14 +504,18 @@ takes `redundancy` + `spread` (= `@rung`), a clone inherits them, an unplaceable
 stormblock). Volume listing has `redundancy`. Default (nothing named) stays `none` (design's owner decision 2 open,
 engine keeps none). Only the class named `stormblock` is provisioned here (rustkube matches the name too): its
 parameters apply; a second class needs rustkube + #200.
-1. [ ] storage.rs `ClaimPolicy::from_class`: redundancy (none|mirror[:N]|raid1|raid10|raid5:D+1|raid5:N|raid6:D+2|
+1. [x] storage.rs `ClaimPolicy::from_class`: redundancy (none|mirror[:N]|raid1|raid10|raid5:D+1|raid5:N|raid6:D+2|
        raid6:N|parity:D+P, `@rung`), spread (stormblock's rungs), tier (hot|warm|cool|cold); other keys refused except
        `csi.storage.k8s.io/*`. `blank_name(class)` = template name + `-mirror2-shelf` etc.; `overhead()`.
-2. [ ] pod_manager: read the class (checked GET: unreadable = wait, 404 = none) for a new volume; mint/clone the
+2. [x] pod_manager: read the class (checked GET: unreadable = wait, 404 = none) for a new volume; mint/clone the
        policy's blank (`redundancy`/`spread` in the mint body); raw Block volumes get redundancy/spread/tier; a
        refused policy (409 not "exists") = ProvisioningFailed on the PVC; tier on a filesystem claim = Warning Event.
-3. [ ] capacity: a claim charged class × overhead; committed volumes × their `redundancy`; policy blanks are sources.
-4. [ ] Tests, docs (README, csi.md), CHANGELOG; sc-build; golden; close.
+3. [x] capacity: a claim charged class × overhead; committed volumes × their `redundancy`; policy blanks are sources.
+4. [x] Tests (5 new: policy parse/names, capacity, mint body + TierNotApplied, Block policy + tier, unplaceable →
+       ProvisioningFailed / no-class default / unknown parameter), README, CHANGELOG (4dee10f, aa5d2cb, bed74fc).
+       SC_BUILD_VM sc-build aa5d2cb: 470 kubelet unit, all suites pass. Stage golden golden-rustkube-node-0c8d465503ed
+       (stormcos#424; a policy class needs stormblock abcd60bee6e2, stormcos#467). Filed stormblock#377 (tier on
+       blanks), rustkube#261 (provision every stormblock.storm.io class; then #200). Closed.
 
 ### (history) Paused (P0 #104 first): #71 (P2), built-in driver: redundancy / spread / tier from the StorageClass
 
