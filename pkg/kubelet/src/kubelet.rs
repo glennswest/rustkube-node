@@ -2365,21 +2365,25 @@ async fn stormd_poll(
         let assets: Vec<_> = crate::mirror::parse_assets(&text).into_iter().filter(|a| a.running).collect();
         let mut now: std::collections::HashMap<String, Vec<stormd_api::Process>> = Default::default();
         for a in &assets {
-            let base = match endpoints.get(&a.name) {
-                Some(Endpoint::Plain(u)) => u.clone(),
-                Some(Endpoint::Guarded(why)) => {
+            let Some(service) = endpoints.get(&a.name) else { continue };
+            let base = match &service.endpoint {
+                Endpoint::Plain(u) => u.clone(),
+                Endpoint::Guarded(why) => {
                     if said.insert(a.name.clone()) {
                         info!("node service {}: its stormd API is not read ({why}): its mirror shows PID 1's view", a.name);
                     }
                     continue;
                 }
-                None => continue,
             };
             let procs = match http.get(format!("{base}/api/v1/processes")).send().await {
                 Ok(r) if r.status().is_success() => r.json::<Value>().await.ok().map(|v| stormd_api::parse_processes(&v)),
                 _ => None,
             };
-            let Some(procs) = procs.filter(|p| !p.is_empty()) else { continue };
+            let Some(mut procs) = procs.filter(|p| !p.is_empty()) else { continue };
+            // What its config runs once (#226): init-like, never the state.
+            for p in &mut procs {
+                p.one_shot = service.one_shots.contains(&p.name);
+            }
             now.insert(a.name.clone(), procs);
             if api_url.is_empty() {
                 continue;

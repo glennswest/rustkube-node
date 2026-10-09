@@ -324,7 +324,10 @@ pub fn with_stormd(pod: &mut Value, container: &str, p: &crate::stormd_api::Proc
     let not_ready = |c: &mut Value| {
         c["status"] = json!("False");
         c["reason"] = json!("ContainersNotReady");
-        c["message"] = json!(format!("containers with unready status: [{container}]"));
+        c["message"] = json!(match &p.reason {
+            Some(why) => format!("containers with unready status: [{container}]: {why}"),
+            None => format!("containers with unready status: [{container}]"),
+        });
     };
     for c in pod["status"]["conditions"].as_array_mut().into_iter().flatten() {
         if c["type"] == "Ready" || c["type"] == "ContainersReady" {
@@ -881,6 +884,7 @@ mod tests {
             exit_code: Some(137),
             started_at: Some("2026-10-08T21:13:23.5Z".into()),
             stopped_at: Some("2026-10-08T21:13:20Z".into()),
+            ..Default::default()
         };
         let cond = |pod: &Value, t: &str| {
             pod["status"]["conditions"].as_array().unwrap().iter().find(|c| c["type"] == t).unwrap().clone()
@@ -906,6 +910,13 @@ mod tests {
         let r = cond(&unready, "Ready");
         assert_eq!((r["status"].clone(), r["reason"].clone()), (json!("False"), json!("ContainersNotReady")));
         assert_eq!(r["message"], "containers with unready status: [fastetcd]");
+        // With why, when the representative knows it (#226).
+        let mut why = base.clone();
+        with_stormd(&mut why, "fastetcd", &Process { reason: Some("one-shot process init-db failed with exit code 1".into()), ..p("running", false) }, a.restarts);
+        assert_eq!(
+            cond(&why, "Ready")["message"],
+            "containers with unready status: [fastetcd]: one-shot process init-db failed with exit code 1"
+        );
         assert!(!status_current(&pod, &unready), "readiness is a change");
 
         // Backing off.

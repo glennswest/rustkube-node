@@ -132,15 +132,69 @@ pub fn endpoint(config: &str) -> Option<Endpoint> {
     })
 }
 
-/// Every host-network service's stormd endpoint, by asset name.
-pub fn endpoints(root: &Path) -> HashMap<String, Endpoint> {
+/// A service's stormd API and what its config says of its processes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceApi {
+    pub endpoint: Endpoint,
+    /// Processes that run once and finish (#226): `on_exit = "stop"`, or a
+    /// `restart_policy` of `OnFailure` or `Never`. Init-like: they never
+    /// decide the container's state.
+    pub one_shots: Vec<String>,
+}
+
+/// Every host-network service's stormd API, by asset name.
+pub fn endpoints(root: &Path) -> HashMap<String, ServiceApi> {
     host_service_roots(root)
         .into_iter()
         .filter_map(|(name, golden)| {
             let text = std::fs::read_to_string(golden.join("etc/stormd/config.toml")).ok()?;
-            Some((name, endpoint(&text)?))
+            Some((name, ServiceApi { endpoint: endpoint(&text)?, one_shots: one_shots(&text) }))
         })
         .collect()
+}
+
+/// The `[[process]]` names a stormd config runs once (#226): `on_exit =
+/// "stop"` (stormd's one-shot), or `restart_policy` `OnFailure` / `Never`
+/// (stormd#48: a clean exit is not restarted). Read by line, like [`endpoint`].
+pub fn one_shots(config: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current: Option<(String, bool)> = None;
+    let mut in_process = false;
+    let flush = |c: &mut Option<(String, bool)>, out: &mut Vec<String>| {
+        if let Some((name, true)) = c.take() {
+            if !name.is_empty() {
+                out.push(name);
+            }
+        }
+    };
+    for line in config.lines().map(|l| l.split('#').next().unwrap_or("").trim()) {
+        if line.starts_with('[') {
+            if line == "[[process]]" {
+                flush(&mut current, &mut out);
+                current = Some((String::new(), false));
+                in_process = true;
+            } else {
+                // A sub-table (`[process.readiness_probe]`) belongs to the
+                // process above; any other table ends it.
+                in_process = line.starts_with("[process.") || line.starts_with("[[process.");
+                if !in_process {
+                    flush(&mut current, &mut out);
+                }
+            }
+            continue;
+        }
+        let (Some(c), true) = (current.as_mut(), in_process) else { continue };
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let (k, v) = (k.trim(), v.trim().trim_matches('"'));
+        match k {
+            "name" if c.0.is_empty() => c.0 = v.to_string(),
+            "on_exit" if v == "stop" => c.1 = true,
+            "restart_policy" | "restartPolicy" if matches!(v, "OnFailure" | "Never") => c.1 = true,
+            _ => {}
+        }
+    }
+    flush(&mut current, &mut out);
+    out
 }
 
 /// One process, as stormd reports it.
@@ -153,6 +207,10 @@ pub struct Process {
     pub exit_code: Option<i32>,
     pub started_at: Option<String>,
     pub stopped_at: Option<String>,
+    /// Runs once and finishes (its config says so, [`one_shots`]).
+    pub one_shot: bool,
+    /// Why the container is not ready, when [`representative`] knows.
+    pub reason: Option<String>,
 }
 
 /// `GET /api/v1/processes`'s array.
@@ -168,6 +226,8 @@ pub fn parse_processes(v: &Value) -> Vec<Process> {
             exit_code: p["exit_code"].as_i64().map(|c| c as i32),
             started_at: p["started_at"].as_str().map(str::to_string),
             stopped_at: p["stopped_at"].as_str().map(str::to_string),
+            one_shot: false,
+            reason: None,
         })
         .filter(|p| !p.name.is_empty())
         .collect()
@@ -185,18 +245,55 @@ fn badness(state: &str) -> u8 {
     }
 }
 
-/// The process a service's one mirror container stands for: the one named
-/// after the service; else, for a stormd running several, the worst of them,
-/// with every process's restarts and ready only when all are.
+/// Has this process run its course? A declared one-shot, whatever its
+/// state, or any process stopped after a clean exit: init-like, never the
+/// container's state (#226).
+fn finished(p: &Process) -> bool {
+    p.one_shot || (p.state == "stopped" && p.exit_code == Some(0))
+}
+
+/// A one-shot that did not finish cleanly: it failed, or stopped on a non-zero exit.
+fn failed_one_shot(p: &Process) -> bool {
+    p.one_shot && (p.state == "failed" || (p.state == "stopped" && p.exit_code.is_some_and(|c| c != 0)))
+}
+
+/// The process a service's one mirror container stands for (#215, #226).
+///
+/// **The long-running processes decide.** A one-shot (`stormcert-client-*`
+/// minting a certificate, a migration) is init-like: stormd reports it
+/// `stopped` with exit 0 once done, and taking that as the container's state
+/// showed a serving apiserver as `Completed`, 0/1 (12.03). Of the long-running
+/// processes: the one named after the service, else the worst of them; the
+/// restarts are theirs, summed; ready only when every one is. A one-shot that
+/// failed keeps the container not ready, named in `reason`. A service whose
+/// every process has finished shows the last of them.
 pub fn representative(asset: &str, procs: &[Process]) -> Option<Process> {
-    if let Some(p) = procs.iter().find(|p| p.name == asset) {
-        return Some(p.clone());
+    let long: Vec<&Process> = procs.iter().filter(|p| !finished(p)).collect();
+    let failed = procs.iter().find(|p| failed_one_shot(p));
+    if long.is_empty() {
+        let last = failed.or_else(|| procs.iter().max_by(|a, b| a.stopped_at.cmp(&b.stopped_at)))?;
+        return Some(last.clone());
     }
-    let worst = procs.iter().max_by_key(|p| badness(&p.state))?;
+    let base = long
+        .iter()
+        .find(|p| p.name == asset)
+        .or_else(|| long.iter().max_by_key(|p| badness(&p.state)))
+        .copied()?;
+    let unready: Vec<&str> = long.iter().filter(|p| !p.ready).map(|p| p.name.as_str()).collect();
+    let reason = match failed {
+        Some(f) => Some(format!(
+            "one-shot process {} {}",
+            f.name,
+            f.exit_code.map_or_else(|| "failed".to_string(), |c| format!("failed with exit code {c}"))
+        )),
+        None if !unready.is_empty() => Some(format!("process(es) not ready: {}", unready.join(", "))),
+        None => None,
+    };
     Some(Process {
-        ready: procs.iter().all(|p| p.ready),
-        restarts: procs.iter().map(|p| p.restarts).sum(),
-        ..worst.clone()
+        ready: unready.is_empty() && failed.is_none(),
+        restarts: long.iter().map(|p| p.restarts).sum(),
+        reason,
+        ..base.clone()
     })
 }
 
@@ -327,8 +424,10 @@ mod tests {
         ]));
         let r = representative("rustkube-node", &procs).unwrap();
         assert_eq!((r.name.as_str(), r.state.as_str(), r.ready, r.restarts), ("kube-proxy", "CrashLoopBackOff", false, 5));
+        // The named one speaks for the state; readiness and restarts are every
+        // long-running process's (#226).
         let r = representative("kubelet", &procs).unwrap();
-        assert_eq!((r.state.as_str(), r.ready, r.restarts), ("running", true, 1));
+        assert_eq!((r.state.as_str(), r.ready, r.restarts), ("running", false, 5));
         assert_eq!(representative("x", &[]), None);
     }
 
@@ -353,5 +452,76 @@ mod tests {
         // Another process of the same service says which.
         let other = StormdEvent { process: "sidecar".into(), message: "Back-off restarting failed container".into(), ..items[0].clone() };
         assert!(event_object(&pod, "fastetcd", "n1", &other)["message"].as_str().unwrap().ends_with("(process sidecar)"));
+    }
+
+    /// #226, the Dell on 12.03: rustkube-apiserver's stormd runs `apiserver`
+    /// and `stormcert` for good and nine `stormcert-client-*` once. The
+    /// finished ones made the container `Completed`, 0/1, while it served.
+    #[test]
+    fn finished_one_shots_never_decide_the_container() {
+        let mut list = vec![
+            json!({"name": "apiserver", "state": "running", "ready": true, "restarts": 0, "started_at": "2026-10-09T14:31:09Z"}),
+            json!({"name": "stormcert", "state": "running", "ready": true, "restarts": 0}),
+        ];
+        for i in 0..9 {
+            list.push(json!({"name": format!("stormcert-client-{i}"), "state": "stopped", "ready": false, "restarts": 0,
+                "exit_code": 0, "started_at": "2026-10-09T14:31:06Z", "stopped_at": "2026-10-09T14:31:08Z"}));
+        }
+        let procs = parse_processes(&Value::Array(list.clone()));
+        let r = representative("rustkube-apiserver", &procs).unwrap();
+        assert_eq!((r.name.as_str(), r.state.as_str(), r.ready, r.restarts), ("apiserver", "running", true, 0));
+        assert_eq!(r.reason, None);
+
+        // A long-running process not ready: not ready, named.
+        let mut l2 = list.clone();
+        l2[1]["ready"] = json!(false);
+        let r = representative("rustkube-apiserver", &parse_processes(&Value::Array(l2))).unwrap();
+        assert!(!r.ready);
+        assert_eq!(r.reason.as_deref(), Some("process(es) not ready: stormcert"));
+
+        // A declared one-shot that failed keeps it not ready, and says which.
+        let mut procs = parse_processes(&Value::Array(list.clone()));
+        procs[2].exit_code = Some(1);
+        procs[2].state = "failed".into();
+        for p in procs.iter_mut().skip(2) {
+            p.one_shot = true;
+        }
+        let r = representative("rustkube-apiserver", &procs).unwrap();
+        assert_eq!((r.state.as_str(), r.ready), ("running", false));
+        assert_eq!(r.reason.as_deref(), Some("one-shot process stormcert-client-0 failed with exit code 1"));
+
+        // Every process done: the service shows how the last one ended.
+        let done = parse_processes(&Value::Array(list[2..].to_vec()));
+        assert_eq!(representative("x", &done).unwrap().state, "stopped");
+    }
+
+    #[test]
+    fn one_shots_are_read_from_the_stormd_config() {
+        let c = r#"
+[api]
+bind = "0.0.0.0:9082"
+
+[[process]]
+name = "stormcert-client-etcd"
+command = "/usr/bin/stormcert"
+on_exit = "stop"
+
+[[process]]
+name = "apiserver"
+command = "/usr/bin/rustkube-apiserver"
+on_exit = "restart"
+
+[process.readiness_probe]
+http_get = { path = "/readyz", port = 6443 }
+
+[[process]]
+name = "migrate"
+restart_policy = "OnFailure"
+
+[[process]]
+name = "steady"
+restart_policy = "Always"
+"#;
+        assert_eq!(one_shots(c), ["stormcert-client-etcd", "migrate"]);
     }
 }
