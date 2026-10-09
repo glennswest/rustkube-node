@@ -84,6 +84,28 @@ pub fn golden_of(image: &str, cmdline: &str) -> Option<Golden> {
     Some(Golden::Pallet(volume))
 }
 
+/// The pallet path of an image reference (`/pallets/<path>`), if it is one.
+pub fn pallet_path(image: &str) -> Option<&str> {
+    let path = image.strip_prefix(PALLET_ROOT)?.strip_prefix('/')?;
+    (!path.is_empty() && !path.contains('/')).then_some(path)
+}
+
+/// The engine volume mounted at a pallet's path (#231): the one whose
+/// `mounted_at` (on the volume, or on one of its `attachments`) is
+/// `/p/<path>` or `/pallets/<path>`. The engine is the authority on what is
+/// mounted where: since stormcos#259 the mount list is no longer on the kernel
+/// command line, and a pallet whose path is not its volume's name
+/// (`operator-generic` is `cilium-operator`) was looked for under its path.
+pub fn pallet_volume(listing: &Value, path: &str) -> Option<String> {
+    let wanted = [format!("/p/{path}"), format!("{PALLET_ROOT}/{path}")];
+    let at = |v: &Value| v.as_str().is_some_and(|m| wanted.iter().any(|w| w == m));
+    listing["items"].as_array()?.iter().find_map(|v| {
+        let mounted = at(&v["mounted_at"])
+            || v["attachments"].as_array().is_some_and(|a| a.iter().any(|x| at(&x["mounted_at"])));
+        mounted.then(|| v["name"].as_str().map(str::to_string)).flatten()
+    })
+}
+
 /// Which golden to clone for a pallet volume `vol`, from the engine's volume
 /// listing: `<vol>.golden` when it is there and sealed, else `vol`'s sealed
 /// parent. Never `vol` itself: that is the mounted first clone, and cloning
@@ -139,6 +161,9 @@ pub struct Roots {
     url: String,
     node: String,
     cmdline: String,
+    /// Pallet path → engine volume, as the engine said (#231), for the
+    /// container's provenance.
+    pallets: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl Roots {
@@ -148,7 +173,18 @@ impl Roots {
     }
 
     pub fn with_cmdline(engine: crate::engine::EngineClient, node: impl Into<String>, cmdline: String) -> Self {
-        Self { url: engine.url().trim_end_matches('/').to_string(), engine, node: node.into(), cmdline }
+        Self {
+            url: engine.url().trim_end_matches('/').to_string(),
+            engine,
+            node: node.into(),
+            cmdline,
+            pallets: Default::default(),
+        }
+    }
+
+    /// The engine volume a pallet path was last found mounted from (#231).
+    pub fn pallet_volume_of(&self, path: &str) -> Option<String> {
+        self.pallets.lock().unwrap_or_else(|e| e.into_inner()).get(path).cloned()
     }
 
     async fn answer(&self, what: &str, resp: reqwest::Result<reqwest::Response>) -> Result<Value, String> {
@@ -177,8 +213,20 @@ impl Roots {
                 let r = self.engine.post(&format!("{}/api/v1/fstemplates/{t}/clone", self.url), &body).await;
                 self.answer(&format!("cloning golden {t} for {name}"), r).await?
             }
-            Golden::Pallet(vol) => {
-                let g = pallet_golden(&self.listing().await?, vol)?;
+            Golden::Pallet(guess) => {
+                let listing = self.listing().await?;
+                // The engine's word on what is mounted at the path first
+                // (#231); the command line's list or the path's own name only
+                // when it says nothing.
+                let vol = match pallet_path(image).and_then(|p| pallet_volume(&listing, p)) {
+                    Some(v) => v,
+                    None => guess.clone(),
+                };
+                if let Some(p) = pallet_path(image) {
+                    self.pallets.lock().unwrap_or_else(|e| e.into_inner()).insert(p.to_string(), vol.clone());
+                }
+                let vol = &vol;
+                let g = pallet_golden(&listing, vol)?;
                 let mut body = json!({ "name": name, "verify": true });
                 if !owner.is_null() {
                     body["owner"] = owner.clone();
@@ -297,6 +345,21 @@ mod tests {
         assert!(pallet_golden(&listing, "loose").unwrap_err().contains("no parent"));
         assert!(pallet_golden(&listing, "drafty").unwrap_err().contains("not sealed"));
         assert!(pallet_golden(&listing, "absent").is_err());
+
+        // #231: no list on the command line (stormcos#259); the engine says
+        // cilium-operator is mounted at /p/operator-generic.
+        let engine = json!({"items": [
+            {"id": "v1", "name": "cilium-operator", "parent": "g9", "attachments": [{"device": "/dev/ublkb6", "mounted_at": "/p/operator-generic"}]},
+            {"id": "v2", "name": "coredns", "mounted_at": "/p/coredns"},
+            {"id": "v3", "name": "busybox"},
+        ]});
+        assert_eq!(pallet_volume(&engine, "operator-generic").as_deref(), Some("cilium-operator"));
+        assert_eq!(pallet_volume(&engine, "coredns").as_deref(), Some("coredns"));
+        assert_eq!(pallet_volume(&engine, "busybox"), None, "not mounted: the engine says nothing");
+        assert_eq!(golden_of("/pallets/operator-generic", "BOOT_IMAGE=/vmlinuz"), Some(Golden::Pallet("operator-generic".into())),
+            "the command line alone guesses the path; make() asks the engine first");
+        assert_eq!(pallet_path("/pallets/operator-generic"), Some("operator-generic"));
+        assert_eq!(pallet_path("template:x"), None);
     }
 
     #[test]
@@ -324,7 +387,11 @@ mod tests {
                 c1.lock().unwrap().push("list".into());
                 async { Json(json!({"items": [
                     {"name": "busybox", "id": "c1", "parent": "g1", "sealed": false},
-                    {"name": "busybox.golden", "id": "g1", "sealed": true}]})) }
+                    {"name": "busybox.golden", "id": "g1", "sealed": true},
+                    // #231: a pallet whose path is not its volume's name.
+                    {"name": "cilium-operator", "id": "c7", "parent": "g7", "sealed": false,
+                     "attachments": [{"device": "/dev/ublkb6", "mounted_at": "/p/operator-generic"}]},
+                    {"name": "cilium-operator-golden", "id": "g7", "sealed": true}]})) }
             }))
             .route("/api/v1/fstemplates/{t}/clone", post(move |Path(t): Path<String>, Json(b): Json<Value>| {
                 c2.lock().unwrap().push(format!("clone template {t} as {}", b["name"].as_str().unwrap()));
@@ -380,6 +447,14 @@ mod tests {
         let log = calls.lock().unwrap().clone();
         let tail: Vec<&String> = log.iter().filter(|c| c.starts_with("detach") || c.starts_with("delete")).collect();
         assert_eq!(tail, vec!["detach v0", "delete v0", "detach v2", "delete v2"]);
+
+        // #231: no mount list on the command line (stormcos#259); the engine
+        // says what is mounted at /p/operator-generic.
+        let bare = Roots::with_cmdline(crate::engine::EngineClient::new(&url, crate::engine::TokenSource::none()), "n1", "BOOT_IMAGE=/vmlinuz".into());
+        bare.make(&volume_name("ct-op"), "/pallets/operator-generic", &owner).await.unwrap();
+        assert!(calls.lock().unwrap().iter().any(|c| c == "clone volume g7 as ctr-ct-op"), "{:?}", calls.lock().unwrap());
+        assert_eq!(bare.pallet_volume_of("operator-generic").as_deref(), Some("cilium-operator"));
+
     }
 
     #[tokio::test]

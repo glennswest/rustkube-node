@@ -578,6 +578,13 @@ impl StormpumpRuntime {
         if let Some(p) = self.image_configs.provenance(image) {
             return Some(p);
         }
+        // The volume the engine said is mounted at the pallet's path (#231),
+        // else the command line's list, else the path's own name.
+        if let Some(vol) = crate::container_roots::pallet_path(image)
+            .and_then(|p| self.roots.as_ref().and_then(|r| r.pallet_volume_of(p)))
+        {
+            return crate::image_config::release_golden(&vol);
+        }
         let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
         match crate::container_roots::golden_of(image, &cmdline)? {
             crate::container_roots::Golden::Pallet(vol) => crate::image_config::release_golden(&vol),
