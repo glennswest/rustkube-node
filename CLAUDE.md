@@ -409,7 +409,7 @@ capacity = new, both conditions removed, allocatedResourceStatuses dropped.
 2026-10-09. Resumed the branch rebased (wip/21-rebased): cadvisor pinned by full rev afb46a0e…, lock from a build
 VM (cadvisor-host/model, inotify), #230 (a test's HELP line), and a guard: the root cgroup's CPU is read only
 outside a cgroup namespace (`/proc/self/cgroup` path not `/`). Docs (metrics.md, api.md, README), CHANGELOG.
-SC_BUILD_VM sc-build cb8ff94 (rebased on main): 486 kubelet unit pass; fast-forwarded to main. Golden, close. Live:
+SC_BUILD_VM sc-build cb8ff94 (rebased on main): 486 kubelet unit pass; fast-forwarded to main. Stage golden golden-rustkube-node-f6c3161f5376 (stormcos#424). Closed. Live:
 `/stats/summary` node cpu/memory and `/metrics/cadvisor` machine_* on a node after the release.
 
 ### (history) Paused (P0 #104 first): #21 (P2), cadvisor's library for node / machine / filesystem stats and eviction signals
