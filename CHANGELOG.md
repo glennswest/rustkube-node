@@ -30,6 +30,13 @@
 - **fix (P0):** The StorageClass keys stormcos's `stormblock` class has always carried, `kind: clone` and `fsType:
   ext4`, are accepted (#232, stormcos#488): #71 refused them, so every new claim failed on 12.05+, and a class's
   parameters cannot be changed on a running cluster. Other values of the two are refused.
+- **feat:** Node and machine stats from the cadvisor library (#21; glennswest/cadvisor `cadvisor-host`, pinned by
+  rev): `/stats/summary`'s node CPU is the root cgroup's and its memory is the node's (usage, working set = usage −
+  inactive file, available, rss, page faults), not the sum of this kubelet's containers (which left out every node
+  service); `/metrics/cadvisor` adds the root container (`id="/"`) to the CPU and working-set families,
+  `container_memory_usage_bytes`/`_rss` for it, and `machine_*`. MemoryPressure uses upstream's eviction signal,
+  capacity − the root's working set (MemAvailable only when that cannot be read). Containers stay on the CRI. Root
+  CPU is read only outside a cgroup namespace.
 - **feat:** An image tag selects a golden version (#86, owner's choice A). `image: <component>:<sha12>` (or
   `:golden-<component>-<sha12>`) of a known component, other than the release's, is pulled through the node's
   registry as `registry/<component>:<sha12>` (stormcentral's name for the golden) instead of running the pallet: its

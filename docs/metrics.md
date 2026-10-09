@@ -27,12 +27,19 @@ Code: `pkg/kubelet/src/metrics.rs`, and the handlers in `server.rs`.
 ## `/metrics/cadvisor`: what the workloads consume
 
 Rendered from the runtime at the moment of the scrape, so a container that has
-gone is gone from the next scrape.
+gone is gone from the next scrape. Container figures come from the CRI (the
+runtime); the node, its root container and the machine come from the cadvisor
+library (glennswest/cadvisor's `cadvisor-host`, #21), as upstream's kubelet
+splits them. A value that could not be read has no series (absent, never 0).
+The node's CPU is read only when the kubelet sees the host's cgroup root (not
+inside a cgroup namespace).
 
 | Metric | Type | Labels | Source |
 |---|---|---|---|
-| `container_cpu_usage_seconds_total` | counter | `container`, `id`, `namespace`, `pod` | CRI `ContainerStats.cpu` |
-| `container_memory_working_set_bytes` | gauge | same | CRI `ContainerStats.memory` |
+| `container_cpu_usage_seconds_total` | counter | `container`, `id`, `namespace`, `pod` | CRI `ContainerStats.cpu`; the node itself as `id="/"` (empty container/namespace/pod), from the root cgroup's `cpu.stat` (#21) |
+| `container_memory_working_set_bytes` | gauge | same | CRI `ContainerStats.memory`; `id="/"`: the node's usage less inactive file pages, as cAdvisor computes the root's (#21) |
+| `container_memory_usage_bytes`, `container_memory_rss` | gauge | `id="/"` only | the node: `MemTotal − MemFree`, and anon (#21) |
+| `machine_cpu_cores`, `machine_cpu_physical_cores`, `machine_cpu_sockets`, `machine_memory_bytes`, `machine_cpu_frequency_khz` | gauge | none | the machine, read once by the cadvisor library (`cadvisor-host`, #21) |
 | `container_fs_usage_bytes` | gauge | same | CRI `ContainerStats.writable_layer` |
 | `container_network_receive_bytes_total` | counter | `container=""`, `id` (the sandbox), `interface`, `namespace`, `pod` | the pod's network namespace |
 | `container_network_transmit_bytes_total` | counter | same | same |

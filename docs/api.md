@@ -33,7 +33,7 @@ anonymous auth. See [credential behavior](configuration.md).
 | GET | `/healthz`, `/livez`, `/readyz` | Process HTTP health only |
 | GET | `/metrics` | Kubelet/process metric families |
 | GET | `/metrics/cadvisor` | Runtime-supplied container/pod metric subset |
-| GET | `/stats/summary` | Partial CPU/memory and filesystem summary; node CPU/memory are container sums (#21); a stormpump container has no rootfs usage (#222); each pod's `network` (upstream's `name`/`rxBytes`/`rxErrors`/`txBytes`/`txErrors` of `eth0`, every interface in `interfaces`, plus `rxPackets`/`rxDropped`/`txPackets`/`txDropped`, #131) |
+| GET | `/stats/summary` | Partial CPU/memory and filesystem summary; node CPU and memory are the node's own (root cgroup CPU; usage, working set, available, rss, page faults as cAdvisor computes the root, #21), the container sums only when unreadable; a stormpump container has no rootfs usage (#222); each pod's `network` (upstream's `name`/`rxBytes`/`rxErrors`/`txBytes`/`txErrors` of `eth0`, every interface in `interfaces`, plus `rxPackets`/`rxDropped`/`txPackets`/`txDropped`, #131) |
 | GET | `/pods` | Locally managed Pods, including recorded waiting Pods |
 | GET | `/containerLogs/{namespace}/{pod}/{container}` | Runtime logs, per container (init containers and sidecars included): the current run's `<N>.log`, `previous=true` the run before, `previous=N` N back (the current and five previous runs are kept; #131, #216); a node service's mirror pod reads its stormd log volume, else PID 1's `last_output` for it (#124) |
 | GET | `/vmConsole/{namespace}/{name}/{door}` | `serial` or `vnc` through stormvm's router, with WebSocket upgrade |
