@@ -1938,6 +1938,21 @@ Steps:
 4. [x] `sc-build 'cargo build --release --locked --target x86_64-unknown-linux-musl'`, then `cargo test --locked`: passed at 6741e93.
 5. [x] Close #58, request the golden.
 
+### In progress: #233, multi-NIC by the Multus standard (stormcos#249, owner's decision)
+
+2026-10-09. `k8s.v1.cni.cncf.io/networks` (names, ns/name, name@if, or the JSON list with interface/ips/mac) and
+`v1.multus-cni.io/default-network`; NADs `k8s.cni.cncf.io/v1` `spec.config`.
+1. [ ] cni: `NetworkConfigList::from_json` (conflist or one plugin), `add_network`/`del_network` with an explicit
+       config, ifname and `runtimeConfig` (ips/mac for plugins whose `capabilities` say so).
+2. [ ] kubelet `multus.rs`: parse the annotations, resolve each NAD (GET, the pod's namespace unless named), ifnames
+       net1.. unless given; onto `PodSandboxConfig.networks` / `default_network`. Missing NAD = NetworkNotReady (wait,
+       FailedCreatePodSandBox naming it).
+3. [ ] stormpump runtime: default (or its override), then one ADD per attachment; a failure DELs what was added
+       (reverse) and fails the sandbox naming it; stop DELs attachments in reverse, then the default.
+       network-status: default first, then each attachment (`name` ns/name, `default: false`).
+4. [ ] Tests (parse, NAD resolution against a fake apiserver, ADD/DEL order with fake plugins), docs, CHANGELOG;
+       sc-build; golden; live (a bridge + a macvlan NAD on a node) — or note what's needed.
+
 ### Live check pending (master installs on the Dell): #231 + #232 (P0, stormcos#488)
 
 2026-10-09. stormcos#259 moved the mount list off the command line (`/etc/stormblock/mounts`), so golden_of
