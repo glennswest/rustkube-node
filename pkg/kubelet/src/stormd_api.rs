@@ -413,7 +413,8 @@ mod tests {
         std::fs::write(root.join("goldens/fastetcd/etc/stormd/config.toml"), "[api]\nbind = \"0.0.0.0:9081\"\n").unwrap();
         let e = endpoints(root);
         assert_eq!(e.len(), 1, "{e:?}");
-        assert_eq!(e["fastetcd"], Endpoint::Plain("http://127.0.0.1:9081".into()));
+        assert_eq!(e["fastetcd"].endpoint, Endpoint::Plain("http://127.0.0.1:9081".into()));
+        assert!(e["fastetcd"].one_shots.is_empty());
     }
 
     #[test]
