@@ -399,6 +399,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
+name = "cadvisor-host"
+version = "0.1.0"
+source = "git+https://github.com/glennswest/cadvisor?rev=afb46a0eafc104c46bb9c75ec9fcfec6b631764d#afb46a0eafc104c46bb9c75ec9fcfec6b631764d"
+dependencies = [
+ "cadvisor-model",
+ "inotify",
+ "rustix 1.1.4",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "cadvisor-model"
+version = "0.1.0"
+source = "git+https://github.com/glennswest/cadvisor?rev=afb46a0eafc104c46bb9c75ec9fcfec6b631764d#afb46a0eafc104c46bb9c75ec9fcfec6b631764d"
+dependencies = [
+ "chrono",
+ "serde",
+]
+
+[[package]]
 name = "caps"
 version = "0.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1326,6 +1348,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "inotify"
+version = "0.11.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cc00ea907cab49550b7da656f80ebb97be1b997d931fbcd28d39734e17ce592"
+dependencies = [
+ "bitflags",
+ "futures-util",
+ "inotify-sys",
+ "libc",
+ "tokio",
+]
+
+[[package]]
+name = "inotify-sys"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c033f80b2c113cdf91ab7a33faa9cbc014726dcad99880c8609af2a370edf37d"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1447,6 +1491,8 @@ dependencies = [
  "axum 0.8.9",
  "axum-server",
  "base64",
+ "cadvisor-host",
+ "cadvisor-model",
  "chrono",
  "clap",
  "cni",
