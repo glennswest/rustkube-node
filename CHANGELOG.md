@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-09
+
+- **fix:** A pod status write that meets a 409 Conflict re-reads the pod and writes again on its current revision,
+  up to 5 tries a pass, instead of failing the pass (#217). The write is made on a revision the apiserver has moved
+  past whenever something else wrote meanwhile, our own start-timing annotation PATCH included; the merge is redone
+  on the fresh status, nothing is written for a pod that is gone, replaced (uid) or already current.
+- **fix(test):** The test container's cleanup no longer deletes its own runner pod (#217). `drain` deleted every pod
+  with the run label, the Job's runner included, so each suite killed itself as it finished, the pod never reached
+  Succeeded and the Job made a new runner every few seconds (Dell 11.99, short 359af1d2c3, 30ca46356e).
+
 ## 2026-10-08
 
 - **feat:** Node services' mirror pods show stormd's supervision (#215, stormd#48). The kubelet reads each

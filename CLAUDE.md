@@ -57,6 +57,19 @@ by #51.
 
 ## Work plan
 
+### Done: #217 (P0), Job pods exit 0 but never reach Succeeded (Dell 11.99)
+
+2026-10-09. Traced live in the node log store (`:9094/api/plugins/logs/events`, short 30ca46356e): each runner pod
+was **deleted** as its suite finished (Stop at the same instant the Job created the next pod: test-f89f4, test-1e14d,
+test-260dd), because `test/` `drain` deletes every pod labelled `storm.io/test-run`, its own runner included. Also:
+every status write after a start met 409 (the start-timing PATCH moves the pod on; cilium-operator too) and was
+dropped until the next pass.
+1. [x] kubelet `write_pod_status`: 409 → GET (uid checked) → merge onto the fresh status → PUT on its revision, ≤5
+       tries; `conflict` metric; 2 tests against a fake apiserver (009d006).
+2. [x] test `drain` skips the runner (`HOSTNAME` or a Job-owned pod); test (d4abb1d).
+3. [x] Docs (metrics.md), CHANGELOG; sc-build 009d006 (P0): 465 kubelet unit pass. Test crate build; stage golden;
+       close; rerun `stormcentral test run rustkube-node short --tag C2NR0Q2`.
+
 ### Done: #215 (P0), mirror pods carry stormd's probe state, restarts/CrashLoopBackOff and events (stormd#48)
 
 2026-10-08. stormd#48 done (golden-stormd-9bd45189d9a8): `GET /api/v1/processes` (state running | CrashLoopBackOff |
