@@ -324,7 +324,15 @@ group snapshots of them (stormstorage#49, needs-owner), a VM disk on another dri
 connects it in NodeStage, #142 closed), then
 #53's restore from VolumeSnapshots (dataSource). Commented; proposed after stormstorage#49. No code.
 
-### Waiting on stormpump#56 + a build: #181 (P2), a VM stopped gracefully: Machine::shut_down(grace) before the engine's stop
+### Waiting on stormpump#144: #181 (P2), a VM stopped gracefully (items 1+2 + spec grace done 2026-10-09)
+
+2026-10-09. Merged to main (c9cec31): items 1+2 (37a5843, rebased), `shutdown_grace_secs` from the VMI on the machine
+spec (stormpump#56; retried without on an older engine), lock stormvm a88c809 (has shut_down; stormvm main fails to
+build, stormvm#81) + stormpump cc878b9. sc-build c9cec31: 477 kubelet unit pass (#234 was a test path). Item 3 (power
+off every VM at once on a node shutdown): nothing tells the kubelet the node is going (its SIGTERM = a restart's);
+filed stormpump#144 (a marker in /run/stormpump); #181 proposed after it.
+
+### (history) Waiting on stormpump#56 + a build: #181 (P2), a VM stopped gracefully: Machine::shut_down(grace) before the engine's stop
 
 2026-10-08. `stop` sends the engine's stop (SIGTERM to the hypervisor = a power cut) at once when there is a handle;
 only `stop_by_control` asks the guest. stormvm main (409e0fc, has 94004b7) offers `Machine::shut_down(grace) ->
