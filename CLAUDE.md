@@ -57,6 +57,14 @@ by #51.
 
 ## Work plan
 
+### In progress: documentation refresh from code since 2026-10-02 (#54-style audit; #166, #220)
+
+2026-10-09, on main at 06b91b5. Audit README, docs/, CLAUDE.md against code and `git log --since=2026-10-02`.
+1. [ ] status.md rewritten (changes since 10-02, decisions, gaps with issues); configuration.md (stale #24/#69/#89/#126
+       lines), api.md (route table, stormimds#12 decided = #166, ports), README, metrics.md (#104 roots), BUILD.md,
+       csi.md, event-driven-design.md, presentation.md; CLAUDE.md reference + #220's unblocked entries.
+2. [ ] Issues for doc promises with no owner; CHANGELOG; commit, push; sc-build `cargo build --locked`; #166/#220.
+
 ### Done: #217 (P0), Job pods exit 0 but never reach Succeeded (Dell 11.99)
 
 2026-10-09. Traced live in the node log store (`:9094/api/plugins/logs/events`, short 30ca46356e): each runner pod
