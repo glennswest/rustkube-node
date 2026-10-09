@@ -2,6 +2,10 @@
 
 ## 2026-10-09
 
+- **fix:** A deleted pod's containers are stopped within its termination grace, not a fixed 30 s (#225): the delete's
+  `metadata.deletionGracePeriodSeconds`, else `spec.terminationGracePeriodSeconds`, else 30. The app containers
+  stop together (one grace for the pod, as upstream), then the sidecars. A 5 s pod whose process ignores SIGTERM was
+  killed 30 s after its delete (stormpump medium `grace-kill`).
 - **feat:** The built-in driver takes `redundancy`, `spread` and `tier` from the StorageClass (#71, stormblock#151).
   One blank per (size, fs, redundancy, spread), named for them (`pvc-ext4j-1048576m-mirror2-shelf`) and minted with
   the policy, so a claim cloned from it inherits it; a Block claim's raw volume carries the policy and the tier. A
