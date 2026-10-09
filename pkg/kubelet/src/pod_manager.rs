@@ -7552,6 +7552,130 @@ pub(crate) mod tests {
         })
     }
 
+    /// A [`ClaimWorld`] with a StorageClass (#71): `class` served at its path
+    /// (else 404), no blanks yet, and every mint answered `mint`.
+    async fn policy_world(pvc: Value, class: Option<Value>, mint: (u16, Value)) -> ClaimWorld {
+        let calls: Arc<Mutex<Vec<(String, String, Value)>>> = Arc::default();
+        let log = calls.clone();
+        let app = axum::Router::new().fallback(
+            move |method: axum::http::Method, uri: axum::http::Uri, body: axum::body::Bytes| {
+                let (log, pvc, class, mint) = (log.clone(), pvc.clone(), class.clone(), mint.clone());
+                async move {
+                    use axum::http::StatusCode;
+                    let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    let path = uri.path().to_string();
+                    log.lock().unwrap().push((method.to_string(), path.clone(), body.clone()));
+                    let ok = |v: Value| (StatusCode::OK, axum::Json(v));
+                    match (method.as_str(), path.as_str()) {
+                        ("GET", p) if p.contains("/persistentvolumeclaims/") => ok(pvc),
+                        ("GET", p) if p.starts_with("/apis/storage.k8s.io/v1/storageclasses/") => match class {
+                            Some(c) => ok(c),
+                            None => (StatusCode::NOT_FOUND, axum::Json(json!({}))),
+                        },
+                        ("GET", p) if p.starts_with("/api/v1/fstemplates/") => (StatusCode::NOT_FOUND, axum::Json(json!({}))),
+                        ("POST", "/api/v1/fstemplates") => (StatusCode::from_u16(mint.0).unwrap(), axum::Json(mint.1)),
+                        ("GET", "/api/v1/volumes") => ok(json!({ "items": [] })),
+                        ("POST", "/api/v1/volumes") => (StatusCode::CREATED, axum::Json(json!({ "id": "vol-raw" }))),
+                        ("POST", p) if p.ends_with("/attach") => ok(json!({ "device_hint": "/dev/ublkb7" })),
+                        _ => ok(json!({})),
+                    }
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        ClaimWorld { url, calls }
+    }
+
+    fn mirror_class() -> Value {
+        json!({ "metadata": { "name": "stormblock" }, "provisioner": "stormblock.storm.io",
+                "parameters": { "redundancy": "mirror", "spread": "shelf", "tier": "cold" } })
+    }
+
+    /// Wait for a request matching `pred` to reach the fake (a mint runs in
+    /// the background).
+    async fn seen(w: &ClaimWorld, pred: impl Fn(&(String, String, Value)) -> bool) -> Option<(String, String, Value)> {
+        for _ in 0..300 {
+            if let Some(c) = w.calls.lock().unwrap().iter().find(|c| pred(c)).cloned() {
+                return Some(c);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        None
+    }
+
+    /// #71: a filesystem claim of a mirrored class mints the blank for its
+    /// size and policy, with the policy, and says the tier is not applied.
+    #[tokio::test]
+    async fn a_class_policy_mints_its_own_blank() {
+        let w = policy_world(raw_claim("16Mi", "Filesystem"), Some(mirror_class()), (201, json!({"template": {}}))).await;
+        let mgr = claim_manager(&w);
+        assert!(mgr.provision_claim("default", "raw", "uid-1").await.is_err(), "waits on the mint");
+        let mint = seen(&w, |(m, p, _)| m == "POST" && p == "/api/v1/fstemplates").await.expect("minted");
+        assert_eq!(mint.2["name"], "pvc-ext4j-16m-mirror2-shelf");
+        assert_eq!(mint.2["redundancy"], "mirror:2");
+        assert_eq!(mint.2["spread"], "shelf");
+        assert!(mint.2.get("tier").is_none(), "fstemplates take no tier (stormblock#377)");
+        let looked = w.calls.lock().unwrap().iter().any(|(m, p, _)| m == "GET" && p == "/api/v1/fstemplates/pvc-ext4j-16m-mirror2-shelf");
+        assert!(looked, "the policy's blank is the one looked for");
+        assert!(seen(&w, |(m, p, b)| m == "POST" && p.ends_with("/events") && b["reason"] == "TierNotApplied").await.is_some());
+    }
+
+    /// #71: a raw Block claim carries the policy and the tier itself.
+    #[tokio::test]
+    async fn a_block_claim_carries_its_class_policy_and_tier() {
+        let w = policy_world(raw_claim("16Mi", "Block"), Some(mirror_class()), (500, json!({}))).await;
+        let mgr = claim_manager(&w);
+        mgr.provision_claim("default", "raw", "uid-1").await.unwrap();
+        let made = seen(&w, |(m, p, _)| m == "POST" && p == "/api/v1/volumes").await.unwrap();
+        assert_eq!((made.2["redundancy"].clone(), made.2["spread"].clone(), made.2["tier"].clone()),
+                   (json!("mirror:2"), json!("shelf"), json!("cold")));
+    }
+
+    /// #71: a policy the node cannot place is refused by the engine with a 409
+    /// that is not "exists"; it is the claim's ProvisioningFailed, not a mint
+    /// taken as done. A class naming nothing keeps the shipped blank.
+    #[tokio::test]
+    async fn an_unplaceable_policy_is_said_on_the_claim() {
+        let refused = (409, json!({"error": "mirror:2 needs 2 distinct shelf domains; this node has 1", "code": "conflict"}));
+        let w = policy_world(raw_claim("16Mi", "Filesystem"), Some(mirror_class()), refused).await;
+        let mgr = claim_manager(&w);
+        assert!(mgr.provision_claim("default", "raw", "uid-1").await.is_err());
+        seen(&w, |(m, p, _)| m == "POST" && p == "/api/v1/fstemplates").await.expect("minted");
+        // The next look finds the mint failed, and says so on the claim.
+        let mut said = None;
+        for _ in 0..50 {
+            let _ = mgr.provision_claim("default", "raw", "uid-1").await;
+            said = w.calls.lock().unwrap().iter().find(|(m, p, b)| {
+                m == "POST" && p.ends_with("/events") && b["reason"] == "ProvisioningFailed"
+                    && b["message"].as_str().unwrap_or("").contains("distinct shelf domains")
+            }).cloned();
+            if said.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(said.is_some(), "{:?}", w.calls.lock().unwrap());
+
+        let w = policy_world(raw_claim("16Mi", "Filesystem"), None, (201, json!({}))).await;
+        let mgr = claim_manager(&w);
+        let _ = mgr.provision_claim("default", "raw", "uid-1").await;
+        let mint = seen(&w, |(m, p, _)| m == "POST" && p == "/api/v1/fstemplates").await.unwrap();
+        assert_eq!(mint.2["name"], "pvc-ext4j-16m");
+        assert!(mint.2.get("redundancy").is_none());
+
+        // A parameter this driver does not take: refused on the claim, nothing made.
+        let bad = json!({ "metadata": { "name": "stormblock" }, "parameters": { "replicas": "3" } });
+        let w = policy_world(raw_claim("16Mi", "Filesystem"), Some(bad), (201, json!({}))).await;
+        let mgr = claim_manager(&w);
+        match mgr.provision_claim("default", "raw", "uid-1").await {
+            Err(ClaimError::Failed(why)) => assert!(why.contains("replicas"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(!w.calls.lock().unwrap().iter().any(|(m, p, _)| m == "POST" && p.starts_with("/api/v1/fstemplates")));
+    }
+
     #[tokio::test]
     async fn a_block_claim_is_a_raw_volume_up_to_a_pebibyte() {
         let w = claim_world(raw_claim("600Ti", "Block")).await;
