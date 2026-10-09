@@ -197,6 +197,8 @@ mod tests {
         assert!(all.contains(r#"container_memory_working_set_bytes{container="",id="/",namespace="",pod=""} 1024"#));
         assert_eq!(all.matches("# TYPE container_cpu_usage_seconds_total").count(), 1, "one family header");
         assert!(text.contains("# TYPE container_memory_rss gauge"), "but its family is named");
-        assert!(!render(&NodeUsage::default(), None).contains("machine_cpu_cores "), "no machine, no value");
+        let none = render(&NodeUsage::default(), None);
+        assert!(!none.lines().any(|l| l.starts_with("machine_cpu_cores")), "no machine, no value: {none}");
+        assert!(none.contains("# TYPE machine_cpu_cores gauge"), "the family is still named");
     }
 }
