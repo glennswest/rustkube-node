@@ -1619,13 +1619,9 @@ impl Kubelet {
         let uid = source["metadata"]["uid"].as_str().unwrap_or("").to_string();
         let acked = self.acked_status.lock().unwrap_or_else(|e| e.into_inner()).get(&uid).cloned();
         let (base, revision) = status_base(source, acked.as_ref());
-        let mut merged = base.as_object().cloned().unwrap_or_default();
-        if status.get("message").is_none() {
-            merged.remove("message");
-            merged.remove("reason");
-        }
-        merged.extend(status.as_object().unwrap().clone());
-        let status = Value::Object(merged);
+        // What this kubelet says, kept apart from any base it is merged onto.
+        let ours = status;
+        let status = merge_status(&base, &ours);
         if status == base {
             crate::metrics::observe_status_write("skipped");
             return Ok(());
@@ -1635,14 +1631,15 @@ impl Kubelet {
         let Some(revision) = revision else {
             return Ok(());
         };
-        let written: Value = self.api_client.put(format!("{path}/status"))
-            .timeout(Duration::from_secs(10))
-            .json(&serde_json::json!({
-                "apiVersion": "v1", "kind": "Pod",
-                "metadata": {"name": &update.name, "namespace": &update.namespace,
-                    "uid": source["metadata"]["uid"], "resourceVersion": revision},
-                "status": status
-            })).send_retrying(retry::Policy::API).await?.error_for_status()?.json().await.unwrap_or(Value::Null);
+        let Some((revision, written, status)) = write_pod_status(
+            &self.api_client, &path, &update.namespace, &update.name, &source["metadata"]["uid"], revision, &ours, status,
+        )
+        .await?
+        else {
+            // Already current after a re-read, or the pod is gone or replaced.
+            self.acked_status.lock().unwrap_or_else(|e| e.into_inner()).remove(&uid);
+            return Ok(());
+        };
         crate::metrics::observe_status_write("written");
         // What the apiserver now holds, and at which revision, for the next
         // pass that runs before the watch delivers it.
@@ -2489,6 +2486,91 @@ struct AckedStatus {
     status: Value,
 }
 
+/// PUT a pod's status on `revision`; on a 409 re-read the pod and write again
+/// on what the apiserver holds now (#217).
+///
+/// A 409 is the object having moved since the revision written on: our own
+/// start-timing annotation PATCH, a controller's label, a watch running
+/// behind. It is never dropped: a short Job pod's terminal write lost that way
+/// left the pod Running for good, and its Job replaced it every few seconds.
+/// `ours` is what this kubelet says, merged onto the fresh status each time.
+///
+/// `Some((revision written on, the answer, the status written))`, or `None`
+/// when there is nothing to write: the pod is gone, a successor of the same
+/// name has replaced it, or the fresh status already says it.
+#[allow(clippy::too_many_arguments)]
+async fn write_pod_status(
+    client: &reqwest::Client,
+    path: &str,
+    namespace: &str,
+    name: &str,
+    uid: &Value,
+    mut revision: String,
+    ours: &Value,
+    mut status: Value,
+) -> anyhow::Result<Option<(String, Value, Value)>> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let resp = client
+            .put(format!("{path}/status"))
+            .timeout(Duration::from_secs(10))
+            .json(&serde_json::json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": name, "namespace": namespace, "uid": uid, "resourceVersion": &revision},
+                "status": &status
+            }))
+            .send_retrying(retry::Policy::API)
+            .await?;
+        if resp.status() != reqwest::StatusCode::CONFLICT || attempt >= STATUS_CONFLICT_ATTEMPTS {
+            let written = resp.error_for_status()?.json().await.unwrap_or(Value::Null);
+            if attempt > 1 {
+                info!("pod {namespace}/{name}: status written on attempt {attempt}, after a 409 re-read");
+            }
+            return Ok(Some((revision, written, status)));
+        }
+        crate::metrics::observe_status_write("conflict");
+        let fresh = client.get(path).send_retrying(retry::Policy::API).await?;
+        if fresh.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let fresh: Value = fresh.error_for_status()?.json().await?;
+        if &fresh["metadata"]["uid"] != uid {
+            return Ok(None);
+        }
+        let Some(rv) = fresh["metadata"]["resourceVersion"].as_str() else {
+            anyhow::bail!("pod {namespace}/{name}: re-read after a 409 has no resourceVersion");
+        };
+        revision = rv.to_string();
+        status = merge_status(&fresh["status"], ours);
+        if status == fresh["status"] {
+            debug!("pod {namespace}/{name}: status already current after a 409");
+            return Ok(None);
+        }
+        debug!("pod {namespace}/{name}: status write met a 409; writing again on revision {revision}");
+    }
+}
+
+/// How many times one status write is made again after a 409 (#217), each
+/// time on a fresh read. A pod written that often in one pass by others is
+/// left to the next pass.
+const STATUS_CONFLICT_ATTEMPTS: u32 = 5;
+
+/// `status` written over `base`: this kubelet's fields replace the base's,
+/// the rest (admission's, the scheduler's) stay; a base `message`/`reason`
+/// goes when this report has none.
+fn merge_status(base: &Value, status: &Value) -> Value {
+    let mut merged = base.as_object().cloned().unwrap_or_default();
+    if status.get("message").is_none() {
+        merged.remove("message");
+        merged.remove("reason");
+    }
+    if let Some(s) = status.as_object() {
+        merged.extend(s.clone());
+    }
+    Value::Object(merged)
+}
+
 /// The status to compare a new one with, and the revision to write it on
 /// (#141). The watch's copy (`source`), unless it is still at the revision
 /// this kubelet's last acknowledged write was made on: then that write is
@@ -2704,5 +2786,100 @@ mod stormd_event_tests {
         assert_eq!(seen[0].1["involvedObject"]["uid"], "u-1");
         assert_eq!(seen[2].1["count"], 5);
         assert_eq!(seen[2].1["lastTimestamp"], "2026-10-08T21:15:00Z");
+    }
+}
+
+#[cfg(test)]
+mod status_conflict_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// A fake apiserver holding one pod at `rv`: a status PUT on another
+    /// revision is a 409, as the real one answers.
+    async fn apiserver(pod: Value) -> (String, Arc<Mutex<Value>>, Arc<Mutex<Vec<String>>>) {
+        let held = Arc::new(Mutex::new(pod));
+        let puts: Arc<Mutex<Vec<String>>> = Arc::default();
+        let (h1, h2, p1) = (held.clone(), held.clone(), puts.clone());
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/namespaces/ns/pods/job-1",
+                axum::routing::get(move || {
+                    let h = h1.clone();
+                    async move { axum::Json(h.lock().unwrap().clone()) }
+                }),
+            )
+            .route(
+                "/api/v1/namespaces/ns/pods/job-1/status",
+                axum::routing::put(move |axum::Json(b): axum::Json<Value>| {
+                    let (h, p) = (h2.clone(), p1.clone());
+                    async move {
+                        let rv = b["metadata"]["resourceVersion"].as_str().unwrap_or("").to_string();
+                        p.lock().unwrap().push(rv.clone());
+                        let mut held = h.lock().unwrap();
+                        if held["metadata"]["resourceVersion"] != rv.as_str() {
+                            return (axum::http::StatusCode::CONFLICT, axum::Json(serde_json::json!({"reason": "Conflict"})));
+                        }
+                        let next = rv.parse::<u64>().unwrap() + 1;
+                        held["status"] = b["status"].clone();
+                        held["metadata"]["resourceVersion"] = serde_json::json!(next.to_string());
+                        (axum::http::StatusCode::OK, axum::Json(held.clone()))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("{url}/api/v1/namespaces/ns/pods/job-1"), held, puts)
+    }
+
+    fn pod(rv: &str, phase: &str) -> Value {
+        serde_json::json!({
+            "metadata": {"name": "job-1", "namespace": "ns", "uid": "u-1", "resourceVersion": rv,
+                "annotations": {"storm.io/start-timing": "total=1s"}},
+            "status": {"phase": phase, "startTime": "2026-10-08T23:41:21Z", "qosClass": "BestEffort"}
+        })
+    }
+
+    /// #217: the terminal write is made on the Running write's revision, the
+    /// start-timing PATCH has moved the pod on meanwhile; the 409 is re-read
+    /// and Succeeded still lands, keeping what others own in the status.
+    #[tokio::test]
+    async fn a_status_write_that_meets_a_409_still_lands() {
+        let (path, held, puts) = apiserver(pod("12", "Running")).await;
+        let ours = serde_json::json!({"phase": "Succeeded"});
+        let stale = pod("11", "Running");
+        let status = merge_status(&stale["status"], &ours);
+        let out = write_pod_status(&reqwest::Client::new(), &path, "ns", "job-1", &serde_json::json!("u-1"), "11".into(), &ours, status)
+            .await
+            .unwrap()
+            .expect("written");
+        assert_eq!(out.0, "12", "written on the re-read revision");
+        assert_eq!(*puts.lock().unwrap(), ["11", "12"]);
+        let held = held.lock().unwrap();
+        assert_eq!(held["status"]["phase"], "Succeeded");
+        assert_eq!(held["status"]["qosClass"], "BestEffort", "the rest of the status kept");
+        assert_eq!(held["metadata"]["resourceVersion"], "13");
+    }
+
+    /// A same-name successor is not ours to write; one already saying it
+    /// needs no write.
+    #[tokio::test]
+    async fn a_409_on_a_replaced_or_current_pod_writes_nothing() {
+        let mut successor = pod("20", "Pending");
+        successor["metadata"]["uid"] = serde_json::json!("u-2");
+        let (path, _, puts) = apiserver(successor).await;
+        let ours = serde_json::json!({"phase": "Succeeded"});
+        let r = write_pod_status(&reqwest::Client::new(), &path, "ns", "job-1", &serde_json::json!("u-1"), "11".into(), &ours, ours.clone())
+            .await
+            .unwrap();
+        assert!(r.is_none());
+        assert_eq!(puts.lock().unwrap().len(), 1);
+
+        let (path, _, puts) = apiserver(pod("30", "Succeeded")).await;
+        let r = write_pod_status(&reqwest::Client::new(), &path, "ns", "job-1", &serde_json::json!("u-1"), "11".into(), &ours, ours.clone())
+            .await
+            .unwrap();
+        assert!(r.is_none(), "already Succeeded");
+        assert_eq!(puts.lock().unwrap().len(), 1);
     }
 }
