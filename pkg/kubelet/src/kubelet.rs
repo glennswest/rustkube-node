@@ -443,6 +443,14 @@ impl Kubelet {
         // table changes, and when a mirror pod is edited or deleted (#101).
         tokio::spawn(self.clone().service_mirror_loop());
 
+        // A node shutdown (#181, stormpump#144): the engine writes its marker
+        // before it stops anything, so every guest is asked to power off the
+        // moment it appears, all at once, while the engine waits out each
+        // guest's grace. SIGTERM with the marker does the same (in case the
+        // watch was late) and exits; SIGTERM without it is a restart, and the
+        // VMs are left running.
+        self.watch_node_shutdown();
+
         // Each engine exit wakes its own Pod or VMI worker (#115).
         tokio::spawn(self.clone().exit_router());
         // A CRI runtime's container events, the same way (#116).
@@ -1738,6 +1746,48 @@ impl workload::Adapter for Kubelet {
 }
 
 impl Kubelet {
+    fn watch_node_shutdown(self: &Arc<Self>) {
+        use crate::vm_manager::{node_going_down, NODE_SHUTDOWN_MARKER};
+        let marker = std::path::PathBuf::from(NODE_SHUTDOWN_MARKER);
+        let reason = |v: &Value| v["reason"].as_str().unwrap_or("unknown").to_string();
+        if let Some(vms) = self.vms.clone() {
+            let changed = Arc::new(tokio::sync::Notify::new());
+            {
+                let changed = changed.clone();
+                let dir = marker.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+                tokio::spawn(crate::fs_watch::watch(dir, move || changed.notify_one()));
+            }
+            let (vms, marker) = (vms.clone(), marker.clone());
+            tokio::spawn(async move {
+                loop {
+                    if let Some(m) = node_going_down(&marker) {
+                        vms.power_down_all(&reason(&m)).await;
+                        return;
+                    }
+                    changed.notified().await;
+                }
+            });
+        }
+        let vms = self.vms.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let Ok(mut term) = signal(SignalKind::terminate()) else {
+                warn!("no SIGTERM handler: a node shutdown will not ask the guests first");
+                return;
+            };
+            term.recv().await;
+            match (node_going_down(&marker), &vms) {
+                (Some(m), Some(vms)) => {
+                    vms.power_down_all(&reason(&m)).await;
+                    info!("SIGTERM: the node is going down; guests asked to power off, exiting");
+                }
+                (Some(_), None) => info!("SIGTERM: the node is going down; exiting"),
+                (None, _) => info!("SIGTERM with no node-shutdown marker: a restart; VMs left running, exiting"),
+            }
+            std::process::exit(0);
+        });
+    }
+
     /// The node's services as mirror pods, on events only (#101).
     ///
     /// Two sources. PID 1's asset table, through inotify on its directory,

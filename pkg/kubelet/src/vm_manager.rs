@@ -250,6 +250,41 @@ pub fn with_shutdown_grace(spec: &[u8], grace: Option<u32>) -> Option<Vec<u8>> {
     Some(s.encode())
 }
 
+/// Where the engine says the node is going down (stormpump#144): written
+/// before any workload is stopped, removed at every start of PID 1. A
+/// SIGTERM without it is a restart, and the VMs are left alone.
+pub const NODE_SHUTDOWN_MARKER: &str = "/run/stormpump/shutdown";
+
+/// How long a node-shutdown power-down waits on each guest: the request
+/// sent and answered, not its grace (#181).
+pub const POWER_DOWN_SEND: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The bound on asking every guest at once, before the kubelet exits.
+pub const POWER_DOWN_ALL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The marker's content when the node is going down (`reason`, `why`, …).
+pub fn node_going_down(marker: &std::path::Path) -> Option<Value> {
+    let text = std::fs::read_to_string(marker).ok()?;
+    Some(serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({"reason": "unknown"})))
+}
+
+/// Run `ask` for every VM at once, bounded by [`POWER_DOWN_ALL`]; how many
+/// answered `true` in time.
+pub async fn power_down_each<F, Fut>(vms: Vec<Vm>, ask: F) -> usize
+where
+    F: Fn(Vm) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let all = futures::future::join_all(vms.into_iter().map(&ask));
+    match tokio::time::timeout(POWER_DOWN_ALL, all).await {
+        Ok(r) => r.into_iter().filter(|ok| *ok).count(),
+        Err(_) => {
+            warn!("node shutdown: not every guest answered within {POWER_DOWN_ALL:?}; the engine waits for each anyway");
+            0
+        }
+    }
+}
+
 /// The machine's control, from its registration: what `shut_down` asks.
 fn machine_of(vm: &Vm) -> Option<stormvm_control::Machine> {
     let reg = stormvm_node::console::find(RUN_ROOT, &vm.namespace, &vm.name)?;
@@ -859,6 +894,9 @@ pub struct VmManager {
     /// the first's disks.
     vms: Mutex<Machines>,
     stopping: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Every guest has been asked to power off for a node shutdown (#181):
+    /// asked once, by the marker or the SIGTERM, whichever comes first.
+    powered_down: std::sync::atomic::AtomicBool,
     /// The VMIs the apiserver last gave this node, by uid.
     ///
     /// **The object is the truth; this is a cache of it.** Metadata is
@@ -1059,6 +1097,7 @@ impl VmManager {
             events,
             vms: Mutex::new(Machines::default()),
             stopping: Arc::new(Mutex::new(Default::default())),
+            powered_down: std::sync::atomic::AtomicBool::new(false),
             desired: Mutex::new(HashMap::new()),
             disk_lifecycle: tokio::sync::RwLock::new(()),
             watched: Mutex::new(None),
@@ -1776,6 +1815,36 @@ impl VmManager {
     /// What this node is running, for `/pods`-style introspection and tests.
     pub async fn running(&self) -> Vec<Vm> {
         self.vms.lock().await.values().cloned().collect()
+    }
+
+    /// The node is going down (#181, stormpump#144): ask every running
+    /// guest to power off, all at once. Nothing is forced and nothing waits
+    /// for a guest: each runs its grace while the engine waits for it
+    /// (`shutdown_grace_secs`, capped by the node), and the kubelet itself is
+    /// stopped long before. Once per process; the number of guests asked.
+    pub async fn power_down_all(&self, why: &str) -> usize {
+        if self.powered_down.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return 0;
+        }
+        let vms: Vec<Vm> = self.running().await.into_iter().filter(|v| !v.phase.terminal()).collect();
+        let asked = power_down_each(vms, |vm| async move {
+            match machine_of(&vm) {
+                // A short wait: long enough for the request to be sent and
+                // its answer read, never the guest's grace.
+                Some(m) => {
+                    let r = m.shut_down(POWER_DOWN_SEND).await;
+                    tracing::debug!(vm = %vm.name, "node shutdown: power-down sent ({r:?})");
+                    true
+                }
+                None => {
+                    warn!(vm = %vm.name, "node shutdown: no control socket to ask the guest; the engine signals it after its grace");
+                    false
+                }
+            }
+        })
+        .await;
+        info!("node going down ({why}): asked {asked} guest(s) to power off");
+        asked
     }
 
 
@@ -4377,6 +4446,42 @@ mod tests {
         let mut m = Machines::default();
         m.insert("u-1".into(), vm);
         assert_eq!(m.at("10.0.1.5").map(|v| v.uid.as_str()), Some("u-1"), "metadata finds it by its pod IP");
+    }
+
+    /// #181, stormpump#144: the engine's marker says the node is going down;
+    /// every guest is asked at once (three 1 s asks take about 1 s, not 3),
+    /// bounded, and only once per process.
+    #[tokio::test]
+    async fn a_node_shutdown_asks_every_guest_at_once_and_once() {
+        let d = tempfile::tempdir().unwrap();
+        let marker = d.path().join("shutdown");
+        assert!(node_going_down(&marker).is_none(), "no marker: a restart");
+        std::fs::write(&marker, r#"{"reason":"poweroff","started_unix":1791547210,"vm_shutdown_max_secs":60}"#).unwrap();
+        assert_eq!(node_going_down(&marker).unwrap()["reason"], "poweroff");
+        std::fs::write(&marker, "garbled").unwrap();
+        assert_eq!(node_going_down(&marker).unwrap()["reason"], "unknown", "present is what matters");
+
+        let vms: Vec<Vm> = ["a", "b", "c"].iter().map(|u| vm_at(u, &[], Phase::Running)).collect();
+        let t = std::time::Instant::now();
+        let asked = power_down_each(vms.clone(), |vm| async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            vm.uid != "c"
+        })
+        .await;
+        assert_eq!(asked, 2, "c had no control socket");
+        assert!(t.elapsed() < std::time::Duration::from_millis(1900), "all at once: {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let asked = power_down_each(vms, |_| async {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            true
+        })
+        .await;
+        assert_eq!(asked, 0);
+        assert!(t.elapsed() < POWER_DOWN_ALL + std::time::Duration::from_secs(1), "bounded");
+
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), "http://127.0.0.1:1");
+        assert_eq!(m.power_down_all("poweroff").await, 0, "no machines");
+        assert!(m.powered_down.load(std::sync::atomic::Ordering::SeqCst), "asked once");
     }
 
     fn vm_at(uid: &str, addresses: &[&str], phase: Phase) -> Vm {
