@@ -693,20 +693,21 @@ claims and pulls already use. Cost on 11.91 warm: ~0.4–1.3 s per start (clone,
 stormpump#107) and a volume per container. Asked on #104: A private by default + readOnlyRootFilesystem keeps the
 shared root (recommended), B private only when asked, C A with pre-minted clones.
 
-### In progress: #86 (P2), versioned goldens for pods (owner 10-09: A, copy on demand, as replication)
+### Waiting on stormblock-registry#116: #86 (P2), versioned goldens for pods (owner 10-09: A, copy on demand, as replication)
 
 2026-10-09. Found: component goldens are engine volumes on forge, `golden-<c>-<sha12>`, shown as
 `registry/<c>:<sha12>` (stormcentral `goldens::image_ref`), not pushed to forge's sbregistry; the release manifest's
 golden asset is `{kind: golden, name: <c>, digest: <device sha256>, provenance: golden-<c>-<sha12>}`. So the fetch is
 new sbregistry work (file it); the kubelet half rides the existing pull + demand flow.
-1. [ ] `image_config::golden_version(image, manifest, pallet?)`: tag `<sha12>` or `golden-<c>-<sha12>` of a known
+1. [x] `image_config::golden_version(image, manifest, pallet?)`: tag `<sha12>` or `golden-<c>-<sha12>` of a known
        component (manifest asset or /pallets/<c>) that is not the release's → `registry/<c>:<sha12>`; the release's
        own, untagged, any other tag or digest → the pallet as today.
-2. [ ] StormpumpImages: a versioned image skips the pallet and pulls `registry/<c>:<sha12>` through the registry
+2. [x] StormpumpImages: a versioned image skips the pallet and pulls `registry/<c>:<sha12>` through the registry
        (GET record → template; 404 → demand → 503 retried on the pull back-off); image_status by the pull only.
-3. [ ] Tests (fake registry), README, CHANGELOG; sc-build; golden; file sbregistry (fetch `golden-<c>-<sha12>` from
-       forge into this engine, sealed, as a golden record with template_name); #86 proposed after it for the live
-       roll/rollback.
+3. [x] Tests (2: selection rules; pull through a fake registry incl. the demand's 503), README, CHANGELOG (4b96e0c,
+       7e39e1a). SC_BUILD_VM sc-build 4b96e0c: 475 kubelet unit pass. Stage golden golden-rustkube-node-d3d0359c3aac
+       (stormcos#424). Filed stormblock-registry#116 (fetch golden-<c>-<sha12> from forge for registry/<c>:<sha12>).
+4. [ ] After #116 + a release: roll one instance to a version not in the release and back; close.
 
 ### (history) Waiting on the owner: #86 (P2), versioned goldens for pods
 
