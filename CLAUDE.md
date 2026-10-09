@@ -1929,13 +1929,16 @@ Steps:
 4. [x] `sc-build 'cargo build --release --locked --target x86_64-unknown-linux-musl'`, then `cargo test --locked`: passed at 6741e93.
 5. [x] Close #58, request the golden.
 
-### In progress: #231 (P0, stormcos#488), pallet → volume from the engine, not /proc/cmdline
+### Live check pending (master installs on the Dell): #231 + #232 (P0, stormcos#488)
 
 2026-10-09. stormcos#259 moved the mount list off the command line (`/etc/stormblock/mounts`), so golden_of
 assumed volume == path: cilium-operator's pallet `operator-generic` is volume `cilium-operator` → "no golden". The
 engine's listing says it (`mounted_at: /p/operator-generic`). Fix: `pallet_volume(listing, path)` (volume-level
 or attachments[] `mounted_at` `/p/<path>` or `/pallets/<path>`), then the cmdline list, then name == path; Roots
-caches path → volume for provenance_for. Test; golden; close. (#21 paused on wip/21-rebased, build running.)
+caches path → volume for provenance_for; also the root volume's /etc/stormblock/mounts (behind the engine, before the
+cmdline's absence). #232 (my #71 regression): kind: clone / fsType: ext4 accepted. ca44386 (+ docs a1974fb); P0
+sc-build ca44386: 475 kubelet unit pass. Golden golden-rustkube-node-9b876df216c9 (stormcos#424), master told; close
+both when the Dell runs cilium-operator and a new claim. #21 paused on branch wip/21-rebased.
 
 ### Waiting on stormcentral#479 (suite cluster writes + a driver SA's cluster rules): #52, external StorageClasses (the CSI node side)
 
