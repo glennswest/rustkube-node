@@ -5817,7 +5817,11 @@ mod seed_tests {
         assert_eq!(shutdown_grace_secs(Some(&vmi)), Some(120));
         assert_eq!(shutdown_grace_secs(Some(&json!({"spec": {}}))), None, "unset: the engine's 45 s");
         assert_eq!(shutdown_grace_secs(Some(&json!({"spec": {"terminationGracePeriodSeconds": 99999}}))), Some(3600));
-        let plain = stormpump::spec::Spec { argv: vec!["/usr/bin/qemu-system-x86_64".into()], ..Default::default() };
+        let plain = stormpump::spec::Spec {
+            domain: stormpump::spec::Domain::Vm,
+            argv: vec!["/usr/bin/qemu-system-x86_64".into()],
+            ..Default::default()
+        };
         let bytes = plain.encode();
         assert_eq!(with_shutdown_grace(&bytes, None), None);
         let graced = with_shutdown_grace(&bytes, Some(120)).expect("set");
