@@ -330,7 +330,8 @@ connects it in NodeStage, #142 closed), then
 spec (stormpump#56; retried without on an older engine), lock stormvm a88c809 (has shut_down; stormvm main fails to
 build, stormvm#81) + stormpump cc878b9. sc-build c9cec31: 477 kubelet unit pass (#234 was a test path). Item 3 (power
 off every VM at once on a node shutdown): nothing tells the kubelet the node is going (its SIGTERM = a restart's);
-filed stormpump#144 (a marker in /run/stormpump); #181 proposed after it.
+filed stormpump#144 (a marker in /run/stormpump); #181 proposed after it. Stage golden golden-rustkube-node-2c941c8bcbec
+(f9b7996, stormcos#424): a release with it needs stormpump >= #56 for the grace (else the spec is retried without).
 
 ### (history) Waiting on stormpump#56 + a build: #181 (P2), a VM stopped gracefully: Machine::shut_down(grace) before the engine's stop
 
