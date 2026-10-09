@@ -573,9 +573,12 @@ starts once the VM lets the claim go (#80).
   `terminationGracePeriodSeconds` also has it on its machine's spec
   (`shutdown_grace_secs`, stormpump#56): on a node shutdown the engine waits that
   long for the guest before signalling the hypervisor (else 45 s, capped by the
-  node's `vm_shutdown_max_secs`). Telling every guest to power off at once when
-  the node is going waits on stormpump#144: the kubelet's own SIGTERM looks the
-  same on a restart.
+  node's `vm_shutdown_max_secs`). **On a node shutdown every guest is asked at
+  once** (#181, stormpump#144): the engine writes `/run/stormpump/shutdown`
+  before it stops any workload; the kubelet watches for it and sends every running
+  VM its power-down together (nothing forced, at most 3 s), so the guests run
+  their graces while the engine waits. A SIGTERM with the marker does the same
+  and exits; a SIGTERM without it is a restart, and the VMs keep running.
 - **A VM outlives a kubelet restart** (the engine supervises it), so the kubelet
   records each one where a restarted kubelet finds it: the machine's
   registration, `/run/stormvm/<ns>/<name>/vm.json`, with the engine's workload

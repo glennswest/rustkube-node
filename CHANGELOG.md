@@ -2,6 +2,10 @@
 
 ## 2026-10-09
 
+- **feat:** On a node shutdown every VM's guest is asked to power off at once (#181 item 3, stormpump#144): the kubelet
+  watches for the engine's `/run/stormpump/shutdown` marker (written before any workload is stopped) and sends every
+  running VM its power-down together, nothing forced, bounded at 3 s; the engine then waits out each guest's grace.
+  SIGTERM with the marker does the same and exits; SIGTERM without it is a restart and leaves the VMs running.
 - **BREAKING:** `--runtime vm` and `--vmm` are removed, with `vm_runtime.rs` (#13, the owner's choice A): microVM Pods
   are stormvisor's (an OCI RuntimeClass shim stormcos ships), picked per Pod by `runtimeClassName`, which is #204. The
   node-wide microVM runtime never got past Phase 1 (one rootfs template, no guest agent, no CNI in the guest) and
