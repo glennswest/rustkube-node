@@ -284,7 +284,13 @@ at /hostroot first: the kubelet's root is its golden), DMI product_uuid. `first_
 (configuration.md), CHANGELOG (956668a). SC_BUILD_VM sc-build: 425 kubelet unit pass. Stage golden
 golden-rustkube-node-dc9c42e9ad95 (stormcos#366). Closed. Live check: `kubectl get nodes -o wide` after a release.
 
-### Waiting on the owner: #13 (P3), microVM Pods (`--runtime vm`)
+### In progress: #13 (P3), microVM Pods: owner chose A (stormvisor's) — retire `--runtime vm`
+
+2026-10-09. Owner (via master, 10-09): A. microVM Pods are stormvisor's; the kubelet's part is RuntimeClass dispatch
+(#204). Here: delete `vm_runtime.rs`, `--runtime vm` and `--vmm` (nothing deploys them: stormcos runs stormpump),
+docs, CHANGELOG (breaking, pre-1.0); sc-build; close #13 as superseded by #204.
+
+### (history) Waiting on the owner: #13 (P3), microVM Pods (`--runtime vm`)
 
 2026-10-08. Stopped before code. Found: stormvisor (created 07-16, minutes before #13) is the platform's microVM-Pod
 runtime (OCI RuntimeClass shim, stormfork microVMs, guest agent + youki; stormcos kubernetes edition ships
