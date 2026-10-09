@@ -82,13 +82,30 @@ pub fn read_usage() -> NodeUsage {
     let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let stat = std::fs::read_to_string(format!("{}/memory.stat", cadvisor_host::cgroup::UNIFIED_MOUNTPOINT)).ok();
     let mut u = root_memory(&meminfo, stat.as_deref());
-    let reader = cadvisor_host::cgroup::CgroupReader::default();
-    u.cpu_usage_ns = reader
-        .read_stats("/", GoTime::now())
-        .ok()
-        .map(|s| s.cpu.usage.total)
-        .filter(|n| *n > 0);
+    // Only when this process sees the node's whole hierarchy: in a cgroup
+    // namespace the root here is the kubelet's own cgroup, and its CPU would
+    // be reported as the node's.
+    let own = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    if sees_host_root(&own) {
+        let reader = cadvisor_host::cgroup::CgroupReader::default();
+        u.cpu_usage_ns = reader
+            .read_stats("/", GoTime::now())
+            .ok()
+            .map(|s| s.cpu.usage.total)
+            .filter(|n| *n > 0);
+    }
     u
+}
+
+/// Does `/proc/self/cgroup` say this process sees the host's cgroup root?
+/// A process in its own cgroup (stormpump puts every workload in one) shows
+/// that cgroup's path, `0::/…`; one in a cgroup namespace shows `0::/`, its
+/// namespace's root, which is not the node's.
+fn sees_host_root(proc_self_cgroup: &str) -> bool {
+    proc_self_cgroup
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .is_some_and(|path| path.trim() != "/" && !path.trim().is_empty())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -178,6 +195,14 @@ mod tests {
         assert_eq!(u.page_faults, None, "unknown is absent, never 0");
 
         assert_eq!(root_memory("", None), NodeUsage::default(), "nothing readable: nothing claimed");
+    }
+
+    #[test]
+    fn the_root_cgroup_is_read_only_from_outside_a_cgroup_namespace() {
+        assert!(sees_host_root("0::/node/rustkube-node\n"));
+        assert!(!sees_host_root("0::/\n"), "a cgroup namespace's root is not the node's");
+        assert!(!sees_host_root(""), "nothing known: not trusted");
+        assert!(!sees_host_root("12:cpu:/x\n"), "cgroup v1 only: not the unified root");
     }
 
     #[test]
