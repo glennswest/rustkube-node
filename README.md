@@ -171,8 +171,9 @@ image's **sealed golden**, made when the container is created (engine volume `ct
 ublk, mounted by PID 1 at `/run/stormpump/roots/<container>`), writable, and detached and deleted when the
 container is removed; a restart is a new container with a fresh clone. Containers never share a root, and one
 layer sits between the golden and what the workload writes. A pallet image's golden is the slab's
-`<volume>.golden` (else the mounted volume's sealed parent; the volume is the one `rd.stormblock.mount=` mounts
-at `/p/<path>`); a pulled image's is the fstemplate sbregistry sealed for it, so a pull clones nothing: it finds
+`<volume>.golden` (else the mounted volume's sealed parent). The volume is the one the engine reports mounted at
+`/p/<path>` (#231), else the one the node's mount list names: the root volume's `/etc/stormblock/mounts` since
+stormcos#259, or `rd.stormblock.mount=` on older releases (on the line it wins); only then the path's own name; a pulled image's is the fstemplate sbregistry sealed for it, so a pull clones nothing: it finds
 the golden record (`GET /v1/goldens/{image}`, ready, `template_name`) and answers `template:<name>`. An image
 this node's registry has no golden of is asked of the cluster (#79): the kubelet posts sbregistry's clone route,
 the one that starts its cluster fetch, and its answer (503 "fetching it from the cluster", 404 "push the image")
@@ -379,7 +380,9 @@ claim's volume is protected, as stormblock spells it (stormblock#151):
 | `spread` | `site` `building` `room` `row` `rack` `node` `hba` `shelf` `set` `bay` `drive` (default `drive`) | the rung the legs differ at; must agree with an `@rung` |
 | `tier` | `hot` `warm` `cool` `cold` | a preference, never a refusal; applied to `volumeMode: Block` claims only until stormblock#377 (a filesystem claim gets a `TierNotApplied` Warning) |
 
-Any other key is refused on the claim (`ProvisioningFailed`), except `csi.storage.k8s.io/*`. A class naming nothing
+Any other key is refused on the claim (`ProvisioningFailed`), except `csi.storage.k8s.io/*` and the two stormcos's
+class has always carried, `kind: clone` and `fsType: ext4` (#232: a class's parameters are immutable on a running
+cluster; other values of those two are refused). A class naming nothing
 is one copy and clones the shipped blank (`pvc-ext4j-<MiB>m`), as before (the design's default, stormblock's
 "owner decision 2", is still `none`). A policy gets **its own blank per (size, fs, redundancy, spread)**, named for
 them (`pvc-ext4j-1048576m-mirror2-shelf`) and minted with `redundancy`/`spread`, so every claim cloned from it

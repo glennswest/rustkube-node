@@ -2,6 +2,13 @@
 
 ## 2026-10-09
 
+- **fix (P0):** A pallet's volume is the one the engine reports mounted at `/p/<path>` (#231, stormcos#488), else
+  the root volume's `/etc/stormblock/mounts` (stormcos#259 took `rd.stormblock.mount=` off the command line; the line
+  still wins on older releases), else the path's name. cilium-operator (pallet `operator-generic`, volume
+  `cilium-operator`) failed "no golden for pallet operator-generic" on 12.05+.
+- **fix (P0):** The StorageClass keys stormcos's `stormblock` class has always carried, `kind: clone` and `fsType:
+  ext4`, are accepted (#232, stormcos#488): #71 refused them, so every new claim failed on 12.05+, and a class's
+  parameters cannot be changed on a running cluster. Other values of the two are refused.
 - **feat:** An image tag selects a golden version (#86, owner's choice A). `image: <component>:<sha12>` (or
   `:golden-<component>-<sha12>`) of a known component, other than the release's, is pulled through the node's
   registry as `registry/<component>:<sha12>` (stormcentral's name for the golden) instead of running the pallet: its
