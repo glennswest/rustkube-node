@@ -331,7 +331,15 @@ group snapshots of them (stormstorage#49, needs-owner), a VM disk on another dri
 connects it in NodeStage, #142 closed), then
 #53's restore from VolumeSnapshots (dataSource). Commented; proposed after stormstorage#49. No code.
 
-### Waiting on stormpump#144: #181 (P2), a VM stopped gracefully (items 1+2 + spec grace done 2026-10-09)
+### In progress: #181 item 3 (stormpump#144 done: /run/stormpump/shutdown)
+
+2026-10-09. The engine writes `/run/stormpump/shutdown` ({reason, started_unix, vm_shutdown_max_secs, why}) before
+stopping any workload, and removes a stale one at every start. Doing: `VmManager::power_down_all` (every running VM's
+`shut_down` started at once, nothing forced, bounded wait), triggered (a) by the marker appearing (fs_watch on
+/run/stormpump) and (b) by SIGTERM when the marker is there (then exit); SIGTERM without it = a restart, VMs untouched.
+Tests, docs, CHANGELOG; sc-build; golden; close.
+
+### (earlier) #181 items 1+2 + spec grace done 2026-10-09
 
 2026-10-09. Merged to main (c9cec31): items 1+2 (37a5843, rebased), `shutdown_grace_secs` from the VMI on the machine
 spec (stormpump#56; retried without on an older engine), lock stormvm a88c809 (has shut_down; stormvm main fails to
