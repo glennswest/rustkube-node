@@ -496,14 +496,16 @@ Steps:
        #362 fixed: stage golden golden-rustkube-node-0fc1a74fff24 (7df677b = c8256ac code), stormcos#366 (asked the gate for
        the isolation / one-clone / pods-start checks); `stormcentral shipped`. Close #161 as superseded once released.
 
-### In progress: #225 (P1), pod delete stops every container with 30 s, not terminationGracePeriodSeconds
+### Done: #225 (P1), pod delete stops every container with 30 s, not terminationGracePeriodSeconds
 
 2026-10-09. `stop_pod` passed a literal 30 (stormpump grace-kill: killed 30163 ms after a delete of a 5 s pod).
-1. [ ] `termination_grace(pod)`: `metadata.deletionGracePeriodSeconds` (the delete's, when the object still carries
+1. [x] `termination_grace(pod)`: `metadata.deletionGracePeriodSeconds` (the delete's, when the object still carries
        it), else `spec.terminationGracePeriodSeconds`, else 30; negative → 0. `stop_pod_within(uid, grace)`; the
        deletion path passes the deleting object's; app containers stopped together (one grace for the pod, as
        upstream), then sidecars last-declared first.
-2. [ ] FakeRuntime records each stop's grace; test; CHANGELOG; sc-build; golden; close. Next: #226.
+2. [x] FakeRuntime records each stop's grace; test (ff878a6); CHANGELOG. SC_BUILD_VM sc-build at the changelog commit:
+       471 kubelet unit, all suites pass. Stage golden golden-rustkube-node-a6c0102dc25b (stormcos#424). Closed. Live
+       check: stormpump medium grace-kill after the release. Filed #227 (zero warnings, pre-existing). Next: #226.
 
 ### Done: #71 (P2), built-in driver: redundancy / spread / tier from the StorageClass
 
