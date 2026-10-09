@@ -2,6 +2,12 @@
 
 ## 2026-10-09
 
+- **feat:** A VM is stopped gracefully (#181): on a VMI delete the guest is asked to power off first
+  (`Machine::shut_down`, `system_powerdown` / the power button, within the VMI's `terminationGracePeriodSeconds`,
+  default 30 s), and the engine's stop (a power cut to qemu) runs only if it does not. The VMI's grace also rides on
+  its machine spec as `shutdown_grace_secs` for the engine's node-shutdown wait (stormpump#56); an engine that
+  refuses the newer spec gets it without the field. Lock: stormvm a88c809 (has `shut_down`; main does not build,
+  stormvm#81), stormpump cc878b9. Node shutdown's power-down-everything waits on stormpump#144.
 - **fix (P0):** A pallet's volume is the one the engine reports mounted at `/p/<path>` (#231, stormcos#488), else
   the root volume's `/etc/stormblock/mounts` (stormcos#259 took `rd.stormblock.mount=` off the command line; the line
   still wins on older releases), else the path's name. cilium-operator (pallet `operator-generic`, volume

@@ -562,8 +562,19 @@ starts once the VM lets the claim go (#80).
   `kubectl get nodes -l storm.io/kvm=true`.
 - **A VMI being deleted stops its machine.** While a machine runs, its VMI
   carries the finalizer `storm.io/vm`, so the deletion completes only once the
-  machine is gone. The stop is ACPI with a 30 s grace, then a kill, then the
-  disks are detached (never deleted: see above).
+  machine is gone. **The guest is asked first** (#181): stormvm's
+  `Machine::shut_down(grace)` sends `system_powerdown` (qemu) or the power button
+  (cloud-hypervisor) and waits up to the VMI's `terminationGracePeriodSeconds`
+  (default 30 s), in the background. The engine's stop (SIGTERM to the hypervisor,
+  to qemu a power cut) follows only when the guest is still running, or when it
+  said it powered off and the engine still sees the hypervisor 5 s later. Then the
+  disks are detached (never deleted: see above). A VMI that sets
+  `terminationGracePeriodSeconds` also has it on its machine's spec
+  (`shutdown_grace_secs`, stormpump#56): on a node shutdown the engine waits that
+  long for the guest before signalling the hypervisor (else 45 s, capped by the
+  node's `vm_shutdown_max_secs`). Telling every guest to power off at once when
+  the node is going waits on stormpump#144: the kubelet's own SIGTERM looks the
+  same on a restart.
 - **A VM outlives a kubelet restart** (the engine supervises it), so the kubelet
   records each one where a restarted kubelet finds it: the machine's
   registration, `/run/stormvm/<ns>/<name>/vm.json`, with the engine's workload
@@ -571,7 +582,8 @@ starts once the VM lets the claim go (#80).
   each change), a registered machine the kubelet does not know is adopted
   when its VMI still wants it, and stopped when not.
 - A machine started by an older kubelet has no handle recorded. If its VMI is
-  gone, it is stopped through its own control socket: ACPI, then `quit`.
+  gone, it is stopped through its own control socket: `shut_down` (ACPI, within
+  its grace), then `quit`.
 - A failed VMI list is skipped, not read as "no machines". Reading it that way
   stopped every VM on the node.
 - **A failed start is retried**, with backoff from 10 s doubling to 5 min.
