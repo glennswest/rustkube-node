@@ -440,8 +440,16 @@ impl ClaimPolicy {
                 "redundancy" => redundancy = Some(v),
                 "spread" => spread = Some(v.to_ascii_lowercase()).filter(|s| !s.is_empty()),
                 "tier" => tier = Some(v.to_ascii_lowercase()).filter(|s| !s.is_empty()),
+                // What stormcos's `stormblock` class has carried since it first
+                // shipped, and keeps on every running cluster (a class's
+                // parameters are immutable) (#232): the only kind and the only
+                // filesystem the blanks are. Anything else is refused.
+                "kind" if v.eq_ignore_ascii_case("clone") => {}
+                "fsType" if v.eq_ignore_ascii_case("ext4") || v.is_empty() => {}
+                "kind" => return Err(format!("StorageClass kind {v:?}: this driver only clones (kind: clone)")),
+                "fsType" => return Err(format!("StorageClass fsType {v:?}: the size-class blanks are ext4")),
                 k if k.starts_with("csi.storage.k8s.io/") => {}
-                k => return Err(format!("unknown StorageClass parameter {k:?} (redundancy, spread, tier)")),
+                k => return Err(format!("unknown StorageClass parameter {k:?} (redundancy, spread, tier; kind: clone, fsType: ext4)")),
             }
         }
         let (scheme_text, rung) = match redundancy.as_deref().map(|r| r.split_once('@').map_or((r, None), |(a, b)| (a, Some(b.trim().to_ascii_lowercase())))) {
@@ -744,6 +752,14 @@ mod tests {
         // A spread on one copy changes nothing.
         let s = ClaimPolicy::from_class(Some(&sc(json!({"spread": "rack"})))).unwrap();
         assert_eq!(s.blank_name("1G"), "pvc-ext4j-1024m");
+        // #232: the shipped class's own keys (immutable on running clusters)
+        // are the default policy; other values of them are refused.
+        let shipped = ClaimPolicy::from_class(Some(&sc(json!({"kind": "clone", "fsType": "ext4"})))).unwrap();
+        assert_eq!(shipped, ClaimPolicy::default());
+        assert_eq!(shipped.blank_name("1G"), "pvc-ext4j-1024m");
+        assert!(ClaimPolicy::from_class(Some(&sc(json!({"kind": "clone", "fsType": "ext4", "redundancy": "mirror"})))).unwrap().scheme == Scheme::Mirror(2));
+        assert!(ClaimPolicy::from_class(Some(&sc(json!({"fsType": "xfs"})))).unwrap_err().contains("ext4"));
+        assert!(ClaimPolicy::from_class(Some(&sc(json!({"kind": "raw"})))).unwrap_err().contains("clone"));
         // CSI's own keys pass; anything else is refused, as is a bad value.
         assert!(ClaimPolicy::from_class(Some(&sc(json!({"csi.storage.k8s.io/fstype": "ext4"})))).is_ok());
         for bad in [

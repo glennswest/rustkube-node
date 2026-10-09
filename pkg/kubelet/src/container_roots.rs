@@ -84,6 +84,40 @@ pub fn golden_of(image: &str, cmdline: &str) -> Option<Golden> {
     Some(Golden::Pallet(volume))
 }
 
+/// Where the node's mount list lives since stormcos#259 (#231): the root
+/// volume's `/etc/stormblock/mounts`, seen from the kubelet under the node's
+/// root (`/hostroot`), else in its own view.
+pub const MOUNT_LISTS: [&str; 2] = ["/hostroot/etc/stormblock/mounts", "/etc/stormblock/mounts"];
+
+/// The kernel command line as [`golden_of`] reads it (#231): `cmdline`, with
+/// the mount list from `mounts_file` (stormblock's format: one `<vol>:<path>`
+/// per line, `#` comments, a leading `?` for an optional entry) appended as
+/// `rd.stormblock.mount=` when the line carries none. A list on the line wins,
+/// as it does for the initramfs (older releases).
+pub fn with_mount_list(cmdline: &str, mounts_file: Option<&str>) -> String {
+    if cmdline.split_whitespace().any(|w| w.starts_with("rd.stormblock.mount=")) {
+        return cmdline.to_string();
+    }
+    let entries: Vec<&str> = mounts_file
+        .unwrap_or("")
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .map(|l| l.trim_start_matches('?'))
+        .filter(|l| l.contains(':'))
+        .collect();
+    if entries.is_empty() {
+        return cmdline.to_string();
+    }
+    format!("{} rd.stormblock.mount={}", cmdline.trim_end(), entries.join(","))
+}
+
+/// The node's command line and mount list, read now ([`with_mount_list`]).
+pub fn node_mount_list() -> String {
+    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    let file = MOUNT_LISTS.iter().find_map(|p| std::fs::read_to_string(p).ok());
+    with_mount_list(&cmdline, file.as_deref())
+}
+
 /// The pallet path of an image reference (`/pallets/<path>`), if it is one.
 pub fn pallet_path(image: &str) -> Option<&str> {
     let path = image.strip_prefix(PALLET_ROOT)?.strip_prefix('/')?;
@@ -168,8 +202,7 @@ pub struct Roots {
 
 impl Roots {
     pub fn new(engine: crate::engine::EngineClient, node: impl Into<String>) -> Self {
-        let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
-        Self::with_cmdline(engine, node, cmdline)
+        Self::with_cmdline(engine, node, node_mount_list())
     }
 
     pub fn with_cmdline(engine: crate::engine::EngineClient, node: impl Into<String>, cmdline: String) -> Self {
@@ -360,6 +393,15 @@ mod tests {
             "the command line alone guesses the path; make() asks the engine first");
         assert_eq!(pallet_path("/pallets/operator-generic"), Some("operator-generic"));
         assert_eq!(pallet_path("template:x"), None);
+
+        // The root volume's /etc/stormblock/mounts, when the line has no list.
+        let file = "# release mounts\ncilium-operator:/p/operator-generic\n?cilium:/p/cilium   # optional\n\n";
+        let line = with_mount_list("BOOT_IMAGE=/vmlinuz quiet", Some(file));
+        assert_eq!(golden_of("/pallets/operator-generic", &line), Some(Golden::Pallet("cilium-operator".into())));
+        assert_eq!(golden_of("/pallets/cilium", &line), Some(Golden::Pallet("cilium".into())));
+        // A list on the line wins (older releases).
+        assert_eq!(with_mount_list(CMDLINE, Some(file)), CMDLINE);
+        assert_eq!(with_mount_list("quiet", None), "quiet");
     }
 
     #[test]

@@ -585,7 +585,7 @@ impl StormpumpRuntime {
         {
             return crate::image_config::release_golden(&vol);
         }
-        let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+        let cmdline = crate::container_roots::node_mount_list();
         match crate::container_roots::golden_of(image, &cmdline)? {
             crate::container_roots::Golden::Pallet(vol) => crate::image_config::release_golden(&vol),
             crate::container_roots::Golden::Template(_) => None,
