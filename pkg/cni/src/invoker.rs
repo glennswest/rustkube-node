@@ -58,6 +58,10 @@ pub struct PodNetwork {
     pub pod_namespace: String,
     pub pod_name: String,
     pub pod_uid: String,
+    /// What the runtime offers plugins as `runtimeConfig` (CNI conventions):
+    /// each key reaches only a plugin whose `capabilities` set it true, as
+    /// Multus does for a NetworkAttachmentDefinition's `ips` and `mac`.
+    pub runtime_config: serde_json::Map<String, Value>,
 }
 
 impl PodNetwork {
@@ -75,7 +79,14 @@ impl PodNetwork {
             pod_namespace: pod_namespace.to_string(),
             pod_name: pod_name.to_string(),
             pod_uid: pod_uid.to_string(),
+            runtime_config: serde_json::Map::new(),
         }
+    }
+
+    /// The same pod on another interface (`net1`, …).
+    pub fn on_interface(mut self, ifname: &str) -> Self {
+        self.ifname = ifname.to_string();
+        self
     }
 
     /// CNI_ARGS in the K8s convention understood by Cilium/calico/flannel.
@@ -84,6 +95,29 @@ impl PodNetwork {
             "IgnoreUnknown=1;K8S_POD_NAMESPACE={};K8S_POD_NAME={};K8S_POD_INFRA_CONTAINER_ID={};K8S_POD_UID={}",
             self.pod_namespace, self.pod_name, self.container_id, self.pod_uid
         )
+    }
+}
+
+impl NetworkConfigList {
+    /// A network config given as text (a NetworkAttachmentDefinition's
+    /// `spec.config`): a conflist (`plugins`) or a single plugin. `source`
+    /// names it in messages.
+    pub fn from_json(raw: &str, source: &str) -> Result<NetworkConfigList, CniError> {
+        let value: Value = serde_json::from_str(raw)?;
+        let name = value["name"].as_str().unwrap_or(source).to_string();
+        let cni_version = value["cniVersion"].as_str().unwrap_or(FALLBACK_CNI_VERSION).to_string();
+        let plugins = match value.get("plugins") {
+            Some(p) => p
+                .as_array()
+                .cloned()
+                .ok_or_else(|| CniError::NetworkNotFound(format!("{source}: plugins is not a list")))?,
+            None if value.get("type").is_some() => vec![value.clone()],
+            None => return Err(CniError::NetworkNotFound(format!("{source}: neither plugins nor a plugin type"))),
+        };
+        if plugins.is_empty() {
+            return Err(CniError::NetworkNotFound(format!("{source}: an empty plugin chain")));
+        }
+        Ok(NetworkConfigList { name, cni_version, plugins, source_path: PathBuf::from(source) })
     }
 }
 
@@ -189,9 +223,16 @@ impl CniInvoker {
         // Reload per call: the config can appear/change at runtime (Cilium
         // writes its conflist once the agent is up).
         let config = load_network_config(&self.conf_dir)?;
+        self.add_network(&config, pod).await
+    }
+
+    /// CNI ADD of an explicit network (a NetworkAttachmentDefinition's, or a
+    /// replaced default network) on `pod.ifname`.
+    pub async fn add_network(&self, config: &NetworkConfigList, pod: &PodNetwork) -> Result<CniResult, CniError> {
+        let config = config.clone();
         info!(
-            "CNI ADD {}/{} via network '{}' ({:?})",
-            pod.pod_namespace, pod.pod_name, config.name, config.source_path
+            "CNI ADD {}/{} via network '{}' ({:?}) on {}",
+            pod.pod_namespace, pod.pod_name, config.name, config.source_path, pod.ifname
         );
 
         let mut prev_result: Option<Value> = None;
@@ -219,9 +260,15 @@ impl CniInvoker {
     /// the first error (if any) is returned at the end.
     pub async fn del(&self, pod: &PodNetwork) -> Result<(), CniError> {
         let config = load_network_config(&self.conf_dir)?;
+        self.del_network(&config, pod).await
+    }
+
+    /// CNI DEL of an explicit network on `pod.ifname`.
+    pub async fn del_network(&self, config: &NetworkConfigList, pod: &PodNetwork) -> Result<(), CniError> {
+        let config = config.clone();
         info!(
-            "CNI DEL {}/{} via network '{}'",
-            pod.pod_namespace, pod.pod_name, config.name
+            "CNI DEL {}/{} via network '{}' on {}",
+            pod.pod_namespace, pod.pod_name, config.name, pod.ifname
         );
 
         let mut first_err = None;
@@ -260,6 +307,16 @@ impl CniInvoker {
         stdin_config["cniVersion"] = json!(config.cni_version);
         if let Some(prev) = prev_result {
             stdin_config["prevResult"] = prev;
+        }
+        // runtimeConfig, only what the plugin's capabilities ask for.
+        let mut runtime = serde_json::Map::new();
+        for (k, v) in &pod.runtime_config {
+            if plugin["capabilities"][k.as_str()] == json!(true) {
+                runtime.insert(k.clone(), v.clone());
+            }
+        }
+        if !runtime.is_empty() {
+            stdin_config["runtimeConfig"] = Value::Object(runtime);
         }
         let stdin_bytes = serde_json::to_vec(&stdin_config)?;
 
@@ -638,5 +695,44 @@ exit 1
         let invoker = CniInvoker::new(conf.path(), vec![bin.path().to_path_buf()]);
         let err = invoker.add(&pod()).await.unwrap_err();
         assert!(err.to_string().contains("cilium-cni"));
+    }
+
+    /// rustkube-node#233: a NetworkAttachmentDefinition's config runs as
+    /// given, on its own interface, and `runtimeConfig` reaches only a
+    /// plugin whose capabilities ask for it.
+    #[tokio::test]
+    async fn an_attachment_runs_its_own_config_on_its_interface() {
+        let conf = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        write_fake_plugin(bin.path(), "macvlan", r#"{"cniVersion":"1.0.0","ips":[{"address":"192.168.50.9/24"}]}"#);
+        write_fake_plugin(bin.path(), "tuning", r#"{"cniVersion":"1.0.0","ips":[{"address":"192.168.50.9/24"}]}"#);
+        let nad = r#"{"cniVersion":"0.4.0","name":"lan","plugins":[
+            {"type":"macvlan","master":"eth0","capabilities":{"ips":true}},
+            {"type":"tuning","capabilities":{"mac":true}}]}"#;
+        let config = NetworkConfigList::from_json(nad, "default/lan").unwrap();
+        assert_eq!((config.name.as_str(), config.plugins.len()), ("lan", 2));
+        let mut pod = pod().on_interface("net1");
+        pod.runtime_config.insert("ips".into(), json!(["192.168.50.9/24"]));
+        pod.runtime_config.insert("mac".into(), json!("02:00:00:00:00:09"));
+        let invoker = CniInvoker::new(conf.path(), vec![bin.path().to_path_buf()]);
+        let r = invoker.add_network(&config, &pod).await.unwrap();
+        assert_eq!(r.ips[0].address, "192.168.50.9/24");
+        assert_eq!(r.network, "lan");
+        let envs = recorded(bin.path(), ".env");
+        assert!(envs.iter().all(|(_, e)| e.contains("CNI_IFNAME=net1")), "{envs:?}");
+        let stdins = recorded(bin.path(), ".stdin");
+        let mac: Value = serde_json::from_str(&stdins[0].1).unwrap();
+        assert_eq!(mac["runtimeConfig"], json!({"ips": ["192.168.50.9/24"]}), "only what macvlan asks for");
+        let tuning: Value = serde_json::from_str(&stdins[1].1).unwrap();
+        assert_eq!(tuning["runtimeConfig"], json!({"mac": "02:00:00:00:00:09"}));
+        invoker.del_network(&config, &pod).await.unwrap();
+        let envs = recorded(bin.path(), ".env");
+        assert!(envs.last().unwrap().0.contains("macvlan.DEL"), "DEL in reverse: macvlan last");
+
+        // A single plugin is a chain of one; nonsense is refused.
+        let one = NetworkConfigList::from_json(r#"{"cniVersion":"1.0.0","name":"br","type":"bridge"}"#, "x").unwrap();
+        assert_eq!(one.plugins.len(), 1);
+        assert!(NetworkConfigList::from_json(r#"{"name":"nothing"}"#, "x").is_err());
+        assert!(NetworkConfigList::from_json("not json", "x").is_err());
     }
 }
