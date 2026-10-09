@@ -2,6 +2,11 @@
 
 ## 2026-10-09
 
+- **feat:** An image tag selects a golden version (#86, owner's choice A). `image: <component>:<sha12>` (or
+  `:golden-<component>-<sha12>`) of a known component, other than the release's, is pulled through the node's
+  registry as `registry/<component>:<sha12>` (stormcentral's name for the golden) instead of running the pallet: its
+  template is the container root, a miss is the cluster demand (fetched from forge, cached: stormblock-registry#116).
+  The release's own version, untagged images, other tags and digests stay the pallet.
 - **fix:** A node service's mirror pod takes its state from its long-running stormd processes; one-shots are
   init-like (#226). On 12.03 rustkube-apiserver read `Running (Completed) 0/1` while serving: no process is named
   after the service, so the worst one stood for the container, and nine finished `stormcert-client-*` one-shots

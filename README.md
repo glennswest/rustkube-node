@@ -177,7 +177,15 @@ the golden record (`GET /v1/goldens/{image}`, ready, `template_name`) and answer
 this node's registry has no golden of is asked of the cluster (#79): the kubelet posts sbregistry's clone route,
 the one that starts its cluster fetch, and its answer (503 "fetching it from the cluster", 404 "push the image")
 is the pull's ErrImagePull, retried on the back-off; a clone it minted because the golden became ready meanwhile
-is deleted (stormblock-registry#98 would make that a plain demand). Building an image from upstream on demand
+is deleted (stormblock-registry#98 would make that a plain demand). **A tag selects a golden version** (#86): for a
+component the release manifest lists (or the node carries as a pallet), `image: nextnfs:<sha12>` (or
+`nextnfs:golden-nextnfs-<sha12>`) at a version other than the release's is not the pallet: it is pulled through the
+registry as `registry/nextnfs:<sha12>`, stormcentral's name for the golden `golden-nextnfs-<sha12>`. The registry's
+record gives the template each container's root is cloned from; a version this node does not hold is the cluster
+demand, which fetches it from forge once and keeps it (the owner's choice A; the fetch is stormblock-registry#116),
+retried on the pull back-off meanwhile. So an operator rolls one instance to a new golden, and back, with no node
+reboot. The release's own version, an untagged image, any other tag and any digest run the pallet, as upstream
+images with tags and `@sha256:` pins always did. Building an image from upstream on demand
 (`POST /v1/goldens`) is not done: whether that endpoint stays is stormblock-registry#50. A failed
 create or start removes the clone; roots no container holds (a kubelet that died mid-way) are deleted at
 start, never one still attached. `readOnlyRootFilesystem` mounts the container's own clone read-only once the
