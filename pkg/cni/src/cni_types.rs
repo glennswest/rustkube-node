@@ -26,6 +26,11 @@ pub enum CniError {
     #[error("netns error: {0}")]
     NetnsError(String),
 
+    /// One of a pod's extra networks (a NetworkAttachmentDefinition's) failed,
+    /// named in the message (rustkube-node#233).
+    #[error("{0}")]
+    Attachment(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

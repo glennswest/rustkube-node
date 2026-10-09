@@ -221,6 +221,19 @@ fn image_id(c: &Container) -> String {
         .unwrap_or_else(|| c.image.clone())
 }
 
+/// The pod as one extra network sees it (#233): its interface, and the
+/// addresses / MAC the pod asked for, offered as `runtimeConfig`.
+fn attachment_pod(base: &cni::PodNetwork, a: &crate::cri::NetworkAttachment) -> cni::PodNetwork {
+    let mut p = base.clone().on_interface(&a.ifname);
+    if !a.ips.is_empty() {
+        p.runtime_config.insert("ips".into(), serde_json::json!(a.ips));
+    }
+    if let Some(m) = &a.mac {
+        p.runtime_config.insert("mac".into(), serde_json::json!(m));
+    }
+    p
+}
+
 /// A sandbox whose CNI ADD failed and whose DEL has not succeeded yet (#100).
 ///
 /// A plugin chain can fail half way through ADD with an address allocated or
@@ -307,18 +320,40 @@ impl StormpumpRuntime {
         }
     }
 
+    /// DEL every network a sandbox has (#233): its extra networks, last first,
+    /// then the default (the replaced one, else the cluster's). Every DEL is
+    /// tried; the first error is answered. DEL of a network never added is
+    /// allowed by the CNI contract, so a half-made sandbox is undone whole.
+    async fn del_networks(&self, invoker: &cni::CniInvoker, id: &str, netns: &str, config: &PodSandboxConfig) -> Result<(), String> {
+        let base = cni::PodNetwork::new(id, netns, &config.namespace, &config.name, &config.uid);
+        let mut first: Option<String> = None;
+        for a in config.networks.iter().rev() {
+            let r = match cni::NetworkConfigList::from_json(&a.config, &a.name) {
+                Ok(c) => invoker.del_network(&c, &attachment_pod(&base, a)).await.map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            if let Err(e) = r {
+                first.get_or_insert(format!("{} ({}): {e}", a.name, a.ifname));
+            }
+        }
+        let r = match &config.default_network {
+            Some(d) => match cni::NetworkConfigList::from_json(&d.config, &d.name) {
+                Ok(c) => invoker.del_network(&c, &base).await.map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            },
+            None => invoker.del(&base).await.map_err(|e| e.to_string()),
+        };
+        if let Err(e) = r {
+            first.get_or_insert(e);
+        }
+        first.map_or(Ok(()), Err)
+    }
+
     /// DEL, then give the sandbox back. `false` when DEL failed: the caller
     /// keeps the record, and the namespace with it.
     async fn unwind_network(&self, failed: &FailedNetwork) -> bool {
         if let Some(invoker) = &self.cni {
-            let pod = cni::PodNetwork::new(
-                &failed.id,
-                &failed.netns,
-                &failed.config.namespace,
-                &failed.config.name,
-                &failed.config.uid,
-            );
-            if let Err(e) = invoker.del(&pod).await {
+            if let Err(e) = self.del_networks(invoker, &failed.id, &failed.netns, &failed.config).await {
                 tracing::warn!(sandbox = %failed.id, pod = %failed.config.name,
                     "CNI DEL after a failed ADD did not succeed, retried before the next sandbox: {e}");
                 return false;
@@ -326,6 +361,23 @@ impl StormpumpRuntime {
         }
         self.release_sandbox(&failed.id, failed.handle).await;
         true
+    }
+
+    /// CNI ADD of each extra network (#233), in order, each on its own
+    /// interface. `Err` names the network that failed; the caller DELs every
+    /// network and fails the sandbox.
+    async fn add_attachments(&self, invoker: &cni::CniInvoker, base: &cni::PodNetwork, config: &PodSandboxConfig) -> Result<Vec<cni::CniResult>, String> {
+        let mut out = Vec::new();
+        for a in &config.networks {
+            let c = cni::NetworkConfigList::from_json(&a.config, &a.name)
+                .map_err(|e| format!("network {} ({}): its config: {e}", a.name, a.ifname))?;
+            let r = invoker
+                .add_network(&c, &attachment_pod(base, a))
+                .await
+                .map_err(|e| format!("network {} ({}): {e}", a.name, a.ifname))?;
+            out.push(r);
+        }
+        Ok(out)
     }
 
     /// Retry every failed ADD's DEL. One at a time, under the lock, so two
@@ -972,7 +1024,12 @@ impl RuntimeService for StormpumpRuntime {
         let mut ip = String::new();
         let mut network_status = None;
         if let (Some(invoker), Some(ns)) = (&self.cni, &netns) {
-            match invoker.network_ready() {
+            // A replaced default network (#233) needs no cluster config.
+            let ready = match &config.default_network {
+                Some(_) => Ok(String::new()),
+                None => invoker.network_ready(),
+            };
+            match ready {
                 Ok(_) => {
                     let pod = cni::PodNetwork::new(
                         &id,
@@ -982,10 +1039,24 @@ impl RuntimeService for StormpumpRuntime {
                         &config.uid,
                     );
                     let adding = std::time::Instant::now();
-                    let added = invoker.add(&pod).await;
+                    let added = match &config.default_network {
+                        Some(d) => match cni::NetworkConfigList::from_json(&d.config, &d.name) {
+                            Ok(c) => invoker.add_network(&c, &pod).await,
+                            Err(e) => Err(e),
+                        },
+                        None => invoker.add(&pod).await,
+                    };
+                    // Then each extra network, in order (#233).
+                    let added = match added {
+                        Ok(result) => match self.add_attachments(invoker, &pod, &config).await {
+                            Ok(extra) => Ok((result, extra)),
+                            Err(e) => Err(cni::CniError::Attachment(e)),
+                        },
+                        Err(e) => Err(e),
+                    };
                     steps.cni = adding.elapsed();
                     match added {
-                        Ok(result) => {
+                        Ok((result, extra)) => {
                             ip = result
                                 .ips
                                 .first()
@@ -997,9 +1068,15 @@ impl RuntimeService for StormpumpRuntime {
                             );
                             // What it wired, for the pod's annotation (#131).
                             let netns_path = ns.clone();
-                            network_status = Some(crate::network_status::entries(&result, &|ifname| {
-                                crate::network_status::mtu_in_netns(&netns_path, ifname)
-                            }));
+                            let mtu = |ifname: &str| crate::network_status::mtu_in_netns(&netns_path, ifname);
+                            let mut status = crate::network_status::entries(&result, &mtu);
+                            if let Some(d) = &config.default_network {
+                                crate::network_status::rename(&mut status, &d.name);
+                            }
+                            for (a, r) in config.networks.iter().zip(&extra) {
+                                crate::network_status::append(&mut status, crate::network_status::attachment_entries(r, &a.name, &a.ifname, &mtu));
+                            }
+                            network_status = Some(status);
                         }
                         // Same reasoning as a missing config: a pod that
                         // asked for a network and did not get one must not
@@ -1102,15 +1179,8 @@ impl RuntimeService for StormpumpRuntime {
         let existing = self.sandboxes.lock().await.get(sandbox_id).cloned();
         let Some(sb) = existing else { return Ok(()) };
         if let (Some(invoker), Some(ns)) = (&self.cni, &sb.netns) {
-            let pod = cni::PodNetwork::new(
-                sandbox_id,
-                ns,
-                &sb.config.namespace,
-                &sb.config.name,
-                &sb.config.uid,
-            );
-            invoker
-                .del(&pod)
+            // Every network it has, extra ones last-first (#233).
+            self.del_networks(invoker, sandbox_id, ns, &sb.config)
                 .await
                 .map_err(|e| CriError::NetworkNotReady(format!("CNI DEL: {e}")))?;
             tracing::info!(sandbox = %sandbox_id, pod = %sb.config.name, "CNI released the pod network");

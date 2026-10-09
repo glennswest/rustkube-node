@@ -13,6 +13,7 @@ pub mod engine;
 pub mod events;
 pub mod metrics;
 pub mod mirror;
+pub mod multus;
 pub mod network_status;
 pub mod node_health;
 pub mod node_logs;

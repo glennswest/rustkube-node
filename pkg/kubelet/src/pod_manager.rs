@@ -898,6 +898,45 @@ impl PodManager {
         }
     }
 
+    /// A pod's extra networks and replaced default network, resolved to their
+    /// NetworkAttachmentDefinitions (#233). `Err` names what is missing.
+    async fn resolve_networks(
+        &self,
+        pod: &Value,
+    ) -> Result<(Vec<crate::cri::NetworkAttachment>, Option<crate::cri::NetworkAttachment>), String> {
+        use crate::multus;
+        let ns = pod["metadata"]["namespace"].as_str().unwrap_or("default");
+        let annotations = &pod["metadata"]["annotations"];
+        let mut networks = Vec::new();
+        if let Some(a) = annotations[multus::NETWORKS].as_str() {
+            for (i, sel) in multus::parse(a)?.iter().enumerate() {
+                let nad = self.nad(sel, ns).await?;
+                networks.push(multus::attachment(sel, ns, multus::ifname(sel, i), nad.as_ref())?);
+            }
+        }
+        let default_network = match annotations[multus::DEFAULT_NETWORK].as_str().filter(|a| !a.trim().is_empty()) {
+            None => None,
+            Some(a) => {
+                let mut sels = multus::parse(a)?;
+                if sels.len() != 1 {
+                    return Err(format!("{}: one network, not {}", multus::DEFAULT_NETWORK, sels.len()));
+                }
+                let sel = sels.remove(0);
+                let nad = self.nad(&sel, ns).await?;
+                Some(multus::attachment(&sel, ns, cni::invoker::DEFAULT_IFNAME.to_string(), nad.as_ref())?)
+            }
+        };
+        Ok((networks, default_network))
+    }
+
+    /// A NAD as the apiserver has it; `Ok(None)` when it does not exist.
+    async fn nad(&self, sel: &crate::multus::Selection, pod_namespace: &str) -> Result<Option<Value>, String> {
+        let ns = sel.namespace.as_deref().unwrap_or(pod_namespace);
+        self.api_get_checked(&crate::multus::nad_path(ns, &sel.name))
+            .await
+            .map_err(|e| format!("NetworkAttachmentDefinition {ns}/{}: {e}", sel.name))
+    }
+
     /// The placement policy a new claim's volume gets: its StorageClass's
     /// `redundancy`, `spread` and `tier` (#71). A class that does not exist,
     /// or names nothing, is the default (one copy); one that cannot be read
@@ -3579,6 +3618,14 @@ impl PodManager {
         // Made by this attempt: its steps are this start's to report (#139).
         let made_here=existing.is_none();
         let sandbox_id=if let Some(existing)=existing {existing} else {
+        // The pod's extra networks (#233), resolved before the sandbox: a
+        // NAD that is not there is a wait naming it.
+        let mut sandbox_config = sandbox_config.clone();
+        if !sandbox_config.host_network {
+            let (networks, default_network) = self.resolve_networks(pod).await.map_err(CriError::NetworkNotReady)?;
+            sandbox_config.networks = networks;
+            sandbox_config.default_network = default_network;
+        }
         let sandbox_id = self.runtime.run_pod_sandbox(&sandbox_config).await?;
         // Persist each side effect before the next await. A failed or cancelled
         // start is cleaned by this UID before another sandbox can be created.
@@ -5749,6 +5796,9 @@ fn build_sandbox_config(pod: &Value) -> PodSandboxConfig {
         // resource rather than on the container that was actually relabelled.
         selinux_options: parse_selinux_options(&pod["spec"]["securityContext"]),
         qos_class: qos_class(pod).to_string(),
+        // Resolved against the apiserver before the sandbox (#233).
+        networks: Vec::new(),
+        default_network: None,
     }
 }
 

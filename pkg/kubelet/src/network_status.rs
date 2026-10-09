@@ -106,6 +106,38 @@ pub fn entries(result: &cni::CniResult, mtu_of: &dyn Fn(&str) -> Option<u32>) ->
     Value::Array(entries)
 }
 
+/// An extra network's entries (#233): as [`entries`], named for its
+/// NetworkAttachmentDefinition (`namespace/name`), never the default, and on
+/// the interface it was put on when the plugin named none.
+pub fn attachment_entries(result: &cni::CniResult, name: &str, ifname: &str, mtu_of: &dyn Fn(&str) -> Option<u32>) -> Value {
+    let mut v = entries(result, mtu_of);
+    for (i, e) in v.as_array_mut().into_iter().flatten().enumerate() {
+        e["name"] = json!(name);
+        e["default"] = json!(false);
+        if result.interfaces.is_empty() && i == 0 {
+            e["interface"] = json!(ifname);
+        }
+    }
+    v
+}
+
+/// Name the default network's entries for the NAD that replaced it (#233).
+pub fn rename(status: &mut Value, name: &str) {
+    for e in status.as_array_mut().into_iter().flatten() {
+        if e["default"] == json!(true) {
+            e["name"] = json!(name);
+        }
+    }
+}
+
+/// Add `more` entries after `status`'s: the default network first, as Multus
+/// writes it.
+pub fn append(status: &mut Value, more: Value) {
+    if let (Some(list), Value::Array(extra)) = (status.as_array_mut(), more) {
+        list.extend(extra);
+    }
+}
+
 /// The MTU of `ifname` inside the network namespace at `netns` (a
 /// `/proc/<pid>/ns/net`), read with `SIOCGIFMTU` from a thread that joins it:
 /// `setns` changes only the calling thread, which ends right after.
@@ -213,5 +245,30 @@ mod tests {
         let mtu = mtu_in_netns("/proc/self/ns/net", "lo");
         assert!(mtu.is_some_and(|m| m >= 1500), "{mtu:?}");
         assert_eq!(mtu_in_netns("/proc/self/ns/net", "no-such-if"), None);
+    }
+
+    /// #233: the default network first, then each extra one, named for its
+    /// NAD, on its own interface, never the default.
+    #[test]
+    fn extra_networks_follow_the_default() {
+        let default: cni::CniResult = serde_json::from_value(serde_json::json!({
+            "cniVersion": "1.0.0",
+            "interfaces": [{"name": "eth0", "sandbox": "/proc/9/ns/net", "mac": "aa:aa:aa:aa:aa:aa"}],
+            "ips": [{"address": "10.0.0.5/24", "interface": 0}]})).unwrap();
+        let lan: cni::CniResult = serde_json::from_value(serde_json::json!({
+            "cniVersion": "1.0.0", "ips": [{"address": "192.168.50.9/24"}]})).unwrap();
+        let none = |_: &str| None;
+        let mut status = entries(&default, &none);
+        append(&mut status, attachment_entries(&lan, "default/lan", "net1", &none));
+        let l = status.as_array().unwrap();
+        assert_eq!(l.len(), 2);
+        assert_eq!((l[0]["interface"].clone(), l[0]["default"].clone()), (json!("eth0"), json!(true)));
+        assert_eq!(l[1]["name"], "default/lan");
+        assert_eq!(l[1]["interface"], "net1");
+        assert_eq!(l[1]["default"], false);
+        assert_eq!(l[1]["ips"], json!(["192.168.50.9"]));
+        rename(&mut status, "kube-system/vlan248");
+        assert_eq!(status[0]["name"], "kube-system/vlan248");
+        assert_eq!(status[1]["name"], "default/lan", "only the default is renamed");
     }
 }

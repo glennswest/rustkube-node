@@ -69,6 +69,30 @@ pub struct PodSandboxConfig {
     /// The pod's QoS class (`Guaranteed`, `Burstable`, `BestEffort`), for its
     /// cgroup parent on a CRI runtime (#24). Empty: the runtime's default.
     pub qos_class: String,
+    /// The pod's extra networks (`k8s.v1.cni.cncf.io/networks`, #233),
+    /// resolved to their NetworkAttachmentDefinitions, in order. A runtime
+    /// that does its own CNI (stormpump) runs one ADD per entry after the
+    /// default network.
+    pub networks: Vec<NetworkAttachment>,
+    /// The pod's default network, replaced (`v1.multus-cni.io/default-network`).
+    pub default_network: Option<NetworkAttachment>,
+}
+
+/// One network a pod attaches to (#233), resolved from its
+/// NetworkAttachmentDefinition.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NetworkAttachment {
+    /// `namespace/name` of the NetworkAttachmentDefinition: the
+    /// `network-status` entry's name.
+    pub name: String,
+    /// The interface in the pod (`net1`, … unless the pod named it).
+    pub ifname: String,
+    /// The NAD's `spec.config`: a CNI conflist or one plugin's config.
+    pub config: String,
+    /// Addresses the pod asked for (`ips`), for plugins that take them.
+    pub ips: Vec<String>,
+    /// A MAC address the pod asked for, likewise.
+    pub mac: Option<String>,
 }
 
 /// Port mapping for a pod sandbox.
