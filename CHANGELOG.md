@@ -2,6 +2,12 @@
 
 ## 2026-10-09
 
+- **fix:** A node service's mirror pod takes its state from its long-running stormd processes; one-shots are
+  init-like (#226). On 12.03 rustkube-apiserver read `Running (Completed) 0/1` while serving: no process is named
+  after the service, so the worst one stood for the container, and nine finished `stormcert-client-*` one-shots
+  (stopped, exit 0) outranked the running `apiserver`. One-shots come from the golden's stormd config (`on_exit =
+  "stop"`, `restart_policy` OnFailure/Never) or a stop on exit 0; readiness and restarts are every long-running
+  process's; a failed one-shot keeps the container not ready, and the `Ready` condition says which process.
 - **fix:** A deleted pod's containers are stopped within its termination grace, not a fixed 30 s (#225): the delete's
   `metadata.deletionGracePeriodSeconds`, else `spec.terminationGracePeriodSeconds`, else 30. The app containers
   stop together (one grace for the pod, as upstream), then the sidecars. A 5 s pod whose process ignores SIGTERM was

@@ -324,8 +324,12 @@ an older PID 1 without it gives `age_secs` (#193).
 A running asset's pod is Running and Ready, and a stopped one is Failed. **A service run by stormd shows what
 stormd's own supervision says** (#215, stormd#48): every 5 s the kubelet asks each host-network service's stormd
 (its `[api] bind` port from the golden's config: 9081 fastetcd, 9082–9084 the control plane, 9085 rustkube-node, a
-service's port + 100) for `GET /api/v1/processes`. The container is the process named after the service (else the
-worst of its processes, their restarts summed, ready only if all are): Running since its start, Waiting
+service's port + 100) for `GET /api/v1/processes`. The container is the service's **long-running** processes (#226): one-shots (a `[[process]]` with
+`on_exit = "stop"` or `restart_policy` `OnFailure`/`Never` in the golden's stormd config, or any process stopped
+after exit 0, such as the `stormcert-client-*` cert minters) are init-like and never decide it. Of the long-running
+processes, the one named after the service speaks for the state, else the worst of them; restarts are theirs, summed;
+ready only when every one is, and a not-ready container's `Ready` condition names the processes (or a one-shot that
+failed, which also keeps it not ready). So: Running since its start, Waiting
 `CrashLoopBackOff` while stormd backs off, Waiting `ContainerCreating` while it starts, Terminated with its exit
 (`Completed`/`Error`) once stopped; `restartCount` is stormd's restarts plus PID 1's; a restarted process carries its
 last exit as `lastState.terminated`; Ready is its readiness probe, and not ready gives upstream's
