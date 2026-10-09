@@ -223,12 +223,6 @@ fn vm_of(reg: &stormvm_node::console::Registration) -> Vm {
     }
 }
 
-/// Is a hypervisor listening on its control socket? For a machine with no
-/// engine handle, the only way left to tell a live one from a dead one.
-///
-/// A connect, not a command: QMP serves one client at a time, and a console
-/// holding it must not make the machine look dead. A dead hypervisor leaves
-/// its socket file behind, and a connect to it is refused.
 /// How long a VMI's guest is given to power off (#181): its
 /// `terminationGracePeriodSeconds`, else 30 s.
 pub fn grace_from(obj: Option<&Value>) -> std::time::Duration {
@@ -236,6 +230,24 @@ pub fn grace_from(obj: Option<&Value>) -> std::time::Duration {
         .and_then(|o| o["spec"]["terminationGracePeriodSeconds"].as_u64())
         .unwrap_or(30);
     std::time::Duration::from_secs(secs)
+}
+
+/// The VMI's own `terminationGracePeriodSeconds`, when it sets one, for the
+/// engine's node-shutdown wait (`Spec.shutdown_grace_secs`, stormpump#56).
+/// Unset leaves the engine's default (45 s, KubeVirt's); the engine refuses
+/// more than an hour, so a larger value is capped there.
+pub fn shutdown_grace_secs(obj: Option<&Value>) -> Option<u32> {
+    obj.and_then(|o| o["spec"]["terminationGracePeriodSeconds"].as_u64()).map(|s| s.min(3600) as u32)
+}
+
+/// A machine's encoded spec (stormvm's plan) with `shutdown_grace_secs` set
+/// (#181). `None` when there is nothing to set or the spec does not decode:
+/// the plan's own bytes are used as they are.
+pub fn with_shutdown_grace(spec: &[u8], grace: Option<u32>) -> Option<Vec<u8>> {
+    let grace = grace?;
+    let mut s = stormpump::spec::Spec::decode(spec).ok()?;
+    s.shutdown_grace_secs = Some(grace);
+    Some(s.encode())
 }
 
 /// The machine's control, from its registration: what `shut_down` asks.
@@ -272,6 +284,12 @@ where
     }
 }
 
+/// Is a hypervisor listening on its control socket? For a machine with no
+/// engine handle, the only way left to tell a live one from a dead one.
+///
+/// A connect, not a command: QMP serves one client at a time, and a console
+/// holding it must not make the machine look dead. A dead hypervisor leaves
+/// its socket file behind, and a connect to it is refused.
 fn control_alive(reg: &stormvm_node::console::Registration) -> bool {
     reg.control_socket
         .as_deref()
@@ -2060,6 +2078,12 @@ impl VmManager {
         let domain = built.domain;
         let volumes = built.volumes.clone();
         let spec_bytes = built.spec.clone();
+        // The VMI's grace for the engine's node shutdown (stormpump#56): the
+        // engine waits that long for the guest before signalling its
+        // hypervisor. An engine older than the field refuses the newer spec,
+        // so it is defined again without it (#181).
+        let graced = with_shutdown_grace(&built.spec, shutdown_grace_secs(self.desired.lock().await.get(uid)));
+        let vm_name = vm.name.clone();
         // Each handle is noted as the engine gives it, and the whole record
         // is let go the moment the spawn succeeds — here, not after the await,
         // so an abandoned start's record is right either way (#100).
@@ -2071,7 +2095,17 @@ impl VmManager {
                 note(&ledger, &owner, Undo::Release(UndoKind::Volume, h));
                 handles.push(h);
             }
-            let spec = ring.spec_define(spec_bytes)?;
+            let spec = match graced {
+                Some(g) => match ring.spec_define(g) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(vm = %vm_name, "the engine refused the spec with a shutdown grace ({e}); \
+                              defining it without one (an engine before stormpump#56 waits its own way)");
+                        ring.spec_define(spec_bytes)?
+                    }
+                },
+                None => ring.spec_define(spec_bytes)?,
+            };
             note(&ledger, &owner, Undo::Release(UndoKind::Spec, spec));
             // No root: a machine's root is a disk on the hypervisor's command
             // line. A sandbox only for a VMI on the pod network (#88), joined
@@ -5774,4 +5808,22 @@ mod seed_tests {
         assert!(seed_text(&serde_json::json!({"stringData": {"a": "x", "b": "y"}})).is_none());
     }
 
+
+    /// #181, stormpump#56: the VMI's grace rides on the machine's spec, and
+    /// only when the VMI sets one.
+    #[test]
+    fn a_vmis_grace_rides_on_its_spec() {
+        let vmi = json!({"spec": {"terminationGracePeriodSeconds": 120}});
+        assert_eq!(shutdown_grace_secs(Some(&vmi)), Some(120));
+        assert_eq!(shutdown_grace_secs(Some(&json!({"spec": {}}))), None, "unset: the engine's 45 s");
+        assert_eq!(shutdown_grace_secs(Some(&json!({"spec": {"terminationGracePeriodSeconds": 99999}}))), Some(3600));
+        let plain = stormpump::spec::Spec { argv: vec!["/usr/bin/qemu-system-x86_64".into()], ..Default::default() };
+        let bytes = plain.encode();
+        assert_eq!(with_shutdown_grace(&bytes, None), None);
+        let graced = with_shutdown_grace(&bytes, Some(120)).expect("set");
+        let back = stormpump::spec::Spec::decode(&graced).unwrap();
+        assert_eq!(back.shutdown_grace_secs, Some(120));
+        assert_eq!(back.argv, plain.argv, "the rest of the plan's spec as it was");
+        assert_eq!(with_shutdown_grace(b"not a spec", Some(5)), None);
+    }
 }
