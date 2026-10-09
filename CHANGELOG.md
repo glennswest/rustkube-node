@@ -2,6 +2,13 @@
 
 ## 2026-10-09
 
+- **feat:** The built-in driver takes `redundancy`, `spread` and `tier` from the StorageClass (#71, stormblock#151).
+  One blank per (size, fs, redundancy, spread), named for them (`pvc-ext4j-1048576m-mirror2-shelf`) and minted with
+  the policy, so a claim cloned from it inherits it; a Block claim's raw volume carries the policy and the tier. A
+  class naming nothing stays one copy on the shipped blank; an unreadable class waits; an unknown parameter or a
+  policy the node cannot place is `ProvisioningFailed` on the claim (a mint 409 that is not "exists" is no longer
+  taken as a success). Capacity charges size times redundancy. `tier` on a filesystem claim: a `TierNotApplied`
+  Warning until stormblock#377.
 - **docs:** Documentation refreshed from the code at 06b91b5 (`git log --since=2026-10-02`). `docs/status.md`
   rewritten: changes since October 2, the owner's decisions and their state, and every gap with its issue.
   configuration.md: the reservation flags, credential waits and serving pair as the code does them (stale lines

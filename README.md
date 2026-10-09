@@ -358,7 +358,25 @@ deleted by the kubelet, and `kubectl logs` on them is described above.
 
 The **built-in stormblock PVC driver** uses stormblock and sbregistry blanks.
 A claim is a copy-on-write clone of a sealed, preformatted size-class blank:
-no per-claim mkfs, data copy or CSI. Claims are cloned and attached over ublk by the
+no per-claim mkfs, data copy or CSI. **The class's policy** (#71): the StorageClass's `parameters` say how a new
+claim's volume is protected, as stormblock spells it (stormblock#151):
+
+| Parameter | Values | |
+|---|---|---|
+| `redundancy` | `none` (default), `mirror` (= `mirror:2`), `mirror:N`, `raid1`, `raid10`, `raid5:D+1` / `raid5:N`, `raid6:D+2` / `raid6:N`, `parity:D+P`; an `@rung` suffix sets the spread | copies or parity legs, each on its own failure domain |
+| `spread` | `site` `building` `room` `row` `rack` `node` `hba` `shelf` `set` `bay` `drive` (default `drive`) | the rung the legs differ at; must agree with an `@rung` |
+| `tier` | `hot` `warm` `cool` `cold` | a preference, never a refusal; applied to `volumeMode: Block` claims only until stormblock#377 (a filesystem claim gets a `TierNotApplied` Warning) |
+
+Any other key is refused on the claim (`ProvisioningFailed`), except `csi.storage.k8s.io/*`. A class naming nothing
+is one copy and clones the shipped blank (`pvc-ext4j-<MiB>m`), as before (the design's default, stormblock's
+"owner decision 2", is still `none`). A policy gets **its own blank per (size, fs, redundancy, spread)**, named for
+them (`pvc-ext4j-1048576m-mirror2-shelf`) and minted with `redundancy`/`spread`, so every claim cloned from it
+inherits the policy; a Block claim's raw volume is created with the policy and the tier. A policy the node cannot
+place on distinct domains is refused by the engine (409) and said on the claim as `ProvisioningFailed` with the
+engine's words. A StorageClass that cannot be read is a wait, never "none". Capacity (#62) charges a claim its class
+times its redundancy (a 2-way mirror twice), and counts committed volumes the same way. Only the class named
+`stormblock` is provisioned here (rustkube's provisioner matches the name too, #200); its parameters apply to every
+claim of it. Claims are cloned and attached over ublk by the
 node itself (`pkg/kubelet/src/storage.rs`), through the node's stormblock
 engine (`--stormblock`, default `http://127.0.0.1:9090`). The engine requires
 its own token, and the kubelet presents it on every call
