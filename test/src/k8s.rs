@@ -276,6 +276,15 @@ pub async fn gone(api: &Api, path: &str, within: Duration) -> Result<(), String>
     .await
 }
 
+/// The pod running this suite: the one named as this process's host (a pod's
+/// `HOSTNAME`), or any pod a Job owns (the runner's Job; the cases make plain
+/// pods). Labelled with the run id like the cases' pods (#97), and never
+/// theirs to delete (#217).
+pub fn is_runner(p: &Value, own: &str) -> bool {
+    (!own.is_empty() && s(p, "/metadata/name") == own)
+        || p["metadata"]["ownerReferences"].as_array().is_some_and(|o| o.iter().any(|r| r["kind"] == "Job"))
+}
+
 /// Delete every pod and claim this run made in its namespace (best effort:
 /// the runner deletes the namespace after, and this is what keeps a failed
 /// case from leaving a clone behind it). Returns the PVs still present after
@@ -284,7 +293,14 @@ pub async fn drain(env: &Env, api: &Api, within: Duration) -> Result<Vec<String>
     let sel = format!("?labelSelector=storm.io/test-run%3D{}", env.run_id);
     let claims = api.list(&format!("{}{sel}", pvcs(env))).await?.unwrap_or_default();
     let mut left: Vec<String> = claims.iter().map(|c| s(c, "/spec/volumeName").to_string()).filter(|v| !v.is_empty()).collect();
+    let own = std::env::var("HOSTNAME").unwrap_or_default();
     for p in api.list(&format!("{}{sel}", pods(env))).await?.unwrap_or_default() {
+        // Never the runner's own pod (rustkube-node#217): it carries the run
+        // label too, and deleting it killed the suite as it finished, so its
+        // Job never saw a success and made a new runner every few seconds.
+        if is_runner(&p, &own) {
+            continue;
+        }
         api.delete(&format!("{}/{}", pods(env), s(&p, "/metadata/name"))).await?;
     }
     for c in &claims {
@@ -367,5 +383,18 @@ pub mod tests {
         let p = json!({"status": {"containerStatuses": [{"state": {"waiting": {"reason": "ContainerCreating", "message": "m"}}}]}});
         assert_eq!(waiting(&p), ", waiting: ContainerCreating: m");
         assert_eq!(waiting(&json!({})), "");
+    }
+
+    /// #217: the cleanup deleted the runner's own pod, which carries the run
+    /// label, so the Job never succeeded and replaced it every few seconds.
+    #[test]
+    fn the_runners_own_pod_is_never_drained() {
+        let runner = json!({"metadata": {"name": "test-f89f4", "labels": {"storm.io/test-run": "r1"},
+            "ownerReferences": [{"kind": "Job", "name": "test", "uid": "j"}]}});
+        let case = json!({"metadata": {"name": "short-runs", "labels": {"storm.io/test-run": "r1"}}});
+        assert!(is_runner(&runner, ""), "a Job's pod, even when HOSTNAME is not set");
+        assert!(is_runner(&json!({"metadata": {"name": "test-f89f4"}}), "test-f89f4"));
+        assert!(!is_runner(&case, "test-f89f4"));
+        assert!(!is_runner(&case, ""));
     }
 }
