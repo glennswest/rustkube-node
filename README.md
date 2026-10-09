@@ -137,8 +137,9 @@ Warnings are written before the start moves on.
 The executable defaults to **`--runtime native`**. The stormcos stage recipe
 explicitly selects **`--runtime stormpump`**, connecting to the engine ring at
 `/hostrun/stormpump.sock`. `--runtime cri` selects an external CRI v1 runtime
-(CRI-O or containerd); it is optional. `--runtime vm` is the separate, incomplete
-legacy microVM-Pod path, not the stormvm VMI manager.
+(CRI-O or containerd); it is optional. The node-wide microVM runtime (`--runtime vm`, `--vmm`)
+is retired (#13, the owner's choice): microVM Pods are stormvisor's, picked per Pod by
+`runtimeClassName` (#204), beside stormpump Pods and stormvm VMIs on one node.
 
 For stormpump Pods, CNI configuration is checked per sandbox: the kubelet
 passes the sandbox network namespace to CNI ADD and invokes DEL when the

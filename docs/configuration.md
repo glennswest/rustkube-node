@@ -20,8 +20,7 @@ An em dash means there is no environment binding or the value is unset.
 | `--node-annotations` | `NODE_ANNOTATIONS` | Empty; comma-separated `key=value` |
 | `--register-with-taints` | `REGISTER_WITH_TAINTS` | Empty; `key=value:Effect` or `key:Effect`, on Node creation only |
 | `--pod-manifest-path` | `POD_MANIFEST_PATH` | `/etc/kubernetes/manifests`; empty string disables static Pods |
-| `--runtime` | — | `native`; choices `native`, `cri`, `vm`, `stormpump` |
-| `--vmm` | — | `auto`; choices `auto`, `cloud-hypervisor`, `qemu`, `firecracker`; for legacy `vm` runtime |
+| `--runtime` | — | `native`; choices `native`, `cri`, `stormpump` (`vm` and `--vmm` retired, #13) |
 | `--registry` | — | `http://127.0.0.1:5100`; sbregistry (stormblock-registry), which mints image clones, with `--runtime stormpump` |
 | `--stormblock` | `STORMBLOCK_URL` | `http://127.0.0.1:9090`; engine for claims, VM disks and images |
 | `--cri-socket` | `CRI_SOCKET` | CRI auto-detection, or `/run/stormpump.sock` for stormpump |
@@ -96,9 +95,8 @@ Every other runtime-side call is bounded too (#99):
   overall bound.
 
 `--runtime stormpump` fails startup if the ring connection fails. It also
-activates the stormvm VMI and snapshot reconcilers. `--runtime vm` detects a
-VMM and falls back to native if none is found; its Pod container lifecycle is
-incomplete (#13). It does not activate the stormvm VMI reconciler.
+activates the stormvm VMI and snapshot reconcilers. The node-wide microVM runtime
+(`--runtime vm`) is retired (#13): microVM Pods are stormvisor's, by RuntimeClass (#204).
 
 `--no-cni` removes the kubelet's invoker. It does not rewrite Pod hostNetwork,
 change CRI runtime configuration or force stormpump to use the host namespace.

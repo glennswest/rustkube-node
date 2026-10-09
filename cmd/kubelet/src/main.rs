@@ -10,7 +10,6 @@
 use clap::Parser;
 use kubelet::{
     detect_cri_socket, CriGrpcClient, Kubelet, KubeletConfig, NativeImageService, NativeRuntime,
-    VmRuntime, VmmBackend,
 };
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
@@ -73,13 +72,11 @@ struct Cli {
     #[arg(long, env = "CRI_SOCKET")]
     cri_socket: Option<String>,
 
-    /// Container runtime: native (libcontainer), vm (microVM), cri (external CRI).
-    #[arg(long, default_value = "native", value_parser = ["native", "vm", "cri", "stormpump"])]
+    /// Container runtime: native (libcontainer), cri (external CRI), stormpump.
+    /// (`vm`, a node-wide microVM runtime, is retired: microVM Pods are
+    /// stormvisor's, chosen per Pod by RuntimeClass, #13, #204.)
+    #[arg(long, default_value = "native", value_parser = ["native", "cri", "stormpump"])]
     runtime: String,
-
-    /// VMM backend for --runtime=vm.
-    #[arg(long, default_value = "auto", value_parser = ["auto", "cloud-hypervisor", "qemu", "firecracker"])]
-    vmm: String,
 
     /// CNI network config directory (Cilium writes 05-cilium.conflist here).
     #[arg(long, env = "CNI_CONF_DIR", default_value = "/etc/cni/net.d")]
@@ -378,27 +375,6 @@ async fn main() -> anyhow::Result<()> {
         Arc<dyn kubelet::cri::ImageService>,
         Arc<dyn kubelet::cri::MigrationService>,
     ) = match cli.runtime.as_str() {
-        "vm" => {
-            let backend = match cli.vmm.as_str() {
-                "cloud-hypervisor" => Some(VmmBackend::CloudHypervisor),
-                "qemu" => Some(VmmBackend::Qemu),
-                "firecracker" => Some(VmmBackend::Firecracker),
-                _ => VmmBackend::detect(),
-            };
-            if let Some(backend) = backend {
-                tracing::info!("kubelet using VM runtime ({:?})", backend);
-                let rt = Arc::new(VmRuntime::new(backend));
-                let img = Arc::new(NativeImageService::new());
-                let mig = rt.clone() as Arc<dyn kubelet::cri::MigrationService>;
-                (rt as _, img as _, mig)
-            } else {
-                tracing::error!("no VMM found, falling back to native runtime");
-                let rt = Arc::new(NativeRuntime::new().with_cni(cni_invoker));
-                let img = Arc::new(NativeImageService::new());
-                let mig = rt.clone() as Arc<dyn kubelet::cri::MigrationService>;
-                (rt as _, img as _, mig)
-            }
-        }
         "stormpump" => {
             // The engine's ring, not a socket protocol. See
             // kubelet::stormpump_runtime for why there is no shim.

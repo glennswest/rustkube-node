@@ -46,7 +46,6 @@ pub mod vm_manager;
 pub mod vm_network;
 pub mod vm_restore;
 pub mod vm_migrate;
-pub mod vm_runtime;
 pub mod vm_snapshot;
 
 pub use checkpoint::CriuCheckpointer;
@@ -54,7 +53,6 @@ pub use cri_client::{CriClient, detect_cri_socket};
 pub use cri_grpc::CriGrpcClient;
 pub use kubelet::{detect_node_name, Kubelet, KubeletConfig};
 pub use runtime::{NativeRuntime, NativeImageService};
-pub use vm_runtime::{VmRuntime, VmConfig, VmmBackend};
 
 mod fs_watch;
 

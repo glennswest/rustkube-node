@@ -208,6 +208,6 @@ Full lists: `docs/api.md`, `docs/configuration.md`, `docs/metrics.md`.
 - **P0:** #214 (class blanks formatted on the node at runtime)
 - **P1:** #56 (exec/attach), #95/#99/#102 (startup speed), #184 (VMI waiting on its golden), #210 (pinned
   git dependencies), #61 (test suites live), #88/#91/#92 (VM checks on a live node)
-- **Waiting on the owner:** #13/#221 (microVM Pods), #86 (versioned goldens)
+- **Decided:** microVM Pods are stormvisor's by RuntimeClass (#13 → #204); versioned goldens copied on demand (#86)
 
 `gh issue list --state open` for the rest.

@@ -50,8 +50,9 @@ a row says so.
 | [#216](https://github.com/glennswest/rustkube-node/issues/216) `--previous` on a mirror pod | The newest finished run, failed or exited | Done |
 | stormimds#12 guest metadata | stormimds asks `/vmInstance` on every request (single source) | Built in stormimds; node credential is stormcos#330 / #180 |
 
-Open questions for the owner: [#13](https://github.com/glennswest/rustkube-node/issues/13)/[#221](https://github.com/glennswest/rustkube-node/issues/221)
-(microVM Pods) and [#86](https://github.com/glennswest/rustkube-node/issues/86) (versioned goldens).
+Decided 2026-10-09: microVM Pods are stormvisor's ([#13](https://github.com/glennswest/rustkube-node/issues/13), `--runtime vm` retired;
+dispatch by RuntimeClass is [#204](https://github.com/glennswest/rustkube-node/issues/204)), and versioned goldens are copied on demand
+([#86](https://github.com/glennswest/rustkube-node/issues/86), the fetch is stormblock-registry#116).
 
 Source entry points: `cmd/kubelet/src/main.rs`, `pkg/kubelet/src/kubelet.rs`,
 `pod_manager.rs`, `stormpump_runtime.rs`, `container_roots.rs`, `vm_manager.rs`,
@@ -67,7 +68,7 @@ Each gap has an owning issue. These are limitations, not supported features.
 | exec, attach and exec probes (port-forward is served). stormpump's op is in the lock (13cf2c9, stormpump#103 done); the kubelet does not use it yet | [#56](https://github.com/glennswest/rustkube-node/issues/56) |
 | Pod `securityContext.capabilities` on stormpump (`Spec.caps` is in the lock; not mapped) and `fsGroup`/`supplementalGroups` (`Spec.groups`; a claim is root's) | [#118](https://github.com/glennswest/rustkube-node/issues/118), [#171](https://github.com/glennswest/rustkube-node/issues/171) |
 | OOMKilled, termination messages, hugepages, in-place resize, `activeDeadlineSeconds` on a running pod | [#194](https://github.com/glennswest/rustkube-node/issues/194), [#162](https://github.com/glennswest/rustkube-node/issues/162), [#195](https://github.com/glennswest/rustkube-node/issues/195), [#192](https://github.com/glennswest/rustkube-node/issues/192), [#185](https://github.com/glennswest/rustkube-node/issues/185) |
-| `runtimeClassName` and AppArmor profiles applied; microVM Pods | [#204](https://github.com/glennswest/rustkube-node/issues/204), [#197](https://github.com/glennswest/rustkube-node/issues/197), [#13](https://github.com/glennswest/rustkube-node/issues/13) |
+| `runtimeClassName` (microVM Pods go to stormvisor through it) and AppArmor profiles applied | [#204](https://github.com/glennswest/rustkube-node/issues/204), [#197](https://github.com/glennswest/rustkube-node/issues/197) |
 | Reservations enforced as a cgroup limit (they are advertised only) | [#205](https://github.com/glennswest/rustkube-node/issues/205) |
 | Actual node CPU/memory, machine info and eviction from cAdvisor's library (node figures are container sums); a stormpump container's filesystem usage; VM tap counters | [#21](https://github.com/glennswest/rustkube-node/issues/21), [#222](https://github.com/glennswest/rustkube-node/issues/222), [#206](https://github.com/glennswest/rustkube-node/issues/206) |
 | `readOnlyRootFilesystem` (the container's own root is mounted writable until the engine can mount it read-only) | [stormpump#108](https://github.com/glennswest/stormpump/issues/108) |

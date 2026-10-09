@@ -2,6 +2,10 @@
 
 ## 2026-10-09
 
+- **BREAKING:** `--runtime vm` and `--vmm` are removed, with `vm_runtime.rs` (#13, the owner's choice A): microVM Pods
+  are stormvisor's (an OCI RuntimeClass shim stormcos ships), picked per Pod by `runtimeClassName`, which is #204. The
+  node-wide microVM runtime never got past Phase 1 (one rootfs template, no guest agent, no CNI in the guest) and
+  could not share a node with stormpump Pods or VMIs. Nothing deployed it (stormcos runs `--runtime stormpump`).
 - **feat:** Multi-NIC by the Multus standard (#233, stormcos#249): a pod's `k8s.v1.cni.cncf.io/networks` (names,
   `ns/name`, `name@if`, or the JSON list with `interface`/`ips`/`mac`) runs one CNI ADD per NetworkAttachmentDefinition
   (`spec.config`) after the default network, on `net1`, `net2`, … unless named; `v1.multus-cni.io/default-network`
