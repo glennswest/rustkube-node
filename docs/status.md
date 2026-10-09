@@ -1,56 +1,62 @@
 # Implementation and documentation audit
 
-Reviewed 2026-10-02 against main **fecb331** and
-`git log --since=2026-09-25` (the previous audit, 2026-09-29, covered from
-September 18 at 5bb1a38). Version 0.13.0 is the workspace version; changes
-after its tag (e8211b6) are unreleased as a version, though stage goldens of
-main have been requested since (latest golden-rustkube-node-e5db6ac32831 at
-9c2f738, release request stormcos#164). This document describes source and
-recorded `sc-build` verification, not a newly tested live node: no change
-below has been measured on a node yet (#102, target C2NR0Q2 per #110).
+Reviewed 2026-10-09 against main **06b91b5** and `git log --since=2026-10-02`
+(the previous audit, 2026-10-02, covered from September 25 at fecb331).
+Version 0.13.0 is the workspace version; changes after its tag (e8211b6) are
+unreleased as a version, though stage goldens of main are requested as issues
+finish (latest golden-rustkube-node-2eabd6fc174b at 9229603, release request
+stormcos#424). This document describes source and recorded `sc-build`
+verification (465 kubelet unit tests at 009d006), not a tested live node unless
+a row says so.
 
-## Changes since September 25
+## Changes since October 2
 
-| Area | Current code and representative commits |
+| Area | Current code and issues |
 |---|---|
-| Standalone builds | Pinned git apimachinery dependency replaces sibling path; Cargo.lock updated (`d3005a9`, `6741e93`) |
-| Engine authentication | Shared EngineClient with the engine's own token (`52726fb`, `ca6dd06`); v0.11.0 |
-| VM disks from stormvm v0.10.0 | emptyDisk and PVC disks (`6aca609`); v0.12.0 |
-| Metrics/resources | Prometheus metric families under upstream names; stormpump QUERY CPU/memory; memory/CPU limits mapped to engine Spec (`f239350`, `4245b8f`) |
-| Service volumes | Complete PV/PVC object builder and reconciliation, including logs volumes (`30bb887`) |
-| VM lifecycle | Registered VM adoption/deletion/finalizers, failed VMI list is not empty (`334f912`, `50c9865`); v0.13.0. Startup retry and failed-start cleanup (`b362777`); durable disks and owner sweep (`5c70a96`); a golden still importing (409 not sealed) waits (`c74b589`, #117) |
-| Built-in PVCs | Fractional quantities and class-sized capacity (`c5187a6`, `30ce985`); waiting Pods recorded Pending/ContainerCreating with FailedMount Events, blanks minted off the reconcile path (`c78baf0`) |
-| VM integration | Bridged tap address reporting (`3fe045b`), accessCredentials (`16fd7c6`), snapshot reconciler (`347655a`), console router told the stormblock URL (`52d7d43`) |
-| Node-service mirrors | stormd mirror logs (`ec32b92`) and "not started on this boot" status (`7f4f3d1`) |
-| UID workers (turbomode, #114) | Shared Pod/VMI workers (eight then; `--pod-workers`, 16 per CPU within 32–256, since #138) with name/claim reservations, shared four-slot image pulls, staged init and VM shutdown waits, retained failed teardown, CSI mutation serialization, inverse claim index, UID-guarded writes (`cdb0a4b`…`55d458c`, merged `600b58a`) |
-| Partial-start unwind (#100) | VM taps withdrawn with stormpump `DEPOSIT_WITHDRAW` and handles released after a failed start (`6c49fbc`); CNI DEL after a failed ADD; reclaim outlives its HTTP client (`077ad5c`) |
-| No sync tick (#101) | Per-probe and backoff deadlines (`4320c20`); service mirror on `/run/stormpump` inotify (`08fc437`); claims mirror, reclaim, CSI sweep and VM maintenance on watches (`82f00c3`); `kubelet_timed_reconciles_total` |
-| Bounded calls (#99) | Ring requests 30 s from enqueue, CNI plugin exec 60 s, engine 5 s connect / 60 s request / 1 h mint (`db9b783`) |
-| Full node filesystem (#129) | Per-pod dirs, ServiceAccount token, resolv.conf and container log dirs written before the sandbox; a failed write (ENOSPC…) keeps the pod Pending with the errno instead of "does not exist" and `Failed` |
-| Pod start timing (#132) | Phases of each start (seen → images → volumes → sandbox → init → containers → Running acknowledged) as `storm.io/start-timing` (`sandbox` split into acquire / cni / status / other since #139; each claim into lookup / blank|clone|raw / attach / bind since #95), a `StartTiming` Event, `kubelet_pod_start_phase_duration_seconds{phase}` and one INFO line (`8009bd4`); not yet read on a node |
-| First-attempt starts (#134) | A start waits up to 100 ms for an image it just asked for, so a local image starts on attempt 1 with no `ContainerCreating` status write first (every start took 2 on pvetest1); lifecycle Normal Events are queued, written in order off the start path (`5f6af4f`); not yet measured on a node |
-| Finished Pods release their IP (#137) | A Succeeded/Failed Pod's sandbox is stopped when it finishes: CNI DEL (stormpump runtime, at stop rather than removal) and the netns holder released; records and logs kept until deletion; a failed DEL retried (`227fbfe`). 1,000 Never pods on pvetest1 filled Cilium's range at ~250 before; not yet measured on a node |
-| Burst starts (#138) | 8 fixed workers queued 173 pods on pvetest1 (wait p50 2.4 s, max 9.3 s): `--pod-workers` (16 per CPU, 32–256), the start-timing PATCH off the worker, `workers=`/`pending=` in the annotation, no PodState clone per pass (`20e95fc`); not yet measured on a node |
-| Clone refusals (#140) | Dell C2NR0Q2 on 11.76: every claim waited on "stormblock would not clone pvc-ext4j-64m". Engine POSTs (template clone, attach, snapshot) now carry stormblock's status and `error`, or the transport error, into the claim's wait; a template refused as broken (sealed volume 404 / not sealed / no sealed snapshot) is deleted and minted again; not yet run on a node |
-| Pods wait for the CNI config (#148) | Dell 11.79: coredns took 16 sandbox attempts over 27 s before the network. No conflist is now a wait without a sandbox, woken by an inotify watch on `--cni-conf-dir` (10 s fallback); a failing ADD backs off from its own first failure (`f1a0c38`); not yet measured on a node |
-| kube-proxy on a TLS apiserver (#145) | `--ca-file`/`--token-file` defaulting to the ServiceAccount, token re-read per request; refused lists are errors, not empty; jumps into `KUBE-SERVICES`/`KUBE-POSTROUTING` ensured; rules rewritten on any change (not counts), resynced every 60 s; ports keyed by protocol and matched by name; optional `--cluster-cidr` (`3243b77`). No stormcos edition runs it (the flowsdn edition uses flowsdn's own Services, owner on #145, stormcos#265); kept in the golden, not run on a node |
-| Tests | PVC medium-suite container and remote static-binary staging (`f63d8c2`, `38dba5a`); latest full sc-build at `c74b589`: 270 kubelet unit, 4 integration, 25 CNI, 17 proxy tests; live acceptance remains open |
+| Each container its own root (#104, owner's option A) | `create_container` clones the image's sealed golden (a pallet's `<volume>.golden`, a pull's sbregistry fstemplate) into engine volume `ctr-<container>`, attached over ublk and mounted by PID 1 at `/run/stormpump/roots/<container>`; deleted with the container, a restart gets a fresh one; orphans swept at start. A pull clones nothing any more (#143's image-level clone and #161 are superseded). `readOnlyRootFilesystem` still mounts it writable (stormpump#108) |
+| Image config (#98, #172) | Entrypoint/Cmd/Env/WorkingDir/User from sbregistry's golden record under the pod spec; `runAsUser`/`runAsGroup`/`runAsNonRoot` applied; declared `Volumes` made as directories in the container's root. Pallets get no config yet (#208) |
+| Unknown images (#79) | A golden the node's registry lacks is demanded through sbregistry's clone route (cluster fetch); 503/404 become ErrImagePull on the pull back-off |
+| Starts and errors (#133, #126, #111, #47) | Image/create errors are waits with the container's reason (ErrImagePull → ImagePullBackOff, CreateContainerError); Never + start failure is `StartError`; no fixed init deadline (`activeDeadlineSeconds` bounds init only, #185); native sidecars (restartPolicy Always); a completed init's log kept |
+| Restarts (#112, #174) | CrashLoopBackOff persisted to `<state root>/crashloop.json` across a kubelet restart; a stop's grace goes where STOP reads it (it waited 30 s every time) |
+| Pod status writes (#141, #217) | Skipped when unchanged against the last acknowledged status; a 409 re-reads the pod (uid checked), merges and writes again (≤ 5 tries), `kubelet_pod_status_writes_total{result="conflict"}` |
+| Retries (#211) | `pkg/retry`: every remote call retries infrastructure failures with bounded, jittered backoff; POST only when never sent or 429. Inventory in [retries.md](retries.md) |
+| Node reporting (#24, #65, #78, #165, #23) | `--max-pods`, `--system-reserved`/`--kube-reserved` (allocatable = capacity − reserved − eviction line; not enforced as a cgroup, #205), `--cgroup-driver` (CRI); KVM advertised (`devices.kubevirt.io/kvm`, `storm.io/kvm`); `nodeInfo` kernel/boot/machine/system IDs; kubeletVersion v1.36, AppArmor profiles refused (#197), containerd < 2.0 refused |
+| Credentials (#69, #77, #89, #105, #113) | A named credential file is waited for 60 s, then fatal; client and serving pairs reloaded when stormcert renews them; engine admin credential for destructive verbs; a given `--apiserver` always wins over the kubeconfig |
+| Pod groups (#57, #106) | Pods under stormpump's `pods` group by QoS (`Spec.group`), CPU requests as `cpu.weight`, the group's weight from allocatable CPU; working set from QUERY MEMORY |
+| Node services' mirror pods (#50, #82, #87, #96, #193, #215) | Container state, readiness, restarts and Events from each service's stormd API (`/api/v1/processes`, `/api/v1/events`), health probe fallback where stormd does not answer (#219); last exit and output; PID 1's run files for non-stormd services; startTime from `started_secs` |
+| Logs (#124, #131, #136, #216) | One directory per container and a file per run (`<N>.log`, `previous=N`), current + 5 kept; rotation (`--container-log-max-size`, `--container-log-max-files`); plain lines no longer stripped |
+| Storage (#59, #60, #62, #67, #70, #80, #209, #42) | Node volumes as `<volume>-<node>` PV/PVC pairs; PV placement annotations from stormblock + stormdrive; CSIStorageCapacity, refusal and `SlabFilling`; ladder to 1Pi (64Ti+ raw block only, #149); Provisioning Events on the claim; a Pod blocked on a VM's claim says why; minting templates not charged; NodeExpandVolume for CSI claims |
+| Networking (#3, #131, #137, #147, #148) | Pod network counters and Multus-style `network-status`; network waits have Events; kube-proxy clears stale UDP conntrack (no stormcos edition runs kube-proxy); the CNI contract in [networking.md](networking.md) |
+| Streaming (#56) | `portForward` over SPDY/3.1 and its WebSocket tunnel; exec/attach still answer 501 (#56 item 5) |
+| VMs (#53, #75, #80, #85, #88, #92, #94, #119, #122, #152, #156) | Restore (option A of #109); `/vmVerb`; hand-placed VMIs (spec.nodeName); pod-network VMIs under rustkube's launcher Pod; `/vmInstance` indexed, placement-gated, staleness-bounded, and answering host-network Pods by their token |
+| Workload identity (#84) | `/run/rustkube/workloads/<cgroup>.json` per stormpump workload (pods, sandboxes, VMs) for cadvisor |
+| CRI runtime (#116) | `GetContainerEvents` followed; the 2 s fallback only without it |
+| Tests (#61, #64, #97, #209, #217) | short, medium and long suites in `test/`; the runner's own pod is never cleaned up. Live: short 4fe3fb250e passed on C2NR0Q2 (4/0/0) at 9229603 |
+| Docs | [retries.md](retries.md), [networking.md](networking.md), [presentation.md](presentation.md) |
 
-## Owner decisions recorded, implementation pending
+## Owner decisions recorded
 
-These were open questions in the previous audit. The owner has answered each;
-what is left is implementation, tracked on the issue named.
-
-| Decision | Answer | Implementation |
+| Decision | Answer | State |
 |---|---|---|
-| [#107](https://github.com/glennswest/rustkube-node/issues/107) service PV/PVC names | `<volume>-<node>` (e.g. `fastetcd-data-<node>`), no migration | [#59](https://github.com/glennswest/rustkube-node/issues/59) |
-| [#108](https://github.com/glennswest/rustkube-node/issues/108) capacity accounting | Class size counted at bind, overcommit ratio 1.0, class-sized clones | [#62](https://github.com/glennswest/rustkube-node/issues/62) |
-| [#109](https://github.com/glennswest/rustkube-node/issues/109) restored VM disks | Option A: a restore rewrites the VirtualMachine's disks to the restored PVCs | [#53](https://github.com/glennswest/rustkube-node/issues/53) |
-| [#110](https://github.com/glennswest/rustkube-node/issues/110) live validation target | C2NR0Q2 (the Dell R230) first | [#102](https://github.com/glennswest/rustkube-node/issues/102) |
+| [#106](https://github.com/glennswest/rustkube-node/issues/106) CPU weights vs node services | Pods under one parent cgroup (OpenShift's shape) | Done (#57, stormpump#68) |
+| [#107](https://github.com/glennswest/rustkube-node/issues/107) service PV/PVC names | `<volume>-<node>`, no migration | Done (#59) |
+| [#108](https://github.com/glennswest/rustkube-node/issues/108) capacity accounting | Class size at bind, ratio 1.0, class-sized clones | Done (#62) |
+| [#109](https://github.com/glennswest/rustkube-node/issues/109) restored VM disks | A: restore rewrites the VM's disks to restored PVCs | Done (#53); needs the CRDs (stormcos#170) |
+| [#110](https://github.com/glennswest/rustkube-node/issues/110), [#158](https://github.com/glennswest/rustkube-node/issues/158) live target | C2NR0Q2 first; the day suite there is the acceptance, full scale at night on a pve VM | [#102](https://github.com/glennswest/rustkube-node/issues/102) open |
+| [#104](https://github.com/glennswest/rustkube-node/issues/104) container roots | A: every container its own CoW clone of the sealed golden, no exceptions | Done |
+| [#3](https://github.com/glennswest/rustkube-node/issues/3) NotReady gating | No gating ("get working early"); per-pod waits instead | Done; #201 follows |
+| [#68](https://github.com/glennswest/rustkube-node/issues/68) replicated claims | stormblock-csi owns them; the built-in class stays node-local | Closed |
+| [#159](https://github.com/glennswest/rustkube-node/issues/159) migration disks | A RAID leg on the destination, then memory | [#40](https://github.com/glennswest/rustkube-node/issues/40) after stormstorage#44 |
+| [#216](https://github.com/glennswest/rustkube-node/issues/216) `--previous` on a mirror pod | The newest finished run, failed or exited | Done |
+| stormimds#12 guest metadata | stormimds asks `/vmInstance` on every request (single source) | Built in stormimds; node credential is stormcos#330 / #180 |
+
+Open questions for the owner: [#13](https://github.com/glennswest/rustkube-node/issues/13)/[#221](https://github.com/glennswest/rustkube-node/issues/221)
+(microVM Pods) and [#86](https://github.com/glennswest/rustkube-node/issues/86) (versioned goldens).
 
 Source entry points: `cmd/kubelet/src/main.rs`, `pkg/kubelet/src/kubelet.rs`,
-`pod_manager.rs`, `stormpump_runtime.rs`, `vm_manager.rs`, `vm_snapshot.rs`,
-`server.rs`, `system_claims.rs`, and `test/src/medium.rs`.
+`pod_manager.rs`, `stormpump_runtime.rs`, `container_roots.rs`, `vm_manager.rs`,
+`mirror.rs`, `stormd_api.rs`, `server.rs`, `system_claims.rs`, `capacity.rs`,
+`pkg/retry`, and `test/src/{short,medium,long}.rs`.
 
 ## Promises the current code does not fulfill
 
@@ -58,26 +64,28 @@ Each gap has an owning issue. These are limitations, not supported features.
 
 | Unsupported or incomplete claim | Tracking |
 |---|---|
-| Full upstream/drop-in Kubernetes node compatibility; API types still use v1_32 | [#23](https://github.com/glennswest/rustkube-node/issues/23) |
-| Interactive exec and attach, and the streaming path `kubectl cp` uses (port-forward is served since #56; exec/attach need the engine) | [#56](https://github.com/glennswest/rustkube-node/issues/56), [stormpump#103](https://github.com/glennswest/stormpump/issues/103) |
-| Full upstream cAdvisor dashboards, actual node CPU/memory, PSI/imagefs-aware eviction and CRI pod-network stats | [#21](https://github.com/glennswest/rustkube-node/issues/21) |
-| External CSI real-driver acceptance (mount propagation reaches the engine since #81) | [#52](https://github.com/glennswest/rustkube-node/issues/52) |
-| Generic ephemeral claim creation | [rustkube#94](https://github.com/glennswest/rustkube/issues/94) |
-| ext4 blanks for the 64Ti, 256Ti and 1Pi classes (raw block only until stormblock carries mkfs.ext4.rs#9/#10); a Block claim's PV written by the control plane says Filesystem | [stormblock#289](https://github.com/glennswest/stormblock/issues/289), [rustkube#201](https://github.com/glennswest/rustkube/issues/201) |
-| StorageClass placement policy and cross-node replication | [#71](https://github.com/glennswest/rustkube-node/issues/71), [#68](https://github.com/glennswest/rustkube-node/issues/68) |
-| Every node's service volume represented (`<volume>-<node>` names decided in #107, not implemented); placement metadata join | [#59](https://github.com/glennswest/rustkube-node/issues/59), [#60](https://github.com/glennswest/rustkube-node/issues/60) |
-| Arbitrary pulled images and versioned golden selection (a pulled image's mount is the container root since #103; its config applies under the pod spec since #98, the boot goldens' once stormblock-registry#58 records it) | [#79](https://github.com/glennswest/rustkube-node/issues/79), [#86](https://github.com/glennswest/rustkube-node/issues/86) |
-| `readOnlyRootFilesystem` on a container's own root (each container has its own CoW clone since #104; mounted writable until the engine can mount it read-only); its writable-layer usage in stats | [stormpump#108](https://github.com/glennswest/stormpump/issues/108), [#104](https://github.com/glennswest/rustkube-node/issues/104) |
-| Real service readiness, complete lifecycle failure Events and live non-stormd logs (a dead service's last 20 lines are served since #124) | [#96](https://github.com/glennswest/rustkube-node/issues/96), [#50](https://github.com/glennswest/rustkube-node/issues/50), [#82](https://github.com/glennswest/rustkube-node/issues/82), [#87](https://github.com/glennswest/rustkube-node/issues/87) |
-| VMI pod-network launcher Pod from rustkube's VM controller (rustkube#203; the kubelet adopts it, not run on a node) and migration (control verbs are on :10250 since #94; the apiserver's proxy is rustkube#141) | [#88](https://github.com/glennswest/rustkube-node/issues/88), [#40](https://github.com/glennswest/rustkube-node/issues/40) |
-| VirtualMachineSnapshot/Restore on a node (needs the CRDs, stormcos#170); a restore from a RAID twin on another node | [stormcos#170](https://github.com/glennswest/stormcos/issues/170) |
-| Pod `securityContext.capabilities` on the stormpump ring path (add and drop are parsed and reach a CRI runtime; stormpump's `Spec` has no capability field until stormpump#47) | [#118](https://github.com/glennswest/rustkube-node/issues/118), [stormpump#47](https://github.com/glennswest/stormpump/issues/47) |
-| Guest metadata (`/vmInstance`) as the metadata service's single source (stormimds keeps its own store; undecided), and stormimds forwarding a host-network workload's token as `X-Storm-Workload-Token` (#122 is the kubelet's side). (Indexed by address and gated on the object's placement since #119; a node cut off from the apiserver for longer than `--metadata-max-staleness`, 40 s, answers 503 since #156.) | [stormimds#12](https://github.com/glennswest/stormimds/issues/12) |
-| End-to-end legacy microVM Pods | [#13](https://github.com/glennswest/rustkube-node/issues/13) |
-| AppArmor profiles applied (a pod that asks for one is refused since #23, upstream's admission; no runtime here applies one) | [#197](https://github.com/glennswest/rustkube-node/issues/197) |
-| Subsecond startup measured on a node; a stormpump exit routed to its own UID | [#95](https://github.com/glennswest/rustkube-node/issues/95), [#99](https://github.com/glennswest/rustkube-node/issues/99), [#115](https://github.com/glennswest/rustkube-node/issues/115) |
-| Complete short/medium/long live acceptance and runner image injection | [#61](https://github.com/glennswest/rustkube-node/issues/61), [#64](https://github.com/glennswest/rustkube-node/issues/64), [#97](https://github.com/glennswest/rustkube-node/issues/97), [#102](https://github.com/glennswest/rustkube-node/issues/102) |
-| Legacy bin-only builder as a supported release path | [#51](https://github.com/glennswest/rustkube-node/issues/51) |
+| exec, attach and exec probes (port-forward is served). stormpump's op is in the lock (13cf2c9, stormpump#103 done); the kubelet does not use it yet | [#56](https://github.com/glennswest/rustkube-node/issues/56) |
+| Pod `securityContext.capabilities` on stormpump (`Spec.caps` is in the lock; not mapped) and `fsGroup`/`supplementalGroups` (`Spec.groups`; a claim is root's) | [#118](https://github.com/glennswest/rustkube-node/issues/118), [#171](https://github.com/glennswest/rustkube-node/issues/171) |
+| OOMKilled, termination messages, hugepages, in-place resize, `activeDeadlineSeconds` on a running pod | [#194](https://github.com/glennswest/rustkube-node/issues/194), [#162](https://github.com/glennswest/rustkube-node/issues/162), [#195](https://github.com/glennswest/rustkube-node/issues/195), [#192](https://github.com/glennswest/rustkube-node/issues/192), [#185](https://github.com/glennswest/rustkube-node/issues/185) |
+| `runtimeClassName` and AppArmor profiles applied; microVM Pods | [#204](https://github.com/glennswest/rustkube-node/issues/204), [#197](https://github.com/glennswest/rustkube-node/issues/197), [#13](https://github.com/glennswest/rustkube-node/issues/13) |
+| Reservations enforced as a cgroup limit (they are advertised only) | [#205](https://github.com/glennswest/rustkube-node/issues/205) |
+| Actual node CPU/memory, machine info and eviction from cAdvisor's library (node figures are container sums); a stormpump container's filesystem usage; VM tap counters | [#21](https://github.com/glennswest/rustkube-node/issues/21), [#222](https://github.com/glennswest/rustkube-node/issues/222), [#206](https://github.com/glennswest/rustkube-node/issues/206) |
+| `readOnlyRootFilesystem` (the container's own root is mounted writable until the engine can mount it read-only) | [stormpump#108](https://github.com/glennswest/stormpump/issues/108) |
+| Pallet images' config; versioned goldens; building an image from upstream on demand | [#208](https://github.com/glennswest/rustkube-node/issues/208), [#86](https://github.com/glennswest/rustkube-node/issues/86), stormblock-registry#50 |
+| The registry over TLS with the engine token | [#167](https://github.com/glennswest/rustkube-node/issues/167) |
+| Class blanks formatted at runtime (`mint_template`) instead of a thin library model | [#214](https://github.com/glennswest/rustkube-node/issues/214) |
+| StorageClass redundancy/spread/tier; the class matched by provisioner, not name | [#71](https://github.com/glennswest/rustkube-node/issues/71), [#200](https://github.com/glennswest/rustkube-node/issues/200) |
+| ext4 for the 64Ti, 256Ti and 1Pi classes (raw block only); a Block claim's control-plane PV | [#149](https://github.com/glennswest/rustkube-node/issues/149), [rustkube#201](https://github.com/glennswest/rustkube/issues/201) |
+| External CSI with a real driver; CSI raw block and volume stats; generic ephemeral claims | [#52](https://github.com/glennswest/rustkube-node/issues/52), [#223](https://github.com/glennswest/rustkube-node/issues/223), [rustkube#94](https://github.com/glennswest/rustkube/issues/94) |
+| Broken templates matched by stormblock's own state (today by the compatibility text) | [#203](https://github.com/glennswest/rustkube-node/issues/203) |
+| Mirror pods: stormd's API over TLS; the readiness fallback reading stormd's current probe keys; units the release does not carry | [#218](https://github.com/glennswest/rustkube-node/issues/218), [#219](https://github.com/glennswest/rustkube-node/issues/219), [#202](https://github.com/glennswest/rustkube-node/issues/202) |
+| `/logs/` (node log files, `oc adm node-logs`); request authorization by SubjectAccessReview | [#198](https://github.com/glennswest/rustkube-node/issues/198), [#180](https://github.com/glennswest/rustkube-node/issues/180) |
+| Per-pod waits woken by events and `storm.io/wait-for` | [#201](https://github.com/glennswest/rustkube-node/issues/201) |
+| VMs: graceful stop (`Machine::shut_down`), live migration, waiting-for-golden progress, snapshot status detail, SSH keys/user-data in `/vmInstance`, a restore from a RAID twin | [#181](https://github.com/glennswest/rustkube-node/issues/181), [#40](https://github.com/glennswest/rustkube-node/issues/40), [#184](https://github.com/glennswest/rustkube-node/issues/184), [#187](https://github.com/glennswest/rustkube-node/issues/187), [#168](https://github.com/glennswest/rustkube-node/issues/168), [#157](https://github.com/glennswest/rustkube-node/issues/157) |
+| VirtualMachineSnapshot/Restore on a node (needs the CRDs); pod-network VMIs live; accessCredentials and tap addresses live | [stormcos#170](https://github.com/glennswest/stormcos/issues/170), [#88](https://github.com/glennswest/rustkube-node/issues/88), [#92](https://github.com/glennswest/rustkube-node/issues/92), [#91](https://github.com/glennswest/rustkube-node/issues/91) |
+| Git dependencies pinned by rev (stormpump, stormvm follow `branch = "main"`) | [#210](https://github.com/glennswest/rustkube-node/issues/210) |
+| Subsecond starts measured; regressions seen on 11.91 | [#95](https://github.com/glennswest/rustkube-node/issues/95), [#99](https://github.com/glennswest/rustkube-node/issues/99), [#102](https://github.com/glennswest/rustkube-node/issues/102), [#160](https://github.com/glennswest/rustkube-node/issues/160), [#190](https://github.com/glennswest/rustkube-node/issues/190), [#191](https://github.com/glennswest/rustkube-node/issues/191), [#207](https://github.com/glennswest/rustkube-node/issues/207) |
+| Complete live acceptance of the medium and long suites; cases that need node access | [#61](https://github.com/glennswest/rustkube-node/issues/61), [#64](https://github.com/glennswest/rustkube-node/issues/64), [#163](https://github.com/glennswest/rustkube-node/issues/163), [#186](https://github.com/glennswest/rustkube-node/issues/186) |
 
 The former CRI-O/crun/conmon-rs default-stack roadmap (#22/#28) is superseded
 by the platform's stormpump selection. An eBPF kube-proxy in this repository

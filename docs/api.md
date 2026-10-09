@@ -1,6 +1,6 @@
 # Ports and kubelet API
 
-Audited from `pkg/kubelet/src/server.rs` and the CLI at main fecb331 (2026-10-02).
+Audited from `pkg/kubelet/src/server.rs` and the CLI at main 06b91b5 (2026-10-09).
 
 | Endpoint | Ownership / default |
 |---|---|
@@ -10,7 +10,10 @@ Audited from `pkg/kubelet/src/server.rs` and the CLI at main fecb331 (2026-10-02
 | `127.0.0.1:5100` HTTP | Outbound sbregistry (stormblock-registry, the registry that mints image clones), `--registry` |
 | `/run/stormpump.sock` Unix socket | Default stormpump ring bootstrap; stormcos uses `/hostrun/stormpump.sock` |
 | `/var/lib/kubelet/plugins_registry/*` Unix sockets | CSI registrar discovery, then node-plugin Unix endpoints |
-| `0.0.0.0:9085` | stormd management listener from stormcos's stage config, not a kubelet route |
+| `127.0.0.1:9081`–`9085` HTTP | Outbound, read: each node service's stormd API (`[api] bind` in its golden's stormd config, found through boot.d under `/hostroot`; 9085 is this golden's own), `GET /api/v1/processes` and `/api/v1/events?since=` for mirror pods (#215). A config whose `[api]` asks for TLS or a credential is not read yet (#218) |
+| `<node-ip>:9092` HTTPS, else HTTP | Outbound, read: stormdrive's `GET /api/v1/placement` for PV placement (#60), `STORMDRIVE_URL` |
+| `http://127.0.0.1:<port><path>` | Outbound: a node service's own health URL, probed every 10 s where its stormd API does not answer (#96, #219) |
+| `/run/rustkube/workloads/*.json` files | Written: each stormpump workload's cgroup → pod/container identity, for cadvisor (#84, [metrics](metrics.md)) |
 
 The kubelet does not listen on a separate read-only HTTP port or expose a CRI
 server. Kube-proxy has no listener. VM console traffic is mounted into the
@@ -30,12 +33,14 @@ anonymous auth. See [credential behavior](configuration.md).
 | GET | `/healthz`, `/livez`, `/readyz` | Process HTTP health only |
 | GET | `/metrics` | Kubelet/process metric families |
 | GET | `/metrics/cadvisor` | Runtime-supplied container/pod metric subset |
-| GET | `/stats/summary` | Partial CPU/memory and filesystem summary; node CPU/memory are container sums; each pod's `network` (upstream's `name`/`rxBytes`/`rxErrors`/`txBytes`/`txErrors` of `eth0`, every interface in `interfaces`, plus `rxPackets`/`rxDropped`/`txPackets`/`txDropped`, #131) |
+| GET | `/stats/summary` | Partial CPU/memory and filesystem summary; node CPU/memory are container sums (#21); a stormpump container has no rootfs usage (#222); each pod's `network` (upstream's `name`/`rxBytes`/`rxErrors`/`txBytes`/`txErrors` of `eth0`, every interface in `interfaces`, plus `rxPackets`/`rxDropped`/`txPackets`/`txDropped`, #131) |
 | GET | `/pods` | Locally managed Pods, including recorded waiting Pods |
 | GET | `/containerLogs/{namespace}/{pod}/{container}` | Runtime logs, per container (init containers and sidecars included): the current run's `<N>.log`, `previous=true` the run before, `previous=N` N back (the current and five previous runs are kept; #131, #216); a node service's mirror pod reads its stormd log volume, else PID 1's `last_output` for it (#124) |
 | GET | `/vmConsole/{namespace}/{name}/{door}` | `serial` or `vnc` through stormvm's router, with WebSocket upgrade |
 | PUT | `/vmVerb/{namespace}/{name}/{verb}` | A VM's verb through stormvm's router (`PUT /api/v1/vms/{ns}/{name}/{verb}`, #94): `pause`, `unpause`, `softreboot`, `reset`, `status`, `freeze`, `thaw` (or `unfreeze`), `snapshot` (`?name=&quiesce=`). Query forwarded without `token`; 400 for any other verb (`migrate`/`receive` included); the router's own answers otherwise (404 for an unregistered VM) |
-| GET | `/vmInstance/{address}` | Guest metadata: the machine found by address in this node's index, answered from its cached VMI only when that object places it here (uid matches, not terminating, `status.nodeName` is this node, no completed migration to another node; #119). **A node address** (a host-network workload) is refused unless the request carries the workload's own ServiceAccount token in `X-Storm-Workload-Token` (#122; not `Authorization`, which is the caller's credential to the kubelet): the kubelet TokenReviews it, takes the pod from `status.user.extra` (`authentication.kubernetes.io/pod-name`/`pod-uid`/`node-name`), and answers that pod's metadata (`storm.io/kind: Pod`) only when the pod's object has that uid, is placed on this node and is not ending. 404 when absent, placed elsewhere, or claimed by two machines here; 503 + `Retry-After: 2` while cold (until the first VMI list; a cluster without the VMI CRD is not cold); 503 + `Retry-After: 5` for a machine here when the apiserver has not been heard from (a renewed node Lease or a VMI list) within `--metadata-max-staleness` (40 s), since a partitioned node cannot see the machine move (#156). Whether the metadata service (stormimds) asks this or keeps its own store is undecided (stormimds#12) |
+| GET | `/vmInstance/{address}` | Guest metadata: the machine found by address in this node's index, answered from its cached VMI only when that object places it here (uid matches, not terminating, `status.nodeName` is this node, no completed migration to another node; #119). **A node address** (a host-network workload) is refused unless the request carries the workload's own ServiceAccount token in `X-Storm-Workload-Token` (#122; not `Authorization`, which is the caller's credential to the kubelet): the kubelet TokenReviews it, takes the pod from `status.user.extra` (`authentication.kubernetes.io/pod-name`/`pod-uid`/`node-name`), and answers that pod's metadata (`storm.io/kind: Pod`) only when the pod's object has that uid, is placed on this node and is not ending. 404 when absent, placed elsewhere, or claimed by two machines here; 503 + `Retry-After: 2` while cold (until the first VMI list; a cluster without the VMI CRD is not cold); 503 + `Retry-After: 5` for a machine here when the apiserver has not been heard from (a renewed node Lease or a VMI list) within `--metadata-max-staleness` (40 s), since a partitioned node cannot see the machine move (#156). This is the metadata service's single source (stormimds#12, decided 2026-10-06; stormimds 71b4fbf): stormimds asks `GET /vmInstance/{source address}` on every guest request, at `https://127.0.0.1:10250` by default, with its own bearer token in `Authorization` and a caller's bearer token forwarded as `X-Storm-Workload-Token`; it passes 404 on and turns 503, 401/403 or no answer into 503 + `Retry-After`. The node's credential for it is stormcos#330 (and #180 for scoping it). SSH keys and user-data are not in the answer yet (#168) |
+| POST, GET | `/portForward/{namespace}/{pod}` | `kubectl port-forward` (#56): SPDY/3.1 (`portforward.k8s.io`) or a WebSocket tunnel of it (`SPDY/3.1+portforward.k8s.io`); connects to `localhost:<port>` in the pod's network namespace (the node's for hostNetwork). 404 unknown pod, 403 another protocol, 503 no namespace found |
+| POST, GET | `/exec/{namespace}/{pod}/{container}`, `/attach/…` | 501 (the message still names stormpump#103). The engine's op exists and is in the lock (stormpump 13cf2c9); the kubelet does not use it yet, and exec probes fail the same way (#56 item 5) |
 | DELETE | `/volumes/{namespace}/{claim}` | Built-in claim clone reclamation: 204 absent/deleted, 409 in use, 503 when safe release cannot be established |
 
 `previous` is `true`/`1` (the run before, as upstream parses it) or `N`, the run N
@@ -59,18 +64,17 @@ every stormpump container's (no per-line metadata), comes back as written, so
 `timestamps`/`since*` have nothing to act on there. A last line with no newline
 is returned by a plain read, and by `follow` once the pod is gone.
 
-| POST, GET | `/portForward/{namespace}/{pod}` | `kubectl port-forward` (#56): SPDY/3.1 (`portforward.k8s.io`) or a WebSocket tunnel of it (`SPDY/3.1+portforward.k8s.io`); connects to `localhost:<port>` in the pod's network namespace (the node's for hostNetwork). 404 unknown pod, 403 another protocol, 503 no namespace found |
-| POST, GET | `/exec/{namespace}/{pod}/{container}`, `/attach/…` | 501 naming stormpump#103: the engine cannot yet run a process in a running container. Exec probes wait on the same |
 
 The SPDY session (`spdy.rs`) answers each stream with a SYN_REPLY, echoes
 PINGs and does no flow control (client-go's spdystream does none either); the WebSocket channel protocols for
-exec/attach (`v5.channel.k8s.io`) come with stormpump#103.
-The console router knows the stormblock URL but its control verbs are not
-exposed by the kubelet route table.
+exec/attach (`v5.channel.k8s.io`) come with #56 item 5.
+The console router's control verbs are served at `/vmVerb` (#94); the
+apiserver's proxy to them is rustkube#141.
 
 VirtualMachineSnapshot is reconciled as a Kubernetes resource through the
 apiserver, not a new kubelet HTTP route. It requires the snapshot CRDs,
 `--runtime stormpump`, a locally owned VM and its local storage.
 VirtualMachineRestore is served the same way, by the node that took the
 snapshot (#53, option A of #109: the VM's disks are rewritten to restored
-PVCs; README, "Restores"). Stormvm VMI migration is also unimplemented (#40).
+PVCs; README, "Restores"). Stormvm VMI live migration is not driven yet: the owner chose a RAID leg on the
+destination (#159), which waits on stormstorage#44 (#40).

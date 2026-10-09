@@ -1,8 +1,8 @@
 # Configuration and defaults
 
 Source: `cmd/kubelet/src/main.rs`, `pkg/kubelet/src/kubelet.rs`,
-`engine.rs`, `cri_client.rs`, and `cmd/kube-proxy/src/main.rs`, main fecb331
-(2026-10-02). These are executable defaults, not the stormcos launch arguments.
+`engine.rs`, `cri_client.rs`, and `cmd/kube-proxy/src/main.rs`, main 06b91b5
+(2026-10-09). These are executable defaults, not the stormcos launch arguments.
 There is no general kubelet YAML/TOML config-file flag; kubeconfig supplies API
 connection credentials. Flags take precedence over their Clap environment
 variables. `RUST_LOG` configures tracing (default `info`).
@@ -52,6 +52,10 @@ An em dash means there is no environment binding or the value is unset.
 | `--server-token-file` | `KUBELET_SERVER_TOKEN_FILE` | Unset; static token accepted by inbound server, alongside TokenReview |
 | `--anonymous-auth` | — | `false`; when true disables inbound bearer authentication |
 
+Environment keys with no flag: `STORMDRIVE_URL` (above), the engine credentials
+`STORMBLOCK_API_TOKEN`/`STORMBLOCK_TOKEN_FILE` and `STORMBLOCK_ADMIN_TOKEN`/`STORMBLOCK_ADMIN_TOKEN_FILE`
+(below), and `RUST_LOG`.
+
 **A named credential file is waited for, then fatal** (#69): `--kubeconfig`, `--apiserver-ca`,
 `--client-certificate`, `--client-key`, `--token-file`, `--tls-cert-file`, `--tls-private-key-file` and
 `--server-token-file`. The boot may write them after the kubelet starts (stormcert), so a missing or empty
@@ -59,9 +63,8 @@ file is waited for up to 60 s, with one warning; if it is still absent the kubel
 and path. It never falls back to the kubeconfig's value, anonymous access or a self-signed serving pair
 for a file it was told to use. An unset flag still falls back as described above.
 
-Clap also provides `--help`. No `--system-reserved`, `--kube-reserved` or
-`--cgroup-driver` flag exists (#24), and no KubeletConfiguration file is read.
-Node reporting uses a fixed 256 MiB memory reservation.
+Clap also provides `--help`. No KubeletConfiguration file is read. Reservations
+are advertised in allocatable only; nothing enforces them as a cgroup limit (#205).
 
 ### Runtime details
 
@@ -111,11 +114,9 @@ Kubeconfig load errors are fatal. A given `--apiserver` (flag or
 Explicit credential files override kubeconfig values; a named one that is
 missing is waited for, then fatal (#69, above). With a CA and verification on,
 the client pair is reloaded when renewed (#77).
-An explicitly named CA is retried every 500 ms for up to 60 seconds; failure
-is fatal. This wait does not apply to every credential file.
-
-The server uses the serving cert/key pair if both were read; otherwise it
-self-signs at startup, including when a configured file is missing (#89).
+The server uses the serving cert/key pair when `--tls-cert-file` and
+`--tls-private-key-file` are given (waited for, then fatal, as above) and says
+so in the log; with neither given it self-signs at startup and says that (#89).
 Outbound API credentials, inbound server tokens and stormblock credentials
 are separate. The non-health inbound routes accept the configured static token
 or a bearer token accepted by API TokenReview; see [API](api.md).
@@ -154,8 +155,8 @@ are not CLI keys. The heartbeat is the only fixed schedule. Pods and VMIs share
 one pool of UID workers (`--pod-workers`) driven by watches and stormpump exits; a worker comes back
 without an event only for its own deadlines (#101): a probe's `periodSeconds`
 from its `initialDelaySeconds`, a CrashLoopBackOff's end, a waiting start
-(backoff of a quarter of the wait, 1–10 s for Pods, 1–30 s for VMIs), an init
-container's 120 s limit, and a VM guest-agent poll (2 s while booting, backing
+(backoff of a quarter of the wait, 1–10 s for Pods, 1–30 s for VMIs), the pod's
+`activeDeadlineSeconds` while an init container runs (there is no fixed init limit, #126), and a VM guest-agent poll (2 s while booting, backing
 off to 30 s; 10 s for a machine adopted without an engine handle).
 `sync_interval` applies only to Pods on a CRI runtime with no open
 `GetContainerEvents` stream (#116), as a counted fallback. Image pulls use four separate slots. The service mirror
@@ -243,5 +244,10 @@ medium or long. The process passes this to `STORM_SUITE` (default short).
 | `RUSTKUBE_NODE_TEST_MINT_BUDGET` | 1200 seconds per PVC case, bounded by remaining suite time |
 
 Token and CA come from `/var/run/secrets/kubernetes.io/serviceaccount`.
-Missing required inputs exit 2. Short and long currently report skips; medium
-covers PVC sizes, raw block, node volumes and overcommit refusal. No live pass is implied.
+`STORM_SUITE` and `STORM_COMMIT` (the image tag's commit) come from the runner too.
+Missing required inputs exit 2. short: Node Ready and heartbeat, a pod's run, address, log, exit
+code and delete; medium: pod features (restart, init, configMap/env, missing image) and the
+storage cases (PVC sizes, raw block, node volumes, overcommit refusal; at most three size cases
+at once); long: waves of pods at the node's capacity. The runner's own pod is never deleted by
+the cleanup (#217). Live: short passed on C2NR0Q2 at 9229603; medium and long have no complete
+live pass yet (#61, #64).

@@ -4,9 +4,9 @@ The **node level** of [rustkube](https://github.com/glennswest/rustkube) — the
 Kubernetes worker components, in Rust. Split into its own repo for parallel
 development; the code stays upstream-shaped and monorepo-mergeable.
 
-Current code: **main at fecb331, audited 2026-10-02**, workspace version
+Current code: **main at 06b91b5, audited 2026-10-09**, workspace version
 **0.13.0** plus unreleased changes (shipped to stormcos as stage goldens of
-main; latest golden-rustkube-node-e5db6ac32831, release request stormcos#164). The kubelet registers Nodes, maintains
+main; latest golden-rustkube-node-2eabd6fc174b, release request stormcos#424). The kubelet registers Nodes, maintains
 heartbeats, runs Pods, and reconciles stormvm VirtualMachineInstances through
 stormpump. This is a partial Kubernetes node implementation; remaining gaps
 and unsupported promises are tracked in [the capability audit](docs/status.md).
@@ -182,8 +182,8 @@ is deleted (stormblock-registry#98 would make that a plain demand). Building an 
 create or start removes the clone; roots no container holds (a kubelet that died mid-way) are deleted at
 start, never one still attached. `readOnlyRootFilesystem` mounts the container's own clone read-only once the
 engine can (stormpump#108); until then it is private and writable, and the kubelet says so. Per container
-start this is a clone, an attach and an ext4 mount (~0.4–1.3 s on 11.91, faster as stormblock#327 and
-stormpump#107 land).
+start this is a clone, an attach and an ext4 mount (~0.4–1.3 s on 11.91; stormpump#107 has since made a warm ext4 mount ~5 ms on 11.95,
+stormblock#327 is the clone).
 
 **The image's config is applied under the pod spec** on stormpump (#98), as a CRI runtime does. When an image
 resolves (a pallet or a pull), the kubelet asks sbregistry for its golden record (`GET /v1/goldens/{image}`,
@@ -200,8 +200,9 @@ stormblock-registry#58) are made as CRI-O's default `image_volumes = "mkdir"` ma
 the container's own root for each path no pod mount covers (at it or above it). Since #104 that root is the
 container's private writable clone, so what the image has there is kept and it goes with the container; the walk
 never follows a symlink, and one on the path (or a file) leaves it unmade with a warning. With
-`readOnlyRootFilesystem` it is writable only while the root is (stormpump#108). Not yet: `fsGroup` (a claim's
-filesystem is root's).
+`readOnlyRootFilesystem` it is writable only while the root is (stormpump#108). Not yet: `fsGroup`/`supplementalGroups` (a claim's
+filesystem is root's; stormpump's `Spec.groups` is in the lock, #171) and `securityContext.capabilities` on
+stormpump (`Spec.caps` is in the lock, not mapped; add/drop reach a CRI runtime only, #118).
 
 **Kubernetes 1.36 posture** (#23, the control plane's since rustkube#37): `nodeInfo.kubeletVersion` is
 `v1.36.0-rustkube+<apimachinery>` and `kubeProxyVersion` is not reported (1.33 removed it). A pod that asks for
@@ -257,13 +258,13 @@ TokenReview); `/healthz`, `/livez` and `/readyz` are open.
 | Route | What it is |
 |---|---|
 | `GET /metrics`, `/metrics/cadvisor` | Prometheus metrics under upstream's names: the kubelet's own, and cAdvisor-shaped container and pod usage. See [docs/metrics.md](docs/metrics.md) |
-| `GET /stats/summary` | Partial Summary API: container CPU/memory, their sums as node CPU/memory, node filesystem usage, and each pod's `network` (bytes, packets, errors, drops per interface, #131); not full metrics-server/HPA conformance |
+| `GET /stats/summary` | Partial Summary API: container CPU/memory, their sums as node CPU/memory, node filesystem usage (no rootfs usage for a stormpump container, #222; node figures from cAdvisor's library are #21), and each pod's `network` (bytes, packets, errors, drops per interface, #131); not full metrics-server/HPA conformance |
 | `GET /pods` | The pods this kubelet manages, including admitted pods still waiting to start (`Pending`, with the reason) |
 | `GET /containerLogs/{ns}/{pod}/{container}` | What `kubectl logs` reads, by way of the apiserver proxy. Each container (init containers and native sidecars too) has its own directory, `/var/log/pods/<ns>_<pod>_<uid>/<container>/`, and each run of it its own file, `<N>.log`: a restart, a retried init, a restarted sidecar or a run after a kubelet restart takes the next number, so `--previous` is the run before (`previous=N`, N back). The current run and five previous are kept (upstream keeps one); older ones go when a new run starts. The live file is rotated as upstream's ContainerLogManager does: every 10 s, past `--container-log-max-size` (10Mi), to `<N>.log.<YYYYMMDD-HHMMSS>`, older rotations gzip'd, at most `--container-log-max-files` (5) files per run; `kubectl logs` reads the live file. stormpump holds an O_APPEND descriptor and has no reopen, so rotation copies then truncates (a line written between the two is lost), and its files carry the raw output: no timestamps or stream per line, so `timestamps` and `since` have nothing to act on there until stormpump writes CRI-format lines (stormpump#129); a CRI runtime's files are served with both (#216). A pod waiting to start answers `400 … is waiting to start: ContainerCreating (<reason>)`, as upstream does. A node service's mirror pod (`kube-system/<asset>-<node>`, container `<asset>`) reads the service's stormd log volume, found through the boot unit that mounts it at `/var/log/stormd` and seen under `/hostroot`. The current log covers every process stormd runs there, rotations included, merged in time order and marked `[<proc>]` when there is more than one. `--previous` is the newest finished run (`.failed.log` or `.exited.log`: upstream's last terminated instance, #216; it was the newest `.failed.log` only), and tail, since, timestamps, limit and follow all apply. A service not run by stormd (stormblock, registry, timesync) is read from PID 1's own file for its running incarnation: `/run/stormpump/assets.json` lists each asset's last five `runs` (stormpump#90), each naming its `w<id>.log` (and `w<id>.1.log`, the rotated start) under `/run/stormpump/logs`; follow polls the live file. `--previous` is then the newest ended run's file (#87). When there is no such file either (the service died before stormd wrote its volume, an older PID 1), the log is PID 1's record of its last exit: `last_output`, the last 20 lines its incarnation wrote (stormpump#51); `--previous` falls back to it too. PID 1's lines have no timestamps, so only tail and limit apply. With none of these, a 404 (400 for `--previous`) names the volume looked in and the last exit or refused start (#124) |
 | `POST/GET /portForward/{ns}/{pod}` | `kubectl port-forward` (#56). Upgrades to SPDY/3.1 (`X-Stream-Protocol-Version: portforward.k8s.io`) or to a WebSocket tunnelling SPDY (`Sec-WebSocket-Protocol: SPDY/3.1+portforward.k8s.io`, what a newer kubectl tries first). Each forwarded connection is an `error` + `data` stream pair by `requestID`; the kubelet connects to `localhost:<port>` inside the pod's network namespace (IPv4, then IPv6; the node's for a hostNetwork pod) and splices; a failure is written on the error stream. Anything else is refused before the upgrade (404 unknown pod, 403 another protocol), which is what makes client-go fall back from WebSocket to SPDY |
-| `POST/GET /exec/…`, `/attach/…` | 501 with the reason: stormpump cannot yet run a process inside a running container or give one a stdin (stormpump#103). Exec probes (`exec_sync`) wait on the same |
+| `POST/GET /exec/…`, `/attach/…` | 501. The engine's op for a process inside a running container is done (stormpump#103) and in the lock; the kubelet does not use it yet (#56 item 5), and exec probes (`exec_sync`) fail the same way until it does |
 | `GET /vmConsole/{ns}/{name}/{door}` | A VM's `serial` or `vnc` console, answered by stormvm's console router mounted here |
-| `GET /vmInstance/{address}` | VMI metadata by observed guest address (an index, not a scan); answered only when the cached VMI places the machine on this node (`status.nodeName`, a completed migration's target), so a moved machine or a reused address is 404 here (#119). A node address (host-network workload) answers only with the workload's ServiceAccount token in `X-Storm-Workload-Token`, for the pod it is bound to, if that pod runs here (#122). Cold cache returns 503 with Retry-After, and so does a machine here when the apiserver has not been heard from (renewed node Lease or VMI list) within `--metadata-max-staleness`, 40 s (#156); absent guest returns 404. stormimds keeps its own store today; which design wins is stormimds#12 |
+| `GET /vmInstance/{address}` | VMI metadata by observed guest address (an index, not a scan); answered only when the cached VMI places the machine on this node (`status.nodeName`, a completed migration's target), so a moved machine or a reused address is 404 here (#119). A node address (host-network workload) answers only with the workload's ServiceAccount token in `X-Storm-Workload-Token`, for the pod it is bound to, if that pod runs here (#122). Cold cache returns 503 with Retry-After, and so does a machine here when the apiserver has not been heard from (renewed node Lease or VMI list) within `--metadata-max-staleness`, 40 s (#156); absent guest returns 404. stormimds asks this route on every guest request (stormimds#12, decided; details in [docs/api.md](docs/api.md)); SSH keys and user-data are not in the answer yet (#168) |
 | `DELETE /volumes/{ns}/{claim}` | Delete the stormblock clone behind a released claim |
 
 The console and volume-release routes exist here because what they reach is on the node and the
