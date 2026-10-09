@@ -1738,6 +1738,9 @@ pub struct StormpumpImages {
     pulled: Mutex<HashMap<String, String>>,
     /// Each image's config, from the registry's golden record (#98).
     configs: Arc<crate::image_config::ImageConfigs>,
+    /// The release manifest's text, when given rather than read from the
+    /// node (`RELEASE_MANIFESTS`): for tests of golden versions (#86).
+    release_manifest: Option<String>,
 }
 
 /// Find `argv0` on the standard PATH *inside* an image root.
@@ -1792,7 +1795,14 @@ impl StormpumpImages {
             http: reqwest::Client::new(),
             pulled: Mutex::new(HashMap::new()),
             configs: Arc::default(),
+            release_manifest: None,
         }
+    }
+
+    /// Read golden versions (#86) against this manifest, not the node's.
+    pub fn with_release_manifest(mut self, manifest: impl Into<String>) -> StormpumpImages {
+        self.release_manifest = Some(manifest.into());
+        self
     }
 
     /// Where the image configs it finds go (#98): the runtime reads them.
@@ -1939,6 +1949,18 @@ impl ImageService for StormpumpImages {
     ///    container's root is its own clone, never the registry's
     ///    (stormblock-registry#98 asks for a demand that mints nothing).
     async fn pull_image(&self, image: &str) -> Result<String, CriError> {
+        // A golden version other than the release's (#86): through the
+        // registry, which fetches it from forge on demand, never the pallet.
+        if let Some(v) = self.version_of(image) {
+            if let Some(found) = self.pulled.lock().await.get(image).cloned() {
+                return Ok(found);
+            }
+            tracing::info!(image = %image, golden = %v.golden, reference = %v.reference,
+                "image asks for a golden version the release does not run; asking the registry");
+            let reference = self.registry_golden(&v.reference).await?;
+            self.pulled.lock().await.insert(image.to_string(), reference.clone());
+            return Ok(reference);
+        }
         if let Some(path) = Self::local_path(image) {
             tracing::info!(image = %image, path = %path.display(), "image is a golden on this node");
             let path = path.to_string_lossy().into_owned();
@@ -1948,38 +1970,7 @@ impl ImageService for StormpumpImages {
         if let Some(found) = self.pulled.lock().await.get(image).cloned() {
             return Ok(found);
         }
-        let mut url = reqwest::Url::parse(&self.registry)
-            .map_err(|e| CriError::ImagePull(format!("registry {}: {e}", self.registry)))?;
-        if let Ok(mut path) = url.path_segments_mut() {
-            path.pop_if_empty().extend(["v1", "goldens", image]);
-        }
-        let resp = self
-            .http
-            .get(url.clone())
-            .send_retrying(retry::Policy::REGISTRY)
-            .await
-            .map_err(|e| CriError::ImagePull(format!("registry {url} did not answer for {image}: {e}")))?;
-        let status = resp.status();
-        let mut text = resp.text().await.unwrap_or_default();
-        let mut record: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
-        if status == reqwest::StatusCode::NOT_FOUND {
-            match self.demand(image).await {
-                Ok(Some(found)) => record = found,
-                Ok(None) => {}
-                Err(why) => return Err(CriError::ImagePull(why)),
-            }
-            text = record.to_string();
-        }
-        let reference = golden_reference(&record).ok_or_else(|| {
-            CriError::ImagePull(format!(
-                "registry has no ready golden for {image} ({status}): {}",
-                text.chars().take(300).collect::<String>()
-            ))
-        })?;
-        tracing::info!(image = %image, golden = %reference, "image's golden is on this node");
-        self.configs.put(&reference, image, crate::image_config::from_golden(&record));
-        // What it is and where it came from (#130).
-        self.configs.put_provenance(&reference, crate::image_config::provenance_of_record(&record));
+        let reference = self.registry_golden(image).await?;
         self.pulled.lock().await.insert(image.to_string(), reference.clone());
         Ok(reference)
     }
@@ -1987,9 +1978,10 @@ impl ImageService for StormpumpImages {
     /// Whether the image is on this node — as a golden, or already pulled.
     ///
     /// A pulled image has to count, or `imagePullPolicy: IfNotPresent` pulls
-    /// every time and the cache above never gets consulted.
+    /// every time and the cache above never gets consulted. A golden version
+    /// (#86) counts only once pulled: the pallet is another version.
     async fn image_status(&self, image: &str) -> Result<Option<ImageInfo>, CriError> {
-        let path = match Self::local_path(image) {
+        let path = match Self::local_path(image).filter(|_| self.version_of(image).is_none()) {
             Some(p) => Some(p.to_string_lossy().into_owned()),
             None => self.pulled.lock().await.get(image).cloned(),
         };
@@ -2022,6 +2014,59 @@ impl ImageService for StormpumpImages {
         // A golden is not this node's to delete: it is a pallet member, and
         // what runs is a clone of it. Removing images is the pallet's business.
         Ok(())
+    }
+}
+
+impl StormpumpImages {
+    /// The golden version `image` asks for, against the node's release
+    /// manifest and its pallets (#86).
+    fn version_of(&self, image: &str) -> Option<crate::image_config::GoldenVersion> {
+        let manifest = self.release_manifest.clone().unwrap_or_else(|| {
+            crate::image_config::RELEASE_MANIFESTS
+                .iter()
+                .find_map(|p| std::fs::read_to_string(p).ok())
+                .unwrap_or_default()
+        });
+        crate::image_config::golden_version(image, &manifest, |n| Self::local_path(n).is_some())
+    }
+
+    /// The registry's ready golden for `image`, as the reference a container
+    /// is created from (`template:<name>`), asking the cluster for it on a
+    /// miss (steps 3 and 4 of [`ImageService::pull_image`]).
+    async fn registry_golden(&self, image: &str) -> Result<String, CriError> {
+        let mut url = reqwest::Url::parse(&self.registry)
+            .map_err(|e| CriError::ImagePull(format!("registry {}: {e}", self.registry)))?;
+        if let Ok(mut path) = url.path_segments_mut() {
+            path.pop_if_empty().extend(["v1", "goldens", image]);
+        }
+        let resp = self
+            .http
+            .get(url.clone())
+            .send_retrying(retry::Policy::REGISTRY)
+            .await
+            .map_err(|e| CriError::ImagePull(format!("registry {url} did not answer for {image}: {e}")))?;
+        let status = resp.status();
+        let mut text = resp.text().await.unwrap_or_default();
+        let mut record: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        if status == reqwest::StatusCode::NOT_FOUND {
+            match self.demand(image).await {
+                Ok(Some(found)) => record = found,
+                Ok(None) => {}
+                Err(why) => return Err(CriError::ImagePull(why)),
+            }
+            text = record.to_string();
+        }
+        let reference = golden_reference(&record).ok_or_else(|| {
+            CriError::ImagePull(format!(
+                "registry has no ready golden for {image} ({status}): {}",
+                text.chars().take(300).collect::<String>()
+            ))
+        })?;
+        tracing::info!(image = %image, golden = %reference, "image's golden is on this node");
+        self.configs.put(&reference, image, crate::image_config::from_golden(&record));
+        // What it is and where it came from (#130).
+        self.configs.put_provenance(&reference, crate::image_config::provenance_of_record(&record));
+        Ok(reference)
     }
 }
 
@@ -2734,6 +2779,9 @@ mod tests {
                         Some("quay.io/a/nonesuch:1") => return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({
                             "error": "no ready golden quay.io/a/nonesuch:1 — push the image, or POST /v1/goldens to build it"})))),
                         Some("quay.io/a/arrived:1") => r.arrived = true,
+                        // #86: a version the node does not hold yet: fetched from forge.
+                        Some("registry/nextnfs:5555cccc6666") => return Err((StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                            "error": "registry/nextnfs:5555cccc6666 is not on this node: fetching it from forge (job j2, queued); retry shortly"})))),
                         _ => {}
                     }
                     r.minted += 1;
@@ -2780,6 +2828,9 @@ mod tests {
                             "Entrypoint": ["/coredns"], "User": "65532:65532", "WorkingDir": "/"}})))
                     } else if name == "quay.io/a/arrived:1" && s.lock().unwrap().arrived {
                         Ok(Json(serde_json::json!({"name": name, "status": "ready", "template_name": "sbr-arrived-1"})))
+                    } else if name == "registry/nextnfs:3333bbbb4444" {
+                        // #86: a version this node holds now (fetched from forge).
+                        Ok(Json(serde_json::json!({"name": name, "status": "ready", "template_name": "golden-nextnfs-3333bbbb4444"})))
                     } else if name == "quay.io/a/building:1" {
                         Ok(Json(serde_json::json!({"name": name, "status": "building", "template_name": "sbr-b-1"})))
                     } else {
@@ -2792,6 +2843,32 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (url, state)
+    }
+
+    /// #86: a tag naming a golden version other than the release's is pulled
+    /// from the registry (and fetched on demand), never the pallet; the
+    /// release's own version and an untagged image stay the pallet.
+    #[tokio::test]
+    async fn a_golden_version_is_pulled_through_the_registry() {
+        let (url, reg) = fake_registry().await;
+        let manifest = r#"{"assets":[{"kind":"golden","name":"nextnfs","digest":"ab","provenance":"golden-nextnfs-1111aaaa2222"}]}"#;
+        let img = StormpumpImages::new(&url).with_release_manifest(manifest);
+        // Held by the registry: a template the container root is cloned from.
+        let r = img.pull_image("nextnfs:3333bbbb4444").await.unwrap();
+        assert_eq!(r, "template:golden-nextnfs-3333bbbb4444");
+        assert!(img.image_status("nextnfs:3333bbbb4444").await.unwrap().is_some(), "pulled: present");
+        assert_eq!(reg.lock().unwrap().golden_lookups, vec!["registry/nextnfs:3333bbbb4444".to_string()]);
+        // Not held: the demand, and the registry's words as the pull failure.
+        match img.pull_image("nextnfs:5555cccc6666").await {
+            Err(CriError::ImagePull(why)) => assert!(why.contains("fetching it from forge"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(img.image_status("nextnfs:5555cccc6666").await.unwrap().is_none());
+        // The release's own version is not a registry question.
+        let before = reg.lock().unwrap().golden_lookups.len();
+        assert!(img.version_of("nextnfs:1111aaaa2222").is_none());
+        assert!(img.version_of("nextnfs").is_none());
+        assert_eq!(reg.lock().unwrap().golden_lookups.len(), before);
     }
 
     /// #98: the image service learns an image's config from its golden record

@@ -246,6 +246,68 @@ pub fn release_golden(name: &str) -> Option<Provenance> {
         .and_then(|t| release_golden_in(&t, name))
 }
 
+/// A golden version a pod asked for by its image tag (#86).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoldenVersion {
+    /// The component (`nextnfs`).
+    pub component: String,
+    /// The golden's volume name (`golden-nextnfs-<sha12>`).
+    pub golden: String,
+    /// How the registry knows it: `registry/<component>:<sha12>`, stormcentral's
+    /// name for a component golden (`goldens::image_ref`).
+    pub reference: String,
+}
+
+/// Is a 12-character lowercase hex string, as a golden's build id is.
+fn is_sha12(s: &str) -> bool {
+    s.len() == 12 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The golden version an image asks for, when it asks for one other than the
+/// release's (#86, owner's choice A on the issue).
+///
+/// `image: nextnfs:<sha12>` (or `nextnfs:golden-nextnfs-<sha12>`) names the
+/// golden `golden-nextnfs-<sha12>`. It is a version only for a **known
+/// component**: one the release manifest lists as a golden, or one the node
+/// carries as a pallet (`has_pallet`). The release's own version, an untagged
+/// image, any other tag, and any digest run the pallet as before: upstream
+/// manifests carry OCI tags and digests (Cilium is pinned `@sha256:`), and
+/// those never named a golden. A digest selects nothing here: a node cannot
+/// map a device digest to a version it does not hold.
+pub fn golden_version(image: &str, manifest: &str, has_pallet: impl Fn(&str) -> bool) -> Option<GoldenVersion> {
+    let last = image.rsplit('/').next().unwrap_or(image);
+    let without_digest = last.split('@').next().unwrap_or(last);
+    let (name, tag) = without_digest.split_once(':')?;
+    if name.is_empty() {
+        return None;
+    }
+    let prefix = format!("golden-{name}-");
+    let sha12 = tag.strip_prefix(&prefix).unwrap_or(tag);
+    if !is_sha12(sha12) {
+        return None;
+    }
+    let release = release_golden_in(manifest, name);
+    if release.is_none() && !has_pallet(name) {
+        return None;
+    }
+    // The release's own version is the pallet.
+    let release_sha12 = serde_json::from_str::<serde_json::Value>(manifest)
+        .ok()
+        .and_then(|doc| {
+            doc["assets"].as_array()?.iter().find(|a| a["kind"] == "golden" && a["name"].as_str() == Some(name)).and_then(
+                |a| a["provenance"].as_str().and_then(|p| p.strip_prefix(&prefix)).map(str::to_string),
+            )
+        });
+    if release_sha12.as_deref() == Some(sha12) {
+        return None;
+    }
+    Some(GoldenVersion {
+        component: name.to_string(),
+        golden: format!("{prefix}{sha12}"),
+        reference: format!("registry/{name}:{sha12}"),
+    })
+}
+
 /// A golden record's `config`, if it carries a non-empty one.
 pub fn from_golden(record: &serde_json::Value) -> Option<ImageConfig> {
     let c: ImageConfig = serde_json::from_value(record.get("config")?.clone()).ok()?;
@@ -642,5 +704,30 @@ mod tests {
         assert!(!outside.path().join("data").exists(), "nothing made outside the root");
         std::fs::write(r.join("file"), "x").unwrap();
         assert!(!make_in_root(r, "/file/sub").unwrap());
+    }
+
+    /// #86: a tag naming a golden version other than the release's selects it;
+    /// everything else stays the pallet.
+    #[test]
+    fn a_tag_selects_a_golden_version_and_nothing_else_does() {
+        let m = r#"{"assets":[
+            {"kind":"golden","name":"nextnfs","digest":"ab","provenance":"golden-nextnfs-1111aaaa2222"},
+            {"kind":"golden","name":"cilium","digest":"unknown","provenance":"cilium/cilium@sha256:9d30"}]}"#;
+        let none = |_: &str| false;
+        let v = golden_version("nextnfs:3333bbbb4444", m, none).unwrap();
+        assert_eq!(v.golden, "golden-nextnfs-3333bbbb4444");
+        assert_eq!(v.reference, "registry/nextnfs:3333bbbb4444");
+        assert_eq!(golden_version("registry/nextnfs:golden-nextnfs-3333bbbb4444", m, none), Some(v));
+        // The release's own version, untagged, other tags, digests: the pallet.
+        assert_eq!(golden_version("nextnfs:1111aaaa2222", m, none), None);
+        assert_eq!(golden_version("nextnfs", m, none), None);
+        assert_eq!(golden_version("nextnfs:latest", m, none), None);
+        assert_eq!(golden_version("nextnfs@sha256:abcd", m, none), None);
+        assert_eq!(golden_version("quay.io/cilium/cilium:v1.18.2@sha256:9d30", m, none), None);
+        // A 12-hex tag on something that is no component of ours: not a version.
+        assert_eq!(golden_version("ghcr.io/x/tool:3333bbbb4444", m, none), None);
+        // A pallet the manifest does not list still has versions.
+        assert!(golden_version("rocketsmbd:3333bbbb4444", m, |n| n == "rocketsmbd").is_some());
+        assert_eq!(golden_version("nextnfs:3333BBBB4444", m, none), None, "build ids are lowercase");
     }
 }
