@@ -5818,7 +5818,7 @@ mod seed_tests {
         assert_eq!(shutdown_grace_secs(Some(&json!({"spec": {}}))), None, "unset: the engine's 45 s");
         assert_eq!(shutdown_grace_secs(Some(&json!({"spec": {"terminationGracePeriodSeconds": 99999}}))), Some(3600));
         let plain = stormpump::spec::Spec {
-            domain: stormpump::spec::Domain::Vm,
+            domain: stormpump_abi::Domain::Vm,
             argv: vec!["/usr/bin/qemu-system-x86_64".into()],
             ..Default::default()
         };
