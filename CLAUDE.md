@@ -331,13 +331,15 @@ group snapshots of them (stormstorage#49, needs-owner), a VM disk on another dri
 connects it in NodeStage, #142 closed), then
 #53's restore from VolumeSnapshots (dataSource). Commented; proposed after stormstorage#49. No code.
 
-### In progress: #181 item 3 (stormpump#144 done: /run/stormpump/shutdown)
+### Done: #181 item 3 (stormpump#144: /run/stormpump/shutdown)
 
 2026-10-09. The engine writes `/run/stormpump/shutdown` ({reason, started_unix, vm_shutdown_max_secs, why}) before
 stopping any workload, and removes a stale one at every start. Doing: `VmManager::power_down_all` (every running VM's
 `shut_down` started at once, nothing forced, bounded wait), triggered (a) by the marker appearing (fs_watch on
 /run/stormpump) and (b) by SIGTERM when the marker is there (then exit); SIGTERM without it = a restart, VMs untouched.
-Tests, docs, CHANGELOG; sc-build; golden; close.
+ecc6cc6 (+ docs f38eb3d). SC_BUILD_VM sc-build ecc6cc6: 483 kubelet unit pass. Stage golden
+golden-rustkube-node-ac027e155623 (stormcos#424). #181 closed. Live: a power-off with a VM running, the guest down
+before its hypervisor is signalled (stormvm's medium shutdown case), on a release with stormpump bdcc7eafef47.
 
 ### (earlier) #181 items 1+2 + spec grace done 2026-10-09
 
