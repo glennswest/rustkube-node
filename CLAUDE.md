@@ -496,17 +496,20 @@ Steps:
        #362 fixed: stage golden golden-rustkube-node-0fc1a74fff24 (7df677b = c8256ac code), stormcos#366 (asked the gate for
        the isolation / one-clone / pods-start checks); `stormcentral shipped`. Close #161 as superseded once released.
 
-### In progress: #226 (P1), mirror pods: rustkube-apiserver "Running (Completed) 0/1" while serving; stormvm 0/1
+### Done: #226 (P1), mirror pods: rustkube-apiserver "Running (Completed) 0/1" while serving; stormvm 0/1
 
 2026-10-09. Live (master, Dell 12.03): stormd :9082 lists `apiserver` running/ready, `stormcert` running, nine
 `stormcert-client-*` one-shots stopped exit 0. No process is named `rustkube-apiserver`, so #215's `representative`
 took the worst process, and a finished one-shot outranks running. stormvm: its API answers 404 on /healthz and /readyz,
 so the readiness probe can't pass (stormvm's, filed there); the mirror is right to say not ready.
-1. [ ] stormd_api: one-shots from the golden's config (`[[process]]` `on_exit = "stop"`, `restart_policy` OnFailure
+1. [x] stormd_api: one-shots from the golden's config (`[[process]]` `on_exit = "stop"`, `restart_policy` OnFailure
        or Never), else a process stopped with exit 0; `representative` over the long-running processes only (named
        one first, else the worst; restarts summed; ready only if all are); a failed one-shot makes it not ready,
        naming it.
-2. [ ] Tests (the 12.03 process list), README, CHANGELOG; sc-build; golden; close.
+2. [x] Tests (the 12.03 process list; config one-shots), README, CHANGELOG (9b04c1c, 8a0fe6e; build failures #228,
+       #229 fixed 4e64ed3, 6a5317e). SC_BUILD_VM sc-build 6a5317e: 473 kubelet unit, all suites pass. 12.03 carries
+       golden-rustkube-node-2eabd6fc174b (#215's mapping with this bug). Stage golden golden-rustkube-node-3413c7a7330d
+       (stormcos#424). stormvm half = stormvm#84 (no /healthz). Closed.
 
 ### Done: #225 (P1), pod delete stops every container with 30 s, not terminationGracePeriodSeconds
 
