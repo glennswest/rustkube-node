@@ -1981,7 +1981,7 @@ Steps:
 5. [ ] Live: stormcos's cni-bin carries only Cilium's binaries; asked in stormcos#495 for containernetworking/plugins.
        Then: a bridge + a macvlan NAD on a test node (test-container case: NADs are namespaced), close.
 
-### Live check pending (master installs on the Dell): #231 + #232 (P0, stormcos#488)
+### Done: #231 + #232 (P0, stormcos#488): verified live on the Dell, 12.07
 
 2026-10-09. stormcos#259 moved the mount list off the command line (`/etc/stormblock/mounts`), so golden_of
 assumed volume == path: cilium-operator's pallet `operator-generic` is volume `cilium-operator` → "no golden". The
