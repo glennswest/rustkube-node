@@ -2831,7 +2831,8 @@ impl PodManager {
                 let is_known = self.pods.read().await.contains_key(uid);
                 if is_known {
                     info!("Pod {namespace}/{name} is terminating — stopping");
-                    if let Err(e) = self.stop_pod(uid).await {
+                    // The deleting object's grace (#225).
+                    if let Err(e) = self.stop_pod_within(uid, Some(termination_grace(pod))).await {
                         apimachinery::reactor::failed();
                         error!("Failed to stop terminating pod {namespace}/{name}: {e}");
                         continue;
@@ -5195,8 +5196,19 @@ impl PodManager {
         info!("Registered restored pod {namespace}/{name} with sandbox {sandbox_id}");
     }
 
-    /// Stop and remove a pod.
+    /// Stop and remove a pod, within its own grace ([`termination_grace`]).
     pub async fn stop_pod(&self, uid: &str) -> Result<(), CriError> {
+        self.stop_pod_within(uid, None).await
+    }
+
+    /// [`Self::stop_pod`], with the grace a delete gave (`None`: the pod's own).
+    ///
+    /// The app containers are stopped together, so the pod's grace is one
+    /// budget as upstream gives it, not one per container; then the sidecars,
+    /// last declared first (#111). Before #225 every container got a literal
+    /// 30 s, whatever the pod said: a 5 s pod whose process ignores SIGTERM
+    /// was killed 30 s after its delete.
+    pub async fn stop_pod_within(&self, uid: &str, grace: Option<i64>) -> Result<(), CriError> {
         fn stopped(result: Result<(), CriError>) -> Result<(), CriError> {
             match result {
                 Err(CriError::NotFound(_)) => Ok(()),
@@ -5211,17 +5223,25 @@ impl PodManager {
             // first (#111): a sidecar (a proxy, a log shipper) outlives what
             // it serves, as upstream orders it.
             let sidecars = sidecar_names(&state.pod);
-            let mut order: Vec<(&String, &String)> =
+            let grace = grace.map(|g| g.max(0)).unwrap_or_else(|| termination_grace(&state.pod));
+            let apps: Vec<(&String, &String)> =
                 state.container_ids.iter().filter(|(n, _)| !sidecars.contains(*n)).collect();
+            let stops = apps.iter().map(|(name, cid)| async move {
+                info!("Stopping container {name} ({cid}), grace {grace}s");
+                stopped(self.runtime.stop_container(cid, grace).await)
+            });
+            for r in futures::future::join_all(stops).await {
+                r?;
+            }
+            for (_, cid) in &apps {
+                stopped(self.runtime.remove_container(cid).await)?;
+            }
             for n in sidecars.iter().rev() {
                 if let Some((name, cid)) = state.container_ids.get_key_value(n) {
-                    order.push((name, cid));
+                    info!("Stopping sidecar {name} ({cid}), grace {grace}s");
+                    stopped(self.runtime.stop_container(cid, grace).await)?;
+                    stopped(self.runtime.remove_container(cid).await)?;
                 }
-            }
-            for (name, cid) in order {
-                info!("Stopping container {name} ({cid})");
-                stopped(self.runtime.stop_container(cid, 30).await)?;
-                stopped(self.runtime.remove_container(cid).await)?;
             }
             // The completed init containers kept for their logs (#47).
             let kept = self.kept_inits.lock().unwrap_or_else(|e| e.into_inner()).get(uid).cloned().unwrap_or_default();
@@ -6186,6 +6206,18 @@ fn new_log_run(config: &mut ContainerConfig, log_directory: &str, at_least: u32)
     config.log_path = format!("{}/{n}.log", config.name);
 }
 
+/// How long a pod's containers get between SIGTERM and SIGKILL (#225): the
+/// delete's `metadata.deletionGracePeriodSeconds` when the object carries it
+/// (a `--grace-period` that shortens it), else `spec.terminationGracePeriodSeconds`,
+/// else upstream's 30. Never negative.
+pub fn termination_grace(pod: &Value) -> i64 {
+    pod["metadata"]["deletionGracePeriodSeconds"]
+        .as_i64()
+        .or_else(|| pod["spec"]["terminationGracePeriodSeconds"].as_i64())
+        .unwrap_or(30)
+        .max(0)
+}
+
 fn ensure_container_log_dir(log_directory: &str, container_name: &str) {
     let dir = format!("{log_directory}/{container_name}");
     if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -6536,6 +6568,8 @@ pub(crate) mod tests {
         missing_images: Mutex<std::collections::HashSet<String>>,
         fail_create: Mutex<std::collections::HashSet<String>>,
         fail_start: Mutex<std::collections::HashSet<String>>,
+        /// Every stop_container: the container and its grace (#225).
+        stop_graces: Mutex<Vec<(String, i64)>>,
     }
 
     impl FakeRuntime {
@@ -6723,7 +6757,8 @@ pub(crate) mod tests {
             Ok(())
         }
 
-        async fn stop_container(&self, container_id: &str, _timeout: i64) -> Result<(), CriError> {
+        async fn stop_container(&self, container_id: &str, timeout: i64) -> Result<(), CriError> {
+            self.stop_graces.lock().unwrap().push((container_id.to_string(), timeout));
             if self.fail_stop.load(Ordering::SeqCst) {
                 return Err(CriError::Connection("injected outage".into()));
             }
@@ -8889,6 +8924,36 @@ pub(crate) mod tests {
         assert_eq!(outcome.removed[0].reason, RemovalReason::Deleting);
         assert_eq!(rt.live_sandbox_count(), 0);
         assert!(rt.container_ids().is_empty());
+    }
+
+    /// #225: a deleted pod's containers get its terminationGracePeriodSeconds,
+    /// or the delete's shorter deletionGracePeriodSeconds, never a fixed 30.
+    #[tokio::test]
+    async fn a_deleted_pod_is_stopped_within_its_own_grace() {
+        let (rt, mgr) = manager();
+        let mut p = pod("uid-1", "web", "Never", simple_container());
+        p["spec"]["terminationGracePeriodSeconds"] = json!(5);
+        mgr.sync_pods(&[p.clone()]).await;
+        let mut deleting = p.clone();
+        deleting["metadata"]["deletionTimestamp"] = json!("2026-10-09T00:00:00Z");
+        mgr.sync_pods(&[deleting]).await;
+        let graces: Vec<i64> = rt.stop_graces.lock().unwrap().iter().map(|(_, g)| *g).collect();
+        assert_eq!(graces, [5]);
+
+        assert_eq!(termination_grace(&json!({"spec": {}})), 30, "upstream's default");
+        assert_eq!(termination_grace(&json!({"spec": {"terminationGracePeriodSeconds": 0}})), 0);
+        assert_eq!(
+            termination_grace(&json!({"metadata": {"deletionGracePeriodSeconds": 2}, "spec": {"terminationGracePeriodSeconds": 60}})),
+            2,
+            "the delete's own grace"
+        );
+        assert_eq!(termination_grace(&json!({"spec": {"terminationGracePeriodSeconds": -1}})), 0);
+
+        // The reconciler's path, with the grace the deleting object gave.
+        let (rt, mgr) = manager();
+        mgr.sync_pods(&[pod("uid-2", "web", "Never", simple_container())]).await;
+        mgr.stop_pod_within("uid-2", Some(1)).await.unwrap();
+        assert_eq!(rt.stop_graces.lock().unwrap().iter().map(|(_, g)| *g).collect::<Vec<_>>(), [1]);
     }
 
     #[tokio::test]

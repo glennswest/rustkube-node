@@ -1664,7 +1664,10 @@ impl workload::Adapter for Kubelet {
             let Some(_operations)=self.workloads.reservations.try_operations(&claims) else {return Ok(Next::After(Duration::from_millis(100)))};
             match key.kind {
                 Kind::Pod=> {
-                    self.pod_manager.stop_pod(&key.uid).await?;
+                    // The deleting object's grace, when the watch still
+                    // has it (#225); else the pod's own.
+                    let grace=desired.as_ref().map(crate::pod_manager::termination_grace);
+                    self.pod_manager.stop_pod_within(&key.uid,grace).await?;
                     self.acked_status.lock().unwrap_or_else(|e| e.into_inner()).remove(&key.uid);
                     if let Some(object)=&desired {
                         // Never acknowledge deletion of a same-name successor.
