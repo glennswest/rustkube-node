@@ -68,7 +68,8 @@ dropped until the next pass.
        tries; `conflict` metric; 2 tests against a fake apiserver (009d006).
 2. [x] test `drain` skips the runner (`HOSTNAME` or a Job-owned pod); test (d4abb1d).
 3. [x] Docs (metrics.md), CHANGELOG; sc-build 009d006 (P0): 465 kubelet unit pass. Test crate build; stage golden;
-       close; rerun `stormcentral test run rustkube-node short --tag C2NR0Q2`.
+       close. Live: short 4fe3fb250e (9229603, C2NR0Q2) passed 4/0/0, one runner, Job completed 1/1. Stage golden
+       golden-rustkube-node-2eabd6fc174b (stormcos#424) carries the 409 fix. Closed.
 
 ### Done: #215 (P0), mirror pods carry stormd's probe state, restarts/CrashLoopBackOff and events (stormd#48)
 
