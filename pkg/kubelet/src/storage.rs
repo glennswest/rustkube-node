@@ -315,6 +315,209 @@ pub fn claim_source(pvc: &Value) -> Option<ClaimSource> {
     }
 }
 
+/// stormblock's failure-domain rungs (its `placement::domain::RUNGS`), widest
+/// first. `drive` is its default.
+pub const RUNGS: [&str; 11] = ["site", "building", "room", "row", "rack", "node", "hba", "shelf", "set", "bay", "drive"];
+/// stormblock's tiers.
+pub const TIERS: [&str; 4] = ["hot", "warm", "cool", "cold"];
+
+/// How a claim's volume is protected, from its StorageClass (#71).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Scheme {
+    /// One copy: a class that names nothing (stormblock's default).
+    #[default]
+    None,
+    /// `copies` full copies, each on its own domain.
+    Mirror(u8),
+    /// `data` + `parity` legs per stripe (RAID 5 = 1 parity, RAID 6 = 2).
+    Parity { data: u8, parity: u8 },
+}
+
+/// A claim's placement policy: the StorageClass's `redundancy`, `spread` and
+/// `tier` (#71, stormblock#151).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ClaimPolicy {
+    pub scheme: Scheme,
+    /// The rung the legs differ at; `None` is stormblock's default (`drive`).
+    pub spread: Option<String>,
+    /// A preferred tier; never a refusal, in stormblock.
+    pub tier: Option<String>,
+}
+
+impl Scheme {
+    /// stormblock's spellings (`RedundancyPolicy::parse`), without an `@rung`.
+    pub fn parse(s: &str) -> Result<Scheme, String> {
+        let lower = s.trim().to_ascii_lowercase();
+        let (kind, arg) = match lower.split_once(':') {
+            Some((k, a)) => (k.trim().to_string(), Some(a.trim().to_string())),
+            None => (lower.clone(), None),
+        };
+        match kind.as_str() {
+            "" | "none" | "single" => Ok(Scheme::None),
+            "mirror" | "raid1" | "raid10" | "raid-1" | "raid-10" => {
+                let copies: u8 = match arg {
+                    None => 2,
+                    Some(a) => a.parse().map_err(|_| format!("bad mirror count {a:?}"))?,
+                };
+                if copies < 2 {
+                    return Err("a mirror needs at least 2 copies".into());
+                }
+                Ok(Scheme::Mirror(copies))
+            }
+            "raid5" | "raid-5" | "raid6" | "raid-6" | "parity" => {
+                let fixed = if kind.contains('5') { Some(1) } else if kind.contains('6') { Some(2) } else { None };
+                let arg = arg.ok_or_else(|| format!("{kind} needs a width, e.g. {kind}:4+{}", fixed.unwrap_or(1)))?;
+                let (data, parity) = match arg.split_once('+') {
+                    Some((d, p)) => (
+                        d.trim().parse::<u8>().map_err(|_| format!("bad data width {d:?}"))?,
+                        p.trim().parse::<u8>().map_err(|_| format!("bad parity width {p:?}"))?,
+                    ),
+                    None => {
+                        let members: u8 = arg.parse().map_err(|_| format!("bad member count {arg:?}"))?;
+                        let p = fixed.ok_or("parity needs D+P")?;
+                        if members <= p {
+                            return Err(format!("{kind}:{members} leaves no data members"));
+                        }
+                        (members - p, p)
+                    }
+                };
+                if let Some(p) = fixed.filter(|p| *p != parity) {
+                    return Err(format!("{kind} has exactly {p} parity leg(s)"));
+                }
+                if parity == 0 {
+                    return Err("parity needs at least 1 parity leg".into());
+                }
+                if data < 2 {
+                    return Err("parity needs at least 2 data members".into());
+                }
+                Ok(Scheme::Parity { data, parity })
+            }
+            other => Err(format!("unknown redundancy {other:?} (none, mirror[:N], raid5:D+1, raid6:D+2, parity:D+P)")),
+        }
+    }
+
+    /// As stormblock spells it, `None` for none.
+    pub fn spelling(&self) -> Option<String> {
+        match *self {
+            Scheme::None => None,
+            Scheme::Mirror(n) => Some(format!("mirror:{n}")),
+            Scheme::Parity { data, parity: 1 } => Some(format!("raid5:{data}+1")),
+            Scheme::Parity { data, parity: 2 } => Some(format!("raid6:{data}+2")),
+            Scheme::Parity { data, parity } => Some(format!("parity:{data}+{parity}")),
+        }
+    }
+
+    /// Physical bytes per byte of data.
+    pub fn overhead(&self) -> f64 {
+        match *self {
+            Scheme::None => 1.0,
+            Scheme::Mirror(n) => n as f64,
+            Scheme::Parity { data, parity } => (data as f64 + parity as f64) / data as f64,
+        }
+    }
+
+    /// The scheme of a volume as stormblock lists it (`mirror:2@shelf`,
+    /// `none`); one it does not parse counts as none.
+    pub fn of_listing(spelled: &str) -> Scheme {
+        Scheme::parse(spelled.split('@').next().unwrap_or("")).unwrap_or_default()
+    }
+}
+
+impl ClaimPolicy {
+    /// From a StorageClass's `parameters` (#71). `None` (no class object) is
+    /// the default policy. A key this driver does not know is refused, as an
+    /// upstream provisioner refuses one, except `csi.storage.k8s.io/*`.
+    pub fn from_class(sc: Option<&Value>) -> Result<ClaimPolicy, String> {
+        let Some(params) = sc.and_then(|c| c["parameters"].as_object()) else {
+            return Ok(ClaimPolicy::default());
+        };
+        let mut redundancy = None::<String>;
+        let mut spread = None::<String>;
+        let mut tier = None::<String>;
+        for (k, v) in params {
+            let v = v.as_str().map(str::trim).unwrap_or("").to_string();
+            match k.as_str() {
+                "redundancy" => redundancy = Some(v),
+                "spread" => spread = Some(v.to_ascii_lowercase()).filter(|s| !s.is_empty()),
+                "tier" => tier = Some(v.to_ascii_lowercase()).filter(|s| !s.is_empty()),
+                k if k.starts_with("csi.storage.k8s.io/") => {}
+                k => return Err(format!("unknown StorageClass parameter {k:?} (redundancy, spread, tier)")),
+            }
+        }
+        let (scheme_text, rung) = match redundancy.as_deref().map(|r| r.split_once('@').map_or((r, None), |(a, b)| (a, Some(b.trim().to_ascii_lowercase())))) {
+            Some((a, r)) => (a.to_string(), r),
+            None => (String::new(), None),
+        };
+        let scheme = Scheme::parse(&scheme_text)?;
+        let spread = match (rung, spread) {
+            (Some(a), Some(b)) if a != b => return Err(format!("spread {b} and redundancy @{a} name different rungs")),
+            (a, b) => a.or(b),
+        };
+        if let Some(r) = &spread {
+            if !RUNGS.contains(&r.as_str()) {
+                return Err(format!("unknown spread {r:?} ({})", RUNGS.join(", ")));
+            }
+        }
+        if let Some(t) = &tier {
+            if !TIERS.contains(&t.as_str()) {
+                return Err(format!("unknown tier {t:?} ({})", TIERS.join(", ")));
+            }
+        }
+        // A spread means nothing to one copy: dropped, so `none` claims keep
+        // sharing the plain blank.
+        let spread = if scheme == Scheme::None { None } else { spread };
+        Ok(ClaimPolicy { scheme, spread, tier })
+    }
+
+    /// The rung, as stormblock takes it (`drive` when the class names none).
+    pub fn rung(&self) -> &str {
+        self.spread.as_deref().unwrap_or("drive")
+    }
+
+    /// The blank a claim of `class` with this policy clones (#71): the class's
+    /// own name for `none` (what the image ships and every node already has),
+    /// else that name with the policy and rung, as stormblock#151 names them:
+    /// `pvc-ext4j-1048576m-mirror2-shelf`, `pvc-ext4j-64m-raid5-4p1-drive`.
+    pub fn blank_name(&self, class: &str) -> String {
+        let base = template_name(class);
+        let slug = match self.scheme {
+            Scheme::None => return base,
+            Scheme::Mirror(n) => format!("mirror{n}"),
+            Scheme::Parity { data, parity: 1 } => format!("raid5-{data}p1"),
+            Scheme::Parity { data, parity: 2 } => format!("raid6-{data}p2"),
+            Scheme::Parity { data, parity } => format!("parity-{data}p{parity}"),
+        };
+        format!("{base}-{slug}-{}", self.rung())
+    }
+
+    /// The fields a mint or a raw volume carries: `redundancy` and `spread`
+    /// when it is not none.
+    pub fn engine_fields(&self) -> serde_json::Map<String, Value> {
+        let mut m = serde_json::Map::new();
+        if let Some(r) = self.scheme.spelling() {
+            m.insert("redundancy".into(), Value::String(r));
+            m.insert("spread".into(), Value::String(self.rung().to_string()));
+        }
+        m
+    }
+}
+
+/// Is `name` a size-class blank, plain or for a policy (#71)?
+pub fn is_class_blank(name: &str) -> bool {
+    SIZE_CLASSES.iter().any(|(c, _, _)| {
+        let base = template_name(c);
+        name == base
+            || name.strip_prefix(&base).and_then(|r| r.strip_prefix('-')).is_some_and(|rest| {
+                // `<slug>-<rung>`, as [`ClaimPolicy::blank_name`] makes it:
+                // not a claim volume that happens to share the prefix.
+                rest.rsplit_once('-').is_some_and(|(slug, rung)| {
+                    RUNGS.contains(&rung)
+                        && ["mirror", "raid5-", "raid6-", "parity-"].iter().any(|p| slug.starts_with(p))
+                })
+            })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,5 +709,60 @@ mod tests {
         assert!(is_block(&json!({"spec": {"volumeMode": "Block"}})));
         assert!(!is_block(&json!({"spec": {"volumeMode": "Filesystem"}})));
         assert!(!is_block(&json!({"spec": {}})));
+    }
+
+    /// #71: what a StorageClass's parameters come to.
+    #[test]
+    fn a_class_policy_and_its_blank() {
+        let sc = |p: Value| json!({"parameters": p});
+        let none = ClaimPolicy::from_class(None).unwrap();
+        assert_eq!(none, ClaimPolicy::default());
+        assert_eq!(none.blank_name("1G"), "pvc-ext4j-1024m", "no policy: the shipped blank");
+        assert!(none.engine_fields().is_empty());
+
+        let m = ClaimPolicy::from_class(Some(&sc(json!({"redundancy": "mirror", "spread": "shelf"})))).unwrap();
+        assert_eq!(m.scheme, Scheme::Mirror(2));
+        assert_eq!(m.blank_name("1T"), "pvc-ext4j-1048576m-mirror2-shelf");
+        assert_eq!(m.engine_fields()["redundancy"], "mirror:2");
+        assert_eq!(m.engine_fields()["spread"], "shelf");
+        // The same policy spelled other ways is the same blank.
+        for r in ["mirror:2@shelf", "raid1@shelf", "MIRROR:2 @ shelf"] {
+            let p = ClaimPolicy::from_class(Some(&sc(json!({"redundancy": r})))).unwrap();
+            assert_eq!(p.blank_name("1T"), m.blank_name("1T"), "{r}");
+        }
+        let d = ClaimPolicy::from_class(Some(&sc(json!({"redundancy": "mirror:3"})))).unwrap();
+        assert_eq!(d.blank_name("64M"), "pvc-ext4j-64m-mirror3-drive", "drive unless told");
+
+        let r5 = ClaimPolicy::from_class(Some(&sc(json!({"redundancy": "raid5:5", "tier": "Cold"})))).unwrap();
+        assert_eq!(r5.scheme, Scheme::Parity { data: 4, parity: 1 });
+        assert_eq!(r5.blank_name("64M"), "pvc-ext4j-64m-raid5-4p1-drive");
+        assert_eq!(r5.tier.as_deref(), Some("cold"));
+        assert!((r5.scheme.overhead() - 1.25).abs() < 1e-9);
+        let r6 = ClaimPolicy::from_class(Some(&sc(json!({"redundancy": "raid6:4+2"})))).unwrap();
+        assert_eq!(r6.engine_fields()["redundancy"], "raid6:4+2");
+
+        // A spread on one copy changes nothing.
+        let s = ClaimPolicy::from_class(Some(&sc(json!({"spread": "rack"})))).unwrap();
+        assert_eq!(s.blank_name("1G"), "pvc-ext4j-1024m");
+        // CSI's own keys pass; anything else is refused, as is a bad value.
+        assert!(ClaimPolicy::from_class(Some(&sc(json!({"csi.storage.k8s.io/fstype": "ext4"})))).is_ok());
+        for bad in [
+            json!({"replicas": "2"}),
+            json!({"redundancy": "mirror:1"}),
+            json!({"redundancy": "raid5:4+2"}),
+            json!({"redundancy": "raid5"}),
+            json!({"redundancy": "mirror@shelf", "spread": "rack"}),
+            json!({"redundancy": "mirror", "spread": "galaxy"}),
+            json!({"tier": "lukewarm"}),
+        ] {
+            assert!(ClaimPolicy::from_class(Some(&sc(bad.clone()))).is_err(), "{bad}");
+        }
+        assert!(is_class_blank("pvc-ext4j-1048576m-mirror2-shelf"));
+        assert!(is_class_blank("pvc-ext4j-64m"));
+        assert!(!is_class_blank("pvc-ext4j-64mx"));
+        assert!(!is_class_blank("pvc-ext4j-64m-data"), "a claim volume (namespace ext4j) is not a blank");
+        assert!(is_class_blank("pvc-ext4j-64m-raid5-4p1-drive"));
+        assert_eq!(Scheme::of_listing("mirror:2@shelf"), Scheme::Mirror(2));
+        assert_eq!(Scheme::of_listing("none"), Scheme::None);
     }
 }

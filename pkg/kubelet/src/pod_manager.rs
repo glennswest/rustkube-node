@@ -878,6 +878,42 @@ impl PodManager {
         resp.json::<Value>().await.ok()
     }
 
+    /// GET an object, telling "not there" (`Ok(None)`, a 404) apart from "not
+    /// answered" (`Err`): what decides a claim's policy must not read an
+    /// unreachable StorageClass as one that names nothing (#71).
+    async fn api_get_checked(&self, path: &str) -> Result<Option<Value>, String> {
+        if self.api_url.is_empty() {
+            return Ok(None);
+        }
+        let resp = self
+            .api_client
+            .get(format!("{}{path}", self.api_url))
+            .send_retrying(retry::Policy::API)
+            .await
+            .map_err(|e| format!("GET {path}: {e}"))?;
+        match resp.status() {
+            s if s.as_u16() == 404 => Ok(None),
+            s if s.is_success() => resp.json::<Value>().await.map(Some).map_err(|e| format!("GET {path}: {e}")),
+            s => Err(format!("GET {path}: {s}")),
+        }
+    }
+
+    /// The placement policy a new claim's volume gets: its StorageClass's
+    /// `redundancy`, `spread` and `tier` (#71). A class that does not exist,
+    /// or names nothing, is the default (one copy); one that cannot be read
+    /// is a wait, never "none"; one that names a policy this driver does not
+    /// take is refused on the claim.
+    async fn claim_policy(&self, pvc: &Value) -> Result<crate::storage::ClaimPolicy, ClaimError> {
+        let class = pvc["spec"]["storageClassName"].as_str().unwrap_or(crate::storage::STORAGE_CLASS);
+        let sc = self
+            .api_get_checked(&format!("/apis/storage.k8s.io/v1/storageclasses/{class}"))
+            .await
+            .map_err(|e| ClaimError::Failed(format!("waiting to read StorageClass {class}: {e}")))?;
+        crate::storage::ClaimPolicy::from_class(sc.as_ref()).map_err(|e| {
+            ClaimError::Failed(format!("StorageClass {class}: {e}"))
+        })
+    }
+
     /// Emit a pod event, if there is a recorder.
     ///
     /// The recorder was built, stored, and never called: `pod_event` had zero
@@ -1856,11 +1892,28 @@ impl PodManager {
         // well as by the scheduler, which static pods and pods written onto
         // `spec.nodeName` never meet. Held until it is made. An engine that
         // cannot list its slabs (older than the slab API) is not checked.
+        // The class's policy (#71), for a volume made here from nothing (a
+        // clone of a source keeps its source's). Refused or unreadable: the
+        // claim waits, and says so on itself.
+        let policy = if existing.is_none() && crate::storage::claim_source(&pvc).is_none() {
+            match self.claim_policy(&pvc).await {
+                Ok(p) => p,
+                Err(e) => {
+                    self.claim_event(&pvc, "Warning", "ProvisioningFailed", &e.to_string()).await;
+                    return Err(e);
+                }
+            }
+        } else {
+            crate::storage::ClaimPolicy::default()
+        };
         let _room = if existing.is_none() {
             let guard = self.capacity_lock.lock().await;
             match crate::capacity::read(&self.engine, &self.storage_policy).await {
                 Ok(c) if c.total > 0 => {
-                    if let Some(why) = c.refusal(class, class_bytes, &self.storage_policy) {
+                    // Charged what its policy costs on the drives: a mirror
+                    // twice its class (#71).
+                    let cost = (class_bytes as f64 * policy.scheme.overhead()).ceil() as u64;
+                    if let Some(why) = c.refusal(class, cost, &self.storage_policy) {
                         return Err(ClaimError::Failed(format!("claim {namespace}/{claim}: {why}")));
                     }
                 }
@@ -1890,7 +1943,7 @@ impl PodManager {
             // **A raw block claim is a plain volume** (#67): nothing to
             // format and nothing to clone, so every class is offered, up to
             // the pebibyte classes no filesystem blank exists for yet.
-            None if block => self.raw_volume(&name, class, class_bytes).await?,
+            None if block => self.raw_volume(&name, class, class_bytes, &policy).await?,
             None => {
                 // A class with no filesystem blank yet: the claim waits, and
                 // says what would serve it now.
@@ -1904,7 +1957,15 @@ impl PodManager {
                 // it descends from a sealed volume, records lineage, and
                 // stamps the clone with its own filesystem UUID — two live
                 // filesystems must never claim one identity (stormblock#76).
-                self.clone_blank(class, &name, &pvc).await?
+                // A tier is a preference stormblock keeps only on volumes it
+                // creates, not yet on blanks or clones (stormblock#377).
+                if let Some(t) = &policy.tier {
+                    self.claim_event(&pvc, "Warning", "TierNotApplied", &format!(
+                        "tier {t} is not applied to a filesystem claim yet: stormblock takes a tier on a \
+                         volume it creates, not on a blank or its clones; the claim uses the blank's tier"
+                    )).await;
+                }
+                self.clone_blank(class, &name, &pvc, &policy).await?
             }
         };
 
@@ -1958,12 +2019,24 @@ impl PodManager {
     /// A raw block claim's volume (#67): a plain stormblock volume of the
     /// class's size, in the data half like every claim, with no filesystem.
     /// Thin, so a pebibyte class costs nothing until it is written.
-    async fn raw_volume(&self, name: &str, class: &str, bytes: u64) -> Result<String, ClaimError> {
-        let body = serde_json::json!({
+    async fn raw_volume(
+        &self,
+        name: &str,
+        class: &str,
+        bytes: u64,
+        policy: &crate::storage::ClaimPolicy,
+    ) -> Result<String, ClaimError> {
+        let mut body = serde_json::json!({
             "name": name,
             "size": crate::storage::engine_size(bytes),
             "role": "data",
         });
+        // The class's policy (#71): redundancy and spread placed by the
+        // engine (409 when it cannot), the tier as a preference.
+        body.as_object_mut().expect("an object").extend(policy.engine_fields());
+        if let Some(t) = &policy.tier {
+            body["tier"] = serde_json::json!(t);
+        }
         let created = self
             .storage_post("/api/v1/volumes", &body)
             .await
@@ -1989,8 +2062,16 @@ impl PodManager {
     /// again: the refusal is the same on every retry, so a claim that only
     /// retried the clone waited forever (#140). Any other refusal is the
     /// claim's wait, with stormblock's answer in it.
-    async fn clone_blank(&self, class: &str, name: &str, claim: &Value) -> Result<String, ClaimError> {
-        let blank = crate::storage::template_name(class);
+    async fn clone_blank(
+        &self,
+        class: &str,
+        name: &str,
+        claim: &Value,
+        policy: &crate::storage::ClaimPolicy,
+    ) -> Result<String, ClaimError> {
+        // One blank per (size, fs, redundancy, spread) (#71): the clone
+        // inherits the blank's policy.
+        let blank = policy.blank_name(class);
         let template = match self.storage_template_state(&blank).await {
             // A blank not sealed yet cannot be cloned. Formatting a
             // 1 TiB class takes minutes (stormblock#141), and the claim
@@ -2022,7 +2103,7 @@ impl PodManager {
             // format is done, and a 1 TiB class held the whole sync
             // loop for it. Every pod on the node stopped being
             // reconciled, and the waiting pod was nowhere.
-            None => match self.mint_template(&blank, class).await {
+            None => match self.mint_template(&blank, class, policy).await {
                 Ok(id) => id,
                 Err(e) => {
                     // On the claim too (#70): `describe pvc` said nothing,
@@ -2053,7 +2134,7 @@ impl PodManager {
                 warn!("template {blank} is broken ({r}); deleting it to mint it again");
                 let path = format!("/api/v1/fstemplates/{template}");
                 let again = match self.storage_delete(&path).await {
-                    Ok(()) => match self.mint_template(&blank, class).await {
+                    Ok(()) => match self.mint_template(&blank, class, policy).await {
                         Ok(_) => "deleted; minted again, cloning on the next try".to_string(),
                         Err(e) => format!("deleted; {e}"),
                     },
@@ -2140,7 +2221,12 @@ impl PodManager {
     /// state while it formats, or the engine's refusal (once; the next claim
     /// tries again). Completion wakes waiting workers; reconciliation never
     /// waits inline for formatting to finish.
-    async fn mint_template(&self, blank: &str, class: &str) -> Result<String, String> {
+    async fn mint_template(
+        &self,
+        blank: &str,
+        class: &str,
+        policy: &crate::storage::ClaimPolicy,
+    ) -> Result<String, String> {
         let started = {
             let mut m = self.minting.lock().unwrap_or_else(|e| e.into_inner());
             match m.get(blank).cloned() {
@@ -2161,9 +2247,9 @@ impl PodManager {
             let url = format!("{}/api/v1/fstemplates", self.storage_url);
             let minting = self.minting.clone();
             let changed = self.volume_changes.clone();
-            let (blank, class) = (blank.to_string(), class.to_string());
+            let (blank, class, policy) = (blank.to_string(), class.to_string(), policy.clone());
             tokio::spawn(async move {
-                let failed = mint_blank(&engine, &url, &blank, &class).await.err();
+                let failed = mint_blank(&engine, &url, &blank, &class, &policy).await.err();
                 let mut m = minting.lock().unwrap_or_else(|e| e.into_inner());
                 match failed {
                     Some(e) => {
@@ -5215,6 +5301,7 @@ async fn mint_blank(
     url: &str,
     blank: &str,
     class: &str,
+    policy: &crate::storage::ClaimPolicy,
 ) -> Result<(), String> {
     // The class's filesystem and its size in MiB (stormblock has no `P`).
     let fs = crate::storage::class_fs(class)?;
@@ -5223,12 +5310,14 @@ async fn mint_blank(
         .find(|(c, _, _)| *c == class)
         .map(|(_, b, _)| *b)
         .ok_or_else(|| format!("no size class {class}"))?;
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "name": blank,
         "size": crate::storage::engine_size(bytes),
         "fs": fs,
         "role": "data",
     });
+    // Its policy (#71): every claim cloned from it inherits it.
+    body.as_object_mut().expect("an object").extend(policy.engine_fields());
     // Bounded by MINT_TIMEOUT, not the ordinary request bound: the answer
     // comes when the format is done (#99).
     let resp = engine
@@ -5236,10 +5325,16 @@ async fn mint_blank(
         .await
         .map_err(|e| format!("stormblock would not mint the blank {blank}: {e}"))?;
     let status = resp.status();
-    if status.is_success() || status.as_u16() == 409 {
+    if status.is_success() {
         return Ok(());
     }
     let text = resp.text().await.unwrap_or_default();
+    // A 409 is "it exists already" (a mint that outlived its caller) or a
+    // policy the node cannot place on distinct domains (stormblock#151):
+    // only the first is a success (#71).
+    if status.as_u16() == 409 && text.to_ascii_lowercase().contains("exist") {
+        return Ok(());
+    }
     Err(format!(
         "stormblock would not mint the blank {blank}: {status}: {}",
         text.chars().take(200).collect::<String>()
@@ -7123,7 +7218,7 @@ pub(crate) mod tests {
         };
 
         // First ask: the mint starts in the background; the claim says so.
-        assert!(mgr.clone_blank("64M", "pvc-ns-d", &claim).await.is_err());
+        assert!(mgr.clone_blank("64M", "pvc-ns-d", &claim, &Default::default()).await.is_err());
         let minting = said("Provisioning");
         assert_eq!(minting.len(), 1, "{:?}", events.lock().unwrap());
         assert_eq!(minting[0]["type"], "Normal");
@@ -7135,7 +7230,7 @@ pub(crate) mod tests {
         let t = Instant::now();
         while said("ProvisioningFailed").is_empty() {
             assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", events.lock().unwrap());
-            let _ = mgr.clone_blank("64M", "pvc-ns-d", &claim).await;
+            let _ = mgr.clone_blank("64M", "pvc-ns-d", &claim, &Default::default()).await;
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         let failed = said("ProvisioningFailed");
@@ -7145,7 +7240,7 @@ pub(crate) mod tests {
 
         // A ready blank: cloned, and the claim says so.
         ready.store(true, Ordering::SeqCst);
-        assert_eq!(mgr.clone_blank("64M", "pvc-ns-d", &claim).await.unwrap(), "vol-d");
+        assert_eq!(mgr.clone_blank("64M", "pvc-ns-d", &claim, &Default::default()).await.unwrap(), "vol-d");
         let ok = said("ProvisioningSucceeded");
         assert_eq!(ok.len(), 1);
         assert!(ok[0]["message"].as_str().unwrap().contains("volume pvc-ns-d cloned from the 64M blank pvc-ext4j-64m"));
@@ -7168,7 +7263,7 @@ pub(crate) mod tests {
 
         let t = Instant::now();
         let e = mgr
-            .mint_template("pvc-ext4j-1048576m", "1T")
+            .mint_template("pvc-ext4j-1048576m", "1T", &Default::default())
             .await
             .unwrap_err();
         assert!(
@@ -7183,7 +7278,7 @@ pub(crate) mod tests {
 
         // The next claim waits on the same mint rather than starting another.
         let e = mgr
-            .mint_template("pvc-ext4j-1048576m", "1T")
+            .mint_template("pvc-ext4j-1048576m", "1T", &Default::default())
             .await
             .unwrap_err();
         assert_eq!(e, "template pvc-ext4j-1048576m awaiting_format");
@@ -7261,7 +7356,7 @@ pub(crate) mod tests {
             refusing_stormblock((404, "volume 5c1e0b7a-0000-4000-8000-000000000001 not found")).await;
         let (_rt, mgr) = manager();
         let mgr = with_stormblock(mgr, &url);
-        let e = mgr.clone_blank("64M", "pvc-ns-d", &Value::Null).await.unwrap_err().to_string();
+        let e = mgr.clone_blank("64M", "pvc-ns-d", &Value::Null, &Default::default()).await.unwrap_err().to_string();
         assert!(e.contains("template pvc-ext4j-64m is broken"), "{e}");
         assert!(e.contains("404"), "{e}");
         assert!(e.contains("volume 5c1e0b7a-0000-4000-8000-000000000001 not found"), "{e}");
@@ -7282,7 +7377,7 @@ pub(crate) mod tests {
             refusing_stormblock((500, "cloning volume: no free slots in the data half")).await;
         let (_rt, mgr) = manager();
         let mgr = with_stormblock(mgr, &url);
-        let e = mgr.clone_blank("64M", "pvc-ns-d", &Value::Null).await.unwrap_err().to_string();
+        let e = mgr.clone_blank("64M", "pvc-ns-d", &Value::Null, &Default::default()).await.unwrap_err().to_string();
         assert!(e.starts_with("stormblock would not clone pvc-ext4j-64m to pvc-ns-d: "), "{e}");
         assert!(e.contains("-> 500: cloning volume: no free slots in the data half"), "{e}");
         assert_eq!(deletes.load(Ordering::SeqCst), 0);
@@ -7327,7 +7422,7 @@ pub(crate) mod tests {
         let (_rt, mgr) = manager();
         let mgr = with_stormblock(mgr, &url);
         let mut changes = mgr.subscribe_volume_changes();
-        let _ = mgr.mint_template("pvc-ext4j-1m", "1M").await;
+        let _ = mgr.mint_template("pvc-ext4j-1m", "1M", &Default::default()).await;
         tokio::time::timeout(std::time::Duration::from_secs(1), changes.changed())
             .await
             .unwrap()

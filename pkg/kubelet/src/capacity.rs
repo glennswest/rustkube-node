@@ -74,9 +74,8 @@ fn is_source(v: &Value) -> bool {
         || name.starts_with(FSTEMPLATE_PREFIX)
         || name.ends_with(".golden")
         || name.starts_with("standby-")
-        || crate::storage::SIZE_CLASSES
-            .iter()
-            .any(|(c, _, _)| name == crate::storage::template_name(c))
+        // Size-class blanks, plain or per policy (#71).
+        || crate::storage::is_class_blank(name)
 }
 
 impl Capacity {
@@ -88,7 +87,13 @@ impl Capacity {
         let committed: u64 = volumes
             .iter()
             .filter(|v| data(v) && !is_source(v))
-            .filter_map(|v| v["virtual_size_bytes"].as_u64())
+            // What it costs on the drives: its size times its redundancy
+            // (#71: a mirror is charged twice).
+            .filter_map(|v| {
+                let size = v["virtual_size_bytes"].as_u64()?;
+                let scheme = crate::storage::Scheme::of_listing(v["redundancy"].as_str().unwrap_or("none"));
+                Some((size as f64 * scheme.overhead()).ceil() as u64)
+            })
             .sum();
         let reserve = (total as f64 * policy.reserve_percent.clamp(0.0, 100.0) / 100.0) as u64;
         let allowed = (total as f64 * policy.overcommit.max(0.0)) as u64;
@@ -372,5 +377,19 @@ mod tests {
         let c = Capacity { total: 100, free: 10, ..Default::default() };
         assert!((c.used_percent() - 90.0).abs() < 1e-9);
         assert_eq!(Capacity::default().used_percent(), 0.0);
+    }
+
+    /// #71: a mirrored claim is charged both its copies; a policy's blank is a
+    /// source like the plain one.
+    #[test]
+    fn redundancy_is_charged_and_policy_blanks_are_sources() {
+        let slabs = vec![json!({"role": "data", "total_bytes": 100 * GI, "free_bytes": 100 * GI})];
+        let vols = vec![
+            json!({"name": "pvc-a", "role": "data", "virtual_size_bytes": 10 * GI, "redundancy": "mirror:2@shelf"}),
+            json!({"name": "pvc-b", "role": "data", "virtual_size_bytes": 10 * GI, "redundancy": "none"}),
+            json!({"name": "pvc-ext4j-1048576m-mirror2-shelf", "role": "data", "virtual_size_bytes": 1024 * GI, "redundancy": "mirror:2"}),
+        ];
+        let c = Capacity::of(&slabs, &vols, &Policy { overcommit: 1.0, reserve_percent: 0.0, alert_percent: 85.0 });
+        assert_eq!(c.committed, 30 * GI);
     }
 }
