@@ -1929,6 +1929,14 @@ Steps:
 4. [x] `sc-build 'cargo build --release --locked --target x86_64-unknown-linux-musl'`, then `cargo test --locked`: passed at 6741e93.
 5. [x] Close #58, request the golden.
 
+### In progress: #231 (P0, stormcos#488), pallet → volume from the engine, not /proc/cmdline
+
+2026-10-09. stormcos#259 moved the mount list off the command line (`/etc/stormblock/mounts`), so golden_of
+assumed volume == path: cilium-operator's pallet `operator-generic` is volume `cilium-operator` → "no golden". The
+engine's listing says it (`mounted_at: /p/operator-generic`). Fix: `pallet_volume(listing, path)` (volume-level
+or attachments[] `mounted_at` `/p/<path>` or `/pallets/<path>`), then the cmdline list, then name == path; Roots
+caches path → volume for provenance_for. Test; golden; close. (#21 paused on wip/21-rebased, build running.)
+
 ### Waiting on stormcentral#479 (suite cluster writes + a driver SA's cluster rules): #52, external StorageClasses (the CSI node side)
 
 2026-10-09. stormblock-registry#99 is fixed (v0.40.1; pushed goldens build). The e2e has to be a test-container
