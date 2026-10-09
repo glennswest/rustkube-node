@@ -1929,7 +1929,16 @@ Steps:
 4. [x] `sc-build 'cargo build --release --locked --target x86_64-unknown-linux-musl'`, then `cargo test --locked`: passed at 6741e93.
 5. [x] Close #58, request the golden.
 
-### Waiting on stormblock-registry#99 (pushed images): #52, external StorageClasses (the CSI node side)
+### Waiting on stormcentral#479 (suite cluster writes + a driver SA's cluster rules): #52, external StorageClasses (the CSI node side)
+
+2026-10-09. stormblock-registry#99 is fixed (v0.40.1; pushed goldens build). The e2e has to be a test-container
+suite (test standard; no kubectl/credentials here), and it must create a CSIDriver and a StorageClass and give the
+external-provisioner's SA cluster rules (PVs): the runner grants only cluster reads (#55); #479 proposes
+cluster_write but refuses RBAC. Commented the exact needs on #479; #52 proposed after it. Then: a `[csi]` suite
+(budget_secs) using tmp/csi52's manifests, driver images copied into the node registry over /v2/ (tmp/regcopy.py),
+the five checks.
+
+### (history) Waiting on stormblock-registry#99 (pushed images): #52, external StorageClasses (the CSI node side)
 
 2026-09-29: stormpump#35's engine side is on stormpump main (a06ce4c..), and `/` is rshared on C2NR0Q2 (11.51).
 What is left here is step 6 = #81 (`Mount.propagation` into `spec_for`), which needs stormpump ≥ a06ce4c in the
