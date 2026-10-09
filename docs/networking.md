@@ -68,3 +68,34 @@ cluster whose network-operator brings the CNI up.
 What #32 saw on scmaster1–3 (local LAN and DNS fine, gateway 192.168.8.1
 unreachable, no cluster) is the gateway row: a lab gateway
 question, independent of the CNI.
+
+## Extra networks: Multus's standard (#233)
+
+The owner's decision on stormcos#249: multi-NIC is the Multus/OpenShift standard as it is.
+NetworkAttachmentDefinitions (`k8s.cni.cncf.io/v1`, shipped in stormcos's apiserver golden) hold a CNI
+config in `spec.config`, and a pod asks for them by annotation. The kubelet, on the stormpump runtime,
+does what Multus does in front of a CRI runtime:
+
+- `k8s.v1.cni.cncf.io/networks`: a comma list of `name`, `namespace/name` or `name@ifname`, or a JSON
+  list of `{name, namespace, interface, ips, mac}`. Each NAD is looked for in the pod's namespace unless
+  named, and its config runs as one more CNI ADD **after the default network**, on `net1`, `net2`, …
+  (by position in the list) unless the entry names the interface. `ips` and `mac` reach a plugin as
+  `runtimeConfig` when its `capabilities` ask for them.
+- `v1.multus-cni.io/default-network`: one NAD that **replaces** the default network on `eth0` (a
+  namespace's VLAN, stormcos#248). The cluster's CNI config is then not needed for that pod.
+- **A NAD that does not exist** (or has no `spec.config`, or cannot be read) is a sandbox that waits,
+  named: `FailedCreatePodSandBox` "NetworkAttachmentDefinition ns/x not found", retried on the network
+  back-off. **A failed ADD** of any network DELs every network the pod has and fails the sandbox
+  naming the network and its interface.
+- **Teardown** (the pod finished or deleted): DEL of each extra network, last first, then the default
+  (the replacement, else the cluster's).
+- `k8s.v1.cni.cncf.io/network-status`: the default network first (named for its replacement NAD when
+  there is one), then one entry per extra network, `name` its `namespace/name`, `default: false`.
+- The plugins a NAD names (`bridge`, `macvlan`, `ipvlan`, …) come from the node's CNI bin directory
+  (`--cni-bin-dir`, `/opt/cni/bin`).
+
+Not here: a CRI runtime (`--runtime cri`) runs its own CNI and gets no attachments from the kubelet;
+VMs' `networks: - multus:` is the VM manager's (#88 path) and not part of #233. A sandbox adopted
+after a kubelet restart DELs only its default network at teardown (its attachments were not recorded
+across the restart).
+

@@ -2,6 +2,13 @@
 
 ## 2026-10-09
 
+- **feat:** Multi-NIC by the Multus standard (#233, stormcos#249): a pod's `k8s.v1.cni.cncf.io/networks` (names,
+  `ns/name`, `name@if`, or the JSON list with `interface`/`ips`/`mac`) runs one CNI ADD per NetworkAttachmentDefinition
+  (`spec.config`) after the default network, on `net1`, `net2`, … unless named; `v1.multus-cni.io/default-network`
+  replaces the default. A missing NAD is a sandbox wait naming it; a failed ADD DELs every network and fails the
+  sandbox naming it; teardown DELs extra networks last-first, then the default. `network-status` lists the default
+  first, then each attachment (`default: false`). cni: `NetworkConfigList::from_json`, `add_network`/`del_network`,
+  `runtimeConfig` by capability. stormpump runtime only. docs/networking.md.
 - **feat:** A VM is stopped gracefully (#181): on a VMI delete the guest is asked to power off first
   (`Machine::shut_down`, `system_powerdown` / the power button, within the VMI's `terminationGracePeriodSeconds`,
   default 30 s), and the engine's stop (a power cut to qemu) runs only if it does not. The VMI's grace also rides on
