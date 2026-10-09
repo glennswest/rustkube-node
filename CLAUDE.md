@@ -11,24 +11,25 @@ stage golden through `stormcentral component stage rustkube-node`, not a package
 `0.13.0`. There is one version location: `[workspace.package] version` in
 `Cargo.toml` (every crate uses `version.workspace = true`).
 
-## Current implementation reference (2026-10-02)
+## Current implementation reference (2026-10-09)
 
-Main baseline: fecb331. See `docs/status.md` for changes since September 25,
-the owner's recorded decisions and issue-backed limitations, `docs/configuration.md` for every CLI/env/default,
-and `docs/api.md` for ports and actual routes. CLI runtime defaults to native;
-stormcos explicitly chooses stormpump. Cilium (or, in the flowsdn edition, flowsdn) owns
-Services; the packaged kube-proxy is not started in either edition (#145, #155). PVCs use the built-in stormblock driver and sealed
-size-class blanks over ublk, with CSI only for third-party drivers.
+Main baseline: 06b91b5 (latest stage golden golden-rustkube-node-2eabd6fc174b, stormcos#424). See
+`docs/status.md` for changes since October 2, the owner's recorded decisions and issue-backed limitations,
+`docs/configuration.md` for every CLI/env/default, `docs/api.md` for ports and actual routes, `docs/retries.md`
+for every remote call's retry policy. CLI runtime defaults to native; stormcos explicitly chooses stormpump.
+Cilium (or, in the flowsdn edition, flowsdn) owns Services; the packaged kube-proxy is not started in either
+edition (#145, #155). PVCs use the built-in stormblock driver and sealed size-class blanks over ublk, with CSI
+only for third-party drivers. Every container's root is its own CoW clone of the image's sealed golden (#104,
+owner's option A). Node services' mirror pods take their state and Events from each service's stormd API (#215).
 
-Main has VMI adoption, persistent VM-owned disks, accessCredentials, tap address
-reporting and snapshot reconciliation; restore is #53. The #114 merge added turbomode's
-UID workers; #100 (partial-start unwind), #101 (no sync tick) and #99 (bounded calls)
-followed. Historical work-plan entries below record what was true at each checkpoint;
-they are not current deployment guarantees.
-Owner decisions (#106–#110) are answered: #106 Pods under one parent cgroup, OpenShift's
-shape (stormpump#68, then #57); #107 `<volume>-<node>` names, no migration (#59); #108
-class size at bind, ratio 1.0, class-sized clones (#62); #109 option A, restore rewrites the
-VM's disks to restored PVCs (#53); #110 C2NR0Q2 first (#102).
+Main has VMI adoption, persistent VM-owned disks, accessCredentials, tap address reporting, snapshots and
+restores (#53), pod-network VMIs under rustkube's launcher Pod (#88), the VM verbs (#94). Exec/attach are still
+501 (#56 item 5). Historical work-plan entries below record what was true at each checkpoint; they are not
+current deployment guarantees. Owner decisions answered: #106 (Pods under one parent cgroup, done), #107
+(`<volume>-<node>`, done), #108 (class size at bind, done), #109 (option A, done), #110/#158 (C2NR0Q2's day
+suite is the acceptance, #102), #104 (A), #3 (no NotReady gating; #201), #68 (stormblock-csi owns replicas),
+#159 (RAID leg on the destination, #40 after stormstorage#44), stormimds#12 (stormimds asks `/vmInstance`).
+Waiting on the owner: #13/#221, #86.
 
 ## Build and test
 
@@ -57,13 +58,13 @@ by #51.
 
 ## Work plan
 
-### In progress: documentation refresh from code since 2026-10-02 (#54-style audit; #166, #220)
+### Done: documentation refresh from code since 2026-10-02 (#54-style audit; #166, #220)
 
 2026-10-09, on main at 06b91b5. Audit README, docs/, CLAUDE.md against code and `git log --since=2026-10-02`.
-1. [ ] status.md rewritten (changes since 10-02, decisions, gaps with issues); configuration.md (stale #24/#69/#89/#126
+1. [x] status.md rewritten (changes since 10-02, decisions, gaps with issues); configuration.md (stale #24/#69/#89/#126
        lines), api.md (route table, stormimds#12 decided = #166, ports), README, metrics.md (#104 roots), BUILD.md,
        csi.md, event-driven-design.md, presentation.md; CLAUDE.md reference + #220's unblocked entries.
-2. [ ] Issues for doc promises with no owner; CHANGELOG; commit, push; sc-build `cargo build --locked`; #166/#220.
+2. [x] Issues for doc promises with no owner (#222, #223); CHANGELOG; commit, push; sc-build `cargo build --locked`; #166/#220.
 
 ### Done: #217 (P0), Job pods exit 0 but never reach Succeeded (Dell 11.99)
 
@@ -393,7 +394,7 @@ upstream split cadvisor into a kubelet library: node/fs/machine there, container
 Resume: lock, merge the branch to main, sc-build, live check (/stats/summary, /metrics/cadvisor on a node), close.
 Not here: PSI, imagefs (images are stormblock volumes on stormcos).
 
-### Paused (P0 #104 first): #60 (P2), each PV's storage placement: volume, drives, shelf/bay, RAID partners
+### Done (closed): #60 (P2), each PV's storage placement: volume, drives, shelf/bay, RAID partners
 
 2026-10-08. Both sources exist: stormblock `GET /api/v1/volumes?placement=true` (`placement.drives[]` serial/wwn,
 `legs` policy/health/missing, `rebuild`, `arrays[].members[]` state/drive/node = RAID partners; stormblock#136) and
@@ -637,7 +638,7 @@ stormcert#14) instead of serving the old one until the kubelet restarts.
        old one stays. Test; docs (configuration.md), CHANGELOG; sc-build (stormcentral#536).
        Done: dd3df0b (1 test). NOT yet built: the SC_BUILD_VM job was cancelled while queued. Rerun, close.
 
-### Waiting on the owner: #104 (P2), private writable container roots
+### Superseded (owner answered A, done above): #104 (P2), private writable container roots
 
 2026-10-08. stormpump's rule ("one storage primitive … no overlay, no tmpfs layering", spec.rs) makes a private
 root a CoW clone per container (clone the golden, attach, PID 1 mount as root, delete on removal/restart), the path
@@ -771,7 +772,11 @@ The lock pins stormpump 30a76d3, stormvm dc1b7ea, stormcast 801f822; all three m
        byte-sized emptyDisk). sc-build 4545e23: 364 kubelet unit pass. Golden golden-rustkube-node-a97563b0a5c7
        (stormcos#366). #81 closed, #164 shipped. #52's step 6 is done; its end-to-end with a real driver stays.
 
-### Waiting on stormpump#103: #56 (P1), exec, attach and portForward on :10250
+### Unblocked, next: #56 (P1), exec, attach and portForward on :10250
+
+2026-10-09 (#220): stormpump#103 is done from its side (golden-stormpump-a2523c9c9406, stormcos#309) and the lock
+pins stormpump 13cf2c9, which carries the exec/attach op. Next: item 5 below (exec, exec_sync for probes, attach,
+the channel protocols). Exec probes fail on every stormpump pod until then.
 
 2026-10-08. rustkube's apiserver splices the upgrade transparently (streaming.rs: headers and bytes as they are,
 query translated to `input/output/error/tty/command`, `port=`), so the kubelet speaks SPDY/3.1 itself, and
@@ -810,7 +815,10 @@ stormpump's Spec has `uid`/`gid` and the engine drops to them (exec.rs). Found: 
        kubelet unit pass. Golden golden-rustkube-node-04134493c42a (stormcos#366). Follow-ups #171 (fsGroup), #172
        (image Volumes, after stormblock-registry#58). Closed. Not run on a node.
 
-### Waiting on stormpump#107 (claim target; golden 6894f5af0f45 built): #95 (P1), pod/claim start toward ≤2 s / ≤1 s: the claim's own steps timed
+### Unblocked, next: #95 (P1), pod/claim start toward ≤2 s / ≤1 s: the claim's own steps timed
+
+2026-10-09 (#220): stormpump#107 is closed (a warm claim's ext4 mount is 5.4 ms on 11.95). Next: the kubelet's own
+warm-probe measurement of claims on a node; what is left beyond that is stormblock#327 (clone) and rustkube#147.
 
 2026-10-08. Done elsewhere: phases on the pod (#132), `sandbox` split (#139); the traced causes (2 s pass, serial
 starts, unbounded CNI, inline events, per-pass PUTs) by #99/#100/#101/#134/#138. Still undone from item 1: "the same
@@ -936,7 +944,17 @@ every suite needs to resolve STORM_NODE). Pods are pinned with `spec.nodeName` (
        stormcentral#521; fff1f4d9d9 reached `running` but its log was lost with the Dell's apiserver.
        #521 closed early; #61 and #97 proposed after stormcentral#526 (test-image builds still go to dev).
 
-### Waiting on stormpump#47: #118 (P2), pod capabilities onto the ring
+### Unblocked, next: #171 (P2), fsGroup / supplementalGroups onto the engine
+
+2026-10-09 (#220): a claim is root's, so a non-root container cannot write it (#98 follow-up). The lock's stormpump
+13cf2c9 carries `Spec.groups`. Next: supplementalGroups + fsGroup into `Spec.groups` in `spec_for`; fsGroup's
+ownership change of a claim's filesystem at mount (upstream's recursive chown/chmod, `fsGroupChangePolicy`
+OnRootMismatch); tests; docs (README "Not yet"); CHANGELOG; sc-build; golden.
+
+### Unblocked, next: #118 (P2), pod capabilities onto the ring
+
+2026-10-09 (#220): the lock's stormpump 13cf2c9 carries `Spec.caps` (stormpump golden accd1a3e8e61), and the stormvm#65
+lock blocker is gone. Next: item 2 below (map add/drop/privileged into `Spec.caps` in `spec_for`, test CapEff).
 
 2026-10-06. stormpump main (819b55d) has no capability field in `Spec`; #47 (open) is the engine side (owner on
 stormpump#59: pods get the runtime's 14 + their `add`, boot.d services the full set). The lock's stormpump

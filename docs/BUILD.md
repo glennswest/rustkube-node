@@ -1,6 +1,6 @@
 # Build, test and ship
 
-Audited against main fecb331 on 2026-10-02. Workspace version: 0.13.0;
+Audited against main 06b91b5 on 2026-10-09. Workspace version: 0.13.0;
 subsequent changes are unreleased, not proof of an installed node version.
 
 ## Build from a pushed commit
@@ -12,9 +12,10 @@ git push
 sc-build 'cargo build --locked && cargo test --locked'
 ```
 
-`sc-build` fetches the pushed commit onto dev.g8.lo as the unprivileged build
-user, builds in an isolated volume and deletes it on success or failure.
-There is no persistent checkout on dev to use. Never build on the session VM
+`sc-build` fetches the pushed commit onto the build box as an unprivileged build
+user, builds on a drive of its own (checkout, target, `TMPDIR`, `HOME`) and
+deletes it on success or failure; nothing is kept between jobs. Recent builds
+here ran on a build VM (`SC_BUILD_VM=1 sc-build …`). A job over an hour is killed. Never build on the session VM
 or use root to work around a build-host problem. Builds queue for a slot;
 allow the existing build to finish instead of starting duplicates.
 

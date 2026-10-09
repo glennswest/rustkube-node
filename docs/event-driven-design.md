@@ -176,7 +176,7 @@ not enqueue runtime work. Recovery seeding retains all observed holders and
 never downgrades an exclusive reservation. Both adapters are wired.
 
 Adapter checkpoint (#100): Pod and VMI producers publish snapshots to one
-eight-worker executor. UID work owns name/claim reservations until confirmed
+executor (eight workers then; `--pod-workers` since #138). UID work owns name/claim reservations until confirmed
 cleanup; shared filesystem users serialize claim mutations without serializing
 unrelated claims. Recovery seeds names before admission and waits for complete
 Pod/VMI views plus known claim ownership before admitting API workloads. Static
@@ -211,8 +211,9 @@ on refused release and startup retains partially registered volume handles.
 
 VM partial-start unwind (#100, on main after #114): [stormpump#63](https://github.com/glennswest/stormpump/issues/63)
 added `DEPOSIT_WITHDRAW` (op 9), which closes a deposit no spawn consumed and
-acknowledges it in the completion. The kubelet sends it by number: the locked
-stormpump-abi predates the variant, and the lock cannot move until stormvm#65.
+acknowledges it in the completion. The kubelet sends it by number
+(`stormpump_ring::OP_DEPOSIT_WITHDRAW`): the stormpump-abi locked when this was
+written predated the variant.
 
 - **Ledger.** Per UID, outside the start's future: each `tap-<nic>` deposit is
   noted *before* it is sent, each volume/spec handle as the engine returns it,
@@ -262,7 +263,7 @@ fixed schedule left.
 
 | Work | Was | Now |
 |---|---|---|
-| Live Pod | every `sync_interval` (2 s) | stormpump exits (or a CRI runtime's `GetContainerEvents`, #116), volume/image/API events; deadlines: each probe's `periodSeconds` from `initialDelaySeconds` (a probe not due keeps its last result), CrashLoopBackOff end, waiting-start retry (¼ of the wait, 1–10 s), init-container limit |
+| Live Pod | every `sync_interval` (2 s) | stormpump exits (or a CRI runtime's `GetContainerEvents`, #116), volume/image/API events; deadlines: each probe's `periodSeconds` from `initialDelaySeconds` (a probe not due keeps its last result), CrashLoopBackOff end, waiting-start retry (¼ of the wait, 1–10 s), `activeDeadlineSeconds` during init (no fixed init limit since #126) |
 | Live VMI | every `sync_interval` | ring exits, API/volume events; deadlines: start backoff, waiting retry (1–30 s), guest-agent poll (2 s while booting → 30 s; 10 s handle-less). The agent has no push, so its poll is a per-machine probe period |
 | Service mirror | 15 s | inotify on `/run/stormpump`, gated on the parsed table (read at most once a second while PID 1 rewrites it every pass: stormpump#67), plus the mirror pods' watch; writes only what differs |
 | System claims | 30 s | stormblock volume watch + PV/PVC watches |

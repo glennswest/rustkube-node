@@ -2,6 +2,15 @@
 
 ## 2026-10-09
 
+- **docs:** Documentation refreshed from the code at 06b91b5 (`git log --since=2026-10-02`). `docs/status.md`
+  rewritten: changes since October 2, the owner's decisions and their state, and every gap with its issue.
+  configuration.md: the reservation flags, credential waits and serving pair as the code does them (stale lines
+  from before #24/#69/#89 removed), no fixed init limit (#126), env-only keys, the test suites as they are. api.md:
+  the streaming routes back in the route table, outbound stormd API / stormdrive / health ports, `/vmInstance` as
+  stormimds's single source (stormimds#12 decided, #166), `/vmVerb` served. README, metrics.md (own roots since #104,
+  QUERY working set), csi.md, BUILD.md (build drives, build VM), event-driven-design.md, presentation.md and
+  CLAUDE.md (implementation reference; #56, #95, #118 unblocked and #171 added, #220). Filed #222 (a stormpump
+  container's filesystem usage) and #223 (CSI raw block and NodeGetVolumeStats) for promises with no issue.
 - **fix:** A pod status write that meets a 409 Conflict re-reads the pod and writes again on its current revision,
   up to 5 tries a pass, instead of failing the pass (#217). The write is made on a revision the apiserver has moved
   past whenever something else wrote meanwhile, our own start-timing annotation PATCH included; the merge is redone

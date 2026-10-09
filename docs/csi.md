@@ -138,9 +138,10 @@ does the mount, in whatever namespace it runs in.
 
 ## Not yet
 
-- End-to-end verification with a real driver (csi-driver-host-path): waits
-  on #81 and stormvm#65, tracked in #52.
+- End-to-end verification with a real driver (csi-driver-host-path): #81
+  is done; the driver's images cannot yet be made goldens on a node
+  (stormblock-registry#99), tracked in #52.
 - Generic ephemeral volumes: the kubelet resolves them to the claim
   `<pod>-<volume>` and waits for it. rustkube has no controller that creates
   that claim (rustkube#94).
-- Raw block volumes, NodeGetVolumeStats.
+- Raw block volumes, NodeGetVolumeStats (#223).
