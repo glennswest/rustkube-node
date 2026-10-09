@@ -277,7 +277,8 @@ pub fn representative(asset: &str, procs: &[Process]) -> Option<Process> {
     let base = long
         .iter()
         .find(|p| p.name == asset)
-        .or_else(|| long.iter().max_by_key(|p| badness(&p.state)))
+        // The worst; of equals, the first in stormd's (config) order.
+        .or_else(|| long.iter().min_by_key(|p| std::cmp::Reverse(badness(&p.state))))
         .copied()?;
     let unready: Vec<&str> = long.iter().filter(|p| !p.ready).map(|p| p.name.as_str()).collect();
     let reason = match failed {
