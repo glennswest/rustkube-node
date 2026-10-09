@@ -404,7 +404,15 @@ capacity = new, both conditions removed, allocatedResourceStatuses dropped.
 2. [x] Tests (2), csi.md, status.md, CHANGELOG (1af5ece). sc-build job 8d5ba26c64: 415 kubelet unit pass. Stage golden
        golden-rustkube-node-0ee0277c7dba (stormcos#366). Closed. Live with #52's driver (stormblock-registry#99).
 
-### Paused (P0 #104 first): #21 (P2), cadvisor's library for node / machine / filesystem stats and eviction signals
+### Done: #21 (P2), cadvisor's library for node / machine / filesystem stats and eviction signals
+
+2026-10-09. Resumed the branch rebased (wip/21-rebased): cadvisor pinned by full rev afb46a0e…, lock from a build
+VM (cadvisor-host/model, inotify), #230 (a test's HELP line), and a guard: the root cgroup's CPU is read only
+outside a cgroup namespace (`/proc/self/cgroup` path not `/`). Docs (metrics.md, api.md, README), CHANGELOG.
+SC_BUILD_VM sc-build cb8ff94 (rebased on main): 486 kubelet unit pass; fast-forwarded to main. Golden, close. Live:
+`/stats/summary` node cpu/memory and `/metrics/cadvisor` machine_* on a node after the release.
+
+### (history) Paused (P0 #104 first): #21 (P2), cadvisor's library for node / machine / filesystem stats and eviction signals
 
 2026-10-08. Work is on branch `wip/21-cadvisor-node` (5f81dec), reverted on main (290938e) so main keeps building:
 the dependency needs Cargo.lock entries made on the build box. Scoping answered on the issue (owner: glennswest/cadvisor;
