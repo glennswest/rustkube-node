@@ -351,11 +351,16 @@ become Events on the mirror pod (`involvedObject.fieldPath` the container, named
 `count`/`lastTimestamp` bumps patch the same Event, and a kubelet restart re-reading from 0 doubles nothing). A
 stormd whose `[api]` asks for TLS or a credential (stormd#32) is not read (said once): its mirror keeps PID 1's view
 below. **Without stormd's answer, ready means it answers** (#96): for a
-host-network service the kubelet reads the liveness URL its golden's stormd config declares
-(`[process.liveness] type = "http"`, `url = …`; the golden is the boot unit's `root` volume, under `/hostroot`)
-and asks it every 10 s (2 s timeout). Three failures in a row make the pod Running but not ready: container
+host-network service the kubelet runs the probe its golden's stormd config declares (the golden is the boot
+unit's `root` volume, under `/hostroot`; #219): from the `[[process]]` named as the service first, the first of
+`[process.readiness_probe]`, `[process.liveness_probe]` (stormd#48's Kubernetes fields: `http_get = {path, port,
+host, scheme, http_headers}` is a GET, 200–399 an answer, no redirects, any certificate; `tcp_socket = {port}` a
+connect) and the retired `[process.liveness] type = "http"`, `url = …`, on the probe's own `period_seconds`,
+`timeout_seconds`, `failure_threshold` and `success_threshold` (stormd's defaults 10 s, 1 s, 3, 1; the old table
+10 s, 2 s, 3). `failure_threshold` failures in a row make the pod Running but not ready: container
 `ready: false`, `Ready`/`ContainersReady` False, reason `Unhealthy` with the failure, and an `Unhealthy` Warning
-Event; one answer makes it ready again. A service with no declared HTTP liveness, or not on the host network,
+Event; `success_threshold` answers make it ready again. An `exec` or `grpc` probe is not run from the kubelet
+(said once in its log). A service with no probe the kubelet can run, or not on the host network,
 is Ready while running, as before. **A service that has exited says how** (#82): PID 1 keeps each asset's last
 exit in assets.json (`last_exit_code` or `last_exit_signal`, `last_exit`, the last 20 lines of `last_output`;
 stormpump#51), and the mirror's container carries it as `lastState.terminated` (`exitCode`, 128 + the signal

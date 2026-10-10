@@ -706,7 +706,7 @@ mod tests {
     #[test]
     fn a_running_service_that_does_not_answer_is_not_ready() {
         let a = Asset { name: "stormstorage".into(), running: true, restarts: 0, age_secs: 60, ..Default::default() };
-        let down = crate::node_health::ServiceHealth { ready: false, failures: 3, reason: "http://127.0.0.1:9093/api/v1/health: connection refused".into() };
+        let down = crate::node_health::ServiceHealth { ready: false, failures: 3, reason: "http://127.0.0.1:9093/api/v1/health: connection refused".into(), ..Default::default() };
         let p = mirror_pod_with(&a, "n1", "u", "2026-10-08T00:00:00Z", Some(&down));
         assert_eq!(p["status"]["phase"], "Running");
         assert_eq!(p["status"]["containerStatuses"][0]["ready"], false);

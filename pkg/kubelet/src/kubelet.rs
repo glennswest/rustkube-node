@@ -1834,7 +1834,7 @@ impl Kubelet {
             let (api, url, node) = (self.api_client.clone(), self.config.api_server_url.clone(), self.config.node_name.clone());
             tokio::spawn(stormd_poll(stormd, worker, api, url, node));
         }
-        // Each running service's own health endpoint, on its own clock (#96):
+        // Each running service's own probe, on its own period (#96, #219):
         // a flip in readiness is a mirror pass. Only for a service whose
         // stormd does not answer: one that does reports its readiness itself.
         {
@@ -1842,10 +1842,19 @@ impl Kubelet {
             let health = self.service_health.clone();
             let stormd = stormd.clone();
             tokio::spawn(async move {
-                let probes = reqwest::Client::new();
+                let probes = crate::node_health::client();
+                let mut table = std::collections::HashMap::new();
+                let mut read_at: Option<std::time::Instant> = None;
+                // When each service is next asked, on its probe's own period.
+                let mut due: std::collections::HashMap<String, std::time::Instant> = std::collections::HashMap::new();
+                // Services whose probe the kubelet cannot run, said once (#219).
+                let mut said: std::collections::HashSet<String> = std::collections::HashSet::new();
                 loop {
-                    tokio::time::sleep(crate::node_health::PERIOD).await;
-                    let urls = crate::node_health::health_urls(std::path::Path::new(crate::node_logs::HOST_ROOT));
+                    tokio::time::sleep(crate::node_health::TICK).await;
+                    if !read_at.is_some_and(|t| t.elapsed() < crate::node_health::PERIOD) {
+                        table = crate::node_health::health_probes(std::path::Path::new(crate::node_logs::HOST_ROOT));
+                        read_at = Some(std::time::Instant::now());
+                    }
                     let text = std::fs::read_to_string(format!("{RUN_DIR}/assets.json")).unwrap_or_default();
                     let running: Vec<String> = crate::mirror::parse_assets(&text)
                         .into_iter()
@@ -1858,19 +1867,35 @@ impl Kubelet {
                         if answered.contains(name) {
                             continue;
                         }
-                        let Some(url) = urls.get(name) else { continue };
-                        let result = crate::node_health::probe(&probes, url).await;
+                        let p = match table.get(name) {
+                            Some(crate::node_health::Probing::Probe(p)) => p,
+                            Some(crate::node_health::Probing::Unprobed(why)) => {
+                                if said.insert(name.clone()) {
+                                    warn!("node service {name}: no probe the kubelet can run ({why}); its mirror pod is ready while its process runs");
+                                }
+                                continue;
+                            }
+                            None => continue,
+                        };
+                        let now = std::time::Instant::now();
+                        if due.get(name).is_some_and(|t| now < *t) {
+                            continue;
+                        }
+                        due.insert(name.clone(), now + p.period);
+                        let result = crate::node_health::probe(&probes, &p.check, p.timeout).await;
                         let mut map = health.lock().unwrap_or_else(|e| e.into_inner());
                         let h = map.entry(name.clone()).or_insert(crate::node_health::ServiceHealth { ready: true, ..Default::default() });
-                        if crate::node_health::observe(h, result) {
+                        if crate::node_health::observe(h, result, p) {
                             if h.ready {
-                                info!("node service {name}: its health endpoint answers again");
+                                info!("node service {name}: its {} probe answers again", p.from);
                             } else {
-                                warn!("node service {name}: not ready: {}", h.reason);
+                                warn!("node service {name}: not ready ({} probe): {}", p.from, h.reason);
                             }
                             flipped = true;
                         }
                     }
+                    due.retain(|n, _| running.contains(n));
+                    said.retain(|n| running.contains(n));
                     // A stopped or unlisted service starts again from ready.
                     health.lock().unwrap_or_else(|e| e.into_inner()).retain(|n, _| running.contains(n));
                     if flipped {

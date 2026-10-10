@@ -2,6 +2,12 @@
 
 ## 2026-10-10
 
+- **fix:** A node service's mirror-pod readiness fallback (#96, used when its stormd does not answer) runs the
+  golden's stormd probes, not only the retired `[process.liveness]` (#219): `[process.readiness_probe]`, then
+  `[process.liveness_probe]`, then the old table, from the process named as the service first; `http_get` (200–399,
+  no redirects, any certificate) or `tcp_socket` (a connect), on the probe's own period, timeout and failure/success
+  thresholds. `exec`/`grpc` are not run from the kubelet (said once). A golden on the new tables had no check at all.
+  stormd configs are read as TOML (`toml` 0.8, already in the lock through stormvm-spec).
 - **fix:** A reboot shows on the Node and on the pods it kept (#239, pvetest2 keep-data reinstall): the first status
   write that finds another `bootID` on the Node says Ready=False (`KubeletNotReady`) and records a Warning `Rebooted`
   Event, and the next says Ready, so the condition's transition is this boot's (it stayed at the previous boot's). A
