@@ -323,25 +323,27 @@ may take the log with the container. Done in code: `RuntimeService::logs_survive
 completed init kept in `PodManager::kept_inits` until `stop_pod` where removal would lose the log. Tests (1 changed,
 1 new). sc-build 90c291c0ec: 419 pass (after #196's test updates). Golden e3415aaa02e2. Closed.
 
-### In progress: #157 (P3), VM disks on stormblock-csi claims: snapshot by VolumeSnapshot, restore from any leg
+### Waiting on stormblock-csi#51 (+ stormcentral#362 for the golden): #157 (P3), VM disks on stormblock-csi claims: snapshot by VolumeSnapshot, restore from any leg
 
 2026-10-10. stormstorage#49 closed (snapshots, one-node group snapshots, `source` clones); stormblock-csi still has
 `snapshots: false` for its stormstorage backend and no csi-snapshotter: filed stormblock-csi#51. stormcos#170 ships the
 VolumeSnapshot CRDs (external-snapshotter v8.6.0) + snapshot-controller. A RAID twin exists only for a VM disk on a
 stormblock-csi claim (owner on #68), so the kubelet's half is KubeVirt's way, driver-agnostic:
-A. [ ] A VM disk on another driver's claim: the PV must be `volumeMode: Block` (no disk.img on a Filesystem claim);
+A. [x] A VM disk on another driver's claim: the PV must be `volumeMode: Block` (no disk.img on a Filesystem claim);
        stage + publish as a raw block (`VolumeCapability.block`), recorded under `vm-<uid>` (not a pod uid, so the
        pod sweep leaves it; the VM manager tears it down at stop / failed start, and sweeps records with no machine).
        The published path is the disk's device; no volume id (the claim is not the VM's).
-B. [ ] Snapshot: freeze → pause (stormvm_control::snapshot::take with the kubelet's closure) → stormblock group of the
+B. [x] Snapshot: freeze → pause (stormvm_control::snapshot::take with the kubelet's closure) → stormblock group of the
        built-in volumes (if any) + one VolumeSnapshot per CSI-claim disk (`vmsnapshot-<snap uid>-volume-<disk>`, the
        driver's default class), waited to `creationTime` → unpause → thaw. Recorded `storm.io/snapshot-volumesnapshots`
        (disk → VolumeSnapshot + the claim's class, modes, size).
-C. [ ] Restore: those disks become claims with `dataSource: VolumeSnapshot` (class/modes/volumeMode as snapshotted,
+C. [x] Restore: those disks become claims with `dataSource: VolumeSnapshot` (class/modes/volumeMode as snapshotted,
        size ≥ restoreSize), no node pinning: the driver serves them from whichever leg holds them. A restore whose
        disks are all CSI is not the snapshot's node's: any node may claim it (rv-guarded).
-D. [ ] Tests, docs, CHANGELOG; sc-build; golden. Live after stormblock-csi#51 + a release: snapshot a VM on a
-       stormblock-csi claim, lose the head, restore.
+D. [ ] Tests (5 new), README, csi.md, status.md, CHANGELOG (0b942e8, c9e168f; #243 = test callers, fixed 52dfe91).
+       SC_BUILD_VM sc-build 52dfe91: 506 kubelet unit, all suites pass. Stage golden NOT built: three tries in a row hit
+       stormcentral#362 (no stormd in the stormd input; commented). Resume: `component stage rustkube-node`, then after
+       stormblock-csi#51 + a release: snapshot a VM on a stormblock-csi claim, lose the head, restore; close.
 
 ### Done: #181 item 3 (stormpump#144: /run/stormpump/shutdown)
 
