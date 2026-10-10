@@ -404,7 +404,7 @@ capacity = new, both conditions removed, allocatedResourceStatuses dropped.
 2. [x] Tests (2), csi.md, status.md, CHANGELOG (1af5ece). sc-build job 8d5ba26c64: 415 kubelet unit pass. Stage golden
        golden-rustkube-node-0ee0277c7dba (stormcos#366). Closed. Live with #52's driver (stormblock-registry#99).
 
-### In progress: #239 (P1), after a keep-data reboot: kept pods' status, node Ready, new pods > 5 min
+### Done: #239 (P1), after a keep-data reboot: kept pods' status, node Ready, new pods > 5 min
 
 2026-10-10. pvetest2 (storm-003102, 12.13-flowsdn) log store (:9094 on 192.168.31.173, `host=`, `search=`):
 - **5 min**: every CNI ADD 14:33–14:58+ failed in flowsdn's agent, `HTTP 500 No space left on device (os error 28)`;
@@ -414,10 +414,12 @@ capacity = new, both conditions removed, allocatedResourceStatuses dropped.
   went via 'flowsdn' (00-flowsdn.conflist, the only config there).
 - **Kept pods**: restarted (new containers, CNI ADD) but `startTime` kept (`source.startTime`), and start timing's
   `scheduled` measured from the old bind (5346327ms). Node Ready always True, so its transition never moved.
-1. [ ] Node: the Node's `nodeInfo.bootID` ≠ this boot's → that write Ready=False (KubeletNotReady, why), Warning
+1. [x] Node: the Node's `nodeInfo.bootID` ≠ this boot's → that write Ready=False (KubeletNotReady, why), Warning
        `Rebooted` Event (upstream's); the next update Ready again (fresh transition). Test (stub apiserver).
-2. [ ] Pods: `startTime` before this boot → now; start timing: no `scheduled` for a pod bound before this boot. Tests.
-3. [ ] File flowsdn (ENOSPC); docs, CHANGELOG; sc-build; golden; close.
+2. [x] Pods: `startTime` before this boot → now; start timing: no `scheduled` for a pod bound before this boot. Tests.
+3. [x] flowsdn#374 filed (ENOSPC); docs (README, configuration.md), CHANGELOG (8983f14, d2eac0c). SC_BUILD_VM sc-build
+       d2eac0c: 491 kubelet unit + node_reregister 4 pass (4 new tests). Stage golden golden-rustkube-node-8b9c15f19053
+       (stormcos#424). Closed. Live: the next keep-data reboot (Node Ready transition + Rebooted Event, kept pods' startTime).
 
 ### Done: #236, host_nqn on sbregistry clone requests (stormblock-registry#102, stormblock#212)
 
