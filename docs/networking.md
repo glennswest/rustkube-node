@@ -95,7 +95,9 @@ does what Multus does in front of a CRI runtime:
   (`--cni-bin-dir`, `/opt/cni/bin`).
 
 Not here: a CRI runtime (`--runtime cri`) runs its own CNI and gets no attachments from the kubelet;
-VMs' `networks: - multus:` is the VM manager's (#88 path) and not part of #233. A sandbox adopted
+VMs' `networks: - multus:` is the VM manager's (#88 path, stormvm#85, #241): the same NADs, ADDed into
+the VMI's own sandbox on `net1`, `net2`, … (or `eth0` for `default: true`), recorded for DEL across a
+restart, and bridged to the guest by stormvm (README, "Multus networks on a VM"). A sandbox adopted
 after a kubelet restart DELs only its default network at teardown (its attachments were not recorded
 across the restart).
 

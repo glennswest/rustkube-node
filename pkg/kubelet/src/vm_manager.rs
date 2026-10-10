@@ -190,6 +190,30 @@ fn registered_disks(disks: &[ResolvedDisk], owned: &[String]) -> Vec<stormvm_nod
 
 /// A machine as its registration describes it: what a kubelet that did not
 /// start it (this one, before a restart) knows about it.
+/// CNI DEL of a VMI's networks (#88, stormvm#85): the multus NADs last-first,
+/// then the default (the NAD that replaced it, or the cluster's). A recorded
+/// config that does not parse was never ADDed: skipped.
+async fn del_networks(invoker: &cni::CniInvoker, net: &crate::vm_network::PodNet) -> Result<(), String> {
+    let pod = net.cni_pod();
+    for a in net.attachments.iter().rev() {
+        match a.config() {
+            Ok(c) => invoker
+                .del_network(&c, &pod.clone().on_interface(&a.ifname))
+                .await
+                .map_err(|e| format!("network {} ({}): {e}", a.name, a.ifname))?,
+            Err(e) => warn!(vm = %net.name, "not deleted: {e}"),
+        }
+    }
+    match net.default_network.as_ref().map(|d| (d, d.config())) {
+        Some((d, Ok(c))) => invoker.del_network(&c, &pod).await.map_err(|e| format!("network {} ({}): {e}", d.name, d.ifname)),
+        Some((_, Err(e))) => {
+            warn!(vm = %net.name, "not deleted: {e}");
+            Ok(())
+        }
+        None => invoker.del(&pod).await.map_err(|e| e.to_string()),
+    }
+}
+
 fn vm_of(reg: &stormvm_node::console::Registration) -> Vm {
     let disks = reg
         .disks
@@ -2699,7 +2723,9 @@ impl VmManager {
             // bridge NIC is made in the node's namespace whatever else the
             // machine has.
             let sandbox = match p.attach {
-                stormvm_net::Attach::Pod(_) => pod.map(|n| n.netns.as_str()),
+                // A multus NIC (stormvm#85): its NAD's interface was ADDed
+                // into the same sandbox.
+                stormvm_net::Attach::Pod(_) | stormvm_net::Attach::Multus { .. } => pod.map(|n| n.netns.as_str()),
                 stormvm_net::Attach::Bridge(_) => None,
             };
             let made = stormvm_net::realise(p, sandbox, RUN_ROOT)?;
@@ -2727,25 +2753,41 @@ impl VmManager {
             // DHCPs in its first second would otherwise do it unwatched. A
             // watcher that cannot open is a warning: the machine still runs,
             // and the agent and the neighbour table still answer.
-            if made.binding == "host-bridge" {
+            // A multus NIC whose NAD has no IPAM is the same (stormvm#85): its
+            // guest asks the VLAN's own DHCP, seen on the tap in the sandbox.
+            let watch = match (made.binding, &made.address, sandbox) {
+                ("host-bridge", _, _) => Some(None),
+                ("multus", None, Some(ns)) => Some(Some(ns)),
+                _ => None,
+            };
+            if let Some(inside) = watch {
                 let (tx, id, i) = (self.snoop_tx.clone(), uid.to_string(), reports.len());
                 let seen = move |addresses: Vec<String>| {
                     let _ = tx.send(Snooped { uid: id.clone(), nic: i, addresses });
                 };
-                match stormvm_net::snoop_tap(&p.tap, &mac, seen) {
+                let snooper = match inside {
+                    Some(ns) => stormvm_net::snoop_tap_in(ns, &p.tap, &mac, seen),
+                    None => stormvm_net::snoop_tap(&p.tap, &mac, seen),
+                };
+                match snooper {
                     Ok(s) => snoopers.0.push((i, s)),
                     Err(e) => warn!(vm = %vm.name, nic = %p.nic, "cannot watch {} for the guest's address: {e}", p.tap),
                 }
             }
             // The guest's DHCP (#88): it is told the pod's address, and
-            // nothing else answers it in the sandbox.
+            // nothing else answers it in the sandbox. A multus NIC whose NAD's
+            // IPAM gave an address (stormvm#85) is told it on its own bridge,
+            // with no router (stormvm's lease has gateway 0.0.0.0), DNS or
+            // name: the pod network keeps the default route and resolver.
             if let (Some(addr), Some(ns)) = (&made.address, sandbox) {
-                let (dns, search) = self.cluster_dns(namespace);
-                let host = vm.hostname.clone().filter(|h| !h.is_empty()).unwrap_or_else(|| vm.name.clone());
-                let lease = addr.lease(dns, search, Some(host))?;
-                leases.push(crate::vm_network::LeaseRecord::of(reports.len(), &mac, &lease));
+                let secondary = made.binding == "multus";
+                let (dns, search) = if secondary { (Vec::new(), Vec::new()) } else { self.cluster_dns(namespace) };
+                let host = (!secondary).then(|| vm.hostname.clone().filter(|h| !h.is_empty()).unwrap_or_else(|| vm.name.clone()));
+                let lease = addr.lease(dns, search, host)?;
+                let bridge = made.bridge.clone().unwrap_or_else(|| stormvm_net::SANDBOX_BRIDGE.to_string());
+                leases.push(crate::vm_network::LeaseRecord::of(reports.len(), &mac, &lease, Some(&bridge)));
                 let ns = ns.to_string();
-                let r = tokio::task::spawn_blocking(move || stormvm_net::serve_dhcp(&ns, lease))
+                let r = tokio::task::spawn_blocking(move || stormvm_net::serve_dhcp_on(&ns, &bridge, lease))
                     .await
                     .map_err(|e| format!("dhcp task: {e}"))?
                     .map_err(|e| format!("interface {}: DHCP for the guest: {e}", p.nic))?;
@@ -2762,6 +2804,8 @@ impl VmManager {
                 // enough to have one.
                 addresses: match (pod, crate::vm_network::on_pod_network(made.binding)) {
                     (Some(n), true) if !n.ip.is_empty() => vec![n.ip.clone()],
+                    // A multus NIC's own address, when its NAD's IPAM gave one.
+                    _ if made.binding == "multus" => made.address.iter().map(|a| a.ip.to_string()).collect(),
                     _ => vec![],
                 },
             });
@@ -2815,6 +2859,23 @@ impl VmManager {
         let Ok(mut pod) = r.json::<Value>().await else { return };
         if pod["metadata"]["uid"].as_str() != Some(net.pod_uid.as_str()) {
             return; // another Pod of the name: not this machine's
+        }
+        // Its networks, the way Multus annotates a pod (stormvm#85): one
+        // entry per network, the default first.
+        if let Some(ns_status) = &net.network_status {
+            let text = ns_status.to_string();
+            if pod["metadata"]["annotations"][crate::network_status::ANNOTATION].as_str() != Some(text.as_str()) {
+                let body = json!({ "metadata": { "annotations": { crate::network_status::ANNOTATION: text } } });
+                match self.api.patch(&path).header("content-type", "application/merge-patch+json").json(&body).send_retrying(retry::Policy::API).await {
+                    Ok(r) if r.status().is_success() => {
+                        if let Ok(p) = r.json::<Value>().await {
+                            pod = p;
+                        }
+                    }
+                    Ok(r) => warn!(pod = %net.pod_name, "launcher Pod network-status not written: {}", r.status()),
+                    Err(e) => warn!(pod = %net.pod_name, "launcher Pod network-status not written: {e}"),
+                }
+            }
         }
         let status = crate::vm_network::launcher_status(&pod["status"], &net.ip, phase, &now_rfc3339());
         if status == pod["status"] {
@@ -2879,6 +2940,12 @@ impl VmManager {
                 Err(e) => return Err(StartFail::Waiting(format!("waiting for the VMI's launcher Pod: {e}"))),
             }
         };
+        // Its multus networks (stormvm#85), resolved before anything is made:
+        // a NAD that is not there yet is a wait, as for a pod.
+        let (default_network, attachments) = self
+            .vm_networks(namespace, &plans)
+            .await
+            .map_err(|e| StartFail::Waiting(format!("waiting for the VM's networks (NetworkNotReady): {e}")))?;
         let Some(r) = self.ring.clone() else {
             return Err(StartFail::Failed("no ring to stormpump: only the engine gives a VM a sandbox".into()));
         };
@@ -2896,6 +2963,9 @@ impl VmManager {
             leases: vec![],
             pod_name,
             pod_uid,
+            default_network,
+            attachments,
+            network_status: None,
         };
         // Recorded before the CNI is asked: a start interrupted here is still
         // found and undone.
@@ -2907,14 +2977,9 @@ impl VmManager {
             self.release_pod_network(uid).await;
             return Err(StartFail::Failed("stormpump gave the VM a sandbox with no holder".into()));
         }
-        match invoker.add(&net.cni_pod()).await {
-            Ok(result) => {
-                net.ip = result
-                    .ips
-                    .first()
-                    .map(|i| i.address.split('/').next().unwrap_or("").to_string())
-                    .unwrap_or_default();
-                info!(vm = %vm.name, ip = %net.ip, "CNI attached the VM's pod network");
+        match self.add_networks(invoker, &mut net).await {
+            Ok(()) => {
+                info!(vm = %vm.name, ip = %net.ip, multus = net.attachments.len(), "CNI attached the VM's pod network");
                 let _ = self.net_store.save(&net);
                 self.pod_nets.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), net.clone());
                 Ok(Some(net))
@@ -2929,6 +2994,81 @@ impl VmManager {
         }
     }
 
+    /// A VMI's multus networks (stormvm#85), each resolved against its
+    /// NetworkAttachmentDefinition: the one replacing the pod network, and
+    /// the secondary ones in order. `Err` names the NAD that is missing,
+    /// empty or unreadable.
+    async fn vm_networks(
+        &self,
+        namespace: &str,
+        plans: &[stormvm_net::NicPlan],
+    ) -> Result<(Option<crate::vm_network::Attachment>, Vec<crate::vm_network::Attachment>), String> {
+        let (default, secondary) = crate::vm_network::multus_networks(plans);
+        let default = match default {
+            Some((network, ifname)) => Some(self.nad_attachment(namespace, &network, &ifname).await?),
+            None => None,
+        };
+        let mut out = Vec::with_capacity(secondary.len());
+        for (network, ifname) in secondary {
+            out.push(self.nad_attachment(namespace, &network, &ifname).await?);
+        }
+        Ok((default, out))
+    }
+
+    /// One NAD (`name`, the VMI's namespace, or `namespace/name`), read now.
+    async fn nad_attachment(&self, namespace: &str, network: &str, ifname: &str) -> Result<crate::vm_network::Attachment, String> {
+        let sel = crate::multus::parse(network)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("{network:?}: not a network name"))?;
+        let ns = sel.namespace.clone().unwrap_or_else(|| namespace.to_string());
+        let what = format!("NetworkAttachmentDefinition {ns}/{}", sel.name);
+        if self.api_url.is_empty() {
+            return Err(format!("{what}: no apiserver to read it from"));
+        }
+        let url = format!("{}{}", self.api_url, crate::multus::nad_path(&ns, &sel.name));
+        let r = self.api.get(&url).send_retrying(retry::Policy::API).await.map_err(|e| format!("reading {what}: {e}"))?;
+        let nad = match r.status().as_u16() {
+            404 => None,
+            s if (200..300).contains(&s) => Some(r.json::<Value>().await.map_err(|e| format!("reading {what}: {e}"))?),
+            s => return Err(format!("reading {what}: HTTP {s}")),
+        };
+        let a = crate::multus::attachment(&sel, namespace, ifname.to_string(), nad.as_ref())?;
+        Ok(crate::vm_network::Attachment { name: a.name, ifname: a.ifname, config: a.config })
+    }
+
+    /// CNI ADD of a VMI's networks into its sandbox (#88, stormvm#85): the
+    /// default (the cluster's, or the NAD replacing it, on `eth0`), then each
+    /// multus NAD on its interface, in order. Sets the pod IP and the
+    /// network-status. `Err` names the network; the caller DELs them all.
+    async fn add_networks(&self, invoker: &cni::CniInvoker, net: &mut crate::vm_network::PodNet) -> Result<(), String> {
+        let pod = net.cni_pod();
+        let result = match &net.default_network {
+            Some(d) => invoker.add_network(&d.config()?, &pod).await.map_err(|e| format!("network {} ({}): {e}", d.name, d.ifname))?,
+            None => invoker.add(&pod).await.map_err(|e| e.to_string())?,
+        };
+        net.ip = result
+            .ips
+            .first()
+            .map(|i| i.address.split('/').next().unwrap_or("").to_string())
+            .unwrap_or_default();
+        let netns = net.netns.clone();
+        let mtu = move |ifname: &str| crate::network_status::mtu_in_netns(&netns, ifname);
+        let mut status = crate::network_status::entries(&result, &mtu);
+        if let Some(d) = &net.default_network {
+            crate::network_status::rename(&mut status, &d.name);
+        }
+        for a in &net.attachments {
+            let r = invoker
+                .add_network(&a.config()?, &pod.clone().on_interface(&a.ifname))
+                .await
+                .map_err(|e| format!("network {} ({}): {e}", a.name, a.ifname))?;
+            crate::network_status::append(&mut status, crate::network_status::attachment_entries(&r, &a.name, &a.ifname, &mtu));
+        }
+        net.network_status = Some(status);
+        Ok(())
+    }
+
     /// Give a VMI's sandbox back (#88): its DHCP responders stop, CNI DEL,
     /// the engine's sandbox released, the record removed. `true` when there
     /// was nothing or it is all done; `false` keeps the record to retry.
@@ -2941,7 +3081,7 @@ impl VmManager {
             return true;
         };
         if let Some(invoker) = &self.cni {
-            if let Err(e) = invoker.del(&net.cni_pod()).await {
+            if let Err(e) = del_networks(invoker, &net).await {
                 warn!(vm = %net.name, "CNI DEL of the VM's pod network failed, retried: {e}");
                 return false;
             }
@@ -2977,8 +3117,11 @@ impl VmManager {
             let mut held = Vec::new();
             for l in &net.leases {
                 let (ns, lease) = (net.netns.clone(), l.lease());
+                // On the bridge it was answered on: a multus NIC's own
+                // (stormvm#85), else the pod network's.
+                let bridge = l.bridge.clone().unwrap_or_else(|| stormvm_net::SANDBOX_BRIDGE.to_string());
                 let served = match lease {
-                    Ok(lease) => tokio::task::spawn_blocking(move || stormvm_net::serve_dhcp(&ns, lease))
+                    Ok(lease) => tokio::task::spawn_blocking(move || stormvm_net::serve_dhcp_on(&ns, &bridge, lease))
                         .await
                         .map_err(|e| e.to_string())
                         .and_then(|r| r),
@@ -4404,6 +4547,179 @@ mod tests {
         assert!(crate::vm_network::Store::at(dir.path()).load_all().is_empty());
     }
 
+    fn multus_vmi(default_nad: bool) -> Value {
+        let first = if default_nad {
+            json!({ "name": "default", "multus": { "networkName": "flat", "default": true } })
+        } else {
+            json!({ "name": "default", "pod": {} })
+        };
+        json!({
+            "kind": "VirtualMachineInstance",
+            "metadata": { "name": "web-1", "namespace": "default", "uid": "u-1" },
+            "spec": {
+                "domain": { "memory": { "guest": "1Gi" }, "devices": { "interfaces": [
+                    { "name": "default", "bridge": {} }, { "name": "v30", "bridge": {} }, { "name": "v40", "bridge": {} }
+                ] } },
+                "networks": [first,
+                    { "name": "v30", "multus": { "networkName": "vlans/v30" } },
+                    { "name": "v40", "multus": { "networkName": "v40" } }]
+            }
+        })
+    }
+
+    fn nad(t: &str) -> Value {
+        json!({ "spec": { "config": format!(r#"{{"cniVersion":"1.0.0","name":"{t}","plugins":[{{"type":"{t}"}}]}}"#) } })
+    }
+
+    /// A fake apiserver serving the launcher Pod and the NADs in `nads`
+    /// (`namespace/name` → object); any other NAD is 404.
+    async fn nad_api(nads: Arc<std::sync::Mutex<HashMap<String, Value>>>) -> String {
+        use axum::response::IntoResponse as _;
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/namespaces/default/pods",
+                axum::routing::get(|| async {
+                    axum::Json(json!({ "items": [{ "metadata": {
+                        "name": "virt-launcher-web-1-abcde", "namespace": "default", "uid": "p-1",
+                        "labels": { "kubevirt.io": "virt-launcher", "kubevirt.io/created-by": "u-1" },
+                        "ownerReferences": [{ "kind": "VirtualMachineInstance", "uid": "u-1", "controller": true }] },
+                        "spec": { "nodeName": "n1" } }] }))
+                }),
+            )
+            .route(
+                "/apis/k8s.cni.cncf.io/v1/namespaces/{ns}/network-attachment-definitions/{name}",
+                axum::routing::get(move |axum::extract::Path((ns, name)): axum::extract::Path<(String, String)>| {
+                    let found = nads.lock().unwrap().get(&format!("{ns}/{name}")).cloned();
+                    async move {
+                        match found {
+                            Some(n) => axum::Json(n).into_response(),
+                            None => axum::http::StatusCode::NOT_FOUND.into_response(),
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+
+    /// stormvm#85: each multus network is its NAD, read from the VMI's
+    /// namespace unless it names one; a missing NAD is a wait naming it, and
+    /// nothing is made or recorded.
+    #[tokio::test]
+    async fn a_vmis_multus_networks_are_resolved_and_a_missing_nad_waits() {
+        let nads = Arc::new(std::sync::Mutex::new(HashMap::from([
+            ("default/flat".to_string(), nad("flat")),
+            ("vlans/v30".to_string(), nad("vlan30")),
+        ])));
+        let url = nad_api(nads.clone()).await;
+        let conf = tempfile::tempdir().unwrap();
+        std::fs::write(conf.path().join("05-cilium.conflist"), r#"{"cniVersion":"1.0.0","name":"cilium","plugins":[{"type":"cilium-cni"}]}"#).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), &url)
+            .with_net_store(crate::vm_network::Store::at(dir.path()))
+            .with_cni(Some(cni::CniInvoker::new(conf.path(), vec![])));
+
+        // v40 (in the VMI's namespace) is not there yet.
+        let spec = spec_of(&multus_vmi(true));
+        match m.acquire_pod_network("u-1", "default", &spec).await {
+            Err(StartFail::Waiting(why)) => assert!(why.contains("NetworkNotReady") && why.contains("default/v40") && why.contains("not found"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(crate::vm_network::Store::at(dir.path()).load_all().is_empty(), "nothing made, nothing recorded");
+
+        nads.lock().unwrap().insert("default/v40".into(), nad("vlan40"));
+        let plans = stormvm_net::plan("default", &spec.name, &spec.interfaces, &Default::default()).unwrap();
+        let (default, secondary) = m.vm_networks("default", &plans).await.unwrap();
+        let default = default.unwrap();
+        assert_eq!((default.name.as_str(), default.ifname.as_str()), ("default/flat", "eth0"));
+        assert!(default.config.contains(r#""type":"flat""#));
+        let named: Vec<(&str, &str)> = secondary.iter().map(|a| (a.name.as_str(), a.ifname.as_str())).collect();
+        assert_eq!(named, [("vlans/v30", "net1"), ("default/v40", "net2")]);
+        // Past the networks, the start goes on to the engine (none here).
+        match m.acquire_pod_network("u-1", "default", &spec).await {
+            Err(StartFail::Failed(why)) => assert!(why.contains("no ring"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+
+        // A NAD with no config names itself too; and no apiserver at all.
+        nads.lock().unwrap().insert("vlans/v30".into(), json!({ "spec": {} }));
+        let e = m.vm_networks("default", &plans).await.unwrap_err();
+        assert!(e.contains("vlans/v30") && e.contains("spec.config"), "{e}");
+        let offline = VmManager::new(None, "n1", reqwest::Client::new(), "");
+        let e = offline.vm_networks("default", &plans).await.unwrap_err();
+        assert!(e.contains("no apiserver"), "{e}");
+    }
+
+    /// stormvm#85: ADD the default (the cluster's, or the NAD replacing it,
+    /// on eth0) then each NAD on its interface in order; DEL last-first,
+    /// then the default; network-status has one entry per network.
+    #[tokio::test]
+    async fn a_vms_networks_are_added_in_order_and_deleted_in_reverse() {
+        use std::os::unix::fs::PermissionsExt;
+        let conf = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        std::fs::write(conf.path().join("05-podnet.conflist"), r#"{"cniVersion":"1.0.0","name":"podnet","plugins":[{"type":"podnet"}]}"#).unwrap();
+        for (t, ip) in [("podnet", "10.0.1.5/32"), ("flat", "192.168.50.7/24"), ("vlan30", "10.30.0.4/24"), ("vlan40", "10.40.0.4/24")] {
+            let script = format!(
+                "#!/bin/sh\ncat >/dev/null\necho \"{t} $CNI_COMMAND $CNI_IFNAME $CNI_CONTAINERID\" >> {dir}/calls\nprintf '%s' '{{\"cniVersion\":\"1.0.0\",\"interfaces\":[{{\"name\":\"'$CNI_IFNAME'\",\"sandbox\":\"x\"}}],\"ips\":[{{\"address\":\"{ip}\",\"interface\":0}}]}}'\n",
+                dir = bin.path().display()
+            );
+            let p = bin.path().join(t);
+            std::fs::write(&p, script).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let invoker = cni::CniInvoker::new(conf.path(), vec![bin.path().to_path_buf()]);
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), "");
+        let att = |name: &str, ifname: &str, t: &str| crate::vm_network::Attachment {
+            name: name.into(),
+            ifname: ifname.into(),
+            config: nad(t)["spec"]["config"].as_str().unwrap().to_string(),
+        };
+        let netns = tempfile::NamedTempFile::new().unwrap();
+        let mut net = crate::vm_network::PodNet {
+            uid: "u-1".into(),
+            namespace: "default".into(),
+            name: "web-1".into(),
+            netns: netns.path().display().to_string(),
+            attachments: vec![att("vlans/v30", "net1", "vlan30"), att("default/v40", "net2", "vlan40")],
+            ..Default::default()
+        };
+        m.add_networks(&invoker, &mut net).await.unwrap();
+        assert_eq!(net.ip, "10.0.1.5", "the pod IP is the default network's");
+        let status = net.network_status.clone().unwrap();
+        let entries = status.as_array().unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["podnet", "vlans/v30", "default/v40"], "{status}");
+        assert_eq!(entries[1]["interface"], "net1");
+        assert_eq!(entries[1]["default"], false);
+        del_networks(&invoker, &net).await.unwrap();
+
+        // The NAD replacing the pod network: its ADD instead of the cluster's.
+        net.default_network = Some(att("default/flat", "eth0", "flat"));
+        net.attachments.truncate(1);
+        m.add_networks(&invoker, &mut net).await.unwrap();
+        assert_eq!(net.ip, "192.168.50.7");
+        assert_eq!(net.network_status.as_ref().unwrap()[0]["name"], "default/flat");
+        del_networks(&invoker, &net).await.unwrap();
+
+        let calls = std::fs::read_to_string(bin.path().join("calls")).unwrap();
+        let lines: Vec<&str> = calls.lines().map(str::trim).collect();
+        assert_eq!(lines, [
+            "podnet ADD eth0 vm-u-1",
+            "vlan30 ADD net1 vm-u-1",
+            "vlan40 ADD net2 vm-u-1",
+            "vlan40 DEL net2 vm-u-1",
+            "vlan30 DEL net1 vm-u-1",
+            "podnet DEL eth0 vm-u-1",
+            "flat ADD eth0 vm-u-1",
+            "vlan30 ADD net1 vm-u-1",
+            "vlan30 DEL net1 vm-u-1",
+            "flat DEL eth0 vm-u-1",
+        ]);
+    }
+
     #[tokio::test]
     async fn a_recorded_sandbox_with_no_machine_is_released_after_a_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -4418,6 +4734,7 @@ mod tests {
             leases: vec![],
             pod_name: String::new(),
             pod_uid: String::new(),
+            ..Default::default()
         };
         store.save(&net).unwrap();
         // No CNI and no ring here: the release is the record's removal.

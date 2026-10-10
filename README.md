@@ -649,6 +649,29 @@ starts once the VM lets the claim go (#80).
     The pod manager never runs it. A terminating launcher Pod with no machine
     of its VMI here is confirmed deleted. Every VMI has its own sandbox and
     launcher Pod, so a namespace holds any number of VMs.
+- **Multus networks on a VM** (stormvm#85, #241; the Multus standard, owner on
+  stormcos#249): `networks: [{multus: {networkName: <nad>}}]` is one more NIC per
+  NetworkAttachmentDefinition, in the VMI's sandbox, as virt-launcher wires it.
+  - Each NAD (`name` in the VMI's namespace, or `namespace/name`) is read before
+    anything is made; one that is missing or has no `spec.config` keeps the VMI
+    Pending (`NetworkNotReady`, naming it), as for a pod.
+  - After the default network's ADD, each NAD's config is ADDed into the sandbox
+    on its interface (`net1`, `net2`, … by order), as container `vm-<uid>`.
+    `multus: {networkName, default: true}` replaces the cluster's network: its
+    NAD is ADDed on `eth0` instead, and its address is the VM's pod IP. Each is
+    recorded (name, interface, config) before its ADD; DEL takes them last-first,
+    then the default, from the record, also after a kubelet restart.
+  - stormvm bridges the NAD's interface to the tap on `vmnetN`. When the NAD's
+    IPAM gave the interface an address, a DHCP responder on that bridge
+    (`serve_dhcp_on`) tells the guest it with no router, DNS or hostname, so
+    the default route stays the pod network's; the lease records its bridge, so a
+    restarted kubelet answers there again. With no IPAM, the guest asks the
+    segment's own DHCP and its address is watched on the tap in the sandbox
+    (`snoop_tap_in`).
+  - `status.interfaces[]` has each multus NIC with binding `multus` and its
+    address (not the pod IP), and the launcher Pod carries
+    `k8s.v1.cni.cncf.io/network-status`: the default network first, then one
+    entry per NAD (`name` its `namespace/name`, its interface, `default: false`).
 - **A guest's address** goes to `status.interfaces[].ipAddress` / `ipAddresses`
   from three sources, in this order:
   - **The tap watcher:** a NIC on one of the node's bridges (`host`,

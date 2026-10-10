@@ -19,6 +19,17 @@
 //!    with the pod IP, gateway, the cluster DNS, the ClusterFirst search list
 //!    and its hostname, for the machine's life.
 //!
+//! A VMI's `networks: [{multus: {networkName}}]` (stormvm#85; the Multus
+//! standard, owner on stormcos#249) are more NICs in the same sandbox, the
+//! way virt-launcher wires them: each NetworkAttachmentDefinition's config is
+//! ADDed into the sandbox on its own interface (`net1`, `net2`, … by order),
+//! after the default network, and stormvm bridges that interface to the VM's
+//! tap on `vmnetN`. `multus: {default: true}` replaces the cluster's network:
+//! its NAD is ADDed on `eth0` instead. A secondary NIC whose NAD's IPAM gave
+//! an address is told it by DHCP on its own bridge, with no router (the
+//! default route stays the pod network's); one with no IPAM has its guest's
+//! address watched on the tap.
+//!
 //! **The record outlives the kubelet.** The engine keeps the machine (and so
 //! the sandbox it occupies) across a kubelet restart, and this process's
 //! memory does not. What teardown and a restarted kubelet need — the sandbox
@@ -53,11 +64,16 @@ pub struct LeaseRecord {
     pub search: Vec<String>,
     pub hostname: Option<String>,
     pub mtu: Option<u32>,
+    /// The sandbox bridge it is answered on: `vmbr0` (none recorded, as
+    /// before stormvm#85) or a multus NIC's `vmnetN`.
+    #[serde(default)]
+    pub bridge: Option<String>,
 }
 
 impl LeaseRecord {
-    pub fn of(nic: usize, mac: &str, l: &stormvm_net::dhcp::Lease) -> LeaseRecord {
+    pub fn of(nic: usize, mac: &str, l: &stormvm_net::dhcp::Lease, bridge: Option<&str>) -> LeaseRecord {
         LeaseRecord {
+            bridge: bridge.filter(|b| *b != stormvm_net::SANDBOX_BRIDGE).map(str::to_string),
             nic,
             mac: mac.to_string(),
             ip: l.ip,
@@ -84,8 +100,26 @@ impl LeaseRecord {
     }
 }
 
+/// A NetworkAttachmentDefinition ADDed into a VMI's sandbox (stormvm#85):
+/// what its DEL needs after a restart, when the NAD itself may be gone.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    /// `namespace/name` of the NAD: the network-status entry's name.
+    pub name: String,
+    /// The interface in the sandbox.
+    pub ifname: String,
+    /// The NAD's `spec.config`, as it was ADDed.
+    pub config: String,
+}
+
+impl Attachment {
+    pub fn config(&self) -> Result<cni::NetworkConfigList, String> {
+        cni::NetworkConfigList::from_json(&self.config, &self.name).map_err(|e| format!("network {} ({}): its config: {e}", self.name, self.ifname))
+    }
+}
+
 /// One VMI's sandbox on the pod network.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PodNet {
     pub uid: String,
     pub namespace: String,
@@ -104,6 +138,18 @@ pub struct PodNet {
     pub pod_name: String,
     #[serde(default)]
     pub pod_uid: String,
+    /// The NAD that replaces the cluster's network on `eth0`
+    /// (`multus: {default: true}`), when the VMI names one.
+    #[serde(default)]
+    pub default_network: Option<Attachment>,
+    /// The secondary NADs, in the order they were ADDed (recorded before
+    /// each ADD, so an interrupted start's DEL covers it).
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
+    /// `k8s.v1.cni.cncf.io/network-status` for the launcher Pod: one entry
+    /// per network, the default first.
+    #[serde(default)]
+    pub network_status: Option<serde_json::Value>,
 }
 
 impl PodNet {
@@ -259,9 +305,27 @@ pub fn pod_metadata(pod: &serde_json::Value, ip: &str, node: &str) -> serde_json
     })
 }
 
-/// The pod-network NICs of a plan: the ones that need a sandbox.
+/// The NICs of a plan that need a sandbox: the pod network's and every
+/// multus one (stormvm#85).
 pub fn wants_sandbox(plans: &[stormvm_net::NicPlan]) -> bool {
-    plans.iter().any(|p| matches!(p.attach, stormvm_net::Attach::Pod(_)))
+    plans.iter().any(|p| matches!(p.attach, stormvm_net::Attach::Pod(_) | stormvm_net::Attach::Multus { .. }))
+}
+
+/// A plan's multus networks: the one replacing the pod network (if any),
+/// and the secondary ones in order, each as `(network, ifname)`.
+pub fn multus_networks(plans: &[stormvm_net::NicPlan]) -> (Option<(String, String)>, Vec<(String, String)>) {
+    let mut default = None;
+    let mut secondary = Vec::new();
+    for p in plans {
+        if let stormvm_net::Attach::Multus { network, ifname, default: d } = &p.attach {
+            if *d {
+                default = Some((network.clone(), ifname.clone()));
+            } else {
+                secondary.push((network.clone(), ifname.clone()));
+            }
+        }
+    }
+    (default, secondary)
 }
 
 /// Is this a binding on the pod network (the machine's address is the pod's)?
@@ -349,7 +413,9 @@ mod tests {
                 search: vec!["default.svc.cluster.local".into()],
                 hostname: Some("web-1".into()),
                 mtu: Some(1450),
+                bridge: None,
             }],
+            ..Default::default()
         }
     }
 
@@ -481,7 +547,52 @@ mod tests {
     fn a_lease_round_trips_through_its_record() {
         let l = record().leases[0].lease().unwrap();
         assert_eq!(l.mac, [0x0a, 0x58, 0x0a, 0, 1, 5]);
-        assert_eq!(LeaseRecord::of(0, "0a:58:0a:00:01:05", &l), record().leases[0]);
+        assert_eq!(LeaseRecord::of(0, "0a:58:0a:00:01:05", &l, Some("vmbr0")), record().leases[0], "vmbr0 is the default, not recorded");
+        assert_eq!(LeaseRecord::of(1, "02:00:00:00:00:07", &l, Some("vmnet1")).bridge.as_deref(), Some("vmnet1"));
+    }
+
+    /// stormvm#85: the multus networks and what DEL needs survive the disk; a
+    /// record written before them still reads.
+    #[test]
+    fn multus_networks_are_recorded_and_an_older_record_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let mut r = record();
+        r.default_network = Some(Attachment { name: "default/flat".into(), ifname: "eth0".into(), config: "{}".into() });
+        r.attachments = vec![Attachment { name: "vlans/v30".into(), ifname: "net1".into(), config: r#"{"type":"bridge"}"#.into() }];
+        r.network_status = Some(serde_json::json!([{ "name": "default/flat", "default": true }]));
+        store.save(&r).unwrap();
+        assert_eq!(store.load_all(), vec![r]);
+        let old = r#"{"uid":"u-2","namespace":"default","name":"old","sandbox":1,"netns":"/proc/9/ns/net","ip":"10.0.1.9",
+            "leases":[{"nic":0,"mac":"0a:58:0a:00:01:09","ip":"10.0.1.9","prefix":32,"gateway":"10.0.1.1","dns":[],"search":[],
+            "hostname":null,"mtu":null}]}"#;
+        std::fs::write(dir.path().join("u-2.json"), old).unwrap();
+        let read = store.load_all().into_iter().find(|p| p.uid == "u-2").unwrap();
+        assert!(read.attachments.is_empty() && read.default_network.is_none() && read.leases[0].bridge.is_none());
+    }
+
+    #[test]
+    fn a_vmis_multus_networks_want_a_sandbox_in_order() {
+        let obj = serde_json::json!({
+            "kind": "VirtualMachineInstance",
+            "metadata": { "name": "web-1", "namespace": "default", "uid": "u-1" },
+            "spec": {
+                "domain": { "memory": { "guest": "1Gi" }, "devices": { "interfaces": [
+                    { "name": "lan", "bridge": {} }, { "name": "v30", "bridge": {} }, { "name": "v40", "bridge": {} }
+                ] } },
+                "networks": [
+                    { "name": "lan", "multus": { "networkName": "flat", "default": true } },
+                    { "name": "v30", "multus": { "networkName": "vlans/v30" } },
+                    { "name": "v40", "multus": { "networkName": "v40" } }
+                ]
+            }
+        });
+        let vm = stormvm_spec::kube::from_kube(&obj).unwrap();
+        let plans = stormvm_net::plan("default", &vm.name, &vm.interfaces, &Default::default()).unwrap();
+        assert!(wants_sandbox(&plans));
+        let (default, secondary) = multus_networks(&plans);
+        assert_eq!(default, Some(("flat".to_string(), "eth0".to_string())));
+        assert_eq!(secondary, vec![("vlans/v30".to_string(), "net1".to_string()), ("v40".to_string(), "net2".to_string())]);
     }
 
     #[test]

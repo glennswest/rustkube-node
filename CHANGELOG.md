@@ -2,6 +2,13 @@
 
 ## 2026-10-10
 
+- **feat:** A VMI's multus networks (#241, stormvm#85): `networks: [{multus: {networkName}}]` is one more NIC per
+  NetworkAttachmentDefinition in the VMI's sandbox. Each NAD is read first (missing = Pending NetworkNotReady); after
+  the default network's ADD each NAD's config is ADDed on `net1`, `net2`, … (`default: true` replaces the cluster's
+  network on `eth0`), recorded for DEL (last-first, then the default) across a restart. A NIC whose NAD's IPAM gave an
+  address gets DHCP on its own sandbox bridge with no router/DNS (the lease records the bridge, so a restart answers
+  there); one with none is watched on its tap in the sandbox. `status.interfaces[]` reports it (binding `multus`, its
+  own address) and the launcher Pod carries `k8s.v1.cni.cncf.io/network-status`. stormvm is pinned at b2f88b8.
 - **fix:** A VMI on the pod network starts again (#240, stormvm#87): stormvm is pinned by `rev` at c7a7859, whose
   bridge binding reads the sandbox's routes and interfaces from the thread's network namespace. The lock's a88c809 read
   the node's (`/proc/net/route` is the process's), so every pod-network VM failed with "stormbr0 carries the default
