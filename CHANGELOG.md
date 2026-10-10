@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-10
+
+- **feat:** The kubelet's clone request to sbregistry (the cluster demand, #79) names this node's NVMe host NQN as
+  `host_nqn` when it has one (`/etc/nvme/hostnqn`, under `/hostroot` first), so the clone's export admits this host
+  alone (#236, stormblock-registry#102, stormblock#212); without one nothing is sent and the engine's default holds.
+
 ## 2026-10-09
 
 - **feat:** On a node shutdown every VM's guest is asked to power off at once (#181 item 3, stormpump#144): the kubelet

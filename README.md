@@ -179,7 +179,9 @@ the golden record (`GET /v1/goldens/{image}`, ready, `template_name`) and answer
 this node's registry has no golden of is asked of the cluster (#79): the kubelet posts sbregistry's clone route,
 the one that starts its cluster fetch, and its answer (503 "fetching it from the cluster", 404 "push the image")
 is the pull's ErrImagePull, retried on the back-off; a clone it minted because the golden became ready meanwhile
-is deleted (stormblock-registry#98 would make that a plain demand). **A tag selects a golden version** (#86): for a
+is deleted (stormblock-registry#98 would make that a plain demand). The demand names this node's NVMe host NQN
+(`host_nqn`, from `/etc/nvme/hostnqn` under `/hostroot`) when it has one, so a clone's export admits this host alone
+(#236, stormblock-registry#102, stormblock#212). **A tag selects a golden version** (#86): for a
 component the release manifest lists (or the node carries as a pallet), `image: nextnfs:<sha12>` (or
 `nextnfs:golden-nextnfs-<sha12>`) at a version other than the release's is not the pallet: it is pulled through the
 registry as `registry/nextnfs:<sha12>`, stormcentral's name for the golden `golden-nextnfs-<sha12>`. The registry's

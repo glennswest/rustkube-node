@@ -2909,6 +2909,8 @@ mod tests {
         arrived: bool,
         /// Clones deleted.
         deleted: Vec<String>,
+        /// Every clone request's body (#236).
+        clone_bodies: Vec<serde_json::Value>,
     }
 
     async fn fake_registry() -> (String, Arc<std::sync::Mutex<FakeRegistry>>) {
@@ -2938,6 +2940,7 @@ mod tests {
                 )
                 .post(|State(s): State<S>, Json(b): Json<serde_json::Value>| async move {
                     let mut r = s.lock().unwrap();
+                    r.clone_bodies.push(b.clone());
                     // The cluster demand (#79): elsewhere in the cluster, or nowhere.
                     match b["golden"].as_str() {
                         Some("quay.io/a/elsewhere:1") => return Err((StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
@@ -3009,6 +3012,20 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (url, state)
+    }
+
+    /// #236, end to end: the demand a pull posts names this host.
+    #[tokio::test]
+    async fn the_demand_names_this_host() {
+        let (url, reg) = fake_registry().await;
+        let n = "nqn.2014-08.org.nvmexpress:uuid:3f1c0a5e-1111-2222-3333-444455556666";
+        let img = StormpumpImages::new(&url).with_host_nqn(Some(n.into()));
+        assert!(img.pull_image("quay.io/a/elsewhere:1").await.is_err(), "fetched from the cluster: retried");
+        let bodies = reg.lock().unwrap().clone_bodies.clone();
+        assert_eq!(bodies.last().unwrap()["host_nqn"], n);
+        let img = StormpumpImages::new(&url).with_host_nqn(None);
+        let _ = img.pull_image("quay.io/a/elsewhere:1").await;
+        assert!(reg.lock().unwrap().clone_bodies.last().unwrap().get("host_nqn").is_none(), "none: not sent");
     }
 
     /// #236: a clone request names this host when it has an NQN, and the
