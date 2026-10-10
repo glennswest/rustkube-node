@@ -1992,14 +1992,14 @@ impl VmManager {
         // Storage first. Nothing has been asked of the engine yet, so a golden
         // that does not exist costs a failed status and no cleanup.
         let owner = self.owner_of(obj).await;
-        let (disks, owned_volumes) = self.resolve_disks_with_keys(&vm, &boot_keys, &owner, fresh).await?;
+        let (disks, owned_volumes) = self.resolve_disks_with_keys(uid, &vm, &boot_keys, &owner, fresh).await?;
 
         // The pod log directory, because that is where `kubectl logs` looks.
         // The container name is the VM's, so the path is the one the kubelet's
         // own log handler builds for a container of the same name.
         let dir = format!("{LOG_ROOT}/{ns}_{}_{uid}/{}", vm.name, vm.name);
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            self.release(&disks).await;
+            self.give_back(uid, &disks).await;
             return Err(StartFail::Failed(format!("could not make {dir}: {e}")));
         }
         // The pod network (#88), before the deposit window: a CNI ADD takes
@@ -2007,7 +2007,7 @@ impl VmManager {
         let pod = match self.acquire_pod_network(uid, &ns, &vm).await {
             Ok(p) => p,
             Err(e) => {
-                self.release(&disks).await;
+                self.give_back(uid, &disks).await;
                 return Err(e);
             }
         };
@@ -2026,7 +2026,7 @@ impl VmManager {
         let (handle, made, registration) = match launched {
             Ok(l) => l,
             Err(e) => {
-                self.release(&disks).await;
+                self.give_back(uid, &disks).await;
                 if pod.is_some() && !self.release_pod_network(uid).await {
                     warn!(vm = %vm.name, "a failed start's pod network is still held, retried at teardown");
                 }
@@ -2434,6 +2434,13 @@ impl VmManager {
                 _ => return false,
             }
         }
+        // Disks on other drivers' claims (#157): unpublished (and unstaged)
+        // by their drivers, retried until done.
+        if let Some(pods) = &self.claims {
+            if !pods.teardown_vm_csi(&vm.uid).await {
+                return false;
+            }
+        }
         // Disk lifetime follows the VM owner (#75), not this VMI. The orphan
         // sweep deletes them only after the owner is confirmed gone.
         self.drop_snoopers(&vm.uid);
@@ -2457,7 +2464,7 @@ impl VmManager {
     /// [`Self::resolve_disks_with_keys`] with no keys: for tests.
     #[cfg(test)]
     async fn resolve_disks(&self, vm: &VmSpec) -> Result<(Vec<ResolvedDisk>, Vec<String>), StartFail> {
-        self.resolve_disks_with_keys(vm, &[], &Value::Null, &mut Vec::new()).await
+        self.resolve_disks_with_keys("u-test", vm, &[], &Value::Null, &mut Vec::new()).await
     }
 
     /// Clone or attach every disk. Failure gives back what it already took —
@@ -2471,6 +2478,7 @@ impl VmManager {
     /// only the first time. `owner` goes on each ([`disk_owner`]).
     async fn resolve_disks_with_keys(
         &self,
+        uid: &str,
         vm: &VmSpec,
         keys: &[String],
         owner: &Value,
@@ -2515,7 +2523,7 @@ impl VmManager {
                             id
                         }
                         Err(e) => {
-                            self.release(&done).await;
+                            self.give_back(uid, &done).await;
                             // A golden that is not here *yet* is not a
                             // failure.
                             //
@@ -2540,7 +2548,7 @@ impl VmManager {
                     }
                         }
                         Err(e) => {
-                            self.release(&done).await;
+                            self.give_back(uid, &done).await;
                             return Err(e);
                         }
                     }
@@ -2554,26 +2562,28 @@ impl VmManager {
                 // change, so the machine waits rather than fails.
                 DiskSource::Claim(c) => {
                     let Some(pods) = &self.claims else {
-                        self.release(&done).await;
+                        self.give_back(uid, &done).await;
                         return Err(StartFail::Failed(format!(
                             "disk {}: claim {c} needs an apiserver to resolve, and this kubelet \
                              has none",
                             d.name
                         )));
                     };
-                    match pods.claim_for_vm(&vm.namespace, c).await {
+                    // Another driver's claim (#157) comes back with no volume
+                        // id: its driver published it, and gives it back.
+                    match pods.claim_for_vm(&vm.namespace, c, uid, &d.name, d.readonly).await {
                         Ok((volume_id, device)) => {
                             done.push(ResolvedDisk {
                                 name: d.name.clone(),
                                 device,
-                                volume_id: Some(volume_id),
+                                volume_id,
                                 readonly: d.readonly,
                                 bus: d.bus,
                             });
                             continue;
                         }
                         Err(why) => {
-                            self.release(&done).await;
+                            self.give_back(uid, &done).await;
                             return Err(StartFail::Waiting(format!("disk {}: {why}", d.name)));
                         }
                     }
@@ -2587,7 +2597,7 @@ impl VmManager {
                     let found = match self.reuse(&d.name, &name, owner).await {
                         Ok(found) => found,
                         Err(e) => {
-                            self.release(&done).await;
+                            self.give_back(uid, &done).await;
                             return Err(e);
                         }
                     };
@@ -2599,7 +2609,7 @@ impl VmManager {
                                 id
                             }
                             Err(e) => {
-                                self.release(&done).await;
+                                self.give_back(uid, &done).await;
                                 return Err(StartFail::Failed(format!("disk {}: {e}", d.name)));
                             }
                         },
@@ -2611,7 +2621,7 @@ impl VmManager {
                         id
                     }
                     Err(e) => {
-                        self.release(&done).await;
+                        self.give_back(uid, &done).await;
                         return Err(StartFail::Failed(format!("disk {}: {e}", d.name)));
                     }
                 },
@@ -2630,12 +2640,12 @@ impl VmManager {
             {
                 Ok(v) => v,
                 Err(e) => {
-                    self.release(&done).await;
+                    self.give_back(uid, &done).await;
                     return Err(StartFail::Failed(format!("attaching {volume_id} for disk {}: {e}", d.name)));
                 }
             };
             let Some(device) = info["device_hint"].as_str() else {
-                self.release(&done).await;
+                self.give_back(uid, &done).await;
                 return Err(StartFail::Failed(format!(
                     "disk {} did not attach locally: {info} — an NVMe-oF attach needs a connect \
                      this node does not do yet",
@@ -3341,6 +3351,7 @@ impl VmManager {
             *swept = Some(std::time::Instant::now());
         }
         let _disks = self.disk_lifecycle.write().await;
+        let mut again = self.sweep_vm_csi().await.then_some(SWEEP_EVERY);
         let volumes = match self.volumes().await {
             Ok(v) => v,
             Err(e) => {
@@ -3349,7 +3360,6 @@ impl VmManager {
                 return None;
             }
         };
-        let mut again = None;
         let held: std::collections::HashSet<String> = {
             let vms = self.vms.lock().await;
             vms.values().flat_map(|v| v.disks.iter().filter_map(|d| d.volume_id.clone())).collect()
@@ -3385,6 +3395,41 @@ impl VmManager {
             again = Some(SWEEP_EVERY);
         }
         again
+    }
+
+    /// [`Self::release`], and the disks on other drivers' claims (#157):
+    /// unpublished by their drivers. Best effort, as release: what is left is
+    /// recorded, and the sweep finishes it.
+    async fn give_back(&self, uid: &str, disks: &[ResolvedDisk]) {
+        self.release(disks).await;
+        if let Some(pods) = &self.claims {
+            if !pods.teardown_vm_csi(uid).await {
+                warn!(%uid, "a failed start's CSI disks are still published; the sweep retries");
+            }
+        }
+    }
+
+    /// CSI disks (#157) recorded for VMIs that have no machine here and are
+    /// not wanted here: a start interrupted by a kubelet restart, or a stop
+    /// whose teardown failed. `true` when one is still left.
+    async fn sweep_vm_csi(&self) -> bool {
+        let Some(pods) = &self.claims else { return false };
+        let holders = match pods.vm_csi_holders() {
+            Ok(h) => h,
+            Err(e) => {
+                warn!("VM CSI records unreadable, nothing torn down: {e}");
+                return true;
+            }
+        };
+        let mut left = false;
+        for uid in holders {
+            if self.vms.lock().await.contains_key(&uid) || self.desired.lock().await.contains_key(&uid) {
+                continue;
+            }
+            info!(%uid, "unpublishing the CSI disks of a VMI with no machine here");
+            left |= !pods.teardown_vm_csi(&uid).await;
+        }
+        left
     }
 
     /// Best effort: a start that has already gone wrong must not be made worse

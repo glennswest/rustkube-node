@@ -136,18 +136,25 @@ pub struct VolumeSpec {
     pub publish_context: HashMap<String, String>,
     pub stage_secrets: HashMap<String, String>,
     pub publish_secrets: HashMap<String, String>,
+    /// A raw block volume (`volumeMode: Block`, #157): the driver puts the
+    /// device itself at the publish target, a file, rather than mounting a
+    /// filesystem on a directory.
+    pub block: bool,
 }
 
 impl VolumeSpec {
     fn capability(&self) -> proto::VolumeCapability {
+        let access_type = if self.block {
+            proto::volume_capability::AccessType::Block(proto::volume_capability::BlockVolume {})
+        } else {
+            proto::volume_capability::AccessType::Mount(proto::volume_capability::MountVolume {
+                fs_type: self.fs_type.clone(),
+                mount_flags: self.mount_flags.clone(),
+                volume_mount_group: String::new(),
+            })
+        };
         proto::VolumeCapability {
-            access_type: Some(proto::volume_capability::AccessType::Mount(
-                proto::volume_capability::MountVolume {
-                    fs_type: self.fs_type.clone(),
-                    mount_flags: self.mount_flags.clone(),
-                    volume_mount_group: String::new(),
-                },
-            )),
+            access_type: Some(access_type),
             access_mode: Some(proto::volume_capability::AccessMode { mode: self.access_mode }),
         }
     }

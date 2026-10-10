@@ -1799,6 +1799,12 @@ impl PodManager {
     /// the id, to detach it when the machine stops. The claim outlives the
     /// machine, so the id is never the VM's to delete.
     ///
+    /// A claim bound to another CSI driver's PV (#157: a stormblock-csi claim,
+    /// a RAID across servers) is staged and published by that driver as a raw
+    /// block for VMI `vmi_uid`'s disk `disk`: no volume id (nothing of the
+    /// engine's to detach), the published path as the device. The VM manager
+    /// unpublishes it ([`Self::teardown_vm_csi`]) when the machine stops.
+    ///
     /// Refused while a pod on this node uses the claim. A pod mounts the
     /// claim's filesystem and a VM writes the raw device, and two writers on
     /// one ext4 is corruption, whatever the access mode says.
@@ -1806,7 +1812,10 @@ impl PodManager {
         &self,
         namespace: &str,
         claim: &str,
-    ) -> Result<(String, String), String> {
+        vmi_uid: &str,
+        disk: &str,
+        readonly: bool,
+    ) -> Result<(Option<String>, String), String> {
         match self.claim_holder_here(namespace, claim).await {
             Ok(Some(pod)) => {
                 return Err(format!(
@@ -1816,14 +1825,45 @@ impl PodManager {
             Ok(None) => {}
             Err(e) => return Err(format!("claim {namespace}/{claim}: {e}")),
         }
+        let explain = |e: ClaimError| match e {
+            ClaimError::NotOurs(why) => format!("waiting for claim {claim} to bind: {why}"),
+            ClaimError::InUse(why) => why,
+            ClaimError::Failed(why) => format!("claim {namespace}/{claim}: {why}"),
+        };
+        if let Some(pvc) = self
+            .api_get(&format!("/api/v1/namespaces/{namespace}/persistentvolumeclaims/{claim}"))
+            .await
+        {
+            if let Some(pv) = self.external_csi_pv(&pvc).await {
+                return self
+                    .mount_csi_block_for_vm(namespace, vmi_uid, disk, &pvc, &pv, readonly)
+                    .await
+                    .map(|device| (None, device))
+                    .map_err(|e| match e {
+                        // Another driver's claim that is not a raw block is
+                        // not a wait: it will not become one.
+                        ClaimError::NotOurs(why) => format!("claim {namespace}/{claim}: {why}"),
+                        e => explain(e),
+                    });
+            }
+        }
         self.provision_claim_volume(namespace, claim, "", &mut Default::default(), false)
             .await
-            .map(|(id, dev, _)| (id, dev))
-            .map_err(|e| match e {
-                ClaimError::NotOurs(why) => format!("waiting for claim {claim} to bind: {why}"),
-                ClaimError::InUse(why) => why,
-                ClaimError::Failed(why) => format!("claim {namespace}/{claim}: {why}"),
-            })
+            .map(|(id, dev, _)| (Some(id), dev))
+            .map_err(explain)
+    }
+
+    /// Unpublish (and unstage, when no one else here has it) VMI `vmi_uid`'s
+    /// disks on other drivers' claims (#157). `true` when nothing is left.
+    pub(crate) async fn teardown_vm_csi(&self, vmi_uid: &str) -> bool {
+        self.teardown_csi_volumes(&csi_volumes::vm_holder(vmi_uid)).await
+    }
+
+    /// The VMIs with CSI disks recorded on this node (#157): for the VM
+    /// manager's sweep of machines that are gone. `Err` when the records
+    /// cannot be read (nothing is torn down then).
+    pub(crate) fn vm_csi_holders(&self) -> std::io::Result<Vec<String>> {
+        csi_volumes::vm_holders(&self.state_root)
     }
 
     /// [`Self::provision_claim`], answering the volume id too, and the

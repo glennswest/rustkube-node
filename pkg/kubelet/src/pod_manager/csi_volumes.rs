@@ -18,7 +18,7 @@ use retry::RetryExt;
 use super::{ClaimError, PodManager};
 use crate::csi::{self, VolumeSpec};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
@@ -115,6 +115,36 @@ impl PodManager {
         pv: &Value,
         readonly: bool,
     ) -> Result<String, ClaimError> {
+        self.mount_csi(pod, vol_name, pvc, pv, readonly, false).await
+    }
+
+    /// A virtual machine's disk on another driver's claim (#157): the PV
+    /// must be `volumeMode: Block` (a VM disk is a device; a filesystem
+    /// claim holding a disk image is not supported), staged and published as
+    /// a raw block. Recorded under [`vm_holder`] of the VMI, so the pod sweep
+    /// leaves it to the VM manager. The published path is the device.
+    pub(crate) async fn mount_csi_block_for_vm(
+        &self,
+        namespace: &str,
+        vmi_uid: &str,
+        disk: &str,
+        pvc: &Value,
+        pv: &Value,
+        readonly: bool,
+    ) -> Result<String, ClaimError> {
+        let holder = json!({ "metadata": { "namespace": namespace, "uid": vm_holder(vmi_uid), "name": disk } });
+        self.mount_csi(&holder, disk, pvc, pv, readonly, true).await
+    }
+
+    async fn mount_csi(
+        &self,
+        pod: &Value,
+        vol_name: &str,
+        pvc: &Value,
+        pv: &Value,
+        readonly: bool,
+        block: bool,
+    ) -> Result<String, ClaimError> {
         let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default");
         let uid = pod["metadata"]["uid"].as_str().unwrap_or("");
         let claim = pvc["metadata"]["name"].as_str().unwrap_or("");
@@ -127,10 +157,17 @@ impl PodManager {
                 "PV {pv_name} has no csi.volumeHandle"
             )));
         }
-        if pv["spec"]["volumeMode"].as_str() == Some("Block") {
+        let is_block = pv["spec"]["volumeMode"].as_str() == Some("Block");
+        if is_block && !block {
             return Err(ClaimError::NotOurs(format!(
-                "PV {pv_name} is a raw block volume (volumeMode: Block), which this node does not \
-                 publish yet; only Filesystem"
+                "PV {pv_name} is a raw block volume (volumeMode: Block), which this node publishes \
+                 only for a VM's disk; a pod gets Filesystem"
+            )));
+        }
+        if block && !is_block {
+            return Err(ClaimError::NotOurs(format!(
+                "PV {pv_name} is volumeMode: Filesystem; a VM's disk on another driver's claim must \
+                 be volumeMode: Block (a disk image on a filesystem claim is not supported)"
             )));
         }
         // ReadWriteOncePod holds on this node whoever the driver is, for the
@@ -225,6 +262,7 @@ impl PodManager {
             publish_secrets: self
                 .csi_secrets(&src["nodePublishSecretRef"], namespace)
                 .await?,
+            block,
         };
         let staging = reg
             .caps
@@ -294,6 +332,7 @@ impl PodManager {
             publish_secrets: self
                 .csi_secrets(&src["nodePublishSecretRef"], namespace)
                 .await?,
+            block: false,
         };
         let data = VolData {
             driver_name: driver.to_string(),
@@ -441,8 +480,14 @@ impl PodManager {
             }
             // Only empty directories are removed. A mount point that is somehow
             // still mounted is not empty, and remove_dir refuses it rather than
-            // deleting what is in the volume.
-            if std::fs::remove_dir(&target).is_err() && Path::new(&target).exists() {
+            // deleting what is in the volume. A raw block's target is a file
+            // (#157), and one still bind-mounted is refused the same way (EBUSY).
+            let removed = if Path::new(&target).is_file() {
+                std::fs::remove_file(&target).is_ok()
+            } else {
+                std::fs::remove_dir(&target).is_ok()
+            };
+            if !removed && Path::new(&target).exists() {
                 warn!(
                     "CSI {}: {target} is not empty after unpublish; left in place",
                     data.driver_name
@@ -550,6 +595,10 @@ impl PodManager {
             .collect();
         let mut gone = Vec::new();
         for uid in uids {
+            // A VM's disks are the VM manager's to tear down (#157).
+            if uid.starts_with(VM_HOLDER_PREFIX) {
+                continue;
+            }
             if live.contains(uid.as_str()) || self.pods.read().await.contains_key(&uid) {
                 continue;
             }
@@ -679,6 +728,26 @@ impl PodManager {
         }
         pending
     }
+}
+
+/// What a VM's CSI disks are recorded under (#157): not a pod uid, so the pod
+/// sweep never mistakes a running VM's disk for a gone pod's volume.
+pub const VM_HOLDER_PREFIX: &str = "vm-";
+
+/// The holder a VMI's CSI disks are recorded under.
+pub fn vm_holder(vmi_uid: &str) -> String {
+    format!("{VM_HOLDER_PREFIX}{vmi_uid}")
+}
+
+/// The VMI uids that hold CSI disk records on this node (#157).
+pub(crate) fn vm_holders(state_root: &str) -> std::io::Result<Vec<String>> {
+    let mut out: Vec<String> = csi_records_checked(state_root)?
+        .into_iter()
+        .filter_map(|(uid, _)| uid.strip_prefix(VM_HOLDER_PREFIX).map(str::to_string))
+        .collect();
+    out.sort();
+    out.dedup();
+    Ok(out)
 }
 
 /// Every CSI record with its directory (the target is `<dir>/mount`).
@@ -863,7 +932,18 @@ mod tests {
         ) -> R<proto::NodePublishVolumeResponse> {
             self.record("publish");
             let r = r.into_inner();
-            std::fs::create_dir_all(&r.target_path).unwrap();
+            // A raw block's target is a file the driver puts the device at
+            // (#157); a filesystem's is a directory.
+            let block = matches!(
+                r.volume_capability.as_ref().and_then(|c| c.access_type.as_ref()),
+                Some(proto::volume_capability::AccessType::Block(_))
+            );
+            if block {
+                std::fs::create_dir_all(Path::new(&r.target_path).parent().unwrap()).unwrap();
+                std::fs::write(&r.target_path, b"").unwrap();
+            } else {
+                std::fs::create_dir_all(&r.target_path).unwrap();
+            }
             if self.propagates.load(std::sync::atomic::Ordering::SeqCst) {
                 use std::io::Write;
                 let mut f = std::fs::OpenOptions::new()
@@ -886,7 +966,9 @@ mod tests {
             r: Request<proto::NodeUnpublishVolumeRequest>,
         ) -> R<proto::NodeUnpublishVolumeResponse> {
             self.record("unpublish");
-            let _ = std::fs::remove_dir(r.into_inner().target_path);
+            let target = r.into_inner().target_path;
+            let _ = std::fs::remove_dir(&target);
+            let _ = std::fs::remove_file(&target);
             Ok(Response::new(proto::NodeUnpublishVolumeResponse {}))
         }
         async fn node_get_volume_stats(
@@ -1294,6 +1376,44 @@ mod tests {
                 "unstage"
             ]
         );
+        assert!(csi_records(&rig.mgr.state_root).is_empty());
+    }
+
+    /// #157: a VM's disk on another driver's claim is a raw block, staged and
+    /// published for the VMI (recorded under `vm-<uid>`, which the pod sweep
+    /// leaves alone), its device the published path, and torn down by the VM
+    /// manager's call. A Filesystem claim is refused, naming volumeMode.
+    #[tokio::test]
+    async fn a_vm_disk_on_another_drivers_claim_is_a_published_raw_block() {
+        let rig = rig().await;
+        store_claim(&rig.api);
+        rig.api.put("/api/v1/pods", json!({"items": []}));
+        rig.csi.scan_once().await;
+        attach(&rig.api);
+
+        // Filesystem: not a VM disk.
+        let e = rig.mgr.claim_for_vm("default", "data", "u-9", "root", false).await.unwrap_err();
+        assert!(e.contains("volumeMode: Block"), "{e}");
+        assert!(rig.driver.calls().is_empty(), "nothing staged for a claim that cannot be a disk");
+
+        let mut pv = rig.api.get("/api/v1/persistentvolumes/pv-data").unwrap();
+        pv["spec"]["volumeMode"] = json!("Block");
+        rig.api.put("/api/v1/persistentvolumes/pv-data", pv);
+        let (volume_id, device) = rig.mgr.claim_for_vm("default", "data", "u-9", "root", false).await.unwrap();
+        assert_eq!(volume_id, None, "the claim's volume is its driver's, not the engine's to detach");
+        assert_eq!(device, csi::publish_path(&rig.mgr.state_root, "vm-u-9", "root"));
+        assert!(Path::new(&device).is_file(), "the device is at the target, a file");
+        assert_eq!(rig.driver.calls(), vec!["stage", "publish"]);
+        let cap = rig.driver.publish.lock().unwrap().clone().unwrap().volume_capability.unwrap();
+        assert!(matches!(cap.access_type, Some(proto::volume_capability::AccessType::Block(_))), "{cap:?}");
+        let cap = rig.driver.stage.lock().unwrap().clone().unwrap().volume_capability.unwrap();
+        assert!(matches!(cap.access_type, Some(proto::volume_capability::AccessType::Block(_))));
+        assert_eq!(rig.mgr.vm_csi_holders().unwrap(), vec!["u-9".to_string()]);
+
+        assert!(rig.mgr.teardown_vm_csi("u-9").await);
+        assert_eq!(rig.driver.calls(), vec!["stage", "publish", "unpublish", "unstage"]);
+        assert!(!Path::new(&device).exists());
+        assert!(rig.mgr.vm_csi_holders().unwrap().is_empty());
         assert!(csi_records(&rig.mgr.state_root).is_empty());
     }
 
