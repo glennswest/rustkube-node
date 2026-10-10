@@ -404,7 +404,7 @@ capacity = new, both conditions removed, allocatedResourceStatuses dropped.
 2. [x] Tests (2), csi.md, status.md, CHANGELOG (1af5ece). sc-build job 8d5ba26c64: 415 kubelet unit pass. Stage golden
        golden-rustkube-node-0ee0277c7dba (stormcos#366). Closed. Live with #52's driver (stormblock-registry#99).
 
-### In progress: #240 (P0), stormvm → c7a7859 (stormvm#87: pod-network VMs "stormbr0 … has no address")
+### Done: #240 (P0), stormvm → c7a7859 (stormvm#87: pod-network VMs "stormbr0 … has no address")
 
 2026-10-10. stormvm f561d97 reads the sandbox's routes from `/proc/thread-self/net` (the lock's a88c809 read the
 node's). Bump every stormvm crate to `rev = "c7a7859f88bb205506a8ebf9cae2f1957112bf7d"` (stormcentral#571).
@@ -412,8 +412,11 @@ Found: stormvm now pins stormpump by rev f466116 (stormvm#82), 91 commits behind
 graph gets two stormpump packages. Nothing crosses between them (the kubelet takes the plan's spec as bytes; spec
 payloads are versioned and an older one decodes in ours), so it builds; one stormpump needs stormvm to move its rev
 (file it). Also in the bump: stormvm#60 (`from_kube` refuses unknown VMI keys by path).
-1. [ ] Branch wip/240: Cargo.toml rev pins; lock from a build VM (`cargo metadata`, `git diff Cargo.lock`); apply.
-2. [ ] sc-build; merge; CHANGELOG/docs; stage golden; file stormvm (one stormpump); close (live proof = stormvm#87's).
+1. [x] Branch wip/240: Cargo.toml rev pins; lock from a build VM (`cargo metadata`, `git diff Cargo.lock`); apply.
+2. [x] Lock job (cargo metadata + build + test) then SC_BUILD_VM sc-build 9b26801 `--locked`: 497 kubelet unit, all suites
+       pass. Fast-forwarded to main (847d0fe), CHANGELOG + status.md. Stage golden golden-rustkube-node-885c18965611
+       (stormcos#424). stormvm#82 asked to move its stormpump rev to ours. Closed; live proof = stormvm#87's (a pod-network
+       VMI starts on the Dell and pvetest2, stormcos_qa medium `up/vm-*`).
 
 ### Done: #219 (P0), node_health's fallback reads stormd's probe tables
 
