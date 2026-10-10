@@ -711,9 +711,20 @@ starts once the VM lets the claim go (#80).
     kubelet does nothing.
   - A taken snapshot also records its disks (`storm.io/snapshot-disks`,
     `{"<disk>": "<volume id>"}`, from the registration, written with the claim).
+  - **A disk on another driver's claim** (#157: a stormblock-csi claim, a RAID
+    across servers) is taken KubeVirt's way in the same hold of the guest: one
+    `VolumeSnapshot` per such disk, `vmsnapshot-<snapshot uid>-volume-<disk>`,
+    of its claim, the driver's default class, owned by the
+    VirtualMachineSnapshot, waited for until its driver has cut it
+    (`status.creationTime`, at most 60 s, else the snapshot fails naming it).
+    Which disks, and the claim each was (class, access modes, mode, size), is
+    recorded at the claim (`storm.io/snapshot-volumesnapshots`). The driver
+    must take snapshots (stormblock-csi#51 for stormblock-csi).
 - **Restores: `VirtualMachineRestore`** (#53; owner's option A, #109;
   `pkg/kubelet/src/vm_restore.rs`). Served by the node that took the snapshot
-  (its stormblock holds the group):
+  when a disk to restore is in its stormblock (it holds the group); a
+  restore whose disks were all taken as VolumeSnapshots (#157) is any node's,
+  the first to mark it `storm.io/restore-node` (against its resourceVersion):
   - waits for the snapshot to be `Succeeded` and the VM stopped (no VMI),
     saying so in the `Progressing` condition;
   - for every disk in the snapshot's disk map except a cloud-init one (made
@@ -730,8 +741,25 @@ starts once the VM lets the claim go (#80).
   - Every step is find-or-create, so an interrupted restore finishes on the
     next pass. A snapshot taken before the disk map was recorded cannot be
     restored: take a new one.
-  - A restored disk is made on this node; pulling a RAID twin from another
-    node (the owner's note on #109) is not done.
+  - **A disk taken as a VolumeSnapshot** (#157) becomes a claim
+    `<vm>-<disk>-restore-<restore>` with `dataSource` that VolumeSnapshot (it
+    must be `readyToUse`; until then the restore waits), the recorded claim's
+    class, access modes and mode, and its size or the snapshot's
+    `restoreSize` when larger. No PV and no node: the driver provisions it
+    from wherever its data is, so a stormblock-csi disk comes back from a
+    surviving leg on another node (the owner's note on #109), and the VM goes
+    where the driver serves it.
+  - A disk of the built-in class is still made on the snapshot's node.
+- **A VM disk on another driver's claim** (#157): a `persistentVolumeClaim`
+  (or `dataVolume`) bound to another CSI driver's PV must be
+  `volumeMode: Block` (a disk image on a filesystem claim is not supported,
+  and is refused naming it). The driver stages and publishes it as a raw
+  block for the VMI (`VolumeCapability.block`, after its VolumeAttachment when
+  the driver attaches), at `<root>/pods/vm-<vmi uid>/volumes/kubernetes.io~csi/<disk>/mount`,
+  and that path is the disk's device. It is unpublished (and unstaged when no
+  one else here has it) when the machine stops or a start fails; records of
+  a VMI with no machine here and not wanted here are swept. The pod sweep
+  leaves `vm-` records alone.
 
 ## Tests on a node
 

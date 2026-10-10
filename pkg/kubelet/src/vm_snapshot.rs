@@ -19,6 +19,17 @@
 //! second take answers with what the first made — at the cost of the guest
 //! held still once more.
 //!
+//! **A disk on another driver's claim** (#157: a stormblock-csi claim, a RAID
+//! across servers) is not in this node's stormblock. It is taken KubeVirt's
+//! way, in the same hold of the guest: one `VolumeSnapshot` per such disk
+//! (`vmsnapshot-<snapshot uid>-volume-<disk>`, the driver's default class,
+//! owned by the VirtualMachineSnapshot), waited for until its driver has cut
+//! it (`status.creationTime`). Which disks, which claims, and what a restore
+//! needs to make a claim like them is recorded at the claim
+//! (`storm.io/snapshot-volumesnapshots`). A restore of those disks makes
+//! claims from the VolumeSnapshots, which the driver serves from wherever its
+//! data is: a surviving leg on another node included (`vm_restore.rs`).
+//!
 //! `VirtualMachineRestore` is `vm_restore.rs` (#53, option A of #109).
 
 use retry::RetryExt;
@@ -40,6 +51,47 @@ pub const NODE_ANNOTATION: &str = "storm.io/snapshot-node";
 /// claim, from the registration, which is gone once the VM stops.
 pub const DISKS_ANNOTATION: &str = "storm.io/snapshot-disks";
 
+/// The disks on other drivers' claims (#157), as
+/// `{"<disk>": {"volumeSnapshot": "<name>", "claim": {name, storageClassName,
+/// accessModes, volumeMode, storage}}}`: what was taken, and what a restore
+/// makes a claim like. Written with the claim of the snapshot.
+pub const VOLUME_SNAPSHOTS_ANNOTATION: &str = "storm.io/snapshot-volumesnapshots";
+
+/// How long the guest is held for a driver to cut its VolumeSnapshots.
+const CUT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Is this registered disk on another driver's claim (#157)? Published by
+/// that driver for the VMI (`csi_volumes::vm_holder`), with no engine volume.
+pub fn is_csi_disk(d: &stormvm_node::console::RegisteredDisk) -> bool {
+    d.volume_id.is_none() && d.device.contains("/volumes/kubernetes.io~csi/")
+}
+
+/// The VolumeSnapshot of disk `disk` for snapshot `snap` (KubeVirt's name).
+pub fn volume_snapshot_name(snap: &Value, disk: &str) -> String {
+    format!("vmsnapshot-{}-volume-{disk}", snap["metadata"]["uid"].as_str().unwrap_or(""))
+}
+
+/// The VolumeSnapshot object for one recorded disk: of its claim, owned by
+/// the VirtualMachineSnapshot (deleting it deletes them), the driver's
+/// default VolumeSnapshotClass.
+pub fn volume_snapshot(snap: &Value, entry: &Value) -> Value {
+    let (ns, name) = ns_name(snap);
+    json!({
+        "apiVersion": "snapshot.storage.k8s.io/v1",
+        "kind": "VolumeSnapshot",
+        "metadata": {
+            "name": entry["volumeSnapshot"],
+            "namespace": ns,
+            "labels": { "snapshot.kubevirt.io/source-vm-name": snap["spec"]["source"]["name"] },
+            "ownerReferences": [{
+                "apiVersion": API, "kind": "VirtualMachineSnapshot", "name": name,
+                "uid": snap["metadata"]["uid"], "controller": true, "blockOwnerDeletion": false,
+            }],
+        },
+        "spec": { "source": { "persistentVolumeClaimName": entry["claim"]["name"] } },
+    })
+}
+
 /// The disk map of a registration: every disk with a volume behind it.
 pub fn disk_map(reg: &Registration) -> Value {
     Value::Object(
@@ -60,6 +112,8 @@ const API: &str = "snapshot.kubevirt.io/v1beta1";
 pub struct Taken {
     /// stormblock's group-snapshot id, when the disks were taken.
     pub group: Option<String>,
+    /// The VolumeSnapshots of disks on other drivers' claims (#157).
+    pub volume_snapshots: Vec<String>,
     pub indications: Vec<String>,
     /// Every problem, including a guest left paused or frozen. `None` is a
     /// success.
@@ -72,16 +126,22 @@ impl Taken {
     }
 }
 
-/// Takes a registered VM's snapshot under a name. A seam for the tests: the
-/// real one needs a hypervisor and a stormblock.
+/// Takes a registered VM's snapshot under a name, with the VolumeSnapshots
+/// to make in the same hold (#157). A seam for the tests: the real one needs
+/// a hypervisor and a stormblock.
 pub type TakeFn =
-    Arc<dyn Fn(Registration, String) -> Pin<Box<dyn Future<Output = Taken> + Send>> + Send + Sync>;
+    Arc<dyn Fn(Registration, String, Vec<Value>) -> Pin<Box<dyn Future<Output = Taken> + Send>> + Send + Sync>;
 
-/// The real take, against this node's stormblock.
-pub fn stormvm_take(stormblock: String) -> TakeFn {
-    Arc::new(move |reg: Registration, name: String| {
+/// The real take, against this node's stormblock, and the apiserver for the
+/// VolumeSnapshots.
+pub fn stormvm_take(stormblock: String, api: reqwest::Client, api_url: String) -> TakeFn {
+    Arc::new(move |reg: Registration, name: String, volume_snapshots: Vec<Value>| {
         let stormblock = stormblock.clone();
+        let (api, api_url) = (api.clone(), api_url.clone());
         Box::pin(async move {
+            if !volume_snapshots.is_empty() {
+                return take_with_volume_snapshots(&reg, &stormblock, &name, volume_snapshots, &api, &api_url).await;
+            }
             // Taken again while stormblock is away (#211): stormvm's take is
             // idempotent by name, and only a take whose disks were not taken
             // for a transport reason is repeated (a refusal, or a guest left
@@ -93,6 +153,7 @@ pub fn stormvm_take(stormblock: String) -> TakeFn {
                 let out = stormvm_console::snapshot::take(reg, stormblock, name, opts).await;
                 let taken = Taken {
                     group: out.disks.as_ref().ok().map(|g| g.id.clone()),
+                    volume_snapshots: Vec::new(),
                     indications: out.indications.iter().map(|s| s.to_string()).collect(),
                     error: out.error(),
                 };
@@ -105,6 +166,90 @@ pub fn stormvm_take(stormblock: String) -> TakeFn {
             taken.unwrap_or_else(|Unreached(t)| t)
         })
     })
+}
+
+/// A take with disks on other drivers' claims (#157): the guest frozen and
+/// paused once (stormvm's hold), then this node's group of its stormblock
+/// volumes, if it has any, and each VolumeSnapshot made and cut.
+async fn take_with_volume_snapshots(
+    reg: &Registration,
+    stormblock: &str,
+    name: &str,
+    volume_snapshots: Vec<Value>,
+    api: &reqwest::Client,
+    api_url: &str,
+) -> Taken {
+    let machine = stormvm_control::Machine {
+        kind: stormvm_control::Kind::parse(&reg.vmm),
+        control: reg.control_socket.clone(),
+        agent: reg.agent_socket.clone(),
+    };
+    let volumes = stormvm_console::snapshot::volumes(reg);
+    let group_name = stormvm_console::snapshot::group_name(reg, name);
+    let base = stormblock.to_string();
+    let opts = stormvm_control::snapshot::Options::default();
+    let out = stormvm_control::snapshot::take(&machine, opts, move || async move {
+        let group = if volumes.is_empty() {
+            None
+        } else {
+            let g = tokio::task::spawn_blocking(move || {
+                stormvm_block::Client::new(base).group_snapshot(&group_name, &volumes).map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| format!("the snapshot call did not finish: {e}"))??;
+            Some(g.id)
+        };
+        let mut made = Vec::new();
+        for vs in &volume_snapshots {
+            made.push(cut(api, api_url, vs).await?);
+        }
+        Ok((group, made))
+    })
+    .await;
+    let (group, volume_snapshots) = out.disks.as_ref().ok().cloned().unwrap_or_default();
+    Taken {
+        group,
+        volume_snapshots,
+        indications: out.indications.iter().map(|s| s.to_string()).collect(),
+        error: out.error(),
+    }
+}
+
+/// Make one VolumeSnapshot (an existing one of the name is this take's,
+/// asked again after a restart) and wait for its driver to cut it.
+async fn cut(api: &reqwest::Client, api_url: &str, vs: &Value) -> Result<String, String> {
+    let (ns, name) = ns_name(vs);
+    let base = format!("{api_url}/apis/snapshot.storage.k8s.io/v1/namespaces/{ns}/volumesnapshots");
+    let r = api
+        .post(&base)
+        .json(vs)
+        .send_repeatable(retry::Policy::API)
+        .await
+        .map_err(|e| format!("VolumeSnapshot {name}: {e}"))?;
+    if !r.status().is_success() && r.status().as_u16() != 409 {
+        return Err(format!("VolumeSnapshot {name} not made: {}", r.status()));
+    }
+    let started = std::time::Instant::now();
+    loop {
+        if let Ok(r) = api.get(format!("{base}/{name}")).send_retrying(retry::Policy::API).await {
+            if let Ok(v) = r.json::<Value>().await {
+                if let Some(e) = v["status"]["error"]["message"].as_str() {
+                    return Err(format!("VolumeSnapshot {name}: {e}"));
+                }
+                if !v["status"]["creationTime"].is_null() || v["status"]["readyToUse"].as_bool() == Some(true) {
+                    return Ok(name.to_string());
+                }
+            }
+        }
+        if started.elapsed() >= CUT_WAIT {
+            return Err(format!(
+                "VolumeSnapshot {name} was not cut within {}s: does its driver take snapshots (csi-snapshotter, \
+                 CreateSnapshot)?",
+                CUT_WAIT.as_secs()
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 }
 
 /// A take that failed before its disks were taken, for a transport reason.
@@ -277,9 +422,23 @@ impl Snapshots {
                     self.finish(&obj, String::new(), Taken::failed(why)).await;
                 }
                 Action::Claim => {
-                    let disks = reg.as_ref().map(disk_map).unwrap_or_else(|| json!({}));
-                    if self.claim(&obj, &disks).await {
-                        self.start(obj, reg.expect("registered"), key);
+                    let reg = reg.expect("registered");
+                    // Its disks on other drivers' claims (#157), read now: a
+                    // claim that cannot be read is a retry, not a snapshot
+                    // that leaves the disk out.
+                    let csi = match self.csi_disks(&obj, &reg).await {
+                        Ok(c) => c,
+                        Err(why) => {
+                            debug!("{key}: not claimed yet: {why}");
+                            apimachinery::reactor::failed();
+                            continue;
+                        }
+                    };
+                    let disks = disk_map(&reg);
+                    if self.claim(&obj, &disks, &csi).await {
+                        let mut obj = obj;
+                        obj["metadata"]["annotations"][VOLUME_SNAPSHOTS_ANNOTATION] = json!(csi.to_string());
+                        self.start(obj, reg, key);
                     }
                 }
                 Action::Resume => self.start(obj, reg.expect("registered"), key),
@@ -318,12 +477,15 @@ impl Snapshots {
 
     /// Mark the snapshot as this node's, against the version read. A node
     /// that loses the race gets a conflict and leaves it.
-    async fn claim(&self, obj: &Value, disks: &Value) -> bool {
+    async fn claim(&self, obj: &Value, disks: &Value, csi: &Value) -> bool {
         let (ns, name) = ns_name(obj);
         let mut meta = json!({ "annotations": {
             NODE_ANNOTATION: self.node,
             DISKS_ANNOTATION: disks.to_string(),
         } });
+        if csi.as_object().is_some_and(|m| !m.is_empty()) {
+            meta["annotations"][VOLUME_SNAPSHOTS_ANNOTATION] = json!(csi.to_string());
+        }
         if let Some(rv) = obj["metadata"]["resourceVersion"].as_str() {
             meta["resourceVersion"] = json!(rv);
         }
@@ -367,11 +529,75 @@ impl Snapshots {
             .await;
             let (ns, name) = ns_name(&obj);
             info!("{ns}/{name}: taking a snapshot of {}", reg.name);
-            let taken = (me.take)(reg, name.to_string()).await;
+            // The VolumeSnapshots recorded at the claim (#157), also after a
+            // restart: the same names, so a second take finds the first's.
+            let recorded: serde_json::Map<String, Value> = obj["metadata"]["annotations"][VOLUME_SNAPSHOTS_ANNOTATION]
+                .as_str()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            let volume_snapshots = recorded.values().map(|e| volume_snapshot(&obj, e)).collect();
+            let taken = (me.take)(reg, name.to_string(), volume_snapshots).await;
             me.finish(&obj, source_uid, taken).await;
             me.in_flight.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
             me.completed.notify_one();
         });
+    }
+
+    /// The VMI's disks on other drivers' claims (#157), each with its
+    /// VolumeSnapshot's name and what its claim was: `{}` when it has none.
+    /// `Err` when the VMI or a claim cannot be read.
+    async fn csi_disks(&self, obj: &Value, reg: &Registration) -> Result<Value, String> {
+        let disks: Vec<&str> = reg.disks.iter().filter(|d| is_csi_disk(d)).map(|d| d.name.as_str()).collect();
+        let mut out = serde_json::Map::new();
+        if disks.is_empty() {
+            return Ok(Value::Object(out));
+        }
+        let ns = reg.namespace.as_str();
+        let vmi = self
+            .get(&format!("/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{}", reg.name))
+            .await?;
+        for disk in disks {
+            let vol = vmi["spec"]["volumes"]
+                .as_array()
+                .and_then(|v| v.iter().find(|v| v["name"] == disk))
+                .ok_or_else(|| format!("disk {disk} is not among VMI {}'s volumes", reg.name))?;
+            let claim = vol["persistentVolumeClaim"]["claimName"]
+                .as_str()
+                .or_else(|| vol["dataVolume"]["name"].as_str())
+                .ok_or_else(|| format!("disk {disk} is not a claim"))?;
+            let pvc = self.get(&format!("/api/v1/namespaces/{ns}/persistentvolumeclaims/{claim}")).await?;
+            let storage = pvc["status"]["capacity"]["storage"]
+                .as_str()
+                .or_else(|| pvc["spec"]["resources"]["requests"]["storage"].as_str())
+                .unwrap_or("");
+            out.insert(
+                disk.to_string(),
+                json!({
+                    "volumeSnapshot": volume_snapshot_name(obj, disk),
+                    "claim": {
+                        "name": claim,
+                        "storageClassName": pvc["spec"]["storageClassName"],
+                        "accessModes": pvc["spec"]["accessModes"],
+                        "volumeMode": pvc["spec"]["volumeMode"],
+                        "storage": storage,
+                    },
+                }),
+            );
+        }
+        Ok(Value::Object(out))
+    }
+
+    async fn get(&self, path: &str) -> Result<Value, String> {
+        let r = self
+            .api
+            .get(format!("{}{path}", self.api_url))
+            .send_retrying(retry::Policy::API)
+            .await
+            .map_err(|e| format!("{path}: {e}"))?;
+        if !r.status().is_success() {
+            return Err(format!("{path}: {}", r.status()));
+        }
+        r.json().await.map_err(|e| format!("{path}: {e}"))
     }
 
     /// The uid of what was snapshotted: the VirtualMachine's when the source
@@ -405,10 +631,16 @@ impl Snapshots {
         self.write_status(obj, &result).await;
         match &taken.error {
             None => {
-                info!("{ns}/{name}: snapshot taken ({})", taken.group.as_deref().unwrap_or(""));
-                self.event(obj, "Normal", "SnapshotSucceeded",
-                           &format!("group snapshot {}", taken.group.as_deref().unwrap_or("")))
-                    .await;
+                let mut what = Vec::new();
+                if let Some(g) = &taken.group {
+                    what.push(format!("group snapshot {g}"));
+                }
+                if !taken.volume_snapshots.is_empty() {
+                    what.push(format!("VolumeSnapshots {}", taken.volume_snapshots.join(", ")));
+                }
+                let what = what.join("; ");
+                info!("{ns}/{name}: snapshot taken ({what})");
+                self.event(obj, "Normal", "SnapshotSucceeded", &what).await;
             }
             Some(e) => {
                 warn!("{ns}/{name}: snapshot failed: {e}");
@@ -580,6 +812,20 @@ mod tests {
                 get(|| async { axum::Json(json!({ "metadata": { "uid": "vm-uid" } })) }),
             )
             .route(
+                "/apis/kubevirt.io/v1/namespaces/web/virtualmachineinstances/web-1",
+                get(|| async { axum::Json(json!({ "spec": { "volumes": [
+                    { "name": "rootdisk", "dataVolume": { "name": "fedora" } },
+                    { "name": "data", "persistentVolumeClaim": { "claimName": "data-claim" } },
+                ] } })) }),
+            )
+            .route(
+                "/api/v1/namespaces/web/persistentvolumeclaims/data-claim",
+                get(|| async { axum::Json(json!({
+                    "spec": { "storageClassName": "stormblock-csi", "accessModes": ["ReadWriteOnce"], "volumeMode": "Block",
+                              "resources": { "requests": { "storage": "16Gi" } } },
+                    "status": { "capacity": { "storage": "20Gi" } } })) }),
+            )
+            .route(
                 "/api/v1/namespaces/web/events",
                 axum::routing::post(move |axum::Json(b): axum::Json<Value>| {
                     let l = l3.clone();
@@ -619,7 +865,7 @@ mod tests {
 
     /// A take that records what it was asked and answers `taken`.
     fn fake_take(taken: Taken, asked: Arc<Mutex<Vec<(String, String)>>>) -> TakeFn {
-        Arc::new(move |reg: Registration, name: String| {
+        Arc::new(move |reg: Registration, name: String, _vs: Vec<Value>| {
             asked.lock().unwrap().push((format!("{}/{}", reg.namespace, reg.name), name));
             let t = taken.clone();
             Box::pin(async move { t })
@@ -647,7 +893,7 @@ mod tests {
         let taken = Taken {
             group: Some("gs-1".into()),
             indications: vec!["Online".into(), "GuestAgent".into()],
-            error: None,
+            ..Default::default()
         };
         let s = Arc::new(Snapshots::new(
             reqwest::Client::new(), &url, "n1", run_dir, fake_take(taken, Arc::clone(&asked)),
@@ -682,9 +928,9 @@ mod tests {
         register(run_dir, "web", "web-1");
         let (url, log) = apiserver(vec![snap("before", "web-1")], 200).await;
         let taken = Taken {
-            group: None,
             indications: vec!["Online".into()],
             error: Some("404 volume vol-1".into()),
+            ..Default::default()
         };
         let s = Arc::new(Snapshots::new(reqwest::Client::new(), &url, "n1", run_dir, fake_take(taken, Arc::default())));
         s.sync().await;
@@ -694,6 +940,83 @@ mod tests {
         assert!(done["status"]["error"]["message"].as_str().unwrap().contains("404 volume vol-1"));
         let ev = &log.iter().find(|(k, _)| k == "event").unwrap().1;
         assert_eq!(ev["type"], "Warning");
+    }
+
+    /// #157: a disk on another driver's claim is recorded at the claim (its
+    /// VolumeSnapshot's name, and the claim it is of) and handed to the take
+    /// as a VolumeSnapshot owned by the VirtualMachineSnapshot.
+    #[tokio::test]
+    async fn a_disk_on_another_drivers_claim_is_taken_as_a_volume_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().to_str().unwrap();
+        let reg: Registration = serde_json::from_value(json!({
+            "namespace": "web", "name": "web-1", "uid": "vmi-uid",
+            "disks": [
+                { "name": "rootdisk", "volume_id": "v-root", "owned": true, "device": "/dev/ublkb1" },
+                { "name": "data", "device": "/var/lib/kubelet/pods/vm-vmi-uid/volumes/kubernetes.io~csi/data/mount" },
+            ],
+        }))
+        .unwrap();
+        assert!(!is_csi_disk(&reg.disks[0]) && is_csi_disk(&reg.disks[1]));
+        stormvm_node::console::write(run_dir, &reg).unwrap();
+        let (url, log) = apiserver(vec![snap("before", "web-1")], 200).await;
+        let given: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let g = given.clone();
+        let take: TakeFn = Arc::new(move |_reg: Registration, _name: String, vs: Vec<Value>| {
+            g.lock().unwrap().extend(vs);
+            Box::pin(async {
+                Taken { group: Some("gs-1".into()), volume_snapshots: vec!["vmsnapshot-u-before-volume-data".into()], ..Default::default() }
+            })
+        });
+        let s = Arc::new(Snapshots::new(reqwest::Client::new(), &url, "n1", run_dir, take));
+        s.sync().await;
+        let log = settled(&log, 4).await;
+
+        let claim = &log.iter().find(|(k, _)| k == "claim before").unwrap().1;
+        assert_eq!(claim["metadata"]["annotations"][DISKS_ANNOTATION], json!(r#"{"rootdisk":"v-root"}"#));
+        let csi: Value = serde_json::from_str(claim["metadata"]["annotations"][VOLUME_SNAPSHOTS_ANNOTATION].as_str().unwrap()).unwrap();
+        assert_eq!(csi["data"]["volumeSnapshot"], "vmsnapshot-u-before-volume-data");
+        assert_eq!(csi["data"]["claim"], json!({ "name": "data-claim", "storageClassName": "stormblock-csi",
+            "accessModes": ["ReadWriteOnce"], "volumeMode": "Block", "storage": "20Gi" }));
+        let vs = given.lock().unwrap().clone();
+        assert_eq!(vs.len(), 1);
+        assert_eq!(vs[0]["metadata"]["name"], "vmsnapshot-u-before-volume-data");
+        assert_eq!(vs[0]["metadata"]["namespace"], "web");
+        assert_eq!(vs[0]["spec"]["source"]["persistentVolumeClaimName"], "data-claim");
+        assert_eq!(vs[0]["metadata"]["ownerReferences"][0]["uid"], "u-before");
+        let ev = &log.iter().find(|(k, _)| k == "event").unwrap().1;
+        assert!(ev["message"].as_str().unwrap().contains("VolumeSnapshots vmsnapshot-u-before-volume-data"), "{ev}");
+    }
+
+    /// A VolumeSnapshot is made (an existing one is this take's) and waited
+    /// for until its driver cut it; the driver's error is the take's.
+    #[tokio::test]
+    async fn a_volume_snapshot_is_made_and_waited_for_until_cut() {
+        let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let g = gets.clone();
+        let app = axum::Router::new()
+            .route("/apis/snapshot.storage.k8s.io/v1/namespaces/web/volumesnapshots",
+                   axum::routing::post(|| async { (axum::http::StatusCode::CONFLICT, axum::Json(json!({}))) }))
+            .route("/apis/snapshot.storage.k8s.io/v1/namespaces/web/volumesnapshots/{name}",
+                   get(move |Path(name): Path<String>| {
+                       let n = g.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                       async move {
+                           axum::Json(match name.as_str() {
+                               "ok" if n == 0 => json!({ "status": { "readyToUse": false } }),
+                               "ok" => json!({ "status": { "creationTime": "2026-10-10T20:00:00Z", "readyToUse": false } }),
+                               _ => json!({ "status": { "error": { "message": "driver does not support snapshots" } } }),
+                           })
+                       }
+                   }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let api = reqwest::Client::new();
+        let vs = |n: &str| json!({ "metadata": { "name": n, "namespace": "web" } });
+        assert_eq!(cut(&api, &url, &vs("ok")).await.unwrap(), "ok");
+        assert!(gets.load(std::sync::atomic::Ordering::SeqCst) >= 2, "waited for the cut");
+        let e = cut(&api, &url, &vs("bad")).await.unwrap_err();
+        assert!(e.contains("driver does not support snapshots"), "{e}");
     }
 
     /// Another node claimed it first: the conflict is a loss, and nothing is

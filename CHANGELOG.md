@@ -2,6 +2,14 @@
 
 ## 2026-10-10
 
+- **feat:** VM disks on another CSI driver's claim, and their snapshot and restore (#157; a stormblock-csi claim is
+  a RAID across servers, so a restore can come from a surviving leg on another node). A VM disk on such a claim (the
+  PV `volumeMode: Block`) is staged and published as a raw block for the VMI (recorded under `vm-<uid>`, torn down at
+  stop / failed start, swept when the VMI is gone). A VirtualMachineSnapshot takes each such disk as a VolumeSnapshot
+  (`vmsnapshot-<uid>-volume-<disk>`, owned by the snapshot) in the same guest freeze as the stormblock group, waited to
+  its cut; `storm.io/snapshot-volumesnapshots` records them. A VirtualMachineRestore makes each a claim with
+  `dataSource` the VolumeSnapshot (class/modes/size as snapshotted, ≥ restoreSize), no PV, no node; a restore with only
+  such disks is any node's (`storm.io/restore-node`). The driver must take snapshots: stormblock-csi#51.
 - **feat:** A VMI's multus networks (#241, stormvm#85): `networks: [{multus: {networkName}}]` is one more NIC per
   NetworkAttachmentDefinition in the VMI's sandbox. Each NAD is read first (missing = Pending NetworkNotReady); after
   the default network's ADD each NAD's config is ADDed on `net1`, `net2`, … (`default: true` replaces the cluster's
