@@ -173,7 +173,17 @@ impl Attempt {
 impl StartTiming {
     /// Seen at `seen`. `pod` gives the scheduling time, when it has one.
     pub fn new(pod: &Value, seen: Instant) -> Self {
-        Self::seen_at(pod, seen, chrono::Utc::now())
+        Self::seen_at(pod, seen, chrono::Utc::now()).since_boot(pod, crate::mirror::boot_time())
+    }
+
+    /// No `scheduled` for a pod scheduled before this node booted (#239): a
+    /// pod kept across a reboot is started again, and the hour since its
+    /// bind is not this start's scheduling.
+    fn since_boot(mut self, pod: &Value, booted: Option<chrono::DateTime<chrono::Utc>>) -> Self {
+        if booted.is_some_and(|b| scheduled_at(pod).is_some_and(|t| t < b)) {
+            self.scheduled_us = None;
+        }
+        self
     }
 
     fn seen_at(pod: &Value, seen: Instant, now: chrono::DateTime<chrono::Utc>) -> Self {
@@ -359,6 +369,20 @@ mod tests {
         assert_eq!(t.scheduled_us, Some(2_000_000));
         let t = StartTiming::seen_at(&json!({}), Instant::now(), at("2026-10-02T10:00:02Z"));
         assert_eq!(t.scheduled_us, None);
+    }
+
+    /// #239: a pod scheduled before this boot has no `scheduled` (it read
+    /// `scheduled=5346327ms` on pvetest2 after a reboot).
+    #[test]
+    fn a_pod_scheduled_before_this_boot_has_no_scheduled() {
+        let pod = json!({"metadata": {"creationTimestamp": "2026-10-10T13:03:21Z"}});
+        let now = at("2026-10-10T14:32:27Z");
+        let t = StartTiming::seen_at(&pod, Instant::now(), now).since_boot(&pod, Some(at("2026-10-10T14:32:00Z")));
+        assert_eq!(t.scheduled_us, None);
+        let t = StartTiming::seen_at(&pod, Instant::now(), now).since_boot(&pod, Some(at("2026-10-10T13:00:00Z")));
+        assert_eq!(t.scheduled_us, Some(5_346_000_000), "scheduled in this boot: measured");
+        let t = StartTiming::seen_at(&pod, Instant::now(), now).since_boot(&pod, None);
+        assert!(t.scheduled_us.is_some(), "boot unknown: measured");
     }
 
     /// #135: the scheduler's microsecond bind time wins over the whole-second

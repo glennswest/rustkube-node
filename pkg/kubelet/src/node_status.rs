@@ -311,18 +311,45 @@ impl NodeReporter {
 
     /// GET the node's current status conditions, so a heartbeat can merge its
     /// own conditions in without wiping ones set by other components
-    /// (rustkube-node#29). Returns an empty list if the node/status can't be
-    /// read — a heartbeat then just re-asserts the kubelet-owned conditions.
-    async fn current_conditions(&self) -> Vec<Value> {
+    /// (rustkube-node#29), and the boot id the object last recorded (#239).
+    /// An empty list and no boot id if the node/status can't be read — a
+    /// heartbeat then just re-asserts the kubelet-owned conditions.
+    async fn current_status(&self) -> (Vec<Value>, Option<String>) {
         let url = format!("{}/api/v1/nodes/{}", self.api_url, self.node_name);
-        match self.client.get(&url).send_retrying(retry::Policy::API).await {
-            Ok(resp) if resp.status().is_success() => resp
-                .json::<Value>()
-                .await
-                .ok()
-                .and_then(|node| node["status"]["conditions"].as_array().cloned())
-                .unwrap_or_default(),
-            _ => Vec::new(),
+        let node = match self.client.get(&url).send_retrying(retry::Policy::API).await {
+            Ok(resp) if resp.status().is_success() => resp.json::<Value>().await.unwrap_or_default(),
+            _ => Value::Null,
+        };
+        let conditions = node["status"]["conditions"].as_array().cloned().unwrap_or_default();
+        let boot_id = node["status"]["nodeInfo"]["bootID"].as_str().filter(|b| !b.is_empty()).map(str::to_string);
+        (conditions, boot_id)
+    }
+
+    /// Upstream's `Rebooted` Warning on the Node, written once per reboot
+    /// (the status write that carries the new boot id is the once).
+    async fn record_reboot(&self, boot_id: &str) {
+        let now = chrono::Utc::now();
+        let event = json!({
+            "apiVersion": "v1",
+            "kind": "Event",
+            "metadata": {
+                "name": format!("{}.{:x}", self.node_name, now.timestamp_nanos_opt().unwrap_or_default()),
+                "namespace": "default"
+            },
+            "involvedObject": {"apiVersion": "v1", "kind": "Node", "name": &self.node_name, "uid": &self.node_name},
+            "reason": "Rebooted",
+            "message": format!("Node {} has been rebooted, boot id: {boot_id}", self.node_name),
+            "type": "Warning",
+            "source": {"component": "kubelet", "host": &self.node_name},
+            "count": 1,
+            "firstTimestamp": now.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "lastTimestamp": now.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        });
+        let url = format!("{}/api/v1/namespaces/default/events", self.api_url);
+        match self.client.post(&url).json(&event).send_repeatable(retry::Policy::API).await {
+            Ok(r) if r.status().is_success() => {}
+            Ok(r) => tracing::warn!(status = %r.status(), "Rebooted event not written"),
+            Err(e) => tracing::warn!("Rebooted event not written: {e}"),
         }
     }
 
@@ -334,12 +361,22 @@ impl NodeReporter {
     /// other failure is an error, since retrying the same PUT is the right
     /// response to a busy or unreachable apiserver.
     async fn put_node_status(&self) -> anyhow::Result<StatusUpdate> {
-        let existing = self.current_conditions().await;
+        let (existing, recorded_boot) = self.current_status().await;
+        // A boot id other than this boot's: the node rebooted since the object
+        // last heard from it (#239). This write says NotReady and carries the
+        // new boot id, so the next pass (the boot ids now agree) flips Ready
+        // back with a fresh transition time: the reboot shows in the Ready
+        // condition rather than leaving it from before.
+        let boot_id = first_value(&BOOT_ID_FILES);
+        let rebooted = recorded_boot.filter(|old| !boot_id.is_empty() && *old != boot_id);
+        let not_ready = rebooted
+            .as_ref()
+            .map(|old| format!("node rebooted (boot id {old} -> {boot_id}); Ready on the next status update"));
         let node_update = json!({
             "apiVersion": "v1",
             "kind": "Node",
             "metadata": { "name": &self.node_name },
-            "status": self.build_status(&existing)
+            "status": self.status_with(&existing, not_ready.as_deref())
         });
 
         let resp = self
@@ -350,6 +387,10 @@ impl NodeReporter {
             .await?;
 
         if resp.status().is_success() {
+            if rebooted.is_some() {
+                info!(boot_id = %boot_id, "node rebooted: NotReady until the next status update");
+                self.record_reboot(&boot_id).await;
+            }
             return Ok(StatusUpdate::Updated);
         }
         if resp.status().as_u16() == 404 {
@@ -479,6 +520,12 @@ impl NodeReporter {
     /// conditions — Cilium's `NetworkUnavailable`, NPD/operator conditions — are
     /// preserved rather than clobbered on every heartbeat (rustkube-node#29).
     fn build_status(&self, existing: &[Value]) -> Value {
+        self.status_with(existing, None)
+    }
+
+    /// [`Self::build_status`], with Ready False and `not_ready` as its message
+    /// when given (a reboot, #239).
+    fn status_with(&self, existing: &[Value], not_ready: Option<&str>) -> Value {
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
         // Real system + filesystem stats (no longer faked).
@@ -521,7 +568,7 @@ impl NodeReporter {
                 "ephemeral-storage": format!("{}Ki", alloc.ephemeral_ki)
             },
             "conditions": merge_owned_conditions(
-                existing, mem_pressure, disk_pressure, pid_pressure, &now,
+                existing, mem_pressure, disk_pressure, pid_pressure, not_ready, &now,
             ),
             "nodeInfo": {
                 "machineID": first_value(&MACHINE_ID_FILES),
@@ -735,11 +782,16 @@ fn merge_owned_conditions(
     mem_pressure: bool,
     disk_pressure: bool,
     pid_pressure: bool,
+    not_ready: Option<&str>,
     now: &str,
 ) -> Value {
     // (type, status, reason, message) for the kubelet-owned conditions.
+    let ready = match not_ready {
+        Some(why) => ("Ready", "False", "KubeletNotReady", why),
+        None => ("Ready", "True", "KubeletReady", "rustkube kubelet is ready"),
+    };
     let owned = [
-        ("Ready", "True", "KubeletReady", "rustkube kubelet is ready"),
+        ready,
         (
             "MemoryPressure",
             if mem_pressure { "True" } else { "False" },
@@ -1117,7 +1169,7 @@ mod tests {
             {"type": "NetworkUnavailable", "status": "False", "reason": "CiliumIsUp",
              "lastHeartbeatTime": "t0", "lastTransitionTime": "t0"}
         ]);
-        let merged = merge_owned_conditions(existing.as_array().unwrap(), false, false, false, "t1");
+        let merged = merge_owned_conditions(existing.as_array().unwrap(), false, false, false, None, "t1");
         let ts = types(&merged);
         assert!(ts.contains(&"NetworkUnavailable".to_string()));
         for owned in ["Ready", "MemoryPressure", "DiskPressure", "PIDPressure"] {
@@ -1136,7 +1188,7 @@ mod tests {
         let existing = json!([
             {"type": "Ready", "status": "True", "lastHeartbeatTime": "t0", "lastTransitionTime": "t0"}
         ]);
-        let merged = merge_owned_conditions(existing.as_array().unwrap(), false, false, false, "t1");
+        let merged = merge_owned_conditions(existing.as_array().unwrap(), false, false, false, None, "t1");
         let ready = cond(&merged, "Ready");
         assert_eq!(ready["lastTransitionTime"], "t0", "transition time must not churn");
         assert_eq!(ready["lastHeartbeatTime"], "t1", "heartbeat time must advance");
@@ -1148,15 +1200,32 @@ mod tests {
         let existing = json!([
             {"type": "DiskPressure", "status": "False", "lastHeartbeatTime": "t0", "lastTransitionTime": "t0"}
         ]);
-        let merged = merge_owned_conditions(existing.as_array().unwrap(), false, true, false, "t1");
+        let merged = merge_owned_conditions(existing.as_array().unwrap(), false, true, false, None, "t1");
         let dp = cond(&merged, "DiskPressure");
         assert_eq!(dp["status"], "True");
         assert_eq!(dp["lastTransitionTime"], "t1", "flip must stamp now");
     }
 
+    /// #239: a reboot's write says NotReady (a fresh transition), the next
+    /// one Ready again (another), so the condition shows the reboot.
+    #[test]
+    fn a_reboot_flips_ready_through_not_ready() {
+        let before = json!([
+            {"type": "Ready", "status": "True", "reason": "KubeletReady", "lastHeartbeatTime": "t0", "lastTransitionTime": "t0"}
+        ]);
+        let down = merge_owned_conditions(before.as_array().unwrap(), false, false, false, Some("node rebooted"), "t1");
+        let r = cond(&down, "Ready");
+        assert_eq!((r["status"].as_str(), r["reason"].as_str()), (Some("False"), Some("KubeletNotReady")));
+        assert_eq!(r["message"], "node rebooted");
+        assert_eq!(r["lastTransitionTime"], "t1");
+        let up = merge_owned_conditions(down.as_array().unwrap(), false, false, false, None, "t2");
+        let r = cond(&up, "Ready");
+        assert_eq!((r["status"].as_str(), r["lastTransitionTime"].as_str()), (Some("True"), Some("t2")));
+    }
+
     #[test]
     fn fresh_node_gets_all_owned_conditions() {
-        let merged = merge_owned_conditions(&[], false, false, false, "t1");
+        let merged = merge_owned_conditions(&[], false, false, false, None, "t1");
         assert_eq!(types(&merged).len(), 4);
         assert_eq!(cond(&merged, "Ready")["lastTransitionTime"], "t1");
     }

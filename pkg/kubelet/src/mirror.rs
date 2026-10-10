@@ -59,6 +59,15 @@ pub fn node_uptime() -> Option<f64> {
     std::fs::read_to_string("/proc/uptime").ok()?.split_whitespace().next()?.parse().ok()
 }
 
+/// When this node booted: now less [`node_uptime`], read once (#239).
+pub fn boot_time() -> Option<chrono::DateTime<chrono::Utc>> {
+    static BOOT: std::sync::OnceLock<Option<chrono::DateTime<chrono::Utc>>> = std::sync::OnceLock::new();
+    *BOOT.get_or_init(|| {
+        let up = node_uptime()?;
+        Some(chrono::Utc::now() - chrono::Duration::milliseconds((up * 1000.0) as i64))
+    })
+}
+
 /// A node service's last exit, from assets.json (stormpump#51).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct LastExit {

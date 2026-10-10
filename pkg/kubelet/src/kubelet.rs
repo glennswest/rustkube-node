@@ -1590,7 +1590,7 @@ impl Kubelet {
             "containerStatuses": container_statuses,
             "initContainerStatuses": init_container_statuses,
             "hostIP": &self.node_ip,
-            "startTime": source["status"]["startTime"].as_str().unwrap_or(&now)
+            "startTime": start_time(source["status"]["startTime"].as_str(), crate::mirror::boot_time(), &now)
         });
 
         // **Publish why.** The kubelet already knows: `start_pod` returns the
@@ -2616,6 +2616,17 @@ const STATUS_CONFLICT_ATTEMPTS: u32 = 5;
 /// `status` written over `base`: this kubelet's fields replace the base's,
 /// the rest (admission's, the scheduler's) stay; a base `message`/`reason`
 /// goes when this report has none.
+/// A pod's `startTime`: the one it has, unless that is from before this boot
+/// (#239). A pod kept across a reboot runs again from a new sandbox, so it
+/// starts now, like a new one, rather than keeping the last boot's time.
+fn start_time(recorded: Option<&str>, booted: Option<chrono::DateTime<chrono::Utc>>, now: &str) -> String {
+    let Some(t) = recorded else { return now.to_string() };
+    let before_boot = booted.is_some_and(|b| {
+        chrono::DateTime::parse_from_rfc3339(t).is_ok_and(|t| t.with_timezone(&chrono::Utc) < b)
+    });
+    if before_boot { now.to_string() } else { t.to_string() }
+}
+
 fn merge_status(base: &Value, status: &Value) -> Value {
     let mut merged = base.as_object().cloned().unwrap_or_default();
     if status.get("message").is_none() {
@@ -2644,6 +2655,19 @@ fn status_base(source: &Value, acked: Option<&AckedStatus>) -> (Value, Option<St
 #[cfg(test)]
 mod status_base_tests {
     use super::*;
+
+    /// #239: a kept pod's startTime from before the reboot is replaced; one
+    /// from this boot is kept; none is now.
+    #[test]
+    fn a_start_time_from_before_this_boot_is_replaced() {
+        let boot = chrono::DateTime::parse_from_rfc3339("2026-10-10T14:32:00Z").unwrap().with_timezone(&chrono::Utc);
+        let now = "2026-10-10T14:32:27Z";
+        assert_eq!(start_time(Some("2026-10-10T13:03:22Z"), Some(boot), now), now);
+        assert_eq!(start_time(Some("2026-10-10T14:32:10Z"), Some(boot), now), "2026-10-10T14:32:10Z");
+        assert_eq!(start_time(None, Some(boot), now), now);
+        assert_eq!(start_time(Some("2026-10-10T13:03:22Z"), None, now), "2026-10-10T13:03:22Z", "boot unknown: kept");
+        assert_eq!(start_time(Some("garbage"), Some(boot), now), "garbage");
+    }
 
     fn pod(rv: &str, phase: &str) -> Value {
         serde_json::json!({"metadata": {"uid": "u", "resourceVersion": rv}, "status": {"phase": phase}})

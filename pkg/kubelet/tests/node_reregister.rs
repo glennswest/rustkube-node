@@ -140,3 +140,80 @@ async fn heartbeat_reports_an_unrenewed_lease() {
     let reporter = NodeReporter::new(&url, "rknode1.g8.lo");
     assert!(!reporter.heartbeat().await.unwrap());
 }
+
+/// A Node whose status the stub keeps: the last PUT's status is what the next
+/// GET answers, and Events are counted (#239).
+#[derive(Default)]
+struct Kept {
+    status: std::sync::Mutex<Value>,
+    puts: std::sync::Mutex<Vec<Value>>,
+    events: std::sync::Mutex<Vec<Value>>,
+}
+
+/// #239: a node that comes back from a reboot (its object records another boot
+/// id) writes NotReady once, with a `Rebooted` Event, and Ready on the next
+/// status update, so the Ready condition shows the reboot.
+#[tokio::test]
+async fn a_reboot_is_reported_through_not_ready() {
+    if std::fs::read_to_string("/proc/sys/kernel/random/boot_id").is_err() {
+        return; // no boot id to compare here
+    }
+    let kept = Arc::new(Kept::default());
+    *kept.status.lock().unwrap() = json!({
+        "conditions": [{"type": "Ready", "status": "True", "reason": "KubeletReady",
+                        "lastHeartbeatTime": "2026-10-10T13:03:21Z", "lastTransitionTime": "2026-10-10T13:03:21Z"}],
+        "nodeInfo": {"bootID": "00000000-0000-0000-0000-000000000000"}
+    });
+    let app = Router::new()
+        .route("/api/v1/nodes", post(|| async { (StatusCode::CONFLICT, Json(json!({"code": 409}))) }))
+        .route(
+            "/api/v1/nodes/{name}",
+            get(|State(k): State<Arc<Kept>>| async move { Json(json!({"status": k.status.lock().unwrap().clone()})) }),
+        )
+        .route(
+            "/api/v1/nodes/{name}/status",
+            put(|State(k): State<Arc<Kept>>, Json(body): Json<Value>| async move {
+                *k.status.lock().unwrap() = body["status"].clone();
+                k.puts.lock().unwrap().push(body["status"].clone());
+                StatusCode::OK
+            }),
+        )
+        .route(
+            "/api/v1/namespaces/default/events",
+            post(|State(k): State<Arc<Kept>>, Json(body): Json<Value>| async move {
+                k.events.lock().unwrap().push(body.clone());
+                (StatusCode::CREATED, Json(body))
+            }),
+        )
+        .route("/apis/coordination.k8s.io/v1/namespaces/kube-node-lease/leases/{name}", put(lease))
+        .with_state(kept.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let reporter = NodeReporter::new(&url, "rknode1.g8.lo");
+    let ready = |st: &Value| {
+        st["conditions"].as_array().unwrap().iter().find(|c| c["type"] == "Ready").unwrap().clone()
+    };
+
+    reporter.register().await.unwrap();
+    let first = kept.puts.lock().unwrap()[0].clone();
+    let r = ready(&first);
+    assert_eq!(r["status"], "False", "{r}");
+    assert_eq!(r["reason"], "KubeletNotReady");
+    assert!(r["message"].as_str().unwrap().contains("rebooted"), "{r}");
+    assert_ne!(r["lastTransitionTime"], "2026-10-10T13:03:21Z");
+    assert_ne!(first["nodeInfo"]["bootID"], "00000000-0000-0000-0000-000000000000");
+    {
+        let events = kept.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["reason"], "Rebooted");
+        assert_eq!(events[0]["involvedObject"]["kind"], "Node");
+    }
+
+    reporter.heartbeat().await.unwrap();
+    let r = ready(&kept.puts.lock().unwrap()[1]);
+    assert_eq!((r["status"].as_str(), r["reason"].as_str()), (Some("True"), Some("KubeletReady")), "{r}");
+    reporter.heartbeat().await.unwrap();
+    assert_eq!(kept.events.lock().unwrap().len(), 1, "one Rebooted per reboot");
+    assert_eq!(ready(&kept.puts.lock().unwrap()[2])["status"], "True");
+}
