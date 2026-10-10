@@ -404,21 +404,23 @@ capacity = new, both conditions removed, allocatedResourceStatuses dropped.
 2. [x] Tests (2), csi.md, status.md, CHANGELOG (1af5ece). sc-build job 8d5ba26c64: 415 kubelet unit pass. Stage golden
        golden-rustkube-node-0ee0277c7dba (stormcos#366). Closed. Live with #52's driver (stormblock-registry#99).
 
-### In progress: #241 (P2), VM multus NICs (stormvm#85: stormvm b2f88b8)
+### Done: #241 (P2), VM multus NICs (stormvm#85: stormvm b2f88b8)
 
 2026-10-10. stormvm b2f88b8 (10 commits on c7a7859, no Cargo.toml change, same stormpump f466116): `Attach::Multus
 {network, ifname, default}` (net1.. by order, eth0 for `multus: {default: true}`), `realise` bridges the sandbox's
 `ifname` to the tap on `vm<ifname>` → `Made {binding "multus", bridge, address (NAD IPAM, gateway 0.0.0.0)}`;
 `serve_dhcp_on(netns, bridge, lease)`, `snoop_tap_in(netns, tap, mac, seen)`, `sandbox_bridge`.
-1. [ ] Lock: stormvm rev c7a7859 → b2f88b8 (Cargo.toml + Cargo.lock by hand: only the rev moves).
-2. [ ] vm_network: `wants_sandbox` for Multus; PodNet records `default_network` / `attachments` (NAD name, ifname,
+1. [x] Lock: stormvm rev c7a7859 → b2f88b8 (Cargo.toml + Cargo.lock by hand: only the rev moves).
+2. [x] vm_network: `wants_sandbox` for Multus; PodNet records `default_network` / `attachments` (NAD name, ifname,
        config: DEL after a restart needs it) and `network_status`; LeaseRecord `bridge`.
-3. [ ] vm_manager: resolve each NAD (VMI namespace unless `ns/name`; missing = Waiting NetworkNotReady); default NAD's
+3. [x] vm_manager: resolve each NAD (VMI namespace unless `ns/name`; missing = Waiting NetworkNotReady); default NAD's
        ADD instead of the cluster's on eth0; then each attachment's ADD on its ifname, recorded first; DEL reverse then
        the default. resolve_nics: Multus arm (the sandbox), DHCP on `made.bridge` (secondary: no DNS/search/router),
        else `snoop_tap_in`; restore answers on the recorded bridge. network-status annotation on the launcher Pod.
-4. [ ] Tests (fake apiserver NADs, fake CNI plugins ADD/DEL order, plan arms), docs (README, networking.md),
-       CHANGELOG; sc-build; stage golden; close (live = stormvm#85's VLAN checks).
+4. [x] Tests (4 new: NAD resolution + wait, ADD/DEL order + network-status, record compat, plan), README,
+       networking.md, CHANGELOG (b4438ba). SC_BUILD_VM sc-build b4438ba: 501 kubelet unit, all suites pass. Stage golden
+       golden-rustkube-node-33c20753224a (stormcos#424; first try hit stormcentral#362's empty stormd input). Closed.
+       Live = stormvm#85's VLAN checks (VM + pod on one VLAN, two VLANs, no cross-VLAN reach).
 
 ### Done: #240 (P0), stormvm → c7a7859 (stormvm#87: pod-network VMs "stormbr0 … has no address")
 
