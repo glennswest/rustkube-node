@@ -404,6 +404,21 @@ capacity = new, both conditions removed, allocatedResourceStatuses dropped.
 2. [x] Tests (2), csi.md, status.md, CHANGELOG (1af5ece). sc-build job 8d5ba26c64: 415 kubelet unit pass. Stage golden
        golden-rustkube-node-0ee0277c7dba (stormcos#366). Closed. Live with #52's driver (stormblock-registry#99).
 
+### In progress: #239 (P1), after a keep-data reboot: kept pods' status, node Ready, new pods > 5 min
+
+2026-10-10. pvetest2 (storm-003102, 12.13-flowsdn) log store (:9094 on 192.168.31.173, `host=`, `search=`):
+- **5 min**: every CNI ADD 14:33–14:58+ failed in flowsdn's agent, `HTTP 500 No space left on device (os error 28)`;
+  the kubelet retried (~2 s) and DEL'd each failed ADD. Kernel 14:32:57: `EXT4-fs error (device ublkb0):
+  ext4_free_inode: comm flowsdn-routes: bit already cleared`. flowsdn's (or the kept volume's): file on flowsdn.
+- **'cilium' DEL**: from storm-06f96d and storm-003101 (other nodes; the store mixes hosts). Every DEL on storm-003102
+  went via 'flowsdn' (00-flowsdn.conflist, the only config there).
+- **Kept pods**: restarted (new containers, CNI ADD) but `startTime` kept (`source.startTime`), and start timing's
+  `scheduled` measured from the old bind (5346327ms). Node Ready always True, so its transition never moved.
+1. [ ] Node: the Node's `nodeInfo.bootID` ≠ this boot's → that write Ready=False (KubeletNotReady, why), Warning
+       `Rebooted` Event (upstream's); the next update Ready again (fresh transition). Test (stub apiserver).
+2. [ ] Pods: `startTime` before this boot → now; start timing: no `scheduled` for a pod bound before this boot. Tests.
+3. [ ] File flowsdn (ENOSPC); docs, CHANGELOG; sc-build; golden; close.
+
 ### Done: #236, host_nqn on sbregistry clone requests (stormblock-registry#102, stormblock#212)
 
 2026-10-10. The kubelet's only sbregistry clone request is the cluster demand (`StormpumpImages::demand`, #79; its
