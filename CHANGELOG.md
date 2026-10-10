@@ -2,6 +2,12 @@
 
 ## 2026-10-10
 
+- **fix:** A VMI on the pod network starts again (#240, stormvm#87): stormvm is pinned by `rev` at c7a7859, whose
+  bridge binding reads the sandbox's routes and interfaces from the thread's network namespace. The lock's a88c809 read
+  the node's (`/proc/net/route` is the process's), so every pod-network VM failed with "stormbr0 carries the default
+  route but has no address". The bump also brings stormvm#60 (`from_kube` refuses VMI keys it does not read, by path).
+  stormvm pins its own stormpump at f466116, so the graph has two stormpump packages (nothing crosses between them;
+  the plan's spec is versioned bytes) until stormvm#82 names the same rev as ours.
 - **fix:** A node service's mirror-pod readiness fallback (#96, used when its stormd does not answer) runs the
   golden's stormd probes, not only the retired `[process.liveness]` (#219): `[process.readiness_probe]`, then
   `[process.liveness_probe]`, then the old table, from the process named as the service first; `http_get` (200–399,
