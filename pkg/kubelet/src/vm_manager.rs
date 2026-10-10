@@ -5638,7 +5638,7 @@ mod tests {
         obj["spec"]["volumes"] = json!([{"name": "root", "containerDisk": {"image": "fedora-43"}}]);
         let vm: VmSpec = stormvm_spec::kube::from_kube(&obj).unwrap();
         let mut fresh = Vec::new();
-        let r = m.resolve_disks_with_keys(&vm, &[], &Value::Null, &mut fresh).await;
+        let r = m.resolve_disks_with_keys("u-test", &vm, &[], &Value::Null, &mut fresh).await;
         assert!(matches!(r, Err(StartFail::Failed(_))), "{r:?}");
         assert_eq!(fresh, vec!["clone-1".to_string()]);
         m.delete_volumes("web-1", &fresh).await;
@@ -5844,7 +5844,7 @@ mod tests {
         let first = vm_owned_vmi("vmi-1");
         let owner = disk_owner(&first, None);
         let spec: VmSpec = stormvm_spec::kube::from_kube(&first).unwrap();
-        let (disks, owned) = m.resolve_disks_with_keys(&spec, &[], &owner, &mut Vec::new()).await.unwrap();
+        let (disks, owned) = m.resolve_disks_with_keys("u-test", &spec, &[], &owner, &mut Vec::new()).await.unwrap();
         let root = disks[0].volume_id.clone().unwrap();
         let seed = disks[1].volume_id.clone().unwrap();
         assert_eq!(owned, vec![root.clone(), seed.clone()]);
@@ -5876,7 +5876,7 @@ mod tests {
         let second = vm_owned_vmi("vmi-2");
         let spec: VmSpec = stormvm_spec::kube::from_kube(&second).unwrap();
         let (again, _) = m
-            .resolve_disks_with_keys(&spec, &[], &disk_owner(&second, None), &mut Vec::new())
+            .resolve_disks_with_keys("u-test", &spec, &[], &disk_owner(&second, None), &mut Vec::new())
             .await
             .unwrap();
         assert_eq!(again[0].volume_id.as_deref(), Some(root.as_str()), "the same root");
@@ -5897,7 +5897,7 @@ mod tests {
         let m = disk_manager(&e, "");
         let obj = vm_owned_vmi("vmi-1");
         let spec: VmSpec = stormvm_spec::kube::from_kube(&obj).unwrap();
-        let r = m.resolve_disks_with_keys(&spec, &[], &disk_owner(&obj, None), &mut Vec::new()).await;
+        let r = m.resolve_disks_with_keys("u-test", &spec, &[], &disk_owner(&obj, None), &mut Vec::new()).await;
         match r {
             Err(StartFail::Waiting(why)) => assert!(why.contains("earlier VirtualMachine"), "{why}"),
             other => panic!("{other:?}"),
@@ -5914,7 +5914,7 @@ mod tests {
         let obj = vm_owned_vmi("vmi-1");
         let spec: VmSpec = stormvm_spec::kube::from_kube(&obj).unwrap();
         let owner = disk_owner(&obj, None);
-        m.resolve_disks_with_keys(&spec, &[], &owner, &mut Vec::new()).await.unwrap();
+        m.resolve_disks_with_keys("u-test", &spec, &[], &owner, &mut Vec::new()).await.unwrap();
         let root = e.vols.lock().unwrap().iter().find(|v| v["id"] == "r").cloned().unwrap();
         assert_eq!(root["owner"], owner);
     }

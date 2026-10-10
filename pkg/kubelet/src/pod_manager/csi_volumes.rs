@@ -123,7 +123,7 @@ impl PodManager {
     /// claim holding a disk image is not supported), staged and published as
     /// a raw block. Recorded under [`vm_holder`] of the VMI, so the pod sweep
     /// leaves it to the VM manager. The published path is the device.
-    pub(crate) async fn mount_csi_block_for_vm(
+    pub(super) async fn mount_csi_block_for_vm(
         &self,
         namespace: &str,
         vmi_uid: &str,
