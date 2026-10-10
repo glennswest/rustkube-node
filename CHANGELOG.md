@@ -2,6 +2,12 @@
 
 ## 2026-10-10
 
+- **fix:** A reboot shows on the Node and on the pods it kept (#239, pvetest2 keep-data reinstall): the first status
+  write that finds another `bootID` on the Node says Ready=False (`KubeletNotReady`) and records a Warning `Rebooted`
+  Event, and the next says Ready, so the condition's transition is this boot's (it stayed at the previous boot's). A
+  pod whose `startTime` is from before this boot gets the time it starts again in this one, and its start timing has
+  no `scheduled` (it read `scheduled=5346327ms`, the hour since its bind). The 5 minutes new pods waited were flowsdn's
+  CNI ADD answering 500 ENOSPC (flowsdn#374); the 'cilium' DEL in the report was another node's log line.
 - **feat:** The kubelet's clone request to sbregistry (the cluster demand, #79) names this node's NVMe host NQN as
   `host_nqn` when it has one (`/etc/nvme/hostnqn`, under `/hostroot` first), so the clone's export admits this host
   alone (#236, stormblock-registry#102, stormblock#212); without one nothing is sent and the engine's default holds.

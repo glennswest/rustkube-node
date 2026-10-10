@@ -147,6 +147,13 @@ from `/proc/sys/kernel/random/boot_id`, `machineID` from the node's
 kubelet's own two), `systemUUID` from `/sys/class/dmi/id/product_uuid`, and
 `osImage` from `/etc/stormcos/release/version` (or `/hostroot`'s).
 
+A reboot (#239): when the Node object records another `bootID` than this
+boot's, that status write says Ready=False (`KubeletNotReady`, naming both boot
+ids) and records upstream's Warning `Rebooted` Event on the Node; the next
+update (registration, then the 10 s heartbeat) says Ready again, so the Ready
+condition's `lastTransitionTime` is this boot's. A kubelet restart without a
+reboot (same boot id) changes nothing.
+
 `KubeletConfig::default()` has `heartbeat_interval = 10s`, `sync_interval = 2s`,
 and API URL `http://localhost:6443` (the CLI overrides that URL). These intervals
 are not CLI keys. The heartbeat is the only fixed schedule. Pods and VMIs share
