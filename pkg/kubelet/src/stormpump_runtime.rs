@@ -1818,6 +1818,9 @@ pub struct StormpumpImages {
     /// The release manifest's text, when given rather than read from the
     /// node (`RELEASE_MANIFESTS`): for tests of golden versions (#86).
     release_manifest: Option<String>,
+    /// This node's NVMe host NQN (#236), sent as `host_nqn` on a clone
+    /// request so the clone's export admits this host alone (stormblock#212).
+    host_nqn: Option<String>,
 }
 
 /// Find `argv0` on the standard PATH *inside* an image root.
@@ -1873,7 +1876,14 @@ impl StormpumpImages {
             pulled: Mutex::new(HashMap::new()),
             configs: Arc::default(),
             release_manifest: None,
+            host_nqn: node_host_nqn(),
         }
+    }
+
+    /// Ask for clones as this host (#236), not the node's own NQN: for tests.
+    pub fn with_host_nqn(mut self, nqn: Option<String>) -> StormpumpImages {
+        self.host_nqn = nqn;
+        self
     }
 
     /// Read golden versions (#86) against this manifest, not the node's.
@@ -1931,7 +1941,7 @@ impl StormpumpImages {
         let resp = self
             .http
             .post(&url)
-            .json(&serde_json::json!({ "golden": image }))
+            .json(&clone_request(image, self.host_nqn.as_deref()))
             .send_retrying(retry::Policy::REGISTRY)
             .await
             .map_err(|e| format!("registry {url} did not answer for {image}: {e}"))?;
@@ -2145,6 +2155,33 @@ impl StormpumpImages {
         self.configs.put_provenance(&reference, crate::image_config::provenance_of_record(&record));
         Ok(reference)
     }
+}
+
+/// Where a node keeps its NVMe host NQN, as the kubelet sees it: the node's
+/// own (`/hostroot`) first, then its own view.
+pub const HOST_NQN_FILES: [&str; 2] = ["/hostroot/etc/nvme/hostnqn", "/etc/nvme/hostnqn"];
+
+/// This node's NVMe host NQN, if it has one (#236): the first readable
+/// `nqn.`… line of [`HOST_NQN_FILES`].
+fn node_host_nqn() -> Option<String> {
+    HOST_NQN_FILES.iter().find_map(|p| host_nqn_in(&std::fs::read_to_string(p).ok()?))
+}
+
+/// The NQN in a `hostnqn` file's text.
+fn host_nqn_in(text: &str) -> Option<String> {
+    text.lines().map(str::trim).find(|l| l.starts_with("nqn.")).map(str::to_string)
+}
+
+/// A clone request to sbregistry (#236): `host_nqn` when the node has one,
+/// so the clone's export admits this host alone (stormblock-registry#102,
+/// stormblock#212). Without it the engine admits any host while
+/// `allow_any_host` is on, its default.
+fn clone_request(golden: &str, host_nqn: Option<&str>) -> serde_json::Value {
+    let mut body = serde_json::json!({ "golden": golden });
+    if let Some(n) = host_nqn {
+        body["host_nqn"] = serde_json::json!(n);
+    }
+    body
 }
 
 /// The reference a container is created from, for a registry golden record
@@ -2972,6 +3009,17 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (url, state)
+    }
+
+    /// #236: a clone request names this host when it has an NQN, and the
+    /// file's NQN is its first `nqn.` line.
+    #[test]
+    fn a_clone_request_names_this_host() {
+        let n = "nqn.2014-08.org.nvmexpress:uuid:3f1c0a5e-1111-2222-3333-444455556666";
+        assert_eq!(clone_request("registry/x:1", Some(n)), serde_json::json!({"golden": "registry/x:1", "host_nqn": n}));
+        assert_eq!(clone_request("registry/x:1", None), serde_json::json!({"golden": "registry/x:1"}));
+        assert_eq!(host_nqn_in(&format!("{n}\n")).as_deref(), Some(n));
+        assert_eq!(host_nqn_in("\n# comment\n"), None);
     }
 
     /// #86: a tag naming a golden version other than the release's is pulled
