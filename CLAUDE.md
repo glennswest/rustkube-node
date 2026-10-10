@@ -323,7 +323,7 @@ may take the log with the container. Done in code: `RuntimeService::logs_survive
 completed init kept in `PodManager::kept_inits` until `stop_pod` where removal would lose the log. Tests (1 changed,
 1 new). sc-build 90c291c0ec: 419 pass (after #196's test updates). Golden e3415aaa02e2. Closed.
 
-### Waiting on stormblock-csi#51 (+ stormcentral#362 for the golden): #157 (P3), VM disks on stormblock-csi claims: snapshot by VolumeSnapshot, restore from any leg
+### Waiting on stormblock-csi#51: #157 (P3), VM disks on stormblock-csi claims: snapshot by VolumeSnapshot, restore from any leg
 
 2026-10-10. stormstorage#49 closed (snapshots, one-node group snapshots, `source` clones); stormblock-csi still has
 `snapshots: false` for its stormstorage backend and no csi-snapshotter: filed stormblock-csi#51. stormcos#170 ships the
@@ -341,9 +341,10 @@ C. [x] Restore: those disks become claims with `dataSource: VolumeSnapshot` (cla
        size ≥ restoreSize), no node pinning: the driver serves them from whichever leg holds them. A restore whose
        disks are all CSI is not the snapshot's node's: any node may claim it (rv-guarded).
 D. [ ] Tests (5 new), README, csi.md, status.md, CHANGELOG (0b942e8, c9e168f; #243 = test callers, fixed 52dfe91).
-       SC_BUILD_VM sc-build 52dfe91: 506 kubelet unit, all suites pass. Stage golden NOT built: three tries in a row hit
-       stormcentral#362 (no stormd in the stormd input; commented). Resume: `component stage rustkube-node`, then after
-       stormblock-csi#51 + a release: snapshot a VM on a stormblock-csi claim, lose the head, restore; close.
+       SC_BUILD_VM sc-build 52dfe91: 506 kubelet unit, all suites pass. Stage: three tries hit the empty stormd input
+       (stormcentral#549); the fourth found golden-rustkube-node-3071252337cd already holding this content (kubelet
+       sha 2cbe48be… = 52dfe91's; stormcos#424). Resume after stormblock-csi#51 + a release: snapshot a VM on a
+       stormblock-csi claim, lose the head, restore; close.
 
 ### Done: #181 item 3 (stormpump#144: /run/stormpump/shutdown)
 
