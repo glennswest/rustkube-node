@@ -1517,8 +1517,8 @@ dependencies = [
  "serde_yaml",
  "sha1",
  "sha2",
- "stormpump",
- "stormpump-abi",
+ "stormpump 0.1.0 (git+https://github.com/glennswest/stormpump?branch=main)",
+ "stormpump-abi 0.1.0 (git+https://github.com/glennswest/stormpump?branch=main)",
  "stormvm-block",
  "stormvm-cloudinit",
  "stormvm-console",
@@ -2986,7 +2986,17 @@ source = "git+https://github.com/glennswest/stormpump?branch=main#cc878b9a224bc6
 dependencies = [
  "libc",
  "stormcast",
- "stormpump-abi",
+ "stormpump-abi 0.1.0 (git+https://github.com/glennswest/stormpump?branch=main)",
+]
+
+[[package]]
+name = "stormpump"
+version = "0.1.0"
+source = "git+https://github.com/glennswest/stormpump?rev=f466116e0e280aac7bf1477308369e8fe3449bd0#f466116e0e280aac7bf1477308369e8fe3449bd0"
+dependencies = [
+ "libc",
+ "stormcast",
+ "stormpump-abi 0.1.0 (git+https://github.com/glennswest/stormpump?rev=f466116e0e280aac7bf1477308369e8fe3449bd0)",
 ]
 
 [[package]]
@@ -2995,9 +3005,14 @@ version = "0.1.0"
 source = "git+https://github.com/glennswest/stormpump?branch=main#cc878b9a224bc6faf1843d161524dee6c434e534"
 
 [[package]]
+name = "stormpump-abi"
+version = "0.1.0"
+source = "git+https://github.com/glennswest/stormpump?rev=f466116e0e280aac7bf1477308369e8fe3449bd0#f466116e0e280aac7bf1477308369e8fe3449bd0"
+
+[[package]]
 name = "stormvm-block"
 version = "0.10.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#a88c8093f97eff3fcc13603a097a9925a20b2017"
+source = "git+https://github.com/glennswest/stormvm?rev=c7a7859f88bb205506a8ebf9cae2f1957112bf7d#c7a7859f88bb205506a8ebf9cae2f1957112bf7d"
 dependencies = [
  "serde",
  "serde_json",
@@ -3008,7 +3023,7 @@ dependencies = [
 [[package]]
 name = "stormvm-cloudinit"
 version = "0.10.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#a88c8093f97eff3fcc13603a097a9925a20b2017"
+source = "git+https://github.com/glennswest/stormvm?rev=c7a7859f88bb205506a8ebf9cae2f1957112bf7d#c7a7859f88bb205506a8ebf9cae2f1957112bf7d"
 dependencies = [
  "serde",
  "serde_json",
@@ -3019,7 +3034,7 @@ dependencies = [
 [[package]]
 name = "stormvm-console"
 version = "0.10.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#a88c8093f97eff3fcc13603a097a9925a20b2017"
+source = "git+https://github.com/glennswest/stormvm?rev=c7a7859f88bb205506a8ebf9cae2f1957112bf7d#c7a7859f88bb205506a8ebf9cae2f1957112bf7d"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
@@ -3031,6 +3046,7 @@ dependencies = [
  "stormvm-control",
  "stormvm-net",
  "stormvm-node",
+ "stormvm-spec",
  "stormvm-vmm",
  "tokio",
  "tracing",
@@ -3039,7 +3055,7 @@ dependencies = [
 [[package]]
 name = "stormvm-control"
 version = "0.10.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#a88c8093f97eff3fcc13603a097a9925a20b2017"
+source = "git+https://github.com/glennswest/stormvm?rev=c7a7859f88bb205506a8ebf9cae2f1957112bf7d#c7a7859f88bb205506a8ebf9cae2f1957112bf7d"
 dependencies = [
  "serde",
  "serde_json",
@@ -3051,7 +3067,7 @@ dependencies = [
 [[package]]
 name = "stormvm-net"
 version = "0.10.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#a88c8093f97eff3fcc13603a097a9925a20b2017"
+source = "git+https://github.com/glennswest/stormvm?rev=c7a7859f88bb205506a8ebf9cae2f1957112bf7d#c7a7859f88bb205506a8ebf9cae2f1957112bf7d"
 dependencies = [
  "libc",
  "stormvm-spec",
@@ -3062,14 +3078,14 @@ dependencies = [
 [[package]]
 name = "stormvm-node"
 version = "0.10.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#a88c8093f97eff3fcc13603a097a9925a20b2017"
+source = "git+https://github.com/glennswest/stormvm?rev=c7a7859f88bb205506a8ebf9cae2f1957112bf7d#c7a7859f88bb205506a8ebf9cae2f1957112bf7d"
 dependencies = [
  "anyhow",
  "libc",
  "serde",
  "serde_json",
- "stormpump",
- "stormpump-abi",
+ "stormpump 0.1.0 (git+https://github.com/glennswest/stormpump?rev=f466116e0e280aac7bf1477308369e8fe3449bd0)",
+ "stormpump-abi 0.1.0 (git+https://github.com/glennswest/stormpump?rev=f466116e0e280aac7bf1477308369e8fe3449bd0)",
  "stormvm-block",
  "stormvm-cloudinit",
  "stormvm-net",
@@ -3082,17 +3098,17 @@ dependencies = [
 [[package]]
 name = "stormvm-ring"
 version = "0.10.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#a88c8093f97eff3fcc13603a097a9925a20b2017"
+source = "git+https://github.com/glennswest/stormvm?rev=c7a7859f88bb205506a8ebf9cae2f1957112bf7d#c7a7859f88bb205506a8ebf9cae2f1957112bf7d"
 dependencies = [
- "stormpump",
- "stormpump-abi",
+ "stormpump 0.1.0 (git+https://github.com/glennswest/stormpump?rev=f466116e0e280aac7bf1477308369e8fe3449bd0)",
+ "stormpump-abi 0.1.0 (git+https://github.com/glennswest/stormpump?rev=f466116e0e280aac7bf1477308369e8fe3449bd0)",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "stormvm-spec"
 version = "0.10.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#a88c8093f97eff3fcc13603a097a9925a20b2017"
+source = "git+https://github.com/glennswest/stormvm?rev=c7a7859f88bb205506a8ebf9cae2f1957112bf7d#c7a7859f88bb205506a8ebf9cae2f1957112bf7d"
 dependencies = [
  "serde",
  "serde_json",
@@ -3103,7 +3119,7 @@ dependencies = [
 [[package]]
 name = "stormvm-vmm"
 version = "0.10.0"
-source = "git+https://github.com/glennswest/stormvm?branch=main#a88c8093f97eff3fcc13603a097a9925a20b2017"
+source = "git+https://github.com/glennswest/stormvm?rev=c7a7859f88bb205506a8ebf9cae2f1957112bf7d#c7a7859f88bb205506a8ebf9cae2f1957112bf7d"
 dependencies = [
  "serde",
  "stormvm-cloudinit",
