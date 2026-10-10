@@ -404,6 +404,13 @@ capacity = new, both conditions removed, allocatedResourceStatuses dropped.
 2. [x] Tests (2), csi.md, status.md, CHANGELOG (1af5ece). sc-build job 8d5ba26c64: 415 kubelet unit pass. Stage golden
        golden-rustkube-node-0ee0277c7dba (stormcos#366). Closed. Live with #52's driver (stormblock-registry#99).
 
+### In progress: #236, host_nqn on sbregistry clone requests (stormblock-registry#102, stormblock#212)
+
+2026-10-10. The kubelet's only sbregistry clone request is the cluster demand (`StormpumpImages::demand`, #79; its
+clone is deleted at once); container roots are engine clones over ublk (#104), no NVMe export. Add `host_nqn` (the
+node's `/etc/nvme/hostnqn`, seen at `/hostroot/etc/nvme/hostnqn`, read once; omitted when there is none) to that body.
+Test with the fake registry, docs, CHANGELOG; sc-build; golden; close.
+
 ### Done: #21 (P2), cadvisor's library for node / machine / filesystem stats and eviction signals
 
 2026-10-09. Resumed the branch rebased (wip/21-rebased): cadvisor pinned by full rev afb46a0e…, lock from a build
