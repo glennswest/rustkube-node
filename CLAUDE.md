@@ -404,18 +404,19 @@ capacity = new, both conditions removed, allocatedResourceStatuses dropped.
 2. [x] Tests (2), csi.md, status.md, CHANGELOG (1af5ece). sc-build job 8d5ba26c64: 415 kubelet unit pass. Stage golden
        golden-rustkube-node-0ee0277c7dba (stormcos#366). Closed. Live with #52's driver (stormblock-registry#99).
 
-### In progress: #219 (P0), node_health's fallback reads stormd's probe tables
+### Done: #219 (P0), node_health's fallback reads stormd's probe tables
 
 2026-10-10. stormd (probes.rs, stormd#48) retired `[process.liveness]` (parsed, never acted on); goldens move to
 `[process.readiness_probe]` / `liveness_probe` / `startup_probe` (Kubernetes fields: `http_get {path, port, host,
 scheme, http_headers}`, `tcp_socket {port, host}`, `exec`, `grpc`; period 10, timeout 1, failure 3, success 1;
 camelCase aliases). `node_health::liveness_url` reads only the old table, so a golden on the new ones has no check.
-1. [ ] node_health: parse the config as TOML (`toml`, already in the lock via stormvm-spec); per `[[process]]` (the one
+1. [x] node_health: parse the config as TOML (`toml`, already in the lock via stormvm-spec); per `[[process]]` (the one
        named as the asset first) readiness_probe, then liveness_probe, then the old liveness http url; `http_get` =
        GET (200–399, no redirects, any cert, as stormd/upstream), `tcp_socket` = connect; exec/grpc not probed, said
        once. The probe's period/timeout/failure/success thresholds; the loop ticks 1 s, probes each when due.
-2. [ ] Tests (each shape, old+new together, exec, thresholds); docs (README, api/configuration if named); CHANGELOG;
-       sc-build; stage golden; close.
+2. [x] Tests (8 new/changed), README, CHANGELOG (7318d26). SC_BUILD_VM sc-build 7318d26: 497 kubelet unit pass, all
+       suites. Stage golden golden-rustkube-node-60ab11be0d6f (stormcos#424). Closed. Live: a node whose stormd API does
+       not answer, a golden on `[process.readiness_probe]`: its mirror goes not ready when the port is refused.
 
 ### Done: #239 (P1), after a keep-data reboot: kept pods' status, node Ready, new pods > 5 min
 
