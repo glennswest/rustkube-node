@@ -58,6 +58,15 @@ by #51.
 
 ## Work plan
 
+### In progress: #102 (P1), turbomode acceptance on C2NR0Q2 (owner via master, 10-13: option A, wait for the Dell)
+
+2026-10-13 ~20:45Z. The Dell's `tests` valve is open again (`valve list` shows only buildvms drains); C2NR0Q2 is
+installing 12.21. A run there (94caeb79d0, stormcos_qa 22a4f567f886) errored: apiserver no /readyz in 10 min (the
+install was not done). Doing: queue `stormcentral test run stormcos_qa turbomode --tag C2NR0Q2 --no-wait` (waits behind
+the install in the machine's line), read it with `test show`, compare with the Dell's 11.50/11.51 baseline (container
+start 20.8/21.2 s, claim 75.5/67.2 s; the target is warm start ≤ 2 s / claim ≤ 1 s, #95), post on #102, close if met.
+pvetest1 data point (not gating): a5c0e611fe (12.21) running.
+
 ### Done: #247 (P1), hot-add and remove a running VMI's disks (stormvm#23)
 
 2026-10-13. stormvm main 7a7baf2 (c185f4b: `Machine::add_disk(&HotDisk)` on a free `hpN` / `scsi0.0` / chv
