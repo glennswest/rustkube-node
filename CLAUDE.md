@@ -13,7 +13,7 @@ stage golden through `stormcentral component stage rustkube-node`, not a package
 
 ## Current implementation reference (2026-10-09)
 
-Main baseline: 97754e7 (latest stage golden golden-rustkube-node-d814f8ef6f80, stormcos#424; every git dependency by rev, #210). See
+Main baseline: 436bd8b (latest stage golden golden-rustkube-node-b62d1f3a06bf, stormcos#424; every git dependency by rev, #210). See
 `docs/status.md` for changes since October 2, the owner's recorded decisions and issue-backed limitations,
 `docs/configuration.md` for every CLI/env/default, `docs/api.md` for ports and actual routes, `docs/retries.md`
 for every remote call's retry policy. CLI runtime defaults to native; stormcos explicitly chooses stormpump.
@@ -58,17 +58,19 @@ by #51.
 
 ## Work plan
 
-### In progress: #187 (P3), VirtualMachineSnapshot status: the step, the disks and the size (stormvm#45)
+### Done: #187 (P3), VirtualMachineSnapshot status: the step, the disks and the size (stormvm#45)
 
 2026-10-13. The lock's stormvm (7a7baf2) has `take_with_progress` (console and control), `Step::as_str`,
 `console::snapshot::detail`, `spec::snapshot_status_with`. Doing in vm_snapshot.rs:
-1. [ ] `TakeFn` gains a `Progress` (`Fn(&'static str)`); `stormvm_take` and the CSI path use `take_with_progress`;
+1. [x] `TakeFn` gains a `Progress` (`Fn(&'static str)`); `stormvm_take` and the CSI path use `take_with_progress`;
        `Taken.detail` (`SnapshotDetail`: console's `detail` for stormblock-only; for #157 the group's disks plus the CSI
        disks, size only when every member's is known).
-2. [ ] The spawn site: each step → a writer task merge-patching `status["storm.io/step"]` (InProgress), joined before
+2. [x] The spawn site: each step → a writer task merge-patching `status["storm.io/step"]` (InProgress), joined before
        `finish`, which writes `snapshot_status_with(result, detail)`.
-3. [ ] Tests (steps written in order then the result's step/included/excluded/size; a failed pause reads Failed +
+3. [x] Tests (steps written in order then the result's step/included/excluded/size; a failed pause reads Failed +
        `freezing`), README, CHANGELOG; sc-build; golden; close.
+       Done: 436bd8b. SC_BUILD_VM sc-build (job 18d7603741): 519 kubelet unit, all suites pass. Stage golden
+       golden-rustkube-node-b62d1f3a06bf (stormcos#424). Closed. Live: needs the CRDs (stormcos#170) and a running VM.
 
 ### Done: #249 (P1), can the kubelet start a `stormpump://` asset pod? (stormcos#547: a second sshd on :22)
 
