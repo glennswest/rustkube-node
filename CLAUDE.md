@@ -68,8 +68,9 @@ apiserver hiccup holds the probe. The ring's blocking calls are all in spawn_blo
 1. [x] server.rs: TokenReview answers cached by token SHA-256 (ok 2 min = upstream's webhook TTL, refused 10 s);
        review bounded (2 tries × 3 s, outer timeout), unanswered/failed = 503 + Retry-After, not cached; WARN when the
        token check or the answer takes > 1 s, naming which. 3 tests (cache, 500 → 503 uncached, hung apiserver < 9 s).
-2. [ ] Docs (api.md, README, retries.md), CHANGELOG; sc-build; stage golden; close. Not done: SubjectAccessReview
-       (stormcos's API-HEALTH.md says the kubelet authorises through it; it does not): filed separately.
+2. [x] Docs (api.md, README, retries.md), CHANGELOG (66ad8de). sc-build 66ad8de: 37 server tests pass (3 new).
+3. [ ] Full suite + clippy on server.rs; stage golden; close. Not done: SubjectAccessReview
+       (stormcos's API-HEALTH.md says the kubelet authorises through it; it does not yet): #180.
 
 ### Done: documentation refresh from code since 2026-10-02 (#54-style audit; #166, #220)
 
