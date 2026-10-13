@@ -1095,7 +1095,7 @@ is live GETs already.
 2026-10-07. de51950: README, BUILD.md, status.md, presentation, CLAUDE.md (flowsdn owns Services in its edition,
 #145; checked against stormcos main). sc-build: deck renders (12 slides), `cargo build --locked` ok. Closed.
 
-### Waiting on stormcentral#526: #61, short, medium and long test suites (stormcentral docs/test-standard.md)
+### Waiting on stormcos#129 (pvetest installs): #61, short, medium and long test suites (stormcentral docs/test-standard.md)
 
 2026-10-06. `test/` has medium's storage cases (#64, #59, #62, #67); short and long are one skip each. The
 runner's namespace Role is `*`; cluster reads come from `test/requires.toml` (only [medium] declares `nodes`, which
@@ -1131,6 +1131,11 @@ every suite needs to resolve STORM_NODE). Pods are pinned with `spec.nodeName` (
        stormcos_qa turbomode 630379c31b failed there). Test crate passes on a build VM (28 tests). #97 proposed after
        stormcentral#521; fff1f4d9d9 reached `running` but its log was lost with the Dell's apiserver.
        #521 closed early; #61 and #97 proposed after stormcentral#526 (test-image builds still go to dev).
+       2026-10-13: short passes on C2NR0Q2 (4fe3fb250e … 10f84b5467, 4/0/0 each; #97 closed). Medium's last runs
+       (1239d5335f Dell, 17983aa5e3 pvetest1, 26bab08, 10-08) predate #217's drain fix (the runner deleted itself).
+       No medium/long run possible: owner closed every machine's `tests` valve but pvetest (10-10), and pvetest1/2's
+       12.16 installs failed (Fedora-44 VM image never arrived: stormcos#129). #61 proposed after stormcos#129;
+       then `stormcentral test run rustkube-node medium --tag pvetest1`, long at night, close on their results.
 
 ### Unblocked, next: #171 (P2), fsGroup / supplementalGroups onto the engine
 

@@ -812,6 +812,7 @@
 ## [Unreleased]
 
 ### 2026-10-13
+- **docs:** #61's work plan: short passes live; medium/long wait on a pvetest install (stormcos#129).
 - **docs:** #102's work plan: the acceptance run is blocked by C2NR0Q2's closed `tests` valve and by no runnable pve VM; owner asked which machine to use.
 
 ### 2026-09-29
