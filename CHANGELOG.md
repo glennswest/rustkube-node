@@ -2,6 +2,14 @@
 
 ## 2026-10-13
 
+- **feat:** A combustion VM's seed disk is combustion's volume (#245, stormvm#63). stormvm d16a49b → def7521 (e67a34a
+  delivers combustion on the seed disk and drops its `CombustionNotDelivered` refusal), and in the same change the
+  kubelet writes the seed through `stormvm_cloudinit::medium`: a VMI with `storm.io/combustion` and a
+  `cloudInitNoCloud` volume gets a vfat volume labelled `combustion` holding `/combustion/script`, with `keep_case`
+  (stormblock#326, 62caa6e, needed on the node); any other VMI the NoCloud `CIDATA` seed as before (no `keep_case`, so
+  an older engine still takes it). A VM whose provisioning reads no seed (ignition, storm) is refused before the volume
+  is made. README.
+
 - **build:** Every git dependency is pinned by `rev`, transitive ones included (#210, stormcentral#571's SBOM check).
   stormpump and stormpump-abi move from `branch = "main"` (cc878b9) to `rev = 9877a97` (stormpump main of 10-10, which
   pins stormcast 3cec734 by rev, stormpump#123); every stormvm crate moves b2f88b8 → d16a49b (stormvm main, which pins

@@ -3147,7 +3147,8 @@ impl VmManager {
     }
 
 
-    /// Build this VM's cloud-init seed.
+    /// Build this VM's seed disk: cloud-init's, or combustion's script for a
+    /// combustion guest ([`stormvm_cloudinit::medium`], #245).
     ///
     /// **A cloud image has no password and no keys**, by design: it becomes
     /// *this* machine by reading a seed. The seed is a small **vfat** volume
@@ -3183,6 +3184,12 @@ impl VmManager {
             }
         }
 
+        // What the disk holds depends on the guest (#245, stormvm#63): NoCloud's
+        // files under `CIDATA` for cloud-init, the script under `combustion`
+        // (case kept) for combustion. Asked before anything is made, so a VM
+        // with no seed to write (ignition, storm) leaves nothing behind.
+        let medium = stormvm_cloudinit::medium(vm, &seed).map_err(|e| format!("the seed disk {disk}: {e}"))?;
+
         // 16 MiB: the files are a few hundred bytes, and FAT16 needs enough
         // clusters to be FAT16 at all. Thin, so it costs what it holds.
         let name = stormvm_node::start::volume_name(vm, disk);
@@ -3208,16 +3215,8 @@ impl VmManager {
             .ok_or_else(|| format!("stormblock returned no volume: {v}"))?
             .to_string();
 
-        let files: Vec<Value> = seed
-            .files()
-            .into_iter()
-            .map(|(name, contents)| json!({ "path": name, "contents": contents }))
-            .collect();
         if let Err(e) = self
-            .post(
-                &format!("{}/api/v1/volumes/{id}/cidata", self.storage),
-                &json!({ "files": files, "label": "CIDATA" }),
-            )
+            .post(&format!("{}/api/v1/volumes/{id}/cidata", self.storage), &medium.body())
             .await
         {
             // Made here and unusable: not left behind for the next try (#76).
@@ -5720,6 +5719,8 @@ mod tests {
         vols: Arc<std::sync::Mutex<Vec<Value>>>,
         cloned: Arc<std::sync::Mutex<Vec<Value>>>,
         deleted: Arc<std::sync::Mutex<Vec<String>>>,
+        /// Each seed write's body (`POST /api/v1/volumes/{id}/cidata`).
+        seeded: Arc<std::sync::Mutex<Vec<Value>>>,
     }
 
     async fn disk_engine(vols: Vec<Value>, owners: Vec<(&'static str, u16, Value)>) -> DiskEngine {
@@ -5730,7 +5731,8 @@ mod tests {
         let cloned: Shared<Vec<Value>> = Arc::default();
         let deleted: Shared<Vec<String>> = Arc::default();
         let (v1, v2, v3, v4, v5) = (vols.clone(), vols.clone(), vols.clone(), vols.clone(), vols.clone());
-        let (c1, d1) = (cloned.clone(), deleted.clone());
+        let seeded: Shared<Vec<Value>> = Arc::default();
+        let (c1, d1, s1) = (cloned.clone(), deleted.clone(), seeded.clone());
         let mut app = axum::Router::new()
             .route(
                 "/api/v1/volumes",
@@ -5795,7 +5797,16 @@ mod tests {
                     }
                 }),
             )
-            .route("/api/v1/volumes/{id}/cidata", post(|| async { axum::Json(json!({})) }));
+            .route(
+                "/api/v1/volumes/{id}/cidata",
+                post(move |axum::Json(b): axum::Json<Value>| {
+                    let s = s1.clone();
+                    async move {
+                        s.lock().unwrap().push(b);
+                        axum::Json(json!({}))
+                    }
+                }),
+            );
         for (path, code, body) in owners {
             app = app.route(
                 path,
@@ -5808,7 +5819,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        DiskEngine { url, vols, cloned, deleted }
+        DiskEngine { url, vols, cloned, deleted, seeded }
     }
 
     fn disk_manager(e: &DiskEngine, api: &str) -> VmManager {
@@ -5885,6 +5896,42 @@ mod tests {
         assert_ne!(again[1].volume_id.as_deref(), Some(seed.as_str()));
         let names: Vec<Value> = e.vols.lock().unwrap().iter().map(|v| v["name"].clone()).collect();
         assert_eq!(names.iter().filter(|n| **n == json!("default.web-1-cloudinit")).count(), 1);
+    }
+
+    /// #245: the seed disk is written as the guest reads it. A plain VMI's is
+    /// NoCloud under `CIDATA`, with no `keep_case` (the request an older engine
+    /// takes); one with `storm.io/combustion` is combustion's volume: label
+    /// `combustion`, `keep_case`, one file at `/combustion/script`.
+    #[tokio::test]
+    async fn the_seed_disk_is_cidata_for_cloud_init_and_combustion_for_combustion() {
+        let e = disk_engine(vec![], vec![]).await;
+        let m = disk_manager(&e, "");
+
+        let plain = vm_owned_vmi("vmi-1");
+        let spec: VmSpec = stormvm_spec::kube::from_kube(&plain).unwrap();
+        m.resolve_disks_with_keys("u-test", &spec, &[], &disk_owner(&plain, None), &mut Vec::new())
+            .await
+            .unwrap();
+        let b = e.seeded.lock().unwrap()[0].clone();
+        assert_eq!(b["label"], json!("CIDATA"), "{b}");
+        assert!(b.get("keep_case").is_none(), "{b}");
+        let paths: Vec<&str> = b["files"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap()).collect();
+        assert!(paths.contains(&"/user-data") && paths.contains(&"/meta-data"), "{paths:?}");
+
+        let mut comb = vm_owned_vmi("vmi-2");
+        comb["metadata"]["name"] = json!("suse-1");
+        comb["metadata"]["annotations"] = json!({"storm.io/combustion": "#!/bin/bash\necho root:x | chpasswd\n"});
+        let spec: VmSpec = stormvm_spec::kube::from_kube(&comb).unwrap();
+        m.resolve_disks_with_keys("u-test", &spec, &[], &disk_owner(&comb, None), &mut Vec::new())
+            .await
+            .unwrap();
+        let b = e.seeded.lock().unwrap()[1].clone();
+        assert_eq!(b["label"], json!("combustion"), "{b}");
+        assert_eq!(b["keep_case"], json!(true), "{b}");
+        let files = b["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1, "{b}");
+        assert_eq!(files[0]["path"], json!("/combustion/script"));
+        assert!(files[0]["contents"].as_str().unwrap().contains("chpasswd"), "{b}");
     }
 
     /// A VM deleted and made again under its name is a new machine: the old

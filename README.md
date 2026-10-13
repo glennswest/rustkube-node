@@ -519,7 +519,7 @@ Each volume of a VMI becomes a stormblock volume attached here:
 | VMI volume | Disk | Deleted with the VM |
 |---|---|---|
 | `dataVolume` / `containerDisk` | `<ns>.<vmi>-<disk>`, a clone of the named golden made on the first start and reattached on every later one | yes |
-| `cloudInitNoCloud` | `<ns>.<vmi>-<disk>`, a generated `cidata` seed, made again on each start (the old one is replaced) | yes |
+| `cloudInitNoCloud` | `<ns>.<vmi>-<disk>`, a generated seed, made again on each start (the old one is replaced): NoCloud's files under `CIDATA`, or, on a VMI with `storm.io/combustion`, combustion's volume (label `combustion`, case kept, `/combustion/script`; stormblock#326 on the node). Which one is `stormvm_cloudinit::medium` (#245); an `ignition`/`storm` VM's seed disk is refused before anything is made | yes |
 | `emptyDisk: {capacity}` | a blank volume `<ns>.<vmi>-<disk>`, reused if it already exists | yes |
 | `persistentVolumeClaim: {claimName}` | the claim's volume, resolved exactly as for a pod (a bound claim uses its volume, an unbound `stormblock` claim is provisioned) | no, it belongs to the claim |
 
