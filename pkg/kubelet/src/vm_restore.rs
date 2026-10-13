@@ -598,6 +598,15 @@ mod tests {
                         }
                         "PATCH" => {
                             w.lock().unwrap().push(format!("PATCH {path} {body}"));
+                            // A merge of what the kubelet patches: annotations and finalizers.
+                            if let Some(o) = s.get_mut(&path) {
+                                for (k, v) in body["metadata"]["annotations"].as_object().into_iter().flatten() {
+                                    o["metadata"]["annotations"][k] = v.clone();
+                                }
+                                if !body["metadata"]["finalizers"].is_null() {
+                                    o["metadata"]["finalizers"] = body["metadata"]["finalizers"].clone();
+                                }
+                            }
                             (StatusCode::OK, axum::Json(json!({})))
                         }
                         _ => (StatusCode::NOT_FOUND, axum::Json(json!({}))),
