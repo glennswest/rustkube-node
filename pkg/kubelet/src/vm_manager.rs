@@ -2841,8 +2841,8 @@ impl VmManager {
                 stormvm_net::Attach::Pod(_) | stormvm_net::Attach::Multus { .. } => pod.map(|n| n.netns.as_str()),
                 stormvm_net::Attach::Bridge(_) => None,
             };
-            let made = stormvm_net::realise(p, sandbox, RUN_ROOT)?;
-            if let Some(fd) = made.fd {
+            let mut made = stormvm_net::realise(p, sandbox, RUN_ROOT)?;
+            if let Some(fd) = made.fd.take() {
                 // Before the spawn: the engine resolves `Spec.fds` against
                 // what was already deposited, so a descriptor that arrives
                 // later is a name nobody deposited and the guest starts with
