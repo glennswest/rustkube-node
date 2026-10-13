@@ -811,6 +811,9 @@
 
 ## [Unreleased]
 
+### 2026-10-13
+- **docs:** #102's work plan: the acceptance run is blocked by C2NR0Q2's closed `tests` valve and by no runnable pve VM; owner asked which machine to use.
+
 ### 2026-09-29
 - **docs:** Recheck #53 and record the unanswered restore decision on #109 as
   its work-plan blocker; preserve existing snapshot verification separately.

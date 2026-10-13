@@ -29,7 +29,7 @@ current deployment guarantees. Owner decisions answered: #106 (Pods under one pa
 (`<volume>-<node>`, done), #108 (class size at bind, done), #109 (option A, done), #110/#158 (C2NR0Q2's day
 suite is the acceptance, #102), #104 (A), #3 (no NotReady gating; #201), #68 (stormblock-csi owns replicas),
 #159 (RAID leg on the destination, #40 after stormstorage#44), stormimds#12 (stormimds asks `/vmInstance`).
-Waiting on the owner: #13/#221, #86.
+Waiting on the owner: #102 (acceptance machine: the Dell's tests valve is closed).
 
 ## Build and test
 
@@ -1517,6 +1517,9 @@ waits on the master installing the release (stormcos#164) = #102.
        #102 proposed after stormcentral#521; rerun then. #521 closed before the build-VM stormcentral installed (plain
        sc-build still went to dev at ~13:45Z): #102 and #97 re-proposed after stormcentral#526 (test-image builds),
        #165 after stormcentral#527 (component stage).
+       2026-10-13: #526 closed, but the owner closed C2NR0Q2's `tests` valve on 10-10 ("tests on pvetest machines
+       only", shelf formats); pvetest1/2 refuse runs (12.16 installs failed). Asked on #102: A wait for the Dell's
+       valve (recommended), B pve VM absolute check, C open the valve for one run. `wait-owner` run.
    Stage golden golden-rustkube-node-e8bca700a793 (bba7d54), release request stormcos#164.
 
 ### Done: #101, events and explicit deadlines instead of sync ticks
