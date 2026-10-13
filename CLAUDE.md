@@ -154,7 +154,15 @@ kube-proxy's apiserver client, the test container's `Api`.
        fixed). `cd test && cargo test --locked && cargo build --release --locked` at a333c3a: 29 pass, release builds.
        Stage golden golden-rustkube-node-00d7475efba3 (105be87), release request stormcos#424. Closed.
 
-### Waiting on stormvm#82 (after stormpump#123): #210, git dependencies pinned by rev (stormcentral#571's SBOM refusal)
+### In progress: #210, git dependencies pinned by rev (stormcentral#571's SBOM refusal)
+
+2026-10-13. Both upstream pins landed: stormpump#123 (272470b pins stormcast 3cec734), stormvm#82 (5f724c4 pins
+stormpump + stormpump-abi at 9877a97). Doing, on branch wip/210: stormpump/stormpump-abi `rev = 9877a97…`, every
+stormvm crate `rev = d16a49b…` (stormvm main; after b2f88b8 only the pin and stormvm-verify changed); the lock from a
+build VM (`cargo metadata`, Cargo.lock carried back with SC_BUILD_OUT); check one stormpump and every git source
+`?rev=`; sc-build `--locked`; merge, CHANGELOG, golden, close.
+
+(earlier)
 
 2026-10-08. stormcentral's `sbom` reads `cargo metadata` and refuses any resolved git package whose source has no
 `rev=`, transitive ones included. Ours: stormpump 13cf2c9, stormvm 180fa13 (direct, `branch = "main"`), stormcast
