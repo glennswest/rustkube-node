@@ -13,7 +13,7 @@ stage golden through `stormcentral component stage rustkube-node`, not a package
 
 ## Current implementation reference (2026-10-09)
 
-Main baseline: bf3d225 (latest stage golden golden-rustkube-node-c426c0ae96ed, stormcos#424; every git dependency by rev, #210). See
+Main baseline: 909962f (latest stage golden golden-rustkube-node-5265b2973b7c, stormcos#424; every git dependency by rev, #210). See
 `docs/status.md` for changes since October 2, the owner's recorded decisions and issue-backed limitations,
 `docs/configuration.md` for every CLI/env/default, `docs/api.md` for ports and actual routes, `docs/retries.md`
 for every remote call's retry policy. CLI runtime defaults to native; stormcos explicitly chooses stormpump.
@@ -58,13 +58,16 @@ by #51.
 
 ## Work plan
 
-### In progress: #245 (P3), the VM seed through stormvm_cloudinit::medium (combustion, stormvm#63)
+### Done: #245 (P3), the VM seed through stormvm_cloudinit::medium (combustion, stormvm#63)
 
 2026-10-13. stormvm e67a34a (main def7521; after d16a49b no Cargo.toml change, so only the rev moves in Cargo.toml and
 Cargo.lock) delivers combustion on the seed disk and drops `Invalid::CombustionNotDelivered`. Same commit as the bump:
 `seed_volume` asks `stormvm_cloudinit::medium(vm, &seed)` before creating the volume, then posts `medium.body()` to
 `/cidata` (cloud-init = `CIDATA` as before, no `keep_case`; combustion = `combustion`, `keep_case`, `/combustion/script`;
 ignition/storm = refused). Fake stormblock records the cidata body; test both. Docs, CHANGELOG; sc-build; golden; close.
+Done: 909962f (1 test). SC_BUILD_VM sc-build 909962f (job c4e82e8876): 510 kubelet unit, all suites pass. Stage golden
+golden-rustkube-node-5265b2973b7c (stormcos#424; combustion needs stormblock 62caa6e on the node). Closed. Live: a
+combustion VMI (openSUSE MicroOS) boots configured, after a release with both.
 
 ### Done: #244 (P1), :10250/pods stalls ~15 s once per install (stormd's API probe)
 
