@@ -5471,12 +5471,12 @@ mod tests {
 
         // Past the maxima: refused, said, and the machine runs on.
         fake.refuse.lock().unwrap().push("vcpus");
-        m.hotplug("u-1", &hot_vmi(3, 2, 8, "2Gi", &[])).await;
+        m.hotplug("u-1", &hot_vmi(3, 2, 4, "2Gi", &[])).await;
         let vm = m.vms.lock().await["u-1"].clone();
         assert_eq!(vm.phase, Phase::Running);
         let cond = vm.hot.condition.unwrap();
         assert_eq!((cond["type"].as_str(), cond["status"].as_str()), (Some("HotplugSynchronized"), Some("False")));
-        assert!(cond["message"].as_str().unwrap().contains("vCPUs 4 → 16: 16 vCPUs is past"), "{cond}");
+        assert!(cond["message"].as_str().unwrap().contains("vCPUs 4 → 8: 8 vCPUs is past"), "{cond}");
         assert_eq!(crate::vm_hotplug::load(dir.path(), "default", "vm-u-1").unwrap().vcpus, 4, "not given");
     }
 
