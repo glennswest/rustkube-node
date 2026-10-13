@@ -46,6 +46,20 @@ use tracing::{debug, info, warn};
 /// Which node took (or is taking) a snapshot.
 pub const NODE_ANNOTATION: &str = "storm.io/snapshot-node";
 
+/// The opt-in for a snapshot with the guest's memory and device state
+/// (#251, stormvm#37): `"true"` on the VirtualMachineSnapshot. KubeVirt's
+/// object has no field for it.
+pub const MEMORY_ANNOTATION: &str = "storm.io/memory";
+
+/// The finalizer a snapshot this node took carries while it has a group to
+/// delete (#251): its content goes with it, unless `spec.deletionPolicy` is
+/// `Retain` (KubeVirt's default is `Delete`).
+pub const FINALIZER: &str = "storm.io/snapshot";
+
+/// The status field naming the volume a memory snapshot's state was written
+/// to (its group member is the memory): what a restore resumes from.
+pub const STATE_VOLUME_STATUS: &str = "storm.io/stateVolume";
+
 /// The VM's disks when the snapshot was taken, as `{"<disk>": "<volume id>"}`
 /// (#53): what a restore matches the group's members to. Written with the
 /// claim, from the registration, which is gone once the VM stops.
@@ -121,6 +135,10 @@ pub struct Taken {
     /// The step it reached, the disks taken and not, and their size, for the
     /// status beyond its phase (stormvm#45, #187).
     pub detail: spec::SnapshotDetail,
+    /// A memory snapshot's state volume, the group's member that is no disk's
+    /// (#251), and the bytes of memory saved.
+    pub state_volume: Option<String>,
+    pub memory_bytes: Option<u64>,
 }
 
 impl Taken {
@@ -136,17 +154,30 @@ pub type Progress = Arc<dyn Fn(&'static str) + Send + Sync>;
 /// Takes a registered VM's snapshot under a name, with the VolumeSnapshots
 /// to make in the same hold (#157), saying each step to `Progress`. A seam
 /// for the tests: the real one needs a hypervisor and a stormblock.
+///
+/// `memory`: with the guest's memory and device state (#251).
 pub type TakeFn = Arc<
-    dyn Fn(Registration, String, Vec<Value>, Progress) -> Pin<Box<dyn Future<Output = Taken> + Send>> + Send + Sync,
+    dyn Fn(Registration, String, Vec<Value>, Progress, bool) -> Pin<Box<dyn Future<Output = Taken> + Send>>
+        + Send
+        + Sync,
 >;
 
 /// The real take, against this node's stormblock, and the apiserver for the
 /// VolumeSnapshots.
 pub fn stormvm_take(stormblock: String, api: reqwest::Client, api_url: String) -> TakeFn {
-    Arc::new(move |reg: Registration, name: String, volume_snapshots: Vec<Value>, progress: Progress| {
+    Arc::new(move |reg: Registration, name: String, volume_snapshots: Vec<Value>, progress: Progress, memory: bool| {
         let stormblock = stormblock.clone();
         let (api, api_url) = (api.clone(), api_url.clone());
         Box::pin(async move {
+            if memory && !volume_snapshots.is_empty() {
+                // The state joins the stormblock group, and a disk on another
+                // driver's claim is not in it: the two would be of different
+                // instants. Refused rather than taken without the memory.
+                return Taken::failed(
+                    "a memory snapshot (storm.io/memory) of a VM with disks on other drivers' claims is not \
+                     supported: the state and those disks would not be of one instant",
+                );
+            }
             if !volume_snapshots.is_empty() {
                 return take_with_volume_snapshots(&reg, &stormblock, &name, volume_snapshots, &api, &api_url, &progress)
                     .await;
@@ -159,16 +190,25 @@ pub fn stormvm_take(stormblock: String, api: reqwest::Client, api_url: String) -
             let (reg, stormblock, name, progress) = (&reg, &stormblock, &name, &progress);
             let taken = retry::with_backoff(retry::Policy::ENGINE.named("snapshot"), &what, |_| retry::Class::Infra, || async move {
                 let opts = stormvm_control::snapshot::Options::default();
-                let out = stormvm_console::snapshot::take_with_progress(reg, stormblock, name, opts, |step| {
-                    progress(step.as_str())
-                })
-                .await;
+                let step = |step: stormvm_control::snapshot::Step| progress(step.as_str());
+                let out = if memory {
+                    stormvm_console::snapshot::take_with_memory(reg, stormblock, name, opts, step).await
+                } else {
+                    stormvm_console::snapshot::take_with_progress(reg, stormblock, name, opts, step).await
+                };
+                // The state is the group's member that is none of the disks.
+                let disks = stormvm_console::snapshot::volumes(reg);
+                let state_volume = out.disks.as_ref().ok().filter(|_| memory).and_then(|g| {
+                    g.snapshots.iter().find(|m| !disks.contains(&m.source_volume_id)).map(|m| m.source_volume_id.clone())
+                });
                 let taken = Taken {
                     group: out.disks.as_ref().ok().map(|g| g.id.clone()),
                     volume_snapshots: Vec::new(),
                     indications: out.indications.iter().map(|s| s.to_string()).collect(),
                     error: out.error(),
                     detail: stormvm_console::snapshot::detail(reg, &out),
+                    memory_bytes: state_volume.as_ref().and(out.memory),
+                    state_volume,
                 };
                 match (&out.disks, &taken.error) {
                     (Err(_), Some(e)) if retry::class_of_message(e) == retry::Class::Infra => Err(Unreached(taken)),
@@ -246,6 +286,7 @@ async fn take_with_volume_snapshots(
         indications: out.indications.iter().map(|s| s.to_string()).collect(),
         error: out.error(),
         detail,
+        ..Default::default()
     }
 }
 
@@ -450,6 +491,14 @@ impl Snapshots {
                 .flatten();
             let key = format!("{ns}/{name}");
             let in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner()).contains(&key);
+            // Deleted (#251): its content goes once no take is running, then
+            // the object; only by the node that took it.
+            if !obj["metadata"]["deletionTimestamp"].is_null() {
+                if !in_flight && self.holds(&obj) {
+                    self.release(&obj).await;
+                }
+                continue;
+            }
             match decide(&obj, &self.node, reg.is_some(), in_flight, now) {
                 Action::Skip => {}
                 Action::Fail(why) => {
@@ -520,6 +569,15 @@ impl Snapshots {
         if csi.as_object().is_some_and(|m| !m.is_empty()) {
             meta["annotations"][VOLUME_SNAPSHOTS_ANNOTATION] = json!(csi.to_string());
         }
+        // Its content is this node's to delete with it (#251), when there is
+        // an engine to delete it with.
+        if self.restore_engine.is_some() {
+            let mut finalizers: Vec<Value> = obj["metadata"]["finalizers"].as_array().cloned().unwrap_or_default();
+            if !finalizers.contains(&json!(FINALIZER)) {
+                finalizers.push(json!(FINALIZER));
+            }
+            meta["finalizers"] = json!(finalizers);
+        }
         if let Some(rv) = obj["metadata"]["resourceVersion"].as_str() {
             meta["resourceVersion"] = json!(rv);
         }
@@ -542,6 +600,69 @@ impl Snapshots {
                 // Not an answer: no event will follow, so the pass retries.
                 apimachinery::reactor::failed();
                 false
+            }
+        }
+    }
+
+    /// This node's to finish deleting: it took it and holds its finalizer.
+    fn holds(&self, obj: &Value) -> bool {
+        obj["metadata"]["annotations"][NODE_ANNOTATION].as_str() == Some(self.node.as_str())
+            && obj["metadata"]["finalizers"].as_array().is_some_and(|f| f.contains(&json!(FINALIZER)))
+    }
+
+    /// A deleted snapshot's content (#251): its group snapshot and a memory
+    /// snapshot's state volume, unless `spec.deletionPolicy: Retain`; then the
+    /// finalizer, against the version read. A refusal keeps the finalizer and
+    /// is retried: content is never left behind unsaid. (A disk on another
+    /// driver's claim is a VolumeSnapshot the object owns: collected with it.)
+    async fn release(&self, obj: &Value) {
+        let (ns, name) = ns_name(obj);
+        let retain = obj["spec"]["deletionPolicy"].as_str() == Some("Retain");
+        if !retain {
+            let Some(engine) = self.restore_engine.clone() else { return };
+            let group = obj["status"]["virtualMachineSnapshotContentName"].as_str().unwrap_or("").to_string();
+            let state = obj["status"][STATE_VOLUME_STATUS].as_str().unwrap_or("").to_string();
+            let done = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                if !group.is_empty() {
+                    engine.delete_group(&group).map_err(|e| format!("group snapshot {group}: {e}"))?;
+                }
+                if !state.is_empty() {
+                    engine.delete_volume(&state).map_err(|e| format!("state volume {state}: {e}"))?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("the delete did not finish: {e}")));
+            if let Err(e) = done {
+                warn!("{ns}/{name}: snapshot deleted, its content not yet: {e}");
+                apimachinery::reactor::failed();
+                return;
+            }
+        }
+        let finalizers: Vec<Value> = obj["metadata"]["finalizers"]
+            .as_array()
+            .map(|f| f.iter().filter(|x| **x != json!(FINALIZER)).cloned().collect())
+            .unwrap_or_default();
+        let mut meta = json!({ "finalizers": finalizers });
+        if let Some(rv) = obj["metadata"]["resourceVersion"].as_str() {
+            meta["resourceVersion"] = json!(rv);
+        }
+        let url = format!("{}/apis/{API}/namespaces/{ns}/virtualmachinesnapshots/{name}", self.api_url);
+        match self
+            .api
+            .patch(&url)
+            .header("content-type", "application/merge-patch+json")
+            .json(&json!({ "metadata": meta }))
+            .send_retrying(retry::Policy::API)
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                info!("{ns}/{name}: snapshot deleted{}", if retain { " (content retained)" } else { " with its content" })
+            }
+            Ok(r) => debug!("{ns}/{name}: finalizer not removed: {}", r.status()),
+            Err(e) => {
+                debug!("{ns}/{name}: finalizer not removed: {e}");
+                apimachinery::reactor::failed();
             }
         }
     }
@@ -584,7 +705,8 @@ impl Snapshots {
                     }
                 })
             };
-            let taken = (me.take)(reg, name.to_string(), volume_snapshots, progress).await;
+            let memory = obj["metadata"]["annotations"][MEMORY_ANNOTATION].as_str() == Some("true");
+            let taken = (me.take)(reg, name.to_string(), volume_snapshots, progress, memory).await;
             let _ = writer.await;
             me.finish(&obj, source_uid, taken).await;
             me.in_flight.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
@@ -677,7 +799,17 @@ impl Snapshots {
             indications: taken.indications,
             error: taken.error.clone(),
         };
-        self.write_status_with(obj, &result, Some(&taken.detail)).await;
+        let mut status = spec::snapshot_status_with(&result, &taken.detail);
+        // A memory snapshot says so, and where its state is (#251): what a
+        // restore resumes from.
+        if let Some(v) = &taken.state_volume {
+            status[MEMORY_ANNOTATION] = json!(true);
+            status[STATE_VOLUME_STATUS] = json!(v);
+            if let Some(b) = taken.memory_bytes {
+                status["storm.io/memoryBytes"] = json!(b);
+            }
+        }
+        self.patch_status(obj, status).await;
         match &taken.error {
             None => {
                 let mut what = Vec::new();
@@ -699,23 +831,13 @@ impl Snapshots {
     }
 
     async fn write_status(&self, obj: &Value, r: &SnapshotResult) {
-        self.write_status_with(obj, r, None).await
+        self.patch_status(obj, spec::snapshot_status(r)).await
     }
 
     /// The step a take in progress has reached (#187): `storm.io/step` alone,
     /// so nothing else the status says is touched.
     async fn write_step(&self, obj: &Value, step: &str) {
         self.patch_status(obj, json!({ "storm.io/step": step })).await
-    }
-
-    /// The status for `r`, with the take's step, disks and size when there is
-    /// a detail (stormvm#45).
-    async fn write_status_with(&self, obj: &Value, r: &SnapshotResult, detail: Option<&spec::SnapshotDetail>) {
-        let status = match detail {
-            Some(d) => spec::snapshot_status_with(r, d),
-            None => spec::snapshot_status(r),
-        };
-        self.patch_status(obj, status).await
     }
 
     async fn patch_status(&self, obj: &Value, status: Value) {
@@ -934,7 +1056,7 @@ mod tests {
 
     /// A take that records what it was asked and answers `taken`.
     fn fake_take(taken: Taken, asked: Arc<Mutex<Vec<(String, String)>>>) -> TakeFn {
-        Arc::new(move |reg: Registration, name: String, _vs: Vec<Value>, progress: Progress| {
+        Arc::new(move |reg: Registration, name: String, _vs: Vec<Value>, progress: Progress, _memory: bool| {
             asked.lock().unwrap().push((format!("{}/{}", reg.namespace, reg.name), name));
             let t = taken.clone();
             Box::pin(async move {
@@ -1069,7 +1191,7 @@ mod tests {
         let (url, log) = apiserver(vec![snap("before", "web-1")], 200).await;
         let given: Arc<Mutex<Vec<Value>>> = Arc::default();
         let g = given.clone();
-        let take: TakeFn = Arc::new(move |_reg: Registration, _name: String, vs: Vec<Value>, _progress: Progress| {
+        let take: TakeFn = Arc::new(move |_reg: Registration, _name: String, vs: Vec<Value>, _progress: Progress, _memory: bool| {
             g.lock().unwrap().extend(vs);
             Box::pin(async {
                 Taken { group: Some("gs-1".into()), volume_snapshots: vec!["vmsnapshot-u-before-volume-data".into()], ..Default::default() }

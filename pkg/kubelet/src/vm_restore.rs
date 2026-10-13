@@ -64,6 +64,12 @@ pub trait RestoreEngine: Send + Sync {
     /// A new volume named `name` holding `member`; asking again under the
     /// same name answers the one already made.
     fn from_snapshot(&self, name: &str, member: &stormvm_block::Snapshot) -> Result<String, String>;
+    /// Delete a group snapshot (#251: a VirtualMachineSnapshot deleted). Gone
+    /// already is done.
+    fn delete_group(&self, id: &str) -> Result<(), String>;
+    /// Delete a volume (a memory snapshot's state volume). Gone already is
+    /// done.
+    fn delete_volume(&self, id: &str) -> Result<(), String>;
 }
 
 /// stormvm's client against this node's stormblock, with the engine's token.
@@ -83,6 +89,16 @@ impl RestoreEngine for Stormblock {
                 .volume_from_snapshot(name, member)
                 .map(|v| if v.name.is_empty() { name.to_string() } else { v.name })
                 .map_err(|e| e.to_string())
+        })
+    }
+    fn delete_group(&self, id: &str) -> Result<(), String> {
+        retry::blocking(retry::Policy::ENGINE, &format!("delete group snapshot {id}"), |e: &String| retry::class_of_message(e), || {
+            stormvm_block::Client::new(&self.0).delete_group_snapshot(id).map_err(|e| e.to_string())
+        })
+    }
+    fn delete_volume(&self, id: &str) -> Result<(), String> {
+        retry::blocking(retry::Policy::ENGINE, &format!("delete volume {id}"), |e: &String| retry::class_of_message(e), || {
+            stormvm_block::Client::new(&self.0).delete_volume(id).map_err(|e| e.to_string())
         })
     }
 }
@@ -546,8 +562,11 @@ mod tests {
 
     /// A stormblock with one group of members of `v-root`, `v-data`, `v-seed`.
     #[derive(Default)]
-    struct Engine {
-        made: Mutex<Vec<String>>,
+    pub(crate) struct Engine {
+        pub(crate) made: Mutex<Vec<String>>,
+        pub(crate) deleted: Mutex<Vec<String>>,
+        /// A group with a memory state member (`v-state`) too (#251).
+        pub(crate) with_state: bool,
     }
 
     impl RestoreEngine for Engine {
@@ -561,10 +580,14 @@ mod tests {
                 created_at_ms: 0,
                 group_snapshot_id: Some(id.into()),
             };
+            let mut snapshots = vec![member("v-root"), member("v-data"), member("v-seed")];
+            if self.with_state {
+                snapshots.push(member("v-state"));
+            }
             Ok((id == "g-1").then(|| stormvm_block::GroupSnapshot {
                 id: id.into(),
                 name: "web.web-1.snap".into(),
-                snapshots: vec![member("v-root"), member("v-data"), member("v-seed")],
+                snapshots,
                 ready: true,
                 created_at_ms: 0,
             }))
@@ -572,6 +595,14 @@ mod tests {
         fn from_snapshot(&self, name: &str, member: &stormvm_block::Snapshot) -> Result<String, String> {
             self.made.lock().unwrap().push(format!("{name} <- {}", member.id));
             Ok(name.to_string())
+        }
+        fn delete_group(&self, id: &str) -> Result<(), String> {
+            self.deleted.lock().unwrap().push(format!("group {id}"));
+            Ok(())
+        }
+        fn delete_volume(&self, id: &str) -> Result<(), String> {
+            self.deleted.lock().unwrap().push(format!("volume {id}"));
+            Ok(())
         }
     }
 
@@ -609,7 +640,7 @@ mod tests {
 
     fn snapshots(url: &str, engine: Arc<Engine>) -> Snapshots {
         let take: crate::vm_snapshot::TakeFn =
-            Arc::new(|_, _, _, _| Box::pin(async { crate::vm_snapshot::Taken::default() }));
+            Arc::new(|_, _, _, _, _| Box::pin(async { crate::vm_snapshot::Taken::default() }));
         Snapshots::new(reqwest::Client::new(), url, "n1", "/nonexistent", take).with_restore_engine(engine)
     }
 
