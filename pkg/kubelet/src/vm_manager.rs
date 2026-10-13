@@ -244,6 +244,7 @@ fn vm_of(reg: &stormvm_node::console::Registration) -> Vm {
         // Whatever reached its seed was decided by the kubelet that started
         // it; the agent's keys are applied again from the Secret.
         access: Access::default(),
+        hot: crate::vm_hotplug::Size::default(),
     }
 }
 
@@ -420,6 +421,9 @@ pub struct Vm {
     pub nics: Vec<NicReport>,
     /// How its SSH keys (`spec.accessCredentials`) have fared (#92).
     pub access: Access,
+    /// Its size as the status reports it, and how the last hotplug fared
+    /// (#246).
+    pub hot: crate::vm_hotplug::Size,
 }
 
 /// What became of a machine's `accessCredentials` (#92), for the
@@ -469,15 +473,15 @@ fn access_condition(prev: Option<&Value>, outcome: &Result<(), String>, now: &st
     c
 }
 
-/// `existing` conditions with the access one replaced (or added). A merge
-/// patch replaces a list whole, so the others are carried over rather than
-/// lost.
+/// `existing` conditions with `cond` replaced (or added), by its type. A
+/// merge patch replaces a list whole, so the others are carried over rather
+/// than lost.
 fn with_condition(existing: &Value, cond: &Value) -> Value {
     let mut out: Vec<Value> = existing
         .as_array()
         .map(|a| {
             a.iter()
-                .filter(|c| c["type"] != stormvm_spec::access::CONDITION)
+                .filter(|c| c["type"] != cond["type"])
                 .cloned()
                 .collect()
         })
@@ -754,11 +758,12 @@ fn note(ledger: &Ledger, uid: &str, step: Undo) {
 }
 
 /// Tap watchers dropped off the runtime: dropping one joins its thread, which
-/// can take up to a second.
-struct Watchers(Vec<(usize, stormvm_net::Snooper)>);
+/// can take up to a second. Each is keyed by its NIC's MAC, not its index: a
+/// NIC taken out of a running machine (#246) moves the ones after it.
+struct Watchers(Vec<(String, stormvm_net::Snooper)>);
 
 impl Watchers {
-    fn take(mut self) -> Vec<(usize, stormvm_net::Snooper)> {
+    fn take(mut self) -> Vec<(String, stormvm_net::Snooper)> {
         std::mem::take(&mut self.0)
     }
 }
@@ -960,7 +965,7 @@ pub struct VmManager {
     /// bridge gets its address from a DHCP server the node does not run, and
     /// the tap is the one place the node sees the lease go by. Not in [`Vm`],
     /// which is cloned freely and a watcher is not.
-    snoopers: std::sync::Mutex<HashMap<String, Vec<(usize, stormvm_net::Snooper)>>>,
+    snoopers: std::sync::Mutex<HashMap<String, Vec<(String, stormvm_net::Snooper)>>>,
     /// Where the watchers report a change, for [`Self::spawn_address_pump`]
     /// to write it to the VMI at once rather than on the next sync.
     snoop_tx: tokio::sync::mpsc::UnboundedSender<Snooped>,
@@ -994,10 +999,24 @@ pub struct VmManager {
     pod_nets: std::sync::Mutex<HashMap<String, crate::vm_network::PodNet>>,
     /// Each bridged guest's DHCP responder, held for the machine's life (#88).
     /// Not in [`Vm`], which is cloned freely, and a responder is a thread.
-    responders: std::sync::Mutex<HashMap<String, Vec<stormvm_net::Responder>>>,
+    /// Keyed by the NIC's MAC, so one taken out (#246) stops its own.
+    responders: std::sync::Mutex<HashMap<String, Vec<(String, stormvm_net::Responder)>>>,
     /// Publishes each machine's hypervisor identity for cadvisor (#84).
     identities: Option<crate::workload_identity::Publisher>,
+    /// Where each machine's hotplug record is kept (#246): the run root, so it
+    /// sits beside the machine's registration.
+    hot_dir: std::path::PathBuf,
+    /// The spec generation each running machine was last brought to (#246).
+    /// Absent: not looked at since this kubelet started (or it is settling).
+    hot_seen: std::sync::Mutex<HashMap<String, i64>>,
+    /// What each running machine was last given (#246), as recorded.
+    hot_records: std::sync::Mutex<HashMap<String, crate::vm_hotplug::Record>>,
+    /// A machine's hotplug verbs: its control socket, or a fake in tests.
+    hot_machine: HotMachine,
 }
+
+/// How the manager reaches a running machine's hotplug verbs (#246).
+type HotMachine = Arc<dyn Fn(&Vm) -> Option<Arc<dyn crate::vm_hotplug::Hotplug>> + Send + Sync>;
 
 /// What making a machine's NICs produced (#88 adds the leases and their
 /// responders).
@@ -1005,8 +1024,15 @@ struct NicsMade {
     nics: Vec<plan::ResolvedNic>,
     reports: Vec<NicReport>,
     snoopers: Watchers,
-    responders: Vec<stormvm_net::Responder>,
+    responders: Vec<(String, stormvm_net::Responder)>,
     leases: Vec<crate::vm_network::LeaseRecord>,
+}
+
+/// One NIC's watcher, DHCP responder and lease, each keyed by its MAC.
+struct NicServed {
+    snooper: Option<(String, stormvm_net::Snooper)>,
+    responder: Option<(String, stormvm_net::Responder)>,
+    lease: Option<crate::vm_network::LeaseRecord>,
 }
 
 /// A failed start waiting for its next try (#76).
@@ -1028,6 +1054,48 @@ const AGENT_FIRST: std::time::Duration = std::time::Duration::from_secs(2);
 /// A machine adopted without an engine handle: the control socket is the
 /// only sign of life, so it is checked on this period.
 const HANDLELESS_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
+/// While a guest takes in (or gives back) memory it was asked to, its status
+/// is read again this often (#246).
+const HOT_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The NICs a machine has, for its hotplug record (#246): what the start
+/// made (`made`), or for a machine adopted with none known, what the spec
+/// plans. A secondary multus NIC carries the sandbox interface its NAD is on.
+fn nic_records(namespace: &str, spec: &VmSpec, made: &[NicReport]) -> Vec<crate::vm_hotplug::NicRecord> {
+    let defaults = stormvm_net::Defaults { uplink_bridge: DEFAULT_BRIDGE.to_string() };
+    let plans = stormvm_net::plan(namespace, &spec.name, &spec.interfaces, &defaults).unwrap_or_default();
+    let ifname = |nic: &str| {
+        plans.iter().find(|p| p.nic == nic).and_then(|p| match &p.attach {
+            stormvm_net::Attach::Multus { ifname, default: false, .. } => Some(ifname.clone()),
+            _ => None,
+        })
+    };
+    if !made.is_empty() {
+        return made
+            .iter()
+            .map(|n| crate::vm_hotplug::NicRecord {
+                name: n.name.clone(),
+                mac: n.mac.clone(),
+                binding: n.binding.clone(),
+                ifname: ifname(&n.name),
+            })
+            .collect();
+    }
+    plans
+        .iter()
+        .map(|p| crate::vm_hotplug::NicRecord {
+            name: p.nic.clone(),
+            mac: p.mac.clone(),
+            binding: match &p.attach {
+                stormvm_net::Attach::Bridge(_) => "host-bridge".to_string(),
+                stormvm_net::Attach::Pod(b) => b.as_str().to_string(),
+                stormvm_net::Attach::Multus { default: true, .. } => "bridge".to_string(),
+                stormvm_net::Attach::Multus { .. } => "multus".to_string(),
+            },
+            ifname: ifname(&p.nic),
+        })
+        .collect()
+}
 
 /// The next try of a start that is waiting (a golden, a claim): a quarter of
 /// the wait so far, between one and thirty seconds (#101).
@@ -1063,12 +1131,12 @@ fn owner_vm(obj: &Value) -> Option<&str> {
         .as_str()
 }
 
-/// A tap watcher's news: the guest behind NIC `nic` of machine `uid` now
-/// holds `addresses`.
+/// A tap watcher's news: the guest behind the NIC with MAC `mac` of machine
+/// `uid` now holds `addresses`.
 #[derive(Debug)]
 struct Snooped {
     uid: String,
-    nic: usize,
+    mac: String,
     addresses: Vec<String>,
 }
 
@@ -1143,6 +1211,12 @@ impl VmManager {
             pod_nets: Default::default(),
             responders: Default::default(),
             identities: None,
+            hot_dir: std::path::PathBuf::from(RUN_ROOT),
+            hot_seen: Default::default(),
+            hot_records: Default::default(),
+            hot_machine: Arc::new(|vm: &Vm| {
+                machine_of(vm).map(|m| Arc::new(m) as Arc<dyn crate::vm_hotplug::Hotplug>)
+            }),
         }
     }
 
@@ -1215,6 +1289,15 @@ impl VmManager {
         }
         let since = (*self.contact.lock().unwrap_or_else(|e| e.into_inner()))?.elapsed();
         (since > self.max_staleness).then_some(since)
+    }
+
+    /// Keep the hotplug records here, and reach machines through `machine`
+    /// (tests).
+    #[cfg(test)]
+    fn with_hotplug(mut self, dir: &std::path::Path, machine: HotMachine) -> VmManager {
+        self.hot_dir = dir.to_path_buf();
+        self.hot_machine = machine;
+        self
     }
 
     /// Keep the pod-network records here instead of `/run` (tests).
@@ -1354,13 +1437,14 @@ impl VmManager {
             if vm.phase.terminal() {
                 return;
             }
-            let Some(nic) = vm.nics.get(news.nic) else { return };
+            let Some(i) = vm.nics.iter().position(|n| n.mac == news.mac) else { return };
+            let nic = &vm.nics[i];
             if nic.addresses == news.addresses {
                 return;
             }
             info!(vm = %vm.name, nic = %nic.name, addresses = ?news.addresses, "guest address seen on its tap");
             vms.update(&news.uid, |vm| {
-                vm.nics[news.nic].addresses = news.addresses;
+                vm.nics[i].addresses = news.addresses;
                 if vm.ready_unix.is_none() {
                     vm.ready_unix = Some(now_unix());
                 }
@@ -1372,15 +1456,17 @@ impl VmManager {
     }
 
     /// What each NIC's tap watcher has seen, empty where there is none.
-    fn snooped_addresses(&self, uid: &str, nics: usize) -> Vec<Vec<String>> {
-        let mut out = vec![Vec::new(); nics];
+    fn snooped_addresses(&self, uid: &str, nics: &[NicReport]) -> Vec<Vec<String>> {
         let map = self.snoopers.lock().unwrap_or_else(|e| e.into_inner());
-        for (i, s) in map.get(uid).into_iter().flatten() {
-            if let Some(slot) = out.get_mut(*i) {
-                *slot = s.addresses();
-            }
-        }
-        out
+        let watched = map.get(uid);
+        nics.iter()
+            .map(|n| {
+                watched
+                    .and_then(|w| w.iter().find(|(mac, _)| *mac == n.mac))
+                    .map(|(_, s)| s.addresses())
+                    .unwrap_or_default()
+            })
+            .collect()
     }
 
     /// A Secret's SSH public keys, in the machine's namespace (#92).
@@ -1658,6 +1744,8 @@ impl VmManager {
         if !self.set_finalizer(object, true).await {
             self.due_in(uid, AGENT_FIRST);
         }
+        // A running machine follows its VMI's cpu, memory and interfaces (#246).
+        self.hotplug(uid, object).await;
         Ok(false)
     }
 
@@ -2074,10 +2162,22 @@ impl VmManager {
             nics: nic_reports,
             message: String::new(),
             access: Access { boot: boot_problems, ..Access::default() },
+            hot: crate::vm_hotplug::Size::default(),
         };
         if let Some(outcome) = access_outcome(&vm.access_credentials, &rec.access) {
             rec.access.condition = Some(access_condition(None, &outcome, &now_rfc3339()));
         }
+        // What it was given: the baseline of a later cpu, memory or interface
+        // change (#246), kept beside its registration for a restarted kubelet.
+        let given = crate::vm_hotplug::Record::from_spec(&vm, nic_records(&rec.namespace, &vm, &rec.nics));
+        rec.hot.topology = Some(crate::vm_hotplug::topology(&vm, given.vcpus));
+        rec.hot.memory = given.memory.map(|m| crate::vm_hotplug::MemoryNow { boot: m, current: m, requested: m });
+        if let Err(e) = crate::vm_hotplug::save(&self.hot_dir, &rec.namespace, &rec.name, &given) {
+            warn!(vm = %vm.name, "could not record what the machine was given: {e}");
+        }
+        self.hot_records.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), given);
+        let generation = obj["metadata"]["generation"].as_i64().unwrap_or(0);
+        self.hot_seen.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), generation);
         self.vms.lock().await.insert(uid.to_string(), rec.clone());
         let snoopers = snoopers.take();
         if !snoopers.is_empty() {
@@ -2272,7 +2372,7 @@ impl VmManager {
             // The tap watcher first of all (#91): it saw the lease, on a
             // bridge where the agent may be absent and the neighbour table
             // knows only what the node has talked to.
-            let addrs = prefer_snooped(addrs, self.snooped_addresses(&vm.uid, vm.nics.len()));
+            let addrs = prefer_snooped(addrs, self.snooped_addresses(&vm.uid, &vm.nics));
             // A NIC on the pod network holds the pod's address, known at
             // start (#88). A masqueraded guest's agent reports the private
             // address inside qemu, which nothing outside can reach.
@@ -2456,6 +2556,9 @@ impl VmManager {
             return false;
         }
         deregister(&vm.namespace, &vm.name);
+        crate::vm_hotplug::remove(&self.hot_dir, &vm.namespace, &vm.name);
+        self.hot_records.lock().unwrap_or_else(|e| e.into_inner()).remove(&vm.uid);
+        self.hot_seen.lock().unwrap_or_else(|e| e.into_inner()).remove(&vm.uid);
         self.stopping.lock().await.remove(&vm.uid);
         info!(vm = %vm.name, "vm stopped");
         true
@@ -2757,52 +2860,10 @@ impl VmManager {
                     .map_err(|e| format!("interface {nic}: {e:?}"))?;
             }
             let mac = made.address.as_ref().map(|a| a.mac.clone()).unwrap_or_else(|| p.mac.clone());
-            // A tap on one of the node's bridges: the guest's address comes
-            // from the segment's DHCP server, and the tap is where the node
-            // sees it (#91). Watched before the spawn, because a guest that
-            // DHCPs in its first second would otherwise do it unwatched. A
-            // watcher that cannot open is a warning: the machine still runs,
-            // and the agent and the neighbour table still answer.
-            // A multus NIC whose NAD has no IPAM is the same (stormvm#85): its
-            // guest asks the VLAN's own DHCP, seen on the tap in the sandbox.
-            let watch = match (made.binding, &made.address, sandbox) {
-                ("host-bridge", _, _) => Some(None),
-                ("multus", None, Some(ns)) => Some(Some(ns)),
-                _ => None,
-            };
-            if let Some(inside) = watch {
-                let (tx, id, i) = (self.snoop_tx.clone(), uid.to_string(), reports.len());
-                let seen = move |addresses: Vec<String>| {
-                    let _ = tx.send(Snooped { uid: id.clone(), nic: i, addresses });
-                };
-                let snooper = match inside {
-                    Some(ns) => stormvm_net::snoop_tap_in(ns, &p.tap, &mac, seen),
-                    None => stormvm_net::snoop_tap(&p.tap, &mac, seen),
-                };
-                match snooper {
-                    Ok(s) => snoopers.0.push((i, s)),
-                    Err(e) => warn!(vm = %vm.name, nic = %p.nic, "cannot watch {} for the guest's address: {e}", p.tap),
-                }
-            }
-            // The guest's DHCP (#88): it is told the pod's address, and
-            // nothing else answers it in the sandbox. A multus NIC whose NAD's
-            // IPAM gave an address (stormvm#85) is told it on its own bridge,
-            // with no router (stormvm's lease has gateway 0.0.0.0), DNS or
-            // name: the pod network keeps the default route and resolver.
-            if let (Some(addr), Some(ns)) = (&made.address, sandbox) {
-                let secondary = made.binding == "multus";
-                let (dns, search) = if secondary { (Vec::new(), Vec::new()) } else { self.cluster_dns(namespace) };
-                let host = (!secondary).then(|| vm.hostname.clone().filter(|h| !h.is_empty()).unwrap_or_else(|| vm.name.clone()));
-                let lease = addr.lease(dns, search, host)?;
-                let bridge = made.bridge.clone().unwrap_or_else(|| stormvm_net::SANDBOX_BRIDGE.to_string());
-                leases.push(crate::vm_network::LeaseRecord::of(reports.len(), &mac, &lease, Some(&bridge)));
-                let ns = ns.to_string();
-                let r = tokio::task::spawn_blocking(move || stormvm_net::serve_dhcp_on(&ns, &bridge, lease))
-                    .await
-                    .map_err(|e| format!("dhcp task: {e}"))?
-                    .map_err(|e| format!("interface {}: DHCP for the guest: {e}", p.nic))?;
-                responders.push(r);
-            }
+            let served = self.watch_and_serve(uid, namespace, vm, p, &made, &mac, sandbox, reports.len()).await?;
+            snoopers.0.extend(served.snooper);
+            responders.extend(served.responder);
+            leases.extend(served.lease);
             reports.push(NicReport {
                 name: p.nic.clone(),
                 mac: mac.clone(),
@@ -2828,6 +2889,74 @@ impl VmManager {
             });
         }
         Ok(NicsMade { nics: out, reports, snoopers, responders, leases })
+    }
+
+    /// A NIC's address watcher and DHCP responder, as at start (#91, #88,
+    /// stormvm#85) and for a NIC added to a running machine (#246). `index`
+    /// is the NIC's position, for its lease record.
+    #[allow(clippy::too_many_arguments)]
+    async fn watch_and_serve(
+        &self,
+        uid: &str,
+        namespace: &str,
+        vm: &VmSpec,
+        p: &stormvm_net::NicPlan,
+        made: &stormvm_net::Made,
+        mac: &str,
+        sandbox: Option<&str>,
+        index: usize,
+    ) -> Result<NicServed, String> {
+        // Wrapped so a DHCP failure below drops the watcher off the runtime.
+        let mut watched = Watchers(Vec::new());
+        let mut responder = None;
+        let mut lease_record = None;
+        // A tap on one of the node's bridges: the guest's address comes
+        // from the segment's DHCP server, and the tap is where the node
+        // sees it (#91). Watched before the spawn, because a guest that
+        // DHCPs in its first second would otherwise do it unwatched. A
+        // watcher that cannot open is a warning: the machine still runs,
+        // and the agent and the neighbour table still answer.
+        // A multus NIC whose NAD has no IPAM is the same (stormvm#85): its
+        // guest asks the VLAN's own DHCP, seen on the tap in the sandbox.
+        let watch = match (made.binding, &made.address, sandbox) {
+            ("host-bridge", _, _) => Some(None),
+            ("multus", None, Some(ns)) => Some(Some(ns)),
+            _ => None,
+        };
+        if let Some(inside) = watch {
+            let (tx, id, key) = (self.snoop_tx.clone(), uid.to_string(), mac.to_string());
+            let seen = move |addresses: Vec<String>| {
+                let _ = tx.send(Snooped { uid: id.clone(), mac: key.clone(), addresses });
+            };
+            let snooper = match inside {
+                Some(ns) => stormvm_net::snoop_tap_in(ns, &p.tap, mac, seen),
+                None => stormvm_net::snoop_tap(&p.tap, mac, seen),
+            };
+            match snooper {
+                Ok(s) => watched.0.push((mac.to_string(), s)),
+                Err(e) => warn!(vm = %vm.name, nic = %p.nic, "cannot watch {} for the guest's address: {e}", p.tap),
+            }
+        }
+        // The guest's DHCP (#88): it is told the pod's address, and
+        // nothing else answers it in the sandbox. A multus NIC whose NAD's
+        // IPAM gave an address (stormvm#85) is told it on its own bridge,
+        // with no router (stormvm's lease has gateway 0.0.0.0), DNS or
+        // name: the pod network keeps the default route and resolver.
+        if let (Some(addr), Some(ns)) = (&made.address, sandbox) {
+            let secondary = made.binding == "multus";
+            let (dns, search) = if secondary { (Vec::new(), Vec::new()) } else { self.cluster_dns(namespace) };
+            let host = (!secondary).then(|| vm.hostname.clone().filter(|h| !h.is_empty()).unwrap_or_else(|| vm.name.clone()));
+            let lease = addr.lease(dns, search, host)?;
+            let bridge = made.bridge.clone().unwrap_or_else(|| stormvm_net::SANDBOX_BRIDGE.to_string());
+            lease_record = Some(crate::vm_network::LeaseRecord::of(index, mac, &lease, Some(&bridge)));
+            let ns = ns.to_string();
+            let r = tokio::task::spawn_blocking(move || stormvm_net::serve_dhcp_on(&ns, &bridge, lease))
+                .await
+                .map_err(|e| format!("dhcp task: {e}"))?
+                .map_err(|e| format!("interface {}: DHCP for the guest: {e}", p.nic))?;
+            responder = Some((mac.to_string(), r));
+        }
+        Ok(NicServed { snooper: watched.take().pop(), responder, lease: lease_record })
     }
 
     /// The cluster DNS a ClusterFirst pod in `namespace` gets, for a guest's
@@ -3138,7 +3267,7 @@ impl VmManager {
                     Err(e) => Err(e),
                 };
                 match served {
-                    Ok(r) => held.push(r),
+                    Ok(r) => held.push((l.mac.clone(), r)),
                     Err(e) => warn!(vm = %net.name, "DHCP for the adopted guest not restarted: {e}"),
                 }
             }
@@ -3146,6 +3275,374 @@ impl VmManager {
         }
     }
 
+
+    /// Bring a running machine to its VMI's cpu, memory and interfaces
+    /// (#246) through stormvm's hotplug verbs.
+    ///
+    /// Looked at once per spec generation, and on first sight after a kubelet
+    /// restart; while the guest is still taking memory in (or giving it
+    /// back), again shortly, for the status. The baseline is what the machine
+    /// was last given ([`crate::vm_hotplug::Record`]), not a reading of the
+    /// machine, so a VM whose spec does not change is never asked anything.
+    /// A verb's refusal (past the maxima, a device the guest kept) is the
+    /// `HotplugSynchronized` condition and a Warning Event, never a failed
+    /// start: the machine runs on as it is, and the change is tried again when
+    /// the spec next changes.
+    async fn hotplug(&self, uid: &str, obj: &Value) {
+        let generation = obj["metadata"]["generation"].as_i64().unwrap_or(0);
+        if self.hot_seen.lock().unwrap_or_else(|e| e.into_inner()).get(uid) == Some(&generation) {
+            return;
+        }
+        let Some(mut vm) = self.vms.lock().await.get(uid).cloned().filter(|v| !v.phase.terminal()) else { return };
+        let spec: VmSpec = match stormvm_spec::kube::from_kube(obj) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(vm = %vm.name, "not hot-plugged: the VMI does not read as a machine: {e}");
+                self.hot_seen.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), generation);
+                return;
+            }
+        };
+        // No control socket yet: the next pass.
+        let Some(machine) = (self.hot_machine)(&vm) else { return };
+        let before = vm.clone();
+        let mut record = self.hot_record(&vm, &spec);
+        // Adopted after a restart: its NICs are what the record says.
+        if vm.nics.is_empty() {
+            vm.nics = record
+                .nics
+                .iter()
+                .map(|n| NicReport { name: n.name.clone(), mac: n.mac.clone(), addresses: vec![], binding: n.binding.clone() })
+                .collect();
+        }
+        if vm.hot.topology.is_none() {
+            vm.hot.topology = Some(crate::vm_hotplug::topology(&spec, record.vcpus));
+        }
+
+        let c = crate::vm_hotplug::changes(&spec, &record);
+        let mut problems = Vec::new();
+        let mut settling = false;
+        if let Some(n) = c.vcpus {
+            match machine.set_vcpus(n).await {
+                Ok(present) => {
+                    info!(vm = %vm.name, from = record.vcpus, to = n, present, "vCPUs changed");
+                    self.event_of(&vm, "Normal", "VcpusChanged", &format!("vCPUs {} → {n}", record.vcpus)).await;
+                    record.vcpus = n;
+                    vm.hot.topology = Some(crate::vm_hotplug::topology(&spec, present));
+                }
+                Err(e) => problems.push(format!("vCPUs {} → {n}: {e}", record.vcpus)),
+            }
+        }
+        if let Some(bytes) = c.memory {
+            let from = record.memory.map(crate::vm_hotplug::quantity).unwrap_or_else(|| "?".into());
+            let to = crate::vm_hotplug::quantity(bytes);
+            match machine.set_memory(bytes).await {
+                Ok(now) => {
+                    info!(vm = %vm.name, %from, %to, "memory changed");
+                    self.event_of(&vm, "Normal", "MemoryChanged", &format!("memory {from} → {to}")).await;
+                    record.memory = Some(bytes);
+                    settling = now.settling();
+                    vm.hot.memory = Some(now);
+                }
+                Err(e) => problems.push(format!("memory {from} → {to}: {e}")),
+            }
+        } else if vm.hot.memory.is_some_and(|m| m.settling()) {
+            if let Ok(now) = machine.memory().await {
+                settling = now.settling();
+                vm.hot.memory = Some(now);
+            }
+        }
+        for name in &c.remove {
+            match self.remove_hot_nic(&vm, &record, name, machine.as_ref()).await {
+                Ok(()) => {
+                    info!(vm = %vm.name, nic = %name, "interface removed");
+                    self.event_of(&vm, "Normal", "InterfaceRemoved", &format!("interface {name} removed")).await;
+                    record.nics.retain(|n| n.name != *name);
+                    vm.nics.retain(|n| n.name != *name);
+                }
+                Err(e) => problems.push(format!("interface {name}: {e}")),
+            }
+        }
+        for name in &c.add {
+            match self.add_hot_nic(&vm, &spec, name, machine.as_ref()).await {
+                Ok((report, nic)) => {
+                    info!(vm = %vm.name, nic = %name, mac = %nic.mac, binding = %nic.binding, "interface added");
+                    self.event_of(&vm, "Normal", "InterfaceAdded", &format!("interface {name} added ({})", nic.binding)).await;
+                    record.nics.push(nic);
+                    vm.nics.push(report);
+                }
+                Err(e) => problems.push(e),
+            }
+        }
+        if !c.is_empty() {
+            if let Err(e) = crate::vm_hotplug::save(&self.hot_dir, &vm.namespace, &vm.name, &record) {
+                warn!(vm = %vm.name, "could not record what the machine was given: {e}");
+            }
+            let cond = crate::vm_hotplug::condition(vm.hot.condition.as_ref(), &problems, &now_rfc3339());
+            if !problems.is_empty() && vm.hot.condition.as_ref().map(|p| &p["message"]) != Some(&cond["message"]) {
+                warn!(vm = %vm.name, "hotplug refused: {}", problems.join("; "));
+                self.event_of(&vm, "Warning", "HotplugRefused", &problems.join("; ")).await;
+            }
+            vm.hot.condition = Some(cond);
+        }
+        self.hot_records.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), record);
+
+        if vm.nics.iter().map(|n| (&n.name, &n.mac)).ne(before.nics.iter().map(|n| (&n.name, &n.mac))) || vm.hot != before.hot {
+            // Onto the record as it is now: a tap watcher may have written an
+            // address meanwhile, kept for the NICs that stayed.
+            let updated = self.vms.lock().await.update(uid, |cur| {
+                let mut nics = vm.nics.clone();
+                for n in &mut nics {
+                    if let Some(c) = cur.nics.iter().find(|c| c.mac == n.mac) {
+                        n.addresses = c.addresses.clone();
+                    }
+                }
+                cur.nics = nics;
+                cur.hot = vm.hot.clone();
+                cur.clone()
+            });
+            if let Some(updated) = updated {
+                self.patch_status(&updated).await;
+            }
+        }
+        if settling {
+            self.due_in(uid, HOT_SETTLE);
+        } else {
+            self.hot_seen.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), generation);
+        }
+    }
+
+    /// What a running machine was last given (#246): held here, else its
+    /// record, else (a machine started before #246) what the spec says now,
+    /// recorded so the next change has a baseline.
+    fn hot_record(&self, vm: &Vm, spec: &VmSpec) -> crate::vm_hotplug::Record {
+        if let Some(r) = self.hot_records.lock().unwrap_or_else(|e| e.into_inner()).get(&vm.uid) {
+            return r.clone();
+        }
+        if let Some(r) = crate::vm_hotplug::load(&self.hot_dir, &vm.namespace, &vm.name) {
+            return r;
+        }
+        let r = crate::vm_hotplug::Record::from_spec(spec, nic_records(&vm.namespace, spec, &vm.nics));
+        if let Err(e) = crate::vm_hotplug::save(&self.hot_dir, &vm.namespace, &vm.name, &r) {
+            warn!(vm = %vm.name, "could not record what the machine was given: {e}");
+        }
+        r
+    }
+
+    /// Plug interface `name` of `spec` into the running machine (#246): its
+    /// network made as at start (a tap on a node bridge, or a NAD's CNI ADD
+    /// into the VMI's sandbox and a tap bridged to it), then the device, then
+    /// its watcher and DHCP. What was made is undone if a later step fails.
+    /// The pod network, and a NAD that replaces it, are a machine's from its
+    /// start: refused, to take effect at the next start.
+    async fn add_hot_nic(
+        &self,
+        vm: &Vm,
+        spec: &VmSpec,
+        name: &str,
+        machine: &dyn crate::vm_hotplug::Hotplug,
+    ) -> Result<(NicReport, crate::vm_hotplug::NicRecord), String> {
+        let at_next_start = |what: String| format!("interface {name}: {what}; it takes effect at the next start");
+        let defaults = stormvm_net::Defaults { uplink_bridge: DEFAULT_BRIDGE.to_string() };
+        let plans = stormvm_net::plan(&vm.namespace, &spec.name, &spec.interfaces, &defaults)
+            .map_err(|e| format!("interface {name}: {e}"))?;
+        let p = plans
+            .into_iter()
+            .find(|p| p.nic == name)
+            .ok_or_else(|| format!("interface {name}: not in the machine's plan"))?;
+        let (sandbox, ifname) = match &p.attach {
+            stormvm_net::Attach::Bridge(_) => (None, None),
+            stormvm_net::Attach::Pod(_) => {
+                return Err(at_next_start("the pod network is given to a machine at start only".into()))
+            }
+            stormvm_net::Attach::Multus { network, default: true, .. } => {
+                return Err(at_next_start(format!(
+                    "network {network} replaces the pod network, which is given to a machine at start only"
+                )))
+            }
+            stormvm_net::Attach::Multus { network, ifname, .. } => {
+                let net = self.attach_network(&vm.uid, &vm.namespace, network, ifname).await.map_err(|e| {
+                    if e.is_empty() {
+                        at_next_start(format!(
+                            "network {network} is wired in the VMI's sandbox, and this machine was started without \
+                             one (no pod or multus network)"
+                        ))
+                    } else {
+                        format!("interface {name}: network {network}: {e}")
+                    }
+                })?;
+                (Some(net), Some(ifname.clone()))
+            }
+        };
+        let undo = || async {
+            if let Some(ifname) = &ifname {
+                self.detach_network(&vm.uid, ifname, &p.mac).await;
+            }
+        };
+        let (plan, inside) = (p.clone(), sandbox.clone());
+        let made = tokio::task::spawn_blocking(move || stormvm_net::realise(&plan, inside.as_deref(), RUN_ROOT))
+            .await
+            .map_err(|e| format!("interface {name}: realise task: {e}"))
+            .and_then(|r| r.map_err(|e| format!("interface {name}: {e}")));
+        let mut made = match made {
+            Ok(m) => m,
+            Err(e) => {
+                undo().await;
+                return Err(e);
+            }
+        };
+        let Some(fd) = made.fd.take() else {
+            undo().await;
+            return Err(format!("interface {name}: binding {} has no tap to hand a running machine", made.binding));
+        };
+        let mac = made.address.as_ref().map(|a| a.mac.clone()).unwrap_or_else(|| p.mac.clone());
+        let nic = stormvm_control::hotplug::HotNic {
+            name: name.to_string(),
+            mac: mac.clone(),
+            transport: stormvm_control::hotplug::HotTransport::Tap(fd),
+            mtu: None,
+        };
+        if let Err(e) = machine.add_nic(nic).await {
+            // The tap went with its descriptor.
+            undo().await;
+            return Err(format!("interface {name}: {e}"));
+        }
+        // Watched and answered as a boot NIC is. A failure here leaves the NIC
+        // in the guest, which reaches its network all the same.
+        let served = self
+            .watch_and_serve(&vm.uid, &vm.namespace, spec, &p, &made, &mac, sandbox.as_deref(), vm.nics.len())
+            .await;
+        match served {
+            Ok(s) => {
+                if let Some(w) = s.snooper {
+                    self.snoopers.lock().unwrap_or_else(|e| e.into_inner()).entry(vm.uid.clone()).or_default().push(w);
+                }
+                if let Some(r) = s.responder {
+                    self.responders.lock().unwrap_or_else(|e| e.into_inner()).entry(vm.uid.clone()).or_default().push(r);
+                }
+                if let Some(l) = s.lease {
+                    self.with_pod_net(&vm.uid, |net| net.leases.push(l));
+                }
+            }
+            Err(e) => warn!(vm = %vm.name, nic = %name, "interface added, but its address is not watched or served: {e}"),
+        }
+        let addresses = match made.binding {
+            "multus" => made.address.iter().map(|a| a.ip.to_string()).collect(),
+            _ => vec![],
+        };
+        Ok((
+            NicReport { name: name.to_string(), mac: mac.clone(), addresses, binding: made.binding.to_string() },
+            crate::vm_hotplug::NicRecord { name: name.to_string(), mac, binding: made.binding.to_string(), ifname },
+        ))
+    }
+
+    /// Take interface `name` out of the running machine (#246): the guest
+    /// releases the device, then what was made for it goes (its watcher, its
+    /// DHCP, a NAD's CNI DEL). A boot NIC is not removable on q35, and the
+    /// verb says so.
+    async fn remove_hot_nic(
+        &self,
+        vm: &Vm,
+        record: &crate::vm_hotplug::Record,
+        name: &str,
+        machine: &dyn crate::vm_hotplug::Hotplug,
+    ) -> Result<(), String> {
+        machine.remove_nic(name).await?;
+        let Some(nic) = record.nics.iter().find(|n| n.name == name) else { return Ok(()) };
+        let watcher = {
+            let mut map = self.snoopers.lock().unwrap_or_else(|e| e.into_inner());
+            map.get_mut(&vm.uid).and_then(|w| w.iter().position(|(m, _)| *m == nic.mac).map(|i| w.remove(i)))
+        };
+        let responder = {
+            let mut map = self.responders.lock().unwrap_or_else(|e| e.into_inner());
+            map.get_mut(&vm.uid).and_then(|r| r.iter().position(|(m, _)| *m == nic.mac).map(|i| r.remove(i)))
+        };
+        if watcher.is_some() || responder.is_some() {
+            tokio::task::spawn_blocking(move || drop((watcher, responder)));
+        }
+        // The tap went with qemu's descriptor; a NAD's interface in the
+        // sandbox goes by its DEL.
+        if let Some(ifname) = &nic.ifname {
+            self.detach_network(&vm.uid, ifname, &nic.mac).await;
+        }
+        Ok(())
+    }
+
+    /// A NAD's network added to a running machine's sandbox (#246): resolved,
+    /// recorded first (so teardown DELs it whatever happens), then ADDed, and
+    /// its network-status entries added. `Err("")`: the machine has no
+    /// sandbox. Returns the sandbox's netns.
+    async fn attach_network(&self, uid: &str, namespace: &str, network: &str, ifname: &str) -> Result<String, String> {
+        let Some(net) = self.pod_nets.lock().unwrap_or_else(|e| e.into_inner()).get(uid).cloned() else {
+            return Err(String::new());
+        };
+        if net.attachments.iter().any(|a| a.ifname == ifname) {
+            return Err(format!(
+                "its sandbox interface {ifname} is already another network's (a network added before others renumbers \
+                 them: add it after them)"
+            ));
+        }
+        let Some(invoker) = &self.cni else { return Err("this node has no CNI (--no-cni)".into()) };
+        let att = self.nad_attachment(namespace, network, ifname).await?;
+        let config = att.config()?;
+        self.with_pod_net(uid, |n| n.attachments.push(att.clone()));
+        let pod = net.cni_pod().on_interface(ifname);
+        match invoker.add_network(&config, &pod).await {
+            Ok(r) => {
+                let netns = net.netns.clone();
+                let mtu = move |i: &str| crate::network_status::mtu_in_netns(&netns, i);
+                let entries = crate::network_status::attachment_entries(&r, &att.name, ifname, &mtu);
+                self.with_pod_net(uid, |n| {
+                    let status = n.network_status.get_or_insert_with(|| json!([]));
+                    crate::network_status::append(status, entries);
+                });
+                self.report_launcher(uid, "Running").await;
+                Ok(net.netns)
+            }
+            Err(e) => {
+                self.detach_network(uid, ifname, "").await;
+                Err(format!("CNI ADD failed: {e}"))
+            }
+        }
+    }
+
+    /// The NAD on sandbox interface `ifname` taken out (#246): CNI DEL, then
+    /// its attachment, its lease (by `mac`) and its network-status entries
+    /// dropped from the record. A DEL that fails keeps the attachment, so the
+    /// machine's teardown DELs it again.
+    async fn detach_network(&self, uid: &str, ifname: &str, mac: &str) {
+        let Some(net) = self.pod_nets.lock().unwrap_or_else(|e| e.into_inner()).get(uid).cloned() else { return };
+        let Some(att) = net.attachments.iter().find(|a| a.ifname == ifname).cloned() else { return };
+        if let Some(invoker) = &self.cni {
+            let deleted = match att.config() {
+                Ok(c) => invoker.del_network(&c, &net.cni_pod().on_interface(ifname)).await.map_err(|e| e.to_string()),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = deleted {
+                warn!(vm = %net.name, network = %att.name, "CNI DEL failed, retried at the machine's teardown: {e}");
+                return;
+            }
+        }
+        self.with_pod_net(uid, |n| {
+            n.attachments.retain(|a| a.ifname != ifname);
+            if !mac.is_empty() {
+                n.leases.retain(|l| l.mac != mac);
+            }
+            if let Some(Value::Array(list)) = &mut n.network_status {
+                list.retain(|e| e["name"] != json!(att.name));
+            }
+        });
+        self.report_launcher(uid, "Running").await;
+    }
+
+    /// Change a machine's pod-network record and keep it on disk.
+    fn with_pod_net(&self, uid: &str, f: impl FnOnce(&mut crate::vm_network::PodNet)) {
+        let mut nets = self.pod_nets.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(net) = nets.get_mut(uid) else { return };
+        f(net);
+        if let Err(e) = self.net_store.save(net) {
+            warn!(vm = %net.name, "could not record the VM's pod network: {e}");
+        }
+    }
 
     /// Build this VM's seed disk: cloud-init's, or combustion's script for a
     /// combustion guest ([`stormvm_cloudinit::medium`], #245).
@@ -3836,6 +4333,7 @@ impl VmManager {
             nics: Vec::new(),
             message: why.to_string(),
             access: Access::default(),
+            hot: crate::vm_hotplug::Size::default(),
         };
         self.vms.lock().await.insert(uid.to_string(), rec.clone());
         self.patch_status(&rec).await;
@@ -3948,17 +4446,24 @@ impl VmManager {
             status["reason"] = json!(if vm.phase == Phase::Failed { "Failed" } else { "Ended" });
             status["message"] = json!(vm.message);
         }
-        // `AccessCredentialsSynchronized` (#92), with whatever conditions the
-        // object already carries: a merge patch replaces the list whole.
-        if let Some(cond) = &vm.access.condition {
-            let existing = self
+        // Its size (#246): KubeVirt's `currentCPUTopology` and `memory`.
+        crate::vm_hotplug::write_status(&mut status, &vm.hot);
+        // `AccessCredentialsSynchronized` (#92) and `HotplugSynchronized`
+        // (#246), with whatever conditions the object already carries: a
+        // merge patch replaces the list whole.
+        let ours: Vec<&Value> = vm.access.condition.iter().chain(vm.hot.condition.iter()).collect();
+        if !ours.is_empty() {
+            let mut conditions = self
                 .desired
                 .lock()
                 .await
                 .get(&vm.uid)
                 .map(|o| o["status"]["conditions"].clone())
                 .unwrap_or(Value::Null);
-            status["conditions"] = with_condition(&existing, cond);
+            for cond in ours {
+                conditions = with_condition(&conditions, cond);
+            }
+            status["conditions"] = conditions;
         }
         let body = json!({ "metadata": {"uid": vm.uid}, "status": status });
         if let Err(e) = self
@@ -4482,14 +4987,15 @@ mod tests {
                 NicReport { name: "net1".into(), mac: "02:00:00:00:00:02".into(), addresses: vec![], binding: "bridge".into() },
             ],
             access: Access::default(),
+            hot: crate::vm_hotplug::Size::default(),
         };
         m.vms.lock().await.insert("u-2".into(), vm);
 
-        m.snooped(Snooped { uid: "other".into(), nic: 0, addresses: vec!["1.2.3.4".into()] }).await;
-        m.snooped(Snooped { uid: "u-2".into(), nic: 1, addresses: vec![] }).await;
+        m.snooped(Snooped { uid: "other".into(), mac: "02:00:00:00:00:01".into(), addresses: vec!["1.2.3.4".into()] }).await;
+        m.snooped(Snooped { uid: "u-2".into(), mac: "02:00:00:00:00:02".into(), addresses: vec![] }).await;
         assert!(m.vms.lock().await["u-2"].nics.iter().all(|n| n.addresses.is_empty()));
 
-        m.snooped(Snooped { uid: "u-2".into(), nic: 1, addresses: vec!["192.168.30.4".into()] }).await;
+        m.snooped(Snooped { uid: "u-2".into(), mac: "02:00:00:00:00:02".into(), addresses: vec!["192.168.30.4".into()] }).await;
         let vm = m.vms.lock().await["u-2"].clone();
         assert!(vm.nics[0].addresses.is_empty());
         assert_eq!(vm.nics[1].addresses, vec!["192.168.30.4".to_string()]);
@@ -4845,6 +5351,198 @@ mod tests {
         assert!(m.powered_down.load(std::sync::atomic::Ordering::SeqCst), "asked once");
     }
 
+    /// A machine's hotplug verbs, as a test sees them (#246): every call
+    /// recorded, the ones named in `refuse` refused in the verb's words.
+    #[derive(Default)]
+    struct FakeHot {
+        calls: std::sync::Mutex<Vec<String>>,
+        refuse: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::vm_hotplug::Hotplug for FakeHot {
+        async fn set_vcpus(&self, n: u32) -> Result<u32, String> {
+            self.calls.lock().unwrap().push(format!("vcpus {n}"));
+            if self.refuse.lock().unwrap().contains(&"vcpus") {
+                return Err(format!("{n} vCPUs is past the machine's maxcpus (8)"));
+            }
+            Ok(n)
+        }
+        async fn set_memory(&self, bytes: u64) -> Result<crate::vm_hotplug::MemoryNow, String> {
+            self.calls.lock().unwrap().push(format!("memory {bytes}"));
+            // The guest has taken in half of it so far.
+            let boot = 1 << 30;
+            Ok(crate::vm_hotplug::MemoryNow { boot, current: boot + (bytes - boot) / 2, requested: bytes })
+        }
+        async fn memory(&self) -> Result<crate::vm_hotplug::MemoryNow, String> {
+            self.calls.lock().unwrap().push("memory?".into());
+            Ok(crate::vm_hotplug::MemoryNow { boot: 1 << 30, current: 2 << 30, requested: 2 << 30 })
+        }
+        async fn add_nic(&self, nic: stormvm_control::hotplug::HotNic) -> Result<String, String> {
+            self.calls.lock().unwrap().push(format!("add {}", nic.name));
+            Ok("hp0".into())
+        }
+        async fn remove_nic(&self, name: &str) -> Result<(), String> {
+            self.calls.lock().unwrap().push(format!("remove {name}"));
+            if self.refuse.lock().unwrap().contains(&"nic") {
+                return Err(format!("the guest did not release nic.{name} within 30s"));
+            }
+            Ok(())
+        }
+    }
+
+    fn hot_manager(dir: &std::path::Path, fake: &Arc<FakeHot>) -> VmManager {
+        let f = fake.clone();
+        VmManager::new(None, "n1", reqwest::Client::new(), "")
+            .with_hotplug(dir, Arc::new(move |_vm: &Vm| Some(f.clone() as Arc<dyn crate::vm_hotplug::Hotplug>)))
+    }
+
+    /// `vm-u-1` (see [`vm_at`]): cores × sockets, memory, the pod network on
+    /// `default`, a NAD per name in `nads`.
+    fn hot_vmi(generation: i64, cores: u64, sockets: u64, guest: &str, nads: &[&str]) -> Value {
+        let mut interfaces = vec![json!({"name": "default", "bridge": {}})];
+        let mut networks = vec![json!({"name": "default", "pod": {}})];
+        for n in nads {
+            interfaces.push(json!({"name": n, "bridge": {}}));
+            networks.push(json!({"name": n, "multus": {"networkName": n}}));
+        }
+        json!({
+            "kind": "VirtualMachineInstance",
+            "metadata": {"name": "vm-u-1", "namespace": "default", "uid": "u-1", "generation": generation},
+            "spec": {
+                "domain": {
+                    "cpu": {"cores": cores, "sockets": sockets, "maxSockets": 4},
+                    "memory": {"guest": guest, "maxGuest": "4Gi"},
+                    "devices": {"interfaces": interfaces},
+                },
+                "networks": networks,
+            }
+        })
+    }
+
+    fn given(vcpus: u32, memory: u64, nics: &[(&str, &str)]) -> crate::vm_hotplug::Record {
+        crate::vm_hotplug::Record {
+            vcpus,
+            memory: Some(memory),
+            nics: nics
+                .iter()
+                .map(|(name, mac)| crate::vm_hotplug::NicRecord {
+                    name: name.to_string(),
+                    mac: mac.to_string(),
+                    binding: "bridge".into(),
+                    ifname: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// #246: a grown vCPU count and memory reach the machine once per
+    /// generation, the status says the new size (memory as far as the guest
+    /// got), and a refusal is the condition, not a failed machine.
+    #[tokio::test]
+    async fn a_running_vmis_cpu_and_memory_reach_the_machine_and_a_refusal_is_a_condition() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeHot::default());
+        let m = hot_manager(dir.path(), &fake);
+        m.vms.lock().await.insert("u-1".into(), vm_at("u-1", &[], Phase::Running));
+        m.hot_records.lock().unwrap().insert("u-1".into(), given(2, 1 << 30, &[("default", "02:00:00:00:00:01")]));
+
+        // Unchanged: nothing asked.
+        m.hotplug("u-1", &hot_vmi(1, 2, 1, "1Gi", &[])).await;
+        assert!(fake.calls.lock().unwrap().is_empty());
+
+        // Two sockets of two cores, 2Gi.
+        m.hotplug("u-1", &hot_vmi(2, 2, 2, "2Gi", &[])).await;
+        assert_eq!(*fake.calls.lock().unwrap(), vec!["vcpus 4".to_string(), format!("memory {}", 2u64 << 30)]);
+        let vm = m.vms.lock().await["u-1"].clone();
+        assert_eq!(vm.hot.topology, Some((2, 2, 1)));
+        assert_eq!(vm.hot.memory.unwrap().current, 3 << 29, "half way in");
+        assert_eq!(vm.hot.condition.as_ref().unwrap()["status"], "True");
+        let rec = crate::vm_hotplug::load(dir.path(), "default", "vm-u-1").expect("recorded beside the machine");
+        assert_eq!((rec.vcpus, rec.memory), (4, Some(2 << 30)));
+
+        // Still settling: asked how far it got, not asked again.
+        m.hotplug("u-1", &hot_vmi(2, 2, 2, "2Gi", &[])).await;
+        assert_eq!(fake.calls.lock().unwrap().last().unwrap(), "memory?");
+        assert_eq!(m.vms.lock().await["u-1"].hot.memory.unwrap().current, 2 << 30);
+        let n = fake.calls.lock().unwrap().len();
+        m.hotplug("u-1", &hot_vmi(2, 2, 2, "2Gi", &[])).await;
+        assert_eq!(fake.calls.lock().unwrap().len(), n, "settled and seen: nothing more");
+
+        // Past the maxima: refused, said, and the machine runs on.
+        fake.refuse.lock().unwrap().push("vcpus");
+        m.hotplug("u-1", &hot_vmi(3, 2, 8, "2Gi", &[])).await;
+        let vm = m.vms.lock().await["u-1"].clone();
+        assert_eq!(vm.phase, Phase::Running);
+        let cond = vm.hot.condition.unwrap();
+        assert_eq!((cond["type"].as_str(), cond["status"].as_str()), (Some("HotplugSynchronized"), Some("False")));
+        assert!(cond["message"].as_str().unwrap().contains("vCPUs 4 → 16: 16 vCPUs is past"), "{cond}");
+        assert_eq!(crate::vm_hotplug::load(dir.path(), "default", "vm-u-1").unwrap().vcpus, 4, "not given");
+    }
+
+    /// #246: an interface the spec no longer names is taken out (and stays
+    /// when the guest will not release it); one on a NAD for a machine with no
+    /// sandbox waits for the next start, without touching the machine.
+    #[tokio::test]
+    async fn an_interface_taken_out_goes_and_one_needing_a_sandbox_waits_for_the_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeHot::default());
+        let m = hot_manager(dir.path(), &fake);
+        let mut vm = vm_at("u-1", &[], Phase::Running);
+        vm.nics.push(NicReport { name: "extra".into(), mac: "02:00:00:00:00:02".into(), addresses: vec![], binding: "host-bridge".into() });
+        m.vms.lock().await.insert("u-1".into(), vm);
+        let had = given(1, 1 << 30, &[("default", "02:00:00:00:00:01"), ("extra", "02:00:00:00:00:02")]);
+
+        // The guest keeps it: still there, and said.
+        fake.refuse.lock().unwrap().push("nic");
+        m.hot_records.lock().unwrap().insert("u-1".into(), had.clone());
+        m.hotplug("u-1", &hot_vmi(2, 1, 1, "1Gi", &[])).await;
+        assert_eq!(*fake.calls.lock().unwrap(), vec!["remove extra".to_string()]);
+        let vm = m.vms.lock().await["u-1"].clone();
+        assert_eq!(vm.nics.len(), 2);
+        assert!(vm.hot.condition.unwrap()["message"].as_str().unwrap().contains("did not release nic.extra"));
+
+        // Released.
+        fake.refuse.lock().unwrap().clear();
+        m.hotplug("u-1", &hot_vmi(3, 1, 1, "1Gi", &[])).await;
+        let vm = m.vms.lock().await["u-1"].clone();
+        assert_eq!(vm.nics.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(), ["default"]);
+        assert_eq!(vm.hot.condition.unwrap()["status"], "True");
+        assert_eq!(crate::vm_hotplug::load(dir.path(), "default", "vm-u-1").unwrap().nics.len(), 1);
+
+        // A NAD, on a machine started with no sandbox: refused before the
+        // machine is asked anything.
+        let n = fake.calls.lock().unwrap().len();
+        m.hotplug("u-1", &hot_vmi(4, 1, 1, "1Gi", &["vlan10"])).await;
+        assert_eq!(fake.calls.lock().unwrap().len(), n);
+        let cond = m.vms.lock().await["u-1"].hot.condition.clone().unwrap();
+        assert_eq!(cond["status"], "False");
+        assert!(cond["message"].as_str().unwrap().contains("interface vlan10: network vlan10 is wired in the VMI's sandbox"), "{cond}");
+        assert!(cond["message"].as_str().unwrap().contains("next start"), "{cond}");
+    }
+
+    /// #246: a machine adopted after a restart, started by a kubelet that kept
+    /// no record: what the spec says now is its baseline (nothing asked of the
+    /// machine), recorded, and its NICs are known again.
+    #[tokio::test]
+    async fn an_adopted_machine_with_no_record_takes_the_spec_as_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeHot::default());
+        let m = hot_manager(dir.path(), &fake);
+        let mut vm = vm_at("u-1", &[], Phase::Running);
+        vm.nics.clear();
+        m.vms.lock().await.insert("u-1".into(), vm);
+        m.hotplug("u-1", &hot_vmi(7, 2, 2, "2Gi", &[])).await;
+        assert!(fake.calls.lock().unwrap().is_empty());
+        let rec = crate::vm_hotplug::load(dir.path(), "default", "vm-u-1").expect("recorded");
+        assert_eq!((rec.vcpus, rec.memory), (4, Some(2 << 30)));
+        assert_eq!(rec.nics.len(), 1);
+        let vm = m.vms.lock().await["u-1"].clone();
+        assert_eq!(vm.nics.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(), ["default"]);
+        assert_eq!(vm.hot.topology, Some((2, 2, 1)));
+        assert!(vm.hot.condition.is_none(), "nothing was tried");
+    }
+
     fn vm_at(uid: &str, addresses: &[&str], phase: Phase) -> Vm {
         Vm {
             namespace: "default".into(),
@@ -4866,6 +5564,7 @@ mod tests {
                 binding: "bridge".into(),
             }],
             access: Access::default(),
+            hot: crate::vm_hotplug::Size::default(),
         }
     }
 
@@ -5879,6 +6578,7 @@ mod tests {
             owned_volumes: owned,
             nics: vec![],
             access: Access::default(),
+            hot: crate::vm_hotplug::Size::default(),
         };
         m.stop(&vm).await;
         assert!(e.deleted.lock().unwrap().is_empty(), "a stop deletes nothing");
@@ -6020,6 +6720,7 @@ mod tests {
             owned_volumes: vec![],
             nics: vec![],
             access: Access::default(),
+            hot: crate::vm_hotplug::Size::default(),
         });
 
         // Deleted, so it comes back once the floor is up to see they went.
