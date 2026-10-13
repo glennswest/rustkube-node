@@ -332,6 +332,11 @@ data.
 When PID 1's asset table (`/run/stormpump/assets.json`) changes, and when a mirror pod is edited or deleted,
 the kubelet mirrors each asset as a
 read-only pod, `kube-system/<asset>-<node>` (labels `storm.io/asset`, `storm.io/component=node-service`).
+**The kubelet never runs one** (#249): a pod carrying any of the mirror's marks (`kubernetes.io/config.source:
+stormpump`, `storm.io/mirror: true`, the `node-service` label, or a `stormpump://<asset>` image) is left out of the pods
+it runs, from the API and from static manifests alike, and a `stormpump://` image is refused by the image service
+rather than resolved to the pallet its last component names (run as a pod, `stormpump://sshd` would be a second sshd
+on the host network beside PID 1's, stormcos#547).
 Its `startTime` is now less the service's age: the node's uptime (`/proc/uptime`) less PID 1's `started_secs`
 (the same `CLOCK_BOOTTIME`), which holds still while assets.json is written only on a change (stormpump#67);
 an older PID 1 without it gives `age_secs` (#193).

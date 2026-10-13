@@ -2,6 +2,13 @@
 
 ## 2026-10-13
 
+- **fix:** A node service's mirror pod is never run as a pod (#249, stormcos#547). It was left out only by its
+  `kubernetes.io/config.source: stormpump` annotation; now any of the mirror's marks counts (that annotation,
+  `storm.io/mirror`, the `storm.io/component=node-service` label, or a `stormpump://<asset>` image), for API and static
+  pods, and the image service refuses a `stormpump://` image instead of resolving it by its last component to a pallet
+  (`stormpump://sshd` → `/pallets/sshd`, a second sshd on the host network). No path started one before (checked: the
+  LIST/watch filter, `recover_state` adopts only the engine's sandboxes); this makes it impossible, not just unused.
+
 - **feat:** A running VMI's disks are hot-added and removed (#247, stormvm#23; stormvm e1a84f1 → 7a7baf2). On #246's
   pass, the spec's disks against the machine's: an added disk is resolved and attached as at start (golden clone,
   emptyDisk, claim; owner as at start), then `add_disk` (virtio on a free `hpN`, or `scsi-hd`; `cache.direct` and
