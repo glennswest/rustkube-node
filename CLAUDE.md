@@ -13,7 +13,7 @@ stage golden through `stormcentral component stage rustkube-node`, not a package
 
 ## Current implementation reference (2026-10-09)
 
-Main baseline: 0eab793 (latest stage golden golden-rustkube-node-282970b3214d, stormcos#424; every git dependency by rev, #210). See
+Main baseline: 307e673 (latest stage golden golden-rustkube-node-b76b70a2ca55, stormcos#424; every git dependency by rev, #210). See
 `docs/status.md` for changes since October 2, the owner's recorded decisions and issue-backed limitations,
 `docs/configuration.md` for every CLI/env/default, `docs/api.md` for ports and actual routes, `docs/retries.md`
 for every remote call's retry policy. CLI runtime defaults to native; stormcos explicitly chooses stormpump.
@@ -58,22 +58,26 @@ by #51.
 
 ## Work plan
 
-### In progress: #247 (P1), hot-add and remove a running VMI's disks (stormvm#23)
+### Done: #247 (P1), hot-add and remove a running VMI's disks (stormvm#23)
 
 2026-10-13. stormvm main 7a7baf2 (c185f4b: `Machine::add_disk(&HotDisk)` on a free `hpN` / `scsi0.0` / chv
 `vm.add-disk`; `remove_disk(name)` refuses a boot disk; the volume stays attached). Only stormvm-verify's lock entry
 changed upstream (not in our graph): rev-only bump. On #246's pass (`hotplug`, once per generation):
-1. [ ] Bump stormvm e1a84f1 → 7a7baf2. Hotplug seam gains add_disk/remove_disk.
-2. [ ] Diff spec disks against `vm.disks` (the registration's disks; none known = no disk diff). Added: resolved and
+1. [x] Bump stormvm e1a84f1 → 7a7baf2. Hotplug seam gains add_disk/remove_disk.
+2. [x] Diff spec disks against `vm.disks` (the registration's disks; none known = no disk diff). Added: resolved and
        attached by `resolve_disks_with_keys` on a one-disk spec (clone / emptyDisk / claim, owner as at start; a seed
        disk is start-only), then `add_disk` (bus virtio|scsi, `direct` from cache, `discard`); a refused add detaches
        it (CSI: that disk only, `teardown_vm_csi_disk`) and deletes what was made for it; a wait (claim not bound) is
        retried. Removed: `remove_disk`, then detach (CSI: that disk); the volume is kept (#75). `vm.disks`,
        `owned_volumes` and the registration's disks rewritten.
-3. [ ] `status.volumeStatus[]`: each disk `Ready` (a hot one's target), a refused one with the verb's message.
-4. [ ] Tests (fake engine + fake machine: emptyDisk added → attached + add_disk; refused → detached, made volume
+3. [x] `status.volumeStatus[]`: each disk `Ready` (a hot one's target), a refused one with the verb's message.
+4. [x] Tests (fake engine + fake machine: emptyDisk added → attached + add_disk; refused → detached, made volume
        deleted; removed → remove_disk + detach, volume kept; seed disk refused), README, CHANGELOG; sc-build; golden;
        close. Live after rustkube#269 (volumes in the VM → VMI propagation).
+       Done: `resolve_disks_as(.., hot)` (a hot failure gives back only its disk, never the running VM's other CSI
+       disks), `teardown_vm_csi_disk`, add/remove_hot_disk, `record_disks`; 2 tests. SC_BUILD_VM sc-build 307e673 (job
+       8ed4e3b464): 518 kubelet unit, all suites pass; clippy nothing new. Stage golden golden-rustkube-node-b76b70a2ca55
+       (stormcos#424). Closed.
 
 ### Done: #246 (P1), a running VMI's cpu, memory and interface changes through stormvm's hotplug verbs (stormvm#24)
 
