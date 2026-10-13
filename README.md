@@ -693,7 +693,7 @@ starts once the VM lets the claim go (#80).
   - **Status:** the VMI carries `AccessCredentialsSynchronized`, with every
     reason when it is False: a missing Secret, no seed, or an agent not
     answering yet.
-- **A running VMI's cpu, memory and interfaces follow its spec** (#246,
+- **A running VMI's cpu, memory, interfaces and disks follow its spec** (#246, #247,
   stormvm#24; `pkg/kubelet/src/vm_hotplug.rs`). A machine can grow only into
   the headroom it was started with: `spec.domain.cpu.maxSockets` and
   `spec.domain.memory.maxGuest` (stormvm renders `maxcpus` and a virtio-mem
@@ -728,6 +728,22 @@ starts once the VM lets the claim go (#80).
     can't have yet) is the condition `HotplugSynchronized` False with each
     verb's own words, and a Warning `HotplugRefused` Event, never a failed
     machine. It is tried again when the spec next changes.
+  - **A disk added** (#247, stormvm#23): resolved and attached exactly as at
+    start (a golden clone, an `emptyDisk`, a claim; owned as at start), then
+    `add_disk`: `virtio-blk` on a free hot-plug port, or `scsi-hd` when the
+    machine booted with a SCSI disk (cloud-hypervisor: `vm.add-disk`). A
+    refused add gives the attach back (a CSI disk: that disk only) and deletes
+    what was made for it. A disk waiting on its claim (unbound, used by a pod
+    here) is tried again every 10 s. A cloud-init seed and a bus other than
+    virtio or SCSI are start-only.
+  - **A disk removed:** `remove_disk` (the guest releases it; a disk the VM
+    booted with is on the root bus and refused), then its volume is detached
+    (or its driver unpublishes it). The volume is kept: only a VM deleted
+    releases its disks (#75). The machine's registration records its disks as
+    they are now, so a restarted kubelet detaches what it has.
+  - `status.volumeStatus[]`: each disk `Ready` (a hot-added one with its
+    `target` and `hotplugVolume`), and each the machine could not be given,
+    `Pending` with why. Events `DiskAdded`, `DiskRemoved`.
   - A VirtualMachine edit reaches the VMI through rustkube's VM controller
     (rustkube#269).
 - **Snapshots: `VirtualMachineSnapshot`** (`snapshot.kubevirt.io/v1beta1`).

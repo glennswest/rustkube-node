@@ -2,6 +2,15 @@
 
 ## 2026-10-13
 
+- **feat:** A running VMI's disks are hot-added and removed (#247, stormvm#23; stormvm e1a84f1 → 7a7baf2). On #246's
+  pass, the spec's disks against the machine's: an added disk is resolved and attached as at start (golden clone,
+  emptyDisk, claim; owner as at start), then `add_disk` (virtio on a free `hpN`, or `scsi-hd`; `cache.direct` and
+  `discard` as at boot); a refused add detaches it (a CSI disk: only that disk, new
+  `PodManager::teardown_vm_csi_disk`) and deletes what was made for it; a claim not ready is retried every 10 s. A
+  removed disk: `remove_disk`, then detach (CSI: unpublish that disk); the volume is kept (#75). The registration's
+  disks follow. `status.volumeStatus[]` (`Ready`, a hot one's `target` and `hotplugVolume`; `Pending` with why).
+  Seeds and non-virtio/SCSI buses are start-only.
+
 - **feat:** A running VMI's cpu, memory and interface changes reach its machine through stormvm's hotplug verbs (#246,
   stormvm#24). stormvm e1a84f1: `cpu.maxSockets` and `memory.maxGuest` are rendered as headroom (qemu `maxcpus` + a
   virtio-mem device, cloud-hypervisor `max`/`hotplug_size`), and every qemu VM gets four empty PCIe root ports
