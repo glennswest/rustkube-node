@@ -13,7 +13,7 @@ stage golden through `stormcentral component stage rustkube-node`, not a package
 
 ## Current implementation reference (2026-10-09)
 
-Main baseline: 307e673 (latest stage golden golden-rustkube-node-b76b70a2ca55, stormcos#424; every git dependency by rev, #210). See
+Main baseline: 97754e7 (latest stage golden golden-rustkube-node-d814f8ef6f80, stormcos#424; every git dependency by rev, #210). See
 `docs/status.md` for changes since October 2, the owner's recorded decisions and issue-backed limitations,
 `docs/configuration.md` for every CLI/env/default, `docs/api.md` for ports and actual routes, `docs/retries.md`
 for every remote call's retry policy. CLI runtime defaults to native; stormcos explicitly chooses stormpump.
@@ -58,7 +58,7 @@ by #51.
 
 ## Work plan
 
-### In progress: #249 (P1), can the kubelet start a `stormpump://` asset pod? (stormcos#547: a second sshd on :22)
+### Done: #249 (P1), can the kubelet start a `stormpump://` asset pod? (stormcos#547: a second sshd on :22)
 
 2026-10-13. 12.21's data (comment on #249): :22 held by PID 1's own sshd, stormcos#547 closed. From the code: no path
 starts one today: every API path (LIST and the watch, which only wakes the LIST) drops `config.source: stormpump`
@@ -66,11 +66,13 @@ starts one today: every API path (LIST and the watch, which only wakes the LIST)
 from the manifest dir. But it rests on one annotation, and a mirror pod that lost it would run: `stormpump://sshd`
 resolves by its last path component to `/pallets/sshd`, on the host network (mirror pods are hostNetwork), which is
 #249's symptom exactly. Doing (no runtime path ever starts a node service):
-1. [ ] `mirror::is_node_service(pod)`: the annotation, `storm.io/mirror`, the `storm.io/component=node-service` label
+1. [x] `mirror::is_node_service(pod)`: the annotation, `storm.io/mirror`, the `storm.io/component=node-service` label
        or any `stormpump://` image; used for API and static pods (a static manifest naming one is skipped, said).
-2. [ ] `StormpumpImages`: a `stormpump://` image is refused (ErrImagePull naming PID 1), never resolved to a pallet;
+2. [x] `StormpumpImages`: a `stormpump://` image is refused (ErrImagePull naming PID 1), never resolved to a pallet;
        `local_path_in` takes no `scheme://` reference.
-3. [ ] Tests, README/CHANGELOG; sc-build; golden; answer and close #249.
+3. [x] Tests, README/CHANGELOG; sc-build; golden; answer and close #249.
+       Done: fix + 97754e7 docs. SC_BUILD_VM sc-build (job 964d550df4): 519 kubelet unit, all suites pass, clippy
+       nothing new. Stage golden golden-rustkube-node-d814f8ef6f80 (stormcos#424). Closed.
 
 ### Waiting on stormcentral#459 (the Dell's boot media): #102 (P1), turbomode acceptance on C2NR0Q2 (owner via master, 10-13: option A)
 
