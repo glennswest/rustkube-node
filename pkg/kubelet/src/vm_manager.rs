@@ -6015,6 +6015,7 @@ mod tests {
             started: 100,
             workload: Some(42),
             disks: registered_disks(&disks, &owned),
+            memory_min: None,
         };
         // Through the file format, as a restarted kubelet reads it.
         let reg: stormvm_node::console::Registration =
@@ -6049,6 +6050,7 @@ mod tests {
             started: 0,
             workload: None,
             disks: Vec::new(),
+            memory_min: None,
         };
         let r = reg(Some(sock.to_string_lossy().into()));
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
