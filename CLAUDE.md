@@ -13,7 +13,7 @@ stage golden through `stormcentral component stage rustkube-node`, not a package
 
 ## Current implementation reference (2026-10-09)
 
-Main baseline: 7f36be0 (latest stage golden golden-rustkube-node-8aae99144ff9, stormcos#424; every git dependency by rev, #210). See
+Main baseline: 46a364b (latest stage golden golden-rustkube-node-b89f9d8278a0, stormcos#424; every git dependency by rev, #210). See
 `docs/status.md` for changes since October 2, the owner's recorded decisions and issue-backed limitations,
 `docs/configuration.md` for every CLI/env/default, `docs/api.md` for ports and actual routes, `docs/retries.md`
 for every remote call's retry policy. CLI runtime defaults to native; stormcos explicitly chooses stormpump.
@@ -58,13 +58,15 @@ by #51.
 
 ## Work plan
 
-### In progress: #252 (P3), a running VMI's memory below its boot size (stormvm#19's balloon)
+### Done: #252 (P3), a running VMI's memory below its boot size (stormvm#19's balloon)
 
 2026-10-13. Item 1 (stormvm e929b8f, `Registration.memory_min` in the two test literals) landed with #251 (7f36be0).
 Left: #246's memory step through `set_memory_within(bytes, floor)`, floor = the machine's registration
 `memory_min` (else the spec's `memory.min` below its size, the same rule); `status.memory.guestCurrent` =
 `MemorySize::current()` (balloon + hot-added); `guestRequested` = what was asked; a squeeze the guest cannot finish
 stops being polled after 5 min. Tests (squeeze within the floor, below it refused), docs, CHANGELOG; sc-build; golden.
+Done: 46a364b. SC_BUILD_VM sc-build (job 4661717ecb): 524 kubelet unit, all suites pass. Stage golden
+golden-rustkube-node-b89f9d8278a0 (stormcos#424). Closed.
 
 ### Done: #251 (P3), VM snapshots with memory, and a restore that resumes from it (stormvm#37)
 
