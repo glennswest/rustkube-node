@@ -2,6 +2,22 @@
 
 ## 2026-10-13
 
+- **feat:** A running VMI's cpu, memory and interface changes reach its machine through stormvm's hotplug verbs (#246,
+  stormvm#24). stormvm e1a84f1: `cpu.maxSockets` and `memory.maxGuest` are rendered as headroom (qemu `maxcpus` + a
+  virtio-mem device, cloud-hypervisor `max`/`hotplug_size`), and every qemu VM gets four empty PCIe root ports
+  (`hp0`…`hp3`, after every other device: no slot or guest NIC name moves). The kubelet (`vm_hotplug.rs`, from
+  `reconcile_one` once per VMI generation) compares the spec with what the machine was last given, recorded beside its
+  registration (`/run/stormvm/<ns>/<name>/kubelet-hotplug.json`; a machine adopted without one takes the spec as
+  given): vCPU total → `set_vcpus`, `memory.guest` → `set_memory` (status read every 2 s while the guest takes it in),
+  an added interface on a node bridge or a secondary NAD in the VMI's sandbox (NAD recorded, CNI ADD, tap, `add_nic`,
+  watcher/DHCP, network-status), a removed one `remove_nic` then its watcher, DHCP and CNI DEL. The pod network (and a
+  NAD replacing it) stay start-only. Status: `currentCPUTopology`, `memory {guestAtBoot, guestCurrent,
+  guestRequested}`, `interfaces[]`; a refusal is `HotplugSynchronized` False with the verb's words and a Warning
+  `HotplugRefused` Event, never a failed machine. Tap watchers and DHCP responders are keyed by MAC, not NIC index.
+- **fix:** (stormvm#92, in the same bump) qemu's `-smp` takes the vCPU total once: a VMI with `cpu: {cores: 2,
+  sockets: 2}` ran 8 vCPUs and now runs 4 at its next start; a total the topology does not divide is refused
+  (`CoresNotDivisible`).
+
 - **feat:** A combustion VM's seed disk is combustion's volume (#245, stormvm#63). stormvm d16a49b → def7521 (e67a34a
   delivers combustion on the seed disk and drops its `CombustionNotDelivered` refusal), and in the same change the
   kubelet writes the seed through `stormvm_cloudinit::medium`: a VMI with `storm.io/combustion` and a
