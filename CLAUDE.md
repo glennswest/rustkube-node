@@ -58,6 +58,14 @@ by #51.
 
 ## Work plan
 
+### In progress: #245 (P3), the VM seed through stormvm_cloudinit::medium (combustion, stormvm#63)
+
+2026-10-13. stormvm e67a34a (main def7521; after d16a49b no Cargo.toml change, so only the rev moves in Cargo.toml and
+Cargo.lock) delivers combustion on the seed disk and drops `Invalid::CombustionNotDelivered`. Same commit as the bump:
+`seed_volume` asks `stormvm_cloudinit::medium(vm, &seed)` before creating the volume, then posts `medium.body()` to
+`/cidata` (cloud-init = `CIDATA` as before, no `keep_case`; combustion = `combustion`, `keep_case`, `/combustion/script`;
+ignition/storm = refused). Fake stormblock records the cidata body; test both. Docs, CHANGELOG; sc-build; golden; close.
+
 ### Done: #244 (P1), :10250/pods stalls ~15 s once per install (stormd's API probe)
 
 2026-10-13. Consoles (pvetest1 15:50Z, pvetest2): both stalls at the moment cadvisor hit max restarts and PID 1
