@@ -13,7 +13,7 @@ stage golden through `stormcentral component stage rustkube-node`, not a package
 
 ## Current implementation reference (2026-10-09)
 
-Main baseline: 06b91b5 (latest stage golden golden-rustkube-node-2eabd6fc174b, stormcos#424). See
+Main baseline: bf3d225 (latest stage golden golden-rustkube-node-c426c0ae96ed, stormcos#424; every git dependency by rev, #210). See
 `docs/status.md` for changes since October 2, the owner's recorded decisions and issue-backed limitations,
 `docs/configuration.md` for every CLI/env/default, `docs/api.md` for ports and actual routes, `docs/retries.md`
 for every remote call's retry policy. CLI runtime defaults to native; stormcos explicitly chooses stormpump.
@@ -154,13 +154,14 @@ kube-proxy's apiserver client, the test container's `Api`.
        fixed). `cd test && cargo test --locked && cargo build --release --locked` at a333c3a: 29 pass, release builds.
        Stage golden golden-rustkube-node-00d7475efba3 (105be87), release request stormcos#424. Closed.
 
-### In progress: #210, git dependencies pinned by rev (stormcentral#571's SBOM refusal)
+### Done: #210, git dependencies pinned by rev (stormcentral#571's SBOM refusal)
 
-2026-10-13. Both upstream pins landed: stormpump#123 (272470b pins stormcast 3cec734), stormvm#82 (5f724c4 pins
-stormpump + stormpump-abi at 9877a97). Doing, on branch wip/210: stormpump/stormpump-abi `rev = 9877a97…`, every
-stormvm crate `rev = d16a49b…` (stormvm main; after b2f88b8 only the pin and stormvm-verify changed); the lock from a
-build VM (`cargo metadata`, Cargo.lock carried back with SC_BUILD_OUT); check one stormpump and every git source
-`?rev=`; sc-build `--locked`; merge, CHANGELOG, golden, close.
+2026-10-13. Upstream pins landed: stormpump#123 (272470b pins stormcast 3cec734), stormvm#82 (5f724c4 pins stormpump +
+stormpump-abi at 9877a97). stormpump/stormpump-abi `rev = 9877a97…`, every stormvm crate `rev = d16a49b…` (stormvm main;
+after b2f88b8 only the pin and stormvm-verify changed) (4b4afef); lock from build job 1dd3eae08c (`cargo metadata`,
+carried back with SC_BUILD_OUT, sha checked; ab461d6): one stormpump, no git source without `?rev=`. SC_BUILD_VM
+sc-build bf3d225 (job 2c167356d6) `cargo metadata --locked && cargo build --locked && cargo test --locked`: 509 kubelet
+unit, all suites pass. Stage golden golden-rustkube-node-c426c0ae96ed (stormcos#424). Closed.
 
 (earlier)
 
