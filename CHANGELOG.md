@@ -2,6 +2,12 @@
 
 ## 2026-10-13
 
+- **build:** Every git dependency is pinned by `rev`, transitive ones included (#210, stormcentral#571's SBOM check).
+  stormpump and stormpump-abi move from `branch = "main"` (cc878b9) to `rev = 9877a97` (stormpump main of 10-10, which
+  pins stormcast 3cec734 by rev, stormpump#123); every stormvm crate moves b2f88b8 → d16a49b (stormvm main, which pins
+  the same stormpump 9877a97, stormvm#82; after b2f88b8 only that pin and stormvm-verify changed). The graph is back
+  to one stormpump (it had two: stormvm's f466116 beside ours), and `Cargo.lock` has no git source without `?rev=`.
+
 - **fix:** `:10250` no longer waits on the apiserver for every request (#244). Each bearer token was sent to the
   apiserver's TokenReview on every request, under the apiserver retry policy (4 tries, 30 s each, 60 s deadline),
   so stormd's `/pods` probe (node-admin token, every 15 s) stalled whenever the apiserver hiccupped (pvetest1/2 on
