@@ -168,8 +168,9 @@ impl MemoryNow {
 pub trait Hotplug: Send + Sync {
     /// Set the vCPU total. Returns how many are present now.
     async fn set_vcpus(&self, n: u32) -> Result<u32, String>;
-    /// Ask for `bytes` of guest memory in all.
-    async fn set_memory(&self, bytes: u64) -> Result<MemoryNow, String>;
+    /// Ask for `bytes` of guest memory in all; below the boot memory, down to
+    /// `floor`, through the balloon (#252). Below the floor is refused.
+    async fn set_memory(&self, bytes: u64, floor: Option<u64>) -> Result<MemoryNow, String>;
     /// The memory now (how far a change has got).
     async fn memory(&self) -> Result<MemoryNow, String>;
     /// Plug a NIC in. Returns the port.
@@ -184,8 +185,19 @@ pub trait Hotplug: Send + Sync {
     async fn remove_disk(&self, name: &str) -> Result<(), String>;
 }
 
+/// What the guest can use now (`current()`: the balloon's share of the boot
+/// memory plus what is hot-added, #252), and what the hot-plug device was
+/// asked for. A squeeze's own target is the caller's (it asked for it).
 fn memory_now(m: stormvm_control::hotplug::MemorySize) -> MemoryNow {
-    MemoryNow { boot: m.boot, current: m.total(), requested: m.boot + m.requested }
+    MemoryNow { boot: m.boot, current: m.current(), requested: m.boot + m.requested }
+}
+
+/// A machine's balloon floor by the spec's rule (#252): `memory.min` below its
+/// size, the request KubeVirt's `resources.requests.memory` gives below
+/// `memory.guest`. The machine's registration records the one it booted with.
+pub fn floor_of(spec: &stormvm_spec::VmSpec) -> Option<u64> {
+    let min = spec.memory.min.as_deref().and_then(stormvm_spec::parse_size)?;
+    (min < want_memory(spec)?).then_some(min)
 }
 
 #[async_trait::async_trait]
@@ -193,8 +205,8 @@ impl Hotplug for stormvm_control::Machine {
     async fn set_vcpus(&self, n: u32) -> Result<u32, String> {
         stormvm_control::Machine::set_vcpus(self, n).await.map(|v| v.present).map_err(|e| e.to_string())
     }
-    async fn set_memory(&self, bytes: u64) -> Result<MemoryNow, String> {
-        stormvm_control::Machine::set_memory(self, bytes).await.map(memory_now).map_err(|e| e.to_string())
+    async fn set_memory(&self, bytes: u64, floor: Option<u64>) -> Result<MemoryNow, String> {
+        stormvm_control::Machine::set_memory_within(self, bytes, floor).await.map(memory_now).map_err(|e| e.to_string())
     }
     async fn memory(&self) -> Result<MemoryNow, String> {
         stormvm_control::Machine::memory(self).await.map(memory_now).map_err(|e| e.to_string())

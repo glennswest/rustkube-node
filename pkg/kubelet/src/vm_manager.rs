@@ -1011,6 +1011,8 @@ pub struct VmManager {
     hot_seen: std::sync::Mutex<HashMap<String, i64>>,
     /// What each running machine was last given (#246), as recorded.
     hot_records: std::sync::Mutex<HashMap<String, crate::vm_hotplug::Record>>,
+    /// When each machine's memory was last changed, while it converges (#252).
+    hot_settle_since: std::sync::Mutex<HashMap<String, std::time::Instant>>,
     /// A machine's hotplug verbs: its control socket, or a fake in tests.
     hot_machine: HotMachine,
     /// Machines started from a saved state, until it is known whether the
@@ -1076,6 +1078,9 @@ const HANDLELESS_PERIOD: std::time::Duration = std::time::Duration::from_secs(10
 /// While a guest takes in (or gives back) memory it was asked to, its status
 /// is read again this often (#246).
 const HOT_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a memory change is followed before the status keeps what it
+/// reached (#252: a balloon squeezes only what the guest gives back).
+const HOT_SETTLE_MAX: std::time::Duration = std::time::Duration::from_secs(300);
 /// A disk added to a running machine that waits on its claim is tried again
 /// this often (#247).
 const HOT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -1246,6 +1251,7 @@ impl VmManager {
             hot_dir: std::path::PathBuf::from(RUN_ROOT),
             hot_seen: Default::default(),
             hot_records: Default::default(),
+            hot_settle_since: Default::default(),
             hot_machine: Arc::new(|vm: &Vm| {
                 machine_of(vm).map(|m| Arc::new(m) as Arc<dyn crate::vm_hotplug::Hotplug>)
             }),
@@ -3558,21 +3564,40 @@ impl VmManager {
         if let Some(bytes) = c.memory {
             let from = record.memory.map(crate::vm_hotplug::quantity).unwrap_or_else(|| "?".into());
             let to = crate::vm_hotplug::quantity(bytes);
-            match machine.set_memory(bytes).await {
-                Ok(now) => {
+            // Below the boot memory, down to the balloon's floor (#252): the one
+            // the machine booted with (its registration), else the spec's rule.
+            let floor = stormvm_node::console::find(RUN_ROOT, &vm.namespace, &vm.name)
+                .and_then(|r| r.memory_min)
+                .or_else(|| crate::vm_hotplug::floor_of(&spec));
+            match machine.set_memory(bytes, floor).await {
+                Ok(mut now) => {
                     info!(vm = %vm.name, %from, %to, "memory changed");
                     self.event_of(&vm, "Normal", "MemoryChanged", &format!("memory {from} → {to}")).await;
                     record.memory = Some(bytes);
+                    // What was asked: a squeeze's target is not the device's.
+                    now.requested = bytes;
                     settling = now.settling();
                     vm.hot.memory = Some(now);
+                    self.hot_settle_since.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), std::time::Instant::now());
                 }
                 Err(e) => problems.push(format!("memory {from} → {to}: {e}")),
             }
         } else if vm.hot.memory.is_some_and(|m| m.settling()) {
-            if let Ok(now) = machine.memory().await {
+            if let Ok(mut now) = machine.memory().await {
+                now.requested = record.memory.unwrap_or(now.requested);
                 settling = now.settling();
                 vm.hot.memory = Some(now);
             }
+            // A squeeze the guest cannot finish (it uses more than asked) is
+            // not polled for ever: what it reached stays in the status.
+            let since = self.hot_settle_since.lock().unwrap_or_else(|e| e.into_inner()).get(uid).copied();
+            if settling && since.is_some_and(|t| t.elapsed() > HOT_SETTLE_MAX) {
+                info!(vm = %vm.name, "memory has not converged in {}s; no longer followed", HOT_SETTLE_MAX.as_secs());
+                settling = false;
+            }
+        }
+        if !settling {
+            self.hot_settle_since.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
         }
         for name in &c.remove {
             match self.remove_hot_nic(&vm, &record, name, machine.as_ref()).await {
@@ -5753,11 +5778,18 @@ mod tests {
             }
             Ok(n)
         }
-        async fn set_memory(&self, bytes: u64) -> Result<crate::vm_hotplug::MemoryNow, String> {
-            self.calls.lock().unwrap().push(format!("memory {bytes}"));
-            // The guest has taken in half of it so far.
-            let boot = 1 << 30;
-            Ok(crate::vm_hotplug::MemoryNow { boot, current: boot + (bytes - boot) / 2, requested: bytes })
+        async fn set_memory(&self, bytes: u64, floor: Option<u64>) -> Result<crate::vm_hotplug::MemoryNow, String> {
+            self.calls.lock().unwrap().push(match floor {
+                Some(f) => format!("memory {bytes} floor {f}"),
+                None => format!("memory {bytes}"),
+            });
+            let boot: u64 = 1 << 30;
+            if bytes < boot && floor.is_none_or(|f| bytes < f) {
+                return Err(format!("{bytes} is below the balloon's floor ({floor:?})"));
+            }
+            // The guest has taken in (or given back) half of it so far.
+            let current = if bytes >= boot { boot + (bytes - boot) / 2 } else { boot - (boot - bytes) / 2 };
+            Ok(crate::vm_hotplug::MemoryNow { boot, current, requested: bytes })
         }
         async fn memory(&self) -> Result<crate::vm_hotplug::MemoryNow, String> {
             self.calls.lock().unwrap().push("memory?".into());
@@ -5979,6 +6011,36 @@ mod tests {
         assert!(!vm.owned_volumes.contains(&id));
         assert!(!e.deleted.lock().unwrap().contains(&id), "only a VM deleted releases its disks (#75)");
         assert!(vm.hot.disk_targets.is_empty());
+    }
+
+    /// #252: lowering `memory.guest` below the boot memory squeezes the guest
+    /// through the balloon, down to its floor (`resources.requests.memory`),
+    /// and the status follows it in; below the floor is refused, said.
+    #[tokio::test]
+    async fn memory_below_boot_is_squeezed_to_its_floor_and_no_further() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeHot::default());
+        let m = hot_manager(dir.path(), &fake);
+        m.vms.lock().await.insert("u-1".into(), vm_at("u-1", &[], Phase::Running));
+        m.hot_records.lock().unwrap().insert("u-1".into(), given(1, 1 << 30, &[("default", "02:00:00:00:00:01")]));
+        let floored = |generation: i64, guest: &str| {
+            let mut obj = hot_vmi(generation, 1, 1, guest, &[]);
+            obj["spec"]["domain"]["resources"] = json!({"requests": {"memory": "512Mi"}});
+            obj
+        };
+
+        m.hotplug("u-1", &floored(2, "768Mi")).await;
+        assert_eq!(*fake.calls.lock().unwrap(), vec![format!("memory {} floor {}", 768u64 << 20, 512u64 << 20)]);
+        let mem = m.vms.lock().await["u-1"].hot.memory.unwrap();
+        assert_eq!((mem.requested, mem.current), (768 << 20, 896 << 20), "squeezing, half way");
+        assert!(mem.settling());
+
+        m.hotplug("u-1", &floored(3, "256Mi")).await;
+        let vm = m.vms.lock().await["u-1"].clone();
+        let cond = vm.hot.condition.unwrap();
+        assert_eq!(cond["status"], "False");
+        assert!(cond["message"].as_str().unwrap().contains("below the balloon's floor"), "{cond}");
+        assert_eq!(crate::vm_hotplug::load(dir.path(), "default", "vm-u-1").unwrap().memory, Some(768 << 20), "not given");
     }
 
     /// #246: an interface the spec no longer names is taken out (and stays

@@ -711,9 +711,16 @@ starts once the VM lets the claim go (#80).
     takes the spec at its adoption as given.
   - **vCPUs:** `cores × sockets × threads` → `set_vcpus(total)`. Only hot-added
     vCPUs are removed; the guest has 30 s to release one.
-  - **Memory:** `memory.guest` → `set_memory(bytes)`, in 2 MiB blocks above
-    the boot memory. While the guest takes it in (or gives it back) the status
-    is read again every 2 s until it has.
+  - **Memory:** `memory.guest` → `set_memory_within(bytes, floor)`: above the
+    boot memory in 2 MiB blocks (virtio-mem); below it, through the balloon,
+    down to the floor (#252, stormvm#19): the `memory.min` the machine booted
+    with (its registration; KubeVirt's `resources.requests.memory` below
+    `memory.guest`, which is what gave it a balloon). Below the floor, or below
+    the boot memory with no balloon, is refused (`HotplugSynchronized` False
+    with the verb's words). `status.memory.guestCurrent` is what the guest can
+    use now (the balloon's share plus what is hot-added), `guestRequested` what
+    was asked; while they differ the status is read again every 2 s, for at
+    most 5 min (a balloon takes only what the guest gives back).
   - **An interface added:** a tap on a node bridge, or a secondary multus NIC
     in the VMI's sandbox (its NAD resolved, recorded, CNI ADD, a tap bridged to
     it, its network-status entry on the launcher Pod), then plugged in on a

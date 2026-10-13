@@ -2,6 +2,12 @@
 
 ## 2026-10-13
 
+- **feat:** A running VMI's memory goes below its boot size through the balloon (#252, stormvm#19): #246's memory step
+  calls `set_memory_within(bytes, floor)`, the floor the machine's registration `memory_min` (else the spec's
+  `memory.min` below its size); below it is the `HotplugSynchronized` refusal. `status.memory.guestCurrent` is
+  `MemorySize::current()` (balloon + hot-added), `guestRequested` what was asked; a squeeze is followed for at most
+  5 min. (`Registration.memory_min` in the test literals came with #251's bump.)
+
 - **feat:** VM snapshots with memory, and restores that resume from them (#251, stormvm#37; stormvm 7a7baf2 → e929b8f).
   `storm.io/memory: "true"` on a VirtualMachineSnapshot takes it with `take_with_memory` (state volume in the same
   group; status `storm.io/memory`, `storm.io/stateVolume`, `storm.io/memoryBytes`; refused with disks on other drivers'
