@@ -56,6 +56,20 @@ const API: &str = "snapshot.kubevirt.io/v1beta1";
 /// Who marks the claims a restore made.
 pub const RESTORED_FROM: &str = "storm.io/restored-from";
 
+/// On a VirtualMachine's template (so on the VMI the VM controller makes from
+/// it): the next start resumes from this saved state (#251), one time.
+/// `{"volume": "<stormblock volume>", "restore": "<ns>/<name>"}`.
+pub const RESUME_ANNOTATION: &str = "storm.io/resume-state";
+
+/// The restore's status field saying what became of the memory (#251):
+/// `pending` (restored, the VM not started yet), `resumed`, `cold-boot`.
+pub const MEMORY_STATUS: &str = "storm.io/memory";
+
+/// The volume a restore makes from a memory snapshot's state member.
+pub fn state_name(ns: &str, vm: &str, restore: &str) -> String {
+    format!("{ns}.{vm}-state-restore-{restore}")
+}
+
 /// The stormblock calls a restore needs. A seam for the tests; the real one
 /// is stormvm's client (blocking, so it is called off the async threads).
 pub trait RestoreEngine: Send + Sync {
@@ -233,8 +247,15 @@ impl Snapshots {
             }
         }
         match self.restore_steps(obj, &req, &snap, engine).await {
-            Ok(restores) => {
-                let st = spec::restore_status(true, &now(), &restores, None);
+            Ok((restores, state)) => {
+                let mut st = spec::restore_status(true, &now(), &restores, None);
+                // The memory too (#251): resumed at the VM's next start.
+                if let Some(state) = &state {
+                    st[MEMORY_STATUS] = json!("pending");
+                    st["storm.io/memoryMessage"] = json!(format!(
+                        "the guest's memory is in volume {state}: the VM's next start resumes from it"
+                    ));
+                }
                 if self.write_restore_status(obj, st).await {
                     info!("{}/{}: restored {} from {}", req.namespace, req.vm, restores.len(), req.snapshot);
                     let msg = format!(
@@ -276,7 +297,7 @@ impl Snapshots {
         req: &spec::RestoreRequest,
         snap: &Value,
         engine: &dyn RestoreEngine,
-    ) -> Result<Vec<Restored>, Step> {
+    ) -> Result<(Vec<Restored>, Option<String>), Step> {
         let ns = req.namespace.as_str();
         match snap["status"]["phase"].as_str() {
             Some("Succeeded") => {}
@@ -301,7 +322,12 @@ impl Snapshots {
             return Err(Step::Error(format!("VirtualMachine {} not found", req.vm)));
         };
         let engine_disks: Vec<(&String, &Value)> = disks.iter().filter(|(d, _)| !is_cloud_init(&vm, d)).collect();
-        let group = if engine_disks.is_empty() {
+        // A memory snapshot's state (#251) is a member of the same group.
+        let state_member = (snap["status"][crate::vm_snapshot::MEMORY_ANNOTATION] == json!(true))
+            .then(|| snap["status"][crate::vm_snapshot::STATE_VOLUME_STATUS].as_str())
+            .flatten()
+            .filter(|v| !v.is_empty());
+        let group = if engine_disks.is_empty() && state_member.is_none() {
             None
         } else {
             Some(
@@ -335,8 +361,26 @@ impl Snapshots {
             restores.push(Restored { disk: disk.clone(), snapshot: req.snapshot.clone(), volume: claim.clone() });
             claims.push((disk.clone(), claim));
         }
+        // The memory (#251): a volume from the state member, named on the VM
+        // template so its next start resumes from it.
+        let mut state = None;
+        if let Some(v) = state_member {
+            let group = group.as_ref().expect("a group for the state");
+            let member = group
+                .of(v)
+                .ok_or_else(|| Step::Error(format!("group {group_id} has no member for the memory state ({v})")))?;
+            let made = engine
+                .from_snapshot(&state_name(ns, &req.vm, &req.name), member)
+                .map_err(|e| Step::Wait(format!("stormblock would not restore the memory state: {e}")))?;
+            state = Some(made);
+        }
+        let mut updated = rewired(&vm, &claims).unwrap_or_else(|| vm.clone());
+        if let Some(made) = &state {
+            let want = json!({ "volume": made, "restore": format!("{ns}/{}", req.name) }).to_string();
+            updated["spec"]["template"]["metadata"]["annotations"][RESUME_ANNOTATION] = json!(want);
+        }
         // The VM's disks are the restored claims (option A).
-        if let Some(updated) = rewired(&vm, &claims) {
+        if updated != vm {
             let (api, url, _) = self.api();
             let r = api.put(format!("{url}{vm_path}")).json(&updated).send_retrying(retry::Policy::API).await;
             match r {
@@ -345,7 +389,7 @@ impl Snapshots {
                 Err(e) => return Err(Step::Wait(format!("VirtualMachine {} not updated: {e}", req.vm))),
             }
         }
-        Ok(restores)
+        Ok((restores, state))
     }
 
     /// Mark a restore any node could serve as this node's, against the

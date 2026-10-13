@@ -1013,7 +1013,26 @@ pub struct VmManager {
     hot_records: std::sync::Mutex<HashMap<String, crate::vm_hotplug::Record>>,
     /// A machine's hotplug verbs: its control socket, or a fake in tests.
     hot_machine: HotMachine,
+    /// Machines started from a saved state, until it is known whether the
+    /// guest resumed (#251), by uid.
+    resuming: std::sync::Mutex<HashMap<String, Resume>>,
+    /// VMIs whose resume was tried (#251): a second start of one is cold.
+    resume_tried: std::sync::Mutex<std::collections::HashSet<String>>,
 }
+
+/// A start from a saved state (#251): the restore that made it, and the
+/// state volume, given back once the outcome is known.
+#[derive(Debug, Clone)]
+struct Resume {
+    /// `<ns>/<name>` of the VirtualMachineRestore.
+    restore: String,
+    volume_id: String,
+    since: std::time::Instant,
+}
+
+/// How long a guest has to load its saved memory and run (#251): a guest
+/// with a lot of RAM reads it all from its volume first.
+const RESUME_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// How the manager reaches a running machine's hotplug verbs (#246).
 type HotMachine = Arc<dyn Fn(&Vm) -> Option<Arc<dyn crate::vm_hotplug::Hotplug>> + Send + Sync>;
@@ -1230,6 +1249,8 @@ impl VmManager {
             hot_machine: Arc::new(|vm: &Vm| {
                 machine_of(vm).map(|m| Arc::new(m) as Arc<dyn crate::vm_hotplug::Hotplug>)
             }),
+            resuming: Default::default(),
+            resume_tried: Default::default(),
         }
     }
 
@@ -1757,6 +1778,11 @@ impl VmManager {
         if !self.set_finalizer(object, true).await {
             self.due_in(uid, AGENT_FIRST);
         }
+        // A machine resuming from a saved state (#251): did the guest run?
+        if self.resuming.lock().unwrap_or_else(|e| e.into_inner()).contains_key(uid) {
+            self.check_resume(uid).await;
+            return Ok(false);
+        }
         // A running machine follows its VMI's cpu, memory and interfaces (#246).
         self.hotplug(uid, object).await;
         Ok(false)
@@ -2112,11 +2138,14 @@ impl VmManager {
                 return Err(e);
             }
         };
+        // A restore's saved memory (#251): this start resumes from it, once.
+        let resume = self.prepare_resume(uid, obj).await;
+        let incoming = resume.as_ref().map(|(_, dev)| stormvm_vmm::qemu::incoming_from_state(dev));
         // Taps, plan and spawn, inside the deposit window (#100): a failure
         // there is unwound before another start may deposit.
         let launched = {
             let _window = self.deposit_window.lock().await;
-            let launched = self.launch(uid, &ns, &vm, ring, &disks, &dir, pod.as_ref()).await;
+            let launched = self.launch(uid, &ns, &vm, ring, &disks, &dir, pod.as_ref(), incoming.as_deref()).await;
             if launched.is_err() {
                 if let Err(e) = self.unwind_held(uid, false).await {
                     warn!(vm = %vm.name, "a failed start's taps are still held, retried before the next: {e}");
@@ -2124,9 +2153,14 @@ impl VmManager {
             }
             launched
         };
+        if let Some((r, _)) = resume {
+            self.resuming.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), r);
+        }
         let (handle, made, registration) = match launched {
             Ok(l) => l,
             Err(e) => {
+                // A resume that never started is a cold boot next (#251).
+                self.finish_resume(uid, Err(format!("the machine did not start: {e}"))).await;
                 self.give_back(uid, &disks).await;
                 if pod.is_some() && !self.release_pod_network(uid).await {
                     warn!(vm = %vm.name, "a failed start's pod network is still held, retried at teardown");
@@ -2216,6 +2250,7 @@ impl VmManager {
         disks: &[ResolvedDisk],
         dir: &str,
         pod: Option<&crate::vm_network::PodNet>,
+        incoming: Option<&str>,
     ) -> Result<(Handle, NicsMade, stormvm_node::console::Registration), String> {
         // NICs, before the plan: the tap has to exist so its descriptor can
         // be named, and it has to be deposited so the engine can find it by
@@ -2256,7 +2291,13 @@ impl VmManager {
             warn!(vm = %vm.name, "could not register for the console doors: {e}");
         }
 
-        let built = match plan::build_with_nics(vm, disks, &nics, &logging, RUN_ROOT) {
+        // From a saved state (#251), `-incoming file:<device>`: the guest
+        // resumes where it was saved.
+        let built = match incoming {
+            Some(uri) => plan::build_receiving(vm, disks, &nics, &logging, RUN_ROOT, uri),
+            None => plan::build_with_nics(vm, disks, &nics, &logging, RUN_ROOT),
+        };
+        let built = match built {
             Ok(p) => p,
             Err(e) => {
                 deregister(&vm.namespace, &vm.name);
@@ -2452,6 +2493,20 @@ impl VmManager {
             let mut done = vm.clone();
             done.phase = if code == 0 { Phase::Succeeded } else { Phase::Failed };
             done.exit_code = code;
+            // A machine that ended while it loaded a saved state (#251): qemu
+            // refused the stream (the VM's spec changed since the snapshot, a
+            // damaged state). Not the VMI's end: a cold boot from the restored
+            // disks, started by the next pass.
+            if self.resuming.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&vm.uid) {
+                let said = hypervisor_said(&vm.log_dir).unwrap_or_else(|| format!("the hypervisor exited with {code}"));
+                self.finish_resume(&vm.uid, Err(said)).await;
+                if self.stop(&done).await {
+                    self.vms.lock().await.remove(&done.uid);
+                    self.withdraw_identity(&done.uid);
+                    self.due_in(&done.uid, std::time::Duration::ZERO);
+                    continue;
+                }
+            }
             done.message = match (code, hypervisor_said(&vm.log_dir)) {
                 (-1, _) => "the hypervisor ended; its exit status is unknown (it was started by an \
                             earlier kubelet, which kept no handle)"
@@ -3303,6 +3358,146 @@ impl VmManager {
         }
     }
 
+
+    /// A start from a restore's saved memory (#251): the VMI names it
+    /// (`storm.io/resume-state`, from its VirtualMachine's template), and this
+    /// VMI has not tried it yet. The annotation is taken off the template
+    /// first, so a VMI made after this one starts cold whatever happens here.
+    /// The state volume attached: its device. `None`: a cold boot, and when a
+    /// state was named and cannot be had, the restore says why.
+    async fn prepare_resume(&self, uid: &str, obj: &Value) -> Option<(Resume, String)> {
+        let text = obj["metadata"]["annotations"][crate::vm_restore::RESUME_ANNOTATION].as_str()?;
+        if !self.resume_tried.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string()) {
+            return None;
+        }
+        let ns = obj["metadata"]["namespace"].as_str().unwrap_or("default").to_string();
+        if let Some(vm) = owner_vm(obj) {
+            self.consume_resume(&ns, vm).await;
+        }
+        let want: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+        let restore = want["restore"].as_str().unwrap_or("").to_string();
+        let volume = want["volume"].as_str().unwrap_or("").to_string();
+        let told = restore.clone();
+        let cold = |why: String| async move {
+            warn!(%uid, "not resumed from the saved state: {why}");
+            self.report_resume(&told, Err(why)).await;
+            None
+        };
+        let id = match self.volume_named(&volume).await {
+            Ok(Some(v)) => v["id"].as_str().unwrap_or(&volume).to_string(),
+            Ok(None) => return cold(format!("its state volume {volume} is gone")).await,
+            Err(e) => return cold(format!("its state volume {volume} could not be looked up: {e}")).await,
+        };
+        let attached = self
+            .post(&format!("{}/api/v1/volumes/{id}/attach", self.storage), &json!({ "transport": "ublk" }))
+            .await;
+        let device = match attached.as_ref().ok().and_then(|a| a["device_hint"].as_str()) {
+            Some(d) => d.to_string(),
+            None => {
+                let why = attached.err().unwrap_or_else(|| "no local device".into());
+                self.delete_volumes(obj["metadata"]["name"].as_str().unwrap_or(""), std::slice::from_ref(&id)).await;
+                return cold(format!("its state volume {volume} did not attach: {why}")).await;
+            }
+        };
+        info!(%uid, %volume, %device, "starting from the saved state");
+        Some((Resume { restore: restore.clone(), volume_id: id, since: std::time::Instant::now() }, device))
+    }
+
+    /// The resume taken off the VirtualMachine's template (#251): it is one
+    /// start's. Only the annotation: the VM controller's live update reads
+    /// the template's spec, not its metadata.
+    async fn consume_resume(&self, ns: &str, vm: &str) {
+        if self.api_url.is_empty() {
+            return;
+        }
+        let url = format!("{}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{vm}", self.api_url);
+        let body = json!({ "spec": { "template": { "metadata": { "annotations": {
+            crate::vm_restore::RESUME_ANNOTATION: Value::Null } } } } });
+        match self.api.patch(&url).header("content-type", "application/merge-patch+json").json(&body).send_retrying(retry::Policy::API).await {
+            Ok(r) if r.status().is_success() => {}
+            Ok(r) => warn!(%vm, "the resume was not taken off the VirtualMachine: {}", r.status()),
+            Err(e) => warn!(%vm, "the resume was not taken off the VirtualMachine: {e}"),
+        }
+    }
+
+    /// A resuming machine (#251): running is resumed; still loading is asked
+    /// again; paused after the load is unpaused; past [`RESUME_WAIT`] it is a
+    /// cold boot (the machine stopped, and started again without its state).
+    async fn check_resume(&self, uid: &str) {
+        let Some(vm) = self.vms.lock().await.get(uid).cloned() else { return };
+        let since = match self.resuming.lock().unwrap_or_else(|e| e.into_inner()).get(uid) {
+            Some(r) => r.since,
+            None => return,
+        };
+        let Some(machine) = machine_of(&vm) else {
+            self.due_in(uid, HOT_SETTLE);
+            return;
+        };
+        let state = machine.status().await.map(|s| s.state);
+        match state.as_deref() {
+            Ok("running") => self.finish_resume(uid, Ok(())).await,
+            Ok("paused") | Ok("postmigrate") => match machine.unpause().await {
+                Ok(()) => self.finish_resume(uid, Ok(())).await,
+                Err(e) => self.finish_resume(uid, Err(format!("the state loaded, but the guest would not run: {e}"))).await,
+            },
+            _ if since.elapsed() > RESUME_WAIT => {
+                let why = format!("the guest did not run within {}s of starting from its state ({state:?})", RESUME_WAIT.as_secs());
+                self.finish_resume(uid, Err(why)).await;
+                // Stopped like a deletion; the next pass starts it cold.
+                if self.stop(&vm).await {
+                    self.vms.lock().await.remove(uid);
+                    self.withdraw_identity(uid);
+                }
+                self.due_in(uid, HOT_SETTLE);
+            }
+            // Loading (`inmigrate`), or the control socket not up yet.
+            _ => self.due_in(uid, HOT_SETTLE),
+        }
+    }
+
+    /// The outcome of a resume (#251): the state volume detached and deleted
+    /// (it was the restore's copy; the snapshot keeps the original), the
+    /// restore told, and an Event on the VMI.
+    async fn finish_resume(&self, uid: &str, outcome: Result<(), String>) {
+        let Some(r) = self.resuming.lock().unwrap_or_else(|e| e.into_inner()).remove(uid) else { return };
+        let url = format!("{}/api/v1/volumes/{}/attach", self.storage, r.volume_id);
+        if let Err(e) = self.engine.delete(&url).await {
+            warn!(%uid, volume = %r.volume_id, "the state volume was not detached: {e}");
+        }
+        let name = self.desired.lock().await.get(uid).and_then(|o| o["metadata"]["name"].as_str().map(String::from)).unwrap_or_default();
+        self.delete_volumes(&name, std::slice::from_ref(&r.volume_id)).await;
+        if let Some(obj) = self.desired.lock().await.get(uid).cloned() {
+            match &outcome {
+                Ok(()) => self.event(&obj, "Normal", "Resumed", "the guest resumed from its saved memory").await,
+                Err(why) => self.event(&obj, "Warning", "ColdBoot", &format!("not resumed from its saved memory, booted cold: {why}")).await,
+            }
+        }
+        match &outcome {
+            Ok(()) => info!(%uid, "the guest resumed from its saved state"),
+            Err(why) => warn!(%uid, "not resumed from the saved state, booting cold: {why}"),
+        }
+        self.report_resume(&r.restore, outcome).await;
+    }
+
+    /// The restore says what became of its memory (#251): `resumed`, or
+    /// `cold-boot` with why.
+    async fn report_resume(&self, restore: &str, outcome: Result<(), String>) {
+        let Some((ns, name)) = restore.split_once('/') else { return };
+        if self.api_url.is_empty() {
+            return;
+        }
+        let (state, message) = match outcome {
+            Ok(()) => ("resumed", "the guest resumed from its saved memory".to_string()),
+            Err(why) => ("cold-boot", format!("booted cold from the restored disks: {why}")),
+        };
+        let url = format!("{}/apis/snapshot.kubevirt.io/v1beta1/namespaces/{ns}/virtualmachinerestores/{name}/status", self.api_url);
+        let body = json!({ "status": { crate::vm_restore::MEMORY_STATUS: state, "storm.io/memoryMessage": message } });
+        match self.api.patch(&url).header("content-type", "application/merge-patch+json").json(&body).send_retrying(retry::Policy::API).await {
+            Ok(r) if r.status().is_success() => {}
+            Ok(r) => warn!(%restore, "the restore's memory outcome was not written: {}", r.status()),
+            Err(e) => warn!(%restore, "the restore's memory outcome was not written: {e}"),
+        }
+    }
 
     /// Bring a running machine to its VMI's cpu, memory and interfaces
     /// (#246) through stormvm's hotplug verbs.
