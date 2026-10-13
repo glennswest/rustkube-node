@@ -764,6 +764,15 @@ starts once the VM lets the claim go (#80).
     `virtualMachineSnapshotContentName` is the stormblock group id, and it
     also carries `sourceUID`, `indications` and an Event on the object.
     `failureDeadline` (default 5 min) counts from creation.
+  - **Progress and detail** (#187, stormvm#45): while it runs,
+    `status["storm.io/step"]` follows the take as each step is entered
+    (`idling` → `freezing` → `cloning` → `thawing`); the result carries the
+    step it reached (on `Failed`, the one it failed in),
+    `status.snapshotVolumes.{includedVolumes,excludedVolumes}` (the VM's disks
+    taken and not; a disk on another driver's claim counts as taken once its
+    VolumeSnapshot is cut) and `status["storm.io/sizeBytes"]` (stormblock's
+    members summed; absent when unknown, as with VolumeSnapshots). Nothing is
+    said about disks when no group was taken.
   - **Restart:** a kubelet restarted mid-take takes it again. stormblock
     answers a name it has seen with what it made then. A snapshot whose VM
     has left the node is Failed.

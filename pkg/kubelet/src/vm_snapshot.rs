@@ -118,6 +118,9 @@ pub struct Taken {
     /// Every problem, including a guest left paused or frozen. `None` is a
     /// success.
     pub error: Option<String>,
+    /// The step it reached, the disks taken and not, and their size, for the
+    /// status beyond its phase (stormvm#45, #187).
+    pub detail: spec::SnapshotDetail,
 }
 
 impl Taken {
@@ -126,36 +129,46 @@ impl Taken {
     }
 }
 
+/// Told each step of a take as it is entered (`idling`, `freezing`,
+/// `cloning`, `thawing`: stormvm's `Step`), for the status (#187).
+pub type Progress = Arc<dyn Fn(&'static str) + Send + Sync>;
+
 /// Takes a registered VM's snapshot under a name, with the VolumeSnapshots
-/// to make in the same hold (#157). A seam for the tests: the real one needs
-/// a hypervisor and a stormblock.
-pub type TakeFn =
-    Arc<dyn Fn(Registration, String, Vec<Value>) -> Pin<Box<dyn Future<Output = Taken> + Send>> + Send + Sync>;
+/// to make in the same hold (#157), saying each step to `Progress`. A seam
+/// for the tests: the real one needs a hypervisor and a stormblock.
+pub type TakeFn = Arc<
+    dyn Fn(Registration, String, Vec<Value>, Progress) -> Pin<Box<dyn Future<Output = Taken> + Send>> + Send + Sync,
+>;
 
 /// The real take, against this node's stormblock, and the apiserver for the
 /// VolumeSnapshots.
 pub fn stormvm_take(stormblock: String, api: reqwest::Client, api_url: String) -> TakeFn {
-    Arc::new(move |reg: Registration, name: String, volume_snapshots: Vec<Value>| {
+    Arc::new(move |reg: Registration, name: String, volume_snapshots: Vec<Value>, progress: Progress| {
         let stormblock = stormblock.clone();
         let (api, api_url) = (api.clone(), api_url.clone());
         Box::pin(async move {
             if !volume_snapshots.is_empty() {
-                return take_with_volume_snapshots(&reg, &stormblock, &name, volume_snapshots, &api, &api_url).await;
+                return take_with_volume_snapshots(&reg, &stormblock, &name, volume_snapshots, &api, &api_url, &progress)
+                    .await;
             }
             // Taken again while stormblock is away (#211): stormvm's take is
             // idempotent by name, and only a take whose disks were not taken
             // for a transport reason is repeated (a refusal, or a guest left
             // paused or frozen, is reported as it is).
             let what = format!("snapshot {name}");
-            let (reg, stormblock, name) = (&reg, &stormblock, &name);
+            let (reg, stormblock, name, progress) = (&reg, &stormblock, &name, &progress);
             let taken = retry::with_backoff(retry::Policy::ENGINE.named("snapshot"), &what, |_| retry::Class::Infra, || async move {
                 let opts = stormvm_control::snapshot::Options::default();
-                let out = stormvm_console::snapshot::take(reg, stormblock, name, opts).await;
+                let out = stormvm_console::snapshot::take_with_progress(reg, stormblock, name, opts, |step| {
+                    progress(step.as_str())
+                })
+                .await;
                 let taken = Taken {
                     group: out.disks.as_ref().ok().map(|g| g.id.clone()),
                     volume_snapshots: Vec::new(),
                     indications: out.indications.iter().map(|s| s.to_string()).collect(),
                     error: out.error(),
+                    detail: stormvm_console::snapshot::detail(reg, &out),
                 };
                 match (&out.disks, &taken.error) {
                     (Err(_), Some(e)) if retry::class_of_message(e) == retry::Class::Infra => Err(Unreached(taken)),
@@ -178,6 +191,7 @@ async fn take_with_volume_snapshots(
     volume_snapshots: Vec<Value>,
     api: &reqwest::Client,
     api_url: &str,
+    progress: &Progress,
 ) -> Taken {
     let machine = stormvm_control::Machine {
         kind: stormvm_control::Kind::parse(&reg.vmm),
@@ -188,7 +202,7 @@ async fn take_with_volume_snapshots(
     let group_name = stormvm_console::snapshot::group_name(reg, name);
     let base = stormblock.to_string();
     let opts = stormvm_control::snapshot::Options::default();
-    let out = stormvm_control::snapshot::take(&machine, opts, move || async move {
+    let out = stormvm_control::snapshot::take_with_progress(&machine, opts, |step| progress(step.as_str()), move || async move {
         let group = if volumes.is_empty() {
             None
         } else {
@@ -197,7 +211,7 @@ async fn take_with_volume_snapshots(
             })
             .await
             .map_err(|e| format!("the snapshot call did not finish: {e}"))??;
-            Some(g.id)
+            Some(g)
         };
         let mut made = Vec::new();
         for vs in &volume_snapshots {
@@ -206,12 +220,32 @@ async fn take_with_volume_snapshots(
         Ok((group, made))
     })
     .await;
-    let (group, volume_snapshots) = out.disks.as_ref().ok().cloned().unwrap_or_default();
+    let mut detail = spec::SnapshotDetail { step: Some(out.step.as_str().to_string()), ..Default::default() };
+    if let Ok((group, made)) = &out.disks {
+        // The group's members and every disk on another driver's claim (each
+        // cut, or the take had failed). Its size only when every member's is
+        // known: a VolumeSnapshot's is its driver's, not counted here, and a
+        // partial sum reads as the whole.
+        for d in &reg.disks {
+            let taken = match &d.volume_id {
+                Some(v) => group.as_ref().is_some_and(|g| g.of(v).is_some()),
+                None => is_csi_disk(d),
+            };
+            if taken { detail.included.push(d.name.clone()) } else { detail.excluded.push(d.name.clone()) }
+        }
+        let total: u64 = group.iter().flat_map(|g| g.snapshots.iter()).map(|s| s.size_bytes).sum();
+        detail.size_bytes = (made.is_empty() && total > 0).then_some(total);
+    }
+    let (group, volume_snapshots) = match out.disks.as_ref() {
+        Ok((g, made)) => (g.as_ref().map(|g| g.id.clone()), made.clone()),
+        Err(_) => (None, Vec::new()),
+    };
     Taken {
         group,
         volume_snapshots,
         indications: out.indications.iter().map(|s| s.to_string()).collect(),
         error: out.error(),
+        detail,
     }
 }
 
@@ -536,7 +570,22 @@ impl Snapshots {
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or_default();
             let volume_snapshots = recorded.values().map(|e| volume_snapshot(&obj, e)).collect();
-            let taken = (me.take)(reg, name.to_string(), volume_snapshots).await;
+            // Each step onto the object as it is entered (#187), in order, by
+            // one writer; done before the result is written.
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
+            let progress: Progress = Arc::new(move |step| {
+                let _ = tx.send(step);
+            });
+            let writer = {
+                let (me, obj) = (me.clone(), obj.clone());
+                tokio::spawn(async move {
+                    while let Some(step) = rx.recv().await {
+                        me.write_step(&obj, step).await;
+                    }
+                })
+            };
+            let taken = (me.take)(reg, name.to_string(), volume_snapshots, progress).await;
+            let _ = writer.await;
             me.finish(&obj, source_uid, taken).await;
             me.in_flight.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
             me.completed.notify_one();
@@ -628,7 +677,7 @@ impl Snapshots {
             indications: taken.indications,
             error: taken.error.clone(),
         };
-        self.write_status(obj, &result).await;
+        self.write_status_with(obj, &result, Some(&taken.detail)).await;
         match &taken.error {
             None => {
                 let mut what = Vec::new();
@@ -650,6 +699,26 @@ impl Snapshots {
     }
 
     async fn write_status(&self, obj: &Value, r: &SnapshotResult) {
+        self.write_status_with(obj, r, None).await
+    }
+
+    /// The step a take in progress has reached (#187): `storm.io/step` alone,
+    /// so nothing else the status says is touched.
+    async fn write_step(&self, obj: &Value, step: &str) {
+        self.patch_status(obj, json!({ "storm.io/step": step })).await
+    }
+
+    /// The status for `r`, with the take's step, disks and size when there is
+    /// a detail (stormvm#45).
+    async fn write_status_with(&self, obj: &Value, r: &SnapshotResult, detail: Option<&spec::SnapshotDetail>) {
+        let status = match detail {
+            Some(d) => spec::snapshot_status_with(r, d),
+            None => spec::snapshot_status(r),
+        };
+        self.patch_status(obj, status).await
+    }
+
+    async fn patch_status(&self, obj: &Value, status: Value) {
         let (ns, name) = ns_name(obj);
         let url = format!(
             "{}/apis/{API}/namespaces/{ns}/virtualmachinesnapshots/{name}/status",
@@ -659,7 +728,7 @@ impl Snapshots {
             .api
             .patch(&url)
             .header("content-type", "application/merge-patch+json")
-            .json(&json!({ "status": spec::snapshot_status(r) }))
+            .json(&json!({ "status": status }))
             .send_retrying(retry::Policy::API)
             .await
         {
@@ -865,10 +934,21 @@ mod tests {
 
     /// A take that records what it was asked and answers `taken`.
     fn fake_take(taken: Taken, asked: Arc<Mutex<Vec<(String, String)>>>) -> TakeFn {
-        Arc::new(move |reg: Registration, name: String, _vs: Vec<Value>| {
+        Arc::new(move |reg: Registration, name: String, _vs: Vec<Value>, progress: Progress| {
             asked.lock().unwrap().push((format!("{}/{}", reg.namespace, reg.name), name));
             let t = taken.clone();
-            Box::pin(async move { t })
+            Box::pin(async move {
+                // The steps a take reaches: all four, or up to the one it failed in.
+                if let Some(step) = &t.detail.step {
+                    for s in ["idling", "freezing", "cloning", "thawing"] {
+                        progress(s);
+                        if s == step {
+                            break;
+                        }
+                    }
+                }
+                t
+            })
         })
     }
 
@@ -893,14 +973,31 @@ mod tests {
         let taken = Taken {
             group: Some("gs-1".into()),
             indications: vec!["Online".into(), "GuestAgent".into()],
+            detail: spec::SnapshotDetail {
+                step: Some("thawing".into()),
+                included: vec!["rootdisk".into()],
+                excluded: vec!["cloudinitdisk".into()],
+                size_bytes: Some(10 << 30),
+            },
             ..Default::default()
         };
         let s = Arc::new(Snapshots::new(
             reqwest::Client::new(), &url, "n1", run_dir, fake_take(taken, Arc::clone(&asked)),
         ));
         s.sync().await;
-        // claim, InProgress, Succeeded, event.
-        let log = settled(&log, 4).await;
+        // claim, InProgress, four steps, Succeeded, event.
+        let log = settled(&log, 8).await;
+
+        // #187: each step as it was entered, in order, before the result.
+        let steps: Vec<&str> = log
+            .iter()
+            .filter(|(k, b)| k == "status before" && b["status"]["phase"].is_null())
+            .map(|(_, b)| b["status"]["storm.io/step"].as_str().unwrap())
+            .collect();
+        assert_eq!(steps, ["idling", "freezing", "cloning", "thawing"]);
+        let last_step = log.iter().rposition(|(_, b)| b["status"]["phase"].is_null() && !b["status"]["storm.io/step"].is_null()).unwrap();
+        let result = log.iter().position(|(k, b)| k == "status before" && b["status"]["phase"] == "Succeeded").unwrap();
+        assert!(last_step < result, "the steps are written before the result");
 
         assert_eq!(*asked.lock().unwrap(), [("web/web-1".to_string(), "before".to_string())]);
         assert_eq!(log[0].0, "claim before");
@@ -908,12 +1005,17 @@ mod tests {
         assert_eq!(log[0].1["metadata"]["resourceVersion"], "7");
         assert_eq!(log[1].0, "status before");
         assert_eq!(log[1].1["status"]["phase"], "InProgress");
-        let done = &log.iter().find(|(k, b)| k == "status before" && b["status"]["phase"] != "InProgress").unwrap().1;
+        let done = &log.iter().find(|(k, b)| k == "status before" && b["status"]["phase"] == "Succeeded").unwrap().1;
         assert_eq!(done["status"]["phase"], "Succeeded");
         assert_eq!(done["status"]["readyToUse"], true);
         assert_eq!(done["status"]["virtualMachineSnapshotContentName"], "gs-1");
         assert_eq!(done["status"]["sourceUID"], "vm-uid");
         assert_eq!(done["status"]["indications"], json!(["Online", "GuestAgent"]));
+        // #187: the step it reached, the disks taken and not, and their size.
+        assert_eq!(done["status"]["storm.io/step"], "thawing");
+        assert_eq!(done["status"]["snapshotVolumes"]["includedVolumes"], json!(["rootdisk"]));
+        assert_eq!(done["status"]["snapshotVolumes"]["excludedVolumes"], json!(["cloudinitdisk"]));
+        assert_eq!(done["status"]["storm.io/sizeBytes"], json!(10u64 << 30));
         let ev = &log.iter().find(|(k, _)| k == "event").unwrap().1;
         assert_eq!(ev["involvedObject"]["kind"], "VirtualMachineSnapshot");
         assert_eq!(ev["reason"], "SnapshotSucceeded");
@@ -927,15 +1029,20 @@ mod tests {
         let run_dir = dir.path().to_str().unwrap();
         register(run_dir, "web", "web-1");
         let (url, log) = apiserver(vec![snap("before", "web-1")], 200).await;
+        // The pause failed: the step it failed in is the last one written.
         let taken = Taken {
             indications: vec!["Online".into()],
-            error: Some("404 volume vol-1".into()),
+            error: Some("pausing the guest: 404 volume vol-1".into()),
+            detail: spec::SnapshotDetail { step: Some("freezing".into()), ..Default::default() },
             ..Default::default()
         };
         let s = Arc::new(Snapshots::new(reqwest::Client::new(), &url, "n1", run_dir, fake_take(taken, Arc::default())));
         s.sync().await;
-        let log = settled(&log, 4).await;
+        // claim, InProgress, idling, freezing, Failed, event.
+        let log = settled(&log, 6).await;
         let done = &log.iter().find(|(k, b)| k == "status before" && b["status"]["phase"] == "Failed").unwrap().1;
+        assert_eq!(done["status"]["storm.io/step"], "freezing");
+        assert!(done["status"]["snapshotVolumes"].is_null(), "no group: nothing said about disks");
         assert_eq!(done["status"]["readyToUse"], false);
         assert!(done["status"]["error"]["message"].as_str().unwrap().contains("404 volume vol-1"));
         let ev = &log.iter().find(|(k, _)| k == "event").unwrap().1;
@@ -962,7 +1069,7 @@ mod tests {
         let (url, log) = apiserver(vec![snap("before", "web-1")], 200).await;
         let given: Arc<Mutex<Vec<Value>>> = Arc::default();
         let g = given.clone();
-        let take: TakeFn = Arc::new(move |_reg: Registration, _name: String, vs: Vec<Value>| {
+        let take: TakeFn = Arc::new(move |_reg: Registration, _name: String, vs: Vec<Value>, _progress: Progress| {
             g.lock().unwrap().extend(vs);
             Box::pin(async {
                 Taken { group: Some("gs-1".into()), volume_snapshots: vec!["vmsnapshot-u-before-volume-data".into()], ..Default::default() }

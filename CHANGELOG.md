@@ -2,6 +2,13 @@
 
 ## 2026-10-13
 
+- **feat:** A VirtualMachineSnapshot's status says its step, disks and size (#187, stormvm#45). The take goes through
+  stormvm's `take_with_progress` (both the stormblock-only and the #157 VolumeSnapshot paths) and each step
+  (`idling`/`freezing`/`cloning`/`thawing`) is merge-patched onto `status["storm.io/step"]` as it is entered, by one
+  writer joined before the result; the result is `snapshot_status_with` its `SnapshotDetail`: the step reached (the
+  failing one on `Failed`), `snapshotVolumes.includedVolumes`/`excludedVolumes`, `storm.io/sizeBytes` (stormblock's
+  members; none when a VolumeSnapshot's size is unknown). README.
+
 - **fix:** A node service's mirror pod is never run as a pod (#249, stormcos#547). It was left out only by its
   `kubernetes.io/config.source: stormpump` annotation; now any of the mirror's marks counts (that annotation,
   `storm.io/mirror`, the `storm.io/component=node-service` label, or a `stormpump://<asset>` image), for API and static

@@ -609,7 +609,7 @@ mod tests {
 
     fn snapshots(url: &str, engine: Arc<Engine>) -> Snapshots {
         let take: crate::vm_snapshot::TakeFn =
-            Arc::new(|_, _, _| Box::pin(async { crate::vm_snapshot::Taken::default() }));
+            Arc::new(|_, _, _, _| Box::pin(async { crate::vm_snapshot::Taken::default() }));
         Snapshots::new(reqwest::Client::new(), url, "n1", "/nonexistent", take).with_restore_engine(engine)
     }
 
