@@ -1145,6 +1145,39 @@ mod tests {
         assert!(log.iter().all(|(k, _)| !k.ends_with("other")), "{log:?}");
     }
 
+    /// #251: `storm.io/memory: "true"` asks the take for the memory; the
+    /// result says it holds memory, and where its state is.
+    #[tokio::test]
+    async fn a_memory_snapshot_is_asked_for_and_says_where_its_state_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().to_str().unwrap();
+        register(run_dir, "web", "web-1");
+        let mut obj = snap("before", "web-1");
+        obj["metadata"]["annotations"] = json!({ MEMORY_ANNOTATION: "true" });
+        let (url, log) = apiserver(vec![obj], 200).await;
+        let asked: Arc<Mutex<Vec<bool>>> = Arc::default();
+        let a = asked.clone();
+        let take: TakeFn = Arc::new(move |_reg: Registration, _name: String, _vs: Vec<Value>, _p: Progress, memory: bool| {
+            a.lock().unwrap().push(memory);
+            Box::pin(async {
+                Taken {
+                    group: Some("gs-1".into()),
+                    state_volume: Some("v-state".into()),
+                    memory_bytes: Some(2 << 30),
+                    ..Default::default()
+                }
+            })
+        });
+        let s = Arc::new(Snapshots::new(reqwest::Client::new(), &url, "n1", run_dir, take));
+        s.sync().await;
+        let log = settled(&log, 4).await;
+        assert_eq!(*asked.lock().unwrap(), [true]);
+        let done = &log.iter().find(|(k, b)| k == "status before" && b["status"]["phase"] == "Succeeded").unwrap().1;
+        assert_eq!(done["status"][MEMORY_ANNOTATION], true);
+        assert_eq!(done["status"][STATE_VOLUME_STATUS], "v-state");
+        assert_eq!(done["status"]["storm.io/memoryBytes"], json!(2u64 << 30));
+    }
+
     #[tokio::test]
     async fn a_failed_take_is_written_failed_with_why() {
         let dir = tempfile::tempdir().unwrap();

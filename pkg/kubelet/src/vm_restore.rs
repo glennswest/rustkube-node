@@ -567,6 +567,10 @@ mod tests {
                             let items: Vec<Value> = s.iter().filter(|(k, _)| k.contains("/virtualmachinerestores/")).map(|(_, v)| v.clone()).collect();
                             (StatusCode::OK, axum::Json(json!({ "items": items })))
                         }
+                        "GET" if path.ends_with("/virtualmachinesnapshots") => {
+                            let items: Vec<Value> = s.iter().filter(|(k, _)| k.contains("/virtualmachinesnapshots/")).map(|(_, v)| v.clone()).collect();
+                            (StatusCode::OK, axum::Json(json!({ "items": items })))
+                        }
                         "GET" => match s.get(&path) {
                             Some(v) => (StatusCode::OK, axum::Json(v.clone())),
                             None => (StatusCode::NOT_FOUND, axum::Json(json!({}))),
@@ -592,7 +596,10 @@ mod tests {
                             }
                             (StatusCode::OK, axum::Json(json!({})))
                         }
-                        "PATCH" => (StatusCode::OK, axum::Json(json!({}))),
+                        "PATCH" => {
+                            w.lock().unwrap().push(format!("PATCH {path} {body}"));
+                            (StatusCode::OK, axum::Json(json!({})))
+                        }
                         _ => (StatusCode::NOT_FOUND, axum::Json(json!({}))),
                     }
                 }
@@ -686,6 +693,64 @@ mod tests {
         let take: crate::vm_snapshot::TakeFn =
             Arc::new(|_, _, _, _, _| Box::pin(async { crate::vm_snapshot::Taken::default() }));
         Snapshots::new(reqwest::Client::new(), url, "n1", "/nonexistent", take).with_restore_engine(engine)
+    }
+
+    /// #251: a memory snapshot's restore makes a volume from its state
+    /// member too and names it on the VM's template, so the VM's next start
+    /// resumes from it; the restore says the memory is pending.
+    #[tokio::test]
+    async fn a_memory_snapshot_is_restored_with_its_state_for_the_next_start() {
+        let mut snap = snapshot("n1", Some(DISKS));
+        snap["status"][crate::vm_snapshot::MEMORY_ANNOTATION] = json!(true);
+        snap["status"][crate::vm_snapshot::STATE_VOLUME_STATUS] = json!("v-state");
+        let (url, store, _) = api(vec![(SNAP, snap), (RESTORE, restore()), (VM, vm())]).await;
+        let engine = Arc::new(Engine { with_state: true, ..Default::default() });
+        snapshots(&url, engine.clone()).restores().await;
+
+        assert!(engine.made.lock().unwrap().contains(&"web.web-1-state-restore-r1 <- s-v-state".to_string()));
+        let s = store.lock().unwrap().clone();
+        let resume: Value =
+            serde_json::from_str(s[VM]["spec"]["template"]["metadata"]["annotations"][RESUME_ANNOTATION].as_str().unwrap()).unwrap();
+        assert_eq!(resume, json!({ "volume": "web.web-1-state-restore-r1", "restore": "web/r1" }));
+        assert_eq!(s[RESTORE]["status"]["complete"], true);
+        assert_eq!(s[RESTORE]["status"][MEMORY_STATUS], "pending");
+    }
+
+    /// #251: a snapshot this node took and holds is deleted with its content
+    /// (the group and a memory snapshot's state volume), then let go; with
+    /// `deletionPolicy: Retain` only let go. Another node's is left alone.
+    #[tokio::test]
+    async fn a_deleted_snapshot_takes_its_group_and_state_with_it_unless_retained() {
+        let gone = |policy: Option<&str>, node: &str| {
+            let mut snap = snapshot(node, Some(DISKS));
+            snap["metadata"]["deletionTimestamp"] = json!("2026-10-13T22:00:00Z");
+            snap["metadata"]["finalizers"] = json!(["other", crate::vm_snapshot::FINALIZER]);
+            snap["metadata"]["resourceVersion"] = json!("9");
+            snap["status"][crate::vm_snapshot::STATE_VOLUME_STATUS] = json!("v-state");
+            if let Some(p) = policy {
+                snap["spec"]["deletionPolicy"] = json!(p);
+            }
+            snap
+        };
+        for (policy, node, deleted) in [
+            (None, "n1", vec!["group g-1", "volume v-state"]),
+            (Some("Retain"), "n1", vec![]),
+            (None, "n2", vec![]),
+        ] {
+            let (url, _, writes) = api(vec![(SNAP, gone(policy, node))]).await;
+            let engine = Arc::new(Engine::default());
+            Arc::new(snapshots(&url, engine.clone())).sync().await;
+            assert_eq!(*engine.deleted.lock().unwrap(), deleted, "{policy:?} {node}");
+            let patched: Vec<String> = writes.lock().unwrap().iter().filter(|w| w.starts_with(&format!("PATCH {SNAP} "))).cloned().collect();
+            if node == "n1" {
+                assert_eq!(patched.len(), 1, "{patched:?}");
+                let body: Value = serde_json::from_str(patched[0].trim_start_matches(&format!("PATCH {SNAP} "))).unwrap();
+                assert_eq!(body["metadata"]["finalizers"], json!(["other"]));
+                assert_eq!(body["metadata"]["resourceVersion"], "9");
+            } else {
+                assert!(patched.is_empty(), "another node's: {patched:?}");
+            }
+        }
     }
 
     #[tokio::test]

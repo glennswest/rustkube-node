@@ -5876,6 +5876,38 @@ mod tests {
         assert_eq!(crate::vm_hotplug::load(dir.path(), "default", "vm-u-1").unwrap().vcpus, 4, "not given");
     }
 
+    /// #251: a VMI naming a restore's saved state resumes from it once: the
+    /// state volume is found and attached for `-incoming`; a second start of
+    /// the same VMI is cold; the outcome gives the volume back (detached and
+    /// deleted). A state volume that is gone is a cold boot.
+    #[tokio::test]
+    async fn a_resume_is_prepared_once_and_its_state_volume_given_back() {
+        let state = json!({"id": "vol-s", "name": "web.web-1-state-restore-r1"});
+        let e = disk_engine(vec![state], vec![]).await;
+        let m = disk_manager(&e, "");
+        let mut obj = vmi("n1");
+        obj["metadata"]["annotations"] = json!({
+            crate::vm_restore::RESUME_ANNOTATION:
+                json!({"volume": "web.web-1-state-restore-r1", "restore": "web/r1"}).to_string(),
+        });
+        let (r, device) = m.prepare_resume("u-1", &obj).await.expect("resumed from its state");
+        assert_eq!(device, "/dev/ublk-vol-s");
+        assert_eq!((r.volume_id.as_str(), r.restore.as_str()), ("vol-s", "web/r1"));
+        assert!(m.prepare_resume("u-1", &obj).await.is_none(), "a second start of this VMI is cold");
+
+        m.resuming.lock().unwrap().insert("u-1".into(), r);
+        m.finish_resume("u-1", Ok(())).await;
+        assert_eq!(*e.deleted.lock().unwrap(), vec!["vol-s".to_string()], "the restore's copy of the state goes");
+        assert!(m.resuming.lock().unwrap().is_empty());
+
+        // Another VMI, its state volume gone: cold.
+        obj["metadata"]["annotations"][crate::vm_restore::RESUME_ANNOTATION] =
+            json!(json!({"volume": "gone", "restore": "web/r2"}).to_string());
+        assert!(m.prepare_resume("u-2", &obj).await.is_none());
+        // And one naming none starts as ever.
+        assert!(m.prepare_resume("u-3", &vmi("n1")).await.is_none());
+    }
+
     /// #247: a disk added to a running VMI is made and attached as at start,
     /// then plugged in; one the machine refuses is detached and what was made
     /// for it deleted; one taken out is unplugged and detached, its volume
