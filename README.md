@@ -693,6 +693,43 @@ starts once the VM lets the claim go (#80).
   - **Status:** the VMI carries `AccessCredentialsSynchronized`, with every
     reason when it is False: a missing Secret, no seed, or an agent not
     answering yet.
+- **A running VMI's cpu, memory and interfaces follow its spec** (#246,
+  stormvm#24; `pkg/kubelet/src/vm_hotplug.rs`). A machine can grow only into
+  the headroom it was started with: `spec.domain.cpu.maxSockets` and
+  `spec.domain.memory.maxGuest` (stormvm renders `maxcpus` and a virtio-mem
+  device; every qemu VM also gets four empty PCIe root ports for NICs).
+  - **When:** once per VMI generation, and on first sight after a kubelet
+    restart. The change is the spec against what the machine was last given,
+    recorded beside its registration
+    (`/run/stormvm/<ns>/<name>/kubelet-hotplug.json`: vCPUs, memory, NICs), not
+    a reading of the machine. A machine started before this record existed
+    takes the spec at its adoption as given.
+  - **vCPUs:** `cores × sockets × threads` → `set_vcpus(total)`. Only hot-added
+    vCPUs are removed; the guest has 30 s to release one.
+  - **Memory:** `memory.guest` → `set_memory(bytes)`, in 2 MiB blocks above
+    the boot memory. While the guest takes it in (or gives it back) the status
+    is read again every 2 s until it has.
+  - **An interface added:** a tap on a node bridge, or a secondary multus NIC
+    in the VMI's sandbox (its NAD resolved, recorded, CNI ADD, a tap bridged to
+    it, its network-status entry on the launcher Pod), then plugged in on a
+    free root port, then watched and answered (DHCP) as a boot NIC is. qemu
+    only for now. The pod network, and a NAD that replaces it, are given at
+    start only; so is a NAD on a machine started with no sandbox: refused, to
+    take effect at the next start. A NAD added before an existing one would
+    renumber the sandbox interfaces (`net1`, …): refused, add it after them.
+  - **An interface removed:** the guest releases the device (a boot NIC on
+    q35 is not removable, and the verb says so), then its watcher, its DHCP,
+    and a NAD's CNI DEL and network-status entry go.
+  - **Status:** `status.currentCPUTopology` (cores and threads per socket as
+    booted, sockets grown), `status.memory` (`guestAtBoot`, `guestCurrent`,
+    `guestRequested`) and `status.interfaces[]`; Events `VcpusChanged`,
+    `MemoryChanged`, `InterfaceAdded`, `InterfaceRemoved`.
+  - **A refusal** (past the maxima, a device the guest kept, a network it
+    can't have yet) is the condition `HotplugSynchronized` False with each
+    verb's own words, and a Warning `HotplugRefused` Event, never a failed
+    machine. It is tried again when the spec next changes.
+  - A VirtualMachine edit reaches the VMI through rustkube's VM controller
+    (rustkube#269).
 - **Snapshots: `VirtualMachineSnapshot`** (`snapshot.kubevirt.io/v1beta1`).
   - **Whose:** the node whose stormblock holds the VM's volumes, the one it
     runs on (`spec.source` is a `VirtualMachine` or a `VirtualMachineInstance`).
