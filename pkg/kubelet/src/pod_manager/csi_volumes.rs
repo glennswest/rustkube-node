@@ -417,6 +417,16 @@ impl PodManager {
     /// is not registered right now, or that the driver refuses to unpublish,
     /// keeps its record and is retried by [`Self::sweep_csi_volumes`].
     pub async fn teardown_csi_volumes(&self, uid: &str) -> bool {
+        self.teardown_csi_dirs(uid, None).await
+    }
+
+    /// [`Self::teardown_csi_volumes`] for the one volume (or VM disk) named
+    /// `only` of holder `uid`: a disk taken out of a running VM (#247).
+    pub async fn teardown_csi_volume(&self, uid: &str, only: &str) -> bool {
+        self.teardown_csi_dirs(uid, Some(only)).await
+    }
+
+    async fn teardown_csi_dirs(&self, uid: &str, only: Option<&str>) -> bool {
         let base = PathBuf::from(&self.state_root)
             .join("pods")
             .join(uid)
@@ -439,6 +449,9 @@ impl PodManager {
                     continue;
                 }
             };
+            if only.is_some_and(|o| entry.file_name() != o) {
+                continue;
+            }
             let dir = entry.path();
             let data = match read_vol_data_checked(&dir) {
                 Ok(data) => data,

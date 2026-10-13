@@ -1859,6 +1859,13 @@ impl PodManager {
         self.teardown_csi_volumes(&csi_volumes::vm_holder(vmi_uid)).await
     }
 
+    /// The one disk `disk` of VMI `vmi_uid` on another driver's claim,
+    /// unpublished (and unstaged when no one else here has it): a disk taken
+    /// out of a running VM (#247). `true` when nothing is left.
+    pub(crate) async fn teardown_vm_csi_disk(&self, vmi_uid: &str, disk: &str) -> bool {
+        self.teardown_csi_volume(&csi_volumes::vm_holder(vmi_uid), disk).await
+    }
+
     /// The VMIs with CSI disks recorded on this node (#157): for the VM
     /// manager's sweep of machines that are gone. `Err` when the records
     /// cannot be read (nothing is torn down then).

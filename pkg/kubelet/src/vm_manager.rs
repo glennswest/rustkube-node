@@ -1057,6 +1057,19 @@ const HANDLELESS_PERIOD: std::time::Duration = std::time::Duration::from_secs(10
 /// While a guest takes in (or gives back) memory it was asked to, its status
 /// is read again this often (#246).
 const HOT_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+/// A disk added to a running machine that waits on its claim is tried again
+/// this often (#247).
+const HOT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A running machine's disks into its registration (#247), so a restarted
+/// kubelet detaches (and adopts) what it has now.
+fn record_disks(vm: &Vm) {
+    let Some(mut reg) = stormvm_node::console::find(RUN_ROOT, &vm.namespace, &vm.name) else { return };
+    reg.disks = registered_disks(&vm.disks, &vm.owned_volumes);
+    if let Err(e) = stormvm_node::console::write(RUN_ROOT, &reg) {
+        warn!(vm = %vm.name, "could not record the machine's disks: {e}");
+    }
+}
 
 /// The NICs a machine has, for its hotplug record (#246): what the start
 /// made (`made`), or for a machine adopted with none known, what the spec
@@ -2587,6 +2600,21 @@ impl VmManager {
         owner: &Value,
         fresh: &mut Vec<String>,
     ) -> Result<(Vec<ResolvedDisk>, Vec<String>), StartFail> {
+        self.resolve_disks_as(uid, vm, keys, owner, fresh, false).await
+    }
+
+    /// [`Self::resolve_disks_with_keys`]; `hot` for disks added to a running
+    /// machine (#247), where a failure gives back only these disks, never the
+    /// machine's others (a start gives back every CSI disk of the VMI).
+    async fn resolve_disks_as(
+        &self,
+        uid: &str,
+        vm: &VmSpec,
+        keys: &[String],
+        owner: &Value,
+        fresh: &mut Vec<String>,
+        hot: bool,
+    ) -> Result<(Vec<ResolvedDisk>, Vec<String>), StartFail> {
         let mut done: Vec<ResolvedDisk> = Vec::new();
         let mut owned: Vec<String> = Vec::new();
         for d in &vm.disks {
@@ -2626,7 +2654,7 @@ impl VmManager {
                             id
                         }
                         Err(e) => {
-                            self.give_back(uid, &done).await;
+                            self.give_back_disks(uid, &done, hot.then_some(vm)).await;
                             // A golden that is not here *yet* is not a
                             // failure.
                             //
@@ -2651,7 +2679,7 @@ impl VmManager {
                     }
                         }
                         Err(e) => {
-                            self.give_back(uid, &done).await;
+                            self.give_back_disks(uid, &done, hot.then_some(vm)).await;
                             return Err(e);
                         }
                     }
@@ -2665,7 +2693,7 @@ impl VmManager {
                 // change, so the machine waits rather than fails.
                 DiskSource::Claim(c) => {
                     let Some(pods) = &self.claims else {
-                        self.give_back(uid, &done).await;
+                        self.give_back_disks(uid, &done, hot.then_some(vm)).await;
                         return Err(StartFail::Failed(format!(
                             "disk {}: claim {c} needs an apiserver to resolve, and this kubelet \
                              has none",
@@ -2686,7 +2714,7 @@ impl VmManager {
                             continue;
                         }
                         Err(why) => {
-                            self.give_back(uid, &done).await;
+                            self.give_back_disks(uid, &done, hot.then_some(vm)).await;
                             return Err(StartFail::Waiting(format!("disk {}: {why}", d.name)));
                         }
                     }
@@ -2700,7 +2728,7 @@ impl VmManager {
                     let found = match self.reuse(&d.name, &name, owner).await {
                         Ok(found) => found,
                         Err(e) => {
-                            self.give_back(uid, &done).await;
+                            self.give_back_disks(uid, &done, hot.then_some(vm)).await;
                             return Err(e);
                         }
                     };
@@ -2712,7 +2740,7 @@ impl VmManager {
                                 id
                             }
                             Err(e) => {
-                                self.give_back(uid, &done).await;
+                                self.give_back_disks(uid, &done, hot.then_some(vm)).await;
                                 return Err(StartFail::Failed(format!("disk {}: {e}", d.name)));
                             }
                         },
@@ -2724,7 +2752,7 @@ impl VmManager {
                         id
                     }
                     Err(e) => {
-                        self.give_back(uid, &done).await;
+                        self.give_back_disks(uid, &done, hot.then_some(vm)).await;
                         return Err(StartFail::Failed(format!("disk {}: {e}", d.name)));
                     }
                 },
@@ -2743,12 +2771,12 @@ impl VmManager {
             {
                 Ok(v) => v,
                 Err(e) => {
-                    self.give_back(uid, &done).await;
+                    self.give_back_disks(uid, &done, hot.then_some(vm)).await;
                     return Err(StartFail::Failed(format!("attaching {volume_id} for disk {}: {e}", d.name)));
                 }
             };
             let Some(device) = info["device_hint"].as_str() else {
-                self.give_back(uid, &done).await;
+                self.give_back_disks(uid, &done, hot.then_some(vm)).await;
                 return Err(StartFail::Failed(format!(
                     "disk {} did not attach locally: {info} — an NVMe-oF attach needs a connect \
                      this node does not do yet",
@@ -3373,7 +3401,50 @@ impl VmManager {
                 Err(e) => problems.push(e),
             }
         }
-        if !c.is_empty() {
+        // Disks (#247), when the machine's are known: a registration from
+        // before disks were recorded has none, and every disk would read as
+        // new.
+        let mut tried = !c.is_empty();
+        let mut wait = false;
+        if !vm.disks.is_empty() {
+            let have: Vec<String> = vm.disks.iter().map(|d| d.name.clone()).collect();
+            let (remove, add) = crate::vm_hotplug::disk_changes(&spec, &have);
+            tried |= !remove.is_empty() || !add.is_empty();
+            vm.hot.disk_refused.clear();
+            for name in &remove {
+                match self.remove_hot_disk(&mut vm, name, machine.as_ref()).await {
+                    Ok(()) => {
+                        info!(vm = %vm.name, disk = %name, "disk removed");
+                        self.event_of(&vm, "Normal", "DiskRemoved", &format!("disk {name} removed; its volume is kept")).await;
+                    }
+                    Err(e) => problems.push(format!("disk {name}: {e}")),
+                }
+            }
+            let owner = if add.is_empty() { Value::Null } else { self.owner_of(obj).await };
+            for name in &add {
+                match self.add_hot_disk(&mut vm, &spec, name, &owner, machine.as_ref()).await {
+                    Ok(target) => {
+                        info!(vm = %vm.name, disk = %name, %target, "disk added");
+                        self.event_of(&vm, "Normal", "DiskAdded", &format!("disk {name} added at {target}")).await;
+                        vm.hot.disk_targets.retain(|(n, _)| n != name);
+                        vm.hot.disk_targets.push((name.clone(), target));
+                    }
+                    Err(StartFail::Waiting(why)) => {
+                        wait = true;
+                        problems.push(why.clone());
+                        vm.hot.disk_refused.push((name.clone(), why));
+                    }
+                    Err(StartFail::Failed(why)) => {
+                        problems.push(why.clone());
+                        vm.hot.disk_refused.push((name.clone(), why));
+                    }
+                }
+            }
+            if vm.disks.iter().map(|d| &d.name).ne(before.disks.iter().map(|d| &d.name)) {
+                record_disks(&vm);
+            }
+        }
+        if tried {
             if let Err(e) = crate::vm_hotplug::save(&self.hot_dir, &vm.namespace, &vm.name, &record) {
                 warn!(vm = %vm.name, "could not record what the machine was given: {e}");
             }
@@ -3386,7 +3457,11 @@ impl VmManager {
         }
         self.hot_records.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), record);
 
-        if vm.nics.iter().map(|n| (&n.name, &n.mac)).ne(before.nics.iter().map(|n| (&n.name, &n.mac))) || vm.hot != before.hot {
+        let disks_moved = vm.disks.iter().map(|d| &d.name).ne(before.disks.iter().map(|d| &d.name));
+        if vm.nics.iter().map(|n| (&n.name, &n.mac)).ne(before.nics.iter().map(|n| (&n.name, &n.mac)))
+            || vm.hot != before.hot
+            || disks_moved
+        {
             // Onto the record as it is now: a tap watcher may have written an
             // address meanwhile, kept for the NICs that stayed.
             let updated = self.vms.lock().await.update(uid, |cur| {
@@ -3398,17 +3473,113 @@ impl VmManager {
                 }
                 cur.nics = nics;
                 cur.hot = vm.hot.clone();
+                cur.disks = vm.disks.clone();
+                cur.owned_volumes = vm.owned_volumes.clone();
                 cur.clone()
             });
             if let Some(updated) = updated {
                 self.patch_status(&updated).await;
             }
         }
-        if settling {
+        if wait {
+            // A disk waiting on its claim (unbound, held by a pod here): asked
+            // again, as a start that waits is.
+            self.due_in(uid, HOT_WAIT);
+        } else if settling {
             self.due_in(uid, HOT_SETTLE);
         } else {
             self.hot_seen.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), generation);
         }
+    }
+
+    /// Add disk `name` of `spec` to the running machine (#247): resolved and
+    /// attached exactly as at start (a clone, an emptyDisk, a claim, owned as
+    /// at start), then plugged in. A refused plug gives the attach back and
+    /// deletes what was made for it. `Waiting` when its claim cannot be had
+    /// yet; a seed, and a bus that is not hot-pluggable, are start-only.
+    async fn add_hot_disk(
+        &self,
+        vm: &mut Vm,
+        spec: &VmSpec,
+        name: &str,
+        owner: &Value,
+        machine: &dyn crate::vm_hotplug::Hotplug,
+    ) -> Result<String, StartFail> {
+        let Some(d) = spec.disks.iter().find(|d| d.name == name).cloned() else {
+            return Err(StartFail::Failed(format!("disk {name}: not in the machine's spec")));
+        };
+        if matches!(d.from, DiskSource::CloudInit) {
+            return Err(StartFail::Failed(format!(
+                "disk {name}: a cloud-init seed is read at first boot; it takes effect at the next start"
+            )));
+        }
+        // Refused before anything is made.
+        crate::vm_hotplug::hot_disk(&d, "").map_err(StartFail::Failed)?;
+        let mut one = spec.clone();
+        one.disks = vec![d.clone()];
+        let mut fresh = Vec::new();
+        let resolved = {
+            let _disks = self.disk_lifecycle.read().await;
+            self.resolve_disks_as(&vm.uid, &one, &[], owner, &mut fresh, true).await
+        };
+        let (done, owned) = match resolved {
+            Ok(r) => r,
+            Err(e) => {
+                self.delete_volumes(&vm.name, &fresh).await;
+                return Err(match e {
+                    StartFail::Waiting(w) => StartFail::Waiting(format!("disk {name}: {w}")),
+                    StartFail::Failed(f) => StartFail::Failed(format!("disk {name}: {f}")),
+                });
+            }
+        };
+        let Some(disk) = done.first().cloned() else {
+            return Err(StartFail::Failed(format!("disk {name}: nothing was attached for it")));
+        };
+        let hot = crate::vm_hotplug::hot_disk(&d, &disk.device).map_err(StartFail::Failed)?;
+        match machine.add_disk(&hot).await {
+            Ok(target) => {
+                vm.disks.push(disk);
+                vm.owned_volumes.extend(owned);
+                Ok(target)
+            }
+            Err(e) => {
+                self.give_back_disks(&vm.uid, &done, Some(&one)).await;
+                self.delete_volumes(&vm.name, &fresh).await;
+                Err(StartFail::Failed(format!("disk {name}: {e}")))
+            }
+        }
+    }
+
+    /// Take disk `name` out of the running machine (#247): the guest releases
+    /// it (a disk it booted with is refused: it is on the root bus), then its
+    /// volume is detached, or its driver unpublishes it. The volume is kept,
+    /// as at a stop: only a VM deleted releases its disks (#75).
+    async fn remove_hot_disk(&self, vm: &mut Vm, name: &str, machine: &dyn crate::vm_hotplug::Hotplug) -> Result<(), String> {
+        machine.remove_disk(name).await?;
+        let Some(i) = vm.disks.iter().position(|d| d.name == name) else { return Ok(()) };
+        vm.hot.disk_targets.retain(|(n, _)| n != name);
+        match &vm.disks[i].volume_id {
+            Some(id) => {
+                let url = format!("{}/api/v1/volumes/{id}/attach", self.storage);
+                match self.engine.delete(&url).await {
+                    Ok(r) if r.status().is_success() || r.status().as_u16() == 404 => {}
+                    // Kept on the machine's record, so its stop detaches it.
+                    Ok(r) => return Err(format!("out of the guest, but its volume {id} is still attached: {}", r.status())),
+                    Err(e) => return Err(format!("out of the guest, but its volume {id} is still attached: {e}")),
+                }
+                let id = id.clone();
+                vm.owned_volumes.retain(|v| *v != id);
+            }
+            None => {
+                if let Some(pods) = &self.claims {
+                    if !pods.teardown_vm_csi_disk(&vm.uid, name).await {
+                        warn!(vm = %vm.name, disk = %name, "the disk's driver has not unpublished it; the machine's stop retries");
+                    }
+                }
+            }
+        }
+        vm.disks.remove(i);
+        Ok(())
     }
 
     /// What a running machine was last given (#246): held here, else its
@@ -3901,6 +4072,20 @@ impl VmManager {
         if let Some(pods) = &self.claims {
             if !pods.teardown_vm_csi(uid).await {
                 warn!(%uid, "a failed start's CSI disks are still published; the sweep retries");
+            }
+        }
+    }
+
+    /// [`Self::give_back`], or with `only` (a disk added to a running machine,
+    /// #247) just the CSI disks `only` names: the machine's others stay.
+    async fn give_back_disks(&self, uid: &str, disks: &[ResolvedDisk], only: Option<&VmSpec>) {
+        let Some(only) = only else { return self.give_back(uid, disks).await };
+        self.release(disks).await;
+        if let Some(pods) = &self.claims {
+            for d in &only.disks {
+                if !pods.teardown_vm_csi_disk(uid, &d.name).await {
+                    warn!(%uid, disk = %d.name, "a disk not added is still published; the machine's stop retries");
+                }
             }
         }
     }
@@ -4448,6 +4633,11 @@ impl VmManager {
         }
         // Its size (#246): KubeVirt's `currentCPUTopology` and `memory`.
         crate::vm_hotplug::write_status(&mut status, &vm.hot);
+        // Its disks (#247): `volumeStatus`, hot-added ones with their target.
+        if !vm.disks.is_empty() || !vm.hot.disk_refused.is_empty() {
+            let names: Vec<String> = vm.disks.iter().map(|d| d.name.clone()).collect();
+            status["volumeStatus"] = crate::vm_hotplug::volume_status(&names, &vm.hot);
+        }
         // `AccessCredentialsSynchronized` (#92) and `HotplugSynchronized`
         // (#246), with whatever conditions the object already carries: a
         // merge patch replaces the list whole.
@@ -5389,6 +5579,17 @@ mod tests {
             }
             Ok(())
         }
+        async fn add_disk(&self, disk: &stormvm_control::hotplug::HotDisk) -> Result<String, String> {
+            self.calls.lock().unwrap().push(format!("add_disk {} {}", disk.name, disk.path));
+            if self.refuse.lock().unwrap().contains(&"disk") {
+                return Err("no free hot-plug port (hp0…hp3 are taken)".into());
+            }
+            Ok("hp1".into())
+        }
+        async fn remove_disk(&self, name: &str) -> Result<(), String> {
+            self.calls.lock().unwrap().push(format!("remove_disk {name}"));
+            Ok(())
+        }
     }
 
     fn hot_manager(dir: &std::path::Path, fake: &Arc<FakeHot>) -> VmManager {
@@ -5478,6 +5679,79 @@ mod tests {
         assert_eq!((cond["type"].as_str(), cond["status"].as_str()), (Some("HotplugSynchronized"), Some("False")));
         assert!(cond["message"].as_str().unwrap().contains("vCPUs 4 → 8: 8 vCPUs is past"), "{cond}");
         assert_eq!(crate::vm_hotplug::load(dir.path(), "default", "vm-u-1").unwrap().vcpus, 4, "not given");
+    }
+
+    /// #247: a disk added to a running VMI is made and attached as at start,
+    /// then plugged in; one the machine refuses is detached and what was made
+    /// for it deleted; one taken out is unplugged and detached, its volume
+    /// kept; a seed is start-only.
+    #[tokio::test]
+    async fn a_running_vmis_disks_are_added_and_taken_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeHot::default());
+        let e = disk_engine(vec![], vec![]).await;
+        let m = hot_manager(dir.path(), &fake)
+            .with_storage(crate::engine::EngineClient::new(&e.url, crate::engine::TokenSource::none()));
+        let mut vm = vm_at("u-1", &[], Phase::Running);
+        vm.disks = vec![ResolvedDisk {
+            name: "root".into(),
+            device: "/dev/ublkb0".into(),
+            volume_id: Some("vol-root".into()),
+            readonly: false,
+            bus: Default::default(),
+        }];
+        m.vms.lock().await.insert("u-1".into(), vm);
+        m.hot_records.lock().unwrap().insert("u-1".into(), given(1, 1 << 30, &[("default", "02:00:00:00:00:01")]));
+        let with_disks = |generation: i64, extra: &[(&str, Value)]| {
+            let mut obj = hot_vmi(generation, 1, 1, "1Gi", &[]);
+            let mut disks = vec![json!({"name": "root", "disk": {"bus": "virtio"}})];
+            let mut volumes = vec![json!({"name": "root", "containerDisk": {"image": "fedora-43"}})];
+            for (name, source) in extra {
+                disks.push(json!({"name": name, "disk": {"bus": "virtio"}}));
+                let mut v = source.clone();
+                v["name"] = json!(name);
+                volumes.push(v);
+            }
+            obj["spec"]["domain"]["devices"]["disks"] = json!(disks);
+            obj["spec"]["volumes"] = json!(volumes);
+            obj
+        };
+        let empty = json!({"emptyDisk": {"capacity": "1Gi"}});
+
+        // Added: made, attached, plugged in.
+        m.hotplug("u-1", &with_disks(2, &[("data", empty.clone())])).await;
+        let vm = m.vms.lock().await["u-1"].clone();
+        let data = vm.disks.iter().find(|d| d.name == "data").expect("the machine has it").clone();
+        let id = data.volume_id.clone().unwrap();
+        assert_eq!(*fake.calls.lock().unwrap(), vec![format!("add_disk data /dev/ublk-{id}")]);
+        assert!(vm.owned_volumes.contains(&id), "an emptyDisk is the VM's");
+        assert_eq!(vm.hot.disk_targets, vec![("data".to_string(), "hp1".to_string())]);
+        assert_eq!(vm.hot.condition.as_ref().unwrap()["status"], "True");
+
+        // Refused by the machine: given back, and the volume made for it deleted.
+        fake.refuse.lock().unwrap().push("disk");
+        m.hotplug("u-1", &with_disks(3, &[("data", empty.clone()), ("more", empty.clone())])).await;
+        let vm = m.vms.lock().await["u-1"].clone();
+        assert!(!vm.disks.iter().any(|d| d.name == "more"));
+        assert_eq!(e.deleted.lock().unwrap().len(), 1, "the volume made for it");
+        assert_ne!(e.deleted.lock().unwrap()[0], id);
+        assert_eq!(vm.hot.disk_refused[0].0, "more");
+        assert!(vm.hot.condition.as_ref().unwrap()["message"].as_str().unwrap().contains("disk more: no free hot-plug port"));
+        fake.refuse.lock().unwrap().clear();
+
+        // A seed is read at first boot: start-only, nothing made.
+        m.hotplug("u-1", &with_disks(4, &[("data", empty.clone()), ("seed", json!({"cloudInitNoCloud": {"userData": "#cloud-config\n"}}))])).await;
+        let vm = m.vms.lock().await["u-1"].clone();
+        assert!(vm.hot.disk_refused.iter().any(|(n, why)| n == "seed" && why.contains("next start")), "{:?}", vm.hot.disk_refused);
+
+        // Taken out: unplugged, detached, the volume kept.
+        m.hotplug("u-1", &with_disks(5, &[])).await;
+        let vm = m.vms.lock().await["u-1"].clone();
+        assert_eq!(vm.disks.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["root"]);
+        assert!(fake.calls.lock().unwrap().contains(&"remove_disk data".to_string()));
+        assert!(!vm.owned_volumes.contains(&id));
+        assert!(!e.deleted.lock().unwrap().contains(&id), "only a VM deleted releases its disks (#75)");
+        assert!(vm.hot.disk_targets.is_empty());
     }
 
     /// #246: an interface the spec no longer names is taken out (and stays

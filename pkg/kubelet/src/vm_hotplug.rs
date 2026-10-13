@@ -176,6 +176,12 @@ pub trait Hotplug: Send + Sync {
     async fn add_nic(&self, nic: stormvm_control::hotplug::HotNic) -> Result<String, String>;
     /// Take a NIC out; the guest has to release it.
     async fn remove_nic(&self, name: &str) -> Result<(), String>;
+    /// Plug in a disk already attached on the node (#247). Returns where it
+    /// went (`hp1`, `scsi0.0`, …).
+    async fn add_disk(&self, disk: &stormvm_control::hotplug::HotDisk) -> Result<String, String>;
+    /// Take a disk out; the guest has to release it. The volume stays
+    /// attached: detaching it is the caller's.
+    async fn remove_disk(&self, name: &str) -> Result<(), String>;
 }
 
 fn memory_now(m: stormvm_control::hotplug::MemorySize) -> MemoryNow {
@@ -199,6 +205,41 @@ impl Hotplug for stormvm_control::Machine {
     async fn remove_nic(&self, name: &str) -> Result<(), String> {
         stormvm_control::Machine::remove_nic(self, name).await.map_err(|e| e.to_string())
     }
+    async fn add_disk(&self, disk: &stormvm_control::hotplug::HotDisk) -> Result<String, String> {
+        stormvm_control::Machine::add_disk(self, disk).await.map_err(|e| e.to_string())
+    }
+    async fn remove_disk(&self, name: &str) -> Result<(), String> {
+        stormvm_control::Machine::remove_disk(self, name).await.map_err(|e| e.to_string())
+    }
+}
+
+/// The disks to take out of a machine that has `have` (newest first) and the
+/// ones to add from `spec` (in spec order) (#247).
+pub fn disk_changes(spec: &stormvm_spec::VmSpec, have: &[String]) -> (Vec<String>, Vec<String>) {
+    let remove = have.iter().rev().filter(|h| !spec.disks.iter().any(|d| d.name == **h)).cloned().collect();
+    let add = spec.disks.iter().filter(|d| !have.contains(&d.name)).map(|d| d.name.clone()).collect();
+    (remove, add)
+}
+
+/// The hot-plug form of a spec disk whose volume is attached at `path`, or
+/// why it cannot be added while the machine runs: a seed is read at first
+/// boot, and only virtio and SCSI disks are hot-pluggable.
+pub fn hot_disk(d: &stormvm_spec::Disk, path: &str) -> Result<stormvm_control::hotplug::HotDisk, String> {
+    use stormvm_control::hotplug::HotBus;
+    let bus = match d.bus {
+        stormvm_spec::DiskBus::Virtio => HotBus::Virtio,
+        stormvm_spec::DiskBus::Scsi => HotBus::Scsi,
+        other => return Err(format!("disk {}: a {other:?} disk is given at start only; use bus virtio or scsi", d.name)),
+    };
+    Ok(stormvm_control::hotplug::HotDisk {
+        name: d.name.clone(),
+        path: path.to_string(),
+        readonly: d.readonly,
+        bus,
+        // As at boot: `cache: none` and `directsync` bypass the host's page cache.
+        direct: matches!(d.cache, stormvm_spec::DiskCache::None | stormvm_spec::DiskCache::Directsync),
+        discard: d.discard,
+    })
 }
 
 /// What the VMI's status says about a machine's size (KubeVirt's fields).
@@ -209,6 +250,10 @@ pub struct Size {
     pub memory: Option<MemoryNow>,
     /// `HotplugSynchronized`, once a change has been tried.
     pub condition: Option<Value>,
+    /// Where each hot-added disk went (`hp1`, …), by disk name (#247).
+    pub disk_targets: Vec<(String, String)>,
+    /// Disks the spec names that the machine does not have, and why (#247).
+    pub disk_refused: Vec<(String, String)>,
 }
 
 /// The topology `vcpus` makes in `spec`'s shape: the cores and threads per
@@ -234,6 +279,27 @@ pub fn quantity(bytes: u64) -> String {
     } else {
         bytes.to_string()
     }
+}
+
+/// `status.volumeStatus[]` (KubeVirt's shape, #247): each disk the machine has
+/// `Ready` (a hot-added one with its target and `hotplugVolume`), then each
+/// one the spec names that it could not be given, with why.
+pub fn volume_status(disks: &[String], size: &Size) -> Value {
+    let mut out: Vec<Value> = disks
+        .iter()
+        .map(|name| {
+            let mut v = json!({ "name": name, "phase": "Ready", "reason": "VolumeReady" });
+            if let Some((_, target)) = size.disk_targets.iter().find(|(n, _)| n == name) {
+                v["target"] = json!(target);
+                v["hotplugVolume"] = json!({});
+            }
+            v
+        })
+        .collect();
+    for (name, why) in &size.disk_refused {
+        out.push(json!({ "name": name, "phase": "Pending", "reason": "HotplugRefused", "message": why }));
+    }
+    Value::Array(out)
 }
 
 /// The status fields for `size`, merged into `status`.
@@ -334,6 +400,44 @@ mod tests {
         assert_eq!((c.vcpus, c.memory), (None, None));
     }
 
+    /// #247: disks the spec dropped go (newest first), new ones are added in
+    /// spec order; the bus decides whether one can be.
+    #[test]
+    fn disk_changes_and_what_can_be_hot_plugged() {
+        let mut obj = vmi(1, 1, "1Gi", &["default"]);
+        obj["spec"]["domain"]["devices"]["disks"] = json!([
+            {"name": "root", "disk": {"bus": "virtio"}},
+            {"name": "data", "disk": {"bus": "virtio"}},
+            {"name": "logs", "disk": {"bus": "sata"}},
+        ]);
+        obj["spec"]["volumes"] = json!([
+            {"name": "root", "containerDisk": {"image": "fedora-43"}},
+            {"name": "data", "emptyDisk": {"capacity": "1Gi"}},
+            {"name": "logs", "emptyDisk": {"capacity": "1Gi"}},
+        ]);
+        let s = spec(&obj);
+        let have = vec!["root".to_string(), "old1".into(), "old2".into()];
+        let (remove, add) = disk_changes(&s, &have);
+        assert_eq!(remove, vec!["old2".to_string(), "old1".into()]);
+        assert_eq!(add, vec!["data".to_string(), "logs".into()]);
+
+        let data = s.disks.iter().find(|d| d.name == "data").unwrap();
+        let h = hot_disk(data, "/dev/ublkb3").unwrap();
+        assert_eq!((h.path.as_str(), h.bus, h.direct, h.discard), ("/dev/ublkb3", stormvm_control::hotplug::HotBus::Virtio, true, true));
+        let logs = s.disks.iter().find(|d| d.name == "logs").unwrap();
+        assert!(hot_disk(logs, "/dev/ublkb4").unwrap_err().contains("given at start only"));
+
+        let size = Size {
+            disk_targets: vec![("data".into(), "hp1".into())],
+            disk_refused: vec![("logs".into(), "a Sata disk is given at start only".into())],
+            ..Size::default()
+        };
+        let v = volume_status(&["root".into(), "data".into()], &size);
+        assert_eq!(v[0], json!({"name": "root", "phase": "Ready", "reason": "VolumeReady"}));
+        assert_eq!((v[1]["target"].as_str(), v[1]["phase"].as_str()), (Some("hp1"), Some("Ready")));
+        assert_eq!((v[2]["phase"].as_str(), v[2]["reason"].as_str()), (Some("Pending"), Some("HotplugRefused")));
+    }
+
     #[test]
     fn the_record_round_trips_beside_the_machine() {
         let dir = tempfile::tempdir().unwrap();
@@ -356,7 +460,7 @@ mod tests {
         write_status(&mut status, &Size {
             topology: Some((2, 3, 1)),
             memory: Some(MemoryNow { boot: 2 << 30, current: 3 << 30, requested: 4 << 30 }),
-            condition: None,
+            ..Size::default()
         });
         assert_eq!(status["currentCPUTopology"], json!({"cores": 2, "sockets": 3, "threads": 1}));
         assert_eq!(status["memory"], json!({"guestAtBoot": "2048Mi", "guestCurrent": "3072Mi", "guestRequested": "4096Mi"}));
