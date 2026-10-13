@@ -13,7 +13,7 @@ stage golden through `stormcentral component stage rustkube-node`, not a package
 
 ## Current implementation reference (2026-10-09)
 
-Main baseline: 909962f (latest stage golden golden-rustkube-node-5265b2973b7c, stormcos#424; every git dependency by rev, #210). See
+Main baseline: 0eab793 (latest stage golden golden-rustkube-node-282970b3214d, stormcos#424; every git dependency by rev, #210). See
 `docs/status.md` for changes since October 2, the owner's recorded decisions and issue-backed limitations,
 `docs/configuration.md` for every CLI/env/default, `docs/api.md` for ports and actual routes, `docs/retries.md`
 for every remote call's retry policy. CLI runtime defaults to native; stormcos explicitly chooses stormpump.
@@ -58,26 +58,30 @@ by #51.
 
 ## Work plan
 
-### In progress: #246 (P1), a running VMI's cpu, memory and interface changes through stormvm's hotplug verbs (stormvm#24)
+### Done: #246 (P1), a running VMI's cpu, memory and interface changes through stormvm's hotplug verbs (stormvm#24)
 
 2026-10-13. stormvm main e1a84f1 (a223f04 hotplug verbs, 503434c qemu `-smp` fix stormvm#92: `cores: 2, sockets: 2` ran
 8 vCPUs, now 4; `CoresNotDivisible` refused). Lock: only stormvm-control gains `libc` + `stormvm-vmm` (both in the graph).
 Production path is `reconcile_one` (the per-UID executor); `sync` is the legacy/test path. Work on branch wip/246.
-1. [ ] Bump stormvm d16a49b → e1a84f1 (Cargo.toml rev, lock by hand).
-2. [ ] `vm_hotplug.rs`: `Hotplug` trait (vcpus/set_vcpus/memory/set_memory/add_nic/remove_nic) for
+1. [x] Bump stormvm d16a49b → e1a84f1 (Cargo.toml rev, lock by hand).
+2. [x] `vm_hotplug.rs`: `Hotplug` trait (vcpus/set_vcpus/memory/set_memory/add_nic/remove_nic) for
        `stormvm_control::Machine`, injectable in tests; pure diff `changes(spec, have)`; the NIC record the machine
        has (`<RUN_ROOT>/<ns>/<name>/kubelet-nics.json`: name, mac, binding, tap, multus ifname), written at start and
        on every change, read at adoption (absent: the spec at adoption is the baseline).
-3. [ ] `reconcile_one`, running machine, on a new generation (or never looked at, or memory still settling): vCPUs
+3. [x] `reconcile_one`, running machine, on a new generation (or never looked at, or memory still settling): vCPUs
        (`cpu.cores` total) → `set_vcpus`; `memory.guest` → `set_memory`; NIC added: host-bridge (realise, `add_nic`
        Tap, snoop) or secondary multus in the VMI's sandbox (NAD, recorded, CNI ADD, realise, `add_nic`, DHCP/snoop,
        network-status); pod / default-multus NICs refused (start only); NIC removed: `remove_nic`, then snooper,
        responder, lease, CNI DEL + attachment. Snoopers/responders keyed by MAC, not index (removal shifts indices).
-4. [ ] Status: `currentCPUTopology`, `memory {guestAtBoot, guestCurrent, guestRequested}`, `interfaces[]`; condition
+4. [x] Status: `currentCPUTopology`, `memory {guestAtBoot, guestCurrent, guestRequested}`, `interfaces[]`; condition
        `HotplugSynchronized` (False + each verb's refusal; never a failed start).
-5. [ ] Tests (diff, apply with a fake machine: grow/shrink/refusal → condition, NIC removal undoes, pod NIC refused,
+5. [x] Tests (diff, apply with a fake machine: grow/shrink/refusal → condition, NIC removal undoes, pod NIC refused,
        record round trip, adoption baseline), README/api.md, CHANGELOG (incl. stormvm#92's vCPU count); sc-build; merge;
        golden; close. Live: rustkube#269 (VM → VMI propagation) for a VirtualMachine edit.
+       Done: bump (stormvm e1a84f1), vm_hotplug.rs, MAC-keyed watchers/responders, `watch_and_serve` shared with start; 6 new tests.
+       SC_BUILD_VM sc-build 0eab793 (job 6b9f3fa8e8): 516 kubelet unit, all suites pass; clippy: nothing new (#227's
+       old ones remain). Stage golden golden-rustkube-node-282970b3214d (stormcos#424). Closed. Not run on a node: NIC
+       add needs a tap (root), live check = a VMI edit with maxSockets/maxGuest after rustkube#269 and the release.
 
 ### Done: #245 (P3), the VM seed through stormvm_cloudinit::medium (combustion, stormvm#63)
 
