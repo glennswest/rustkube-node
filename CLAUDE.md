@@ -58,6 +58,18 @@ by #51.
 
 ## Work plan
 
+### In progress: #187 (P3), VirtualMachineSnapshot status: the step, the disks and the size (stormvm#45)
+
+2026-10-13. The lock's stormvm (7a7baf2) has `take_with_progress` (console and control), `Step::as_str`,
+`console::snapshot::detail`, `spec::snapshot_status_with`. Doing in vm_snapshot.rs:
+1. [ ] `TakeFn` gains a `Progress` (`Fn(&'static str)`); `stormvm_take` and the CSI path use `take_with_progress`;
+       `Taken.detail` (`SnapshotDetail`: console's `detail` for stormblock-only; for #157 the group's disks plus the CSI
+       disks, size only when every member's is known).
+2. [ ] The spawn site: each step → a writer task merge-patching `status["storm.io/step"]` (InProgress), joined before
+       `finish`, which writes `snapshot_status_with(result, detail)`.
+3. [ ] Tests (steps written in order then the result's step/included/excluded/size; a failed pause reads Failed +
+       `freezing`), README, CHANGELOG; sc-build; golden; close.
+
 ### Done: #249 (P1), can the kubelet start a `stormpump://` asset pod? (stormcos#547: a second sshd on :22)
 
 2026-10-13. 12.21's data (comment on #249): :22 held by PID 1's own sshd, stormcos#547 closed. From the code: no path
