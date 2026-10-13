@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-13
+
+- **fix:** `:10250` no longer waits on the apiserver for every request (#244). Each bearer token was sent to the
+  apiserver's TokenReview on every request, under the apiserver retry policy (4 tries, 30 s each, 60 s deadline),
+  so stormd's `/pods` probe (node-admin token, every 15 s) stalled whenever the apiserver hiccupped (pvetest1/2 on
+  12.16: "no answer within 10 s" for ~15 s). Now a review's answer is cached per token (SHA-256): authenticated
+  2 min (upstream's webhook cache TTL), refused 10 s; the review is bounded (2 tries × 3 s) and an unanswered or
+  failed one is 503 + `Retry-After: 1`, not cached. A token check or answer over 1 s is logged with its path. Docs:
+  api.md, README, retries.md.
+
 ## 2026-10-10
 
 - **feat:** VM disks on another CSI driver's claim, and their snapshot and restore (#157; a stormblock-csi claim is

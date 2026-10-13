@@ -265,7 +265,9 @@ this does **not** establish full upstream compatibility.
 ## The kubelet API (`:10250`)
 
 HTTPS, bearer-token auth (a static token, or one the apiserver accepts via
-TokenReview); `/healthz`, `/livez` and `/readyz` are open.
+TokenReview, its answer kept 2 min, a refusal 10 s; an apiserver that cannot be
+asked within ~6 s makes the request 503, #244); `/healthz`, `/livez` and
+`/readyz` are open.
 
 | Route | What it is |
 |---|---|

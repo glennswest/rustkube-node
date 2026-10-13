@@ -65,7 +65,39 @@ struct AuthState {
     api_client: reqwest::Client,
     api_url: String,
     anonymous: bool,
+    /// TokenReview answers, by the token's SHA-256 (#244).
+    reviews: Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], (bool, std::time::Instant)>>>,
 }
+
+impl AuthState {
+    fn new(auth_token: Option<String>, api_client: reqwest::Client, api_url: String, anonymous: bool) -> Self {
+        AuthState { auth_token, api_client, api_url, anonymous, reviews: Default::default() }
+    }
+}
+
+/// How long the apiserver's "authenticated" is kept for a token (#244):
+/// upstream's `--authentication-token-webhook-cache-ttl` default. Without it
+/// every request (stormd's `/pods` probe every 15 s among them) waited on a
+/// TokenReview, and a hiccup in the apiserver read as the kubelet stalled.
+const REVIEW_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+/// A refusal is kept for less: a token minted a moment ago is not locked out
+/// for long, and a client retrying a bad token does not reach the apiserver
+/// each time.
+const REVIEW_DENIED_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+/// The review is on the request's path, so it is bounded well inside a
+/// caller's own timeout (stormd's probe gives 10 s): two tries of 3 s each.
+/// Past that the request is answered 503, not held.
+const REVIEW_POLICY: retry::Policy = retry::Policy {
+    name: "apiserver (token review)",
+    attempts: 2,
+    first_delay: std::time::Duration::from_millis(250),
+    max_delay: std::time::Duration::from_secs(1),
+    deadline: std::time::Duration::from_secs(4),
+};
+const REVIEW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// A request whose check or answer takes longer than this is logged, saying
+/// which of the two it was (#244).
+const SLOW_REQUEST: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Everything the routes need: the pods this kubelet manages, and stormvm's
 /// console doors as a mounted router.
@@ -192,12 +224,12 @@ pub async fn serve(
     if config.anonymous {
         warn!("kubelet server: anonymous auth enabled — :{port} endpoints are unauthenticated");
     }
-    let auth = AuthState {
-        auth_token: config.auth_token.clone(),
-        api_client: config.api_client.clone(),
-        api_url: config.api_url.clone(),
-        anonymous: config.anonymous,
-    };
+    let auth = AuthState::new(
+        config.auth_token.clone(),
+        config.api_client.clone(),
+        config.api_url.clone(),
+        config.anonymous,
+    );
     let app = router_with_console(
         pod_manager,
         vms,
@@ -253,10 +285,14 @@ pub async fn serve(
 
 /// Auth gate: health/liveness/readiness are always open; everything else needs a
 /// valid bearer token (a configured static token, or one the apiserver accepts
-/// via TokenReview).
+/// via TokenReview, its answer cached: [`REVIEW_TTL`]).
+///
+/// A token the apiserver could not be asked about is answered 503 within
+/// [`REVIEW_POLICY`]'s bound, never held (#244). A slow check or a slow answer
+/// is logged with its path and which of the two took the time.
 async fn auth_mw(State(auth): State<AuthState>, req: Request, next: Next) -> Response {
-    let path = req.uri().path();
-    let exempt = matches!(path, "/healthz" | "/livez" | "/readyz");
+    let path = req.uri().path().to_string();
+    let exempt = matches!(path.as_str(), "/healthz" | "/livez" | "/readyz");
     if exempt || auth.anonymous {
         return next.run(req).await;
     }
@@ -266,24 +302,75 @@ async fn auth_mw(State(auth): State<AuthState>, req: Request, next: Next) -> Res
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(str::to_string);
-    match token {
-        Some(t) if authorize(&auth, &t).await => next.run(req).await,
-        _ => (StatusCode::UNAUTHORIZED, "Unauthorized\n").into_response(),
+    let t = std::time::Instant::now();
+    let review = match token {
+        Some(t) => authorize(&auth, &t).await,
+        None => Review::Refused,
+    };
+    let checked = t.elapsed();
+    if checked > SLOW_REQUEST {
+        warn!("kubelet server: {path}: checking the bearer token took {} ms ({review:?})", checked.as_millis());
+    }
+    match review {
+        Review::Authenticated => {
+            let t = std::time::Instant::now();
+            let resp = next.run(req).await;
+            let answered = t.elapsed();
+            if answered > SLOW_REQUEST {
+                warn!("kubelet server: {path}: answered in {} ms (token checked in {} ms)", answered.as_millis(), checked.as_millis());
+            }
+            resp
+        }
+        Review::Refused => (StatusCode::UNAUTHORIZED, "Unauthorized\n").into_response(),
+        Review::Unknown(why) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "1")],
+            format!("cannot check the bearer token: {why}\n"),
+        )
+            .into_response(),
     }
 }
 
-async fn authorize(auth: &AuthState, token: &str) -> bool {
+/// What the kubelet knows of a bearer token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Review {
+    Authenticated,
+    Refused,
+    /// The apiserver did not say (no answer, an error status): not cached.
+    Unknown(String),
+}
+
+async fn authorize(auth: &AuthState, token: &str) -> Review {
     if let Some(expected) = &auth.auth_token {
         if constant_time_eq(token.as_bytes(), expected.as_bytes()) {
-            return true;
+            return Review::Authenticated;
         }
     }
-    token_review(auth, token).await
+    use sha2::Digest;
+    let key: [u8; 32] = sha2::Sha256::digest(token.as_bytes()).into();
+    let now = std::time::Instant::now();
+    if let Some(&(ok, at)) = auth.reviews.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        if now.duration_since(at) < if ok { REVIEW_TTL } else { REVIEW_DENIED_TTL } {
+            return if ok { Review::Authenticated } else { Review::Refused };
+        }
+    }
+    let review = token_review(auth, token).await;
+    let ok = match review {
+        Review::Authenticated => true,
+        Review::Refused => false,
+        Review::Unknown(_) => return review,
+    };
+    let mut reviews = auth.reviews.lock().unwrap_or_else(|e| e.into_inner());
+    // Expired answers go as new ones come, so the map is the tokens seen
+    // within a TTL.
+    reviews.retain(|_, (ok, at)| now.duration_since(*at) < if *ok { REVIEW_TTL } else { REVIEW_DENIED_TTL });
+    reviews.insert(key, (ok, std::time::Instant::now()));
+    review
 }
 
-/// Validate a token via the apiserver's TokenReview API (best-effort — succeeds
-/// only if the apiserver implements it and the token authenticates).
-async fn token_review(auth: &AuthState, token: &str) -> bool {
+/// Validate a token via the apiserver's TokenReview API, within
+/// [`REVIEW_POLICY`] and [`REVIEW_TIMEOUT`] per try.
+async fn token_review(auth: &AuthState, token: &str) -> Review {
     let url = format!(
         "{}/apis/authentication.k8s.io/v1/tokenreviews",
         auth.api_url.trim_end_matches('/')
@@ -293,14 +380,17 @@ async fn token_review(auth: &AuthState, token: &str) -> bool {
         "kind": "TokenReview",
         "spec": { "token": token }
     });
-    match auth.api_client.post(&url).json(&body).send_repeatable(retry::Policy::API).await {
-        Ok(resp) => resp
-            .json::<serde_json::Value>()
-            .await
-            .ok()
-            .and_then(|v| v["status"]["authenticated"].as_bool())
-            .unwrap_or(false),
-        Err(_) => false,
+    let sent = auth.api_client.post(&url).json(&body).timeout(REVIEW_TIMEOUT).send_repeatable(REVIEW_POLICY);
+    let answer = match tokio::time::timeout(REVIEW_POLICY.deadline + REVIEW_TIMEOUT, sent).await {
+        Ok(Ok(resp)) if resp.status().is_success() => resp,
+        Ok(Ok(resp)) => return Review::Unknown(format!("the apiserver's TokenReview answered {}", resp.status())),
+        Ok(Err(e)) => return Review::Unknown(format!("the apiserver's TokenReview: {e}")),
+        Err(_) => return Review::Unknown("the apiserver's TokenReview did not answer in time".into()),
+    };
+    match answer.json::<serde_json::Value>().await {
+        Ok(v) if v["status"]["authenticated"].as_bool() == Some(true) => Review::Authenticated,
+        Ok(_) => Review::Refused,
+        Err(e) => Review::Unknown(format!("the apiserver's TokenReview answer: {e}")),
     }
 }
 
@@ -1078,6 +1168,119 @@ mod tests {
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::OK, "{uri}");
         }
+    }
+
+    /// A fake apiserver's TokenReview: `good` authenticates, anything else
+    /// does not; `mode` "ok" answers, "500" fails, "hang" never answers.
+    /// Returns its URL and how many reviews it was asked for.
+    async fn fake_reviewer(mode: &'static str) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = asked.clone();
+        let app = Router::new().route(
+            "/apis/authentication.k8s.io/v1/tokenreviews",
+            axum::routing::post(move |Json(body): Json<serde_json::Value>| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    match mode {
+                        "500" => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({}))),
+                        "hang" => {
+                            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                            (StatusCode::OK, Json(serde_json::json!({})))
+                        }
+                        _ => {
+                            let ok = body["spec"]["token"] == "good";
+                            (StatusCode::CREATED, Json(serde_json::json!({"status": {"authenticated": ok}})))
+                        }
+                    }
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (url, asked)
+    }
+
+    fn guarded(url: &str) -> Router {
+        let rt = Arc::new(NoopRt);
+        let auth = AuthState::new(None, reqwest::Client::new(), url.to_string(), false);
+        router(Arc::new(PodManager::new(rt.clone(), rt, "test-node")))
+            .layer(middleware::from_fn_with_state(auth, auth_mw))
+    }
+
+    async fn get_pods(app: &Router, token: &str) -> StatusCode {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/pods")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// stormd's `/pods` probe every 15 s does not reach the apiserver each
+    /// time (#244): a token's review is kept, a refusal too (for less).
+    #[tokio::test]
+    async fn a_token_review_is_cached() {
+        let (url, asked) = fake_reviewer("ok").await;
+        let app = guarded(&url);
+        for _ in 0..3 {
+            assert_eq!(get_pods(&app, "good").await, StatusCode::OK);
+        }
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1, "one review for three requests");
+        for _ in 0..2 {
+            assert_eq!(get_pods(&app, "bad").await, StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2, "a refusal is kept too");
+        let no_token = app
+            .clone()
+            .oneshot(Request::builder().uri("/pods").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(no_token.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2, "no token, no review");
+    }
+
+    /// An apiserver that fails the review: 503, not 401, and nothing kept, so
+    /// the next request asks again.
+    #[tokio::test]
+    async fn a_failed_review_is_503_and_not_kept() {
+        let (url, asked) = fake_reviewer("500").await;
+        let app = guarded(&url);
+        assert_eq!(get_pods(&app, "good").await, StatusCode::SERVICE_UNAVAILABLE);
+        let first = asked.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(first, REVIEW_POLICY.attempts as usize, "retried within the policy");
+        assert_eq!(get_pods(&app, "good").await, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), first * 2, "not cached");
+    }
+
+    /// An apiserver that never answers holds `/pods` for less than stormd's
+    /// 10 s probe timeout (#244), and the answer says why.
+    #[tokio::test]
+    async fn a_hung_review_is_bounded() {
+        let (url, _) = fake_reviewer("hang").await;
+        let app = guarded(&url);
+        let t = std::time::Instant::now();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/pods")
+                    .header(AUTHORIZATION, "Bearer good")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(t.elapsed() < std::time::Duration::from_secs(9), "{:?}", t.elapsed());
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("cannot check the bearer token"));
     }
 
     #[tokio::test]

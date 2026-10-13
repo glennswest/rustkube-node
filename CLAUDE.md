@@ -58,6 +58,19 @@ by #51.
 
 ## Work plan
 
+### In progress: #244 (P1), :10250/pods stalls ~15 s once per install (stormd's API probe)
+
+2026-10-13. Consoles (pvetest1 15:50Z, pvetest2): both stalls at the moment cadvisor hit max restarts and PID 1
+restarted it; the nodes no longer answer (12.16 installs failed), so the kubelet's own log is not readable. Code:
+`/pods` waits on only two things: the pods RwLock (never held across an await: checked every guard) and `auth_mw`'s
+TokenReview, sent on **every** request (no cache) under `Policy::API` (4 tries, 30 s each, 60 s deadline), so any
+apiserver hiccup holds the probe. The ring's blocking calls are all in spawn_blocking.
+1. [x] server.rs: TokenReview answers cached by token SHA-256 (ok 2 min = upstream's webhook TTL, refused 10 s);
+       review bounded (2 tries × 3 s, outer timeout), unanswered/failed = 503 + Retry-After, not cached; WARN when the
+       token check or the answer takes > 1 s, naming which. 3 tests (cache, 500 → 503 uncached, hung apiserver < 9 s).
+2. [ ] Docs (api.md, README, retries.md), CHANGELOG; sc-build; stage golden; close. Not done: SubjectAccessReview
+       (stormcos's API-HEALTH.md says the kubelet authorises through it; it does not): filed separately.
+
 ### Done: documentation refresh from code since 2026-10-02 (#54-style audit; #166, #220)
 
 2026-10-09, on main at 06b91b5. Audit README, docs/, CLAUDE.md against code and `git log --since=2026-10-02`.

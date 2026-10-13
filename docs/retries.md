@@ -97,7 +97,7 @@ rules say. `R` = POST marked repeatable (named create or review).
 | `capacity.rs` | 223, 235, 270, 241 R (CSIStorageCapacity) |
 | `pv_placement.rs` | 373, 393 (PVs) |
 | `events.rs` | 233 (event patch), 252 R (event create, fixed name) |
-| `server.rs` | 296 R (TokenReview for `/vmInstance`) |
+| `server.rs` | `token_review` R (inbound bearer tokens, #244: its own policy, 2 tries × 3 s, then 503; answers cached 2 min / refusals 10 s) |
 | `pkg/proxy/src/client.rs` | 126 (kube-proxy's lists) |
 | `test/src/api.rs` | 40 (every test call; POST not repeated unless it never left) |
 

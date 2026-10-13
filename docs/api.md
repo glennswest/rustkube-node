@@ -25,8 +25,16 @@ kubelet process; no separate console TCP service is required by this path.
 same handler. They do not probe CNI, API connectivity or workload readiness.
 Every other route requires a bearer token unless `--anonymous-auth` is set:
 a configured static token is accepted, otherwise API TokenReview checks the
-token. Missing/invalid credentials are rejected; TLS is still used with
+token. Missing/invalid credentials are rejected (401); TLS is still used with
 anonymous auth. See [credential behavior](configuration.md).
+
+A TokenReview's answer is kept per token (by its SHA-256): "authenticated" for
+2 minutes (upstream's `--authentication-token-webhook-cache-ttl` default), a
+refusal for 10 s (#244). The review itself is bounded: two tries of 3 s each;
+an apiserver that does not answer, or answers with an error, makes the request
+503 + `Retry-After: 1` ("cannot check the bearer token: …"), never held and
+never cached. A request whose token check or answer takes over 1 s is logged
+(WARN, `kubelet server: <path>: …`), naming which of the two took the time.
 
 | Method | Route | Behavior |
 |---|---|---|
