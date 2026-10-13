@@ -2,6 +2,16 @@
 
 ## 2026-10-13
 
+- **feat:** VM snapshots with memory, and restores that resume from them (#251, stormvm#37; stormvm 7a7baf2 → e929b8f).
+  `storm.io/memory: "true"` on a VirtualMachineSnapshot takes it with `take_with_memory` (state volume in the same
+  group; status `storm.io/memory`, `storm.io/stateVolume`, `storm.io/memoryBytes`; refused with disks on other drivers'
+  claims). Its restore also makes a volume from the state member and puts `storm.io/resume-state` on the VM's template;
+  the VMI made from it starts with `-incoming file:<device>` (`plan::build_receiving`), once; a refused stream, an exit
+  or no running guest within 10 min is a cold boot of the same VMI from the restored disks; the restore says
+  `resumed` / `cold-boot` and why, the VMI gets `Resumed` / `ColdBoot`, the state copy is deleted.
+- **feat:** A deleted VirtualMachineSnapshot takes its content with it (#251): finalizer `storm.io/snapshot` at claim
+  (with an engine), the group snapshot and the state volume deleted on deletion unless `spec.deletionPolicy: Retain`.
+
 - **feat:** A VirtualMachineSnapshot's status says its step, disks and size (#187, stormvm#45). The take goes through
   stormvm's `take_with_progress` (both the stormblock-only and the #157 VolumeSnapshot paths) and each step
   (`idling`/`freezing`/`cloning`/`thawing`) is merge-patched onto `status["storm.io/step"]` as it is entered, by one

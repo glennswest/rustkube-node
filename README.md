@@ -773,6 +773,21 @@ starts once the VM lets the claim go (#80).
     VolumeSnapshot is cut) and `status["storm.io/sizeBytes"]` (stormblock's
     members summed; absent when unknown, as with VolumeSnapshots). Nothing is
     said about disks when no group was taken.
+  - **With memory** (#251, stormvm#37; opt-in, qemu only): a
+    VirtualMachineSnapshot annotated `storm.io/memory: "true"` also saves the
+    guest's memory and device state, into a thin volume
+    `<ns>.<vm>.<snapshot>.state` that joins the same group (the guest paused
+    while its RAM is written). Its status then says `storm.io/memory: true`,
+    `storm.io/stateVolume` and `storm.io/memoryBytes`. A VM with a disk on
+    another driver's claim is refused (the state and that disk would not be of
+    one instant).
+  - **Deleted with its content** (#251): a snapshot this node takes carries
+    the finalizer `storm.io/snapshot`; when it is deleted, its group snapshot
+    and its state volume are deleted, then the finalizer, unless
+    `spec.deletionPolicy: Retain` (KubeVirt's; the default is `Delete`). A
+    refusal keeps the finalizer and is retried. Snapshots taken before this
+    carry no finalizer and keep their content. A snapshot of a node that is
+    gone keeps its finalizer: remove it by hand.
   - **Restart:** a kubelet restarted mid-take takes it again. stormblock
     answers a name it has seen with what it made then. A snapshot whose VM
     has left the node is Failed.
@@ -819,6 +834,17 @@ starts once the VM lets the claim go (#80).
     surviving leg on another node (the owner's note on #109), and the VM goes
     where the driver serves it.
   - A disk of the built-in class is still made on the snapshot's node.
+  - **A memory snapshot** (#251) also gets a volume from its state member,
+    `<ns>.<vm>-state-restore-<restore>`, named on the VirtualMachine's template
+    (`storm.io/resume-state`), and the restore says `storm.io/memory: pending`.
+    The VMI made from it starts with qemu's `-incoming file:<device>`: the
+    guest resumes where it was saved. The annotation is taken off the template
+    at that start (a later VMI starts cold), and the VMI tries once. If qemu
+    refuses the state (the VM's spec changed since the snapshot) or the guest
+    does not run within 10 min, the machine is started again cold from the
+    restored disks. The restore then says `storm.io/memory: resumed` or
+    `cold-boot` with why (`storm.io/memoryMessage`), with a `Resumed` or
+    `ColdBoot` Event on the VMI. The state volume is deleted either way.
 - **A VM disk on another driver's claim** (#157): a `persistentVolumeClaim`
   (or `dataVolume`) bound to another CSI driver's PV must be
   `volumeMode: Block` (a disk image on a filesystem claim is not supported,
