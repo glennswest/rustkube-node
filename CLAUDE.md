@@ -13,7 +13,7 @@ stage golden through `stormcentral component stage rustkube-node`, not a package
 
 ## Current implementation reference (2026-10-09)
 
-Main baseline: 436bd8b (latest stage golden golden-rustkube-node-b62d1f3a06bf, stormcos#424; every git dependency by rev, #210). See
+Main baseline: 7f36be0 (latest stage golden golden-rustkube-node-8aae99144ff9, stormcos#424; every git dependency by rev, #210). See
 `docs/status.md` for changes since October 2, the owner's recorded decisions and issue-backed limitations,
 `docs/configuration.md` for every CLI/env/default, `docs/api.md` for ports and actual routes, `docs/retries.md`
 for every remote call's retry policy. CLI runtime defaults to native; stormcos explicitly chooses stormpump.
@@ -58,27 +58,30 @@ by #51.
 
 ## Work plan
 
-### In progress: #251 (P3), VM snapshots with memory, and a restore that resumes from it (stormvm#37)
+### Done: #251 (P3), VM snapshots with memory, and a restore that resumes from it (stormvm#37)
 
 2026-10-13. stormvm main e929b8f (dcbbb14/cd90296: `console::snapshot::take_with_memory`, `state_volume_name`,
 `Outcome.memory`, `qemu::incoming_from_state`; also #19's balloon: `Registration.memory_min`, `MemorySize.balloon`).
 No Cargo change upstream. rustkube's VM controller copies `spec.template.metadata.annotations` onto the VMI
 (controller-manager virtualmachine.rs), which carries a resume to the next start. Today nothing handles a
 VirtualMachineSnapshot's deletion (no finalizer, no group deleted). Branch wip/251:
-1. [ ] Bump stormvm 7a7baf2 → e929b8f (Registration literals gain `memory_min`).
-2. [ ] Opt-in `metadata.annotations["storm.io/memory"] = "true"` → `take_with_memory` (the stormblock-only path; a
+1. [x] Bump stormvm 7a7baf2 → e929b8f (Registration literals gain `memory_min`).
+2. [x] Opt-in `metadata.annotations["storm.io/memory"] = "true"` → `take_with_memory` (the stormblock-only path; a
        VM with disks on other drivers' claims is refused, naming it). Status `storm.io/memory: true` and
        `storm.io/stateVolume` (the group member that is no disk's).
-3. [ ] Deletion (KubeVirt's `spec.deletionPolicy`, default Delete; Retain keeps): finalizer `storm.io/snapshot` at
+3. [x] Deletion (KubeVirt's `spec.deletionPolicy`, default Delete; Retain keeps): finalizer `storm.io/snapshot` at
        claim (only with an engine); on deletion, the group snapshot and the state volume deleted, then the finalizer.
-4. [ ] Restore of a memory snapshot: disks as now, plus `<ns>.<vm>-state-restore-<restore>` from the state member;
+4. [x] Restore of a memory snapshot: disks as now, plus `<ns>.<vm>-state-restore-<restore>` from the state member;
        the VM template gets `storm.io/resume-state` {volume, restore}; restore status says the memory is pending.
-5. [ ] Start of a VMI with `storm.io/resume-state` (once per VMI): attach it, `plan::build_receiving` with
+5. [x] Start of a VMI with `storm.io/resume-state` (once per VMI): attach it, `plan::build_receiving` with
        `incoming_from_state(dev)`; a watcher: guest running → resumed; hypervisor gone or not running in time → cold
        boot (the #76 retry starts it without incoming), with the hypervisor's words. Either way: the restore's
        status (`storm.io/memory: resumed | cold-boot` + message), an Event, the state volume detached and deleted,
        the annotation taken off the VM template. No volume (gone, a kubelet restart) = cold boot, said.
-6. [ ] Tests, README, CHANGELOG; sc-build; merge; golden; close.
+6. [x] Tests, README, CHANGELOG; sc-build; merge; golden; close.
+       Done: main 7f36be0. SC_BUILD_VM sc-build (job 19c4ae7f48): 523 kubelet unit (4 new), all suites pass; clippy
+       nothing new (launch's argument count was already over, #227). Stage golden golden-rustkube-node-8aae99144ff9
+       (stormcos#424). Closed. Live: needs the snapshot CRDs (stormcos#170), qemu, a running VM.
 
 ### Done: #187 (P3), VirtualMachineSnapshot status: the step, the disks and the size (stormvm#45)
 
