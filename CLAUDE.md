@@ -58,6 +58,14 @@ by #51.
 
 ## Work plan
 
+### In progress: #252 (P3), a running VMI's memory below its boot size (stormvm#19's balloon)
+
+2026-10-13. Item 1 (stormvm e929b8f, `Registration.memory_min` in the two test literals) landed with #251 (7f36be0).
+Left: #246's memory step through `set_memory_within(bytes, floor)`, floor = the machine's registration
+`memory_min` (else the spec's `memory.min` below its size, the same rule); `status.memory.guestCurrent` =
+`MemorySize::current()` (balloon + hot-added); `guestRequested` = what was asked; a squeeze the guest cannot finish
+stops being polled after 5 min. Tests (squeeze within the floor, below it refused), docs, CHANGELOG; sc-build; golden.
+
 ### Done: #251 (P3), VM snapshots with memory, and a restore that resumes from it (stormvm#37)
 
 2026-10-13. stormvm main e929b8f (dcbbb14/cd90296: `console::snapshot::take_with_memory`, `state_volume_name`,
