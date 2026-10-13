@@ -58,7 +58,7 @@ by #51.
 
 ## Work plan
 
-### In progress: #244 (P1), :10250/pods stalls ~15 s once per install (stormd's API probe)
+### Done: #244 (P1), :10250/pods stalls ~15 s once per install (stormd's API probe)
 
 2026-10-13. Consoles (pvetest1 15:50Z, pvetest2): both stalls at the moment cadvisor hit max restarts and PID 1
 restarted it; the nodes no longer answer (12.16 installs failed), so the kubelet's own log is not readable. Code:
@@ -69,7 +69,8 @@ apiserver hiccup holds the probe. The ring's blocking calls are all in spawn_blo
        review bounded (2 tries × 3 s, outer timeout), unanswered/failed = 503 + Retry-After, not cached; WARN when the
        token check or the answer takes > 1 s, naming which. 3 tests (cache, 500 → 503 uncached, hung apiserver < 9 s).
 2. [x] Docs (api.md, README, retries.md), CHANGELOG (66ad8de). sc-build 66ad8de: 37 server tests pass (3 new).
-3. [ ] Full suite + clippy on server.rs; stage golden; close. Not done: SubjectAccessReview
+3. [x] SC_BUILD_VM sc-build 2388508: full suite (509 kubelet unit), clippy clean on server.rs. Stage golden
+       golden-rustkube-node-c6f01d65b9b7 (stormcos#424). Closed. Live: the next pvetest install, no STALLED on `pods`. Not done: SubjectAccessReview
        (stormcos's API-HEALTH.md says the kubelet authorises through it; it does not yet): #180.
 
 ### Done: documentation refresh from code since 2026-10-02 (#54-style audit; #166, #220)
