@@ -1069,7 +1069,17 @@ impl Kubelet {
 
     /// Publish independent snapshots; unavailable sources never imply deletion.
     async fn sync(&self) -> anyhow::Result<()> {
-        let static_pods = self.load_static_pods();
+        let mut static_pods = self.load_static_pods();
+        // A manifest naming a node service (`stormpump://`) describes PID 1's
+        // work: never started here (#249).
+        static_pods.retain(|p| {
+            let ours = !crate::mirror::is_node_service(p);
+            if !ours {
+                warn!(pod = %p["metadata"]["name"].as_str().unwrap_or(""),
+                      "static pod names a node service (stormpump://), which PID 1 runs: not started");
+            }
+            ours
+        });
         if self.static_read_complete.load(Ordering::Acquire) {
             self.pod_manager.cache_specs(&static_pods).await;
             self.pod_manager.note_seen(&static_pods).await;
@@ -1086,7 +1096,8 @@ impl Kubelet {
         self.adopt_launchers(list["items"].as_array().map(|a| a.as_slice()).unwrap_or(&[])).await;
         let want: Vec<_> = list["items"].as_array().unwrap().iter().filter(|p|
             p["spec"]["nodeName"].as_str()==Some(&self.config.node_name)
-            && p["metadata"]["annotations"]["kubernetes.io/config.source"].as_str()!=Some("stormpump")
+            // PID 1's node services are mirrored, never run (#249).
+            && !crate::mirror::is_node_service(p)
             && !crate::vm_network::is_launcher(p)
             && !p["metadata"]["uid"].as_str().unwrap_or("").starts_with("static-"))
             .cloned().collect();

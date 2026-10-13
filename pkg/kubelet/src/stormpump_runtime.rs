@@ -1995,6 +1995,11 @@ impl StormpumpImages {
     }
 
     fn local_path_in(image: &str, pallets: &std::path::Path) -> Option<std::path::PathBuf> {
+        // `scheme://…` is not an image reference: `stormpump://sshd` is PID
+        // 1's sshd, and its last component must never pick the pallet (#249).
+        if image.contains("://") {
+            return None;
+        }
         let last = image.rsplit('/').next().unwrap_or(image);
         let name = last.split(['@', ':']).next().unwrap_or(last);
         if name.is_empty() {
@@ -2036,6 +2041,13 @@ impl ImageService for StormpumpImages {
     ///    container's root is its own clone, never the registry's
     ///    (stormblock-registry#98 asks for a demand that mints nothing).
     async fn pull_image(&self, image: &str) -> Result<String, CriError> {
+        // A node service's mirror image names something PID 1 runs (#249):
+        // the kubelet never starts one, and nothing resolves it.
+        if crate::mirror::names_node_service(image) {
+            return Err(CriError::ImagePull(format!(
+                "{image} names a node service PID 1 runs; the kubelet never starts one"
+            )));
+        }
         // A golden version other than the release's (#86): through the
         // registry, which fetches it from forge on demand, never the pallet.
         if let Some(v) = self.version_of(image) {
@@ -2805,6 +2817,23 @@ mod tests {
         }
         assert_eq!(image_root_in("empty", pallets.path()), None);
         assert_eq!(image_root_in("quay.io/x/nonesuch:1", pallets.path()), None);
+    }
+
+    /// #249: a node service's mirror image (`stormpump://sshd`) never
+    /// resolves to the pallet its last component names, and a pull of it is
+    /// refused without asking anything: run, it would be a second sshd beside
+    /// PID 1's.
+    #[tokio::test]
+    async fn a_node_service_image_is_never_resolved_or_pulled() {
+        let pallets = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(pallets.path().join("sshd/usr/sbin")).unwrap();
+        assert!(image_root_in("sshd", pallets.path()).is_some(), "the pallet is there");
+        assert_eq!(image_root_in("stormpump://sshd", pallets.path()), None);
+        assert_eq!(image_root_in("https://example.com/sshd", pallets.path()), None);
+        // Nothing listens here: a refusal that asked would fail differently.
+        let img = StormpumpImages::new("http://127.0.0.1:9");
+        let e = img.pull_image("stormpump://sshd").await.unwrap_err().to_string();
+        assert!(e.contains("names a node service PID 1 runs"), "{e}");
     }
 
     /// The engine refuses a relative argv[0], and every real manifest writes

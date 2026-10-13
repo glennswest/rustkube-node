@@ -186,6 +186,37 @@ pub fn mirror_name(asset: &str, node: &str) -> String {
     format!("{asset}-{node}")
 }
 
+/// The image scheme of a node service's mirror pod: `stormpump://<asset>`.
+/// It names something PID 1 runs, not an image.
+pub const IMAGE_SCHEME: &str = "stormpump://";
+
+/// Is `image` a node service's (`stormpump://<asset>`)?
+pub fn names_node_service(image: &str) -> bool {
+    image.starts_with(IMAGE_SCHEME)
+}
+
+/// Is this pod one of PID 1's node services, mirrored here read-only (#249)?
+///
+/// **The kubelet never starts one.** Every mark the mirror writes counts, not
+/// only `config.source`, so an object that lost one (an edit, an older
+/// writer) is still recognised: run as a pod, `stormpump://sshd` would be a
+/// second sshd from the unit's own pallet on the host network, beside PID 1's
+/// (stormcos#547).
+pub fn is_node_service(pod: &Value) -> bool {
+    let meta = &pod["metadata"];
+    if meta["annotations"]["kubernetes.io/config.source"] == "stormpump"
+        || meta["annotations"]["storm.io/mirror"] == "true"
+        || meta["labels"]["storm.io/component"] == "node-service"
+    {
+        return true;
+    }
+    ["containers", "initContainers", "ephemeralContainers"].iter().any(|k| {
+        pod["spec"][k]
+            .as_array()
+            .is_some_and(|cs| cs.iter().any(|c| c["image"].as_str().is_some_and(names_node_service)))
+    })
+}
+
 /// Build the mirror pod for an asset.
 ///
 /// `config.source: stormpump` is the annotation that says this object
@@ -696,6 +727,18 @@ mod tests {
         assert!(p["status"]["containerStatuses"][0]["state"]["running"].is_object());
         // The annotation is what says the API did not schedule this.
         assert_eq!(p["metadata"]["annotations"]["kubernetes.io/config.source"], "stormpump");
+        // #249: recognised by every mark it carries, each alone.
+        assert!(is_node_service(&p));
+        for strip in ["/metadata/annotations", "/metadata/labels"] {
+            let mut q = p.clone();
+            *q.pointer_mut(strip).unwrap() = json!({});
+            assert!(is_node_service(&q), "without {strip}");
+        }
+        let mut bare = p.clone();
+        bare["metadata"] = json!({"name": "sshd-n1", "namespace": "kube-system"});
+        assert!(is_node_service(&bare), "by its stormpump:// image alone");
+        let ordinary = json!({"metadata": {"name": "web"}, "spec": {"containers": [{"image": "registry/web:1"}]}});
+        assert!(!is_node_service(&ordinary));
         // Owned by the Node, so it is collected with it.
         assert_eq!(p["metadata"]["ownerReferences"][0]["kind"], "Node");
         assert_eq!(p["metadata"]["ownerReferences"][0]["uid"], "uid-1");
