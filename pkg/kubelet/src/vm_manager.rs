@@ -985,6 +985,10 @@ pub struct VmManager {
     /// this is what keeps the per-UID workers from doing that. The window is
     /// milliseconds; disks are resolved outside it.
     deposit_window: Mutex<()>,
+    /// When each machine not yet running was first seen here, and how many
+    /// start attempts it has had: the `created` and `wait` of its start
+    /// timing (#259). Dropped once it runs, fails for good or goes.
+    start_seen: std::sync::Mutex<HashMap<String, crate::vm_start_timing::Seen>>,
     /// When each machine must next be looked at with no event (#101): a
     /// start's backoff, a pending wait, the guest agent's next poll.
     due: std::sync::Mutex<HashMap<String, std::time::Instant>>,
@@ -1241,6 +1245,7 @@ impl VmManager {
             partial: Arc::default(),
             unwinder,
             deposit_window: Mutex::new(()),
+            start_seen: Default::default(),
             due: Default::default(),
             waiting_since: Default::default(),
             cni: None,
@@ -1766,6 +1771,7 @@ impl VmManager {
             }
             self.retries.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
             self.waiting_since.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+            self.start_seen.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
             self.due.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
             // A failed start's tap still held would meet a successor of the
             // same name: the deletion (and its name) is held until it goes.
@@ -1897,6 +1903,12 @@ impl VmManager {
                 _ => {}
             }
         }
+        self.start_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(uid.to_string())
+            .or_insert_with(|| crate::vm_start_timing::Seen::new(obj))
+            .attempts += 1;
         let result = self.start(uid, obj).await;
         if !matches!(result, Err(StartFail::Waiting(_))) {
             self.waiting_since.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
@@ -1938,6 +1950,7 @@ impl VmManager {
                 None => None,
             };
             if gives_up(owner.as_ref()) {
+                self.start_seen.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
                 // The reason, where somebody will look for it.
                 //
                 // This is the message that said `cloning golden
@@ -2081,21 +2094,33 @@ impl VmManager {
     /// begin while an earlier one's tap is still held: it would only meet
     /// EBUSY.
     async fn start(&self, uid: &str, obj: &Value) -> Result<(), StartFail> {
+        let mut steps = crate::vm_start_timing::Steps::begin();
+        let t = steps.began;
         if let Err(e) = self.unwind(uid, false).await {
             return Err(StartFail::Waiting(format!(
                 "an earlier start's tap is still held by stormpump: {e}"
             )));
         }
+        let t = steps.since("unwind", t);
+        // The orphan sweep holds this for writing (#75): a start waits it out.
         let _disks = self.disk_lifecycle.read().await;
+        steps.since("lock", t);
         let mut fresh = Vec::new();
-        let result = self.start_attempt(uid, obj, &mut fresh).await;
+        let result = self.start_attempt(uid, obj, &mut fresh, &mut steps).await;
         if result.is_err() {
             self.delete_volumes(obj["metadata"]["name"].as_str().unwrap_or(""), &fresh).await;
         }
         result
     }
 
-    async fn start_attempt(&self, uid: &str, obj: &Value, fresh: &mut Vec<String>) -> Result<(), StartFail> {
+    async fn start_attempt(
+        &self,
+        uid: &str,
+        obj: &Value,
+        fresh: &mut Vec<String>,
+        steps: &mut crate::vm_start_timing::Steps,
+    ) -> Result<(), StartFail> {
+        let t = std::time::Instant::now();
         // Resolve the cloud-init secret before anything reads the spec.
         //
         // A seed may be referenced rather than inlined -- `userDataSecretRef`
@@ -2112,6 +2137,7 @@ impl VmManager {
         // kubelet and inlined into the spec it hands to the engine, so the
         // payload still never travels in the VMI.
         let obj = &self.with_seed(obj).await;
+        let t = steps.since("seed", t);
         let vm: VmSpec = stormvm_spec::kube::from_kube(obj).map_err(|e| e.to_string())?;
         let ns = obj["metadata"]["namespace"].as_str().unwrap_or("default").to_string();
         let ring = self.ring.clone().ok_or_else(|| {
@@ -2122,10 +2148,14 @@ impl VmManager {
         // A Secret that cannot be read does not stop the machine: the key may
         // be in its user-data too, and the condition says what is missing.
         let (boot_keys, boot_problems) = self.boot_keys(&vm).await;
+        let t = steps.since("keys", t);
         // Storage first. Nothing has been asked of the engine yet, so a golden
         // that does not exist costs a failed status and no cleanup.
         let owner = self.owner_of(obj).await;
-        let (disks, owned_volumes) = self.resolve_disks_with_keys(uid, &vm, &boot_keys, &owner, fresh).await?;
+        let t = steps.since("owner", t);
+        let (disks, owned_volumes) =
+            self.resolve_disks_as(uid, &vm, &boot_keys, &owner, fresh, false, steps.disks_mut()).await?;
+        let t = steps.since("disks", t);
 
         // The pod log directory, because that is where `kubectl logs` looks.
         // The container name is the VM's, so the path is the one the kubelet's
@@ -2144,13 +2174,17 @@ impl VmManager {
                 return Err(e);
             }
         };
+        let t = steps.since("network", t);
         // A restore's saved memory (#251): this start resumes from it, once.
         let resume = self.prepare_resume(uid, obj).await;
         let incoming = resume.as_ref().map(|(_, dev)| stormvm_vmm::qemu::incoming_from_state(dev));
+        let t = steps.since("resume", t);
         // Taps, plan and spawn, inside the deposit window (#100): a failure
         // there is unwound before another start may deposit.
+        let mut t = t;
         let launched = {
             let _window = self.deposit_window.lock().await;
+            t = steps.since("window", t);
             let launched = self.launch(uid, &ns, &vm, ring, &disks, &dir, pod.as_ref(), incoming.as_deref()).await;
             if launched.is_err() {
                 if let Err(e) = self.unwind_held(uid, false).await {
@@ -2159,6 +2193,7 @@ impl VmManager {
             }
             launched
         };
+        let t = steps.since("launch", t);
         if let Some((r, _)) = resume {
             self.resuming.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), r);
         }
@@ -2198,8 +2233,6 @@ impl VmManager {
         if let Err(e) = stormvm_node::console::write(RUN_ROOT, &reg) {
             warn!(vm = %vm.name, "could not record the running machine's handle: {e}");
         }
-        self.event(obj, "Normal", "Started",
-                   &format!("Started virtual machine {}", vm.name)).await;
         let mut rec = Vm {
             namespace: ns,
             name: vm.name.clone(),
@@ -2236,11 +2269,56 @@ impl VmManager {
         if !snoopers.is_empty() {
             self.snoopers.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), snoopers);
         }
+        let t = steps.since("record", t);
         self.patch_status(&rec).await;
+        let acked = steps.since("report", t);
+        // After `Running`, never in front of it: an Event POST took 0.5–0.7 s
+        // on pvetest1's apiserver, and `Started` was awaited before the
+        // status (#259).
+        self.started(uid, obj, &rec, steps, acked).await;
         if on_pod_network {
             self.report_launcher(uid, "Running").await;
         }
         Ok(())
+    }
+
+    /// A machine just reported `Running`: its `Started` Event, and where the
+    /// start went (#259) as an INFO line, the `storm.io/start-timing`
+    /// annotation and a `StartTiming` Event. The Events are queued and the
+    /// annotation written off the worker.
+    async fn started(
+        &self,
+        uid: &str,
+        obj: &Value,
+        rec: &Vm,
+        steps: &crate::vm_start_timing::Steps,
+        acked: std::time::Instant,
+    ) {
+        let seen = self.start_seen.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+        let text = steps.finish(seen.as_ref(), acked);
+        info!("VMI {}/{} started: {text}", rec.namespace, rec.name);
+        if let Some(r) = &self.events {
+            r.pod_event_later(obj, "Normal", "Started", &format!("Started virtual machine {}", rec.name)).await;
+            r.pod_event_later(obj, "Normal", crate::vm_start_timing::REASON, &text).await;
+        }
+        if self.api_url.is_empty() {
+            return;
+        }
+        let request = self
+            .api
+            .patch(format!(
+                "{}/apis/kubevirt.io/v1/namespaces/{}/virtualmachineinstances/{}",
+                self.api_url, rec.namespace, rec.name
+            ))
+            .header("content-type", "application/merge-patch+json")
+            .timeout(std::time::Duration::from_secs(10))
+            .json(&json!({"metadata": {"uid": uid, "annotations": {crate::vm_start_timing::ANNOTATION: text}}}));
+        let name = format!("{}/{}", rec.namespace, rec.name);
+        tokio::spawn(async move {
+            if let Err(error) = request.send_retrying(retry::Policy::API).await.and_then(|r| r.error_for_status()) {
+                warn!(%error, "VMI {name}: start timing annotation not written");
+            }
+        });
     }
 
     /// Taps, console registration, plan and spawn: everything from the first
@@ -2661,7 +2739,7 @@ impl VmManager {
         owner: &Value,
         fresh: &mut Vec<String>,
     ) -> Result<(Vec<ResolvedDisk>, Vec<String>), StartFail> {
-        self.resolve_disks_as(uid, vm, keys, owner, fresh, false).await
+        self.resolve_disks_as(uid, vm, keys, owner, fresh, false, &mut Vec::new()).await
     }
 
     /// [`Self::resolve_disks_with_keys`]; `hot` for disks added to a running
@@ -2675,10 +2753,12 @@ impl VmManager {
         owner: &Value,
         fresh: &mut Vec<String>,
         hot: bool,
+        times: &mut Vec<(String, std::time::Duration)>,
     ) -> Result<(Vec<ResolvedDisk>, Vec<String>), StartFail> {
         let mut done: Vec<ResolvedDisk> = Vec::new();
         let mut owned: Vec<String> = Vec::new();
         for d in &vm.disks {
+            let began = std::time::Instant::now();
             let volume_id = match &d.from {
                 DiskSource::Golden(g) => {
                     // Both qualified by namespace, through stormvm's own
@@ -2866,6 +2946,7 @@ impl VmManager {
                 readonly: d.readonly,
                 bus: d.bus,
             });
+            times.push((d.name.clone(), began.elapsed()));
         }
         Ok((done, owned))
     }
@@ -3740,7 +3821,7 @@ impl VmManager {
         let mut fresh = Vec::new();
         let resolved = {
             let _disks = self.disk_lifecycle.read().await;
-            self.resolve_disks_as(&vm.uid, &one, &[], owner, &mut fresh, true).await
+            self.resolve_disks_as(&vm.uid, &one, &[], owner, &mut fresh, true, &mut Vec::new()).await
         };
         let (done, owned) = match resolved {
             Ok(r) => r,

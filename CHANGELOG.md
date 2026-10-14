@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-10-14
+
+- **feat:** A VMI's start says where its time went (#259): `storm.io/start-timing` on the VMI, a `StartTiming`
+  Event and an INFO line, with `created`, `wait`, `unwind`, `lock` (the orphan sweep's disk lock), `seed`, `keys`,
+  `owner`, `disks` (+ `disk/<name>`), `network`, `resume`, `window`, `launch`, `record`, `report`, `total` and
+  `attempts`. Written after `Running`; the `Started` Event is now queued after the `Running` patch instead of awaited
+  before it. For pvetest1's install probe, whose second VM reads `Running` 3.5–6.7 s late since 12.19 while its
+  guest boots on time (the node's log shows 6.3 s inside one start attempt, untimed until now).
+
 ## 2026-10-13
 
 - **chore:** stormvm e929b8f → a8b509d (#255; stormpump stays 9877a97, only the rev moves). Brings: a `pod:passt` NIC's

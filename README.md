@@ -126,6 +126,35 @@ lifecycle Events (`Pulling`, `Pulled`, `Created`, `Started`, `StartTiming`) are 
 written in order by one background sender, so `containers` does not include their POSTs;
 Warnings are written before the start moves on.
 
+### VMI start timing
+
+A VMI's start says where its time went too (#259), in the same annotation on the VMI, a
+`StartTiming` Event and one INFO line (`VMI <ns>/<name> started: …`), written after `Running`
+is answered:
+
+    storm.io/start-timing: created=480ms wait=0.4ms unwind=0.1ms lock=0.0ms seed=0.0ms keys=0.0ms
+      owner=3.1ms disks=61ms network=0.0ms resume=0.0ms window=0.0ms launch=38ms record=4.2ms
+      report=9.8ms total=117ms attempts=1 disk/root=61ms
+
+| step | from → to |
+|---|---|
+| `created` | the VMI's `creationTimestamp` → first seen here (wall clocks; the VM controller and the scheduler before it) |
+| `wait` | seen → the attempt that started it (a `Waiting` start and its retries) |
+| `unwind` | an earlier failed start's taps withdrawn (#100) |
+| `lock` | waiting on the disk lock, which the orphan sweep holds while it runs (#75) |
+| `seed`, `keys`, `owner` | the cloud-init Secret, the `accessCredentials` Secrets (#92) and the VirtualMachine read |
+| `disks` | every disk found or cloned or made, and attached; each also as `disk/<name>` |
+| `network` | the pod network (#88): sandbox and CNI ADD; ~0 for a VM on a node bridge |
+| `resume` | a restore's saved state prepared (#251) |
+| `window` | waiting for the deposit window: another start's taps (#100) |
+| `launch` | taps, plan and the engine's spawn |
+| `record` | identity published, the registration rewritten with the handle |
+| `report` | the `Running` status patch |
+| `total` | seen → `Running` answered |
+
+`attempts` counts start attempts. The `Started` Event is queued after `Running`, not awaited
+before it (an Event POST took 0.5–0.7 s on a busy apiserver).
+
 ## Components and runtime selection
 
 | Component | Source | Current role |

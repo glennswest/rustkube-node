@@ -44,6 +44,7 @@ pub mod runtime;
 pub mod server;
 pub mod spdy;
 pub mod vm_hotplug;
+pub mod vm_start_timing;
 pub mod vm_manager;
 pub mod vm_network;
 pub mod vm_restore;
