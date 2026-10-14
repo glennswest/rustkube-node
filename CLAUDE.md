@@ -58,6 +58,14 @@ by #51.
 
 ## Work plan
 
+### In progress: #255 (P3), stormvm → a8b509d: pod:passt's passt as a stormpump helper (stormvm#7), chv display (stormvm#1)
+
+2026-10-13. stormvm main a8b509d (has d0313bc, fb77c46, 2d6fe95). Manifests: only the `stormvm` binary crate gains
+stormvm-display (not in our graph), so a rev-only bump in Cargo.toml and Cargo.lock. API: new console `Config` fields
+(`admitted_by_host`, `migration_tls`) are covered by `..Default::default()`; `Alloc.display` is not built here.
+1. [ ] Bump every stormvm rev e929b8f → a8b509d; CHANGELOG (passt helper, add_nic's refusal of a socketless passt NIC,
+       chv display under `vmm: cloud-hypervisor`), README/status; sc-build `--locked`; golden; close.
+
 ### Done: #252 (P3), a running VMI's memory below its boot size (stormvm#19's balloon)
 
 2026-10-13. Item 1 (stormvm e929b8f, `Registration.memory_min` in the two test literals) landed with #251 (7f36be0).
