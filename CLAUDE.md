@@ -13,7 +13,7 @@ stage golden through `stormcentral component stage rustkube-node`, not a package
 
 ## Current implementation reference (2026-10-09)
 
-Main baseline: 46a364b (latest stage golden golden-rustkube-node-b89f9d8278a0, stormcos#424; every git dependency by rev, #210). See
+Main baseline: 56cbda7 (stormvm a8b509d, #255; latest stage golden golden-rustkube-node-b89f9d8278a0 at 46a364b, stormcos#424; every git dependency by rev, #210). See
 `docs/status.md` for changes since October 2, the owner's recorded decisions and issue-backed limitations,
 `docs/configuration.md` for every CLI/env/default, `docs/api.md` for ports and actual routes, `docs/retries.md`
 for every remote call's retry policy. CLI runtime defaults to native; stormcos explicitly chooses stormpump.
@@ -58,13 +58,17 @@ by #51.
 
 ## Work plan
 
-### In progress: #255 (P3), stormvm → a8b509d: pod:passt's passt as a stormpump helper (stormvm#7), chv display (stormvm#1)
+### Waiting on stormcentral#838 (golden only): #255 (P3), stormvm → a8b509d: pod:passt's passt as a stormpump helper (stormvm#7), chv display (stormvm#1)
 
 2026-10-13. stormvm main a8b509d (has d0313bc, fb77c46, 2d6fe95). Manifests: only the `stormvm` binary crate gains
 stormvm-display (not in our graph), so a rev-only bump in Cargo.toml and Cargo.lock. API: new console `Config` fields
 (`admitted_by_host`, `migration_tls`) are covered by `..Default::default()`; `Alloc.display` is not built here.
-1. [ ] Bump every stormvm rev e929b8f → a8b509d; CHANGELOG (passt helper, add_nic's refusal of a socketless passt NIC,
-       chv display under `vmm: cloud-hypervisor`), README/status; sc-build `--locked`; golden; close.
+1. [x] Bump every stormvm rev e929b8f → a8b509d; CHANGELOG, README (56cbda7). SC_BUILD_VM sc-build 56cbda7 (job
+       334a512dab) `cargo metadata --locked && cargo build --locked && cargo test --locked`: 524 kubelet unit, all suites
+       pass, warnings unchanged (#227's).
+2. [ ] Stage golden: build 07ccb0dcaf50 failed at forge's `in` mount (`/dev/nvme0c0n1: Can't lookup blockdev`) =
+       stormcentral#838 (commented); #255 proposed after it. Resume: `stormcentral component stage rustkube-node --url
+       http://stormcentral.g8.lo`, then close #255 (live: a pod:passt VMI after stormcos#565 ships /pallets/passt).
 
 ### Done: #252 (P3), a running VMI's memory below its boot size (stormvm#19's balloon)
 
