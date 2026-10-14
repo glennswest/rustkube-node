@@ -1144,6 +1144,14 @@ fn wait_backoff(waited: std::time::Duration) -> std::time::Duration {
     (waited / 4).clamp(std::time::Duration::from_secs(1), std::time::Duration::from_secs(30))
 }
 
+/// Why a VMI's disks are being resolved: its start, each disk's time kept for
+/// its start timing (#259), or a disk added to the running machine (#247),
+/// where a failure gives back only that disk.
+enum Resolving<'a> {
+    Start(&'a mut Vec<(String, std::time::Duration)>),
+    Hot,
+}
+
 /// The wait before the next try after `attempts` failures: 10 s, doubling,
 /// at most 5 min.
 fn retry_delay(attempts: u32) -> std::time::Duration {
@@ -2154,7 +2162,7 @@ impl VmManager {
         let owner = self.owner_of(obj).await;
         let t = steps.since("owner", t);
         let (disks, owned_volumes) =
-            self.resolve_disks_as(uid, &vm, &boot_keys, &owner, fresh, false, steps.disks_mut()).await?;
+            self.resolve_disks_as(uid, &vm, &boot_keys, &owner, fresh, Resolving::Start(steps.disks_mut())).await?;
         let t = steps.since("disks", t);
 
         // The pod log directory, because that is where `kubectl logs` looks.
@@ -2731,6 +2739,7 @@ impl VmManager {
     /// A disk the machine owns is found by name before it is made (#75): a
     /// restart attaches the root the guest left, and the golden is needed
     /// only the first time. `owner` goes on each ([`disk_owner`]).
+    #[cfg(test)]
     async fn resolve_disks_with_keys(
         &self,
         uid: &str,
@@ -2739,12 +2748,13 @@ impl VmManager {
         owner: &Value,
         fresh: &mut Vec<String>,
     ) -> Result<(Vec<ResolvedDisk>, Vec<String>), StartFail> {
-        self.resolve_disks_as(uid, vm, keys, owner, fresh, false, &mut Vec::new()).await
+        self.resolve_disks_as(uid, vm, keys, owner, fresh, Resolving::Start(&mut Vec::new())).await
     }
 
-    /// [`Self::resolve_disks_with_keys`]; `hot` for disks added to a running
-    /// machine (#247), where a failure gives back only these disks, never the
-    /// machine's others (a start gives back every CSI disk of the VMI).
+    /// Clone or attach every disk of `vm`, as above. [`Resolving::Hot`] for
+    /// disks added to a running machine (#247), where a failure gives back
+    /// only these disks, never the machine's others (a start gives back every
+    /// CSI disk of the VMI); [`Resolving::Start`] keeps each disk's time (#259).
     async fn resolve_disks_as(
         &self,
         uid: &str,
@@ -2752,9 +2762,9 @@ impl VmManager {
         keys: &[String],
         owner: &Value,
         fresh: &mut Vec<String>,
-        hot: bool,
-        times: &mut Vec<(String, std::time::Duration)>,
+        mut how: Resolving<'_>,
     ) -> Result<(Vec<ResolvedDisk>, Vec<String>), StartFail> {
+        let hot = matches!(how, Resolving::Hot);
         let mut done: Vec<ResolvedDisk> = Vec::new();
         let mut owned: Vec<String> = Vec::new();
         for d in &vm.disks {
@@ -2946,7 +2956,9 @@ impl VmManager {
                 readonly: d.readonly,
                 bus: d.bus,
             });
-            times.push((d.name.clone(), began.elapsed()));
+            if let Resolving::Start(times) = &mut how {
+                times.push((d.name.clone(), began.elapsed()));
+            }
         }
         Ok((done, owned))
     }
@@ -3821,7 +3833,7 @@ impl VmManager {
         let mut fresh = Vec::new();
         let resolved = {
             let _disks = self.disk_lifecycle.read().await;
-            self.resolve_disks_as(&vm.uid, &one, &[], owner, &mut fresh, true, &mut Vec::new()).await
+            self.resolve_disks_as(&vm.uid, &one, &[], owner, &mut fresh, Resolving::Hot).await
         };
         let (done, owned) = match resolved {
             Ok(r) => r,
