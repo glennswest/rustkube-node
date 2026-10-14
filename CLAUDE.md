@@ -58,6 +58,23 @@ by #51.
 
 ## Work plan
 
+### In progress: #259 (P2), the second VM of the install probe starts late on pvetest1 (3.5 s → 6.7 s since 12.19)
+
+2026-10-14. Samples (stormcentral /api/v1/metrics): the Dell's `vm_start_ready_ms` is 1.19–2.12 s on every release
+since 11.88 (12.27's 1.64 is in range: noise). pvetest1: the first VM (`vm_start_ms`) 117–184 ms throughout; the
+second (`vm_start_ready_ms`, created right after) 115–428 ms to 12.18, then 3.5 s (12.19, 12.21), 6.7 s (12.27); its
+guest still came up on time (`vm_guest_up_ready_ms` 10.4 s vs the first's 10.2 s). 12.18 → 12.19 moved rustkube-node
+c6f01d65b9b7 → 5265b2973b7c (our range: #210 deps, #245 seed, not on this VM's path: no cloud-init) plus stormblock,
+stormpump, stormvm goldens. Node log (storm-84b7e0, 12.27, via the Dell's console ring): VMI v2 created 18:52:05.17, no
+kubelet line for it until `vm started` 18:52:11.94: no Waiting, no retry: 6.3 s inside one start attempt. Nothing on
+the VMI start path is timed. Suspect (unproven): `sweep_orphans` holds `disk_lifecycle.write()` across an apiserver GET
+per owned volume and the deletes, and every start waits on its read. Doing:
+1. [ ] `vm_start_timing.rs`: per-VMI steps (created, wait, unwind, lock, seed, keys, owner, disks + disk/<name>,
+       network, resume, window, launch, record, report, total) → `storm.io/start-timing` on the VMI, Event, INFO line,
+       after Running; the `Started` Event after the Running patch (an Event POST took 0.5–0.7 s there).
+2. [ ] Tests, docs (README, metrics.md), CHANGELOG; sc-build; golden; read the next pvetest1 install's breakdown; fix
+       the step that grew (the sweep's lock if it is that), or file it on its owner.
+
 ### Done: #255 (P3), stormvm → a8b509d: pod:passt's passt as a stormpump helper (stormvm#7), chv display (stormvm#1)
 
 2026-10-13. stormvm main a8b509d (has d0313bc, fb77c46, 2d6fe95). Manifests: only the `stormvm` binary crate gains
