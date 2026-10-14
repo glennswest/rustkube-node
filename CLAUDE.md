@@ -58,7 +58,7 @@ by #51.
 
 ## Work plan
 
-### Waiting on stormcentral#838 (golden only): #255 (P3), stormvm → a8b509d: pod:passt's passt as a stormpump helper (stormvm#7), chv display (stormvm#1)
+### Waiting on stormcentral#841 (golden only): #255 (P3), stormvm → a8b509d: pod:passt's passt as a stormpump helper (stormvm#7), chv display (stormvm#1)
 
 2026-10-13. stormvm main a8b509d (has d0313bc, fb77c46, 2d6fe95). Manifests: only the `stormvm` binary crate gains
 stormvm-display (not in our graph), so a rev-only bump in Cargo.toml and Cargo.lock. API: new console `Config` fields
@@ -67,7 +67,9 @@ stormvm-display (not in our graph), so a rev-only bump in Cargo.toml and Cargo.l
        334a512dab) `cargo metadata --locked && cargo build --locked && cargo test --locked`: 524 kubelet unit, all suites
        pass, warnings unchanged (#227's).
 2. [ ] Stage golden: build 07ccb0dcaf50 failed at forge's `in` mount (`/dev/nvme0c0n1: Can't lookup blockdev`) =
-       stormcentral#838 (commented); #255 proposed after it. Resume: `stormcentral component stage rustkube-node --url
+       stormcentral#838 (commented). 2026-10-14: #838 closed as #841's dup (fix 5feb778 needs a root bootstrap install);
+       stage e6aeeed6a1c1 failed the same way; #255 proposed after stormcentral#841. #841 also says forge lost most
+       goldens (rustkube-node's among them): the stage's inputs may need rebuilding first, the master's to order. Resume: `stormcentral component stage rustkube-node --url
        http://stormcentral.g8.lo`, then close #255 (live: a pod:passt VMI after stormcos#565 ships /pallets/passt).
 
 ### Done: #252 (P3), a running VMI's memory below its boot size (stormvm#19's balloon)
