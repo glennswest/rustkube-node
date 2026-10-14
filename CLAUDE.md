@@ -80,6 +80,8 @@ per owned volume and the deletes, and every start waits on its read. Doing:
        Dell's console ring also holds pvetest1's lines, host storm-…), the probe's v2 line; fix the step that grew (the
        sweep's `lock`: GETs/deletes out from under the write lock), or file it on stormblock (`disks`) / stormpump
        (`launch`); close.
+       2026-10-14: 12.28 (carries 3672fc1e06d0) failed on pvetest1 before the probes (stormcos#587: static-pod.sh
+       `mkdir: not found`, no control plane); the golden rolls into the next release; queued `--after` stormcos#587.
 
 ### Done: #255 (P3), stormvm → a8b509d: pod:passt's passt as a stormpump helper (stormvm#7), chv display (stormvm#1)
 
