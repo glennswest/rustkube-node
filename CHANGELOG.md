@@ -2,6 +2,14 @@
 
 ## 2026-10-13
 
+- **chore:** stormvm e929b8f → a8b509d (#255; stormpump stays 9877a97, only the rev moves). Brings: a `pod:passt` NIC's
+  passt as a stormpump helper on the hypervisor's spec (stormvm#7; `realise` removes a stale socket first; the binary is
+  stormcos#565, without it the start fails at `HelperReady`); `Machine::add_nic` refuses a hot-added passt NIC by name,
+  which #246's `HotplugSynchronized` now reports instead of qemu's connect error; cloud-hypervisor's display (stormvm#1:
+  a VMI with a framebuffer and `vmm: cloud-hypervisor` gets a `stormvm display` helper, its RFB on `vnc.sock`, so
+  `/vmConsole/…/vnc` serves it; `vmm: auto` still sends a framebuffer to qemu); console `admitted_by_host` (stormvm#13,
+  used by #254). No kubelet code changes.
+
 - **feat:** A running VMI's memory goes below its boot size through the balloon (#252, stormvm#19): #246's memory step
   calls `set_memory_within(bytes, floor)`, the floor the machine's registration `memory_min` (else the spec's
   `memory.min` below its size); below it is the `HotplugSynchronized` refusal. `status.memory.guestCurrent` is
