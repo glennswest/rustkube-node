@@ -204,14 +204,18 @@ impl EngineClient {
     /// The node token, and the admin token for what the node token is
     /// refused (#105).
     pub fn with_admin(url: &str, source: TokenSource, admin: TokenSource) -> EngineClient {
+        // Timed on its own (#262): a boot spent 3 s between the line before
+        // this client and the line after it, with nothing logged.
+        let building = std::time::Instant::now();
+        // No client-wide timeout: each request carries its own, and the
+        // volume watch carries none (#99).
+        let http = reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT).build().unwrap_or_default();
+        if building.elapsed() > std::time::Duration::from_millis(100) {
+            tracing::warn!("building the stormblock engine's HTTP client took {} ms", building.elapsed().as_millis());
+        }
         EngineClient {
             inner: Arc::new(Inner {
-                // No client-wide timeout: each request carries its own, and
-                // the volume watch carries none (#99).
-                http: reqwest::Client::builder()
-                    .connect_timeout(CONNECT_TIMEOUT)
-                    .build()
-                    .unwrap_or_default(),
+                http,
                 url: url.trim_end_matches('/').to_string(),
                 source,
                 admin,

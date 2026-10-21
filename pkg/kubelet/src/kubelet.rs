@@ -295,7 +295,7 @@ impl Kubelet {
     }
 
     async fn run_inner(self: &Arc<Self>) -> anyhow::Result<()> {
-        info!("Kubelet starting for node {}", self.config.node_name);
+        info!("Kubelet starting for node {} (startup: {})", self.config.node_name, crate::startup::summary());
 
         // Query the container runtime version for nodeInfo (e.g. cri-o://1.32.0).
         let runtime_version = match self.runtime.version().await {
@@ -1062,6 +1062,9 @@ impl Kubelet {
             pod["metadata"]["namespace"] = Value::String(ns);
             pod["metadata"]["uid"] = Value::String(uid);
             pod["spec"]["nodeName"] = Value::String(self.config.node_name.clone());
+            // Upstream's mark of a pod from a manifest file: what keeps API
+            // objects out of its start (no ServiceAccount token, #262).
+            pod["metadata"]["annotations"][crate::pod_manager::CONFIG_SOURCE] = Value::String("file".into());
             pods.push(pod);
         }
         pods

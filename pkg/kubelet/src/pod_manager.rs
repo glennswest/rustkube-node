@@ -189,6 +189,15 @@ pub struct SyncOutcome {
 /// Manages pod lifecycle on a single node.
 /// A pod volume, resolved to something the runtime can mount.
 ///
+/// The annotation upstream's kubelet marks a pod's source with: `file` for a
+/// static pod's manifest, `api` for the apiserver's (#262).
+pub const CONFIG_SOURCE: &str = "kubernetes.io/config.source";
+
+/// A pod from this node's manifest directory (#262).
+pub fn is_static(pod: &Value) -> bool {
+    pod["metadata"]["annotations"][CONFIG_SOURCE].as_str() == Some("file")
+}
+
 /// Make a `hostPath` source exist, if its declared type says the kubelet
 /// should.
 ///
@@ -2805,6 +2814,13 @@ impl PodManager {
         if pod["spec"]["automountServiceAccountToken"].as_bool() == Some(false) {
             return Ok(None);
         }
+        // **A static pod gets no ServiceAccount token** (#262), as upstream: it
+        // is not an API object a ServiceAccount admits. The control plane's
+        // static pods start before the apiserver answers, and asking for a
+        // token there cost every boot ~1.1 s of refused retries, then wrote none.
+        if is_static(pod) {
+            return Ok(None);
+        }
         if pod_mounts_sa_path(pod) {
             return Ok(None); // SA admission already provided it — don't double-mount.
         }
@@ -5020,6 +5036,9 @@ impl PodManager {
         let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default");
         let name = pod["metadata"]["name"].as_str().unwrap_or("");
         info!("Pod {namespace}/{name} started: {}", finished.text);
+        if is_static(pod) {
+            crate::startup::static_pod_started(&format!("{namespace}/{name}"));
+        }
         for &(phase, took) in &finished.phases {
             crate::metrics::observe_start_phase(phase, took.as_secs_f64());
         }
@@ -8655,6 +8674,21 @@ pub(crate) mod tests {
         let mut off = pod("uid-3", "web", "Always", simple_container());
         off["spec"]["automountServiceAccountToken"] = json!(false);
         assert!(mgr.service_account_mount(&off).await.unwrap().is_none());
+    }
+
+    /// #262: a static pod (its manifest marked `config.source: file`) gets no
+    /// ServiceAccount mount and asks no apiserver for a token: the control
+    /// plane's static pods start before there is one to ask.
+    #[tokio::test]
+    async fn a_static_pod_asks_for_no_service_account_token() {
+        let (_rt, mgr) = manager();
+        let mut p = pod("static-etcd-n1", "etcd", "Always", simple_container());
+        p["metadata"]["annotations"] = json!({CONFIG_SOURCE: "file"});
+        assert!(is_static(&p));
+        let started = std::time::Instant::now();
+        assert!(mgr.service_account_mount(&p).await.unwrap().is_none());
+        assert!(started.elapsed() < std::time::Duration::from_millis(50), "no request, no retries");
+        assert!(!is_static(&pod("uid-4", "web", "Always", simple_container())));
     }
 
     #[tokio::test]

@@ -276,6 +276,8 @@ fn api_server_url(given: Option<String>, kubeconfig_server: Option<String>) -> S
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Each startup step timed from here (#262).
+    kubelet::startup::begin();
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -292,6 +294,7 @@ async fn main() -> anyhow::Result<()> {
         cli.runtime,
         cli.apiserver.as_deref().unwrap_or("(kubeconfig, else the default)")
     );
+    kubelet::startup::mark("flags");
 
     // Standard CNI for the native/VM-fallback runtimes. Cilium is the expected
     // default plugin; anything spec-compliant in the conf dir works.
@@ -363,12 +366,14 @@ async fn main() -> anyhow::Result<()> {
     // The ring, when there is one. A VM is a workload in a machine domain and
     // only the engine starts one, so every other runtime leaves this None and
     // the kubelet simply does not reconcile VMs.
+    kubelet::startup::mark("cni");
     let mut engine_ring: Option<std::sync::Arc<kubelet::stormpump_ring::RingClient>> = None;
     // The node's stormblock engine, with its token (#66): one client, shared
     // by claims, VM disks and image pulls. The token may not exist yet (the
     // engine mints it at start), and the client keeps looking for it.
     let engine = kubelet::engine::EngineClient::from_env(&cli.stormblock);
     tracing::info!("stormblock engine: {engine:?}");
+    kubelet::startup::mark("engine");
 
     let (runtime, images, migration): (
         Arc<dyn kubelet::cri::RuntimeService>,
@@ -451,6 +456,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    kubelet::startup::mark("runtime");
     // A kubeconfig supplies defaults for the apiserver URL, CA, client cert/key,
     // and token; explicit --* flags override the matching kubeconfig field.
     // Written by the same boot as the credentials it names: waited for too.
@@ -585,6 +591,7 @@ async fn main() -> anyhow::Result<()> {
         container_log,
         ..Default::default()
     };
+    kubelet::startup::mark("credentials");
     let mut kubelet = Kubelet::new(config, runtime, images, migration)?;
     if let Some(ring) = engine_ring {
         // The same connection the containers are started on, deliberately: a
@@ -597,6 +604,7 @@ async fn main() -> anyhow::Result<()> {
         });
         kubelet = kubelet.with_engine(ring, vm_cni);
     }
+    kubelet::startup::mark("kubelet");
     if let Err(e) = kubelet.run().await {
         anyhow::bail!("kubelet failed: {e}");
     }
