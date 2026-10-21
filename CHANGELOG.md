@@ -908,6 +908,7 @@
 ## [Unreleased]
 
 ### 2026-10-21
+- **feat:** pod status at the 1.36 API's shape (#275, step 2): `status.observedGeneration` and each condition's `observedGeneration` from the pod's `metadata.generation` (GA in 1.35; none when the object has no generation); each app container's and sidecar's `allocatedResources` (its requests) and `resources` (requests and limits), and the pod's `status.resources` when it has pod-level `spec.resources`. No in-place resize yet, so what is applied is the spec's. Nothing here depends on k8s-openapi or kube: 0.24/v1_32 comes only through rustkube's `apimachinery`, which moves with rustkube#285.
 - **docs:** #259 closed: the second probe VM's start on pvetest1 is 107–461 ms on every install since 12.30 (was 3.5–6.7 s on 12.19–12.27); the Dell's VM starts are within their spread since 11.88. The VMI start timing (94cd23c) stays for a recurrence.
 - **feat:** fsGroup and supplementalGroups (#171): the pod's fsGroup then supplementalGroups are the container's groups (stormpump `Spec.groups`, also for an exec; CRI `supplemental_groups`), and a claim's filesystem is given to fsGroup before the start (group read-write, setgid directories, symlinks skipped; `fsGroupChangePolicy: OnRootMismatch` checks only the root). A non-root container can now write its claim.
 - **docs:** #64's work plan: the medium run waits on stormcos#271 (test machines cannot fetch test images from forge).

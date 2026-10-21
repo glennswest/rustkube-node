@@ -275,6 +275,13 @@ profile). A `gitRepo` volume waits with a message naming its 1.36 removal (clone
 emptyDir). With `--runtime cri`, containerd before 2.0 stops the kubelet at startup (1.36 dropped containerd 1.7);
 CRI-O is not checked. cgroups are v2 only; kube-proxy has no IPVS mode.
 
+**The 1.36 API's pod status** (#275). Each status write carries `observedGeneration` (the pod's
+`metadata.generation` it was made from) on the status and on every condition, each app container's and sidecar's
+`allocatedResources` (requests) and `resources` (requests and limits), and the pod's `status.resources` when the
+spec has pod-level resources. In-place resize (`/resize`) is not done yet, so the reported resources are the spec's.
+The kubelet holds no k8s-openapi or kube types of its own (every object is JSON); its k8s-openapi comes through
+rustkube's `apimachinery` and moves to 0.28/v1_36 with rustkube#285.
+
 **Container status and image provenance** (#130). A container that ended carries upstream's
 `state.terminated.reason` (the runtime's, e.g. `OOMKilled`, else `Completed` for exit 0, `Error` otherwise) and
 `message`; once it is restarted (or while it backs off) its previous run is `lastState.terminated` (exit code,

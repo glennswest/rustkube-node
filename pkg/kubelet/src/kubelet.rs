@@ -1625,6 +1625,7 @@ impl Kubelet {
             status["podIP"] = serde_json::json!(ip);
             status["podIPs"] = serde_json::json!([{"ip": ip}]);
         }
+        report_generation_and_resources(source, &mut status);
 
         // Fetch current pod, merge status, update
         let path = format!(
@@ -2666,6 +2667,59 @@ fn start_time(recorded: Option<&str>, booted: Option<chrono::DateTime<chrono::Ut
     if before_boot { now.to_string() } else { t.to_string() }
 }
 
+/// The 1.35/1.36 status fields the kubelet owns (#275).
+///
+/// `observedGeneration`, on the status and on each of its conditions, is the
+/// `metadata.generation` this status was made from (GA in 1.35): a reader can
+/// tell a status about the spec it just changed from one about the spec
+/// before. An object with no generation gets none.
+///
+/// Each container's `allocatedResources` (its requests) and `resources`
+/// (requests and limits), for app containers and sidecars, and the pod's
+/// `resources` when its spec has pod-level ones: what upstream reports since
+/// in-place resize. The kubelet does not resize in place yet, so what is
+/// applied is the spec's, and that is what is said.
+fn report_generation_and_resources(source: &Value, status: &mut Value) {
+    if let Some(generation) = source["metadata"]["generation"].as_i64() {
+        status["observedGeneration"] = serde_json::json!(generation);
+        for c in status["conditions"].as_array_mut().into_iter().flatten() {
+            c["observedGeneration"] = serde_json::json!(generation);
+        }
+    }
+    let resources_of = |list: &str, name: &str| -> Option<Value> {
+        source["spec"][list].as_array()?.iter().find(|c| c["name"] == name).map(|c| c["resources"].clone())
+    };
+    for (statuses, list) in [("containerStatuses", "containers"), ("initContainerStatuses", "initContainers")] {
+        for cs in status[statuses].as_array_mut().into_iter().flatten() {
+            let name = cs["name"].as_str().unwrap_or("").to_string();
+            let Some(r) = resources_of(list, &name) else { continue };
+            // A plain init container has finished before anything is
+            // allocated to it for the pod's life: only sidecars carry it.
+            if list == "initContainers"
+                && !source["spec"][list].as_array().into_iter().flatten()
+                    .any(|c| c["name"] == name.as_str() && c["restartPolicy"] == "Always")
+            {
+                continue;
+            }
+            let mut applied = serde_json::Map::new();
+            for key in ["requests", "limits"] {
+                if r[key].as_object().is_some_and(|m| !m.is_empty()) {
+                    applied.insert(key.into(), r[key].clone());
+                }
+            }
+            if let Some(requests) = applied.get("requests") {
+                cs["allocatedResources"] = requests.clone();
+            }
+            if !applied.is_empty() {
+                cs["resources"] = Value::Object(applied);
+            }
+        }
+    }
+    if source["spec"]["resources"].as_object().is_some_and(|m| !m.is_empty()) {
+        status["resources"] = source["spec"]["resources"].clone();
+    }
+}
+
 fn merge_status(base: &Value, status: &Value) -> Value {
     let mut merged = base.as_object().cloned().unwrap_or_default();
     if status.get("message").is_none() {
@@ -2710,6 +2764,51 @@ mod status_base_tests {
 
     fn pod(rv: &str, phase: &str) -> Value {
         serde_json::json!({"metadata": {"uid": "u", "resourceVersion": rv}, "status": {"phase": phase}})
+    }
+
+    /// #275: observedGeneration on the status and every condition; the spec's
+    /// resources on app containers and sidecars, not on a plain init.
+    #[test]
+    fn generation_and_resources_are_reported_as_1_36_does() {
+        let source = serde_json::json!({
+            "metadata": {"generation": 3},
+            "spec": {
+                "resources": {"limits": {"cpu": "2"}},
+                "initContainers": [
+                    {"name": "setup", "resources": {"requests": {"cpu": "1"}}},
+                    {"name": "proxy", "restartPolicy": "Always", "resources": {"requests": {"memory": "64Mi"}}}
+                ],
+                "containers": [
+                    {"name": "app", "resources": {"requests": {"cpu": "500m"}, "limits": {"memory": "1Gi"}}},
+                    {"name": "bare", "resources": {}},
+                    {"name": "none"}
+                ]
+            }
+        });
+        let mut status = serde_json::json!({
+            "conditions": [{"type": "Ready", "status": "True"}, {"type": "PodScheduled", "status": "True"}],
+            "containerStatuses": [{"name": "app"}, {"name": "bare"}, {"name": "none"}],
+            "initContainerStatuses": [{"name": "setup"}, {"name": "proxy"}]
+        });
+        report_generation_and_resources(&source, &mut status);
+        assert_eq!(status["observedGeneration"], 3);
+        assert!(status["conditions"].as_array().unwrap().iter().all(|c| c["observedGeneration"] == 3));
+        let app = &status["containerStatuses"][0];
+        assert_eq!(app["allocatedResources"], serde_json::json!({"cpu": "500m"}));
+        assert_eq!(app["resources"], serde_json::json!({"requests": {"cpu": "500m"}, "limits": {"memory": "1Gi"}}));
+        for i in [1, 2] {
+            let cs = &status["containerStatuses"][i];
+            assert!(cs.get("resources").is_none() && cs.get("allocatedResources").is_none(), "{cs}");
+        }
+        assert!(status["initContainerStatuses"][0].get("resources").is_none());
+        assert_eq!(status["initContainerStatuses"][1]["allocatedResources"], serde_json::json!({"memory": "64Mi"}));
+        assert_eq!(status["resources"], serde_json::json!({"limits": {"cpu": "2"}}));
+
+        // No generation (an object written before 1.33's pod generation): none said.
+        let mut bare = serde_json::json!({"conditions": [{"type": "Ready"}], "containerStatuses": []});
+        report_generation_and_resources(&serde_json::json!({"metadata": {}, "spec": {}}), &mut bare);
+        assert!(bare.get("observedGeneration").is_none() && bare["conditions"][0].get("observedGeneration").is_none());
+        assert!(bare.get("resources").is_none());
     }
 
     fn acked() -> AckedStatus {
