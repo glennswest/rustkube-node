@@ -58,6 +58,7 @@ impl Env {
         let budget = match suite.as_str() {
             "medium" => 1800,
             "long" => 8 * 3600,
+            "csi" => 900,
             _ => 120,
         };
         let secs = |k: &str, d: u64| Duration::from_secs(var(k).and_then(|v| v.parse().ok()).unwrap_or(d));

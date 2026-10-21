@@ -5,16 +5,19 @@
 
 use rustkube_node_test::env::Env;
 use rustkube_node_test::report::{Outcome, Report};
-use rustkube_node_test::{run, workload};
+use rustkube_node_test::{csi_driver, run, workload};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if workload::is_workload(&args) {
         std::process::exit(workload::main(&args));
     }
+    if csi_driver::is_mode(&args) {
+        std::process::exit(csi_driver::main(&args));
+    }
     // Started as `/test <suite>` (the standard); the argument wins over
     // STORM_SUITE. Set before any thread exists.
-    if let Some(suite) = args.first().filter(|a| matches!(a.as_str(), "short" | "medium" | "long")) {
+    if let Some(suite) = args.first().filter(|a| matches!(a.as_str(), "short" | "medium" | "long" | "csi")) {
         std::env::set_var("STORM_SUITE", suite);
     }
     let env = Env::read();

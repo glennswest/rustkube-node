@@ -29,3 +29,22 @@ cluster_read = [
   { apiGroup = "", resource = "persistentvolumes" },
   { apiGroup = "storage.k8s.io", resource = "storageclasses" },
 ]
+
+[csi]
+# The kubelet's CSI node side against this image's own driver (#52): a
+# CSIDriver and a PV of it made by the suite (cluster_write, #479), which
+# Node it is, and its CSINode (registration). The driver's pod (privileged,
+# /var/lib/kubelet Bidirectional) and the kubelet-restart pod (privileged,
+# hostPID) are pods the suite makes in its namespace; the runner itself needs
+# nothing of the node. By day: 15 min.
+budget_secs = 900
+cluster_read = [
+  { apiGroup = "", resource = "nodes" },
+  { apiGroup = "", resource = "persistentvolumes" },
+  { apiGroup = "storage.k8s.io", resource = "csinodes" },
+  { apiGroup = "storage.k8s.io", resource = "csidrivers" },
+]
+cluster_write = [
+  { apiGroup = "", resource = "persistentvolumes" },
+  { apiGroup = "storage.k8s.io", resource = "csidrivers" },
+]

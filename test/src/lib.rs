@@ -9,6 +9,8 @@
 //!   size class and at arbitrary sizes, end to end (`medium.rs`, #64), the
 //!   node's own volumes as complete PV + PVC pairs (`node_volumes.rs`, #59),
 //!   and pod features and failure paths (`pods.rs`, #61).
+//! - `csi` (< 15 min, #52): the kubelet's CSI node side against a real driver
+//!   process, this image's own (`csi.rs`, `csi_driver.rs`).
 //! - `long` (the night): waves of pods sized from the node's capacity,
 //!   measuring start latency and what each wave leaves behind (`long.rs`).
 //!
@@ -18,6 +20,8 @@
 //! report one skip and long's waves carry no claims.
 
 pub mod api;
+pub mod csi;
+pub mod csi_driver;
 pub mod env;
 pub mod k8s;
 pub mod long;
@@ -77,8 +81,9 @@ pub async fn run(env: Arc<Env>, r: &mut Report) {
             }
         }
         "long" => Box::pin(long::run(env, api, r)).await,
+        "csi" => Box::pin(csi::run(env, api, r)).await,
         other => {
-            r.record("suite", Outcome::Infra(format!("STORM_SUITE {other:?} is not short, medium or long")), 0, None);
+            r.record("suite", Outcome::Infra(format!("STORM_SUITE {other:?} is not short, medium, long or csi")), 0, None);
         }
     }
 }
