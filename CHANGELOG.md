@@ -908,6 +908,7 @@
 ## [Unreleased]
 
 ### 2026-10-21
+- **feat:** pod capabilities on stormpump (#118): `Spec.caps` = the standard 14 − drop + add (privileged: every capability), `no_new_privs` from `allowPrivilegeEscalation: false` (also forwarded on CRI gRPC); an unknown name fails the create naming it. Pods no longer run with every capability (stormpump's node suite saw `CapEff 000001ffffffffff`). Needs stormpump accd1a3e8e61+ in the release.
 - **docs:** #102's work plan: the Dell runs 12.37, but the turbomode run is stormcos_qa's to queue (403 for this token); waits on stormcos_qa#78.
 
 ### 2026-10-13

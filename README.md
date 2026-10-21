@@ -241,9 +241,17 @@ stormblock-registry#58) are made as CRI-O's default `image_volumes = "mkdir"` ma
 the container's own root for each path no pod mount covers (at it or above it). Since #104 that root is the
 container's private writable clone, so what the image has there is kept and it goes with the container; the walk
 never follows a symlink, and one on the path (or a file) leaves it unmade with a warning. With
-`readOnlyRootFilesystem` it is writable only while the root is (stormpump#108). Not yet: `fsGroup`/`supplementalGroups` (a claim's
-filesystem is root's; stormpump's `Spec.groups` is in the lock, #171) and `securityContext.capabilities` on
-stormpump (`Spec.caps` is in the lock, not mapped; add/drop reach a CRI runtime only, #118).
+`readOnlyRootFilesystem` it is writable only while the root is (stormpump#108).
+
+**Capabilities** (#118, stormpump#47's `Spec.caps`): a container gets the runtime's standard 14 (Docker's,
+containerd's and CRI-O's: CHOWN, DAC_OVERRIDE, FSETID, FOWNER, MKNOD, NET_RAW, SETGID, SETUID, SETFCAP, SETPCAP,
+NET_BIND_SERVICE, SYS_CHROOT, KILL, AUDIT_WRITE), minus `capabilities.drop`, plus `capabilities.add` (drop first, so
+`drop: [ALL]` + `add` keeps exactly the added ones); `allowPrivilegeEscalation: false` sets `no_new_privs`. A
+`privileged` container keeps every capability (its add/drop ignored, as upstream). An unknown name fails the
+container's create, naming it. Before this every stormpump pod ran with the full set (the engine's default, a node
+service's); a release with it needs stormpump accd1a3e8e61 or later (`Spec.caps`). The CRI gRPC path forwards
+add/drop and `no_new_privs` to the runtime. Not yet: `fsGroup`/`supplementalGroups` (a claim's filesystem is
+root's; stormpump's `Spec.groups` is in the lock, #171).
 
 **Kubernetes 1.36 posture** (#23, the control plane's since rustkube#37): `nodeInfo.kubeletVersion` is
 `v1.36.0-rustkube+<apimachinery>` and `kubeProxyVersion` is not reported (1.33 removed it). A pod that asks for
