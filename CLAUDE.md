@@ -1199,7 +1199,7 @@ Done: 377d7e7 (+ 8d9… test count fix, #273). SC_BUILD_VM sc-build (job 091fffd
 30 + release build, warnings = #227's. Stage golden golden-rustkube-node-9cea8d70a3db (stormcos#628). Closed. Live: a
 64Ti+ ext4 claim needs a node with that room (none of the test machines; medium checks it as a refusal there).
 
-### In progress: #262 (P1), static pods behind kubelet startup: the stall's kind
+### Waiting on a release with b383dad: #262 (P1), static pods behind kubelet startup: the stall's kind
 
 2026-10-21. 12.38 carries 2bf962a (golden d3c3e72b4eaf). Read on pvetest1/2 (`testhost logs <m> kubelet --search 'first
 static pod'`): (2) fixed live: static pods' `volumes` 0.1–9 ms (was 1142). (1) first static pod 1.8–3.0 s after the
@@ -1207,10 +1207,14 @@ kubelet's start; one stall of ~1.2–1.6 s per start, in `flags` (1356–2050 ms
 or once in `engine` (1575 ms, of which the HTTP client 300 ms). Not CPU work: paging in from the root volume, a
 descheduled vCPU (the node logged `clocksource: Watchdog remote CPU 2 read timed out`) or a blocked first stdout write.
 Doing:
-1. [ ] startup.rs: per step CPU (user+sys), major faults, voluntary / involuntary switches (getrusage); `exec` = process
+1. [x] startup.rs: per step CPU (user+sys), major faults, voluntary / involuntary switches (getrusage); `exec` = process
        start → main (/proc/self/stat starttime vs CLOCK_BOOTTIME); `flags` split into `logging`, `flags`, `hello`.
-2. [ ] Tests, README, CHANGELOG; sc-build; stage golden; #262 `--after-release`; then fix where it points (majflt:
-       the root volume's reads at boot, stormblock/stormcos; preempted: the VM host; a write: the log path).
+2. [x] Tests, README, CHANGELOG (b383dad, 4f3e70f). SC_BUILD_VM sc-build: 549 kubelet unit, all suites, nothing new from rustc
+       or clippy in the touched files (#284 was my `grep -c`, closed). Stage build 18e651ad4f93. Proposed
+       `--after-release rustkube-node>=b383dad`.
+3. [ ] Resume: `stormcentral testhost logs pvetest1 kubelet --search 'first static pod'` (and pvetest2): the slow step's
+       `(cpu …, N faults, N waits, N preempted)` and `exec=`; fix where it points (majflt: the root volume's reads at
+       boot, stormblock/stormcos; preempted: the VM host, pve; a blocked write: the log path); or close if it is gone.
 
 ### (earlier) Waiting on a release with 2bf962a: #262 (P1), static pods wait ~4 s behind kubelet startup (12.30 reboot, stormcos#596)
 
