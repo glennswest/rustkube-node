@@ -1164,8 +1164,24 @@ The lock pins stormpump 30a76d3, stormvm dc1b7ea, stormcast 801f822; all three m
        byte-sized emptyDisk). sc-build 4545e23: 364 kubelet unit pass. Golden golden-rustkube-node-a97563b0a5c7
        (stormcos#366). #81 closed, #164 shipped. #52's step 6 is done; its end-to-end with a real driver stays.
 
-### Unblocked, next: #56 (P1), exec, attach and portForward on :10250
+### In progress: #56 (P1), exec, attach and portForward on :10250 (stormpump#103's exec op is in the lock)
 
+2026-10-21. Lock's stormpump 9877a97 (≥ 0093db4): SPAWN with a running workload's handle in `inline_a` runs the spec in
+it (its namespaces, root, cgroup); stdio from `fds` slots 0/1/2 naming deposits (pipes or one pty slave), `logs
+discard|inherit`, no root/mounts/limits/terminal; the result is a workload (Exit event, STOP, WORKLOAD_RELEASE).
+Found on the way: `spec_for` sets `Spec.tty = config.tty`, which in stormpump is *the node's console* (one per node):
+a `tty: true` pod claims the node's console. Doing, on main, each step pushed:
+1. [ ] Ring `spawn_exec(spec, target, slots)`; runtime `exec_process(container, cmd, ExecIo{stdin, tty})`: pipes or a
+       pty (posix_openpt), deposits `exec-<n>-<fd>`, spec (the container's env/cwd/uid/gid, logs discard), exit waiter
+       fed by `note_exits` (+ early exits kept by handle), withdraw on a failed spawn, release after exit.
+2. [ ] `exec_sync` on it (probes): output capped, timeout → force stop, exit code.
+3. [ ] `/exec`: SPDY `v4.channel.k8s.io` (v3/v2 too: same streams, v4's error is a Status) and WebSocket
+       `v5.channel.k8s.io`/`v4.channel.k8s.io` (channel byte); resize → TIOCSWINSZ; Status with ExitCode.
+4. [ ] `/attach`: a `stdin: true` container gets a stdin pipe deposited at fd 0 (writer kept); a `tty` container a
+       kubelet pty on 0/1/2 instead of `Spec.tty` (its output copied to the CRI log by the kubelet); attach = stdin +
+       the log followed (non-tty) or the pty (tty).
+5. [ ] Tests, README/api.md/status.md, CHANGELOG; sc-build; stage golden; live `kubectl exec -it` after a release.
+(earlier) 
 2026-10-09 (#220): stormpump#103 is done from its side (golden-stormpump-a2523c9c9406, stormcos#309) and the lock
 pins stormpump 13cf2c9, which carries the exec/attach op. Next: item 5 below (exec, exec_sync for probes, attach,
 the channel protocols). Exec probes fail on every stormpump pod until then.
