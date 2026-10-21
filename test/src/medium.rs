@@ -16,8 +16,8 @@
 //! **Raw block** (`volumeMode: Block`, #67): claims of 1Mi, 20Ti (the 64Ti
 //! class) and 1Pi, each a device at `volumeDevices[].devicePath`; the pod
 //! writes and reads back at offset 0 and the device is exactly its class.
-//! A 20Ti *filesystem* claim rounds to 64Ti, which has no ext4 blank yet: it
-//! waits with the reason, which names `volumeMode: Block`.
+//! Every class is an ext4 blank too, up to 1Pi (#149): a 20Ti *filesystem*
+//! claim is a size case of the 64Ti class like any other.
 //!
 //! **Above the ladder** (2Pi): refused, not stuck. The pod waits with the
 //! reason ("larger than the largest size class") on its status or in an
@@ -68,11 +68,8 @@ pub const LADDER: &[(&str, u64)] = &[
     ("1Ti", 1024 * 1024 * MIB),
     ("4Ti", 4 * 1024 * 1024 * MIB),
     ("16Ti", 16 * 1024 * 1024 * MIB),
-];
-
-/// The classes past [`LADDER`]: raw block only, until stormblock can format
-/// ext4 at these sizes (#67).
-pub const BLOCK_ONLY: &[(&str, u64)] = &[
+    // ext4 since #149 (stormblock#289). Above a test node's room they are
+    // refusal checks (#209), not mints.
     ("64Ti", 64 * 1024 * 1024 * MIB),
     ("256Ti", 256 * 1024 * 1024 * MIB),
     ("1Pi", 1024 * 1024 * 1024 * MIB),
@@ -102,6 +99,7 @@ pub fn cases() -> Vec<Case> {
         ("1500m", "1500M"),
         ("3.5gi", "3.5Gi"),
         ("600gi", "600Gi"),
+        ("20ti", "20Ti"),
     ] {
         v.push(Case { name: name.into(), request: request.into(), block: false });
     }
@@ -113,12 +111,12 @@ pub fn cases() -> Vec<Case> {
 
 /// The class a request rounds to, and the class below it (0 for the first):
 /// the filesystem must be larger than `lo` and at most `hi`. `None` above
-/// the ladder (for a filesystem, the ext4 classes; for a block claim, all).
+/// the ladder. A block claim rounds as a filesystem one does (#149).
 pub fn class_range(request: &str, block: bool) -> Option<(u64, u64)> {
+    let _ = block;
     let want = api::quantity_bytes(request)?;
-    let all: Vec<(&str, u64)> = LADDER.iter().chain(if block { BLOCK_ONLY } else { &[] }).copied().collect();
-    let i = all.iter().position(|(_, b)| *b >= want)?;
-    Some((if i == 0 { 0 } else { all[i - 1].1 }, all[i].1))
+    let i = LADDER.iter().position(|(_, b)| *b >= want)?;
+    Some((if i == 0 { 0 } else { LADDER[i - 1].1 }, LADDER[i].1))
 }
 
 /// The pod cases (`pods.rs`), started by the caller alongside these: run in
@@ -179,15 +177,6 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report, pod_cases: PodCases) {
         })
     };
     tasks.push(above);
-    let unformatted = {
-        let (env, api) = (env.clone(), api.clone());
-        tokio::spawn(async move {
-            let t = Instant::now();
-            let o = refused(&env, &api, "sz-fs-20ti", "20Ti", &["volumeMode: Block"], false, false).await;
-            ("pvc-size-filesystem-past-ext4-classes".to_string(), o, t.elapsed().as_millis())
-        })
-    };
-    tasks.push(unformatted);
     for t in tasks {
         match t.await {
             Ok((name, o, ms)) => {
@@ -246,7 +235,7 @@ pub fn too_large(c: &Case, max: &Result<(String, u64), String>) -> Option<String
 
 /// A class's bytes as the ladder writes it (`1Ti`).
 fn k8s_q(b: u64) -> String {
-    LADDER.iter().chain(BLOCK_ONLY).find(|(_, x)| *x == b).map(|(q, _)| q.to_string()).unwrap_or_else(|| b.to_string())
+    LADDER.iter().find(|(_, x)| *x == b).map(|(q, _)| q.to_string()).unwrap_or_else(|| b.to_string())
 }
 
 /// Claim `request`, mount, write, check the size, delete, check reclaimed.
@@ -277,7 +266,7 @@ async fn size_case(env: &Env, api: &Api, c: &Case, seed: u64) -> Outcome {
     if done.phase != "Succeeded" {
         return Outcome::Fail(format!("request {}: pod failed on {}: {}", c.request, done.node, done.message));
     }
-    let class = LADDER.iter().chain(BLOCK_ONLY).find(|(_, b)| *b == hi).map(|(q, _)| *q).unwrap_or("?");
+    let class = LADDER.iter().find(|(_, b)| *b == hi).map(|(q, _)| *q).unwrap_or("?");
 
     // Bound, and saying the class it rounded to.
     let claim_path = format!("{}/{name}", k8s::pvcs(env));
@@ -339,7 +328,7 @@ async fn overcommit_refused(env: &Env, api: &Api) -> Outcome {
         Err(e) => return Outcome::Infra(e),
     };
     let max = api::quantity_bytes(s(&cap, "/maximumVolumeSize")).unwrap_or(0);
-    let all: Vec<(&str, u64)> = LADDER.iter().chain(BLOCK_ONLY).copied().collect();
+    let all: Vec<(&str, u64)> = LADDER.iter().copied().collect();
     let Some((request, _)) = all.iter().find(|(_, b)| *b > max) else {
         return Outcome::Skip(format!("node {} can still take the largest class (maximumVolumeSize {max})", env.node_name));
     };
@@ -421,7 +410,9 @@ mod tests {
         assert_eq!(fs("1Ti"), Some((256 << 30, 1 << 40)));
         assert_eq!(fs("2Ti"), Some((1 << 40, 4 << 40)));
         assert_eq!(fs("16Ti"), Some((4 << 40, 16 << 40)));
-        assert_eq!(fs("20Ti"), None, "no ext4 class past 16Ti yet");
+        assert_eq!(fs("20Ti"), Some((16 << 40, 64 << 40)), "an ext4 class since #149");
+        assert_eq!(fs("1Pi"), Some((256 << 40, 1 << 50)));
+        assert_eq!(fs("2Pi"), None);
         assert_eq!(class_range("20Ti", true), Some((16 << 40, 64 << 40)));
         assert_eq!(class_range("1Pi", true), Some((256 << 40, 1 << 50)));
         assert_eq!(class_range("2Pi", true), None);

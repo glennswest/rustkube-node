@@ -529,11 +529,11 @@ The ladder is **1Mi, 16Mi, 64Mi, 256Mi, 1Gi, 4Gi, 16Gi, 64Gi, 256Gi, 1Ti,
 4Ti, 16Ti, 64Ti, 256Ti, 1Pi** (#67); requests round up, and requests above 1Pi
 are refused. The rounded class is the volume ceiling. Each class names its
 filesystem (`storage.rs` `SIZE_CLASSES`); all are ext4 (owner, #67; stormcos#91
-found nothing that forces XFS). **64Ti, 256Ti and 1Pi are raw block only** for
-now: stormblock's formatter (mkfs-ext4 v3.0.0) needs ~5 GiB to format 64 TiB
-(mkfs.ext4.rs#10) and wraps the inode count at 256 TiB (mkfs.ext4.rs#9), so a
-filesystem claim rounding to them waits with that reason and the hint to use
-`volumeMode: Block` (stormblock#289 tracks carrying the fixed formatter).
+found nothing that forces XFS), **1Pi included** (#149): stormblock carries mkfs-ext4 v4.1.1 since
+golden-stormblock-12891c0025b2 (stormblock#289: the streaming format of mkfs.ext4.rs#10 and the inode count of #9),
+which on a build VM formats and seals a 1 PiB template in 1016 s at 1.6 GiB peak (64 TiB in 264 s). A class blank
+is minted once per node, under the hour `MINT_TIMEOUT`; the claim waits on it like any mint. A claim is still
+charged its class at bind (#108), so a node only takes one its data slab has room for.
 
 **Raw block claims** (`volumeMode: Block`): a plain thin stormblock volume of
 the class's size (`POST /api/v1/volumes`, `role: data`; no template, no mkfs),

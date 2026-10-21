@@ -7971,18 +7971,24 @@ pub(crate) mod tests {
         assert!(posted(), "the bind ran in the background");
     }
 
+    /// #149: a filesystem claim past 16 TiB rounds up to an ext4 class blank
+    /// like any other (stormblock carries mkfs.ext4.rs#9/#10), minted with
+    /// its size in MiB, not refused as Block-only.
     #[tokio::test]
-    async fn a_filesystem_claim_past_the_formatted_classes_waits_and_says_use_block() {
-        let w = claim_world(raw_claim("20Ti", "Filesystem")).await;
-        let mgr = claim_manager(&w);
-        match mgr.provision_claim("default", "raw", "uid-1").await {
-            Err(ClaimError::Failed(why)) => {
-                assert!(why.contains("64T class") && why.contains("volumeMode: Block"), "{why}")
+    async fn a_filesystem_claim_of_a_pebibyte_class_mints_its_ext4_blank() {
+        for (want, mib) in [("20Ti", 64u64 << 20), ("300Ti", 1u64 << 30)] {
+            let w = policy_world(raw_claim(want, "Filesystem"), None, (201, json!({"template": {}}))).await;
+            let mgr = claim_manager(&w);
+            match mgr.provision_claim("default", "raw", "uid-1").await {
+                Err(ClaimError::Failed(why)) => assert!(!why.contains("no filesystem"), "{want}: {why}"),
+                Err(_) => {}
+                Ok(_) => panic!("{want}: the blank is still being minted"),
             }
-            other => panic!("{other:?}"),
+            let mint = seen(&w, |(m, p, _)| m == "POST" && p == "/api/v1/fstemplates").await.expect("minted");
+            assert_eq!(mint.2["name"], format!("pvc-ext4j-{mib}m"), "{want}");
+            assert_eq!(mint.2["size"], format!("{mib}M"), "{want}");
+            assert_eq!(mint.2["fs"], "ext4", "{want}");
         }
-        let calls = w.calls.lock().unwrap().clone();
-        assert!(!calls.iter().any(|(m, _, _)| m == "POST"), "nothing made: {calls:?}");
     }
 
     #[tokio::test]

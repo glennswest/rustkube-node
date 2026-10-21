@@ -195,8 +195,7 @@ Full lists: `docs/api.md`, `docs/configuration.md`, `docs/metrics.md`.
 - **Live migration** of stormvm machines: a RAID leg on the destination first (owner, #159), behind
   stormstorage#44 (#40); graceful VM stop (#181)
 - **Pod-network VMs on a live node:** the proof is stormcos_qa#18's namespace-isolation run (#88)
-- **ext4 for the 64Ti–1Pi classes** once stormblock carries the fixed formatter (#149, stormblock#289);
-  class blanks from a thin library model instead of a format on the node (#214)
+- **Class blanks** from a thin library model instead of a format on the node (#214)
 - **Node stats from cAdvisor's library** (#21); **live measurement** of warm subsecond starts on the Dell (#102)
 
 ---

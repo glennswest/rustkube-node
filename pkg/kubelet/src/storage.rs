@@ -65,8 +65,9 @@ use serde_json::Value;
 ///
 /// **Each class names its filesystem** ([`ClassFs`]). Every one is ext4 (owner,
 /// #67: "ext4 might work"; stormcos#91's measurements found nothing that forces
-/// XFS). The largest classes are offered as raw block volumes only, until the
-/// formatter stormblock carries can lay them down — see [`ClassFs::BlockOnly`].
+/// XFS). Up to 1 PiB since stormblock carries mkfs-ext4 v4.1.1 (#149,
+/// stormblock#289: mkfs.ext4.rs#10's streaming format, #9's inode count at
+/// 256 TiB and up; a 1 PiB template formats in 1016 s at 1.6 GiB peak).
 pub const SIZE_CLASSES: &[(&str, u64, ClassFs)] = &[
     ("1M", MIB, ClassFs::Ext4),
     ("16M", 16 * MIB, ClassFs::Ext4),
@@ -80,9 +81,9 @@ pub const SIZE_CLASSES: &[(&str, u64, ClassFs)] = &[
     ("1T", TIB, ClassFs::Ext4),
     ("4T", 4 * TIB, ClassFs::Ext4),
     ("16T", 16 * TIB, ClassFs::Ext4),
-    ("64T", 64 * TIB, ClassFs::BlockOnly(FORMAT_MEMORY)),
-    ("256T", 256 * TIB, ClassFs::BlockOnly(INODE_WRAP)),
-    ("1P", 1024 * TIB, ClassFs::BlockOnly(INODE_WRAP)),
+    ("64T", 64 * TIB, ClassFs::Ext4),
+    ("256T", 256 * TIB, ClassFs::Ext4),
+    ("1P", 1024 * TIB, ClassFs::Ext4),
 ];
 
 /// What a size class's blank is formatted as.
@@ -93,19 +94,11 @@ pub const SIZE_CLASSES: &[(&str, u64, ClassFs)] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClassFs {
     Ext4,
-    /// No filesystem blank yet, with why. A filesystem claim of the class
-    /// waits with this reason; a block claim is served.
+    /// No filesystem blank, with why. A filesystem claim of the class waits
+    /// with this reason; a block claim is served. No class is one since #149
+    /// (64T–1P were, until stormblock carried mkfs.ext4.rs#9/#10).
     BlockOnly(&'static str),
 }
-
-/// stormblock pins mkfs-ext4 v3.0.0, whose format holds about 8 KiB per block
-/// group: 1.3 GiB at 16 TiB, 5.1 GiB at 64 TiB (stormcos#91), in the storage
-/// engine every pod on the node depends on. Fixed by mkfs.ext4.rs#10, not
-/// yet tagged or carried by stormblock.
-const FORMAT_MEMORY: &str = "an ext4 blank this large needs about 5 GiB of stormblock's memory to      format until stormblock carries mkfs.ext4.rs#10; ask for volumeMode: Block, or a smaller claim";
-/// mkfs.ext4.rs#9: at 256 TiB and over, the default inode count wraps and the
-/// filesystem is not clean, and stormblock's template API has no inode ratio.
-const INODE_WRAP: &str = "an ext4 blank this large is laid down with a wrapped inode count      (mkfs.ext4.rs#9) and needs mkfs.ext4.rs#10's memory fix; ask for volumeMode: Block";
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
@@ -693,17 +686,16 @@ mod tests {
         assert_eq!(class_for(parse_quantity("1Pi").unwrap() + 1), None);
     }
 
+    /// #149: every class is an ext4 blank, the pebibyte ones included.
     #[test]
-    fn each_class_names_its_filesystem_and_the_largest_are_block_only() {
-        for c in ["1M", "1T", "4T", "16T"] {
+    fn each_class_names_its_filesystem_up_to_a_pebibyte() {
+        for (c, _, _) in SIZE_CLASSES {
             assert_eq!(class_fs(c), Ok("ext4"), "{c}");
         }
         assert_eq!(template_name("4T"), "pvc-ext4j-4194304m");
         assert_eq!(template_name("16T"), "pvc-ext4j-16777216m");
-        for c in ["64T", "256T", "1P"] {
-            let why = class_fs(c).unwrap_err();
-            assert!(why.contains("mkfs.ext4.rs#") && why.contains("volumeMode: Block"), "{c}: {why}");
-        }
+        assert_eq!(template_name("64T"), "pvc-ext4j-67108864m");
+        assert_eq!(template_name("1P"), "pvc-ext4j-1073741824m");
     }
 
     #[test]
