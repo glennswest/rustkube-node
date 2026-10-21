@@ -2173,8 +2173,15 @@ Steps:
        assets.json) for stormblock/registry/timesync; #87 keeps those and the stale-status half. Not run on a node:
        whether `/hostroot/logs/<svc>` shows the mounted volume is unchecked (C2NR0Q2 down). Unreleased.
 
-### Waiting on a test machine (stormblock#331 / morning blades): #64, PVC size test (the medium suite's first test)
+### Waiting on stormcos#271 (nodes' forge peer for test images): #64, PVC size test (the medium suite's first test)
 
+2026-10-21. stormblock#331 closed. Every test run since stormcentral#697 that finds its image on forge dies at the node's
+fetch (`forge.g16.lo:5100 is not a peer of this registry`, stormcos#271); pvetest1/2 are refused ("sbregistry failing"),
+the Dell needs a pve pass (#791). Suite ready at main (ladder to 1Pi with #149, 20ti case, 3 at a time, #209 refusals,
+overcommit). Resume: `stormcentral test run rustkube-node medium --tag pvetest1` once a release carries the peer; close
+on the size cases, file what fails.
+
+(earlier) 
 2026-10-08: medium ran at c8256ac on server3 (63a3c5201b, 19:08–19:43Z): image built and pushed, the Job ran, and 90 s
 into the size cases the node's apiserver stopped answering (delete of sz-class-1mi, then cleanup, timed out): the
 second time after the Dell's fff1f4d9d9. The Dell's 4d4721131e: the Job never got a pod. All twenty size cases ran at

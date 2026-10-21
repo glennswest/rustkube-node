@@ -908,6 +908,7 @@
 ## [Unreleased]
 
 ### 2026-10-21
+- **docs:** #64's work plan: the medium run waits on stormcos#271 (test machines cannot fetch test images from forge).
 - **docs:** #52's work plan: stormcentral#479 is in, but no node can run csi-driver-host-path's plugin (not a pinned image); the owner is asked which driver runs the end-to-end.
 - **feat:** the 64Ti, 256Ti and 1Pi size classes are ext4 blanks (#149): stormblock carries mkfs-ext4 v4.1.1 since golden-stormblock-12891c0025b2 (stormblock#289: mkfs.ext4.rs#10's streaming format, #9's inode count; a 1 PiB template formats in 1016 s at 1.6 GiB peak). A filesystem claim past 16Ti mints its class blank like any other instead of waiting with "use volumeMode: Block". The medium suite's ladder has all 15 classes (above a node's room they are refusal checks, #209); its 20Ti filesystem case is a size case.
 - **fix:** static pods ask for no ServiceAccount token (#262): marked `kubernetes.io/config.source: file` as upstream marks them, they get no kube-api-access mount. At boot the token request met the apiserver the pod was starting and cost ~1.1 s of refused retries (`volumes=1142ms` on hostPath-only control-plane pods).
