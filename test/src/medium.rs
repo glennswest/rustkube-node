@@ -435,7 +435,7 @@ mod tests {
     #[test]
     fn every_class_and_the_arbitrary_sizes_are_cases() {
         let c = cases();
-        assert_eq!(c.len(), LADDER.len() + 6 + BLOCK_CASES.len());
+        assert_eq!(c.len(), LADDER.len() + 7 + BLOCK_CASES.len());
         assert!(c.iter().all(|c| class_range(&c.request, c.block).is_some()));
         // Names are unique, and make valid object names.
         let mut names: Vec<String> = c.iter().map(|c| format!("sz-{}", c.name.replace('.', "-"))).collect();
