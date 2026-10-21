@@ -234,7 +234,7 @@ eBPF backend.
 ## Test container
 
 Sources: `test/src/env.rs`, `test/src/main.rs`. `/test <suite>` selects short,
-medium or long. The process passes this to `STORM_SUITE` (default short).
+medium, long or csi (#52, declared in `test/requires.toml`). The process passes this to `STORM_SUITE` (default short).
 
 | Variable | Default / purpose |
 |---|---|
@@ -245,7 +245,7 @@ medium or long. The process passes this to `STORM_SUITE` (default short).
 | `RUSTKUBE_NODE_TEST_IMAGE` | The workload pods' image; empty: the Job's own pod's image, else `test-rustkube-node-<suite>:<commit12>` (#97) |
 | `RUSTKUBE_NODE_TEST_WAVE_MAX` | long: the largest wave, default 500 pods (a wave is otherwise 80% of the node's free pod slots) |
 | `RUSTKUBE_NODE_TEST_WAVES` | long: stop after this many waves (default: until the suite's time is nearly out) |
-| `STORM_TIMEOUT` | Seconds: short 120, medium 1800, long 28800 |
+| `STORM_TIMEOUT` | Seconds: short 120, medium 1800, long 28800, csi 900 |
 | `RUSTKUBE_NODE_TEST_MINT_BUDGET` | 1200 seconds per PVC case, bounded by remaining suite time |
 
 Token and CA come from `/var/run/secrets/kubernetes.io/serviceaccount`.
@@ -253,6 +253,7 @@ Token and CA come from `/var/run/secrets/kubernetes.io/serviceaccount`.
 Missing required inputs exit 2. short: Node Ready and heartbeat, a pod's run, address, log, exit
 code and delete; medium: pod features (restart, init, configMap/env, missing image) and the
 storage cases (PVC sizes, raw block, node volumes, overcommit refusal; at most three size cases
-at once); long: waves of pods at the node's capacity. The runner's own pod is never deleted by
-the cleanup (#217). Live: short passed on C2NR0Q2 at 9229603; medium and long have no complete
-live pass yet (#61, #64).
+at once); long: waves of pods at the node's capacity; csi: the CSI node side against the image's
+own driver (registration, publish, unpublish, a kubelet restart, deregistration). The runner's own pod is never deleted by
+the cleanup (#217). Live: short passed on C2NR0Q2 at 9229603; medium, long and csi have no complete
+live pass yet (#61, #64, #52).

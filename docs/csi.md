@@ -139,11 +139,26 @@ Mounting in PID 1 instead, the way stormblock claims avoid propagation
 entirely, is not an option for a third-party driver. The driver's own code
 does the mount, in whatever namespace it runs in.
 
+## The end-to-end test (#52)
+
+The test container's `csi` suite (README, "Tests on a node") runs a real driver
+process on the node: the test image's own `csi-driver` mode (`test/src/csi_driver.rs`),
+a gRPC server on the same vendored `csi.proto` and plugin-registration API.
+Owner's choice (master, option A on #52): no third-party image, since nodes run
+only pinned upstream images and csi-driver-host-path's plugin is not one. Its
+pod is shaped as an upstream driver's DaemonSet is (privileged, `/var/lib/kubelet`
+Bidirectional), and it does its own registration. Its NodePublish is a kernel
+bind mount in its own container, so the case that a pod reads its data proves
+that the mount propagated to PID 1. A kubelet restart (SIGTERM from a
+privileged hostPID pod) must leave a holding pod's container running, and the
+restarted kubelet must find the driver again and unpublish from the records on
+disk. Compatibility with a third-party driver is not covered (option B on #52,
+pinning csi-driver-host-path in stormcos, would add it).
+
 ## Not yet
 
-- End-to-end verification with a real driver (csi-driver-host-path): #81
-  is done; the driver's images cannot yet be made goldens on a node
-  (stormblock-registry#99), tracked in #52.
+- A live pass of the `csi` suite (below). The end-to-end is written; its run
+  waits on a test node that can fetch the test image (#52).
 - Generic ephemeral volumes: the kubelet resolves them to the claim
   `<pod>-<volume>` and waits for it. rustkube has no controller that creates
   that claim (rustkube#94).

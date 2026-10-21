@@ -1008,16 +1008,38 @@ kubelet is under test, not the scheduler.
   (pods, claims, PVs) or a p95 start over twice the first wave's plus 2 s.
   Waves repeat until the suite's time is nearly out (`RUSTKUBE_NODE_TEST_WAVES`
   caps them for a hand run). VM waves are stormcos_qa's `vm-waves`.
+- **csi** (< 15 min, declared in `test/requires.toml`, run on request, #52): the
+  kubelet's CSI node side against a real driver process, this image's own
+  `csi-driver` mode (no third-party image). The suite makes a CSIDriver named
+  for the run (`attachRequired: false`), the driver's pod (privileged,
+  `/var/lib/kubelet` as a Bidirectional hostPath), and a Retain PV of that
+  driver pre-bound to a claim. The driver serves Identity and Node (no staging)
+  and registers itself on `plugins_registry`. NodePublish bind-mounts the
+  volume's own directory at the target, so data outlives a publish. Cases:
+  - `csi-registered`: CSINode lists the driver with the node's name as nodeID.
+  - `csi-claim-bound`: the claim is Bound to the PV.
+  - `csi-publish`: a pod writes a file on the claim; the driver logged its
+    NodePublishVolume (the mount reached the pod through propagation, or the
+    kubelet's mountinfo check would have held the pod).
+  - `csi-unpublish`: the writer deleted, the driver logs its NodeUnpublishVolume,
+    and a new pod reads the file back.
+  - `csi-kubelet-restart`: a pod holds the volume while a privileged hostPID pod
+    (`restart-kubelet`) SIGTERMs the kubelet and waits for the new one. The
+    holder keeps its container, the driver is registered again, a new pod reads
+    the file, and the holder's delete is unpublished by the restarted kubelet.
+  - `csi-deregistered`: the driver pod deleted, CSINode no longer lists it.
 
 The same image is the workload pods' program (`/test sized <path> <seed>
 <bytes> <lo> <hi>`, `/test echo …`, `sleep`, `exit`, `fail-once`,
-`write-file`, `expect-file`, `expect-env`), so a run pulls nothing else. Check it builds with
+`write-file`, `expect-file`, `expect-env`, and `csi-driver`, `restart-kubelet`
+for the csi suite), so a run pulls nothing else. The crate builds the CSI and
+plugin-registration protos the kubelet vendors, so it needs `protoc` too. Check it builds with
 `sc-build 'cd test && cargo test --locked && cargo build --release --locked'`.
 
 Required test inputs are listed in [configuration](docs/configuration.md#test-container).
 The image the workload pods run is the Job's own (#97), and `STORM_NODE` (an
-address) is resolved to its Node. No successful live run of any suite is
-claimed yet (#64, #61).
+address) is resolved to its Node. Live: short passed on C2NR0Q2 (#97); medium,
+long and csi have no complete live pass yet (#64, #61, #52).
 
 ## Relationship to rustkube
 

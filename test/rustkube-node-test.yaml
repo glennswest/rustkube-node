@@ -11,6 +11,10 @@
 #             volumes (#59), and pod features and failure paths (#61).
 #             long (night): waves of pods at the node's free capacity, start
 #             latency and residue per wave (#61).
+#             csi (< 15 min, on request): the CSI node side against this
+#             image's own driver; its driver pod is privileged with
+#             /var/lib/kubelet Bidirectional, its restart-kubelet pod
+#             privileged and hostPID (#52).
 #   requires: []            (storage comes from the node's stormblock engine
 #                            through the kubelet. Where the class is not
 #                            offered — no StorageClass stormblock of

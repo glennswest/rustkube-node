@@ -2428,18 +2428,20 @@ both when the Dell runs cilium-operator and a new claim. #21 paused on branch wi
 
 2026-10-21. Master's decision on #52: **A**, the suite brings its own driver. Host `/var/lib/kubelet` is the
 kubelet's (stormcos `volume kubeletdir`), so a driver pod's hostPath reaches what the kubelet watches. Doing:
-1. [ ] `test/`: tonic/prost + build.rs on the vendored protos (`../pkg/kubelet/proto`, server + client for tests);
+1. [x] `test/`: tonic/prost + build.rs on the vendored protos (`../pkg/kubelet/proto`, server + client for tests);
        `csi_driver.rs`: mode `csi-driver <name> <node>` (Identity, Node without stage: NodePublish = bind of
        `/var/lib/kubelet/plugins/<name>/data/<handle>` at the target, NodeUnpublish = umount + rmdir, each call one
        stdout line; Registration on `plugins_registry/<name>-reg.sock`; SIGTERM removes sockets and data); mode
        `restart-kubelet` (hostPID: SIGTERM the `kubelet` process, wait for a new pid).
-2. [ ] `csi.rs` suite `csi` (requires.toml `[csi]`, budget 900, cluster_write csidrivers + persistentvolumes, reads
+2. [x] `csi.rs` suite `csi` (requires.toml `[csi]`, budget 900, cluster_write csidrivers + persistentvolumes, reads
        nodes/csinodes/PVs): CSIDriver (no attach), privileged driver pod (Bidirectional /var/lib/kubelet), static PV
        pre-bound to a claim; cases: registered (CSINode), publish (writer pod; NodePublish in the driver's log),
        unpublish (writer deleted → NodeUnpublish; reader reads the data back), kubelet-restart (holder stays Running,
        a new reader reads, holder's delete unpublishes), deregistered (driver deleted → CSINode drops it).
-3. [ ] Lock from a build VM (`cargo metadata`, SC_BUILD_OUT); sc-build `cd test && cargo test --locked && cargo build
+3. [x] Lock from a build VM (`cargo metadata`, SC_BUILD_OUT); sc-build `cd test && cargo test --locked && cargo build
        --release --locked`; docs (csi.md "Not yet", README test section), CHANGELOG.
+       Done: f0489cd, 9fc4801 (lock sha 56bf0777…, job c0ebe2c2b1), docs. sc-build 9fc4801 (job 624672bcac): 41 test-crate
+       tests (9 new), clippy -D warnings clean, release builds; `restart-kubelet` off-node says no kubelet, exit 1.
 4. [ ] Live: `stormcentral test run rustkube-node csi --tag <machine>`; close on its result (or move it behind what
        blocks the run: stormcos#271 for test images on nodes).
 
