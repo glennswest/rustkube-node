@@ -1188,6 +1188,38 @@ mod tests {
                 exit_code: 0,
             })
         }
+        /// A stand-in process (#56): `out:` + its stdin on stdout, `err` on
+        /// stderr, exit 3.
+        async fn exec_process(
+            &self,
+            id: &str,
+            cmd: &[String],
+            io: crate::exec::ExecIo,
+        ) -> Result<ExecSession, CriError> {
+            assert_eq!(id, "ctr-app");
+            assert_eq!(cmd, ["/bin/cat"]);
+            let (stdio, ends) = crate::exec::make(&io).unwrap();
+            let (tx, exit) = tokio::sync::oneshot::channel();
+            tokio::task::spawn_blocking(move || {
+                use std::io::{Read, Write};
+                let mut fds: std::collections::HashMap<i32, std::fs::File> =
+                    ends.0.into_iter().map(|(fd, e)| (fd, std::fs::File::from(e))).collect();
+                let mut input = Vec::new();
+                if let Some(mut i) = fds.remove(&0) {
+                    i.read_to_end(&mut input).unwrap();
+                }
+                if let Some(mut o) = fds.remove(&1) {
+                    o.write_all(b"out:").unwrap();
+                    o.write_all(&input).unwrap();
+                }
+                if let Some(mut e) = fds.remove(&2) {
+                    e.write_all(b"err").unwrap();
+                }
+                drop(fds);
+                let _ = tx.send(3);
+            });
+            Ok(ExecSession { stdio, exit, kill: Box::new(|| {}) })
+        }
     }
     #[async_trait::async_trait]
     impl ImageService for NoopRt {
@@ -1357,17 +1389,115 @@ mod tests {
         assert!(head.starts_with("HTTP/1.1 403"), "{head}");
     }
 
+    /// #56: `kubectl exec` over SPDY v4: the process's stdin from the stdin
+    /// stream, its stdout and stderr on theirs, and its exit as a Status on
+    /// the error stream, with the exit code where kubectl reads it.
     #[tokio::test]
-    async fn exec_and_attach_answer_why_not_rather_than_404() {
-        for path in ["/exec/default/web/app?command=sh&input=1&output=1&tty=1", "/attach/default/web/app?output=1"] {
-            let resp = app()
-                .oneshot(Request::builder().method("POST").uri(path).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED, "{path}");
-            let body = axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap();
-            assert!(String::from_utf8_lossy(&body).contains("stormpump#103"));
+    async fn exec_over_spdy_v4_carries_the_streams_and_the_exit_code() {
+        use crate::spdy::client::{read_frame, Client, Frame};
+        use tokio::io::AsyncWriteExt;
+        let (addr, _) = streaming_world().await;
+        let (mut io, head) = upgrade(
+            addr,
+            "POST /exec/default/web/app?command=%2Fbin%2Fcat&input=1&output=1&error=1 HTTP/1.1\r\nHost: n\r\n\
+             Connection: Upgrade\r\nUpgrade: SPDY/3.1\r\n\
+             X-Stream-Protocol-Version: v4.channel.k8s.io\r\nX-Stream-Protocol-Version: v3.channel.k8s.io\r\n\r\n",
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        assert!(head.to_ascii_lowercase().contains("x-stream-protocol-version: v4.channel.k8s.io"), "{head}");
+        let mut c = Client::new();
+        for (id, t) in [(1, "error"), (3, "stdin"), (5, "stdout"), (7, "stderr")] {
+            io.write_all(&c.syn_stream(id, &[("streamType", t)], t == "error")).await.unwrap();
         }
+        io.write_all(&Client::data(3, b"hi", true)).await.unwrap();
+        let (mut out, mut err, mut status) = (Vec::new(), Vec::new(), Vec::new());
+        let mut finished = 0;
+        while finished < 3 {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), read_frame(&mut io)).await.unwrap() {
+                Some(Frame::Data(id, flags, b)) => {
+                    match id {
+                        5 => out.extend(b),
+                        7 => err.extend(b),
+                        1 => status.extend(b),
+                        _ => {}
+                    }
+                    if flags & 1 != 0 {
+                        finished += 1;
+                    }
+                }
+                Some(_) => {}
+                None => panic!("session ended"),
+            }
+        }
+        assert_eq!(out, b"out:hi");
+        assert_eq!(err, b"err");
+        let status: serde_json::Value = serde_json::from_slice(&status).unwrap();
+        assert_eq!(status["reason"], "NonZeroExitCode", "{status}");
+        assert_eq!(status["details"]["causes"][0]["message"], "3");
+    }
+
+    /// #56: the same over a WebSocket (`v5.channel.k8s.io`, what kubectl ≥
+    /// 1.30 tries first): channel bytes, and v5's close of stdin.
+    #[tokio::test]
+    async fn exec_over_a_websocket_v5_carries_the_channels_and_the_exit_code() {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{protocol::Role, Message};
+        let (addr, _) = streaming_world().await;
+        let (io, head) = upgrade(
+            addr,
+            "GET /exec/default/web/app?command=/bin/cat&stdin=true&stdout=true&stderr=true HTTP/1.1\r\nHost: n\r\n\
+             Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Protocol: v5.channel.k8s.io, v4.channel.k8s.io\r\n\r\n",
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        assert!(head.to_ascii_lowercase().contains("sec-websocket-protocol: v5.channel.k8s.io"), "{head}");
+        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(io, Role::Client, None).await;
+        ws.send(Message::Binary(b"\x00hi".to_vec().into())).await.unwrap();
+        ws.send(Message::Binary(vec![255u8, 0].into())).await.unwrap();
+        let mut got: std::collections::HashMap<u8, Vec<u8>> = Default::default();
+        while let Some(Ok(m)) = tokio::time::timeout(std::time::Duration::from_secs(10), ws.next()).await.unwrap() {
+            match m {
+                Message::Binary(d) if !d.is_empty() => got.entry(d[0]).or_default().extend(&d[1..]),
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        assert_eq!(got[&1], b"out:hi");
+        assert_eq!(got[&2], b"err");
+        let status: serde_json::Value = serde_json::from_slice(&got[&3]).unwrap();
+        assert_eq!(status["details"]["causes"][0]["message"], "3", "{status}");
+    }
+
+    #[tokio::test]
+    async fn exec_and_attach_refusals_say_why_and_never_upgrade() {
+        let (addr, _) = streaming_world().await;
+        let spdy = |path: &str| {
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: n\r\nConnection: Upgrade\r\nUpgrade: SPDY/3.1\r\n\
+                 X-Stream-Protocol-Version: v4.channel.k8s.io\r\n\r\n"
+            )
+        };
+        let (_, head) = upgrade(addr, &spdy("/exec/default/web/app?output=1")).await;
+        assert!(head.starts_with("HTTP/1.1 400"), "no command: {head}");
+        let (_, head) = upgrade(addr, &spdy("/exec/default/web/app?command=ls")).await;
+        assert!(head.starts_with("HTTP/1.1 400"), "no stream: {head}");
+        let (_, head) = upgrade(addr, &spdy("/exec/default/nope/app?command=ls&output=1")).await;
+        assert!(head.starts_with("HTTP/1.1 404"), "{head}");
+        let (_, head) = upgrade(addr, &spdy("/exec/default/web/other?command=ls&output=1")).await;
+        assert!(head.starts_with("HTTP/1.1 404"), "{head}");
+        let (_, head) = upgrade(
+            addr,
+            "POST /exec/default/web/app?command=ls&output=1 HTTP/1.1\r\nHost: n\r\nConnection: Upgrade\r\n\
+             Upgrade: SPDY/3.1\r\nX-Stream-Protocol-Version: portforward.k8s.io\r\n\r\n",
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        // A runtime that cannot attach says so, before any upgrade.
+        let (_, head) = upgrade(addr, &spdy("/attach/default/web/app?output=1")).await;
+        assert!(head.starts_with("HTTP/1.1 500"), "{head}");
     }
 
     #[tokio::test]
