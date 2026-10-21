@@ -190,12 +190,12 @@ mod tests {
     fn steps_are_timed_one_after_another_and_the_first_static_pod_is_said_once() {
         begin();
         mark("a");
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(60));
         mark("b");
         let s = summary();
         assert!(s.starts_with("total=") && s.contains(" a=") && s.contains(" b="), "{s}");
         let b: u128 = s.split(" b=").nth(1).unwrap().chars().take_while(char::is_ascii_digit).collect::<String>().parse().unwrap();
-        assert!(b >= 20, "{s}");
+        assert!(b >= 60, "{s}");
         // A step past DETAIL_FROM says what it did: a sleep is waiting, not CPU.
         assert!(s.contains(" b=") && s.split(" b=").nth(1).unwrap().contains("(cpu "), "{s}");
         assert!(static_pod_started("kube-system/etcd").is_some());
