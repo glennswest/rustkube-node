@@ -159,6 +159,19 @@ struct Container {
     /// [`REMOVAL_RETRY`], and before its sandbox is removed. A removed
     /// container is gone to the kubelet (not listed, NotFound) at once.
     removing: Option<std::time::Instant>,
+    /// What a process run inside it inherits (#56): the container's composed
+    /// env, cwd, user and capabilities. `None` for a record not created here.
+    exec_base: Option<ExecBase>,
+}
+
+/// The container's side of an exec (#56).
+#[derive(Clone, Debug)]
+struct ExecBase {
+    env: Vec<String>,
+    cwd: String,
+    uid: u32,
+    gid: u32,
+    caps: stormpump::spec::Caps,
 }
 
 /// How often a removal the engine refused is tried again with no exit to
@@ -1404,8 +1417,16 @@ impl RuntimeService for StormpumpRuntime {
                 }
             }
         }
+        let mut exec_base = None;
         let defined = match compose_for(config, image.as_ref(), name.as_deref(), Some(&read_root)) {
             Ok(run) => {
+                exec_base = Some(ExecBase {
+                    env: run.env.clone(),
+                    cwd: run.cwd.clone(),
+                    uid: run.uid,
+                    gid: run.gid,
+                    caps: caps_for(config),
+                });
                 let spec = spec_for(config, _sandbox_config, run, Some(&read_root));
                 // A capability name the engine does not know would come back as
                 // spec code 54; say which one, here.
@@ -1429,6 +1450,7 @@ impl RuntimeService for StormpumpRuntime {
                 return Err(e);
             }
         };
+        let exec_base = exec_base.expect("composed when the spec was defined");
 
         let c = Container {
             id: id.clone(),
@@ -1479,6 +1501,7 @@ impl RuntimeService for StormpumpRuntime {
             host_network: config.host_network,
             host_pid: config.host_pid,
             removing: None,
+            exec_base: Some(exec_base),
         };
         let qualified = format!("{}/{}/{}", c.namespace, c.pod, c.name);
         self.containers.lock().await.insert(id.clone(), c);
@@ -1807,19 +1830,190 @@ impl RuntimeService for StormpumpRuntime {
         Some(sandboxes.get(&sandbox)?.config.uid.clone()).filter(|u| !u.is_empty())
     }
 
+    /// An exec probe and `crictl exec` without a terminal (#56): stdout and
+    /// stderr collected, each kept to [`EXEC_SYNC_OUTPUT`], the exit code.
+    /// Past `timeout` seconds (0: none, as CRI's) it is stopped and that is the
+    /// error, never a success it did not have.
     async fn exec_sync(
         &self,
-        _container_id: &str,
-        _cmd: &[String],
-        _timeout: i64,
+        container_id: &str,
+        cmd: &[String],
+        timeout: i64,
     ) -> Result<crate::cri::ExecSyncResult, CriError> {
-        // A Task spawned into the container's sandbox is exactly this, and the
-        // ring already has the op. Not wired yet, and an empty success would be
-        // worse than an error: a readiness probe that "succeeds" without
-        // running anything reports every container healthy.
-        Err(CriError::Runtime(
-            "exec_sync is not wired to the stormpump ring yet".to_string(),
-        ))
+        let io = crate::exec::ExecIo { stdin: false, stdout: true, stderr: true, tty: false };
+        let crate::cri::ExecSession { mut stdio, exit, kill } = self.exec_process(container_id, cmd, io).await?;
+        let (out, err) = (stdio.stdout.take(), stdio.stderr.take());
+        let run = async {
+            let (stdout, stderr, code) = tokio::join!(read_capped(out), read_capped(err), exit);
+            (stdout, stderr, code)
+        };
+        let ran = if timeout > 0 {
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout as u64), run).await {
+                Ok(r) => r,
+                Err(_) => {
+                    kill();
+                    return Err(CriError::Runtime(format!(
+                        "command {cmd:?} in container {container_id} timed out after {timeout}s"
+                    )));
+                }
+            }
+        } else {
+            run.await
+        };
+        match ran {
+            (stdout, stderr, Ok(exit_code)) => Ok(crate::cri::ExecSyncResult { stdout, stderr, exit_code }),
+            (_, _, Err(_)) => Err(CriError::Runtime(format!(
+                "command {cmd:?} in container {container_id}: its exit was lost (the engine connection went)"
+            ))),
+        }
+    }
+
+    /// `cmd` inside a running container (#56, stormpump#103): a `SPAWN` with
+    /// the container's workload in `inline_a`, its stdio the descriptors
+    /// deposited for it, its env, cwd, user and capabilities the container's.
+    async fn exec_process(
+        &self,
+        container_id: &str,
+        cmd: &[String],
+        io: crate::exec::ExecIo,
+    ) -> Result<crate::cri::ExecSession, CriError> {
+        let (target, base, root, qualified) = {
+            let containers = self.containers.lock().await;
+            let c = containers
+                .get(container_id)
+                .filter(|c| c.removing.is_none())
+                .ok_or_else(|| CriError::NotFound(format!("container {container_id}")))?;
+            let qualified = format!("{}/{}/{}", c.namespace, c.pod, c.name);
+            let target = c
+                .workload_handle
+                .filter(|_| c.state == ContainerState::Running)
+                .ok_or_else(|| CriError::Runtime(format!("container {qualified} is not running")))?;
+            let base = c.exec_base.clone().ok_or_else(|| {
+                CriError::Runtime(format!("container {qualified} was not created by this kubelet"))
+            })?;
+            (target, base, c.root_path.clone(), qualified)
+        };
+        let mut argv = cmd.to_vec();
+        let Some(first) = argv.first().cloned() else {
+            return Err(CriError::Runtime(format!("exec in {qualified}: no command")));
+        };
+        // The engine takes an absolute argv[0], as at create (`spec_for`).
+        if !first.starts_with('/') {
+            let path = crate::image_config::path_of(&base.env);
+            match root.as_deref().and_then(|r| resolve_in_image(std::path::Path::new(r), &first, &path)) {
+                Some(abs) => argv[0] = abs,
+                None => {
+                    return Err(CriError::Runtime(format!(
+                        "exec in {qualified}: {first:?}: executable file not found in $PATH"
+                    )))
+                }
+            }
+        }
+        let (stdio, ends) = crate::exec::make(&io)
+            .map_err(|e| CriError::Runtime(format!("exec in {qualified}: its stdio: {e}")))?;
+        let n = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let deposits: Vec<(String, i32, std::os::fd::OwnedFd)> =
+            ends.0.into_iter().map(|(fd, end)| (format!("exec-{n}-{fd}"), fd, end)).collect();
+        let spec = exec_spec(argv, base, deposits.iter().map(|(name, fd, _)| (name.clone(), *fd)).collect());
+        spec.validate()
+            .map_err(|e| CriError::Runtime(format!("exec in {qualified}: the engine would refuse it: {e:?}")))?;
+        let encoded = spec.encode();
+        let ring = self.ring()?;
+        let (handle, spec) = self
+            .on_ring(move |r| {
+                let mut sent = Vec::new();
+                let made = (|| {
+                    for (name, _, fd) in deposits {
+                        r.deposit_fd(&name, fd)?;
+                        sent.push(name);
+                    }
+                    let spec = r.spec_define(encoded)?;
+                    match r.spawn(spec, Handle::NONE, Handle::NONE, target, &[], Domain::Container as u8) {
+                        Ok(h) => Ok((h, spec)),
+                        Err(e) => {
+                            let _ = r.spec_release(spec);
+                            Err(e)
+                        }
+                    }
+                })();
+                // A spawn that did not happen consumed nothing (stormpump#63).
+                if made.is_err() {
+                    for name in &sent {
+                        let _ = r.deposit_withdraw(name);
+                    }
+                }
+                made
+            })
+            .await
+            .map_err(|e| CriError::Runtime(format!("exec in {qualified}: {e}")))?;
+        tracing::info!(container = %qualified, ?cmd, tty = io.tty, "stormpump: exec started");
+
+        // Its exit is the waiter's alone (the ring keeps one that arrived
+        // first); then its handle and spec are released.
+        let status = ring.wait_exit(handle);
+        let (exit_tx, exit) = tokio::sync::oneshot::channel();
+        let releaser = ring.clone();
+        tokio::spawn(async move {
+            if let Ok(status) = status.await {
+                let code = crate::exec::exit_code(status);
+                tracing::info!(container = %qualified, code, "stormpump: exec ended");
+                let _ = exit_tx.send(code);
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = releaser.workload_release(handle);
+                    let _ = releaser.spec_release(spec);
+                })
+                .await;
+            }
+        });
+        let kill: Box<dyn Fn() + Send + Sync> = Box::new(move || {
+            let r = ring.clone();
+            // Off the caller's thread: a ring call blocks. A stop after the
+            // exit is refused as stale, which is fine.
+            std::thread::spawn(move || {
+                let _ = r.stop(handle, 0);
+            });
+        });
+        Ok(crate::cri::ExecSession { stdio, exit, kill })
+    }
+}
+
+/// The most of each stream an `exec_sync` keeps; the rest is read and dropped
+/// so the process is never blocked on a full pipe.
+const EXEC_SYNC_OUTPUT: usize = 1 << 20;
+
+async fn read_capped(r: Option<crate::exec::Reader>) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let Some(mut r) = r else { return Vec::new() };
+    let (mut kept, mut buf) = (Vec::new(), vec![0u8; 16 * 1024]);
+    loop {
+        match r.read(&mut buf).await {
+            Ok(0) | Err(_) => return kept,
+            Ok(n) => {
+                let room = EXEC_SYNC_OUTPUT.saturating_sub(kept.len());
+                kept.extend_from_slice(&buf[..n.min(room)]);
+            }
+        }
+    }
+}
+
+/// The spec of a process run inside a container (#56): its own argv, the
+/// container's env, cwd, user and capabilities, stdio from `slots` (the
+/// deposits' names and the fd each becomes), nothing else (the engine refuses
+/// a root, mounts, limits or file logs for an exec: they would mean nothing).
+fn exec_spec(argv: Vec<String>, base: ExecBase, slots: Vec<(String, i32)>) -> stormpump::spec::Spec {
+    use stormpump::spec::{FdSlot, Logs, Root, Spec};
+    Spec {
+        domain: Domain::Container,
+        root: Root::Inherit,
+        logs: Logs::Discard,
+        argv,
+        env: base.env,
+        cwd: base.cwd,
+        uid: base.uid,
+        gid: base.gid,
+        caps: base.caps,
+        fds: slots.into_iter().map(|(name, target_fd)| FdSlot { name, target_fd }).collect(),
+        ..Spec::default()
     }
 }
 
@@ -2602,6 +2796,7 @@ mod tests {
                     host_network: false,
                     host_pid: false,
                     removing: None,
+                    exec_base: None,
                 },
             );
         }
@@ -2642,6 +2837,30 @@ mod tests {
         let text = format!("{e}");
         assert!(text.contains("stormpump"), "{text}");
         assert!(text.contains("/nonexistent/stormpump.sock"), "{text}");
+    }
+
+    /// #56: what an exec sends the engine passes the engine's own checks:
+    /// the container's env, user and capabilities, stdio from the deposits'
+    /// slots (0–2 are allowed on a container), no root, mounts or file logs.
+    #[test]
+    fn an_exec_spec_is_one_the_engine_accepts() {
+        let base = ExecBase {
+            env: vec!["PATH=/bin".into(), "A=b".into()],
+            cwd: "/srv".into(),
+            uid: 1000,
+            gid: 1000,
+            caps: caps_for(&ContainerConfig::default()),
+        };
+        let slots = vec![("exec-1-0".to_string(), 0), ("exec-1-1".to_string(), 1), ("exec-1-2".to_string(), 2)];
+        let spec = exec_spec(vec!["/bin/sh".into(), "-c".into(), "id".into()], base, slots);
+        spec.validate().unwrap();
+        let back = stormpump::spec::Spec::decode(&spec.encode()).unwrap();
+        assert_eq!(back.argv, ["/bin/sh", "-c", "id"]);
+        assert_eq!((back.uid, back.gid, back.cwd.as_str()), (1000, 1000, "/srv"));
+        assert_eq!(back.fds.iter().map(|f| f.target_fd).collect::<Vec<_>>(), [0, 1, 2]);
+        assert_eq!(back.logs, stormpump::spec::Logs::Discard);
+        assert_eq!(back.root, stormpump::spec::Root::Inherit);
+        assert_eq!(back.caps.base, stormpump::spec::CapBase::Standard);
     }
 
     #[tokio::test]
@@ -2777,6 +2996,7 @@ mod tests {
                     host_network: false,
                     host_pid: false,
                     removing: None,
+                    exec_base: None,
                 },
             );
             ids.push(id);
@@ -3281,6 +3501,7 @@ mod tests {
             host_network: false,
             host_pid: false,
             removing: None,
+            exec_base: None,
         }
     }
 

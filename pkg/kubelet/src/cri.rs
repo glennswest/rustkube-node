@@ -329,6 +329,17 @@ pub struct ExecSyncResult {
     pub exit_code: i32,
 }
 
+/// A process running inside a container, its stdio held by the kubelet
+/// (#56): `kubectl exec`, and the runtime's own `exec_sync`.
+pub struct ExecSession {
+    pub stdio: crate::exec::Stdio,
+    /// Its exit code (128 + signal when signalled) once it has ended. Dropped
+    /// unanswered when the runtime lost it (its connection went).
+    pub exit: tokio::sync::oneshot::Receiver<i32>,
+    /// Stop it now. Safe to call again, and after it ended.
+    pub kill: Box<dyn Fn() + Send + Sync>,
+}
+
 /// CRI RuntimeService trait.
 #[async_trait]
 pub trait RuntimeService: Send + Sync + 'static {
@@ -434,6 +445,21 @@ pub trait RuntimeService: Send + Sync + 'static {
         cmd: &[String],
         timeout: i64,
     ) -> Result<ExecSyncResult, CriError>;
+
+    /// Run `cmd` inside a running container with the streams `io` asks for
+    /// (#56). A runtime that cannot answers why; the CRI gRPC path's runtimes
+    /// stream through their own server, which this kubelet does not proxy.
+    async fn exec_process(
+        &self,
+        container_id: &str,
+        cmd: &[String],
+        io: crate::exec::ExecIo,
+    ) -> Result<ExecSession, CriError> {
+        let _ = (cmd, io);
+        Err(CriError::Runtime(format!(
+            "container {container_id}: this node's runtime does not run a process in a container for the kubelet"
+        )))
+    }
 }
 
 /// CRI ImageService trait.
