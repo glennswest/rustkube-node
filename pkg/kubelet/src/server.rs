@@ -725,23 +725,29 @@ async fn remote_command(
         Some(Err(e)) => return (StatusCode::NOT_FOUND, format!("{e}\n")).into_response(),
         Some(Ok(t)) => t,
     };
-    let header = |name: &str| -> Vec<String> {
-        req.headers()
-            .get_all(name)
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .flat_map(|v| v.split(','))
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .collect()
+    // Read into owned values: the request (its body is not Sync) must not be
+    // borrowed across the awaits below.
+    let (websocket, spdy, offered, key) = {
+        let header = |name: &str| -> Vec<String> {
+            req.headers()
+                .get_all(name)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .flat_map(|v| v.split(','))
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .collect()
+        };
+        let upgrade = header("upgrade");
+        let websocket = upgrade.iter().any(|u| u.eq_ignore_ascii_case("websocket"));
+        let spdy = upgrade.iter().any(|u| u.eq_ignore_ascii_case("SPDY/3.1"));
+        let offered = header(if websocket { "sec-websocket-protocol" } else { "x-stream-protocol-version" });
+        let key = header("sec-websocket-key").into_iter().next();
+        (websocket, spdy, offered, key)
     };
-    let upgrade = header("upgrade");
-    let websocket = upgrade.iter().any(|u| u.eq_ignore_ascii_case("websocket"));
-    let spdy = upgrade.iter().any(|u| u.eq_ignore_ascii_case("SPDY/3.1"));
     if !websocket && !spdy {
         return (StatusCode::BAD_REQUEST, "exec and attach need an upgrade to SPDY/3.1 or a WebSocket\n").into_response();
     }
-    let offered = header(if websocket { "sec-websocket-protocol" } else { "x-stream-protocol-version" });
     let ours = if websocket { rc::WEBSOCKET_PROTOCOLS } else { rc::SPDY_PROTOCOLS };
     let Some(protocol) = rc::negotiate(ours, &offered) else {
         return (
@@ -750,7 +756,6 @@ async fn remote_command(
         )
             .into_response();
     };
-    let key = header("sec-websocket-key").into_iter().next();
     if websocket && key.is_none() {
         return (StatusCode::BAD_REQUEST, "a WebSocket handshake needs Sec-WebSocket-Key\n").into_response();
     }
