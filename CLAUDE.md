@@ -71,7 +71,11 @@ Steps 2–7 are kubelet behaviour on JSON, independent of the crates. Doing:
 2. [x] Steps 3–7 filed: #276 in-place resize (needs a stormpump per-workload limits verb), #277 stopSignal + sleep
        (stormpump's Signal op is enough), #278 sidecar edge cases, #279 image volumes (stormpump#108 for read-only),
        #280 user namespaces (needs stormpump Spec userns).
-3. [ ] sc-build; stage golden; propose #275 `--after` rustkube#285 for the crate bump + kubeletVersion.
+3. [x] SC_BUILD_VM sc-build (job f8d8e62af8): 547 kubelet unit, all suites, warnings = #227's. Stage build d3c3e72b4eaf.
+       #275 proposed `--after` rustkube#285.
+4. [ ] Resume after rustkube#285: bump `apimachinery`'s rev (Cargo.toml + lock from a build VM), fix what its 0.28 /
+       jiff API breaks, sc-build `--locked` with zero new warnings; then the issue's done-when (stormcos suites on pve
+       and the Dell, kubectl 1.36, a release carrying it).
 
 ### Done (not reproducing since 12.30): #259 (P2), the second VM of the install probe starts late on pvetest1 (3.5 s → 6.7 s since 12.19)
 
