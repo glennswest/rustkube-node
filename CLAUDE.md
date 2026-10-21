@@ -2378,8 +2378,17 @@ cmdline's absence). #232 (my #71 regression): kind: clone / fsType: ext4 accepte
 sc-build ca44386: 475 kubelet unit pass. Golden golden-rustkube-node-9b876df216c9 (stormcos#424), master told; close
 both when the Dell runs cilium-operator and a new claim. #21 paused on branch wip/21-rebased.
 
-### Waiting on stormcentral#479 (suite cluster writes + a driver SA's cluster rules): #52, external StorageClasses (the CSI node side)
+### Waiting on the owner: #52, external StorageClasses (the CSI node side): which driver runs the node end-to-end
 
+2026-10-21. stormcentral#479 landed (`cluster_write`, `service_account_cluster_rules`). Blocker found: no stormcos node
+can run csi-driver-host-path's `hostpathplugin` (upstream images only as pinned imports; `pinned-images.txt` has the
+registrar v2.13.0 and provisioner v5.1.0 as optional goldens, no hostpath plugin; stormblock-csi is not deployed), and
+copying images over /v2/ by hand is not a test-standard run. Asked on #52 (wait-owner): A the test container's own
+CSI driver (recommended: Identity+Node from the vendored csi.proto, self-registration, bind-mount NodePublish, static
+PV via `cluster_write` csidrivers+persistentvolumes, privileged pod with /var/lib/kubelet Bidirectional), B pin
+hostpathplugin in stormcos, C unit tests only. Resume from the answer.
+
+(earlier) 
 2026-10-09. stormblock-registry#99 is fixed (v0.40.1; pushed goldens build). The e2e has to be a test-container
 suite (test standard; no kubectl/credentials here), and it must create a CSIDriver and a StorageClass and give the
 external-provisioner's SA cluster rules (PVs): the runner grants only cluster reads (#55); #479 proposes
