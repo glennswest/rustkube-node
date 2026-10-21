@@ -67,11 +67,11 @@ lock for every exit, pods' too, one exit at a time: a VM pass holding it stalls 
 arrives before `start_container` records its handle (a quick init: Cilium's `config`) is drained by any other pod's
 status call, matches nothing and is dropped: the container stays Running in the record; (c) "container exited" is
 logged only when some pass drains it, so the log shows when it was read, not when it happened. Doing:
-1. [ ] Router: drain and record the exits at arrival (logged then); pod lookup first, the VM lookup only for a handle
+1. [x] Router: drain and record the exits at arrival (logged then); pod lookup first, the VM lookup only for a handle
        no container has, bounded (1 s, then every VMI woken, said); routing over 1 s warned naming the lookup.
-2. [ ] Runtime: an exit no container claims is kept (last 256) and applied by `start_container` when it records that
+2. [x] Runtime: an exit no container claims is kept (last 256) and applied by `start_container` when it records that
        handle.
-3. [ ] Engine waits said: a ring call over 1 s warned (op, ms, whether it waited for the arena); an engine HTTP call
+3. [x] Engine waits said: a ring call over 1 s warned (op, ms, whether it waited for the arena); an engine HTTP call
        over 1 s warned (method, path, ms).
 4. [ ] Tests (early exit kept and applied; router not blocked by a held VM lock), README/CHANGELOG; sc-build; stage; close.
 

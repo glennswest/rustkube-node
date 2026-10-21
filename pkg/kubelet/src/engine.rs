@@ -281,6 +281,31 @@ impl EngineClient {
         body: Option<&Value>,
         timeout: Option<std::time::Duration>,
     ) -> reqwest::Result<Response> {
+        let began = std::time::Instant::now();
+        let answered = self.send_authorised(method.clone(), url, body, timeout).await;
+        // A slow engine, seen from the kubelet's side (#285): which call, how
+        // long (a clone stormblock took 10–20 s to make held a pod's start).
+        // The volume watch (no timeout) is long by design and not said.
+        let took = began.elapsed();
+        if timeout.is_some() && took > crate::stormpump_ring::SLOW_CALL {
+            warn!(
+                %method, path = %path_of(url), ms = took.as_millis() as u64,
+                status = answered.as_ref().map(|r| r.status().as_u16()).unwrap_or(0),
+                "stormblock took {} ms to answer {method} {}", took.as_millis(), path_of(url)
+            );
+        }
+        answered
+    }
+
+    /// [`Self::send_within`]'s call, with the token re-read or the admin
+    /// credential on a refusal.
+    async fn send_authorised(
+        &self,
+        method: Method,
+        url: &str,
+        body: Option<&Value>,
+        timeout: Option<std::time::Duration>,
+    ) -> reqwest::Result<Response> {
         let used = self.token();
         let resp = self.once(method.clone(), url, body, used.as_deref(), timeout).await?;
         if resp.status() != StatusCode::UNAUTHORIZED {

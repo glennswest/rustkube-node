@@ -228,6 +228,9 @@ struct ExitWaiters {
 
 const RECENT_EXITS: usize = 256;
 
+/// A ring call slower than this is said (#285).
+pub const SLOW_CALL: std::time::Duration = std::time::Duration::from_secs(1);
+
 impl ExitWaiters {
     /// `true` when a waiter took it.
     fn exited(&mut self, handle: u64, status: u32) -> bool {
@@ -361,6 +364,7 @@ impl RingClient {
         read_back: bool,
     ) -> Result<Reply, RingError> {
         let (reply, answer) = mpsc::channel();
+        let (began, op) = (std::time::Instant::now(), sqe.opcode);
         {
             let tx = self.tx.lock().map_err(|_| RingError::Gone)?;
             tx.send(Request {
@@ -379,11 +383,22 @@ impl RingClient {
         // The ring thread answers by the deadline (#99). Waiting twice as
         // long here is only a guard against that thread being stuck itself;
         // a request it dequeues after its deadline is never submitted.
-        match answer.recv_timeout(DEADLINE * 2) {
+        let answered = match answer.recv_timeout(DEADLINE * 2) {
             Ok(answer) => answer,
             Err(mpsc::RecvTimeoutError::Timeout) => Err(RingError::Timeout),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(RingError::Gone),
+        };
+        // A slow engine, seen from the kubelet's side (#285): which call, how
+        // long. A request with a payload also waits for the one arena.
+        let took = began.elapsed();
+        if took > SLOW_CALL {
+            let name = Op::from_u8(op).map_or_else(|| format!("op {op}"), |o| format!("{o:?}"));
+            tracing::warn!(
+                op = %name, ms = took.as_millis() as u64, ok = answered.is_ok(),
+                "stormpump took {} ms to answer {name}", took.as_millis()
+            );
         }
+        answered
     }
 
     /// Hand the engine a descriptor, under a name a spec can claim.

@@ -239,6 +239,21 @@ fn removals_due(
         .collect()
 }
 
+/// A container's end, from the engine's wait status: the low byte is the
+/// signal, the next the exit code. Kubernetes reports 128+signal for a
+/// signalled container, which is what a shell does too.
+fn record_exit(c: &mut Container, status: u32) {
+    c.state = ContainerState::Exited;
+    c.finished_at = now_nanos();
+    let sig = (status & 0x7f) as i32;
+    c.exit_code = if sig != 0 { 128 + sig } else { ((status >> 8) & 0xff) as i32 };
+    tracing::info!(
+        container = %c.id,
+        name = %format!("{}/{}/{}", c.namespace, c.pod, c.name),
+        code = c.exit_code, "stormpump: container exited"
+    );
+}
+
 /// One pod sandbox.
 #[derive(Clone)]
 struct Sandbox {
@@ -327,7 +342,15 @@ pub struct StormpumpRuntime {
     making: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Publishes each workload's identity for cadvisor (#84); `None` in tests.
     identities: Option<crate::workload_identity::Publisher>,
+    /// Exits no container claimed when they were read (#285): a container
+    /// that ends before `start_container` has recorded its handle (Cilium's
+    /// `config` init dumps and exits at once). Kept until the start records
+    /// the handle, the last [`UNCLAIMED_EXITS`].
+    unclaimed: std::sync::Mutex<std::collections::VecDeque<crate::stormpump_ring::Exited>>,
 }
+
+/// How many unclaimed exits are kept (#285).
+const UNCLAIMED_EXITS: usize = 256;
 
 impl StormpumpRuntime {
     /// Attach to stormpump. Fails if the engine is not there, because a
@@ -355,6 +378,7 @@ impl StormpumpRuntime {
             roots: None,
             making: Default::default(),
             identities: None,
+            unclaimed: Default::default(),
         })
     }
 
@@ -466,6 +490,7 @@ impl StormpumpRuntime {
             roots: None,
             making: Default::default(),
             identities: None,
+            unclaimed: Default::default(),
         }
     }
 
@@ -598,29 +623,32 @@ impl StormpumpRuntime {
         let mut containers = self.containers.lock().await;
         retry = removals_due(&containers, &exits);
         for e in exits {
+            let mut claimed = false;
             for c in containers.values_mut() {
                 if c.workload_handle == Some(e.handle) {
-                    c.state = ContainerState::Exited;
-                    c.finished_at = now_nanos();
-                    // A wait status: the low byte is the signal, the next is
-                    // the exit code. Kubernetes reports 128+signal for a
-                    // signalled container, which is what a shell does too.
-                    let sig = (e.status & 0x7f) as i32;
-                    c.exit_code = if sig != 0 {
-                        128 + sig
-                    } else {
-                        ((e.status >> 8) & 0xff) as i32
-                    };
-                    tracing::info!(
-                        container = %c.id,
-                        name = %format!("{}/{}/{}", c.namespace, c.pod, c.name),
-                        code = c.exit_code, "stormpump: container exited"
-                    );
+                    record_exit(c, e.status);
+                    claimed = true;
                 }
+            }
+            // Its start has not recorded the handle yet (#285): kept for it,
+            // never dropped, or the container is Running here for good.
+            if !claimed {
+                let mut kept = self.unclaimed.lock().unwrap_or_else(|p| p.into_inner());
+                if kept.len() == UNCLAIMED_EXITS {
+                    kept.pop_front();
+                }
+                kept.push_back(e);
             }
         }
         }
         self.retry_removals(retry).await;
+    }
+
+    /// The exit of `handle` read before its start recorded it (#285), taken.
+    fn take_unclaimed(&self, handle: Handle) -> Option<u32> {
+        let mut kept = self.unclaimed.lock().unwrap_or_else(|p| p.into_inner());
+        let i = kept.iter().position(|e| e.handle == handle)?;
+        kept.remove(i).map(|e| e.status)
     }
 
     /// Release what a container holds in the engine (its workload, then its
@@ -1760,6 +1788,11 @@ impl RuntimeService for StormpumpRuntime {
         c.console = console;
         c.state = ContainerState::Running;
         c.started_at = now_nanos();
+        // It may have ended already, its exit read by another caller before
+        // this line recorded the handle (#285).
+        if let Some(status) = self.take_unclaimed(workload) {
+            record_exit(c, status);
+        }
         let identity = c.identity.clone();
         drop(containers);
         // Who it is, for cadvisor (#84), from its pid's cgroup.
@@ -1943,6 +1976,9 @@ impl RuntimeService for StormpumpRuntime {
     }
 
     async fn pod_of_workload(&self, handle: u64) -> Option<String> {
+        // Read the exits now (#285): the container is Exited from the moment
+        // it ended, and logged then, not when a pass next asks for its status.
+        self.absorb_exits().await;
         let sandbox = {
             let containers = self.containers.lock().await;
             containers.values().find(|c| c.workload_handle.map(|h| h.0) == Some(handle))?.sandbox_id.clone()
@@ -2986,6 +3022,40 @@ mod tests {
     /// one — a sandbox is acquired from stormpump's pool and a container is a
     /// spawn — so what is tested here is the bookkeeping either side of the
     /// ring, and the failures a node without stormpump should give.
+
+    /// #285: an exit read before the start recorded its handle (a quick init
+    /// container, read by another pod's status call) is kept, not dropped, and
+    /// is that container's once the handle is recorded.
+    #[tokio::test]
+    async fn an_exit_before_the_handle_is_recorded_is_kept_for_it() {
+        use crate::stormpump_ring::Exited;
+        let r = StormpumpRuntime::new("/run/stormpump.sock");
+        let mut c = bare("ct-1", "sb-1");
+        c.state = ContainerState::Running;
+        r.containers.lock().await.insert("ct-1".into(), c);
+        // Exit code 0 for the not-yet-recorded 77, code 3 for nobody's 78.
+        r.note_exits(vec![Exited { handle: Handle(77), status: 0 }, Exited { handle: Handle(78), status: 3 << 8 }]).await;
+        assert_eq!(r.containers.lock().await["ct-1"].state, ContainerState::Running, "not this one's yet");
+        // What start_container does once the spawn answers.
+        let status = r.take_unclaimed(Handle(77));
+        assert_eq!(status, Some(0));
+        let mut containers = r.containers.lock().await;
+        let c = containers.get_mut("ct-1").unwrap();
+        c.workload_handle = Some(Handle(77));
+        record_exit(c, status.unwrap());
+        assert_eq!(c.state, ContainerState::Exited);
+        assert_eq!(c.exit_code, 0);
+        assert!(c.finished_at > 0);
+        drop(containers);
+        assert_eq!(r.take_unclaimed(Handle(77)), None, "taken once");
+        assert_eq!(r.take_unclaimed(Handle(78)), Some(3 << 8), "another's still kept");
+        // Bounded: the oldest go first.
+        let many: Vec<_> = (0..UNCLAIMED_EXITS as u64 + 10).map(|h| Exited { handle: Handle(1000 + h), status: 0 }).collect();
+        r.note_exits(many).await;
+        assert_eq!(r.unclaimed.lock().unwrap().len(), UNCLAIMED_EXITS);
+        assert_eq!(r.take_unclaimed(Handle(1000)), None);
+        assert_eq!(r.take_unclaimed(Handle(1000 + UNCLAIMED_EXITS as u64 + 9)), Some(0));
+    }
 
     /// #115: an exiting workload's handle names its pod, through its
     /// container and sandbox; an unknown one names none.

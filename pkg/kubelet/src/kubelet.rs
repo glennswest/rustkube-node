@@ -542,12 +542,35 @@ impl Kubelet {
         loop {
             let wake = match exits.recv().await {
                 Ok(handle) => {
+                    let began = std::time::Instant::now();
                     let pod = self.pod_manager.pod_of_workload(handle).await;
-                    let vm = match &self.vms {
-                        Some(v) => v.uid_of_handle(handle).await,
-                        None => None,
+                    let looked_up_pod = began.elapsed();
+                    // Only a handle no container has can be a VM's (#285):
+                    // the VM manager's lock is held across slow work (a start,
+                    // the disk sweep), and a pod's exit must not wait on it.
+                    let vm = match (&pod, &self.vms) {
+                        (None, Some(v)) => match time::timeout(EXIT_ROUTE_VM_LOOKUP, v.uid_of_handle(handle)).await {
+                            Ok(vm) => vm.map(VmOwner::Known).unwrap_or(VmOwner::None),
+                            Err(_) => VmOwner::Busy,
+                        },
+                        _ => VmOwner::None,
                     };
-                    exit_wake(pod, vm)
+                    let took = began.elapsed();
+                    if took > EXIT_ROUTE_SLOW {
+                        warn!(
+                            handle, pod_lookup_ms = looked_up_pod.as_millis() as u64, total_ms = took.as_millis() as u64,
+                            "routing an engine exit took {} ms ({})", took.as_millis(),
+                            if looked_up_pod > EXIT_ROUTE_SLOW { "the container runtime's records were busy" } else { "the VM manager was busy" }
+                        );
+                    }
+                    match vm {
+                        VmOwner::Busy => {
+                            warn!(handle, "an engine exit no container claims, and the VM manager did not answer within {EXIT_ROUTE_VM_LOOKUP:?}: waking every VMI");
+                            ExitWake::AllVms
+                        }
+                        VmOwner::Known(uid) => exit_wake(None, Some(uid)),
+                        VmOwner::None => exit_wake(pod, None),
+                    }
                 }
                 // Missed some: nobody knows whose, so everyone looks.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => ExitWake::Everyone,
@@ -556,6 +579,7 @@ impl Kubelet {
             match wake {
                 ExitWake::Pod(uid) => self.workloads.wake_where(Kind::Pod, |k| k.uid == uid),
                 ExitWake::Vm(uid) => self.workloads.wake_where(Kind::VirtualMachine, |k| k.uid == uid),
+                ExitWake::AllVms => self.workloads.wake_kind(Kind::VirtualMachine),
                 ExitWake::Everyone => {
                     debug!("an engine exit no workload here claims: waking every Pod and VMI");
                     self.workloads.wake_kind(Kind::Pod);
@@ -2015,7 +2039,23 @@ enum ExitWake {
     /// A handle no record here names (an adopted workload, a race with its
     /// removal): every Pod and VMI looks, as every exit used to make them.
     Everyone,
+    /// No container has it and the VM manager did not answer in time (#285):
+    /// every VMI looks, the Pods are not woken for it.
+    AllVms,
 }
+
+/// Whose an exit is, as the VM manager answered (#285).
+enum VmOwner {
+    Known(String),
+    None,
+    /// Its lock was held past [`EXIT_ROUTE_VM_LOOKUP`].
+    Busy,
+}
+
+/// How long an exit's routing waits on the VM manager's records (#285).
+const EXIT_ROUTE_VM_LOOKUP: Duration = Duration::from_secs(1);
+/// An exit routed slower than this is said (#285).
+const EXIT_ROUTE_SLOW: Duration = Duration::from_secs(1);
 
 /// Its own pod, else its own VMI, else everyone.
 fn exit_wake(pod: Option<String>, vm: Option<String>) -> ExitWake {
