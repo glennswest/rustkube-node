@@ -2805,7 +2805,12 @@ mod tests {
     /// groups, fsGroup first, each once; none asked, none set.
     #[test]
     fn fs_group_and_supplemental_groups_become_the_specs_groups() {
-        let cc = ContainerConfig { fs_group: Some(2000), supplemental_groups: vec![3000, 2000, 4000], ..Default::default() };
+        let cc = ContainerConfig {
+            command: vec!["/bin/true".into()],
+            fs_group: Some(2000),
+            supplemental_groups: vec![3000, 2000, 4000],
+            ..Default::default()
+        };
         let spec = spec_of(&cc, &PodSandboxConfig::default());
         assert_eq!(spec.groups, [2000, 3000, 4000]);
         spec.validate().unwrap();
