@@ -908,6 +908,7 @@
 ## [Unreleased]
 
 ### 2026-10-21
+- **perf:** a claim's lookup (#95): the PV and the engine's volume list read once each and together (were the PV twice and the list up to three times, in a row: 10.6 s on the Dell under I/O stress, 12.37); the StorageClass read while the capacity lock is waited for; capacity's slabs and volumes together. New `claim/<volume>/room` step (policy + capacity, inside `lookup`) in `storm.io/start-timing` and the `claim/room` histogram.
 - **feat:** pod capabilities on stormpump (#118): `Spec.caps` = the standard 14 − drop + add (privileged: every capability), `no_new_privs` from `allowPrivilegeEscalation: false` (also forwarded on CRI gRPC); an unknown name fails the create naming it. Pods no longer run with every capability (stormpump's node suite saw `CapEff 000001ffffffffff`). Needs stormpump accd1a3e8e61+ in the release.
 - **docs:** #102's work plan: the Dell runs 12.37, but the turbomode run is stormcos_qa's to queue (403 for this token); waits on stormcos_qa#78.
 
