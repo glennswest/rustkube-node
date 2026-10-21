@@ -58,7 +58,7 @@ by #51.
 
 ## Work plan
 
-### Waiting on a pvetest1 install with golden 3672fc1e06d0: #259 (P2), the second VM of the install probe starts late on pvetest1 (3.5 s → 6.7 s since 12.19)
+### Done (not reproducing since 12.30): #259 (P2), the second VM of the install probe starts late on pvetest1 (3.5 s → 6.7 s since 12.19)
 
 2026-10-14. Samples (stormcentral /api/v1/metrics): the Dell's `vm_start_ready_ms` is 1.19–2.12 s on every release
 since 11.88 (12.27's 1.64 is in range: noise). pvetest1: the first VM (`vm_start_ms`) 117–184 ms throughout; the
@@ -82,6 +82,11 @@ per owned volume and the deletes, and every start waits on its read. Doing:
        (`launch`); close.
        2026-10-14: 12.28 (carries 3672fc1e06d0) failed on pvetest1 before the probes (stormcos#587: static-pod.sh
        `mkdir: not found`, no control plane); the golden rolls into the next release; queued `--after` stormcos#587.
+       2026-10-21: closed on the samples (stormcentral /api/v1/metrics). pvetest1's second VM (`vm_start_ready_ms`) since
+       12.30 (carries 3672fc1e06d0): 107–461 ms on nine installs (one 1360 on 12.35; pvetest2 one 1199 on 12.36); 12.37 118.
+       Dell since 11.88: `vm_start_ms` median 1010 (619–2336), 12.37 1043; `vm_start_ready_ms` 1191–2119, 12.37 1559.
+       The VMI `started:` lines had rolled out of every console ring (probe VMIs are deleted, so no annotation). The
+       sweep-lock suspect stays unproven; a recurrence reads the step that grew from `VMI … started:`.
 
 ### Done: #255 (P3), stormvm → a8b509d: pod:passt's passt as a stormpump helper (stormvm#7), chv display (stormvm#1)
 

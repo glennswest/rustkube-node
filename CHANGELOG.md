@@ -908,6 +908,7 @@
 ## [Unreleased]
 
 ### 2026-10-21
+- **docs:** #259 closed: the second probe VM's start on pvetest1 is 107–461 ms on every install since 12.30 (was 3.5–6.7 s on 12.19–12.27); the Dell's VM starts are within their spread since 11.88. The VMI start timing (94cd23c) stays for a recurrence.
 - **feat:** fsGroup and supplementalGroups (#171): the pod's fsGroup then supplementalGroups are the container's groups (stormpump `Spec.groups`, also for an exec; CRI `supplemental_groups`), and a claim's filesystem is given to fsGroup before the start (group read-write, setgid directories, symlinks skipped; `fsGroupChangePolicy: OnRootMismatch` checks only the root). A non-root container can now write its claim.
 - **docs:** #64's work plan: the medium run waits on stormcos#271 (test machines cannot fetch test images from forge).
 - **docs:** #52's work plan: stormcentral#479 is in, but no node can run csi-driver-host-path's plugin (not a pinned image); the owner is asked which driver runs the end-to-end.
