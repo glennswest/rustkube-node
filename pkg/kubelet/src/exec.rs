@@ -66,6 +66,106 @@ impl Pty {
     }
 }
 
+impl Pty {
+    /// Another handle on the same master (a resize from an attach while the
+    /// copier keeps reading).
+    pub fn try_clone(&self) -> io::Result<Pty> {
+        Ok(Pty(self.0.try_clone()?))
+    }
+}
+
+/// A `stdin: true` or `tty: true` container's stdio, held by the kubelet for
+/// the container's life (#56): what `kubectl attach` reaches.
+///
+/// A terminal is the kubelet's pty on the container's 0–2, not the engine's
+/// `tty` (which is *the node's console*, one per node): its output is copied
+/// here, to the container's log file and to whoever is attached.
+pub struct Console {
+    /// The container's stdin, while it is open.
+    pub stdin: tokio::sync::Mutex<Option<Writer>>,
+    /// A terminal's output, as it is read (`None` without one: attach then
+    /// follows the log file).
+    pub output: Option<tokio::sync::broadcast::Sender<axum::body::Bytes>>,
+    pub pty: Option<Pty>,
+    /// The container's log file.
+    pub log_file: std::path::PathBuf,
+}
+
+impl Console {
+    /// Make one for a container (`stdin`, `tty` as its spec says): the console
+    /// and the descriptors to deposit for its 0 (and 1, 2 with a terminal).
+    pub fn make(stdin: bool, tty: bool, log_file: std::path::PathBuf) -> io::Result<(Console, ChildEnds)> {
+        let io = ExecIo { stdin, stdout: tty, stderr: false, tty };
+        let (stdio, ends) = make(&io)?;
+        let output = tty.then(|| tokio::sync::broadcast::channel(256).0);
+        let console = Console {
+            stdin: tokio::sync::Mutex::new(stdio.stdin),
+            output: output.clone(),
+            pty: stdio.pty,
+            log_file: log_file.clone(),
+        };
+        // A terminal's output: into the log, and to each attach.
+        if let (Some(mut out), Some(output)) = (stdio.stdout, output) {
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut log = tokio::fs::OpenOptions::new().create(true).append(true).open(&log_file).await.ok();
+                let mut buf = vec![0u8; 32 * 1024];
+                loop {
+                    match out.read(&mut buf).await {
+                        // EIO once the container's last descriptor on it closed.
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if let Some(f) = log.as_mut() {
+                                let _ = f.write_all(&buf[..n]).await;
+                            }
+                            let _ = output.send(axum::body::Bytes::copy_from_slice(&buf[..n]));
+                        }
+                    }
+                }
+            });
+        }
+        Ok((console, ends))
+    }
+}
+
+/// Follow `path` from its end: what is appended, as it is. A file that shrank
+/// (a copy-truncate rotation, #216) is read again from its start. Ends when
+/// `until` has fired and nothing more came, or the reader goes.
+pub fn follow(path: std::path::PathBuf, mut until: tokio::sync::watch::Receiver<bool>) -> Reader {
+    let (mut w, r) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+        let Ok(mut f) = tokio::fs::File::open(&path).await else { return };
+        let mut at = f.seek(std::io::SeekFrom::End(0)).await.unwrap_or(0);
+        let mut buf = vec![0u8; 32 * 1024];
+        loop {
+            let len = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(at);
+            if len < at {
+                at = f.seek(std::io::SeekFrom::Start(0)).await.unwrap_or(0);
+            }
+            match f.read(&mut buf).await {
+                Ok(n) if n > 0 => {
+                    at += n as u64;
+                    if w.write_all(&buf[..n]).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                Ok(_) => {}
+                Err(_) => return,
+            }
+            if *until.borrow() {
+                return;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+                _ = until.changed() => {}
+            }
+        }
+    });
+    Box::pin(r)
+}
+
 /// Make the descriptors for `io`.
 pub fn make(io: &ExecIo) -> io::Result<(Stdio, ChildEnds)> {
     let mut ours = Stdio::default();
@@ -200,6 +300,48 @@ mod tests {
         let mut buf = [0u8; 16];
         let n = ours.stdout.as_mut().unwrap().read(&mut buf).await.unwrap();
         assert!(buf[..n].starts_with(b"hi"), "{:?}", &buf[..n]);
+    }
+
+    #[tokio::test]
+    async fn a_followed_log_gives_what_is_appended_and_reads_a_truncated_one_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("0.log");
+        std::fs::write(&path, "before attach\n").unwrap();
+        let (done, until) = tokio::sync::watch::channel(false);
+        let mut r = follow(path.clone(), until);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let append = |s: &str| {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(s.as_bytes()).unwrap();
+        };
+        append("one\n");
+        let mut buf = [0u8; 64];
+        let n = r.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"one\n", "only what came after the attach");
+        std::fs::write(&path, "").unwrap(); // rotated: copy-truncate
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        append("two\n");
+        let n = r.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"two\n");
+        done.send(true).unwrap();
+        assert_eq!(r.read(&mut buf).await.unwrap(), 0, "ends once the container has");
+    }
+
+    #[tokio::test]
+    async fn a_terminal_containers_output_reaches_its_log_and_each_attach() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("0.log");
+        let (console, ends) = Console::make(true, true, log.clone()).unwrap();
+        let mut attached = console.output.as_ref().unwrap().subscribe();
+        assert_eq!(ends.0.iter().map(|(fd, _)| *fd).collect::<Vec<_>>(), [0, 1, 2]);
+        let mut slave = std::fs::File::from(ends.0.into_iter().nth(1).unwrap().1);
+        slave.write_all(b"hello\n").unwrap();
+        let got = attached.recv().await.unwrap();
+        assert!(got.starts_with(b"hello"), "{got:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(std::fs::read_to_string(&log).unwrap().starts_with("hello"));
+        // Its stdin reaches the container.
+        console.stdin.lock().await.as_mut().unwrap().write_all(b"ls\n").await.unwrap();
     }
 
     #[test]

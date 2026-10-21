@@ -162,6 +162,43 @@ struct Container {
     /// What a process run inside it inherits (#56): the container's composed
     /// env, cwd, user and capabilities. `None` for a record not created here.
     exec_base: Option<ExecBase>,
+    /// `stdin: true` / `tty: true` (#56): the deposits its spec names for its
+    /// 0 (and 1, 2 with a terminal), made and deposited at start.
+    stdio: Option<StdioWanted>,
+    /// What `kubectl attach` reaches, once started.
+    console: Option<Arc<crate::exec::Console>>,
+    /// Its log file: what `kubectl attach` follows without a terminal.
+    log_file: std::path::PathBuf,
+}
+
+/// A container's stdio held by the kubelet (#56).
+#[derive(Clone, Debug)]
+struct StdioWanted {
+    stdin: bool,
+    tty: bool,
+    /// The deposits' names and the fd each becomes.
+    slots: Vec<(String, i32)>,
+    log_file: std::path::PathBuf,
+}
+
+/// The slots of a container's stdio (#56): a terminal on 0, 1 and 2, or a
+/// stdin pipe on 0; `None` when it asked for neither.
+fn stdio_wanted(id: &str, config: &ContainerConfig, log_dir: &str) -> Option<StdioWanted> {
+    if !config.stdin && !config.tty {
+        return None;
+    }
+    let slots = if config.tty {
+        (0..3).map(|fd| (format!("ctty-{id}-{fd}"), fd)).collect()
+    } else {
+        vec![(format!("cin-{id}"), 0)]
+    };
+    Some(StdioWanted { stdin: config.stdin, tty: config.tty, slots, log_file: log_file_of(config, log_dir) })
+}
+
+/// `<log dir>/<restart>.log`, the file the spec's `log_name` names.
+fn log_file_of(config: &ContainerConfig, log_dir: &str) -> std::path::PathBuf {
+    let name = config.log_path.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("0.log");
+    std::path::Path::new(log_dir).join(name)
 }
 
 /// The container's side of an exec (#56).
@@ -857,7 +894,10 @@ fn spec_for(
             ipc: config.host_ipc || sandbox.host_ipc,
             uts: false,
         },
-        tty: config.tty,
+        // Never the engine's `tty`: that is *the node's console*, one per node,
+        // and a `tty: true` pod took it (#56). A pod's terminal is a pty the
+        // kubelet holds, on the container's 0–2 (`create_container`).
+        tty: false,
         // The pod's QoS group (#57, the owner's choice on #106: OpenShift's
         // shape, stormpump#68): Pods under `pods/`, beside the node services
         // rather than among them, so upstream's shares → weight conversion
@@ -1417,6 +1457,7 @@ impl RuntimeService for StormpumpRuntime {
                 }
             }
         }
+        let log_dir = format!("{}/{}", _sandbox_config.log_directory.trim_end_matches('/'), config.name);
         let mut exec_base = None;
         let defined = match compose_for(config, image.as_ref(), name.as_deref(), Some(&read_root)) {
             Ok(run) => {
@@ -1427,7 +1468,12 @@ impl RuntimeService for StormpumpRuntime {
                     gid: run.gid,
                     caps: caps_for(config),
                 });
-                let spec = spec_for(config, _sandbox_config, run, Some(&read_root));
+                let mut spec = spec_for(config, _sandbox_config, run, Some(&read_root));
+                if let Some(w) = stdio_wanted(&id, config, &log_dir) {
+                    spec.fds.extend(
+                        w.slots.into_iter().map(|(name, target_fd)| stormpump::spec::FdSlot { name, target_fd }),
+                    );
+                }
                 // A capability name the engine does not know would come back as
                 // spec code 54; say which one, here.
                 match spec.caps.resolve() {
@@ -1464,11 +1510,7 @@ impl RuntimeService for StormpumpRuntime {
                 .take(MAX_MOUNTS)
                 .map(|m| (m.host_path.clone(), m.fstype.clone()))
                 .collect(),
-            log_dir: format!(
-                "{}/{}",
-                _sandbox_config.log_directory.trim_end_matches('/'),
-                config.name
-            ),
+            log_dir: log_dir.clone(),
             image: config.image.clone(),
             spec_handle: Some(spec),
             workload_handle: None,
@@ -1502,6 +1544,9 @@ impl RuntimeService for StormpumpRuntime {
             host_pid: config.host_pid,
             removing: None,
             exec_base: Some(exec_base),
+            stdio: stdio_wanted(&id, config, &log_dir),
+            console: None,
+            log_file: log_file_of(config, &log_dir),
         };
         let qualified = format!("{}/{}/{}", c.namespace, c.pod, c.name);
         self.containers.lock().await.insert(id.clone(), c);
@@ -1514,7 +1559,7 @@ impl RuntimeService for StormpumpRuntime {
 
     async fn start_container(&self, container_id: &str) -> Result<(), CriError> {
         self.probe()?;
-        let (spec, path, log_dir, sandbox_id, mount_sources) = {
+        let (spec, path, log_dir, sandbox_id, mount_sources, stdio) = {
             let containers = self.containers.lock().await;
             let c = containers
                 .get(container_id)
@@ -1532,7 +1577,7 @@ impl RuntimeService for StormpumpRuntime {
                 ))
             })?;
             let path = c.root_path.clone().unwrap_or_default();
-            (spec, (root, path), c.log_dir.clone(), c.sandbox_id.clone(), c.mount_sources.clone())
+            (spec, (root, path), c.log_dir.clone(), c.sandbox_id.clone(), c.mount_sources.clone(), c.stdio.clone())
         };
         let (root, path) = path;
 
@@ -1563,10 +1608,31 @@ impl RuntimeService for StormpumpRuntime {
             )));
         }
 
+        // `stdin: true` / `tty: true` (#56): the kubelet's ends kept, the
+        // container's deposited under the names its spec gives them.
+        let (console, deposits) = match &stdio {
+            Some(w) => {
+                let (console, ends) = crate::exec::Console::make(w.stdin, w.tty, w.log_file.clone())
+                    .map_err(|e| CriError::Runtime(format!("container {container_id}: its stdin or terminal: {e}")))?;
+                let deposits: Vec<(String, std::os::fd::OwnedFd)> = ends
+                    .0
+                    .into_iter()
+                    .filter_map(|(fd, end)| w.slots.iter().find(|(_, f)| *f == fd).map(|(n, _)| (n.clone(), end)))
+                    .collect();
+                (Some(Arc::new(console)), deposits)
+            }
+            None => (None, Vec::new()),
+        };
+
         let (workload, held) = self
             .on_ring(move |r| {
                 let mut held = Vec::new();
+                let mut deposited = Vec::new();
                 let result = (|| {
+                for (name, fd) in deposits {
+                    r.deposit_fd(&name, fd)?;
+                    deposited.push(name);
+                }
                 // Its own root, registered at create and released at removal.
                 let logs = r.volume_register(&log_dir)?;
                 held.push(logs);
@@ -1625,6 +1691,12 @@ impl RuntimeService for StormpumpRuntime {
                         }
                     })
                 })();
+                // Deposits no spawn consumed go back (stormpump#63).
+                if result.is_err() {
+                    for name in &deposited {
+                        let _ = r.deposit_withdraw(name);
+                    }
+                }
                 // Preserve partial registrations even when a later operation fails.
                 Ok((result, held))
             })
@@ -1637,6 +1709,7 @@ impl RuntimeService for StormpumpRuntime {
         c.volume_handles = held;
         let workload = workload.map_err(|e| CriError::Runtime(e.to_string()))?;
         c.workload_handle = Some(workload);
+        c.console = console;
         c.state = ContainerState::Running;
         c.started_at = now_nanos();
         let identity = c.identity.clone();
@@ -1975,6 +2048,137 @@ impl RuntimeService for StormpumpRuntime {
         });
         Ok(crate::cri::ExecSession { stdio, exit, kill })
     }
+
+    async fn attach_process(
+        &self,
+        container_id: &str,
+        io: crate::exec::ExecIo,
+    ) -> Result<crate::cri::ExecSession, CriError> {
+        attach_to(self, container_id, io).await
+    }
+}
+
+/// `kubectl attach` to a stormpump container (#56): its stdin (when it was
+/// made with `stdin: true`), and its output: a terminal's as the kubelet
+/// reads it, else its log file followed from now. Ends when the container
+/// does; `kill` detaches and leaves it running.
+async fn attach_to(
+    runtime: &StormpumpRuntime,
+    container_id: &str,
+    io: crate::exec::ExecIo,
+) -> Result<crate::cri::ExecSession, CriError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    runtime.absorb_exits().await;
+    let (workload, console, log_file, qualified) = {
+        let containers = runtime.containers.lock().await;
+        let c = containers
+            .get(container_id)
+            .filter(|c| c.removing.is_none())
+            .ok_or_else(|| CriError::NotFound(format!("container {container_id}")))?;
+        let qualified = format!("{}/{}/{}", c.namespace, c.pod, c.name);
+        let workload = c
+            .workload_handle
+            .filter(|_| c.state == ContainerState::Running)
+            .ok_or_else(|| CriError::Runtime(format!("container {qualified} is not running")))?;
+        (workload, c.console.clone(), c.log_file.clone(), qualified)
+    };
+    let terminal = console.as_ref().filter(|c| c.pty.is_some());
+    if io.tty && terminal.is_none() {
+        return Err(CriError::Runtime(format!(
+            "unable to use a TTY: container {qualified} did not allocate one (tty: true)"
+        )));
+    }
+    let ring = runtime.ring()?;
+
+    // `ended`: the container's exit. `stop`: that, or the client detaching.
+    let (ended_tx, mut ended) = tokio::sync::watch::channel(false);
+    let (stop_tx, stop) = tokio::sync::watch::channel(false);
+    let stop_tx = Arc::new(stop_tx);
+    let mut exits = ring.subscribe_exit_handles();
+    {
+        let stop_tx = stop_tx.clone();
+        tokio::spawn(async move {
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                match exits.recv().await {
+                    Ok(h) if h == workload.0 => break,
+                    Ok(_) | Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => break,
+                }
+            }
+            let _ = ended_tx.send(true);
+            let _ = stop_tx.send(true);
+        });
+    }
+    let (exit_tx, exit) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if ended.wait_for(|e| *e).await.is_ok() {
+            let _ = exit_tx.send(0);
+        }
+    });
+
+    let mut stdio = crate::exec::Stdio::default();
+    if io.stdin {
+        let (w, mut r) = tokio::io::duplex(16 * 1024);
+        stdio.stdin = Some(Box::pin(w));
+        let console = console.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                let n = match r.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                // A container without an open stdin takes nothing (upstream).
+                let Some(console) = &console else { continue };
+                let mut stdin = console.stdin.lock().await;
+                if let Some(to) = stdin.as_mut() {
+                    if to.write_all(&buf[..n]).await.is_err() || to.flush().await.is_err() {
+                        *stdin = None;
+                    }
+                }
+            }
+        });
+    }
+    if io.stdout || io.stderr {
+        let out: crate::exec::Reader = match terminal.and_then(|c| c.output.as_ref()) {
+            Some(output) => {
+                let mut rx = output.subscribe();
+                let mut stop = stop.clone();
+                let (mut w, r) = tokio::io::duplex(64 * 1024);
+                tokio::spawn(async move {
+                    use tokio::sync::broadcast::error::RecvError;
+                    loop {
+                        tokio::select! {
+                            got = rx.recv() => match got {
+                                Ok(b) => if w.write_all(&b).await.is_err() { return },
+                                Err(RecvError::Lagged(_)) => continue,
+                                Err(RecvError::Closed) => return,
+                            },
+                            _ = stop.wait_for(|s| *s) => return,
+                        }
+                    }
+                });
+                Box::pin(r)
+            }
+            None => crate::exec::follow(log_file, stop.clone()),
+        };
+        // One combined stream (the engine's log is both): stdout when asked.
+        if io.stdout {
+            stdio.stdout = Some(out);
+        } else {
+            stdio.stderr = Some(out);
+        }
+    }
+    stdio.pty = match terminal.and_then(|c| c.pty.as_ref()) {
+        Some(p) => p.try_clone().ok(),
+        None => None,
+    };
+    tracing::info!(container = %qualified, tty = io.tty, stdin = io.stdin, "stormpump: attached");
+    let kill: Box<dyn Fn() + Send + Sync> = Box::new(move || {
+        let _ = stop_tx.send(true);
+    });
+    Ok(crate::cri::ExecSession { stdio, exit, kill })
 }
 
 /// The most of each stream an `exec_sync` keeps; the rest is read and dropped
@@ -2797,6 +3001,9 @@ mod tests {
                     host_pid: false,
                     removing: None,
                     exec_base: None,
+                    stdio: None,
+                    console: None,
+                    log_file: Default::default(),
                 },
             );
         }
@@ -2997,6 +3204,9 @@ mod tests {
                     host_pid: false,
                     removing: None,
                     exec_base: None,
+                    stdio: None,
+                    console: None,
+                    log_file: Default::default(),
                 },
             );
             ids.push(id);
@@ -3502,6 +3712,9 @@ mod tests {
             host_pid: false,
             removing: None,
             exec_base: None,
+            stdio: None,
+            console: None,
+            log_file: Default::default(),
         }
     }
 
