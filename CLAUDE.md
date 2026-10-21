@@ -1164,7 +1164,7 @@ The lock pins stormpump 30a76d3, stormvm dc1b7ea, stormcast 801f822; all three m
        byte-sized emptyDisk). sc-build 4545e23: 364 kubelet unit pass. Golden golden-rustkube-node-a97563b0a5c7
        (stormcos#366). #81 closed, #164 shipped. #52's step 6 is done; its end-to-end with a real driver stays.
 
-### In progress: #262 (P1), static pods wait ~4 s behind kubelet startup (12.30 reboot, stormcos#596)
+### Waiting on a release with 2bf962a: #262 (P1), static pods wait ~4 s behind kubelet startup (12.30 reboot, stormcos#596)
 
 2026-10-21. Found: (2) `volumes=1142ms` on hostPath-only static pods is `service_account_mount`: every pod without
 `automountServiceAccountToken: false` gets a kube-api-access token asked of the apiserver (`Policy::API`), which at
@@ -1176,7 +1176,11 @@ code explains seconds, and no node's console ring still holds a boot. Doing:
 2. [x] `startup.rs`: each `main` step timed (flags, cni, engine, runtime, credentials, kubelet) → `Kubelet starting for
        node … (startup: …)`; the engine client's HTTP build warned when > 100 ms; `first static pod … running N ms
        after the kubelet started` once.
-3. [ ] Tests, README, CHANGELOG; sc-build; stage golden. Then read the next pvetest boot's `startup:` line: if
+3. [x] Tests, README, CHANGELOG (2bf962a, 6c8d04d). SC_BUILD_VM sc-build (job ad11738c5b): 541 kubelet unit, all
+       suites, warnings = #227's. Stage golden golden-rustkube-node-bb53f0c47eb4 (stormcos#628). #262 proposed
+       `--after-release rustkube-node>=2bf962a`. (#272 was my `cargo tree -i getrandom` diagnostic: closed.)
+4. [ ] Resume: `stormcentral testhost logs pvetest2 kubelet --search startup` after its next boot (or the stormd
+       API on :9085): `volumes` in ms, the `engine` step and the HTTP-client warning. Then read the next pvetest boot's `startup:` line: if
        `engine` is still ~3 s, the warning says whether it is the HTTP client (then the step moves or is filed where it
        lies); close on the numbers.
 
