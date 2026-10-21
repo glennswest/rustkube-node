@@ -3018,10 +3018,10 @@ mod tests {
         assert!(a.starts_with("ct-") && b.starts_with("ct-"));
     }
 
-    /// Everything below runs without an engine. The lifecycle itself needs
-    /// one — a sandbox is acquired from stormpump's pool and a container is a
-    /// spawn — so what is tested here is the bookkeeping either side of the
-    /// ring, and the failures a node without stormpump should give.
+    // Everything below runs without an engine. The lifecycle itself needs
+    // one — a sandbox is acquired from stormpump's pool and a container is a
+    // spawn — so what is tested here is the bookkeeping either side of the
+    // ring, and the failures a node without stormpump should give.
 
     /// #285: an exit read before the start recorded its handle (a quick init
     /// container, read by another pod's status call) is kept, not dropped, and
