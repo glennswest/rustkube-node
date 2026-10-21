@@ -1348,17 +1348,19 @@ every suite needs to resolve STORM_NODE). Pods are pinned with `spec.nodeName` (
 ownership change of a claim's filesystem at mount (upstream's recursive chown/chmod, `fsGroupChangePolicy`
 OnRootMismatch); tests; docs (README "Not yet"); CHANGELOG; sc-build; golden.
 
-### In progress: #118 (P1), pod capabilities onto the ring (stormpump#47's `Spec.caps`)
+### Done: #118 (P1), pod capabilities onto the ring (stormpump#47's `Spec.caps`)
 
 2026-10-21. Lock's stormpump 9877a97 has `Spec.caps: Caps {base: Full|Standard, add, drop, no_new_privs}` (names as
 Kubernetes spells them, drop before add, unknown name = spec code 54; default Full = what every pod gets today:
 stormpump's node suite saw `CapEff 000001ffffffffff` on a plain pod, e4c7c276ed). Doing:
-1. [ ] `ContainerConfig.no_new_privs` (`allowPrivilegeEscalation: false`), forwarded on CRI gRPC too.
-2. [ ] `spec_for`: `caps_for(config)`: privileged → Full (add/drop ignored, as upstream); else Standard + add/drop +
+1. [x] `ContainerConfig.no_new_privs` (`allowPrivilegeEscalation: false`), forwarded on CRI gRPC too.
+2. [x] `spec_for`: `caps_for(config)`: privileged → Full (add/drop ignored, as upstream); else Standard + add/drop +
        no_new_privs. Module doc "What this does not do yet" updated.
-3. [ ] Tests (Standard by default, add/drop carried, privileged Full, `resolve` of Cilium's drop ALL + add list),
+3. [x] Tests (Standard by default, add/drop carried, privileged Full, `resolve` of Cilium's drop ALL + add list),
        README/status.md, CHANGELOG; sc-build; stage golden (needs stormpump accd1a3e8e61+, already required); close.
        Live: `stormcentral test run stormpump node` `pod-capabilities` after a release (stormpump's suite).
+       Done: f57a7c0 (+ test fix 43020cd = #269), docs d5a4e9b. SC_BUILD_VM sc-build 43020cd (job 0d2d1dc87b): 526 kubelet
+       unit, all suites pass, warnings = #227's. Stage golden golden-rustkube-node-72c9244f0ffc (stormcos#628). Closed.
 (earlier) 
 2026-10-09 (#220): the lock's stormpump 13cf2c9 carries `Spec.caps` (stormpump golden accd1a3e8e61), and the stormvm#65
 lock blocker is gone. Next: item 2 below (map add/drop/privileged into `Spec.caps` in `spec_for`, test CapEff).
