@@ -542,35 +542,13 @@ impl Kubelet {
         loop {
             let wake = match exits.recv().await {
                 Ok(handle) => {
-                    let began = std::time::Instant::now();
-                    let pod = self.pod_manager.pod_of_workload(handle).await;
-                    let looked_up_pod = began.elapsed();
-                    // Only a handle no container has can be a VM's (#285):
-                    // the VM manager's lock is held across slow work (a start,
-                    // the disk sweep), and a pod's exit must not wait on it.
-                    let vm = match (&pod, &self.vms) {
-                        (None, Some(v)) => match time::timeout(EXIT_ROUTE_VM_LOOKUP, v.uid_of_handle(handle)).await {
-                            Ok(vm) => vm.map(VmOwner::Known).unwrap_or(VmOwner::None),
-                            Err(_) => VmOwner::Busy,
-                        },
-                        _ => VmOwner::None,
-                    };
-                    let took = began.elapsed();
-                    if took > EXIT_ROUTE_SLOW {
-                        warn!(
-                            handle, pod_lookup_ms = looked_up_pod.as_millis() as u64, total_ms = took.as_millis() as u64,
-                            "routing an engine exit took {} ms ({})", took.as_millis(),
-                            if looked_up_pod > EXIT_ROUTE_SLOW { "the container runtime's records were busy" } else { "the VM manager was busy" }
-                        );
-                    }
-                    match vm {
-                        VmOwner::Busy => {
-                            warn!(handle, "an engine exit no container claims, and the VM manager did not answer within {EXIT_ROUTE_VM_LOOKUP:?}: waking every VMI");
-                            ExitWake::AllVms
-                        }
-                        VmOwner::Known(uid) => exit_wake(None, Some(uid)),
-                        VmOwner::None => exit_wake(pod, None),
-                    }
+                    let vms = self.vms.clone();
+                    route_exit(
+                        handle,
+                        self.pod_manager.pod_of_workload(handle),
+                        vms.map(|v| move || async move { v.uid_of_handle(handle).await }),
+                    )
+                    .await
                 }
                 // Missed some: nobody knows whose, so everyone looks.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => ExitWake::Everyone,
@@ -2057,6 +2035,44 @@ const EXIT_ROUTE_VM_LOOKUP: Duration = Duration::from_secs(1);
 /// An exit routed slower than this is said (#285).
 const EXIT_ROUTE_SLOW: Duration = Duration::from_secs(1);
 
+/// Whom one engine exit wakes (#115, #285): its pod, found first; the VM
+/// manager is asked only about a handle no container has, and for at most
+/// [`EXIT_ROUTE_VM_LOOKUP`], because its lock is held across slow work (a
+/// start, the disk sweep) and a pod's exit must not wait on it.
+async fn route_exit<P, F, V>(handle: u64, pod: P, vm: Option<F>) -> ExitWake
+where
+    P: std::future::Future<Output = Option<String>>,
+    F: FnOnce() -> V,
+    V: std::future::Future<Output = Option<String>>,
+{
+    let began = std::time::Instant::now();
+    let pod = pod.await;
+    let looked_up_pod = began.elapsed();
+    let owner = match (&pod, vm) {
+        (None, Some(vm)) => match time::timeout(EXIT_ROUTE_VM_LOOKUP, vm()).await {
+            Ok(uid) => uid.map(VmOwner::Known).unwrap_or(VmOwner::None),
+            Err(_) => VmOwner::Busy,
+        },
+        _ => VmOwner::None,
+    };
+    let took = began.elapsed();
+    if took > EXIT_ROUTE_SLOW {
+        warn!(
+            handle, pod_lookup_ms = looked_up_pod.as_millis() as u64, total_ms = took.as_millis() as u64,
+            "routing an engine exit took {} ms ({})", took.as_millis(),
+            if looked_up_pod > EXIT_ROUTE_SLOW { "the container runtime's records were busy" } else { "the VM manager was busy" }
+        );
+    }
+    match owner {
+        VmOwner::Busy => {
+            warn!(handle, "an engine exit no container claims, and the VM manager did not answer within {EXIT_ROUTE_VM_LOOKUP:?}: waking every VMI");
+            ExitWake::AllVms
+        }
+        VmOwner::Known(uid) => exit_wake(None, Some(uid)),
+        VmOwner::None => exit_wake(pod, None),
+    }
+}
+
 /// Its own pod, else its own VMI, else everyone.
 fn exit_wake(pod: Option<String>, vm: Option<String>) -> ExitWake {
     match (pod, vm) {
@@ -2140,6 +2156,31 @@ mod exit_wake_tests {
         assert_eq!(exit_wake(Some("pod-a".into()), None), ExitWake::Pod("pod-a".into()));
         assert_eq!(exit_wake(None, Some("vmi-b".into())), ExitWake::Vm("vmi-b".into()));
         assert_eq!(exit_wake(None, None), ExitWake::Everyone, "unknown: the old behaviour");
+    }
+    /// #285: a pod's exit is routed without asking the VM manager, so a VM
+    /// pass holding its lock delays nothing; a handle no container has waits
+    /// on it at most a second, then wakes every VMI.
+    #[tokio::test]
+    async fn a_held_vm_lock_does_not_hold_a_pods_exit() {
+        let held = tokio::sync::Mutex::new(());
+        let guard = held.lock().await;
+        let vm_lookup = || async { let _ = held.lock().await; Some("vmi-x".to_string()) };
+        let began = std::time::Instant::now();
+        let wake = route_exit(7, async { Some("pod-a".to_string()) }, Some(vm_lookup)).await;
+        assert_eq!(wake, ExitWake::Pod("pod-a".into()));
+        assert!(began.elapsed() < Duration::from_millis(100), "the VM lock was not awaited");
+
+        let vm_lookup = || async { let _ = held.lock().await; Some("vmi-x".to_string()) };
+        let began = std::time::Instant::now();
+        let wake = route_exit(8, async { None }, Some(vm_lookup)).await;
+        assert_eq!(wake, ExitWake::AllVms, "busy VM manager: every VMI, not every Pod");
+        assert!(began.elapsed() < EXIT_ROUTE_VM_LOOKUP + Duration::from_millis(500));
+
+        drop(guard);
+        let vm_lookup = || async { let _ = held.lock().await; Some("vmi-x".to_string()) };
+        assert_eq!(route_exit(9, async { None }, Some(vm_lookup)).await, ExitWake::Vm("vmi-x".into()));
+        let none: Option<fn() -> std::future::Ready<Option<String>>> = None;
+        assert_eq!(route_exit(10, async { None }, none).await, ExitWake::Everyone);
     }
     // That `wake_where` queues the picked key alone is `workload::tests::
     // wake_where_wakes_only_the_picked_keys`.

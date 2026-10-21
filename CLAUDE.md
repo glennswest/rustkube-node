@@ -73,7 +73,8 @@ logged only when some pass drains it, so the log shows when it was read, not whe
        handle.
 3. [x] Engine waits said: a ring call over 1 s warned (op, ms, whether it waited for the arena); an engine HTTP call
        over 1 s warned (method, path, ms).
-4. [ ] Tests (early exit kept and applied; router not blocked by a held VM lock), README/CHANGELOG; sc-build; stage; close.
+4. [ ] Tests (early exit kept and applied: 75de9f1; router not blocked by a held VM lock: `route_exit` extracted, test),
+       README/CHANGELOG (75de9f1); sc-build; stage; close.
 
 ### In progress: #275 (P2), the kubelet on the Kubernetes 1.36 API (k8s-openapi 0.28 v1_36, kube 4.2)
 
