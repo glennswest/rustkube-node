@@ -2424,9 +2424,26 @@ cmdline's absence). #232 (my #71 regression): kind: clone / fsType: ext4 accepte
 sc-build ca44386: 475 kubelet unit pass. Golden golden-rustkube-node-9b876df216c9 (stormcos#424), master told; close
 both when the Dell runs cilium-operator and a new claim. #21 paused on branch wip/21-rebased.
 
-### Waiting on the owner: #52, external StorageClasses (the CSI node side): which driver runs the node end-to-end
+### In progress: #52, external StorageClasses: the end-to-end with the test container's own CSI driver (master: A)
 
-2026-10-21. stormcentral#479 landed (`cluster_write`, `service_account_cluster_rules`). Blocker found: no stormcos node
+2026-10-21. Master's decision on #52: **A**, the suite brings its own driver. Host `/var/lib/kubelet` is the
+kubelet's (stormcos `volume kubeletdir`), so a driver pod's hostPath reaches what the kubelet watches. Doing:
+1. [ ] `test/`: tonic/prost + build.rs on the vendored protos (`../pkg/kubelet/proto`, server + client for tests);
+       `csi_driver.rs`: mode `csi-driver <name> <node>` (Identity, Node without stage: NodePublish = bind of
+       `/var/lib/kubelet/plugins/<name>/data/<handle>` at the target, NodeUnpublish = umount + rmdir, each call one
+       stdout line; Registration on `plugins_registry/<name>-reg.sock`; SIGTERM removes sockets and data); mode
+       `restart-kubelet` (hostPID: SIGTERM the `kubelet` process, wait for a new pid).
+2. [ ] `csi.rs` suite `csi` (requires.toml `[csi]`, budget 900, cluster_write csidrivers + persistentvolumes, reads
+       nodes/csinodes/PVs): CSIDriver (no attach), privileged driver pod (Bidirectional /var/lib/kubelet), static PV
+       pre-bound to a claim; cases: registered (CSINode), publish (writer pod; NodePublish in the driver's log),
+       unpublish (writer deleted → NodeUnpublish; reader reads the data back), kubelet-restart (holder stays Running,
+       a new reader reads, holder's delete unpublishes), deregistered (driver deleted → CSINode drops it).
+3. [ ] Lock from a build VM (`cargo metadata`, SC_BUILD_OUT); sc-build `cd test && cargo test --locked && cargo build
+       --release --locked`; docs (csi.md "Not yet", README test section), CHANGELOG.
+4. [ ] Live: `stormcentral test run rustkube-node csi --tag <machine>`; close on its result (or move it behind what
+       blocks the run: stormcos#271 for test images on nodes).
+
+(earlier) 2026-10-21. stormcentral#479 landed (`cluster_write`, `service_account_cluster_rules`). Blocker found: no stormcos node
 can run csi-driver-host-path's `hostpathplugin` (upstream images only as pinned imports; `pinned-images.txt` has the
 registrar v2.13.0 and provisioner v5.1.0 as optional goldens, no hostpath plugin; stormblock-csi is not deployed), and
 copying images over /v2/ by hand is not a test-standard run. Asked on #52 (wait-owner): A the test container's own
