@@ -134,6 +134,13 @@ pub struct ContainerConfig {
     pub run_as_group: Option<i64>,
     /// securityContext.runAsNonRoot: refuse to start as uid 0.
     pub run_as_non_root: Option<bool>,
+    /// The pod's securityContext.fsGroup (#171): a claim's filesystem is
+    /// given to it before the start, and the container gets it as a group.
+    pub fs_group: Option<u32>,
+    /// securityContext.fsGroupChangePolicy (`Always`, `OnRootMismatch`).
+    pub fs_group_change_policy: Option<String>,
+    /// securityContext.supplementalGroups (#171).
+    pub supplemental_groups: Vec<u32>,
     /// securityContext.privileged — full host access (Cilium agent needs this).
     pub privileged: bool,
     /// securityContext.readOnlyRootFilesystem.

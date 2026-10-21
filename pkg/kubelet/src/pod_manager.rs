@@ -6551,6 +6551,10 @@ fn build_container_config(
         seccomp_profile: parse_seccomp(sc),
         // The pod's, set by apply_pod_namespaces (#57).
         qos_class: String::new(),
+        // The pod's, set by apply_pod_namespaces (#171).
+        fs_group: None,
+        fs_group_change_policy: None,
+        supplemental_groups: Vec::new(),
     }
 }
 
@@ -6652,6 +6656,16 @@ fn apply_pod_namespaces(config: &mut ContainerConfig, pod: &Value) {
     if config.run_as_non_root.is_none() {
         config.run_as_non_root = pod_sc["runAsNonRoot"].as_bool();
     }
+    // fsGroup, its change policy and supplementalGroups are the pod's only
+    // (#171): a container's securityContext has none of them.
+    config.fs_group = pod_sc["fsGroup"].as_u64().and_then(|g| u32::try_from(g).ok());
+    config.fs_group_change_policy = pod_sc["fsGroupChangePolicy"].as_str().map(String::from);
+    config.supplemental_groups = pod_sc["supplementalGroups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|g| g.as_u64().and_then(|g| u32::try_from(g).ok()))
+        .collect();
 }
 
 fn parse_cpu_quota(s: &str) -> i64 {
@@ -8864,6 +8878,21 @@ pub(crate) mod tests {
         let mut c2 = build_container_config(&simple_container(), "img", vec![], vec![]);
         apply_pod_namespaces(&mut c2, &json!({"spec": {}}));
         assert!(!c2.host_pid && !c2.host_network && !c2.host_ipc && !c2.share_process_namespace);
+    }
+
+    /// #171: fsGroup, its policy and supplementalGroups come from the pod.
+    #[test]
+    fn fs_group_and_supplemental_groups_are_the_pods() {
+        let mut c = build_container_config(&simple_container(), "img", vec![], vec![]);
+        apply_pod_namespaces(&mut c, &json!({"spec": {"securityContext": {
+            "fsGroup": 2000, "fsGroupChangePolicy": "OnRootMismatch", "supplementalGroups": [3000, 4000]
+        }}}));
+        assert_eq!(c.fs_group, Some(2000));
+        assert_eq!(c.fs_group_change_policy.as_deref(), Some("OnRootMismatch"));
+        assert_eq!(c.supplemental_groups, [3000, 4000]);
+        let mut plain = build_container_config(&simple_container(), "img", vec![], vec![]);
+        apply_pod_namespaces(&mut plain, &json!({"spec": {}}));
+        assert_eq!((plain.fs_group, plain.supplemental_groups.len()), (None, 0));
     }
 
     #[test]

@@ -169,6 +169,8 @@ struct Container {
     console: Option<Arc<crate::exec::Console>>,
     /// Its log file: what `kubectl attach` follows without a terminal.
     log_file: std::path::PathBuf,
+    /// The pod's fsGroup, for its claims' filesystems (#171).
+    ownership: Option<Ownership>,
 }
 
 /// A container's stdio held by the kubelet (#56).
@@ -209,6 +211,7 @@ struct ExecBase {
     uid: u32,
     gid: u32,
     caps: stormpump::spec::Caps,
+    groups: Vec<u32>,
 }
 
 /// How often a removal the engine refused is tried again with no exit to
@@ -906,8 +909,30 @@ fn spec_for(
         cpu_weight: weight_for(config),
         limits: limits_for(config),
         caps: caps_for(config),
+        groups: groups_for(config),
         ..Spec::default()
     }
+}
+
+/// A container's supplementary groups (#171): the pod's `fsGroup`, then its
+/// `supplementalGroups`, each once, as upstream's runtimes give them.
+fn groups_for(config: &ContainerConfig) -> Vec<u32> {
+    let mut groups: Vec<u32> = Vec::new();
+    for g in config.fs_group.into_iter().chain(config.supplemental_groups.iter().copied()) {
+        if !groups.contains(&g) {
+            groups.push(g);
+        }
+    }
+    groups
+}
+
+/// What a claim's filesystem is given to before the start (#171).
+#[derive(Clone, Debug)]
+struct Ownership {
+    gid: u32,
+    policy: crate::volume_ownership::ChangePolicy,
+    /// Per mount, as `mount_sources`: whether it is mounted read-only.
+    readonly: Vec<bool>,
 }
 
 /// A container's capabilities (#118) as upstream's runtimes give them: a
@@ -1467,6 +1492,7 @@ impl RuntimeService for StormpumpRuntime {
                     uid: run.uid,
                     gid: run.gid,
                     caps: caps_for(config),
+                    groups: groups_for(config),
                 });
                 let mut spec = spec_for(config, _sandbox_config, run, Some(&read_root));
                 if let Some(w) = stdio_wanted(&id, config, &log_dir) {
@@ -1547,6 +1573,11 @@ impl RuntimeService for StormpumpRuntime {
             stdio: stdio_wanted(&id, config, &log_dir),
             console: None,
             log_file: log_file_of(config, &log_dir),
+            ownership: config.fs_group.map(|gid| Ownership {
+                gid,
+                policy: crate::volume_ownership::ChangePolicy::parse(config.fs_group_change_policy.as_deref()),
+                readonly: config.mounts.iter().take(MAX_MOUNTS).map(|m| m.readonly).collect(),
+            }),
         };
         let qualified = format!("{}/{}/{}", c.namespace, c.pod, c.name);
         self.containers.lock().await.insert(id.clone(), c);
@@ -1559,7 +1590,7 @@ impl RuntimeService for StormpumpRuntime {
 
     async fn start_container(&self, container_id: &str) -> Result<(), CriError> {
         self.probe()?;
-        let (spec, path, log_dir, sandbox_id, mount_sources, stdio) = {
+        let (spec, path, log_dir, sandbox_id, mount_sources, stdio, ownership) = {
             let containers = self.containers.lock().await;
             let c = containers
                 .get(container_id)
@@ -1577,7 +1608,7 @@ impl RuntimeService for StormpumpRuntime {
                 ))
             })?;
             let path = c.root_path.clone().unwrap_or_default();
-            (spec, (root, path), c.log_dir.clone(), c.sandbox_id.clone(), c.mount_sources.clone(), c.stdio.clone())
+            (spec, (root, path), c.log_dir.clone(), c.sandbox_id.clone(), c.mount_sources.clone(), c.stdio.clone(), c.ownership.clone())
         };
         let (root, path) = path;
 
@@ -1638,7 +1669,7 @@ impl RuntimeService for StormpumpRuntime {
                 held.push(logs);
                 // One per mount point, in the spec's order.
                 let mut mounts = Vec::with_capacity(mount_sources.len());
-                for (src, fstype) in &mount_sources {
+                for (i, (src, fstype)) in mount_sources.iter().enumerate() {
                     match fstype {
                         // A block device: PID 1 mounts it on the node, and the
                         // container binds that directory. Idempotent, so two
@@ -1650,6 +1681,23 @@ impl RuntimeService for StormpumpRuntime {
                             let handle = r.volume_register_device(&host, src, fs)?;
                             held.push(handle);
                             mounts.push(handle);
+                            // The pod's fsGroup on the claim's filesystem, now
+                            // that PID 1 has mounted it and before anything runs
+                            // on it (#171). The kubelet sees the mount: the
+                            // host's /run is its /run.
+                            if let Some(o) = &ownership {
+                                let ro = o.readonly.get(i).copied().unwrap_or(false);
+                                match crate::volume_ownership::set(std::path::Path::new(&host), o.gid, ro, o.policy) {
+                                    Ok(n) if n > 0 => tracing::info!(claim = %src, gid = o.gid, changed = n, "fsGroup applied"),
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        return Err(RingError::Detail(format!(
+                                            "setting fsGroup {} on the claim {src} (mounted at {host}): {e}",
+                                            o.gid
+                                        )))
+                                    }
+                                }
+                            }
                         }
                         None => {
                             let handle = r.volume_register(src)?;
@@ -2216,6 +2264,7 @@ fn exec_spec(argv: Vec<String>, base: ExecBase, slots: Vec<(String, i32)>) -> st
         uid: base.uid,
         gid: base.gid,
         caps: base.caps,
+        groups: base.groups,
         fds: slots.into_iter().map(|(name, target_fd)| FdSlot { name, target_fd }).collect(),
         ..Spec::default()
     }
@@ -2752,6 +2801,17 @@ mod tests {
         StormpumpRuntime::new("/nonexistent/stormpump.sock")
     }
 
+    /// #171: the pod's fsGroup and supplementalGroups are the container's
+    /// groups, fsGroup first, each once; none asked, none set.
+    #[test]
+    fn fs_group_and_supplemental_groups_become_the_specs_groups() {
+        let cc = ContainerConfig { fs_group: Some(2000), supplemental_groups: vec![3000, 2000, 4000], ..Default::default() };
+        let spec = spec_of(&cc, &PodSandboxConfig::default());
+        assert_eq!(spec.groups, [2000, 3000, 4000]);
+        spec.validate().unwrap();
+        assert!(spec_of(&ContainerConfig::default(), &PodSandboxConfig::default()).groups.is_empty());
+    }
+
     /// Capabilities reach the engine (#118): a pod that asks for nothing gets
     /// the standard set, not every capability; add/drop/no_new_privs carried;
     /// a privileged container the full set.
@@ -3004,6 +3064,7 @@ mod tests {
                     stdio: None,
                     console: None,
                     log_file: Default::default(),
+                    ownership: None,
                 },
             );
         }
@@ -3057,6 +3118,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             caps: caps_for(&ContainerConfig::default()),
+            groups: vec![2000],
         };
         let slots = vec![("exec-1-0".to_string(), 0), ("exec-1-1".to_string(), 1), ("exec-1-2".to_string(), 2)];
         let spec = exec_spec(vec!["/bin/sh".into(), "-c".into(), "id".into()], base, slots);
@@ -3207,6 +3269,7 @@ mod tests {
                     stdio: None,
                     console: None,
                     log_file: Default::default(),
+                    ownership: None,
                 },
             );
             ids.push(id);
@@ -3715,6 +3778,7 @@ mod tests {
             stdio: None,
             console: None,
             log_file: Default::default(),
+            ownership: None,
         }
     }
 

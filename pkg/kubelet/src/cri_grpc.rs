@@ -355,6 +355,13 @@ fn to_proto_container_config(config: &ContainerConfig) -> proto::ContainerConfig
                 // are unset (#98).
                 run_as_user: config.run_as_user.map(|value| proto::Int64Value { value }),
                 run_as_group: config.run_as_group.map(|value| proto::Int64Value { value }),
+                // fsGroup is one of them, as upstream's kuberuntime sends it (#171).
+                supplemental_groups: config
+                    .fs_group
+                    .into_iter()
+                    .chain(config.supplemental_groups.iter().copied())
+                    .map(i64::from)
+                    .collect(),
                 ..Default::default()
             }),
         }),

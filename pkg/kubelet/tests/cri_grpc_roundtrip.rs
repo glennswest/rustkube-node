@@ -414,6 +414,8 @@ async fn full_pod_flow_over_unix_socket() {
         add_capabilities: vec!["NET_ADMIN".into()],
         drop_capabilities: vec!["NET_RAW".into()],
         no_new_privs: true,
+        fs_group: Some(2000),
+        supplemental_groups: vec![3000],
         selinux_options: Some(kubelet::cri::SeLinuxOptions {
             type_: "spc_t".into(),
             level: "s0".into(),
@@ -443,6 +445,7 @@ async fn full_pod_flow_over_unix_socket() {
     assert_eq!(caps.add_capabilities, vec!["NET_ADMIN"]);
     assert_eq!(caps.drop_capabilities, vec!["NET_RAW"]);
     assert!(sc.no_new_privs, "allowPrivilegeEscalation: false reaches the wire");
+    assert_eq!(sc.supplemental_groups, vec![2000, 3000], "fsGroup, then supplementalGroups (#171)");
 
     client.start_container(&container_id).await.unwrap();
 
