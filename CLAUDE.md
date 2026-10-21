@@ -58,7 +58,7 @@ by #51.
 
 ## Work plan
 
-### In progress: #285 (P1), an init container's exit noticed only at the pod's next pass, minutes late (server1 12.37)
+### Done: #285 (P0), an init container's exit noticed only at the pod's next pass, minutes late (server1 12.37)
 
 2026-10-21. The exit is an event: the ring thread broadcasts the handle, `exit_router` maps it to a pod (runtime's
 containers lock) or a VMI (`vms.lock()`, the VM manager's lock, held across slow work) and wakes that worker; the state
@@ -73,8 +73,10 @@ logged only when some pass drains it, so the log shows when it was read, not whe
        handle.
 3. [x] Engine waits said: a ring call over 1 s warned (op, ms, whether it waited for the arena); an engine HTTP call
        over 1 s warned (method, path, ms).
-4. [ ] Tests (early exit kept and applied: 75de9f1; router not blocked by a held VM lock: `route_exit` extracted, test),
-       README/CHANGELOG (75de9f1); sc-build; stage; close.
+4. [x] Tests (early exit kept and applied; `route_exit` with the VM lock held: a pod's exit at once, an unclaimed one
+       gives up after 1 s → every VMI), README/CHANGELOG (75de9f1, a60c7d9, 453d083). SC_BUILD_VM sc-build 453d083: 551
+       kubelet unit, all suites, warnings = #227's. Stage build bdcded773dac. Closed. Live: the next reboot install
+       (stormcos#626): `stormpump: container exited` within a second of each init's start, no "routing an engine exit" WARN.
 
 ### In progress: #275 (P2), the kubelet on the Kubernetes 1.36 API (k8s-openapi 0.28 v1_36, kube 4.2)
 
