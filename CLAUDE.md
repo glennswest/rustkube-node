@@ -1164,6 +1164,22 @@ The lock pins stormpump 30a76d3, stormvm dc1b7ea, stormcast 801f822; all three m
        byte-sized emptyDisk). sc-build 4545e23: 364 kubelet unit pass. Golden golden-rustkube-node-a97563b0a5c7
        (stormcos#366). #81 closed, #164 shipped. #52's step 6 is done; its end-to-end with a real driver stays.
 
+### In progress: #262 (P1), static pods wait ~4 s behind kubelet startup (12.30 reboot, stormcos#596)
+
+2026-10-21. Found: (2) `volumes=1142ms` on hostPath-only static pods is `service_account_mount`: every pod without
+`automountServiceAccountToken: false` gets a kube-api-access token asked of the apiserver (`Policy::API`), which at
+boot is the static pod being started, so ~1.1 s of refused retries and no token. Upstream never gives a static pod a
+token. (1) the 3 s is between the CNI line and `EngineClient::from_env`'s log line: env reads and a
+`reqwest::Client` build (rustls + webpki roots, no http3/native roots, `cargo tree` on a build VM); nothing in the
+code explains seconds, and no node's console ring still holds a boot. Doing:
+1. [x] Static pods marked `kubernetes.io/config.source: file` (upstream's); `service_account_mount` skips them.
+2. [x] `startup.rs`: each `main` step timed (flags, cni, engine, runtime, credentials, kubelet) → `Kubelet starting for
+       node … (startup: …)`; the engine client's HTTP build warned when > 100 ms; `first static pod … running N ms
+       after the kubelet started` once.
+3. [ ] Tests, README, CHANGELOG; sc-build; stage golden. Then read the next pvetest boot's `startup:` line: if
+       `engine` is still ~3 s, the warning says whether it is the HTTP client (then the step moves or is filed where it
+       lies); close on the numbers.
+
 ### Shipped (golden aeeaa02c3099): #56 (P1), exec, attach and portForward on :10250 (stormpump#103's exec op)
 
 2026-10-21. Lock's stormpump 9877a97 (≥ 0093db4): SPAWN with a running workload's handle in `inline_a` runs the spec in

@@ -106,7 +106,11 @@ histogram `kubelet_pod_start_phase_duration_seconds{phase}` and one INFO log lin
 | `total` | seen → `Running` acknowledged |
 
 `image` overlaps `wait` (images resolve off the worker while the pod waits). A static pod
-has no API object, so it gets the log line and the histograms only. The annotation's merge
+has no API object, so it gets the log line and the histograms only, and no ServiceAccount token (#262: it is marked
+`kubernetes.io/config.source: file`, as upstream marks a manifest's pod; the control plane's static pods start
+before there is an apiserver to ask). The first static pod to run is said once, `first static pod <ns>/<name>
+running N ms after the kubelet started`, with the kubelet's own startup steps (`flags`, `cni`, `engine`,
+`runtime`, `credentials`, `kubelet`), which `Kubelet starting for node …` also carries. The annotation's merge
 patch changes the pod's resourceVersion; a status write racing it gets a 409 and is retried
 on the newer object.
 
