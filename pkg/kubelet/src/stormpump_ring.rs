@@ -29,6 +29,7 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc;
+use std::sync::Arc;
 
 use stormpump::ring::Mapping;
 use stormpump_abi::handle::Handle;
@@ -208,6 +209,49 @@ pub struct RingClient {
     /// Which workload each exit was (#115), for routing it to its own
     /// worker. Beside the drained queue, which the runtime's status path reads.
     exit_handles: tokio::sync::broadcast::Sender<u64>,
+    /// Exits a caller is waiting for by handle: an exec's (#56).
+    waiters: Arc<std::sync::Mutex<ExitWaiters>>,
+}
+
+/// Exits waited for by handle (#56), and the last unclaimed ones.
+///
+/// An exec's exit is its caller's alone: it is handed to the waiter and not
+/// queued or broadcast, so an exec probe every few seconds does not wake every
+/// workload on the node (#115 wakes everything for a handle it cannot place).
+/// An exit can arrive before its spawn's completion has been read and the
+/// waiter registered, so the last [`RECENT_EXITS`] are kept for that.
+#[derive(Default)]
+struct ExitWaiters {
+    wanted: HashMap<u64, tokio::sync::oneshot::Sender<u32>>,
+    recent: std::collections::VecDeque<(u64, u32)>,
+}
+
+const RECENT_EXITS: usize = 256;
+
+impl ExitWaiters {
+    /// `true` when a waiter took it.
+    fn exited(&mut self, handle: u64, status: u32) -> bool {
+        if let Some(w) = self.wanted.remove(&handle) {
+            let _ = w.send(status);
+            return true;
+        }
+        if self.recent.len() == RECENT_EXITS {
+            self.recent.pop_front();
+        }
+        self.recent.push_back((handle, status));
+        false
+    }
+
+    fn wait(&mut self, handle: u64) -> tokio::sync::oneshot::Receiver<u32> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if let Some(i) = self.recent.iter().position(|(h, _)| *h == handle) {
+            let (_, status) = self.recent.remove(i).unwrap_or_default();
+            let _ = tx.send(status);
+        } else {
+            self.wanted.insert(handle, tx);
+        }
+        rx
+    }
 }
 
 impl std::fmt::Debug for RingClient {
@@ -241,6 +285,8 @@ impl RingClient {
         let notify_exits = exit_changes.clone();
         let (exit_handles, _) = tokio::sync::broadcast::channel::<u64>(1024);
         let routed_exits = exit_handles.clone();
+        let waiters: Arc<std::sync::Mutex<ExitWaiters>> = Arc::default();
+        let waited = waiters.clone();
         let submit = attached.submit;
         let complete = attached.complete;
         let ring_fd = attached.ring;
@@ -271,6 +317,7 @@ impl RingClient {
                     exit_tx,
                     notify_exits,
                     routed_exits,
+                    waited,
                     submit,
                     complete,
                 );
@@ -283,7 +330,17 @@ impl RingClient {
             exits: std::sync::Mutex::new(exits),
             exit_changes,
             exit_handles,
+            waiters,
         })
+    }
+
+    /// The wait status of `workload` once it exits (#56): an exec's. Its exit
+    /// is then this receiver's only, not the drained queue's.
+    pub fn wait_exit(&self, workload: Handle) -> tokio::sync::oneshot::Receiver<u32> {
+        match self.waiters.lock() {
+            Ok(mut w) => w.wait(workload.0),
+            Err(_) => tokio::sync::oneshot::channel().1,
+        }
     }
 
     /// Submit one entry and wait for its completion.
@@ -810,6 +867,7 @@ fn run(
     exits: mpsc::Sender<Exited>,
     exit_changes: tokio::sync::watch::Sender<u64>,
     exit_handles: tokio::sync::broadcast::Sender<u64>,
+    waiters: Arc<std::sync::Mutex<ExitWaiters>>,
     submit: i32,
     complete: i32,
 ) {
@@ -923,6 +981,10 @@ fn run(
                         ..Default::default()
                     });
                 }
+                // An exec's: its caller's only (#56).
+                if waiters.lock().map(|mut w| w.exited(cqe.handle().0, cqe.aux)).unwrap_or(false) {
+                    continue;
+                }
                 // Unsolicited: a workload ended. Nothing asked, and something
                 // still has to hear it.
                 let _ = exits.send(Exited {
@@ -998,6 +1060,27 @@ fn stop_sqe(workload: Handle, grace_secs: u64) -> Sqe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #56: an exec's exit goes to its waiter only, whether it arrives after
+    /// the wait was registered or before (the spawn's race); one nobody
+    /// waits for is left to the queue.
+    #[test]
+    fn an_exit_reaches_its_waiter_before_or_after_it_registers() {
+        let mut w = ExitWaiters::default();
+        let mut after = w.wait(7);
+        assert!(w.exited(7, 3 << 8), "a waited exit is the waiter's");
+        assert_eq!(after.try_recv().unwrap(), 3 << 8);
+
+        assert!(!w.exited(8, 9), "nobody waits: the queue's");
+        let mut before = w.wait(8);
+        assert_eq!(before.try_recv().unwrap(), 9, "kept for a waiter that registers late");
+        assert!(w.recent.is_empty() && w.wanted.is_empty());
+
+        for h in 0..(RECENT_EXITS as u64 + 10) {
+            w.exited(1000 + h, 0);
+        }
+        assert_eq!(w.recent.len(), RECENT_EXITS, "bounded");
+    }
 
     /// #174: the grace reaches the engine in `inline_b`, in milliseconds;
     /// zero is FORCE, because zero there means the 30 s default.

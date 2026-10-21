@@ -10,6 +10,7 @@ pub mod container_logs;
 pub mod container_roots;
 pub mod dns;
 pub mod engine;
+pub mod exec;
 pub mod events;
 pub mod metrics;
 pub mod mirror;
