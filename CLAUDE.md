@@ -58,6 +58,23 @@ by #51.
 
 ## Work plan
 
+### In progress: #285 (P1), an init container's exit noticed only at the pod's next pass, minutes late (server1 12.37)
+
+2026-10-21. The exit is an event: the ring thread broadcasts the handle, `exit_router` maps it to a pod (runtime's
+containers lock) or a VMI (`vms.lock()`, the VM manager's lock, held across slow work) and wakes that worker; the state
+itself is read only when a pass calls `container_status` (absorb_exits). Found: (a) the router awaits the VM manager's
+lock for every exit, pods' too, one exit at a time: a VM pass holding it stalls every wake behind it; (b) an exit that
+arrives before `start_container` records its handle (a quick init: Cilium's `config`) is drained by any other pod's
+status call, matches nothing and is dropped: the container stays Running in the record; (c) "container exited" is
+logged only when some pass drains it, so the log shows when it was read, not when it happened. Doing:
+1. [ ] Router: drain and record the exits at arrival (logged then); pod lookup first, the VM lookup only for a handle
+       no container has, bounded (1 s, then every VMI woken, said); routing over 1 s warned naming the lookup.
+2. [ ] Runtime: an exit no container claims is kept (last 256) and applied by `start_container` when it records that
+       handle.
+3. [ ] Engine waits said: a ring call over 1 s warned (op, ms, whether it waited for the arena); an engine HTTP call
+       over 1 s warned (method, path, ms).
+4. [ ] Tests (early exit kept and applied; router not blocked by a held VM lock), README/CHANGELOG; sc-build; stage; close.
+
 ### In progress: #275 (P2), the kubelet on the Kubernetes 1.36 API (k8s-openapi 0.28 v1_36, kube 4.2)
 
 2026-10-21. Found: nothing here depends on k8s-openapi or kube. k8s-openapi 0.24 (v1_32) comes only through
