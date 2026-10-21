@@ -907,6 +907,9 @@
 
 ## [Unreleased]
 
+### 2026-10-21
+- **docs:** #102's work plan: the Dell runs 12.37, but the turbomode run is stormcos_qa's to queue (403 for this token); waits on stormcos_qa#78.
+
 ### 2026-10-13
 - **docs:** #61's work plan: short passes live; medium/long wait on a pvetest install (stormcos#129).
 - **docs:** #102's work plan: the acceptance run is blocked by C2NR0Q2's closed `tests` valve and by no runnable pve VM; owner asked which machine to use.

@@ -164,7 +164,7 @@ resolves by its last path component to `/pallets/sshd`, on the host network (mir
        Done: fix + 97754e7 docs. SC_BUILD_VM sc-build (job 964d550df4): 519 kubelet unit, all suites pass, clippy
        nothing new. Stage golden golden-rustkube-node-d814f8ef6f80 (stormcos#424). Closed.
 
-### Waiting on stormcentral#459 (the Dell's boot media): #102 (P1), turbomode acceptance on C2NR0Q2 (owner via master, 10-13: option A)
+### Waiting on stormcos_qa#78 (someone with stormcos_qa's token queues the run): #102 (P1), turbomode acceptance on C2NR0Q2 (owner via master, 10-13: option A)
 
 2026-10-13 ~20:45Z. The Dell's `tests` valve is open again (`valve list` shows only buildvms drains); C2NR0Q2 is
 installing 12.21. A run there (94caeb79d0, stormcos_qa 22a4f567f886) errored: apiserver no /readyz in 10 min (the
@@ -177,6 +177,9 @@ Pods never reached Succeeded in 4 min: filed #250 (P1).
 hard cut), right after stormcentral#459's media decision; a run is refused (no release). Evidence on stormcentral#459;
 #102 proposed after it. Resume: `stormcentral test run stormcos_qa turbomode --tag C2NR0Q2` once the Dell runs a
 release (`stormcentral testhost list`: last=… passed), compare, post, close.
+2026-10-21: stormcentral#459 closed; the Dell passed 12.37, every valve open. `test run stormcos_qa turbomode` is
+403 for this session's token (stormcentral#829: own project only). Asked on stormcos_qa#78 + master note; #102 proposed
+after stormcos_qa#78. Resume: read the run id posted there with `stormcentral test show <id>`, compare, post, close.
 
 ### Done: #247 (P1), hot-add and remove a running VMI's disks (stormvm#23)
 
