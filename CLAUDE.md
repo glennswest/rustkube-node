@@ -2424,7 +2424,7 @@ cmdline's absence). #232 (my #71 regression): kind: clone / fsType: ext4 accepte
 sc-build ca44386: 475 kubelet unit pass. Golden golden-rustkube-node-9b876df216c9 (stormcos#424), master told; close
 both when the Dell runs cilium-operator and a new claim. #21 paused on branch wip/21-rebased.
 
-### In progress: #52, external StorageClasses: the end-to-end with the test container's own CSI driver (master: A)
+### Waiting on stormcos#271 (test images on nodes): #52, external StorageClasses: the end-to-end with the test container's own CSI driver (master: A)
 
 2026-10-21. Master's decision on #52: **A**, the suite brings its own driver. Host `/var/lib/kubelet` is the
 kubelet's (stormcos `volume kubeletdir`), so a driver pod's hostPath reaches what the kubelet watches. Doing:
@@ -2444,6 +2444,10 @@ kubelet's (stormcos `volume kubeletdir`), so a driver pod's hostPath reaches wha
        tests (9 new), clippy -D warnings clean, release builds; `restart-kubelet` off-node says no kubelet, exit 1.
 4. [ ] Live: `stormcentral test run rustkube-node csi --tag <machine>`; close on its result (or move it behind what
        blocks the run: stormcos#271 for test images on nodes).
+       2026-10-21: run 9deb7dc500 (pvetest1, 12.38, e05e237): the test image built on stormcentral's build VM and was
+       pushed to forge (sha256:2128789e…); the node's fetch failed: `forge.g16.lo:5100 is not a peer of this registry`
+       = stormcos#271. #52 proposed after it. Resume: `stormcentral test run rustkube-node csi --tag pvetest1`, read
+       with `test show`, fix what fails, close on a pass.
 
 (earlier) 2026-10-21. stormcentral#479 landed (`cluster_write`, `service_account_cluster_rules`). Blocker found: no stormcos node
 can run csi-driver-host-path's `hostpathplugin` (upstream images only as pinned imports; `pinned-images.txt` has the
