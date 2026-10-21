@@ -2155,7 +2155,7 @@ async fn attach_to(
                                 Err(RecvError::Lagged(_)) => continue,
                                 Err(RecvError::Closed) => return,
                             },
-                            _ = stop.wait_for(|s| *s) => return,
+                            _ = async { let _ = stop.wait_for(|s| *s).await; } => return,
                         }
                     }
                 });
