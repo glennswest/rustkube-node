@@ -178,8 +178,8 @@ pub async fn read(engine: &crate::engine::EngineClient, policy: &Policy) -> Resu
         let v: Value = r.json().await.map_err(|e| format!("stormblock {path}: {e}"))?;
         Ok::<_, String>(v["items"].as_array().cloned().unwrap_or_default())
     };
-    let slabs = get("/api/v1/slabs").await?;
-    let volumes = get("/api/v1/volumes").await?;
+    // Together (#95): one waits on the other for nothing.
+    let (slabs, volumes) = tokio::try_join!(get("/api/v1/slabs"), get("/api/v1/volumes"))?;
     Ok(Capacity::of(&slabs, &volumes, policy))
 }
 

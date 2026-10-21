@@ -21,6 +21,7 @@
 //! | `sandbox/status`  | the sandbox's status read (its address) |
 //! | `sandbox/other`   | the rest of `sandbox`: the runtime's checks, retried DELs of earlier failed networks, bookkeeping |
 //! | `claim/<volume>/lookup` | a claim's PVC, PV and existing volume read, its room checked (#95) |
+//! | `claim/<volume>/room`   | inside `lookup`, for a new volume: the class's policy and the engine's slabs and volumes read under the capacity lock |
 //! | `claim/<volume>/<made>` | the volume made: `blank` (clone of the class's sealed blank), `clone` (of a source), `raw` (a Block claim); absent when it already existed |
 //! | `claim/<volume>/attach` | the ublk attach |
 //! | `claim/<volume>/bind`   | the PV written and the claim bound, when the start waited for it (the VM path; a pod's start no longer does, #95) |
@@ -58,7 +59,7 @@ pub const PHASES: &[&str] = &[
 ];
 
 /// A claim's steps (#95), each with a histogram (one observation per claim).
-pub const CLAIM_STEPS: &[&str] = &["claim/lookup", "claim/make", "claim/attach", "claim/bind"];
+pub const CLAIM_STEPS: &[&str] = &["claim/lookup", "claim/room", "claim/make", "claim/attach", "claim/bind"];
 
 /// `sandbox`'s steps (#139), with a histogram each when they were measured.
 pub const SANDBOX_STEPS: &[&str] = &["sandbox/acquire", "sandbox/cni", "sandbox/status", "sandbox/other"];
@@ -85,6 +86,10 @@ pub struct StartTiming {
 pub struct ClaimSteps {
     /// The PVC, its PV and an existing volume read; the room checked.
     pub lookup: Duration,
+    /// The part of `lookup` that checked the room for a new volume: the
+    /// class's policy and the engine's slabs and volumes, under the capacity
+    /// lock (#95). `None` when the volume already existed.
+    pub room: Option<Duration>,
     /// How the volume was made (`blank`, `clone`, `raw`) and how long it took;
     /// `None` when it already existed.
     pub made: Option<(&'static str, Duration)>,
@@ -286,6 +291,10 @@ impl StartTiming {
             for (name, c) in &a.claims {
                 text.push(format!("claim/{name}/lookup={}", ms(c.lookup)));
                 phases.push(("claim/lookup", c.lookup));
+                if let Some(r) = c.room {
+                    text.push(format!("claim/{name}/room={}", ms(r)));
+                    phases.push(("claim/room", r));
+                }
                 if let Some((how, d)) = c.made {
                     text.push(format!("claim/{name}/{how}={}", ms(d)));
                     phases.push(("claim/make", d));
@@ -443,6 +452,7 @@ mod tests {
         a.volume("data", Duration::from_millis(80));
         a.claim("data", ClaimSteps {
             lookup: Duration::from_micros(2_500),
+            room: Some(Duration::from_micros(1_200)),
             made: Some(("blank", Duration::from_millis(12))),
             attach: Duration::from_millis(60),
             bind: Some(Duration::from_micros(5_400)),
@@ -453,7 +463,7 @@ mod tests {
         let f = t.finish(Duration::ZERO, seen);
         assert!(
             f.text.ends_with(
-                "volume/data=80ms claim/data/lookup=2.5ms claim/data/blank=12ms claim/data/attach=60ms \
+                "volume/data=80ms claim/data/lookup=2.5ms claim/data/room=1.2ms claim/data/blank=12ms claim/data/attach=60ms \
                  claim/data/bind=5.4ms claim/old/lookup=0.0ms claim/old/attach=30ms"
             ),
             "{}",

@@ -1951,29 +1951,48 @@ impl PodManager {
         // ext4 from a pod would corrupt it, so they are cloned, never mounted:
         // a claim with `dataSource: {kind: PersistentVolumeClaim, name: <it>}`
         // in this namespace gets a copy-on-write copy.
-        if let Some(pv) = pvc["spec"]["volumeName"].as_str().filter(|v| !v.is_empty()) {
-            if let Some(pv) = self
-                .api_get(&format!("/api/v1/persistentvolumes/{pv}"))
-                .await
-            {
-                if pv["metadata"]["labels"][crate::system_claims::LABEL].as_str() == Some("true") {
-                    return Err(ClaimError::InUse(format!(
-                        "{namespace}/{claim} is a node service's live data volume; mount a clone \
-                         of it (a claim with dataSource naming it) rather than the volume itself"
-                    )));
+        //
+        // The PV and the engine's volume list are read once each, together
+        // (#95): this was the PV twice and the whole list up to three times,
+        // one after another, and under the Dell's I/O stress each took
+        // seconds (claim/<v>/lookup 10.6 s on 12.37).
+        let pv_name = pvc["spec"]["volumeName"].as_str().filter(|v| !v.is_empty());
+        let (pv, volumes) = tokio::join!(
+            async {
+                match pv_name {
+                    Some(pv) => self.api_get(&format!("/api/v1/persistentvolumes/{pv}")).await,
+                    None => None,
                 }
+            },
+            self.storage_get("/api/v1/volumes"),
+        );
+        if let Some(pv) = &pv {
+            if pv["metadata"]["labels"][crate::system_claims::LABEL].as_str() == Some("true") {
+                return Err(ClaimError::InUse(format!(
+                    "{namespace}/{claim} is a node service's live data volume; mount a clone \
+                     of it (a claim with dataSource naming it) rather than the volume itself"
+                )));
             }
         }
+        let volume_id = |wanted: &str| -> Option<String> {
+            volumes.as_ref()?["items"]
+                .as_array()?
+                .iter()
+                .find(|v| v["name"].as_str() == Some(wanted))?["id"]
+                .as_str()
+                .map(String::from)
+        };
 
         // A claim already bound to a stormblock PV mounts *that* volume. The
         // node's own data containers are claims like this (system_claims.rs),
         // and so is any volume an administrator publishes by hand: deriving a
         // name here instead would clone a new, empty volume beside the real one.
-        let bound = self.bound_volume(&pvc).await;
-        let existing = match bound {
-            Some(id) => Some(id),
-            None => self.storage_volume_id(&name).await,
-        };
+        let bound = pv
+            .as_ref()
+            .filter(|pv| pv["spec"]["csi"]["driver"].as_str() == Some("stormblock.storm.io"))
+            .and_then(|pv| pv["spec"]["csi"]["volumeHandle"].as_str())
+            .and_then(|handle| volume_id(handle));
+        let existing = bound.or_else(|| volume_id(&name));
         // **A new volume is charged its class** (#62, #108): refused here as
         // well as by the scheduler, which static pods and pods written onto
         // `spec.nodeName` never meet. Held until it is made. An engine that
@@ -1981,20 +2000,40 @@ impl PodManager {
         // The class's policy (#71), for a volume made here from nothing (a
         // clone of a source keeps its source's). Refused or unreadable: the
         // claim waits, and says so on itself.
-        let policy = if existing.is_none() && crate::storage::claim_source(&pvc).is_none() {
-            match self.claim_policy(&pvc).await {
+        //
+        // The class is read while the lock is waited for and the room read
+        // (#95): neither needs the other.
+        let room_step = Instant::now();
+        let (policy, room) = if existing.is_none() {
+            let wants_policy = crate::storage::claim_source(&pvc).is_none();
+            let (policy, (guard, capacity)) = tokio::join!(
+                async {
+                    if wants_policy {
+                        self.claim_policy(&pvc).await
+                    } else {
+                        Ok(crate::storage::ClaimPolicy::default())
+                    }
+                },
+                async {
+                    let guard = self.capacity_lock.lock().await;
+                    let capacity = crate::capacity::read(&self.engine, &self.storage_policy).await;
+                    (guard, capacity)
+                },
+            );
+            let policy = match policy {
                 Ok(p) => p,
                 Err(e) => {
+                    drop(guard);
                     self.claim_event(&pvc, "Warning", "ProvisioningFailed", &e.to_string()).await;
                     return Err(e);
                 }
-            }
+            };
+            (policy, Some((guard, capacity)))
         } else {
-            crate::storage::ClaimPolicy::default()
+            (crate::storage::ClaimPolicy::default(), None)
         };
-        let _room = if existing.is_none() {
-            let guard = self.capacity_lock.lock().await;
-            match crate::capacity::read(&self.engine, &self.storage_policy).await {
+        let _room = if let Some((guard, capacity)) = room {
+            match capacity {
                 Ok(c) if c.total > 0 => {
                     // Charged what its policy costs on the drives: a mirror
                     // twice its class (#71).
@@ -2010,6 +2049,9 @@ impl PodManager {
         } else {
             None
         };
+        if existing.is_none() {
+            steps.room = Some(room_step.elapsed());
+        }
         steps.lookup = step.elapsed();
         step = Instant::now();
         let how = match &existing {
@@ -2449,21 +2491,6 @@ impl PodManager {
         made["id"].as_str().map(String::from).ok_or_else(|| {
             ClaimError::Failed(format!("clone of {src_name} returned no id: {made}"))
         })
-    }
-
-    /// The stormblock volume behind a claim's bound PV, when it is ours.
-    async fn bound_volume(&self, pvc: &Value) -> Option<String> {
-        let pv_name = pvc["spec"]["volumeName"]
-            .as_str()
-            .filter(|v| !v.is_empty())?;
-        let pv = self
-            .api_get(&format!("/api/v1/persistentvolumes/{pv_name}"))
-            .await?;
-        if pv["spec"]["csi"]["driver"].as_str() != Some("stormblock.storm.io") {
-            return None;
-        }
-        let handle = pv["spec"]["csi"]["volumeHandle"].as_str()?;
-        self.storage_volume_id(handle).await
     }
 
     /// A filesystem template's id and state (`ready`, `awaiting_format`,
@@ -7883,6 +7910,13 @@ pub(crate) mod tests {
         for (step, d) in [("lookup", steps.lookup), ("raw", made), ("attach", steps.attach)] {
             assert!(d > std::time::Duration::ZERO, "{step} was not timed: {steps:?}");
         }
+        // The room check is a part of the lookup, timed on its own for a new volume.
+        let room = steps.room.expect("a new volume's room was checked");
+        assert!(room > std::time::Duration::ZERO && room <= steps.lookup, "{steps:?}");
+        // The engine's volume list is read once for the lookup and once for
+        // the room, not once per question (#95).
+        let listings = w.calls.lock().unwrap().iter().filter(|(m, p, _)| m == "GET" && p == "/api/v1/volumes").count();
+        assert_eq!(listings, 2, "{:?}", w.calls.lock().unwrap());
         // The bind runs after the start path returns, not in it, and still
         // happens: the claim's PV reaches the apiserver.
         assert_eq!(steps.bind, None, "the pod path does not wait for the bind");
