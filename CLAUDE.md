@@ -62,14 +62,15 @@ by #51.
 
 2026-10-21. Found: nothing here depends on k8s-openapi or kube. k8s-openapi 0.24 (v1_32) comes only through
 rustkube's `apimachinery` (Cargo.lock), and every API object here is `serde_json::Value`. So step 1 (crates) here is the
-`apimachinery` rev bump after rustkube#285 moves it (with chrono → jiff only if apimachinery's API exposes it), plus
-`kubeletVersion` v1.32 → v1.36 at the same time (a kubelet newer than the apiserver breaks the version skew rule).
+`apimachinery` rev bump after rustkube#285 moves it (chrono → jiff only if apimachinery's API exposes it).
+`kubeletVersion` already says v1.36.0 (#23).
 Steps 2–7 are kubelet behaviour on JSON, independent of the crates. Doing:
-1. [ ] Step 2 here: `status.observedGeneration` and each condition's `observedGeneration` from `metadata.generation`
+1. [x] Step 2 here (f727862): `status.observedGeneration` and each condition's `observedGeneration` from `metadata.generation`
        (GA 1.35); `containerStatuses[].resources` / `allocatedResources` (and sidecars'), pod `status.resources` from
        `spec.resources` (no in-place resize yet: what is applied is the spec). Tests, README/status.md, CHANGELOG.
-2. [ ] File steps 3–7 as their own issues (in-place resize `/resize`, stopSignal + sleep, sidecar edge cases, image
-       volumes, user namespaces), each naming what it needs from stormpump.
+2. [x] Steps 3–7 filed: #276 in-place resize (needs a stormpump per-workload limits verb), #277 stopSignal + sleep
+       (stormpump's Signal op is enough), #278 sidecar edge cases, #279 image volumes (stormpump#108 for read-only),
+       #280 user namespaces (needs stormpump Spec userns).
 3. [ ] sc-build; stage golden; propose #275 `--after` rustkube#285 for the crate bump + kubeletVersion.
 
 ### Done (not reproducing since 12.30): #259 (P2), the second VM of the install probe starts late on pvetest1 (3.5 s → 6.7 s since 12.19)
