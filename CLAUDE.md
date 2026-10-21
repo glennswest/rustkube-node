@@ -1207,8 +1207,22 @@ stormpump's Spec has `uid`/`gid` and the engine drops to them (exec.rs). Found: 
        kubelet unit pass. Golden golden-rustkube-node-04134493c42a (stormcos#366). Follow-ups #171 (fsGroup), #172
        (image Volumes, after stormblock-registry#58). Closed. Not run on a node.
 
-### Unblocked, next: #95 (P1), pod/claim start toward ≤2 s / ≤1 s: the claim's own steps timed
+### In progress: #95 (P1), pod/claim start toward ≤2 s / ≤1 s: the claim's own steps timed
 
+2026-10-21. stormcentral's install probes (`/api/v1/metrics`, 12.21–12.37). Container start meets ≤ 2 s everywhere:
+pvetest1/2 0.2–0.3 s, the Dell 0.5–0.9 s (baseline 21 s). Claim meets ≤ 1 s on pvetest1/2 (0.40–0.55 s end to end,
+kubelet 0.23–0.30 s) and misses on the Dell (12.37: cold 1.39 s, kubelet 1.10 s = lookup 161, blank 206 [stormblock#327],
+cni 142, container/p 489; warm 9.5 s, of which `sandbox/cni` 7.4 s = Cilium's ADD, no kubelet lock around it). Under the
+probe's 2 GiB rewrite loop the Dell's claim/d/lookup is 10.6 s (pvetest 0.4–0.9 s): lookup is ~8 serial calls (PVC, PV
+twice, the engine's whole volume list up to 3×, StorageClass, slabs). Doing (the kubelet's share):
+1. [ ] provision_claim_volume: one PV GET and one volume listing (handle + name), in parallel; StorageClass read while
+       the capacity lock is awaited; capacity::read's slabs + volumes in parallel. `ClaimSteps.room` (policy + capacity,
+       inside lookup) → `claim/<v>/room=`, histogram `claim/room`.
+2. [ ] Tests (existing claim tests; room timed), README/metrics.md, CHANGELOG; sc-build; stage golden.
+3. [ ] File the rest: Cilium's 7.4 s ADD on the Dell (stormcos-cilium), the Dell's container/p and I/O-stress collapse
+       (container/c 20 s, blank 10.6 s: stormblock under a rewrite loop). Comment numbers on #95; close it on the kubelet
+       half if the others carry the Dell's claim target (else ask).
+(earlier) 
 2026-10-09 (#220): stormpump#107 is closed (a warm claim's ext4 mount is 5.4 ms on 11.95). Next: the kubelet's own
 warm-probe measurement of claims on a node; what is left beyond that is stormblock#327 (clone) and rustkube#147.
 
