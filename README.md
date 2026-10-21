@@ -254,8 +254,17 @@ NET_BIND_SERVICE, SYS_CHROOT, KILL, AUDIT_WRITE), minus `capabilities.drop`, plu
 `privileged` container keeps every capability (its add/drop ignored, as upstream). An unknown name fails the
 container's create, naming it. Before this every stormpump pod ran with the full set (the engine's default, a node
 service's); a release with it needs stormpump accd1a3e8e61 or later (`Spec.caps`). The CRI gRPC path forwards
-add/drop and `no_new_privs` to the runtime. Not yet: `fsGroup`/`supplementalGroups` (a claim's filesystem is
-root's; stormpump's `Spec.groups` is in the lock, #171).
+add/drop and `no_new_privs` to the runtime.
+
+**fsGroup and supplementalGroups** (#171). The pod's `fsGroup` and then its `supplementalGroups` (each once) are the
+container's supplementary groups (stormpump's `Spec.groups`, set with `setgroups` before its gid and uid; an exec
+gets the same). A claim's filesystem is given to `fsGroup` before the container starts, as upstream's kubelet does:
+PID 1 mounts it at `/run/stormpump/pvc/<dev>` (the kubelet sees that mount), and the tree's group becomes `fsGroup`,
+files gain group read-write (read-only `0440` on a read-only mount), directories group execute and setgid, and
+symlinks are left alone. `fsGroupChangePolicy: OnRootMismatch` walks nothing when the root's group and mode are
+already right. A change that fails fails the start, naming the path. emptyDir is 0777 and configMap/secret files
+keep their own modes, as upstream. The CRI gRPC path sends fsGroup and supplementalGroups as the container's
+`supplemental_groups`.
 
 **Kubernetes 1.36 posture** (#23, the control plane's since rustkube#37): `nodeInfo.kubeletVersion` is
 `v1.36.0-rustkube+<apimachinery>` and `kubeProxyVersion` is not reported (1.33 removed it). A pod that asks for

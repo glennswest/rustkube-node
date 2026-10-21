@@ -14,6 +14,7 @@ a row says so.
 | Area | Current code and issues |
 |---|---|
 | Each container its own root (#104, owner's option A) | `create_container` clones the image's sealed golden (a pallet's `<volume>.golden`, a pull's sbregistry fstemplate) into engine volume `ctr-<container>`, attached over ublk and mounted by PID 1 at `/run/stormpump/roots/<container>`; deleted with the container, a restart gets a fresh one; orphans swept at start. A pull clones nothing any more (#143's image-level clone and #161 are superseded). `readOnlyRootFilesystem` still mounts it writable (stormpump#108) |
+| fsGroup (#171) | the pod's fsGroup + supplementalGroups are the container's groups (`Spec.groups`); a claim's filesystem is given to fsGroup before the start (group rw, setgid dirs; `OnRootMismatch` honoured) |
 | Capabilities (#118) | stormpump containers get the standard 14 − `drop` + `add` (`Spec.caps`, stormpump#47); privileged: every capability; `allowPrivilegeEscalation: false` = `no_new_privs`. Before it every pod had the full set |
 | Image config (#98, #172) | Entrypoint/Cmd/Env/WorkingDir/User from sbregistry's golden record under the pod spec; `runAsUser`/`runAsGroup`/`runAsNonRoot` applied; declared `Volumes` made as directories in the container's root. Pallets get no config yet (#208) |
 | Unknown images (#79) | A golden the node's registry lacks is demanded through sbregistry's clone route (cluster fetch); 503/404 become ErrImagePull on the pull back-off |
@@ -66,7 +67,6 @@ Each gap has an owning issue. These are limitations, not supported features.
 
 | Unsupported or incomplete claim | Tracking |
 |---|---|
-| Pod `fsGroup`/`supplementalGroups` on stormpump (`Spec.groups` is in the lock; a claim is root's) | [#171](https://github.com/glennswest/rustkube-node/issues/171) |
 | OOMKilled, termination messages, hugepages, in-place resize, `activeDeadlineSeconds` on a running pod | [#194](https://github.com/glennswest/rustkube-node/issues/194), [#162](https://github.com/glennswest/rustkube-node/issues/162), [#195](https://github.com/glennswest/rustkube-node/issues/195), [#192](https://github.com/glennswest/rustkube-node/issues/192), [#185](https://github.com/glennswest/rustkube-node/issues/185) |
 | `runtimeClassName` (microVM Pods go to stormvisor through it) and AppArmor profiles applied | [#204](https://github.com/glennswest/rustkube-node/issues/204), [#197](https://github.com/glennswest/rustkube-node/issues/197) |
 | Reservations enforced as a cgroup limit (they are advertised only) | [#205](https://github.com/glennswest/rustkube-node/issues/205) |

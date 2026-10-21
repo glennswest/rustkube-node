@@ -190,8 +190,6 @@ Full lists: `docs/api.md`, `docs/configuration.md`, `docs/metrics.md`.
 
 ## Planned (not in the code yet)
 
-- fsGroup onto the engine's `Spec`
-  (#171)
 - **Live migration** of stormvm machines: a RAID leg on the destination first (owner, #159), behind
   stormstorage#44 (#40); graceful VM stop (#181)
 - **Pod-network VMs on a live node:** the proof is stormcos_qa#18's namespace-isolation run (#88)
