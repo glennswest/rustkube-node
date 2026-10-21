@@ -58,6 +58,20 @@ by #51.
 
 ## Work plan
 
+### In progress: #275 (P2), the kubelet on the Kubernetes 1.36 API (k8s-openapi 0.28 v1_36, kube 4.2)
+
+2026-10-21. Found: nothing here depends on k8s-openapi or kube. k8s-openapi 0.24 (v1_32) comes only through
+rustkube's `apimachinery` (Cargo.lock), and every API object here is `serde_json::Value`. So step 1 (crates) here is the
+`apimachinery` rev bump after rustkube#285 moves it (with chrono → jiff only if apimachinery's API exposes it), plus
+`kubeletVersion` v1.32 → v1.36 at the same time (a kubelet newer than the apiserver breaks the version skew rule).
+Steps 2–7 are kubelet behaviour on JSON, independent of the crates. Doing:
+1. [ ] Step 2 here: `status.observedGeneration` and each condition's `observedGeneration` from `metadata.generation`
+       (GA 1.35); `containerStatuses[].resources` / `allocatedResources` (and sidecars'), pod `status.resources` from
+       `spec.resources` (no in-place resize yet: what is applied is the spec). Tests, README/status.md, CHANGELOG.
+2. [ ] File steps 3–7 as their own issues (in-place resize `/resize`, stopSignal + sleep, sidecar edge cases, image
+       volumes, user namespaces), each naming what it needs from stormpump.
+3. [ ] sc-build; stage golden; propose #275 `--after` rustkube#285 for the crate bump + kubeletVersion.
+
 ### Done (not reproducing since 12.30): #259 (P2), the second VM of the install probe starts late on pvetest1 (3.5 s → 6.7 s since 12.19)
 
 2026-10-14. Samples (stormcentral /api/v1/metrics): the Dell's `vm_start_ready_ms` is 1.19–2.12 s on every release
