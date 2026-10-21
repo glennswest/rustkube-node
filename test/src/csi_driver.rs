@@ -208,19 +208,19 @@ impl Driver {
     }
 
     /// A volume id is a path component here: refused unless it is a plain one.
-    fn volume_id(&self, id: &str) -> Result<(), Status> {
+    fn volume_id(&self, id: &str) -> Result<(), String> {
         let ok = !id.is_empty()
             && id.len() <= 128
             && !id.starts_with('.')
             && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
-        if ok { Ok(()) } else { Err(Status::invalid_argument(format!("volume id {id:?} is not a plain name"))) }
+        if ok { Ok(()) } else { Err(format!("volume id {id:?} is not a plain name")) }
     }
 
     /// A target must be a pod volume's directory under the kubelet's tree.
-    fn target(&self, t: &str) -> Result<PathBuf, Status> {
+    fn target(&self, t: &str) -> Result<PathBuf, String> {
         let p = PathBuf::from(t);
         let under = p.starts_with(self.root.join("pods")) && !t.contains("/../") && !t.ends_with("/..");
-        if under { Ok(p) } else { Err(Status::invalid_argument(format!("target {t:?} is not under {}/pods", self.root.display()))) }
+        if under { Ok(p) } else { Err(format!("target {t:?} is not under {}/pods", self.root.display())) }
     }
 }
 
@@ -266,8 +266,8 @@ impl proto::node_server::Node for Driver {
         r: Request<proto::NodePublishVolumeRequest>,
     ) -> R<proto::NodePublishVolumeResponse> {
         let r = r.into_inner();
-        self.volume_id(&r.volume_id)?;
-        let target = self.target(&r.target_path)?;
+        self.volume_id(&r.volume_id).map_err(Status::invalid_argument)?;
+        let target = self.target(&r.target_path).map_err(Status::invalid_argument)?;
         match r.volume_capability.as_ref().and_then(|c| c.access_type.as_ref()) {
             Some(proto::volume_capability::AccessType::Mount(_)) => {}
             Some(proto::volume_capability::AccessType::Block(_)) => {
@@ -297,8 +297,8 @@ impl proto::node_server::Node for Driver {
         r: Request<proto::NodeUnpublishVolumeRequest>,
     ) -> R<proto::NodeUnpublishVolumeResponse> {
         let r = r.into_inner();
-        self.volume_id(&r.volume_id)?;
-        let target = self.target(&r.target_path)?;
+        self.volume_id(&r.volume_id).map_err(Status::invalid_argument)?;
+        let target = self.target(&r.target_path).map_err(Status::invalid_argument)?;
         let fail = |e: String| {
             say(format!("NodeUnpublishVolume volume={} target={} failed: {e}", r.volume_id, target.display()));
             Status::internal(e)

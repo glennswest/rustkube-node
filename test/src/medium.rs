@@ -328,7 +328,7 @@ async fn overcommit_refused(env: &Env, api: &Api) -> Outcome {
         Err(e) => return Outcome::Infra(e),
     };
     let max = api::quantity_bytes(s(&cap, "/maximumVolumeSize")).unwrap_or(0);
-    let all: Vec<(&str, u64)> = LADDER.iter().copied().collect();
+    let all: Vec<(&str, u64)> = LADDER.to_vec();
     let Some((request, _)) = all.iter().find(|(_, b)| *b > max) else {
         return Outcome::Skip(format!("node {} can still take the largest class (maximumVolumeSize {max})", env.node_name));
     };

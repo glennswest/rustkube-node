@@ -162,7 +162,7 @@ pub fn wave_objects(env: &Env, n: usize, i: usize, claims: bool) -> (Value, Opti
     let mut p = k8s::pod(env, &name, &["sleep", "86400"]);
     p["metadata"]["labels"]["storm.io/wave"] = json!(n.to_string());
     p["spec"]["terminationGracePeriodSeconds"] = json!(5);
-    if !claims || i % CLAIM_EVERY != 0 {
+    if !claims || !i.is_multiple_of(CLAIM_EVERY) {
         return (p, None);
     }
     let mut c = k8s::claim(env, &name, "16Mi");

@@ -41,3 +41,7 @@ tonic-build = "0.12"
 
 [profile.release]
 strip = true
+
+# Zero warnings (stormcentral#193): a warning fails the build.
+[lints.rust]
+warnings = "deny"

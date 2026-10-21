@@ -31,9 +31,12 @@ const MARGIN: Duration = Duration::from_secs(15);
 /// apiserver.
 const HEARTBEAT: i64 = 120;
 
+/// One case, as a function the run spawns.
+type Case = fn(Arc<Env>, Api) -> std::pin::Pin<Box<dyn std::future::Future<Output = Outcome> + Send>>;
+
 pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
     r.run("node-ready", node_ready(&env, &api)).await;
-    let spawn = |name: &'static str, f: fn(Arc<Env>, Api) -> std::pin::Pin<Box<dyn std::future::Future<Output = Outcome> + Send>>| {
+    let spawn = |name: &'static str, f: Case| {
         let (env, api) = (env.clone(), api.clone());
         tokio::spawn(async move {
             let t = Instant::now();
