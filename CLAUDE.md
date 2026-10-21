@@ -1164,13 +1164,16 @@ The lock pins stormpump 30a76d3, stormvm dc1b7ea, stormcast 801f822; all three m
        byte-sized emptyDisk). sc-build 4545e23: 364 kubelet unit pass. Golden golden-rustkube-node-a97563b0a5c7
        (stormcos#366). #81 closed, #164 shipped. #52's step 6 is done; its end-to-end with a real driver stays.
 
-### In progress: #149 (P3), 64T/256T/1P classes to ext4 (stormblock#289 closed: mkfs-ext4 v4.1.1 in golden-stormblock-12891c0025b2+)
+### Done: #149 (P3), 64T/256T/1P classes to ext4 (stormblock#289 closed: mkfs-ext4 v4.1.1 in golden-stormblock-12891c0025b2+)
 
 2026-10-21. stormblock verified a 1 PiB template (1016 s, 1.6 GiB peak) and 16T/64T/256T formats (70/264/781 s) on a
 16 GB build VM; MINT_TIMEOUT is 1 h. Doing: `SIZE_CLASSES` 64T/256T/1P → `ClassFs::Ext4` (BlockOnly kept, unused; its
 two reason consts gone); storage + pod_manager tests (a 20Ti and a 300Ti filesystem claim mint `pvc-ext4j-<mib>m`
 with `<mib>M`, ext4); test/ medium `LADDER` gets the three, `BLOCK_ONLY` and the 20Ti refused case go (a `20ti`
 size case instead); README, status.md, presentation, CHANGELOG; sc-build (root + test/); stage golden; close.
+Done: 377d7e7 (+ 8d9… test count fix, #273). SC_BUILD_VM sc-build (job 091fffdddf): 541 kubelet unit, all suites, `test/`
+30 + release build, warnings = #227's. Stage golden golden-rustkube-node-9cea8d70a3db (stormcos#628). Closed. Live: a
+64Ti+ ext4 claim needs a node with that room (none of the test machines; medium checks it as a refusal there).
 
 ### Waiting on a release with 2bf962a: #262 (P1), static pods wait ~4 s behind kubelet startup (12.30 reboot, stormcos#596)
 
