@@ -6472,6 +6472,7 @@ fn build_container_config(
         readonly_rootfs: sc["readOnlyRootFilesystem"].as_bool().unwrap_or(false),
         add_capabilities,
         drop_capabilities,
+        no_new_privs: sc["allowPrivilegeEscalation"].as_bool() == Some(false),
         selinux_options,
         host_network: false,
         host_pid: false,
@@ -8692,6 +8693,14 @@ pub(crate) mod tests {
         assert!(c.readonly_rootfs);
         assert_eq!(c.add_capabilities, vec!["NET_ADMIN", "SYS_MODULE"]);
         assert_eq!(c.drop_capabilities, vec!["NET_RAW"]);
+        assert!(!c.no_new_privs, "allowPrivilegeEscalation unset is not no_new_privs");
+        let c = build_container_config(
+            &json!({"name": "x", "securityContext": {"allowPrivilegeEscalation": false}}),
+            "x",
+            vec![],
+            vec![],
+        );
+        assert!(c.no_new_privs);
         // Only the resolvable mount is included; the unresolved one is dropped.
         assert_eq!(c.mounts.len(), 1);
         assert_eq!(c.mounts[0].host_path, "/sys/fs/bpf");

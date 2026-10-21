@@ -143,6 +143,9 @@ pub struct ContainerConfig {
     /// securityContext.capabilities.drop (#118). `ALL` is a name here as in
     /// the pod spec; the runtime resolves it.
     pub drop_capabilities: Vec<String>,
+    /// securityContext.allowPrivilegeEscalation: false — the process (and
+    /// what it execs) can gain no privilege: `no_new_privs` (#118).
+    pub no_new_privs: bool,
     /// securityContext.seLinuxOptions — the container's SELinux label. Cilium's
     /// init containers request `type: spc_t` so they can write host paths under
     /// enforcing SELinux; without passing this the runtime uses `container_t`

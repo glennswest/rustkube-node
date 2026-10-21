@@ -38,15 +38,12 @@
 //!
 //! # What this does not do yet
 //!
-//! Capabilities, seccomp and SELinux are absent from stormpump's spec — it does
-//! not drop anything, so a workload keeps what PID 1 had. That is permissive
-//! rather than restrictive: a privileged container works, and an unprivileged
-//! one is over-privileged. Cilium runs; a hostile workload is not contained.
-//! `ContainerConfig` carries the pod's `capabilities.add`/`drop` and
-//! `privileged`, but `spec_for` has nowhere to put them until stormpump#47 gives
-//! `Spec` a capability set (#118). It must map them before stormpump's default
-//! narrows to the runtime's standard set, or every pod that adds one (Cilium's
-//! NET_ADMIN, BPF, …) loses it as an EPERM rather than a refused start.
+//! Seccomp and SELinux are absent from stormpump's spec. Capabilities are
+//! not (#118, stormpump#47): a container gets the runtime's standard 14 plus
+//! its `capabilities.add`, minus its `drop` (drop first, as upstream), and
+//! `no_new_privs` when `allowPrivilegeEscalation: false`; a privileged one
+//! gets the full set. Before #118 every pod ran with every capability
+//! (the engine's default, `CapBase::Full`, is a node service's).
 
 use retry::RetryExt;
 use std::collections::HashMap;
@@ -855,7 +852,25 @@ fn spec_for(
         group: group_for(&config.qos_class),
         cpu_weight: weight_for(config),
         limits: limits_for(config),
+        caps: caps_for(config),
         ..Spec::default()
+    }
+}
+
+/// A container's capabilities (#118) as upstream's runtimes give them: a
+/// privileged container every one (its add/drop ignored, as containerd and
+/// CRI-O do); any other the standard set, `drop` then `add`, by the names the
+/// pod spells. `allowPrivilegeEscalation: false` is `no_new_privs`.
+fn caps_for(config: &ContainerConfig) -> stormpump::spec::Caps {
+    use stormpump::spec::{CapBase, Caps};
+    if config.privileged {
+        return Caps { base: CapBase::Full, add: Vec::new(), drop: Vec::new(), no_new_privs: false };
+    }
+    Caps {
+        base: CapBase::Standard,
+        add: config.add_capabilities.clone(),
+        drop: config.drop_capabilities.clone(),
+        no_new_privs: config.no_new_privs,
     }
 }
 
@@ -1391,8 +1406,19 @@ impl RuntimeService for StormpumpRuntime {
         }
         let defined = match compose_for(config, image.as_ref(), name.as_deref(), Some(&read_root)) {
             Ok(run) => {
-                let encoded = spec_for(config, _sandbox_config, run, Some(&read_root)).encode();
-                self.on_ring(move |r| r.spec_define(encoded)).await
+                let spec = spec_for(config, _sandbox_config, run, Some(&read_root));
+                // A capability name the engine does not know would come back as
+                // spec code 54; say which one, here.
+                match spec.caps.resolve() {
+                    Err(e) => Err(CriError::Runtime(format!(
+                        "container {}: securityContext.capabilities: {e:?}",
+                        config.name
+                    ))),
+                    Ok(_) => {
+                        let encoded = spec.encode();
+                        self.on_ring(move |r| r.spec_define(encoded)).await
+                    }
+                }
             }
             Err(e) => Err(CriError::Runtime(format!("container {}: {e}", config.name))),
         };
@@ -2326,6 +2352,52 @@ mod tests {
 
     fn rt() -> StormpumpRuntime {
         StormpumpRuntime::new("/nonexistent/stormpump.sock")
+    }
+
+    /// Capabilities reach the engine (#118): a pod that asks for nothing gets
+    /// the standard set, not every capability; add/drop/no_new_privs carried;
+    /// a privileged container the full set.
+    #[test]
+    fn capabilities_become_the_specs_caps() {
+        use stormpump::spec::{CapBase, STANDARD_CAPS, cap_number};
+        let bit = |n: &str| 1u64 << cap_number(n).unwrap();
+        let standard = STANDARD_CAPS.iter().fold(0, |m, n| m | bit(n));
+
+        let plain = spec_of(&ContainerConfig::default(), &PodSandboxConfig::default());
+        assert_eq!(plain.caps.base, CapBase::Standard);
+        assert_eq!(plain.caps.resolve().unwrap(), Some(standard));
+        assert!(!plain.caps.no_new_privs);
+
+        let cc = ContainerConfig {
+            add_capabilities: vec!["NET_ADMIN".into()],
+            drop_capabilities: vec!["NET_RAW".into()],
+            no_new_privs: true,
+            ..Default::default()
+        };
+        let caps = spec_of(&cc, &PodSandboxConfig::default()).caps;
+        assert_eq!(caps.resolve().unwrap(), Some((standard & !bit("NET_RAW")) | bit("NET_ADMIN")));
+        assert!(caps.no_new_privs);
+
+        // Cilium's mount-cgroup init: drop ALL, then exactly what it adds.
+        let cc = ContainerConfig {
+            add_capabilities: vec!["SYS_ADMIN".into(), "SYS_CHROOT".into(), "SYS_PTRACE".into()],
+            drop_capabilities: vec!["ALL".into()],
+            ..Default::default()
+        };
+        let caps = spec_of(&cc, &PodSandboxConfig::default()).caps;
+        assert_eq!(caps.resolve().unwrap(), Some(bit("SYS_ADMIN") | bit("SYS_CHROOT") | bit("SYS_PTRACE")));
+
+        let cc = ContainerConfig {
+            privileged: true,
+            drop_capabilities: vec!["ALL".into()],
+            ..Default::default()
+        };
+        let caps = spec_of(&cc, &PodSandboxConfig::default()).caps;
+        assert_eq!(caps.base, CapBase::Full);
+        assert_eq!(caps.resolve().unwrap(), None, "privileged keeps every capability");
+
+        let cc = ContainerConfig { add_capabilities: vec!["NOT_A_CAP".into()], ..Default::default() };
+        assert!(spec_of(&cc, &PodSandboxConfig::default()).caps.resolve().is_err());
     }
 
     /// A pod's limits reach the engine (#57): memory.max with no swap, and

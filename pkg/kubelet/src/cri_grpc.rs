@@ -348,6 +348,7 @@ fn to_proto_container_config(config: &ContainerConfig) -> proto::ContainerConfig
                     drop_capabilities: config.drop_capabilities.clone(),
                     ..Default::default()
                 }),
+                no_new_privs: config.no_new_privs,
                 selinux_options: config.selinux_options.as_ref().map(to_proto_selinux),
                 seccomp: config.seccomp_profile.as_ref().map(to_proto_seccomp),
                 // A CRI runtime applies the image's User itself when these
