@@ -58,7 +58,7 @@ Environment keys with no flag: `STORMDRIVE_URL` (above), the engine credentials
 **A named credential file is waited for, then fatal** (#69): `--kubeconfig`, `--apiserver-ca`,
 `--client-certificate`, `--client-key`, `--token-file`, `--tls-cert-file`, `--tls-private-key-file` and
 `--server-token-file`. The boot may write them after the kubelet starts (stormcert), so a missing or empty
-file is waited for up to 60 s, with one warning; if it is still absent the kubelet exits naming the flag
+file is waited for up to 60 s (looked for every 50 ms, #262), with one warning; if it is still absent the kubelet exits naming the flag
 and path. It never falls back to the kubeconfig's value, anonymous access or a self-signed serving pair
 for a file it was told to use. An unset flag still falls back as described above.
 

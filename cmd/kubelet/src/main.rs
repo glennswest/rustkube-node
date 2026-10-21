@@ -198,6 +198,12 @@ struct Cli {
 /// How long a credential file named on the command line may take to appear.
 const CREDENTIAL_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How often a credential that is not there yet is looked for again. A read
+/// of a missing file is one failed `open`; at 500 ms each wait added up to half
+/// a second after stormcert wrote the file, and a boot waits on several in turn
+/// (the client pair, then the serving pair: #262, 12.38 on pvetest1).
+const CREDENTIAL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Read a credential file the boot may not have written yet: the apiserver CA,
 /// the client pair, a token, the serving pair (#69).
 ///
@@ -234,7 +240,7 @@ async fn wait_for_file(flag: &str, path: &str, limit: std::time::Duration) -> an
             tracing::warn!("{flag} {path} is not there yet — waiting for it");
             said = true;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(CREDENTIAL_POLL).await;
     }
 }
 
@@ -658,6 +664,26 @@ mod tests {
         });
         let got = wait_for_file("--client-certificate", f.to_str().unwrap(), Duration::from_secs(10)).await;
         assert_eq!(got.unwrap(), b"PEM");
+    }
+
+    /// #262: read within a poll of being written, not up to half a second later.
+    #[tokio::test]
+    async fn a_named_credential_is_read_soon_after_it_is_written() {
+        let f = scratch("soon").join("kubelet-serving.crt");
+        let g = f.clone();
+        let written = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let w = written.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            // Taken just before the write, so the reader always finds it.
+            *w.lock().unwrap() = Some(std::time::Instant::now());
+            std::fs::write(&g, b"PEM").unwrap();
+        });
+        let got = wait_for_file("--tls-cert-file", f.to_str().unwrap(), Duration::from_secs(10)).await;
+        let read = std::time::Instant::now();
+        assert_eq!(got.unwrap(), b"PEM");
+        let late = read - written.lock().unwrap().expect("written before it was read");
+        assert!(late < CREDENTIAL_POLL * 4, "read {late:?} after it was written");
     }
 
     #[tokio::test]

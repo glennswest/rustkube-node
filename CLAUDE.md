@@ -1219,7 +1219,15 @@ Done: 377d7e7 (+ 8d9… test count fix, #273). SC_BUILD_VM sc-build (job 091fffd
 30 + release build, warnings = #227's. Stage golden golden-rustkube-node-9cea8d70a3db (stormcos#628). Closed. Live: a
 64Ti+ ext4 claim needs a node with that room (none of the test machines; medium checks it as a refusal there).
 
-### Waiting on a release with b383dad: #262 (P1), static pods behind kubelet startup: the stall's kind
+### In progress: #262 (P1), static pods behind kubelet startup: read on 12.38+b383dad
+
+2026-10-21 (later). Read (`testhost logs pvetest1|2 kubelet --search 'first static pod'`): the stall is page-in: `flags=1495ms
+(cpu 0ms, 16 faults, 16 waits)`, `engine=1532ms(cpu 1ms, 22 faults, 22 waits)`: waits = major faults, ~70–95 ms each
+(fast starts: 16 faults in 57 ms). `credentials` 2.5–5.6 s = stormcert writing kubelet.crt, then kubelet-serving.crt late,
+each wait polled at 500 ms. Doing: poll 50 ms (test, docs, CHANGELOG); file stormblock (root-volume page-in at boot, cf.
+stormblock#409's one ublk queue); sc-build; stage; close #262 (the rest is stormblock's / stormcert's boot order).
+
+### (earlier) Waiting on a release with b383dad: #262 (P1), static pods behind kubelet startup: the stall's kind
 
 2026-10-21. 12.38 carries 2bf962a (golden d3c3e72b4eaf). Read on pvetest1/2 (`testhost logs <m> kubelet --search 'first
 static pod'`): (2) fixed live: static pods' `volumes` 0.1–9 ms (was 1142). (1) first static pod 1.8–3.0 s after the
