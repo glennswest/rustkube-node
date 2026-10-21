@@ -1412,18 +1412,21 @@ every suite needs to resolve STORM_NODE). Pods are pinned with `spec.nodeName` (
        12.16 installs failed (Fedora-44 VM image never arrived: stormcos#129). #61 proposed after stormcos#129;
        then `stormcentral test run rustkube-node medium --tag pvetest1`, long at night, close on their results.
 
-### In progress: #171 (P2), fsGroup / supplementalGroups onto the engine
+### Done: #171 (P2), fsGroup / supplementalGroups onto the engine
 
 2026-10-21. Lock's stormpump 9877a97 has `Spec.groups` (stormpump#104: setgroups before gid/uid). The kubelet sees PID 1's
 claim mounts (`/run/stormpump/pvc/<dev>`, host /run bound at /run, as it reads /run/stormpump/roots), right after
 `volume_register_device` and before the spawn: upstream's SetVolumeOwnership point. Doing:
-1. [ ] ContainerConfig `fs_group`, `fs_group_change_policy`, `supplemental_groups` (pod-level, `apply_pod_namespaces`);
+1. [x] ContainerConfig `fs_group`, `fs_group_change_policy`, `supplemental_groups` (pod-level, `apply_pod_namespaces`);
        CRI gRPC `supplemental_groups` (+ fsGroup in it, as upstream's kuberuntime does).
-2. [ ] `spec_for` and `exec_spec`: `groups` = fsGroup + supplementalGroups, deduplicated.
-3. [ ] Ownership (`volume_ownership.rs`): each claim filesystem mount (fstype set) before the spawn: OnRootMismatch
+2. [x] `spec_for` and `exec_spec`: `groups` = fsGroup + supplementalGroups, deduplicated.
+3. [x] Ownership (`volume_ownership.rs`): each claim filesystem mount (fstype set) before the spawn: OnRootMismatch
        skips a root already right; else the tree, symlinks skipped: chown(-1, fsGroup), files |0660 (|0440 ro), dirs
        |0660|0110|setgid. A failure fails the start naming the path.
-4. [ ] Tests, README ("Not yet"), status.md, CHANGELOG; sc-build; stage golden; close.
+4. [x] Tests, README ("Not yet"), status.md, CHANGELOG; sc-build; stage golden; close.
+       Done (+ #274, my test's empty argv). SC_BUILD_VM sc-build (job 34670a02d1): 546 kubelet unit, all suites, warnings =
+       #227's. Stage golden golden-rustkube-node-cb08ee3dbf99 (stormcos#628). Closed. Live: a pod with runAsUser 1000,
+       fsGroup 2000 writing its claim, after the release (blocked like #64 on stormcos#271 for a test-standard run).
 
 
 2026-10-09 (#220): a claim is root's, so a non-root container cannot write it (#98 follow-up). The lock's stormpump
