@@ -48,7 +48,7 @@ never cached. A request whose token check or answer takes over 1 s is logged
 | PUT | `/vmVerb/{namespace}/{name}/{verb}` | A VM's verb through stormvm's router (`PUT /api/v1/vms/{ns}/{name}/{verb}`, #94): `pause`, `unpause`, `softreboot`, `reset`, `status`, `freeze`, `thaw` (or `unfreeze`), `snapshot` (`?name=&quiesce=`). Query forwarded without `token`; 400 for any other verb (`migrate`/`receive` included); the router's own answers otherwise (404 for an unregistered VM) |
 | GET | `/vmInstance/{address}` | Guest metadata: the machine found by address in this node's index, answered from its cached VMI only when that object places it here (uid matches, not terminating, `status.nodeName` is this node, no completed migration to another node; #119). **A node address** (a host-network workload) is refused unless the request carries the workload's own ServiceAccount token in `X-Storm-Workload-Token` (#122; not `Authorization`, which is the caller's credential to the kubelet): the kubelet TokenReviews it, takes the pod from `status.user.extra` (`authentication.kubernetes.io/pod-name`/`pod-uid`/`node-name`), and answers that pod's metadata (`storm.io/kind: Pod`) only when the pod's object has that uid, is placed on this node and is not ending. 404 when absent, placed elsewhere, or claimed by two machines here; 503 + `Retry-After: 2` while cold (until the first VMI list; a cluster without the VMI CRD is not cold); 503 + `Retry-After: 5` for a machine here when the apiserver has not been heard from (a renewed node Lease or a VMI list) within `--metadata-max-staleness` (40 s), since a partitioned node cannot see the machine move (#156). This is the metadata service's single source (stormimds#12, decided 2026-10-06; stormimds 71b4fbf): stormimds asks `GET /vmInstance/{source address}` on every guest request, at `https://127.0.0.1:10250` by default, with its own bearer token in `Authorization` and a caller's bearer token forwarded as `X-Storm-Workload-Token`; it passes 404 on and turns 503, 401/403 or no answer into 503 + `Retry-After`. The node's credential for it is stormcos#330 (and #180 for scoping it). SSH keys and user-data are not in the answer yet (#168) |
 | POST, GET | `/portForward/{namespace}/{pod}` | `kubectl port-forward` (#56): SPDY/3.1 (`portforward.k8s.io`) or a WebSocket tunnel of it (`SPDY/3.1+portforward.k8s.io`); connects to `localhost:<port>` in the pod's network namespace (the node's for hostNetwork). 404 unknown pod, 403 another protocol, 503 no namespace found |
-| POST, GET | `/exec/{namespace}/{pod}/{container}`, `/attach/…` | 501 (the message still names stormpump#103). The engine's op exists and is in the lock (stormpump 13cf2c9); the kubelet does not use it yet, and exec probes fail the same way (#56 item 5) |
+| POST, GET | `/exec/{namespace}/{pod}/{container}`, `/attach/…` | `kubectl exec` / `attach` (#56): upgrade to SPDY/3.1 (`v4.channel.k8s.io`, v3, v2, `channel.k8s.io`) or a WebSocket (`v5.channel.k8s.io`, `v4.channel.k8s.io`). Query `command` (repeated), `input`/`stdin`, `output`/`stdout`, `error`/`stderr`, `tty`. Refused before the upgrade: 400 no command (exec) or no stream, 404 no such pod or container here, 403 no common protocol, 500 the runtime refused (its words) |
 | DELETE | `/volumes/{namespace}/{claim}` | Built-in claim clone reclamation: 204 absent/deleted, 409 in use, 503 when safe release cannot be established |
 
 `previous` is `true`/`1` (the run before, as upstream parses it) or `N`, the run N
@@ -74,8 +74,15 @@ is returned by a plain read, and by `follow` once the pod is gone.
 
 
 The SPDY session (`spdy.rs`) answers each stream with a SYN_REPLY, echoes
-PINGs and does no flow control (client-go's spdystream does none either); the WebSocket channel protocols for
-exec/attach (`v5.channel.k8s.io`) come with #56 item 5.
+PINGs and does no flow control (client-go's spdystream does none either).
+
+**exec and attach** (#56, `remotecommand.rs`). Over SPDY the client opens one stream per channel, named by
+`streamType` (`error`, `stdin`, `stdout`, `stderr`, and `resize` with a terminal from v3); the kubelet waits up to
+30 s for every one the query asked for. Over a WebSocket each binary message's first byte is the channel (0 stdin,
+1 stdout, 2 stderr, 3 error, 4 resize); v5's 255 + 0 ends stdin. v4 and v5 write the result on the error
+channel as a `metav1.Status`: `Success`, or `Failure` / `NonZeroExitCode` with the exit code as the `ExitCode`
+cause (kubectl exits with it); v1–v3 write only an error's text. Resizes are `{"Width":…,"Height":…}`, applied to
+the pty (`TIOCSWINSZ`). The client going away stops an exec (an attach only detaches).
 The console router's control verbs are served at `/vmVerb` (#94); the
 apiserver's proxy to them is rustkube#141.
 

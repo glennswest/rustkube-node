@@ -313,7 +313,7 @@ asked within ~6 s makes the request 503, #244); `/healthz`, `/livez` and
 | `GET /pods` | The pods this kubelet manages, including admitted pods still waiting to start (`Pending`, with the reason) |
 | `GET /containerLogs/{ns}/{pod}/{container}` | What `kubectl logs` reads, by way of the apiserver proxy. Each container (init containers and native sidecars too) has its own directory, `/var/log/pods/<ns>_<pod>_<uid>/<container>/`, and each run of it its own file, `<N>.log`: a restart, a retried init, a restarted sidecar or a run after a kubelet restart takes the next number, so `--previous` is the run before (`previous=N`, N back). The current run and five previous are kept (upstream keeps one); older ones go when a new run starts. The live file is rotated as upstream's ContainerLogManager does: every 10 s, past `--container-log-max-size` (10Mi), to `<N>.log.<YYYYMMDD-HHMMSS>`, older rotations gzip'd, at most `--container-log-max-files` (5) files per run; `kubectl logs` reads the live file. stormpump holds an O_APPEND descriptor and has no reopen, so rotation copies then truncates (a line written between the two is lost), and its files carry the raw output: no timestamps or stream per line, so `timestamps` and `since` have nothing to act on there until stormpump writes CRI-format lines (stormpump#129); a CRI runtime's files are served with both (#216). A pod waiting to start answers `400 … is waiting to start: ContainerCreating (<reason>)`, as upstream does. A node service's mirror pod (`kube-system/<asset>-<node>`, container `<asset>`) reads the service's stormd log volume, found through the boot unit that mounts it at `/var/log/stormd` and seen under `/hostroot`. The current log covers every process stormd runs there, rotations included, merged in time order and marked `[<proc>]` when there is more than one. `--previous` is the newest finished run (`.failed.log` or `.exited.log`: upstream's last terminated instance, #216; it was the newest `.failed.log` only), and tail, since, timestamps, limit and follow all apply. A service not run by stormd (stormblock, registry, timesync) is read from PID 1's own file for its running incarnation: `/run/stormpump/assets.json` lists each asset's last five `runs` (stormpump#90), each naming its `w<id>.log` (and `w<id>.1.log`, the rotated start) under `/run/stormpump/logs`; follow polls the live file. `--previous` is then the newest ended run's file (#87). When there is no such file either (the service died before stormd wrote its volume, an older PID 1), the log is PID 1's record of its last exit: `last_output`, the last 20 lines its incarnation wrote (stormpump#51); `--previous` falls back to it too. PID 1's lines have no timestamps, so only tail and limit apply. With none of these, a 404 (400 for `--previous`) names the volume looked in and the last exit or refused start (#124) |
 | `POST/GET /portForward/{ns}/{pod}` | `kubectl port-forward` (#56). Upgrades to SPDY/3.1 (`X-Stream-Protocol-Version: portforward.k8s.io`) or to a WebSocket tunnelling SPDY (`Sec-WebSocket-Protocol: SPDY/3.1+portforward.k8s.io`, what a newer kubectl tries first). Each forwarded connection is an `error` + `data` stream pair by `requestID`; the kubelet connects to `localhost:<port>` inside the pod's network namespace (IPv4, then IPv6; the node's for a hostNetwork pod) and splices; a failure is written on the error stream. Anything else is refused before the upgrade (404 unknown pod, 403 another protocol), which is what makes client-go fall back from WebSocket to SPDY |
-| `POST/GET /exec/…`, `/attach/…` | 501. The engine's op for a process inside a running container is done (stormpump#103) and in the lock; the kubelet does not use it yet (#56 item 5), and exec probes (`exec_sync`) fail the same way until it does |
+| `POST/GET /exec/…`, `/attach/…` | `kubectl exec` and `kubectl attach` over SPDY (`v4.channel.k8s.io` and older) or a WebSocket (`v5.channel.k8s.io`, `v4`), see [exec and attach](#exec-and-attach) |
 | `GET /vmConsole/{ns}/{name}/{door}` | A VM's `serial` or `vnc` console, answered by stormvm's console router mounted here (`vnc` for qemu, and for cloud-hypervisor's `stormvm display` helper when `vmm: cloud-hypervisor` is named, stormvm#1) |
 | `GET /vmInstance/{address}` | VMI metadata by observed guest address (an index, not a scan); answered only when the cached VMI places the machine on this node (`status.nodeName`, a completed migration's target), so a moved machine or a reused address is 404 here (#119). A node address (host-network workload) answers only with the workload's ServiceAccount token in `X-Storm-Workload-Token`, for the pod it is bound to, if that pod runs here (#122). Cold cache returns 503 with Retry-After, and so does a machine here when the apiserver has not been heard from (renewed node Lease or VMI list) within `--metadata-max-staleness`, 40 s (#156); absent guest returns 404. stormimds asks this route on every guest request (stormimds#12, decided; details in [docs/api.md](docs/api.md)); SSH keys and user-data are not in the answer yet (#168) |
 | `DELETE /volumes/{ns}/{claim}` | Delete the stormblock clone behind a released claim |
@@ -355,6 +355,28 @@ through it (`[vm] url = http://127.0.0.1:9095`, stormconsole
 registrations this kubelet writes, so both doors answer for the same machines.
 From outside the node the apiserver's `vmConsole` proxy to `:10250` (above) is the
 way in; `:9095` is the node-local one (#123, stormcos#65).
+
+### exec and attach
+
+`kubectl exec` (#56) runs the command **inside the running container** through stormpump's exec op
+(stormpump#103): a `SPAWN` with the container's workload in `inline_a`, so the process is in its namespaces, at
+its root and in its cgroup, with the container's environment, working directory, user and capabilities (#118). A
+relative command is looked up on the container's `PATH` in its root, as at start. Its stdio is descriptors the
+kubelet deposits on the engine's socket and keeps the other ends of: a pipe per stream asked for, or one pty
+(`kubectl exec -t`) on all three, resized from the session's resize stream. No stream data goes through the
+ring. The process's exit reaches the session alone (not the node's exit queue, so an exec probe wakes nothing
+else), and its exit code becomes kubectl's. Exec probes (`exec_sync`) are the same op: stdout and stderr kept to
+1 MiB each, past `timeoutSeconds` it is stopped and the probe fails.
+
+`kubectl attach` reaches the container's own stdio. A container with `stdin: true` gets a pipe on its fd 0,
+deposited at start, whose writer the kubelet keeps for its life; its output still goes to its log, and an attach
+follows the log file from that moment (a copy-truncate rotation is followed too). A container with `tty: true`
+gets a **kubelet-held pty** on 0, 1 and 2: the kubelet copies what it writes into the container's log and to
+everyone attached, and `kubectl attach -it` gets the terminal, resizes included. (The engine's own `tty` is the
+node's console, one per node; a `tty: true` pod used to take it.) Detaching leaves the container running.
+
+The transports and the wire format are in [docs/api.md](docs/api.md). The CRI gRPC path (a containerd or CRI-O
+runtime) has no exec or attach here: its runtime streams through its own server, which this kubelet does not proxy.
 
 `DELETE /volumes` is what makes `reclaimPolicy: Delete` finish instead of
 leaking: `204` when the clone is gone or was never there, `409` while a pod
@@ -403,8 +425,8 @@ connect) and the retired `[process.liveness] type = "http"`, `url = …`, on the
 `timeout_seconds`, `failure_threshold` and `success_threshold` (stormd's defaults 10 s, 1 s, 3, 1; the old table
 10 s, 2 s, 3). `failure_threshold` failures in a row make the pod Running but not ready: container
 `ready: false`, `Ready`/`ContainersReady` False, reason `Unhealthy` with the failure, and an `Unhealthy` Warning
-Event; `success_threshold` answers make it ready again. An `exec` or `grpc` probe is not run from the kubelet
-(said once in its log). A service with no probe the kubelet can run, or not on the host network,
+Event; `success_threshold` answers make it ready again. A node service's `exec` or `grpc` probe is not run from the
+kubelet (said once in its log; a Pod's exec probe is, #56). A service with no probe the kubelet can run, or not on the host network,
 is Ready while running, as before. **A service that has exited says how** (#82): PID 1 keeps each asset's last
 exit in assets.json (`last_exit_code` or `last_exit_signal`, `last_exit`, the last 20 lines of `last_output`;
 stormpump#51), and the mirror's container carries it as `lastState.terminated` (`exitCode`, 128 + the signal

@@ -98,8 +98,8 @@ From the code (`pkg/kubelet/src/pod_manager.rs`, `stormpump_runtime.rs`):
 - **Network:** a stormpump sandbox per Pod, CNI ADD into it; a Pod waits, with no sandbox, until the CNI
   config appears (inotify on `--cni-conf-dir`, #148); a finished Pod gives its IP back at once (#137)
 - **Images and roots:** every container gets its own CoW clone of the image's sealed golden, mounted by
-  PID 1 and deleted with it (#104); the image's config applies under the pod spec (#98); `port-forward`
-  is served, exec/attach not yet (#56)
+  PID 1 and deleted with it (#104); the image's config applies under the pod spec (#98); `port-forward`,
+  `exec` (with a terminal) and `attach` are served (#56)
 - **Lifecycle:** init containers and native sidecars (#111), restart policies, CrashLoopBackOff, liveness/readiness/startup probes,
   Events, ServiceAccount tokens **bound to the Pod** and refreshed at 80% of their life (#122)
 - **Start timing:** every start's phases in `storm.io/start-timing`, a `StartTiming` Event and
@@ -162,7 +162,7 @@ So `kubectl get pods -n kube-system` shows the whole node, not only what Kuberne
 | | |
 |---|---|
 | **Listener** | `:10250` HTTPS (`--kubelet-port`), bearer token (static or TokenReview); `/healthz` `/livez` `/readyz` open |
-| **Routes** | `/pods`, `/containerLogs/…`, `/metrics`, `/metrics/cadvisor`, `/stats/summary`, `/portForward/…`, `/vmConsole/…`, `/vmVerb/…`, `/vmInstance/…`, `DELETE /volumes/{ns}/{claim}`; `/exec`, `/attach` answer 501 |
+| **Routes** | `/pods`, `/containerLogs/…`, `/metrics`, `/metrics/cadvisor`, `/stats/summary`, `/portForward/…`, `/vmConsole/…`, `/vmVerb/…`, `/vmInstance/…`, `DELETE /volumes/{ns}/{claim}`, `/exec/…`, `/attach/…` |
 | **Talks to** | apiserver (`--apiserver`), stormpump ring (`--cri-socket`), stormblock `:9090` (`--stormblock`), sbregistry `:5100` (`--registry`), CNI (`--cni-conf-dir`, `--cni-bin-dir`) |
 | **Tuning** | `--pod-workers`, `--max-pods` (110), `--system-reserved`/`--kube-reserved`, `--container-log-max-size`/`-files`, `--storage-overcommit` (1.0), `--storage-reserve-percent` (5), `--storage-alert-percent` (85) |
 | **Metrics** | upstream names (`kubelet_running_pods`, `kubelet_pod_start_duration_seconds` …), cAdvisor series, slab gauges |
@@ -190,7 +190,7 @@ Full lists: `docs/api.md`, `docs/configuration.md`, `docs/metrics.md`.
 
 ## Planned (not in the code yet)
 
-- **exec / attach** and exec probes through stormpump's op (#56); fsGroup onto the engine's `Spec`
+- fsGroup onto the engine's `Spec`
   (#171)
 - **Live migration** of stormvm machines: a RAID leg on the destination first (owner, #159), behind
   stormstorage#44 (#40); graceful VM stop (#181)
@@ -206,7 +206,7 @@ Full lists: `docs/api.md`, `docs/configuration.md`, `docs/metrics.md`.
 - **Verified by build and unit tests**, and for some work by a live run (the short suite passed on the
   Dell at 9229603, #217); each issue says what ran (`docs/status.md` is the audit)
 - **P0:** #214 (class blanks formatted on the node at runtime)
-- **P1:** #56 (exec/attach), #95/#99/#102 (startup speed), #184 (VMI waiting on its golden), #210 (pinned
+- **P1:** #95/#99/#102 (startup speed), #184 (VMI waiting on its golden), #210 (pinned
   git dependencies), #61 (test suites live), #88/#91/#92 (VM checks on a live node)
 - **Decided:** microVM Pods are stormvisor's by RuntimeClass (#13 → #204); versioned goldens copied on demand (#86)
 
