@@ -1207,7 +1207,7 @@ stormpump's Spec has `uid`/`gid` and the engine drops to them (exec.rs). Found: 
        kubelet unit pass. Golden golden-rustkube-node-04134493c42a (stormcos#366). Follow-ups #171 (fsGroup), #172
        (image Volumes, after stormblock-registry#58). Closed. Not run on a node.
 
-### In progress: #95 (P1), pod/claim start toward ≤2 s / ≤1 s: the claim's own steps timed
+### Waiting on stormcos-cilium#38 (+ stormblock#327/#434): #95 (P1), pod/claim start toward ≤2 s / ≤1 s
 
 2026-10-21. stormcentral's install probes (`/api/v1/metrics`, 12.21–12.37). Container start meets ≤ 2 s everywhere:
 pvetest1/2 0.2–0.3 s, the Dell 0.5–0.9 s (baseline 21 s). Claim meets ≤ 1 s on pvetest1/2 (0.40–0.55 s end to end,
@@ -1215,13 +1215,16 @@ kubelet 0.23–0.30 s) and misses on the Dell (12.37: cold 1.39 s, kubelet 1.10 
 cni 142, container/p 489; warm 9.5 s, of which `sandbox/cni` 7.4 s = Cilium's ADD, no kubelet lock around it). Under the
 probe's 2 GiB rewrite loop the Dell's claim/d/lookup is 10.6 s (pvetest 0.4–0.9 s): lookup is ~8 serial calls (PVC, PV
 twice, the engine's whole volume list up to 3×, StorageClass, slabs). Doing (the kubelet's share):
-1. [ ] provision_claim_volume: one PV GET and one volume listing (handle + name), in parallel; StorageClass read while
+1. [x] provision_claim_volume: one PV GET and one volume listing (handle + name), in parallel; StorageClass read while
        the capacity lock is awaited; capacity::read's slabs + volumes in parallel. `ClaimSteps.room` (policy + capacity,
        inside lookup) → `claim/<v>/room=`, histogram `claim/room`.
-2. [ ] Tests (existing claim tests; room timed), README/metrics.md, CHANGELOG; sc-build; stage golden.
-3. [ ] File the rest: Cilium's 7.4 s ADD on the Dell (stormcos-cilium), the Dell's container/p and I/O-stress collapse
-       (container/c 20 s, blank 10.6 s: stormblock under a rewrite loop). Comment numbers on #95; close it on the kubelet
-       half if the others carry the Dell's claim target (else ask).
+2. [x] Tests (existing claim tests; room timed), README/metrics.md, CHANGELOG; sc-build; stage golden.
+3. [x] File the rest: Cilium's 7.4 s ADD on the Dell = stormcos-cilium#38; the I/O-stress collapse added to
+       stormblock#434 (engine lock held by GET /slabs). Done: 78bbe92 (+ docs). SC_BUILD_VM sc-build 78bbe92 (job
+       cc31d4be02): 526 kubelet unit, all suites, warnings = #227's. Stage golden golden-rustkube-node-4ce19b8a7ee9
+       (stormcos#628). Numbers on #95; proposed after stormcos-cilium#38.
+4. [ ] Resume: on a release with 4ce19b8a7ee9 and #38's fix, the Dell's `warm_claim_bind_and_mount_timing` (and
+       `claim/d/room`) from `/api/v1/metrics`; close when the claim is ≤ 1 s there, else file the step that misses.
 (earlier) 
 2026-10-09 (#220): stormpump#107 is closed (a warm claim's ext4 mount is 5.4 ms on 11.95). Next: the kubelet's own
 warm-probe measurement of claims on a node; what is left beyond that is stormblock#327 (clone) and rustkube#147.
