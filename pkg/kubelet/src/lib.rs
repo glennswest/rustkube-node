@@ -41,6 +41,7 @@ pub mod node_status;
 pub mod pod_manager;
 pub mod pv_placement;
 pub mod portforward;
+pub mod remotecommand;
 pub mod runtime;
 pub mod server;
 pub mod spdy;

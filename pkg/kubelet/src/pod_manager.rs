@@ -5209,6 +5209,25 @@ impl PodManager {
         })
     }
 
+    /// The runtime's id for `container` of pod `namespace/name` on this node,
+    /// and the runtime (#56: `kubectl exec`, `attach`). `None`: no such pod
+    /// here; `Some(Err)`: the pod has no such container running.
+    pub async fn exec_target(
+        &self,
+        namespace: &str,
+        name: &str,
+        container: &str,
+    ) -> Option<Result<(String, Arc<dyn RuntimeService>), String>> {
+        let pods = self.pods.read().await;
+        let p = pods.values().find(|p| p.namespace == namespace && p.name == name)?;
+        Some(match p.container_ids.get(container) {
+            Some(id) => Ok((id.clone(), self.runtime.clone())),
+            None => Err(format!(
+                "container {container} is not valid for pod {name}, or it is not running on this node yet"
+            )),
+        })
+    }
+
     /// Record `pod` as running in `sandbox`, for tests of what reads the
     /// record (the server's streaming routes) without a start.
     #[cfg(test)]
@@ -5217,7 +5236,10 @@ impl PodManager {
         let s = |k: &str| m[k].as_str().unwrap_or("").to_string();
         self.pods.write().await.insert(s("uid"), PodState {
             namespace: s("namespace"), name: s("name"), uid: s("uid"),
-            sandbox_id: Some(sandbox.into()), container_ids: HashMap::new(),
+            sandbox_id: Some(sandbox.into()),
+            container_ids: pod["spec"]["containers"].as_array().into_iter().flatten()
+                .filter_map(|c| c["name"].as_str())
+                .map(|n| (n.to_string(), format!("ctr-{n}"))).collect(),
             phase: "Running".into(), pod: pod.clone(), pod_ip: None,
             restart_counts: HashMap::new(), ready: HashMap::new(), liveness_failures: HashMap::new(),
             startup_passed: HashMap::new(), started: HashMap::new(), terminated: HashMap::new(),

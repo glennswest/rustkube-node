@@ -4,8 +4,8 @@
 //! pods this kubelet manages) and `/containerLogs` — the endpoint the
 //! apiserver proxies `kubectl logs` to (rustkube-node#34). `/portForward`
 //! speaks SPDY/3.1 (`spdy.rs`) or a WebSocket tunnel of it (#56); `/exec` and
-//! `/attach` answer 501 until the engine can run a process inside a running
-//! container (stormpump#103). Served over HTTPS with bearer-token auth
+//! `/attach` speak the remotecommand protocols (`remotecommand.rs`) over SPDY or
+//! a WebSocket, on a process the runtime runs in the container (#56). Served over HTTPS with bearer-token auth
 //! (rustkube-node#9).
 //!
 //! Two routes are here because the thing they reach is on the node and the
@@ -190,8 +190,8 @@ fn router_with_console(
         // `kubectl port-forward`, `exec`, `attach`. GET for a WebSocket
         // handshake, POST for SPDY.
         .route("/portForward/{namespace}/{pod}", get(port_forward).post(port_forward))
-        .route("/exec/{namespace}/{pod}/{container}", get(exec_refused).post(exec_refused))
-        .route("/attach/{namespace}/{pod}/{container}", get(attach_refused).post(attach_refused))
+        .route("/exec/{namespace}/{pod}/{container}", get(exec).post(exec))
+        .route("/attach/{namespace}/{pod}/{container}", get(attach).post(attach))
         // Who is at this address.
         //
         // Meant for the metadata service. The kubelet already holds the VMI,
@@ -672,28 +672,263 @@ where
     ours
 }
 
-/// `kubectl exec` (#56). Not served yet on stormpump: the engine has no way
-/// to run a process inside a running container (stormpump#103). Refused with
-/// the reason, before any upgrade, so `kubectl` prints it.
-async fn exec_refused(Path((namespace, pod, container)): Path<(String, String, String)>) -> Response {
-    streaming_refused("exec", &namespace, &pod, &container)
+/// `kubectl exec` (#56): run the command in the container (the runtime's
+/// `exec_process`, stormpump#103's exec op) and serve its streams over SPDY or
+/// a WebSocket (`remotecommand.rs`).
+async fn exec(
+    State(pm): State<Arc<PodManager>>,
+    Path((namespace, pod, container)): Path<(String, String, String)>,
+    req: Request,
+) -> Response {
+    remote_command(pm, Verb::Exec, namespace, pod, container, req).await
 }
 
-/// `kubectl attach` (#56): as exec, a container's stdin needs the engine (stormpump#103).
-async fn attach_refused(Path((namespace, pod, container)): Path<(String, String, String)>) -> Response {
-    streaming_refused("attach", &namespace, &pod, &container)
+/// `kubectl attach` (#56): the container's own stdin and output.
+async fn attach(
+    State(pm): State<Arc<PodManager>>,
+    Path((namespace, pod, container)): Path<(String, String, String)>,
+    req: Request,
+) -> Response {
+    remote_command(pm, Verb::Attach, namespace, pod, container, req).await
 }
 
-fn streaming_refused(verb: &str, namespace: &str, pod: &str, container: &str) -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        format!(
-            "{verb} into {namespace}/{pod}/{container} is not supported on this node yet: its runtime \
-             (stormpump) cannot run a process inside a running container (stormpump#103). \
-             `kubectl port-forward` and `kubectl logs` work.\n"
-        ),
-    )
-        .into_response()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verb {
+    Exec,
+    Attach,
+}
+
+/// The upgrade both verbs share. The process is started (or the container
+/// reached) before the 101, so a refusal is an HTTP answer kubectl prints,
+/// and a WebSocket attempt that cannot be served lets client-go fall back to
+/// SPDY.
+async fn remote_command(
+    pm: Arc<PodManager>,
+    verb: Verb,
+    namespace: String,
+    pod: String,
+    container: String,
+    mut req: Request,
+) -> Response {
+    use crate::remotecommand as rc;
+    let opts = rc::options(req.uri().query());
+    if verb == Verb::Exec && opts.command.is_empty() {
+        return (StatusCode::BAD_REQUEST, "you must specify at least one command for the container\n").into_response();
+    }
+    if !opts.io.stdin && !opts.io.stdout && !opts.io.stderr {
+        return (StatusCode::BAD_REQUEST, "you must specify at least one of stdin, stdout, stderr\n").into_response();
+    }
+    let (container_id, runtime) = match pm.exec_target(&namespace, &pod, &container).await {
+        None => {
+            return (StatusCode::NOT_FOUND, format!("pod {namespace}/{pod} not found on this node\n")).into_response()
+        }
+        Some(Err(e)) => return (StatusCode::NOT_FOUND, format!("{e}\n")).into_response(),
+        Some(Ok(t)) => t,
+    };
+    let header = |name: &str| -> Vec<String> {
+        req.headers()
+            .get_all(name)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .collect()
+    };
+    let upgrade = header("upgrade");
+    let websocket = upgrade.iter().any(|u| u.eq_ignore_ascii_case("websocket"));
+    let spdy = upgrade.iter().any(|u| u.eq_ignore_ascii_case("SPDY/3.1"));
+    if !websocket && !spdy {
+        return (StatusCode::BAD_REQUEST, "exec and attach need an upgrade to SPDY/3.1 or a WebSocket\n").into_response();
+    }
+    let offered = header(if websocket { "sec-websocket-protocol" } else { "x-stream-protocol-version" });
+    let ours = if websocket { rc::WEBSOCKET_PROTOCOLS } else { rc::SPDY_PROTOCOLS };
+    let Some(protocol) = rc::negotiate(ours, &offered) else {
+        return (
+            StatusCode::FORBIDDEN,
+            format!("unable to upgrade: this kubelet speaks {ours:?}; the client offered {offered:?}\n"),
+        )
+            .into_response();
+    };
+    let key = header("sec-websocket-key").into_iter().next();
+    if websocket && key.is_none() {
+        return (StatusCode::BAD_REQUEST, "a WebSocket handshake needs Sec-WebSocket-Key\n").into_response();
+    }
+    let Some(on_upgrade) = req.extensions_mut().remove::<hyper::upgrade::OnUpgrade>() else {
+        return (StatusCode::BAD_REQUEST, "the connection cannot be upgraded\n").into_response();
+    };
+    let started = match verb {
+        Verb::Exec => runtime.exec_process(&container_id, &opts.command, opts.io).await,
+        Verb::Attach => runtime.attach_process(&container_id, opts.io).await,
+    };
+    let session = match started {
+        Ok(s) => s,
+        Err(crate::cri::CriError::NotFound(e)) => {
+            return (StatusCode::NOT_FOUND, format!("{e}\n")).into_response()
+        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response(),
+    };
+    let mut resp = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS).header("connection", "Upgrade");
+    resp = if let Some(key) = key.filter(|_| websocket) {
+        resp.header("upgrade", "websocket")
+            .header("sec-websocket-accept", websocket_accept(&key))
+            .header("sec-websocket-protocol", protocol)
+    } else {
+        resp.header("upgrade", "SPDY/3.1").header("x-stream-protocol-version", protocol)
+    };
+    let what = format!("{verb:?} {namespace}/{pod}/{container}").to_lowercase();
+    let command = opts.command.clone();
+    let io_opts = opts.io;
+    tokio::spawn(async move {
+        let io = match on_upgrade.await {
+            Ok(u) => hyper_util::rt::TokioIo::new(u),
+            Err(e) => {
+                warn!("{what}: upgrade failed: {e}");
+                (session.kill)();
+                return;
+            }
+        };
+        let version = rc::version(protocol);
+        let wire = if websocket {
+            use tokio_tungstenite::tungstenite::protocol::Role;
+            let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(io, Role::Server, None).await;
+            websocket_wire(ws, io_opts, version)
+        } else {
+            match spdy_wire(crate::spdy::serve(io), io_opts, version).await {
+                Some(w) => w,
+                None => {
+                    warn!("{what}: the client did not open its streams in time");
+                    (session.kill)();
+                    return;
+                }
+            }
+        };
+        match rc::run(session, wire, command, version).await {
+            Ok(code) => info!("{what}: ended, exit code {code}"),
+            Err(e) => info!("{what}: ended: {e}"),
+        }
+    });
+    resp.body(axum::body::Body::empty()).unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// How long the client has to open the streams it asked for.
+const STREAM_CREATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The SPDY session's streams, by `streamType`, once every one the request
+/// asked for is open (resize with a terminal from v3): upstream's wait.
+async fn spdy_wire(
+    mut streams: tokio::sync::mpsc::Receiver<crate::spdy::Stream>,
+    io: crate::exec::ExecIo,
+    version: u8,
+) -> Option<crate::remotecommand::Wire> {
+    let want_resize = io.tty && version >= 3;
+    let mut got: std::collections::HashMap<String, crate::spdy::Stream> = Default::default();
+    let complete = |got: &std::collections::HashMap<String, crate::spdy::Stream>| {
+        got.contains_key("error")
+            && (!io.stdin || got.contains_key("stdin"))
+            && (!io.stdout || got.contains_key("stdout"))
+            && (!io.stderr || got.contains_key("stderr"))
+            && (!want_resize || got.contains_key("resize"))
+    };
+    let collect = async {
+        while !complete(&got) {
+            let s = streams.recv().await?;
+            let kind = s.headers.get("streamtype").unwrap_or("").to_ascii_lowercase();
+            match kind.as_str() {
+                "error" | "stdin" | "stdout" | "stderr" | "resize" => {
+                    got.insert(kind, s);
+                }
+                _ => s.out.reset(crate::spdy::RST_REFUSED).await,
+            }
+        }
+        Some(())
+    };
+    tokio::time::timeout(STREAM_CREATION_TIMEOUT, collect).await.ok()??;
+    let (gone_tx, gone) = tokio::sync::oneshot::channel();
+    // The session's end is the client's going; a stream opened late is refused.
+    tokio::spawn(async move {
+        while let Some(s) = streams.recv().await {
+            s.out.reset(crate::spdy::RST_REFUSED).await;
+        }
+        let _ = gone_tx.send(());
+    });
+    let mut take = |k: &str| got.remove(k);
+    let out = |s: Option<crate::spdy::Stream>| -> Option<Box<dyn crate::remotecommand::Out>> {
+        s.map(|s| Box::new(s.out) as Box<dyn crate::remotecommand::Out>)
+    };
+    let stdin = take("stdin").map(|s| s.data);
+    let resize = take("resize").map(|s| s.data);
+    Some(crate::remotecommand::Wire {
+        stdin,
+        resize,
+        stdout: out(take("stdout")),
+        stderr: out(take("stderr")),
+        error: out(take("error")),
+        gone,
+    })
+}
+
+/// A WebSocket session as channels: the first byte of each binary message
+/// names it (0 stdin, 1 stdout, 2 stderr, 3 error, 4 resize; v5's 255 closes
+/// the channel its second byte names).
+fn websocket_wire<S>(
+    ws: tokio_tungstenite::WebSocketStream<S>,
+    io: crate::exec::ExecIo,
+    version: u8,
+) -> crate::remotecommand::Wire
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let (mut sink, mut stream) = ws.split();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<axum::body::Bytes>(64);
+    tokio::spawn(async move {
+        while let Some(m) = out_rx.recv().await {
+            if sink.send(Message::Binary(m)).await.is_err() {
+                return;
+            }
+        }
+        let _ = sink.send(Message::Close(None)).await;
+    });
+    let (stdin_tx, stdin_rx) = tokio::sync::mpsc::channel::<axum::body::Bytes>(64);
+    let (resize_tx, resize_rx) = tokio::sync::mpsc::channel::<axum::body::Bytes>(16);
+    let (gone_tx, gone) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let mut stdin_tx = Some(stdin_tx);
+        while let Some(Ok(m)) = stream.next().await {
+            let d = match m {
+                Message::Binary(d) => d,
+                Message::Close(_) => break,
+                _ => continue,
+            };
+            match d.first() {
+                Some(0) => {
+                    if let Some(tx) = &stdin_tx {
+                        let _ = tx.send(d.slice(1..)).await;
+                    }
+                }
+                Some(4) => {
+                    let _ = resize_tx.send(d.slice(1..)).await;
+                }
+                // v5: the client closed a channel; its stdin's end is EOF.
+                Some(255) if version >= 5 && d.get(1) == Some(&0) => stdin_tx = None,
+                _ => {}
+            }
+        }
+        let _ = gone_tx.send(());
+    });
+    let channel = |c: u8| -> Option<Box<dyn crate::remotecommand::Out>> {
+        Some(Box::new(crate::remotecommand::WsChannel { channel: c, tx: out_tx.clone() }))
+    };
+    crate::remotecommand::Wire {
+        stdin: io.stdin.then_some(stdin_rx),
+        resize: io.tty.then_some(resize_rx),
+        stdout: if io.stdout { channel(1) } else { None },
+        stderr: if io.stderr { channel(2) } else { None },
+        error: channel(3),
+        gone,
+    }
 }
 
 async fn pods(State(pm): State<Arc<PodManager>>) -> impl IntoResponse {

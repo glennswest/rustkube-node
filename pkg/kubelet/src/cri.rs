@@ -460,6 +460,19 @@ pub trait RuntimeService: Send + Sync + 'static {
             "container {container_id}: this node's runtime does not run a process in a container for the kubelet"
         )))
     }
+
+    /// The container's own stdin and output (#56: `kubectl attach`). Its
+    /// `exit` answers when the container ends; `kill` only detaches.
+    async fn attach_process(
+        &self,
+        container_id: &str,
+        io: crate::exec::ExecIo,
+    ) -> Result<ExecSession, CriError> {
+        let _ = io;
+        Err(CriError::Runtime(format!(
+            "container {container_id}: this node's runtime does not attach the kubelet to a container"
+        )))
+    }
 }
 
 /// CRI ImageService trait.
