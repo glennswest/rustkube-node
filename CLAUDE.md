@@ -23,8 +23,8 @@ only for third-party drivers. Every container's root is its own CoW clone of the
 owner's option A). Node services' mirror pods take their state and Events from each service's stormd API (#215).
 
 Main has VMI adoption, persistent VM-owned disks, accessCredentials, tap address reporting, snapshots and
-restores (#53), pod-network VMIs under rustkube's launcher Pod (#88), the VM verbs (#94). Exec/attach are still
-501 (#56 item 5). Historical work-plan entries below record what was true at each checkpoint; they are not
+restores (#53), pod-network VMIs under rustkube's launcher Pod (#88), the VM verbs (#94). Exec/attach are served
+on stormpump's exec op (#56). Historical work-plan entries below record what was true at each checkpoint; they are not
 current deployment guarantees. Owner decisions answered: #106 (Pods under one parent cgroup, done), #107
 (`<volume>-<node>`, done), #108 (class size at bind, done), #109 (option A, done), #110/#158 (C2NR0Q2's day
 suite is the acceptance, #102), #104 (A), #3 (no NotReady gating; #201), #68 (stormblock-csi owns replicas),
@@ -1164,23 +1164,30 @@ The lock pins stormpump 30a76d3, stormvm dc1b7ea, stormcast 801f822; all three m
        byte-sized emptyDisk). sc-build 4545e23: 364 kubelet unit pass. Golden golden-rustkube-node-a97563b0a5c7
        (stormcos#366). #81 closed, #164 shipped. #52's step 6 is done; its end-to-end with a real driver stays.
 
-### In progress: #56 (P1), exec, attach and portForward on :10250 (stormpump#103's exec op is in the lock)
+### Shipped (golden aeeaa02c3099): #56 (P1), exec, attach and portForward on :10250 (stormpump#103's exec op)
 
 2026-10-21. Lock's stormpump 9877a97 (≥ 0093db4): SPAWN with a running workload's handle in `inline_a` runs the spec in
 it (its namespaces, root, cgroup); stdio from `fds` slots 0/1/2 naming deposits (pipes or one pty slave), `logs
 discard|inherit`, no root/mounts/limits/terminal; the result is a workload (Exit event, STOP, WORKLOAD_RELEASE).
 Found on the way: `spec_for` sets `Spec.tty = config.tty`, which in stormpump is *the node's console* (one per node):
 a `tty: true` pod claims the node's console. Doing, on main, each step pushed:
-1. [ ] Ring `spawn_exec(spec, target, slots)`; runtime `exec_process(container, cmd, ExecIo{stdin, tty})`: pipes or a
+1. [x] Ring `spawn_exec(spec, target, slots)`; runtime `exec_process(container, cmd, ExecIo{stdin, tty})`: pipes or a
        pty (posix_openpt), deposits `exec-<n>-<fd>`, spec (the container's env/cwd/uid/gid, logs discard), exit waiter
        fed by `note_exits` (+ early exits kept by handle), withdraw on a failed spawn, release after exit.
-2. [ ] `exec_sync` on it (probes): output capped, timeout → force stop, exit code.
-3. [ ] `/exec`: SPDY `v4.channel.k8s.io` (v3/v2 too: same streams, v4's error is a Status) and WebSocket
+2. [x] `exec_sync` on it (probes): output capped, timeout → force stop, exit code.
+3. [x] `/exec`: SPDY `v4.channel.k8s.io` (v3/v2 too: same streams, v4's error is a Status) and WebSocket
        `v5.channel.k8s.io`/`v4.channel.k8s.io` (channel byte); resize → TIOCSWINSZ; Status with ExitCode.
-4. [ ] `/attach`: a `stdin: true` container gets a stdin pipe deposited at fd 0 (writer kept); a `tty` container a
+4. [x] `/attach`: a `stdin: true` container gets a stdin pipe deposited at fd 0 (writer kept); a `tty` container a
        kubelet pty on 0/1/2 instead of `Spec.tty` (its output copied to the CRI log by the kubelet); attach = stdin +
        the log followed (non-tty) or the pty (tty).
-5. [ ] Tests, README/api.md/status.md, CHANGELOG; sc-build; stage golden; live `kubectl exec -it` after a release.
+5. [x] Tests, README/api.md/status.md, CHANGELOG; sc-build; stage golden; live `kubectl exec -it` after a release.
+       Done: exec.rs (pipes, pty, Console, follow), remotecommand.rs, RingClient::wait_exit (an exec's exit is its
+       waiter's only), runtime exec_process/exec_sync/attach_process, server /exec /attach (297c789..6a345af, fixes for
+       build failures #270/#271), docs 6b150a9. SC_BUILD_VM sc-build (job ac9b5cdbf7): 539 kubelet unit, all suites,
+       warnings = #227's. Stage golden golden-rustkube-node-aeeaa02c3099 (stormcos#628). `stormcentral shipped`.
+       Live after the release: `kubectl exec -it <pod> -- sh`, `kubectl exec <pod> -- sh -c 'exit 3'` (kubectl exits 3),
+       an exec readiness probe, `kubectl run -it --rm busybox -- sh` (tty attach). stormpump#103 notes a container
+       exec has only been exercised on root-less tasks there.
 (earlier) 
 2026-10-09 (#220): stormpump#103 is done from its side (golden-stormpump-a2523c9c9406, stormcos#309) and the lock
 pins stormpump 13cf2c9, which carries the exec/attach op. Next: item 5 below (exec, exec_sync for probes, attach,
