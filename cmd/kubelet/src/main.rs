@@ -283,18 +283,21 @@ async fn main() -> anyhow::Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+    kubelet::startup::mark("logging");
 
     let cli = Cli::parse();
     let node_name = cli
         .node_name
         .clone()
         .unwrap_or_else(kubelet::detect_node_name);
+    kubelet::startup::mark("flags");
+    // The first line written (#262: a stall here would be the log's).
     tracing::info!(
         "kubelet starting — node={node_name} runtime={} apiserver={}",
         cli.runtime,
         cli.apiserver.as_deref().unwrap_or("(kubeconfig, else the default)")
     );
-    kubelet::startup::mark("flags");
+    kubelet::startup::mark("hello");
 
     // Standard CNI for the native/VM-fallback runtimes. Cilium is the expected
     // default plugin; anything spec-compliant in the conf dir works.
