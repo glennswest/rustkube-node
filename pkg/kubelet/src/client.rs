@@ -57,11 +57,14 @@ pub fn build_authed_client(auth: &ClientAuth) -> anyhow::Result<reqwest::Client>
 ///
 /// rustls asks this for the pair on every handshake, and every clone of the
 /// `reqwest::Client` shares it: a new connection presents the current pair.
+/// A pair as presented, with the bytes it was read from (to see a change).
+type Presented = (std::sync::Arc<rustls::sign::CertifiedKey>, Vec<u8>, Vec<u8>);
+
 #[derive(Debug)]
 pub struct ReloadingClientCert {
     /// `None` until the pair is there (#291): nothing is presented, and the
     /// client's [`CredentialGate`] refuses every handshake.
-    current: std::sync::RwLock<Option<(std::sync::Arc<rustls::sign::CertifiedKey>, Vec<u8>, Vec<u8>)>>,
+    current: std::sync::RwLock<Option<Presented>>,
 }
 
 impl ReloadingClientCert {
