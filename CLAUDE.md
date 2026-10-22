@@ -58,13 +58,12 @@ by #51.
 
 ## Work plan
 
-### In progress: #290 (P2), a stale engine token at boot: the 401 goes back to the caller
+### Done: #290 (P2), a stale engine token at boot: the 401 went back to the caller
 
-2026-10-21. `send_authorised` re-reads once on a 401; when the file still holds the refused token (last boot's fallback, or
-the engine answering before it writes), the 401 goes back to the caller, which retries seconds later. Doing: until a token
-is accepted, `await_new_token` polls the file (50 ms, ≤ 3 s), once per refused token; tests (stale → waits → OK; a wait
-that gave up is not repeated); configuration.md, CHANGELOG; sc-build; stage; close. stormblock's half (write before
-listening) is the master's note on the issue.
+2026-10-21. df1d832: until a token is accepted, a 401 with nothing new on disk polls the token file (50 ms, ≤ 3 s, once per
+refused token) and retries with the new one. SC_BUILD_VM sc-build (job 458882288f): 556 kubelet unit (2 new), all suites,
+warnings = #227's, nothing from clippy in engine.rs. Stage build fc48d8a31464. Closed. Live: a boot's `stormblock engine token
+rewritten; waited for it ms=…` instead of a refused first listing.
 
 ### Done: #289 (P0), a transient engine error on a static pod waits the 10 s start back-off
 
