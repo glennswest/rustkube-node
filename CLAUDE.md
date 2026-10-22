@@ -58,13 +58,14 @@ by #51.
 
 ## Work plan
 
-### In progress: #258 (P1), static pods get no mirror pod in the API (stormcos#559)
+### Done: #258 (P1), static pods get no mirror pod in the API (stormcos#559)
 
-2026-10-21. Doing: `static_mirror.rs` (is_mirror, manifest_hash, mirror_of, plan: create / delete stale+orphans / current);
-`static_pod()` names the static pod `<name>-<node>` + `config.hash`; `sync` excludes mirrors from the pods it runs and
-reconciles them after the API list (complete manifest read only); `report_pod_status` writes a static pod's status on its
-mirror (uid, revision, base); a new mirror wakes its pod. Tests (plan, mirror body, hash, manifest load); README, status.md,
-CHANGELOG; sc-build; stage; close. Live: `kubectl get pods -n kube-system` shows `etcd-<node>` … Running, `logs` reads them.
+2026-10-21. 81dc1bd: `static_mirror.rs` (plan: create / delete stale+orphans / current), static pods named `<name>-<node>`
+with `config.hash`, mirrors never run, a static pod's status on its mirror. SC_BUILD_VM sc-build (job da1a62723b): 561
+kubelet unit (4 new), all suites, nothing from clippy in the new code. Stage build a29c9aa0af69. Closed. Live (a release with it and
+stormcos#559): `get pods -n kube-system` shows `etcd-<node>`, `kube-apiserver-<node>` … with their status; `logs` reads them;
+deleting one brings it back. Note: a kubelet restarted onto this build in a running boot sees its static pods renamed (same
+uid): expect one restart of each; a reboot (the release path) does not.
 
 ### Done: #291 (P1), static pods wait for the kubelet's own credentials (2.0–5.6 s per first boot)
 
