@@ -58,11 +58,11 @@ by #51.
 
 ## Work plan
 
-### In progress: #289 (P0), a transient engine error on a static pod waits the 10 s start back-off
+### Done: #289 (P0), a transient engine error on a static pod waits the 10 s start back-off
 
-2026-10-21. #287 put CreateContainerError (the root's attach/mount) on `create_backoff` (0.5 s doubling to the 10 s clock).
-Left: a refused start (RunContainerError: claim mounts are registered in `start_container`) still got `start_backoff`.
-Doing: both on `create_backoff`; test (Always start failure held ≤ 0.5 s); README/CHANGELOG; sc-build; stage; close.
+2026-10-21. #287 put CreateContainerError (root attach/mount) on `create_backoff`; 4850e00 puts RunContainerError (claim
+mounts registered in `start_container`) on it too. SC_BUILD_VM sc-build (job 7e447bd6c5): 554 kubelet unit, all suites,
+warnings = #227's. Stage build 4cc9b7543164. Closed. Live: a boot's refused first create/start retried in 0.5 s (`next try in 500 ms`).
 
 ### Done: #288 (P0), the start-up root sweep deletes a static pod's fresh root (same `ctr-ct-N` as last boot)
 
