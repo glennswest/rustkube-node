@@ -19,6 +19,7 @@ pub mod network_status;
 pub mod node_health;
 pub mod node_logs;
 pub mod start_timing;
+pub mod static_mirror;
 pub mod startup;
 pub mod storage;
 pub mod system_claims;

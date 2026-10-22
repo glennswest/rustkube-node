@@ -109,7 +109,7 @@ histogram `kubelet_pod_start_phase_duration_seconds{phase}` and one INFO log lin
 | `total` | seen → `Running` acknowledged |
 
 `image` overlaps `wait` (images resolve off the worker while the pod waits). A static pod
-has no API object, so it gets the log line and the histograms only, and no ServiceAccount token (#262: it is marked
+is not annotated (its mirror is the API's object, #258), so it gets the log line and the histograms only, and no ServiceAccount token (#262: it is marked
 `kubernetes.io/config.source: file`, as upstream marks a manifest's pod; the control plane's static pods start
 before there is an apiserver to ask). The first static pod to run is said once, `first static pod <ns>/<name>
 running N ms after the kubelet started`, with the kubelet's own startup steps (`exec`: the process's start to
@@ -414,6 +414,19 @@ it is unused. It never answers `204` on a guess — the volume name is derived
 from the claim's, so a PV deleted over a surviving clone would let a later
 claim of the same name in the same namespace adopt the previous tenant's
 data.
+
+## Static pods and their mirror pods
+
+Each manifest in `--pod-manifest-path` (stormcos#559: etcd, kube-apiserver, kube-controller-manager,
+kube-scheduler from `/run/kubernetes/manifests`) runs as a pod named as upstream names it, `<name>-<node>`
+(uid `static-<name>-<node>`), and is published in the API as its **mirror pod** (#258): the same pod, annotated
+`kubernetes.io/config.mirror` and `kubernetes.io/config.hash` (the manifest's SHA-256, first 16 hex digits) and
+`kubernetes.io/config.source: file`, owned by the Node (made once the Node is registered). The kubelet writes the
+mirror's status from the static pod's containers and probes (phase, containerStatuses with restarts, Ready), so
+`get pods -n kube-system`, `describe` and `logs` (`pods/log` reaches the static pod by that name) show the control
+plane. A deleted mirror is made again; one whose hash is not its manifest's (the manifest changed) is deleted and
+made again; one whose manifest is gone is deleted. Only after a complete read of the manifest directory: a failed
+read deletes nothing. **A mirror pod is never run** (it carries `kubernetes.io/config.mirror`); its static pod is.
 
 ## The node's services as pods
 

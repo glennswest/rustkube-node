@@ -160,6 +160,9 @@ pub struct Kubelet {
     /// directory that is not there is a fact about the configuration, not an
     /// event, and repeating it only buries the lines that are events.
     said_no_static_dir: std::sync::atomic::AtomicBool,
+    /// The mirror pod of each static pod (#258), by `<namespace>/<name>`, as
+    /// the API last showed it: where the static pod's status is written.
+    mirrors: std::sync::Mutex<std::collections::HashMap<String, Value>>,
     /// The external CSI drivers on this node, shared with the pod manager
     /// and kept current by the registration loop (#52).
     csi: Arc<crate::csi_plugins::CsiPlugins>,
@@ -249,6 +252,7 @@ impl Kubelet {
             api_client,
             node_ip,
             said_no_static_dir: std::sync::atomic::AtomicBool::new(false),
+            mirrors: Default::default(),
             watches: Default::default(),
             last_claims: Default::default(),
             static_read_complete: std::sync::atomic::AtomicBool::new(true),
@@ -1064,8 +1068,10 @@ impl Kubelet {
                     continue;
                 }
             };
-            let mut pod: Value = match serde_yaml::from_str(&text) {
-                Ok(v) => v,
+            let stem = path.file_stem().and_then(|s| s.to_str());
+            let pod = match static_pod(&text, stem, &self.config.node_name) {
+                Ok(Some(pod)) => pod,
+                Ok(None) => continue,
                 Err(e) => {
                     self.static_read_complete
                         .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1073,32 +1079,6 @@ impl Kubelet {
                     continue;
                 }
             };
-            if pod.get("kind").and_then(|k| k.as_str()) != Some("Pod") {
-                continue;
-            }
-            let name = pod["metadata"]["name"]
-                .as_str()
-                .map(str::to_string)
-                .or_else(|| {
-                    path.file_stem()
-                        .and_then(|s| s.to_str())
-                        .map(str::to_string)
-                })
-                .unwrap_or_else(|| "static".into());
-            let ns = pod["metadata"]["namespace"]
-                .as_str()
-                .unwrap_or("kube-system")
-                .to_string();
-            // Stable, node-scoped identity so reconciles don't recreate the pod
-            // (matches Kubernetes' mirror-pod `<name>-<node>` convention).
-            let uid = format!("static-{name}-{}", self.config.node_name);
-            pod["metadata"]["name"] = Value::String(name);
-            pod["metadata"]["namespace"] = Value::String(ns);
-            pod["metadata"]["uid"] = Value::String(uid);
-            pod["spec"]["nodeName"] = Value::String(self.config.node_name.clone());
-            // Upstream's mark of a pod from a manifest file: what keeps API
-            // objects out of its start (no ServiceAccount token, #262).
-            pod["metadata"]["annotations"][crate::pod_manager::CONFIG_SOURCE] = Value::String("file".into());
             pods.push(pod);
         }
         pods
@@ -1131,10 +1111,17 @@ impl Kubelet {
         // as a pod: its VMI is woken when it appears, and a terminating one
         // is let go once no machine of its VMI runs here (#88).
         self.adopt_launchers(list["items"].as_array().map(|a| a.as_slice()).unwrap_or(&[])).await;
+        // The static pods' mirrors (#258), only on a complete read of the
+        // manifests: a failed read never deletes one.
+        if self.static_read_complete.load(Ordering::Acquire) {
+            self.sync_mirrors(&static_pods, list["items"].as_array().map(|a| a.as_slice()).unwrap_or(&[])).await;
+        }
         let want: Vec<_> = list["items"].as_array().unwrap().iter().filter(|p|
             p["spec"]["nodeName"].as_str()==Some(&self.config.node_name)
-            // PID 1's node services are mirrored, never run (#249).
+            // PID 1's node services are mirrored, never run (#249); nor is a
+            // static pod's mirror (#258): its static pod runs.
             && !crate::mirror::is_node_service(p)
+            && !crate::static_mirror::is_mirror(p)
             && !crate::vm_network::is_launcher(p)
             && !p["metadata"]["uid"].as_str().unwrap_or("").starts_with("static-"))
             .cloned().collect();
@@ -1148,6 +1135,73 @@ impl Kubelet {
         // Dependency collection changes wake only affected claim users.
         self.refresh_claim_dependencies().await;
         Ok(())
+    }
+
+    /// Make the API's mirror pods match the static pods (#258): create the
+    /// missing ones (owned by this Node), delete orphaned and stale ones
+    /// (stale: recreated once gone), and remember the current ones for status.
+    async fn sync_mirrors(&self, statics: &[Value], api: &[Value]) {
+        let plan = crate::static_mirror::plan(statics, api, &self.config.node_name);
+        for (ns, name, uid) in &plan.delete {
+            let body = serde_json::json!({"apiVersion":"v1","kind":"DeleteOptions","gracePeriodSeconds":0,
+                "preconditions":{"uid":uid}});
+            match self.api_client.delete(format!("{}/api/v1/namespaces/{ns}/pods/{name}", self.config.api_server_url))
+                .json(&body).send_retrying(retry::Policy::API).await
+            {
+                Ok(r) if r.status().is_success() || matches!(r.status().as_u16(), 404 | 409) => {
+                    info!(pod = %name, namespace = %ns, "mirror pod deleted: its manifest is gone or changed")
+                }
+                Ok(r) => debug!(pod = %name, "mirror pod deletion not confirmed: {}", r.status()),
+                Err(e) => debug!(pod = %name, "mirror pod deletion not confirmed: {e}"),
+            }
+        }
+        let made = if plan.create.is_empty() { Vec::new() } else { self.create_mirrors(statics, &plan.create).await };
+        let mut mirrors = self.mirrors.lock().unwrap_or_else(|e| e.into_inner());
+        *mirrors = plan.current;
+        for (k, m) in made {
+            mirrors.insert(k, m);
+        }
+    }
+
+    /// Create the mirrors named in `create`; the ones made, by key. Each made
+    /// one's static pod is woken, so its status is written to it.
+    async fn create_mirrors(&self, statics: &[Value], create: &[String]) -> Vec<(String, Value)> {
+        // Owned by the Node, as upstream's are: none until it is registered.
+        let node_url = format!("{}/api/v1/nodes/{}", self.config.api_server_url, self.config.node_name);
+        let node_uid = match self.api_client.get(&node_url).send_retrying(retry::Policy::API).await {
+            Ok(r) if r.status().is_success() => r.json::<Value>().await.ok()
+                .and_then(|n| n["metadata"]["uid"].as_str().map(str::to_string)),
+            _ => None,
+        };
+        let Some(node_uid) = node_uid else {
+            debug!("mirror pods wait for this Node to be registered");
+            return Vec::new();
+        };
+        let mut made = Vec::new();
+        for s in statics.iter().filter(|s| create.contains(&crate::static_mirror::key(s))) {
+            let body = crate::static_mirror::mirror_of(s, &self.config.node_name, &node_uid);
+            let ns = s["metadata"]["namespace"].as_str().unwrap_or("kube-system");
+            let name = s["metadata"]["name"].as_str().unwrap_or("");
+            let url = format!("{}/api/v1/namespaces/{ns}/pods", self.config.api_server_url);
+            match self.api_client.post(&url).json(&body).send_retrying(retry::Policy::API).await {
+                Ok(r) if r.status().is_success() => {
+                    info!(pod = %name, namespace = %ns, "mirror pod created");
+                    if let Ok(m) = r.json::<Value>().await {
+                        made.push((crate::static_mirror::key(s), m));
+                    }
+                    let uid = s["metadata"]["uid"].as_str().unwrap_or("").to_string();
+                    self.workloads.wake_where(Kind::Pod, |k| k.uid == uid);
+                }
+                Ok(r) if r.status().as_u16() == 409 => debug!(pod = %name, "mirror pod already there"),
+                Ok(r) => {
+                    let status = r.status();
+                    let text = r.text().await.unwrap_or_default();
+                    warn!(pod = %name, namespace = %ns, "mirror pod not created: {status}: {}", text.chars().take(300).collect::<String>());
+                }
+                Err(e) => warn!(pod = %name, namespace = %ns, "mirror pod not created: {e}"),
+            }
+        }
+        made
     }
 
     /// This node's launcher Pods (#88, rustkube#203).
@@ -1466,6 +1520,22 @@ impl Kubelet {
         let last_runs = self
             .pod_manager
             .last_terminated(source["metadata"]["uid"].as_str().unwrap_or(""));
+        // A static pod's status goes on its mirror (#258): its uid and
+        // revision, its status as the base. None yet: written once it is made
+        // (its creation wakes this pod).
+        let mirror;
+        let source = if crate::pod_manager::is_static(source) {
+            let found = self.mirrors.lock().unwrap_or_else(|e| e.into_inner()).get(&crate::static_mirror::key(source)).cloned();
+            match found {
+                Some(m) => {
+                    mirror = m;
+                    &mirror
+                }
+                None => return Ok(()),
+            }
+        } else {
+            source
+        };
 
         let container_statuses: Vec<Value> = update
             .container_statuses
@@ -1683,8 +1753,8 @@ impl Kubelet {
             crate::metrics::observe_status_write("skipped");
             return Ok(());
         }
-        // Static manifests have no API identity; their mirror publication is
-        // separate from managing their local runtime state.
+        // No revision: nothing in the API to write on (a static pod's mirror
+        // always has one, #258).
         let Some(revision) = revision else {
             return Ok(());
         };
@@ -2130,6 +2200,62 @@ fn unsupported_runtime(name: &str, version: &str) -> Option<String> {
              (this kubelet reports the 1.36 posture, rustkube-node#23)"
         )
     })
+}
+
+/// A static pod from its manifest's text (`None`: not a Pod). Named
+/// `<name>-<node>` as upstream names it and its mirror is (#258); the uid is
+/// node-scoped and stable, `static-<name>-<node>`; marked
+/// `config.source: file` (#262) and `config.hash` (the manifest's, #258).
+fn static_pod(text: &str, stem: Option<&str>, node: &str) -> Result<Option<Value>, String> {
+    let mut pod: Value = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
+    if pod.get("kind").and_then(|k| k.as_str()) != Some("Pod") {
+        return Ok(None);
+    }
+    let name = pod["metadata"]["name"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| stem.map(str::to_string))
+        .unwrap_or_else(|| "static".into());
+    let ns = pod["metadata"]["namespace"].as_str().unwrap_or("kube-system").to_string();
+    pod["metadata"]["uid"] = Value::String(format!("static-{name}-{node}"));
+    pod["metadata"]["name"] = Value::String(format!("{name}-{node}"));
+    pod["metadata"]["namespace"] = Value::String(ns);
+    pod["spec"]["nodeName"] = Value::String(node.to_string());
+    // Upstream's mark of a pod from a manifest file: what keeps API objects
+    // out of its start (no ServiceAccount token, #262).
+    pod["metadata"]["annotations"][crate::pod_manager::CONFIG_SOURCE] = Value::String("file".into());
+    pod["metadata"]["annotations"][crate::static_mirror::CONFIG_HASH] =
+        Value::String(crate::static_mirror::manifest_hash(text));
+    Ok(Some(pod))
+}
+
+#[cfg(test)]
+mod static_pod_tests {
+    use super::*;
+
+    /// #258: a manifest's pod is `<name>-<node>` (its mirror's name), keeps
+    /// a stable uid, and carries the manifest's hash; a change to the text
+    /// changes the hash, so the mirror is replaced.
+    #[test]
+    fn a_manifests_pod_is_named_for_its_node_and_hashed() {
+        let text = "apiVersion: v1\nkind: Pod\nmetadata:\n  name: etcd\nspec:\n  containers:\n  - name: etcd\n    image: /pallets/fastetcd\n";
+        let p = static_pod(text, Some("etcd"), "n1").unwrap().unwrap();
+        assert_eq!(p["metadata"]["name"], "etcd-n1");
+        assert_eq!(p["metadata"]["namespace"], "kube-system");
+        assert_eq!(p["metadata"]["uid"], "static-etcd-n1");
+        assert_eq!(p["spec"]["nodeName"], "n1");
+        assert!(crate::pod_manager::is_static(&p));
+        assert!(!crate::static_mirror::is_mirror(&p), "the static pod is not its own mirror");
+        let hash = p["metadata"]["annotations"][crate::static_mirror::CONFIG_HASH].as_str().unwrap().to_string();
+        let changed = static_pod(&text.replace("fastetcd", "fastetcd2"), None, "n1").unwrap().unwrap();
+        assert_eq!(changed["metadata"]["uid"], "static-etcd-n1", "same pod");
+        assert_ne!(changed["metadata"]["annotations"][crate::static_mirror::CONFIG_HASH], hash.as_str());
+        // No name: the file's; not a Pod: nothing; not YAML: an error.
+        let unnamed = static_pod("kind: Pod\nspec: {}\n", Some("sched"), "n1").unwrap().unwrap();
+        assert_eq!(unnamed["metadata"]["name"], "sched-n1");
+        assert!(static_pod("kind: ConfigMap\n", None, "n1").unwrap().is_none());
+        assert!(static_pod("[unclosed", None, "n1").is_err());
+    }
 }
 
 #[cfg(test)]

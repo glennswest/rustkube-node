@@ -58,6 +58,14 @@ by #51.
 
 ## Work plan
 
+### In progress: #258 (P1), static pods get no mirror pod in the API (stormcos#559)
+
+2026-10-21. Doing: `static_mirror.rs` (is_mirror, manifest_hash, mirror_of, plan: create / delete stale+orphans / current);
+`static_pod()` names the static pod `<name>-<node>` + `config.hash`; `sync` excludes mirrors from the pods it runs and
+reconciles them after the API list (complete manifest read only); `report_pod_status` writes a static pod's status on its
+mirror (uid, revision, base); a new mirror wakes its pod. Tests (plan, mirror body, hash, manifest load); README, status.md,
+CHANGELOG; sc-build; stage; close. Live: `kubectl get pods -n kube-system` shows `etcd-<node>` … Running, `logs` reads them.
+
 ### Done: #291 (P1), static pods wait for the kubelet's own credentials (2.0–5.6 s per first boot)
 
 2026-10-21. fba93ec (+ clippy aliases, 8d77eb2): a named client pair not written yet is given later to a client behind
