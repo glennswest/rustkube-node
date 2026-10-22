@@ -49,6 +49,13 @@ pub struct KubeletConfig {
     pub client_key: Option<Vec<u8>>,
     /// Skip apiserver cert verification (dev only).
     pub insecure_skip_tls_verify: bool,
+    /// The client pair is named and not written yet (#291): the client is
+    /// built without it and makes no connection until it is given
+    /// ([`Kubelet::client_cert_resolver`]).
+    pub client_pair_later: bool,
+    /// The serving pair, when it is named and not written yet (#291): `:10250`
+    /// starts when it arrives here. Static pods do not wait for it.
+    pub serving_pair_later: Option<tokio::sync::watch::Receiver<Option<(Vec<u8>, Vec<u8>)>>>,
     /// Inbound `:10250` serving cert + key (PEM). None → self-signed at startup.
     pub serving_cert: Option<Vec<u8>>,
     pub serving_key: Option<Vec<u8>>,
@@ -104,6 +111,8 @@ impl Default for KubeletConfig {
             client_cert: None,
             client_key: None,
             insecure_skip_tls_verify: false,
+            client_pair_later: false,
+            serving_pair_later: None,
             serving_cert: None,
             serving_key: None,
             serving_cert_path: None,
@@ -175,6 +184,12 @@ pub struct Kubelet {
 }
 
 impl Kubelet {
+    /// The apiserver client's pair, to give it once written (#291). `None`
+    /// when the identity is fixed (no CA, verification off, a token).
+    pub fn client_cert_resolver(&self) -> Option<Arc<crate::client::ReloadingClientCert>> {
+        self.client_cert.clone()
+    }
+
     pub fn new(
         config: KubeletConfig,
         runtime: Arc<dyn RuntimeService>,
@@ -196,6 +211,7 @@ impl Kubelet {
             client_cert_pem: config.client_cert.as_deref(),
             client_key_pem: config.client_key.as_deref(),
             insecure_skip_tls_verify: config.insecure_skip_tls_verify,
+            client_pair_later: config.client_pair_later,
         })?;
 
         let csi = Arc::new(
@@ -399,7 +415,20 @@ impl Kubelet {
                 stormblock_url: self.config.engine.url().to_string(),
             };
             let vms = self.vms.clone();
-            tokio::spawn(async move { crate::server::serve(port, pm, vms, server_config).await });
+            let later = self.config.serving_pair_later.clone();
+            tokio::spawn(async move {
+                let mut server_config = server_config;
+                // Named and not written yet (#291): served once it is, never
+                // on a self-signed one in the meantime (#69).
+                if let (None, Some(mut later)) = (&server_config.tls_cert, later) {
+                    let pair = later.wait_for(|p| p.is_some()).await.ok().and_then(|p| p.clone());
+                    let Some((cert, key)) = pair else { return };
+                    info!(":10250 serving pair arrived; serving");
+                    server_config.tls_cert = Some(cert);
+                    server_config.tls_key = Some(key);
+                }
+                crate::server::serve(port, pm, vms, server_config).await
+            });
         }
 
         // Spawn heartbeat task

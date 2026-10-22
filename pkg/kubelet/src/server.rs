@@ -452,7 +452,7 @@ async fn reload_pair(
 }
 
 /// Generate a self-signed serving cert (PEM cert, PEM key) for the node.
-fn self_signed_cert(node_name: &str, node_ip: &str) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+pub fn self_signed_cert(node_name: &str, node_ip: &str) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let mut sans = vec![node_name.to_string(), "localhost".to_string()];
     if !node_ip.is_empty() {
         sans.push(node_ip.to_string());

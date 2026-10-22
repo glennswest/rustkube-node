@@ -62,6 +62,17 @@ file is waited for up to 60 s (looked for every 50 ms, #262), with one warning; 
 and path. It never falls back to the kubeconfig's value, anonymous access or a self-signed serving pair
 for a file it was told to use. An unset flag still falls back as described above.
 
+**The client and serving pairs do not hold the static pods** (#291). On a first boot stormcert writes
+`kubelet.crt` and `kubelet-serving.crt` seconds after the kubelet starts, and etcd and the apiserver (static
+pods) waited behind them (`credentials=2027–5557 ms`). When `--client-certificate`/`--client-key` are named,
+`--apiserver-ca` is there and verification is on, and the pair is not written yet, the kubelet starts without
+it: its apiserver client makes **no connection at all** until the pair loads (every handshake is refused
+before a request is sent, so it is never `system:anonymous`), and callers retry as they do while the apiserver
+is down. A named serving pair not written yet starts `:10250` when it is. Each is taken once both files are
+there and the key is the certificate's, logged with how long it took; still missing after the same 60 s,
+the kubelet exits naming it. Without the CA, or with verification off, the client pair is waited for first,
+as before; `--kubeconfig`, `--apiserver-ca` and the token files are always waited for first.
+
 Clap also provides `--help`. No KubeletConfiguration file is read. Reservations
 are advertised in allocatable only; nothing enforces them as a cgroup limit (#205).
 

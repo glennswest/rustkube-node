@@ -263,6 +263,36 @@ async fn named(flag: &str, path: Option<&str>) -> anyhow::Result<Option<Vec<u8>>
     }
 }
 
+/// Both halves of a pair readable now, and a key that is the certificate's:
+/// read at once, as before #291.
+fn pair_ready(cert: &str, key: &str) -> bool {
+    match (std::fs::read(cert), std::fs::read(key)) {
+        (Ok(c), Ok(k)) => kubelet::client::ReloadingClientCert::new(&c, &k).is_ok(),
+        _ => false,
+    }
+}
+
+/// A pair once both files are there and the key is the certificate's (a
+/// writer replaces them one at a time), within [`CREDENTIAL_WAIT`] (#291).
+async fn pair_when_written(cert_flag: &str, cert: &str, key_flag: &str, key: &str) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let started = std::time::Instant::now();
+    loop {
+        let left = CREDENTIAL_WAIT.saturating_sub(started.elapsed());
+        let c = wait_for_file(cert_flag, cert, left).await?;
+        let k = wait_for_file(key_flag, key, CREDENTIAL_WAIT.saturating_sub(started.elapsed())).await?;
+        match kubelet::client::ReloadingClientCert::new(&c, &k) {
+            Ok(_) => {
+                tracing::info!("{cert_flag} {cert} and {key_flag} {key} written after {} ms", started.elapsed().as_millis());
+                return Ok((c, k));
+            }
+            Err(e) if started.elapsed() >= CREDENTIAL_WAIT => {
+                anyhow::bail!("{cert_flag} {cert} / {key_flag} {key} do not load after {}s: {e}", CREDENTIAL_WAIT.as_secs())
+            }
+            Err(_) => tokio::time::sleep(CREDENTIAL_POLL).await,
+        }
+    }
+}
+
 /// A token file's contents, trimmed.
 fn token_text(bytes: Vec<u8>) -> anyhow::Result<String> {
     Ok(String::from_utf8(bytes)?.trim().to_string())
@@ -513,12 +543,28 @@ async fn main() -> anyhow::Result<()> {
     let apiserver_ca = named("--apiserver-ca", cli.apiserver_ca.as_deref())
         .await?
         .or_else(|| kubeconfig.as_ref().and_then(|k| k.ca_pem.clone()));
-    let client_cert = named("--client-certificate", cli.client_certificate.as_deref())
-        .await?
-        .or_else(|| kubeconfig.as_ref().and_then(|k| k.client_cert_pem.clone()));
-    let client_key = named("--client-key", cli.client_key.as_deref())
-        .await?
-        .or_else(|| kubeconfig.as_ref().and_then(|k| k.client_key_pem.clone()));
+    // The client pair is not waited for here when the client can be built
+    // without it (#291): stormcert writes it seconds into a first boot, and
+    // the static pods (etcd, the apiserver) waited behind it. The client then
+    // makes no connection until the pair is given (never anonymous, #69), and
+    // a pair still missing after the same 60 s is as fatal as before.
+    let insecure = cli.insecure_skip_tls_verify || kubeconfig.as_ref().is_some_and(|k| k.insecure_skip_tls_verify);
+    let client_later = match (cli.client_certificate.as_deref(), cli.client_key.as_deref()) {
+        (Some(c), Some(k)) if apiserver_ca.is_some() && !insecure && !pair_ready(c, k) => Some((c.to_string(), k.to_string())),
+        _ => None,
+    };
+    let (client_cert, client_key) = if client_later.is_some() {
+        (None, None)
+    } else {
+        (
+            named("--client-certificate", cli.client_certificate.as_deref())
+                .await?
+                .or_else(|| kubeconfig.as_ref().and_then(|k| k.client_cert_pem.clone())),
+            named("--client-key", cli.client_key.as_deref())
+                .await?
+                .or_else(|| kubeconfig.as_ref().and_then(|k| k.client_key_pem.clone())),
+        )
+    };
     let bearer_token = match named("--token-file", cli.token_file.as_deref()).await? {
         Some(b) => Some(token_text(b)?),
         None => kubeconfig.as_ref().and_then(|k| k.token.clone()),
@@ -538,8 +584,22 @@ async fn main() -> anyhow::Result<()> {
     // Inbound :10250 server TLS + auth (rustkube-node#9).
     // Named serving files too (#69): a missing pair silently became a
     // self-signed one, a missing token no static token.
-    let serving_cert = named("--tls-cert-file", cli.tls_cert_file.as_deref()).await?;
-    let serving_key = named("--tls-private-key-file", cli.tls_private_key_file.as_deref()).await?;
+    // The serving pair too (#291): `:10250` starts when it is written.
+    let serving_later = match (cli.tls_cert_file.as_deref(), cli.tls_private_key_file.as_deref()) {
+        (Some(c), Some(k)) if !pair_ready(c, k) => Some((c.to_string(), k.to_string())),
+        _ => None,
+    };
+    let (serving_cert, serving_key, serving_tx, serving_rx) = if serving_later.is_some() {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        (None, None, Some(tx), Some(rx))
+    } else {
+        (
+            named("--tls-cert-file", cli.tls_cert_file.as_deref()).await?,
+            named("--tls-private-key-file", cli.tls_private_key_file.as_deref()).await?,
+            None,
+            None,
+        )
+    };
     let server_auth_token = match named("--server-token-file", cli.server_token_file.as_deref()).await? {
         Some(b) => Some(token_text(b)?),
         None => None,
@@ -580,6 +640,8 @@ async fn main() -> anyhow::Result<()> {
         client_cert,
         client_key,
         insecure_skip_tls_verify,
+        client_pair_later: client_later.is_some(),
+        serving_pair_later: serving_rx,
         serving_cert,
         serving_key,
         serving_cert_path: cli.tls_cert_file.as_ref().map(std::path::PathBuf::from),
@@ -612,6 +674,39 @@ async fn main() -> anyhow::Result<()> {
             cni::CniInvoker::new(cli.cni_conf_dir.clone(), vec![std::path::PathBuf::from(&cli.cni_bin_dir)])
         });
         kubelet = kubelet.with_engine(ring, vm_cni);
+    }
+    // The pairs not written yet (#291), given as they are; one still missing
+    // after the wait ends the kubelet, naming it, as a missing file always has.
+    if let Some((cert, key)) = client_later {
+        let resolver = kubelet.client_cert_resolver();
+        tokio::spawn(async move {
+            match pair_when_written("--client-certificate", &cert, "--client-key", &key).await {
+                Ok((c, k)) => match resolver.map(|r| r.replace(&c, &k)) {
+                    Some(Ok(_)) => tracing::info!("apiserver client certificate {cert} arrived; connecting"),
+                    other => {
+                        tracing::error!("the client pair {cert} could not be given to the apiserver client: {other:?}");
+                        std::process::exit(1);
+                    }
+                },
+                Err(e) => {
+                    tracing::error!("{e}");
+                    std::process::exit(1);
+                }
+            }
+        });
+    }
+    if let (Some((cert, key)), Some(tx)) = (serving_later, serving_tx) {
+        tokio::spawn(async move {
+            match pair_when_written("--tls-cert-file", &cert, "--tls-private-key-file", &key).await {
+                Ok(pair) => {
+                    let _ = tx.send(Some(pair));
+                }
+                Err(e) => {
+                    tracing::error!("{e}");
+                    std::process::exit(1);
+                }
+            }
+        });
     }
     kubelet::startup::mark("kubelet");
     if let Err(e) = kubelet.run().await {
@@ -664,6 +759,29 @@ mod tests {
         });
         let got = wait_for_file("--client-certificate", f.to_str().unwrap(), Duration::from_secs(10)).await;
         assert_eq!(got.unwrap(), b"PEM");
+    }
+
+    /// #291: a pair is taken once both files are there and the key is the
+    /// certificate's: a certificate alone, or a half-written key, is waited past.
+    #[tokio::test]
+    async fn a_pair_is_taken_once_both_halves_load() {
+        let dir = scratch("pair");
+        let (cert, key) = (dir.join("kubelet.crt"), dir.join("kubelet.key"));
+        let (c, k) = kubelet::server::self_signed_cert("n1", "10.0.0.1").unwrap();
+        assert!(!pair_ready(cert.to_str().unwrap(), key.to_str().unwrap()));
+        let (wc, wk, want) = (cert.clone(), key.clone(), (c.clone(), k.clone()));
+        tokio::spawn(async move {
+            std::fs::write(&wc, &c).unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            std::fs::write(&wk, b"-----BEGIN PRIVATE KEY-----\nhalf").unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            std::fs::write(&wk, &k).unwrap();
+        });
+        let got = pair_when_written("--client-certificate", cert.to_str().unwrap(), "--client-key", key.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(got, want);
+        assert!(pair_ready(cert.to_str().unwrap(), key.to_str().unwrap()));
     }
 
     /// #262: read within a poll of being written, not up to half a second later.

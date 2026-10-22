@@ -58,6 +58,14 @@ by #51.
 
 ## Work plan
 
+### In progress: #291 (P1), static pods wait for the kubelet's own credentials (2.0–5.6 s per first boot)
+
+2026-10-21. main waited for the client pair and the serving pair before building the kubelet. Doing: client built with an
+empty `ReloadingClientCert` behind `CredentialGate` (refuses every handshake until the pair: never anonymous, #69), the pair
+given by a waiter in main (`pair_when_written`, 60 s, fatal); serving pair over a watch, `:10250` starts on it; CA,
+kubeconfig, tokens still first. Tests (client: no connection before the pair, then verified; main: pair taken once the key
+loads); configuration.md, CHANGELOG; sc-build; stage; close. stormcert-init's 3.1 s before the apiserver listens is stormcos's.
+
 ### Done: #290 (P2), a stale engine token at boot: the 401 went back to the caller
 
 2026-10-21. df1d832: until a token is accepted, a 401 with nothing new on disk polls the token file (50 ms, ≤ 3 s, once per
