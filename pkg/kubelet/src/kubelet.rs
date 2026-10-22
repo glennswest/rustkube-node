@@ -13,6 +13,9 @@ use std::sync::Arc;
 use tokio::time::{self, Duration};
 use tracing::{debug, error, info, warn};
 
+/// A certificate and its key, PEM.
+pub type PemPair = (Vec<u8>, Vec<u8>);
+
 /// Kubelet configuration.
 #[derive(Debug, Clone)]
 pub struct KubeletConfig {
@@ -55,7 +58,7 @@ pub struct KubeletConfig {
     pub client_pair_later: bool,
     /// The serving pair, when it is named and not written yet (#291): `:10250`
     /// starts when it arrives here. Static pods do not wait for it.
-    pub serving_pair_later: Option<tokio::sync::watch::Receiver<Option<(Vec<u8>, Vec<u8>)>>>,
+    pub serving_pair_later: Option<tokio::sync::watch::Receiver<Option<PemPair>>>,
     /// Inbound `:10250` serving cert + key (PEM). None → self-signed at startup.
     pub serving_cert: Option<Vec<u8>>,
     pub serving_key: Option<Vec<u8>>,
