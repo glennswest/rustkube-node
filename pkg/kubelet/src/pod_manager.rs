@@ -541,6 +541,10 @@ pub struct PodManager {
     /// container would not start, is not tried again before its back-off is
     /// up, whatever wakes it (an exit anywhere wakes every workload, #115).
     start_holdoff: std::sync::Mutex<HashMap<String, Instant>>,
+    /// How many tries in a row a pod's container create was refused (#287):
+    /// those are retried on [`deadlines::create_backoff`]'s short schedule
+    /// before the 10 s clock. Cleared when the pod starts.
+    create_refusals: std::sync::Mutex<HashMap<String, u32>>,
     /// Blanks being minted in the background, by name (#63). A 1 TiB blank
     /// takes minutes to format, and the sync loop must not wait for it.
     minting: Arc<std::sync::Mutex<HashMap<String, Mint>>>,
@@ -670,6 +674,7 @@ impl PodManager {
             last_terminated: Default::default(),
             waiting: std::sync::Mutex::new(HashMap::new()),
             start_holdoff: std::sync::Mutex::new(HashMap::new()),
+            create_refusals: std::sync::Mutex::new(HashMap::new()),
             minting: Arc::new(std::sync::Mutex::new(HashMap::new())),
             volume_changes: tokio::sync::watch::channel(0).0,
             host_root: crate::node_logs::HOST_ROOT.into(),
@@ -3065,6 +3070,7 @@ impl PodManager {
                 match started {
                     Ok(status) => {
                         self.start_holdoff.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+                        self.create_refusals.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
                         self.first_seen
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -3206,9 +3212,22 @@ impl PodManager {
                             });
                         } else {
                             let kind = if reason == "StartError" { "RunContainerError".to_string() } else { reason };
-                            warn!("Pod {namespace}/{name}: {kind}: container {container}: {message}");
+                            // A refused create (#287: the engine refusing a
+                            // new root's attach or mount, once, after a boot)
+                            // is tried again within a second, growing to the
+                            // 10 s clock; the control plane's static pods are
+                            // on that path at every boot.
+                            let after = if kind == "CreateContainerError" {
+                                let mut refusals = self.create_refusals.lock().unwrap_or_else(|e| e.into_inner());
+                                let n = refusals.entry(uid.to_string()).or_insert(0);
+                                *n += 1;
+                                deadlines::create_backoff(*n, seen.elapsed())
+                            } else {
+                                deadlines::start_backoff(seen.elapsed())
+                            };
+                            warn!("Pod {namespace}/{name}: {kind}: container {container}: {message} (next try in {} ms)", after.as_millis());
                             self.event_waits.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
-                            self.hold_off(uid, deadlines::start_backoff(seen.elapsed()));
+                            self.hold_off(uid, after);
                             outcome.updates.push(self.waiting_pod_as(pod, &kind, format!("container {container}: {message}")));
                         }
                     }
@@ -3301,6 +3320,10 @@ impl PodManager {
             .unwrap_or_else(|e| e.into_inner())
             .retain(|uid, _| desired_uids.contains(uid));
         self.start_holdoff
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|uid, _| desired_uids.contains(uid));
+        self.create_refusals
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|uid, _| desired_uids.contains(uid));
@@ -8579,6 +8602,35 @@ pub(crate) mod tests {
         assert_eq!(u.phase, "Pending");
         assert_eq!(u.container_statuses[0].reason, "CreateContainerError");
         assert!(u.container_statuses[0].message.contains("injected create failure"));
+    }
+
+    /// #287: a refused create is tried again in 0.5 s, then 1 s, not after
+    /// the 10 s start back-off; once it starts, the count is gone.
+    #[tokio::test]
+    async fn a_refused_create_is_retried_within_a_second() {
+        use std::time::Duration;
+        let (rt, mgr) = manager();
+        rt.fail_create.lock().unwrap().insert("app".into());
+        let p = pod("uid-cr", "cr", "Always", simple_container());
+        let holdoff = |mgr: &PodManager| {
+            mgr.start_holdoff.lock().unwrap()["uid-cr"].saturating_duration_since(Instant::now())
+        };
+        let u = mgr.sync_pods(&[p.clone()]).await.updates.remove(0);
+        assert_eq!(u.container_statuses[0].reason, "CreateContainerError");
+        let first = holdoff(&mgr);
+        assert!(first <= Duration::from_millis(500) && first > Duration::from_millis(300), "{first:?}");
+
+        mgr.start_holdoff.lock().unwrap().clear();
+        mgr.sync_pods(&[p.clone()]).await;
+        let second = holdoff(&mgr);
+        assert!(second <= Duration::from_secs(1) && second > Duration::from_millis(800), "{second:?}");
+
+        // The runtime takes it now: started, and the count forgotten.
+        rt.fail_create.lock().unwrap().clear();
+        mgr.start_holdoff.lock().unwrap().clear();
+        let u = mgr.sync_pods(&[p]).await.updates.remove(0);
+        assert_eq!(u.phase, "Running");
+        assert!(mgr.create_refusals.lock().unwrap().is_empty());
     }
 
     /// Under restartPolicy Never a start failure ends the pod, with the

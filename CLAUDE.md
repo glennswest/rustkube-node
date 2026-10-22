@@ -58,6 +58,13 @@ by #51.
 
 ## Work plan
 
+### In progress: #287 (P0), a refused container create waits 10 s; the apiserver starts 10 s late after a boot (rustkube#286)
+
+2026-10-21. `start_backoff` (10–300 s from first seen) holds every CreateContainerError. Doing: `create_backoff(n, waited)`
+0.5 s doubling while < 10 s, then `start_backoff`; `PodManager.create_refusals` per uid (cleared on start/removal); unit for
+the schedule, a sync test (0.5 s, then 1 s, started clears it); README/CHANGELOG; sc-build; stage; close. Live: the next
+pvetest boot's `kube-apiserver started: wait=` under ~1.5 s when a first create is refused.
+
 ### Done: #285 (P0), an init container's exit noticed only at the pod's next pass, minutes late (server1 12.37)
 
 2026-10-21. The exit is an event: the ring thread broadcasts the handle, `exit_router` maps it to a pod (runtime's

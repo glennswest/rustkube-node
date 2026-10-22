@@ -77,6 +77,20 @@ pub(super) fn start_backoff(waited: Duration) -> Duration {
     waited.clamp(Duration::from_secs(10), Duration::from_secs(300))
 }
 
+/// How long a pod whose container create was refused `refusals` times in a
+/// row waits before the next try (#287): 0.5 s, doubling, while that is under
+/// 10 s, then [`start_backoff`]. The engine refusing a fresh root's attach or
+/// mount once after a boot costs half a second, not the 10 s floor; a create
+/// that keeps failing is on the usual clock after five tries (~15 s).
+pub(super) fn create_backoff(refusals: u32, waited: Duration) -> Duration {
+    let fast = Duration::from_millis(500).saturating_mul(1 << refusals.saturating_sub(1).min(16));
+    if refusals > 0 && fast < Duration::from_secs(10) {
+        fast
+    } else {
+        start_backoff(waited)
+    }
+}
+
 impl Deadlines {
     fn due_at(&mut self, uid: &str, at: Instant) {
         self.due
@@ -175,6 +189,15 @@ impl PodManager {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_refused_create_backs_off_from_half_a_second_to_the_start_clock() {
+        let ms = |n| create_backoff(n, Duration::from_secs(1)).as_millis();
+        assert_eq!((ms(1), ms(2), ms(3), ms(4), ms(5)), (500, 1000, 2000, 4000, 8000));
+        assert_eq!(ms(6), 10_000, "then start_backoff's floor");
+        assert_eq!(create_backoff(6, Duration::from_secs(60)), Duration::from_secs(60));
+        assert_eq!(create_backoff(1000, Duration::from_secs(900)), Duration::from_secs(300));
+    }
 
     #[test]
     fn a_probe_runs_once_a_period_from_its_initial_delay() {
