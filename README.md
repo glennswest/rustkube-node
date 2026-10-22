@@ -209,7 +209,10 @@ the pod's IP, a failed ADD is DEL'd and never leaves a pod addressless, and DEL 
 **Every container runs on its own root** on stormpump (#104, the owner's rule): a copy-on-write clone of its
 image's **sealed golden**, made when the container is created (engine volume `ctr-<container>`, attached over
 ublk, mounted by PID 1 at `/run/stormpump/roots/<container>`), writable, and detached and deleted when the
-container is removed; a restart is a new container with a fresh clone. Containers never share a root, and one
+container is removed; a restart is a new container with a fresh clone. Container ids carry a mark of this kubelet's
+start (`ct-<run>-<n>`, #288), so a root is never named like an earlier boot's; the start-up sweep deletes only roots
+of earlier starts that nothing holds (not attached, not in use), reads what it has after the engine's listing, and
+never touches this start's own. Containers never share a root, and one
 layer sits between the golden and what the workload writes. A pallet image's golden is the slab's
 `<volume>.golden` (else the mounted volume's sealed parent). The volume is the one the engine reports mounted at
 `/p/<path>` (#231), else the one the node's mount list names: the root volume's `/etc/stormblock/mounts` since

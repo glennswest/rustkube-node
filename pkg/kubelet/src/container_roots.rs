@@ -165,15 +165,17 @@ pub fn pallet_golden(listing: &Value, vol: &str) -> Result<String, String> {
 
 /// The root volumes nothing holds (#104): named [`VOLUME_PREFIX`], not one of
 /// `known` (the containers this kubelet has, and the ones it is making), not
+/// named `own` (this kubelet's own roots, #288: never an earlier one's), not
 /// in use and not attached. What a kubelet that died between a create and a
 /// removal leaves. Anything still attached or mounted is kept.
-pub fn orphans(listing: &Value, known: &HashSet<String>) -> Vec<(String, String)> {
+pub fn orphans(listing: &Value, known: &HashSet<String>, own: &str) -> Vec<(String, String)> {
     listing["items"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|v| Some((v["name"].as_str()?, v["id"].as_str()?, v)))
         .filter(|(name, _, _)| name.starts_with(VOLUME_PREFIX) && !known.contains(*name))
+        .filter(|(name, _, _)| own.is_empty() || !name.starts_with(own))
         .filter(|(_, _, v)| {
             v["in_use"].as_bool() != Some(true)
                 && v["attachments"].as_array().map_or(true, |a| a.is_empty())
@@ -319,8 +321,14 @@ impl Roots {
         Ok(())
     }
 
-    /// Delete the [`orphans`]; how many went.
-    pub async fn sweep(&self, known: &HashSet<String>) -> usize {
+    /// Delete the [`orphans`]; how many went. `known` is asked for after the
+    /// listing (#288): a root made while the engine was answering is in it,
+    /// never taken for a dead kubelet's.
+    pub async fn sweep<F, Fut>(&self, own: &str, known: F) -> usize
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = HashSet<String>>,
+    {
         let listing = match self.listing().await {
             Ok(l) => l,
             Err(e) => {
@@ -328,8 +336,9 @@ impl Roots {
                 return 0;
             }
         };
+        let known = known().await;
         let mut gone = 0;
-        for (name, id) in orphans(&listing, known) {
+        for (name, id) in orphans(&listing, &known, own) {
             match self.destroy(&id).await {
                 Ok(()) => {
                     tracing::info!(volume = %name, "deleted a container root nothing holds");
@@ -414,7 +423,23 @@ mod tests {
             {"name": "pvc-ns-data", "id": "5", "in_use": false},
         ]});
         let known: HashSet<String> = ["ctr-live".to_string()].into();
-        assert_eq!(orphans(&listing, &known), vec![("ctr-gone".to_string(), "1".to_string())]);
+        assert_eq!(orphans(&listing, &known, ""), vec![("ctr-gone".to_string(), "1".to_string())]);
+    }
+
+    /// #288: last boot's `ctr-ct-…-00000008` is an orphan; this kubelet's own
+    /// root, made after it knew what it had and not yet attached, is not.
+    #[test]
+    fn this_kubelets_own_roots_are_never_orphans() {
+        let listing = json!({"items": [
+            {"name": "ctr-ct-0badc0de-00000008", "id": "1", "in_use": false},
+            {"name": "ctr-ct-00000008", "id": "2", "in_use": false},
+            {"name": "ctr-ct-5eed1234-00000008", "id": "3", "in_use": false},
+        ]});
+        let none = HashSet::new();
+        assert_eq!(
+            orphans(&listing, &none, "ctr-ct-5eed1234-"),
+            vec![("ctr-ct-0badc0de-00000008".to_string(), "1".to_string()), ("ctr-ct-00000008".to_string(), "2".to_string())]
+        );
     }
 
     /// A fake stormblock: records every call, clones and attaches.

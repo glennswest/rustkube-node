@@ -334,6 +334,10 @@ pub struct StormpumpRuntime {
     /// Monotonic, so two containers created in the same millisecond do not
     /// collide the way a timestamp-derived id would.
     next_id: std::sync::atomic::AtomicU64,
+    /// This kubelet's own mark in every id it mints (#288): ids used to start
+    /// at `ct-00000001` on every start, so a static pod's new root had last
+    /// boot's name, and the start-up sweep of last boot's roots took it.
+    run_tag: String,
     /// Image configs by image root, filled by [`StormpumpImages`] (#98).
     image_configs: Arc<crate::image_config::ImageConfigs>,
     /// Makes and deletes each container's own root (#104).
@@ -374,6 +378,7 @@ impl StormpumpRuntime {
             containers: Mutex::new(HashMap::new()),
             failed_networks: Mutex::new(Vec::new()),
             next_id: std::sync::atomic::AtomicU64::new(1),
+            run_tag: run_tag(),
             image_configs: Arc::default(),
             roots: None,
             making: Default::default(),
@@ -486,6 +491,7 @@ impl StormpumpRuntime {
             containers: Mutex::new(HashMap::new()),
             failed_networks: Mutex::new(Vec::new()),
             next_id: std::sync::atomic::AtomicU64::new(1),
+            run_tag: run_tag(),
             image_configs: Arc::default(),
             roots: None,
             making: Default::default(),
@@ -544,12 +550,19 @@ impl StormpumpRuntime {
     /// still attached or mounted is never touched.
     pub async fn sweep_roots(&self) {
         let Some(roots) = self.roots.clone() else { return };
-        let mut known: std::collections::HashSet<String> =
-            self.making.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        known.extend(
-            self.containers.lock().await.keys().map(|id| crate::container_roots::volume_name(id)),
-        );
-        let gone = roots.sweep(&known).await;
+        // This kubelet's own roots are never a dead one's (#288), and what it
+        // has is read after the listing, not before.
+        let own = crate::container_roots::volume_name(&format!("ct-{}-", self.run_tag));
+        let gone = roots
+            .sweep(&own, || async {
+                let mut known: std::collections::HashSet<String> =
+                    self.making.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                known.extend(
+                    self.containers.lock().await.keys().map(|id| crate::container_roots::volume_name(id)),
+                );
+                known
+            })
+            .await;
         if gone > 0 {
             tracing::info!(gone, "stormpump: orphan container roots deleted");
         }
@@ -750,7 +763,7 @@ impl StormpumpRuntime {
         let n = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        format!("{prefix}-{n:08x}")
+        format!("{prefix}-{}-{n:08x}", self.run_tag)
     }
 
     /// Whether stormpump is reachable at all.
@@ -2716,6 +2729,21 @@ fn golden_reference(record: &serde_json::Value) -> Option<String> {
     Some(format!("{}{t}", crate::container_roots::TEMPLATE_PREFIX))
 }
 
+/// Eight hex digits that differ from one kubelet start to the next (#288):
+/// the process's randomly keyed hasher over its pid and the time.
+fn run_tag() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u32(std::process::id());
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default(),
+    );
+    format!("{:08x}", h.finish() as u32)
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -3016,6 +3044,9 @@ mod tests {
         let b = r.mint_id("ct");
         assert_ne!(a, b);
         assert!(a.starts_with("ct-") && b.starts_with("ct-"));
+        // #288: another kubelet start mints other ids from its first.
+        assert_ne!(rt().mint_id("ct"), rt().mint_id("ct"));
+        assert_eq!(a.len(), "ct-01234567-00000001".len(), "{a}");
     }
 
     // Everything below runs without an engine. The lifecycle itself needs

@@ -58,6 +58,13 @@ by #51.
 
 ## Work plan
 
+### In progress: #288 (P0), the start-up root sweep deletes a static pod's fresh root (same `ctr-ct-N` as last boot)
+
+2026-10-21. Ids restart at ct-00000001 every start; the sweep snapshots `known` before a slow listing. Doing: `run_tag`
+(8 hex, random per start) in every minted id; `Roots::sweep(own, known)`: `known` read after the listing, names under
+this start's `ctr-ct-<tag>-` never orphans; tests (orphans with `own`, ids differ per start); README/CHANGELOG;
+sc-build; stage; close. Live: no `deleted a container root` for a `ctr-ct-<this start>-` name in the next boots.
+
 ### Done: #287 (P0), a refused container create waits 10 s; the apiserver starts 10 s late after a boot (rustkube#286)
 
 2026-10-21. `create_backoff(n, waited)`: 0.5 s doubling while < 10 s, then `start_backoff`; `PodManager.create_refusals`

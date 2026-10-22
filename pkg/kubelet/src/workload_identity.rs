@@ -12,7 +12,7 @@
 //! ```json
 //! {"cgroup": "/stormpump/w4398046511104-7", "pid": 4242, "kind": "container",
 //!  "reports_network": false, "namespace": "default", "pod": "web-1", "pod_uid": "…",
-//!  "container": "app", "container_id": "ct-0000002c", "image": "busybox",
+//!  "container": "app", "container_id": "ct-5eed1234-0000002c", "image": "busybox",
 //!  "labels": {"io.kubernetes.pod.name": "web-1", …}, "annotations": {…}}
 //! ```
 //!
