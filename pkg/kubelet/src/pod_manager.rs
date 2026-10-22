@@ -541,7 +541,7 @@ pub struct PodManager {
     /// container would not start, is not tried again before its back-off is
     /// up, whatever wakes it (an exit anywhere wakes every workload, #115).
     start_holdoff: std::sync::Mutex<HashMap<String, Instant>>,
-    /// How many tries in a row a pod's container create was refused (#287):
+    /// How many tries in a row a pod's container create or start was refused (#287, #289):
     /// those are retried on [`deadlines::create_backoff`]'s short schedule
     /// before the 10 s clock. Cleared when the pod starts.
     create_refusals: std::sync::Mutex<HashMap<String, u32>>,
@@ -3212,18 +3212,18 @@ impl PodManager {
                             });
                         } else {
                             let kind = if reason == "StartError" { "RunContainerError".to_string() } else { reason };
-                            // A refused create (#287: the engine refusing a
-                            // new root's attach or mount, once, after a boot)
-                            // is tried again within a second, growing to the
-                            // 10 s clock; the control plane's static pods are
-                            // on that path at every boot.
-                            let after = if kind == "CreateContainerError" {
+                            // A refused create or start (#287, #289: the
+                            // engine refusing a new root's attach or mount, or
+                            // a claim's mount at start, once, after a boot) is
+                            // tried again within a second, growing to the 10 s
+                            // clock; the control plane's static pods are on
+                            // that path at every boot. A container that ran
+                            // and exited is CrashLoopBackOff's, not this.
+                            let after = {
                                 let mut refusals = self.create_refusals.lock().unwrap_or_else(|e| e.into_inner());
                                 let n = refusals.entry(uid.to_string()).or_insert(0);
                                 *n += 1;
                                 deadlines::create_backoff(*n, seen.elapsed())
-                            } else {
-                                deadlines::start_backoff(seen.elapsed())
                             };
                             warn!("Pod {namespace}/{name}: {kind}: container {container}: {message} (next try in {} ms)", after.as_millis());
                             self.event_waits.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
@@ -8651,6 +8651,10 @@ pub(crate) mod tests {
         let p = pod("uid-se2", "se2", "Always", simple_container());
         let u = mgr.sync_pods(&[p]).await.updates.remove(0);
         assert_eq!((u.phase.as_str(), u.container_statuses[0].reason.as_str()), ("Pending", "RunContainerError"));
+        // #289: a refused start (a claim's mount the engine refused once) is
+        // tried again in half a second, not after the 10 s start back-off.
+        let next = mgr.start_holdoff.lock().unwrap()["uid-se2"].saturating_duration_since(Instant::now());
+        assert!(next <= std::time::Duration::from_millis(500), "{next:?}");
     }
 
     #[tokio::test]

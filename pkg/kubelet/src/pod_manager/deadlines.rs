@@ -77,8 +77,8 @@ pub(super) fn start_backoff(waited: Duration) -> Duration {
     waited.clamp(Duration::from_secs(10), Duration::from_secs(300))
 }
 
-/// How long a pod whose container create was refused `refusals` times in a
-/// row waits before the next try (#287): 0.5 s, doubling, while that is under
+/// How long a pod whose container create or start was refused `refusals` times
+/// in a row waits before the next try (#287, #289): 0.5 s, doubling, while that is under
 /// 10 s, then [`start_backoff`]. The engine refusing a fresh root's attach or
 /// mount once after a boot costs half a second, not the 10 s floor; a create
 /// that keeps failing is on the usual clock after five tries (~15 s).

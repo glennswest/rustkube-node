@@ -58,6 +58,12 @@ by #51.
 
 ## Work plan
 
+### In progress: #289 (P0), a transient engine error on a static pod waits the 10 s start back-off
+
+2026-10-21. #287 put CreateContainerError (the root's attach/mount) on `create_backoff` (0.5 s doubling to the 10 s clock).
+Left: a refused start (RunContainerError: claim mounts are registered in `start_container`) still got `start_backoff`.
+Doing: both on `create_backoff`; test (Always start failure held ≤ 0.5 s); README/CHANGELOG; sc-build; stage; close.
+
 ### Done: #288 (P0), the start-up root sweep deletes a static pod's fresh root (same `ctr-ct-N` as last boot)
 
 2026-10-21. `run_tag` (8 hex, random per start) in every minted id; `Roots::sweep(own, known)`: `known` read after the
