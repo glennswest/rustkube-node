@@ -68,6 +68,12 @@ pub const MINT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(360
 /// `mgmt::auth::admin_token_file`).
 pub const DEFAULT_ADMIN_TOKEN_FILE: &str = "/run/stormblock-admin/admin_token";
 
+/// How long a refused call waits for a new token on disk before any token
+/// has been accepted (#290): the engine can answer before it has written this
+/// boot's token, and the kubelet then holds last boot's.
+pub const TOKEN_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+const TOKEN_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
 const FALLBACK_TOKEN_FILES: [&str; 2] = ["/etc/stormblock/api_token", "/var/lib/stormblock/api_token"];
 
 /// Where the engine's token can come from, in order. Not `Debug`: it can
@@ -160,6 +166,11 @@ struct Inner {
     /// Whether "no token found" has been logged, so a node whose engine has
     /// not minted yet says so once rather than on every sync tick.
     said_none: AtomicBool,
+    /// Whether the engine has answered anything but a 401 (#290). Until it
+    /// has, a refusal waits [`TOKEN_WAIT`] for a new token on disk.
+    accepted: AtomicBool,
+    /// The token a wait gave up on: not waited for again until it changes.
+    gave_up_on: Mutex<Option<Option<String>>>,
 }
 
 /// A client for this node's stormblock engine that carries its token.
@@ -222,6 +233,8 @@ impl EngineClient {
                 said_no_admin: AtomicBool::new(false),
                 token: Mutex::new(None),
                 said_none: AtomicBool::new(false),
+                accepted: AtomicBool::new(false),
+                gave_up_on: Mutex::new(None),
             }),
         }
     }
@@ -309,14 +322,19 @@ impl EngineClient {
         let used = self.token();
         let resp = self.once(method.clone(), url, body, used.as_deref(), timeout).await?;
         if resp.status() != StatusCode::UNAUTHORIZED {
+            self.inner.accepted.store(true, Ordering::Relaxed);
             return Ok(resp);
         }
-        let fresh = self.reload();
+        let mut fresh = self.reload();
+        if fresh == used {
+            fresh = self.await_new_token(&used).await;
+        }
         let mut resp = resp;
         if fresh.is_some() && fresh != used {
             info!("stormblock refused the engine token; retrying with the one now on disk");
             resp = self.once(method.clone(), url, body, fresh.as_deref(), timeout).await?;
             if resp.status() != StatusCode::UNAUTHORIZED {
+                self.inner.accepted.store(true, Ordering::Relaxed);
                 return Ok(resp);
             }
         }
@@ -385,6 +403,38 @@ impl EngineClient {
             }
         }
         cached.clone()
+    }
+
+    /// At boot (#290): the engine refused `used` and nothing newer is on
+    /// disk. Before it has accepted any token, that is this boot's engine
+    /// answering before it wrote its token, or the kubelet holding last boot's
+    /// (a fallback file outlives the reboot): the file is read every
+    /// [`TOKEN_POLL`] for up to [`TOKEN_WAIT`], instead of the refusal going
+    /// back to a caller that retries seconds later. Once a token has been
+    /// accepted, or a wait for this one gave up, `used` is returned at once.
+    async fn await_new_token(&self, used: &Option<String>) -> Option<String> {
+        if self.inner.accepted.load(Ordering::Relaxed) {
+            return used.clone();
+        }
+        if self.inner.gave_up_on.lock().unwrap_or_else(|e| e.into_inner()).as_ref() == Some(used) {
+            return used.clone();
+        }
+        let began = std::time::Instant::now();
+        while began.elapsed() < TOKEN_WAIT {
+            tokio::time::sleep(TOKEN_POLL).await;
+            let fresh = self.reload();
+            if fresh.is_some() && fresh != *used {
+                info!(ms = began.elapsed().as_millis() as u64, "stormblock engine token rewritten; waited for it");
+                return fresh;
+            }
+        }
+        warn!(
+            "stormblock refused the engine token and no other appeared in {} ms (looked in {})",
+            TOKEN_WAIT.as_millis(),
+            self.inner.source.describe()
+        );
+        *self.inner.gave_up_on.lock().unwrap_or_else(|e| e.into_inner()) = Some(used.clone());
+        used.clone()
     }
 
     /// Read the token again, whatever is cached.
@@ -576,9 +626,60 @@ mod tests {
         let c = EngineClient::new(&url, TokenSource::files([&file]));
         let path = format!("{url}/api/v1/volumes");
 
-        assert_eq!(c.get(&path).await.unwrap().status(), StatusCode::UNAUTHORIZED);
-        std::fs::write(&file, "minted").unwrap();
+        // Written while the first call is refused: that call waits for it.
+        let writer = {
+            let file = file.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                std::fs::write(&file, "minted").unwrap();
+            })
+        };
         assert_eq!(c.get(&path).await.unwrap().status(), StatusCode::OK);
+        writer.await.unwrap();
+    }
+
+    /// #290: at boot the kubelet reads last boot's token (or the engine
+    /// listens before it writes this boot's). The first refused call waits
+    /// for the new one and succeeds, instead of going back to its caller.
+    #[tokio::test]
+    async fn a_stale_token_at_boot_waits_for_the_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("api_token");
+        std::fs::write(&file, "last-boot").unwrap();
+        let (url, seen) = engine(Arc::new(Mutex::new("this-boot".into()))).await;
+        let c = EngineClient::new(&url, TokenSource::files([&file]));
+        let path = format!("{url}/api/v1/volumes");
+        let writer = {
+            let file = file.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                std::fs::write(&file, "this-boot\n").unwrap();
+            })
+        };
+        let began = std::time::Instant::now();
+        assert_eq!(c.get(&path).await.unwrap().status(), StatusCode::OK);
+        let took = began.elapsed();
+        assert!(took >= std::time::Duration::from_millis(300) && took < std::time::Duration::from_secs(1), "{took:?}");
+        assert_eq!(seen.load(Ordering::SeqCst), 2, "refused once, then the new token");
+        writer.await.unwrap();
+    }
+
+    /// A token that is never replaced is waited for once, not on every call.
+    #[tokio::test]
+    async fn a_wait_that_gave_up_is_not_repeated_for_the_same_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("api_token");
+        std::fs::write(&file, "wrong").unwrap();
+        let (url, seen) = engine(Arc::new(Mutex::new("right".into()))).await;
+        let c = EngineClient::new(&url, TokenSource::files([&file]));
+        let path = format!("{url}/api/v1/volumes");
+        let began = std::time::Instant::now();
+        assert_eq!(c.get(&path).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert!(began.elapsed() >= TOKEN_WAIT);
+        let began = std::time::Instant::now();
+        assert_eq!(c.get(&path).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert!(began.elapsed() < std::time::Duration::from_millis(500), "{:?}", began.elapsed());
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -709,6 +810,10 @@ mod tests {
         let (url, seen) = gated("node", Some(Arc::new(Mutex::new("adm".into())))).await;
         let c = EngineClient::with_admin(&url, TokenSource::files([&nf]), TokenSource::files([&af]));
         let path = format!("{url}/api/v1/fstemplates/t");
+        // The node token accepted first (as the kubelet's first listing is):
+        // the delete's refusal is the gate's, not a stale token's (#290).
+        assert_eq!(c.get(&path).await.unwrap().status(), StatusCode::OK);
+        seen.lock().unwrap().clear();
 
         assert_eq!(c.delete(&path).await.unwrap().status(), StatusCode::UNAUTHORIZED);
         assert_eq!(*seen.lock().unwrap(), ["node"]);

@@ -123,7 +123,11 @@ Engine token lookup: nonempty `STORMBLOCK_API_TOKEN`, then
 `STORMBLOCK_TOKEN_FILE` (default `/run/stormblock/engine/api_token`), then
 `/etc/stormblock/api_token`, then `/var/lib/stormblock/api_token`.
 It retries discovery while absent, caches a found token, and rereads on 401,
-retrying once only if changed.
+retrying once only if changed. Until the engine has accepted a token (a boot,
+#290), a 401 with nothing new on disk waits for the file to change (read every
+50 ms, up to 3 s) and retries with the new token: the engine can answer before
+it writes this boot's token, and a fallback file can still hold last boot's.
+A wait that gives up is not repeated for the same token.
 
 Admin credential (#105), for what stormblock's admin gate (stormblock#274)
 refuses to the node token: deleting a template (#140's rebuild of a broken

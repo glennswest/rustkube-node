@@ -58,6 +58,14 @@ by #51.
 
 ## Work plan
 
+### In progress: #290 (P2), a stale engine token at boot: the 401 goes back to the caller
+
+2026-10-21. `send_authorised` re-reads once on a 401; when the file still holds the refused token (last boot's fallback, or
+the engine answering before it writes), the 401 goes back to the caller, which retries seconds later. Doing: until a token
+is accepted, `await_new_token` polls the file (50 ms, ≤ 3 s), once per refused token; tests (stale → waits → OK; a wait
+that gave up is not repeated); configuration.md, CHANGELOG; sc-build; stage; close. stormblock's half (write before
+listening) is the master's note on the issue.
+
 ### Done: #289 (P0), a transient engine error on a static pod waits the 10 s start back-off
 
 2026-10-21. #287 put CreateContainerError (root attach/mount) on `create_backoff`; 4850e00 puts RunContainerError (claim
