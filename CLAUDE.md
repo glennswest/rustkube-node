@@ -58,6 +58,19 @@ by #51.
 
 ## Work plan
 
+### In progress: #292 (P0), ring arena per request; 180 s for a device mount; no root deleted under a mount (stormcos#626)
+
+2026-10-28. server1 (X9 SMR HDD), 12.40/12.54: one `mount(2)` of cilium's root took 30.95 s; the ring client's one arena
+(`arena_holder`) parked every later payload request behind it and each ran out its own 30 s; the timed-out
+VolumeRegister's root was then detached and deleted (`discard_root`) while PID 1 was still mounting it (EIO, cilium
+restarted from init 1). stormpump#181 completes the device form deferred. Doing:
+1. [ ] Ring: a first-fit slot allocator over the arena; each payload request its own region, freed at its completion
+       (live or abandoned); requests that do not fit wait in a FIFO, everything else is still submitted.
+2. [ ] Per-request deadline: device-form VolumeRegister 180 s (`MOUNT_DEADLINE`), the rest 30 s.
+3. [ ] A request's "settled" signal (its completion, and a late success's undo completed); `create_container`: a root
+       whose VolumeRegister timed out stays (in `making`) until settled, then is destroyed; never while the mount runs.
+4. [ ] Tests (allocator, settled after undo), README/docs/retries.md, CHANGELOG; sc-build; stage; close.
+
 ### Done: #258 (P1), static pods get no mirror pod in the API (stormcos#559)
 
 2026-10-21. 81dc1bd: `static_mirror.rs` (plan: create / delete stale+orphans / current), static pods named `<name>-<node>`
