@@ -2514,6 +2514,13 @@ Steps:
        across a kubelet restart).
 5. [ ] Live: stormcos's cni-bin carries only Cilium's binaries; asked in stormcos#495 for containernetworking/plugins.
        Then: a bridge + a macvlan NAD on a test node (test-container case: NADs are namespaced), close.
+       2026-10-28: 12.58 (pvetest1/2) carries cni-bin f77591d (has stormcos 3ca1af8: plugins v1.9.1 in cni-bin) and
+       this code; stormcos ships the NAD CRD (97-network-attachment-crd.yaml); the run's Role is `*`. Every test run still
+       dies at the node's image fetch (stormcos#271). Doing: `test/` suite `multus` (`multus.rs`, workload
+       `expect-nics`): bridge + macvlan NADs → net1/net2 with IPv4 in the pod and in network-status; a missing NAD →
+       FailedCreatePodSandBox naming it; a one-address host-local NAD used by two pods in turn (DEL released it).
+       requires.toml `[multus]`; sc-build `cd test`; propose #233 after stormcos#271; resume: `stormcentral test run
+       rustkube-node multus --tag pvetest1`, close on a pass.
 
 ### Done: #231 + #232 (P0, stormcos#488): verified live on the Dell, 12.07
 
