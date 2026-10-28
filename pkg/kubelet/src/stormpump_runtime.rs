@@ -53,6 +53,10 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::stormpump_ring::{RingClient, RingError};
+
+/// How long a root whose mount timed out waits for the engine to let go of it
+/// before it is left for the next start's sweep (#292).
+const ROOT_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(3600);
 use stormpump::sandbox::Profile;
 use stormpump_abi::handle::Handle;
 use stormpump_abi::Domain;
@@ -342,8 +346,9 @@ pub struct StormpumpRuntime {
     image_configs: Arc<crate::image_config::ImageConfigs>,
     /// Makes and deletes each container's own root (#104).
     roots: Option<Arc<crate::container_roots::Roots>>,
-    /// Root volumes being made, which the orphan sweep must not take.
-    making: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Root volumes being made, which the orphan sweep must not take; and a
+    /// root whose mount timed out, until the engine has let go of it (#292).
+    making: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Publishes each workload's identity for cadvisor (#84); `None` in tests.
     identities: Option<crate::workload_identity::Publisher>,
     /// Exits no container claimed when they were read (#285): a container
@@ -746,6 +751,45 @@ impl StormpumpRuntime {
                 tracing::warn!(volume = %volume, "a discarded root was not deleted (the sweep retries): {e}");
             }
         }
+    }
+
+    /// Delete a root whose mount timed out once the engine has let go of it
+    /// (#292): `released` disconnects when the ring has the late answer to
+    /// that `VOLUME_REGISTER` and, for a late success, the release that undoes
+    /// it. Until then PID 1 may still be in `mount(2)` on the device, and the
+    /// volume stays (and stays out of the sweep). An engine that never answers
+    /// within [`ROOT_RELEASE_WAIT`] keeps it: the next start's sweep takes it
+    /// once nothing holds it.
+    fn discard_root_when_released(
+        &self,
+        volume: String,
+        volume_id: String,
+        released: std::sync::mpsc::Receiver<()>,
+    ) {
+        let (roots, making) = (self.roots.clone(), self.making.clone());
+        tracing::warn!(
+            volume = %volume,
+            "a root's mount timed out; kept until stormpump has answered for it, then deleted"
+        );
+        tokio::spawn(async move {
+            let waited = tokio::task::spawn_blocking(move || released.recv_timeout(ROOT_RELEASE_WAIT)).await;
+            let let_go = matches!(waited, Ok(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)));
+            if let_go {
+                if let Some(roots) = roots {
+                    match roots.destroy(&volume_id).await {
+                        Ok(()) => tracing::info!(volume = %volume, "stormpump let go of a timed-out root; deleted"),
+                        Err(e) => tracing::warn!(volume = %volume, "a timed-out root was not deleted (the sweep retries): {e}"),
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    volume = %volume,
+                    "stormpump has not answered for a timed-out root in {ROOT_RELEASE_WAIT:?}; kept, never \
+                     deleted under a mount"
+                );
+            }
+            making.lock().unwrap_or_else(|e| e.into_inner()).remove(&volume);
+        });
     }
 
     /// Finish the removals in `ids` (#90). A refusal keeps the record and is
@@ -1479,11 +1523,38 @@ impl RuntimeService for StormpumpRuntime {
         };
         let mount = crate::container_roots::mount_point(&id);
         let (at, device) = (mount.clone(), made.device.clone());
-        let root = self.on_ring(move |r| r.volume_register_device(&at, &device, "ext4")).await;
-        self.making.lock().unwrap_or_else(|e| e.into_inner()).remove(&volume);
+        let root = self
+            .on_ring(move |r| {
+                let (settled, released) = std::sync::mpsc::channel();
+                Ok((r.volume_register_device_settled(&at, &device, "ext4", Some(settled)), released))
+            })
+            .await;
         let root = match root {
-            Ok(h) => h,
-            Err(e) => {
+            Ok((Ok(h), _)) => {
+                self.making.lock().unwrap_or_else(|e| e.into_inner()).remove(&volume);
+                h
+            }
+            // **Never delete a root PID 1 may still be mounting** (#292): the
+            // device torn down under `mount(2)` reads a deleted volume (EIO,
+            // server1 12.54). The ring undoes a late mount; the root goes once
+            // that is answered.
+            Ok((Err(RingError::Timeout), released)) => {
+                self.discard_root_when_released(volume.clone(), made.volume_id.clone(), released);
+                return Err(CriError::Runtime(format!(
+                    "container {}: stormpump did not mount its root {} at {mount} within {:?}; \
+                     the root is deleted once the engine lets go of it",
+                    config.name,
+                    made.device,
+                    crate::stormpump_ring::MOUNT_DEADLINE
+                )));
+            }
+            other => {
+                let e = match other {
+                    Ok((Err(e), _)) => e.to_string(),
+                    Err(e) => e.to_string(),
+                    Ok((Ok(_), _)) => String::new(),
+                };
+                self.making.lock().unwrap_or_else(|e| e.into_inner()).remove(&volume);
                 self.discard_root(None, &made.volume_id).await;
                 return Err(CriError::Runtime(format!(
                     "container {}: stormpump would not mount its root {} at {mount}: {e}",

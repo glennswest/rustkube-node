@@ -288,9 +288,10 @@ start retry deadlines. Not measured on a node (#102).
 The ring, CNI and engine I/O named in #99's comments are bounded (see
 [configuration](configuration.md#runtime-details)). The ring's deadline counts
 from when a request is made, not from when it is sent. A timeout never unsends
-an SQE: the request is kept as abandoned until the engine answers, so the
-arena is not reused early, and whatever a late success made is undone by the
-ring thread. Verified by unit tests (deadline bookkeeping, late-success undo,
+an SQE: the request is kept as abandoned until the engine answers, so its
+region of the arena (each payload has its own, #292) is not reused early, and
+whatever a late success made is undone by the ring thread. A device mount
+waits 180 s, not 30 (#292). Verified by unit tests (deadline bookkeeping, late-success undo,
 a hung CNI plugin killed and reaped, a silent engine timing out), not on a
 node.
 

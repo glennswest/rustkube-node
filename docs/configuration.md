@@ -90,11 +90,16 @@ runtime probe. The gRPC client has a 120-second channel timeout and requests
 Every other runtime-side call is bounded too (#99):
 
 - **stormpump ring:** 30 s per request, counted from when it was asked, so a
-  request queued behind a wedged engine times out as well. A request dequeued
-  after its deadline is never submitted. One already on the ring is answered
-  `Timeout` and kept: its late completion still frees the shared arena, and a
-  late success is undone (a spawn is stopped and released on exit; a volume,
-  spec or sandbox is released).
+  request queued behind a wedged engine times out as well; a device-form
+  `VolumeRegister` (PID 1 mounting a root or a claim) 180 s, since one mount
+  took 31 s on an SMR disk (#292). A request dequeued after its deadline is
+  never submitted. One already on the ring is answered `Timeout` and kept: its
+  late completion still frees its region of the arena, and a late success is
+  undone (a spawn is stopped and released on exit; a volume, spec or sandbox is
+  released). Each payload has its own region of the arena (#292), so one slow
+  request holds only its own. A container root whose mount timed out is
+  deleted only after the engine has answered for it and the late mount is
+  released, never while `mount(2)` may still be reading the device.
 - **CNI plugins:** 60 s per plugin exec, stdin to exit
   (`cni::PLUGIN_TIMEOUT`, `CniInvoker::with_timeout`). Past it the plugin is
   killed and reaped, and the call fails. A failed ADD is followed by DEL

@@ -108,7 +108,7 @@ rules say. `R` = POST marked repeatable (named create or review).
 | `health.rs` (HTTP probes) | a probe is asked once per period; its failureThreshold is the retry |
 | `node_health.rs` (node services' liveness) | three failures in a row are the threshold |
 | `cri_grpc.rs` (CRI runtime) | RunPodSandbox / CreateContainer make a new object each time; Unavailable is `CriError::Connection`, a wait the pod worker retries on its backoff after reading back what exists |
-| `stormpump_ring.rs` (PID 1's ring) | shared memory on this node, bounded by `DEADLINE`; SPAWN, CLONE, SANDBOX_ACQUIRE are not safe to repeat |
+| `stormpump_ring.rs` (PID 1's ring) | shared memory on this node, bounded by `DEADLINE` (30 s; a device mount `MOUNT_DEADLINE`, 180 s, #292); SPAWN, CLONE, SANDBOX_ACQUIRE are not safe to repeat |
 | `pkg/cni/src/invoker.rs` (CNI plugin exec) | bounded (60 s); an ADD allocates, a failed one is followed by DEL and the start retried on the CNI backoff (#148) |
 | The kubelet's Pod watch | apimachinery's reflector (rustkube), with its own relist and backoff |
 
