@@ -11,6 +11,8 @@
 //!   and pod features and failure paths (`pods.rs`, #61).
 //! - `csi` (< 15 min, #52): the kubelet's CSI node side against a real driver
 //!   process, this image's own (`csi.rs`, `csi_driver.rs`).
+//! - `multus` (< 10 min, #233): a pod's extra networks by the Multus
+//!   standard, with the standard CNI plugins (`multus.rs`).
 //! - `long` (the night): waves of pods sized from the node's capacity,
 //!   measuring start latency and what each wave leaves behind (`long.rs`).
 //!
@@ -26,6 +28,7 @@ pub mod env;
 pub mod k8s;
 pub mod long;
 pub mod medium;
+pub mod multus;
 pub mod node_volumes;
 pub mod pods;
 pub mod report;
@@ -82,8 +85,9 @@ pub async fn run(env: Arc<Env>, r: &mut Report) {
         }
         "long" => Box::pin(long::run(env, api, r)).await,
         "csi" => Box::pin(csi::run(env, api, r)).await,
+        "multus" => Box::pin(multus::run(env, api, r)).await,
         other => {
-            r.record("suite", Outcome::Infra(format!("STORM_SUITE {other:?} is not short, medium, long or csi")), 0, None);
+            r.record("suite", Outcome::Infra(format!("STORM_SUITE {other:?} is not short, medium, long, csi or multus")), 0, None);
         }
     }
 }

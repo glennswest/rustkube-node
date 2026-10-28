@@ -22,6 +22,10 @@
 //! - `write-file <path> <text>`, `expect-file <path> <text>`: write, or check
 //!   the file holds exactly `text`.
 //! - `expect-env <name> <value>`: the variable is set to exactly `value`.
+//! - `expect-nics <hold-secs> <ifname>...` (#233): each interface is there
+//!   with an IPv4 address; the line says `name=address` for each, then the
+//!   process holds (Running, SIGTERM ends it with 0) so the suite can read
+//!   the pod while it has its networks. Exits 1 at once when one is missing.
 //!
 //! A directory `path` means a filesystem volume: the data goes in
 //! `<path>/rustkube-node-test.bin`. Anything else is a raw block device,
@@ -40,7 +44,7 @@ pub fn is_workload(args: &[String]) -> bool {
         args.first().map(String::as_str),
         Some(
             "fill" | "verify" | "size-at-least" | "sized" | "echo" | "exit" | "sleep" | "fail-once"
-                | "write-file" | "expect-file" | "expect-env"
+                | "write-file" | "expect-file" | "expect-env" | "expect-nics"
         )
     )
 }
@@ -61,12 +65,18 @@ pub fn main(args: &[String]) -> i32 {
         return 0;
     }
     let result = run(args);
+    let hold = (args[0] == "expect-nics" && result.is_ok()).then(|| args.get(1).and_then(|c| c.parse().ok()).unwrap_or(0));
     let (code, line) = match &result {
         Ok(d) => (0, format!("{{\"workload\": {}, \"ok\": true, \"detail\": {}}}", crate::report::json(&args.join(" ")), crate::report::json(d))),
         Err(e) => (1, format!("{{\"workload\": {}, \"ok\": false, \"detail\": {}}}", crate::report::json(&args.join(" ")), crate::report::json(e))),
     };
     println!("{line}");
     let _ = std::fs::write("/dev/termination-log", &line);
+    if let Some(secs) = hold {
+        // SAFETY: the handler only calls _exit, which is async-signal-safe.
+        unsafe { libc::signal(libc::SIGTERM, on_term as *const () as libc::sighandler_t) };
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+    }
     code
 }
 
@@ -140,8 +150,55 @@ fn run(args: &[String]) -> Result<String, String> {
                 Err(_) => Err(format!("{k} is not set")),
             }
         }
+        "expect-nics" => {
+            let want: Vec<&str> = args.iter().skip(2).map(String::as_str).collect();
+            if want.is_empty() {
+                return Err("missing ifname".into());
+            }
+            nics_found(&want, &ipv4_addresses()?)
+        }
         other => Err(format!("unknown workload {other:?}")),
     }
+}
+
+/// Every interface's IPv4 addresses, as `getifaddrs` gives them.
+fn ipv4_addresses() -> Result<Vec<(String, std::net::Ipv4Addr)>, String> {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `head` with a list freed below.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return Err(format!("getifaddrs: {}", std::io::Error::last_os_error()));
+    }
+    let mut out = Vec::new();
+    let mut cur = head;
+    while !cur.is_null() {
+        // SAFETY: `cur` is a node of the list getifaddrs returned.
+        let ifa = unsafe { &*cur };
+        if !ifa.ifa_addr.is_null() && i32::from(unsafe { (*ifa.ifa_addr).sa_family }) == libc::AF_INET {
+            // SAFETY: an AF_INET address is a sockaddr_in; the name is a C string.
+            let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+            let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }.to_string_lossy().into_owned();
+            out.push((name, std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr))));
+        }
+        cur = ifa.ifa_next;
+    }
+    // SAFETY: `head` came from getifaddrs and is freed once.
+    unsafe { libc::freeifaddrs(head) };
+    Ok(out)
+}
+
+/// `name=address` for each wanted interface, or which has none.
+pub fn nics_found(want: &[&str], have: &[(String, std::net::Ipv4Addr)]) -> Result<String, String> {
+    let mut seen = Vec::new();
+    for w in want {
+        match have.iter().find(|(n, _)| n == w) {
+            Some((n, a)) => seen.push(format!("{n}={a}")),
+            None => {
+                let all: Vec<String> = have.iter().map(|(n, a)| format!("{n}={a}")).collect();
+                return Err(format!("no IPv4 address on {w} (have: {})", all.join(" ")));
+            }
+        }
+    }
+    Ok(seen.join(" "))
 }
 
 fn target(p: &str) -> PathBuf {
@@ -221,6 +278,17 @@ mod tests {
         let d = std::env::temp_dir().join(format!("rknt-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn expect_nics_names_each_address_or_the_missing_one() {
+        let have = vec![("lo".to_string(), "127.0.0.1".parse().unwrap()), ("net1".to_string(), "172.31.250.10".parse().unwrap())];
+        assert_eq!(nics_found(&["net1"], &have).unwrap(), "net1=172.31.250.10");
+        let e = nics_found(&["net1", "net2"], &have).unwrap_err();
+        assert!(e.starts_with("no IPv4 address on net2"), "{e}");
+        assert!(is_workload(&["expect-nics".into()]));
+        // The loopback is always there, so the real lookup works in a test.
+        assert!(nics_found(&["lo"], &ipv4_addresses().unwrap()).is_ok());
     }
 
     #[test]

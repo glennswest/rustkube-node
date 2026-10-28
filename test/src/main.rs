@@ -17,7 +17,7 @@ fn main() {
     }
     // Started as `/test <suite>` (the standard); the argument wins over
     // STORM_SUITE. Set before any thread exists.
-    if let Some(suite) = args.first().filter(|a| matches!(a.as_str(), "short" | "medium" | "long" | "csi")) {
+    if let Some(suite) = args.first().filter(|a| matches!(a.as_str(), "short" | "medium" | "long" | "csi" | "multus")) {
         std::env::set_var("STORM_SUITE", suite);
     }
     let env = Env::read();

@@ -48,3 +48,13 @@ cluster_write = [
   { apiGroup = "", resource = "persistentvolumes" },
   { apiGroup = "storage.k8s.io", resource = "csidrivers" },
 ]
+
+[multus]
+# A pod's extra networks (#233): NetworkAttachmentDefinitions are made in the
+# run's namespace (its Role is `*`), so the only cluster read is which Node
+# STORM_NODE is. Needs stormcos's NAD CRD and the standard CNI plugins in
+# cni-bin (stormcos#495). By day: 10 min.
+budget_secs = 600
+cluster_read = [
+  { apiGroup = "", resource = "nodes" },
+]
