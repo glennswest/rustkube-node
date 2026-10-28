@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-10-28
+
+- **test:** A `multus` suite in the test container (#233's live check): a bridge and a macvlan
+  NetworkAttachmentDefinition give a pod `net1`/`net2` with IPv4 addresses, inside the pod (new workload mode
+  `expect-nics <hold> <ifname>…`) and in `k8s.v1.cni.cncf.io/network-status`; a missing NAD fails by name
+  (FailedCreatePodSandBox); a one-address host-local NAD used by two pods in turn proves teardown DELs the
+  attachment. `test/requires.toml` `[multus]` (600 s, nodes read). Needs the standard CNI plugins in cni-bin
+  (stormcos#495) and the NAD CRD.
+
 ## 2026-10-14
 
 - **feat:** A VMI's start says where its time went (#259): `storm.io/start-timing` on the VMI, a `StartTiming`

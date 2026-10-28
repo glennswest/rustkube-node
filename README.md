@@ -1052,11 +1052,24 @@ kubelet is under test, not the scheduler.
     holder keeps its container, the driver is registered again, a new pod reads
     the file, and the holder's delete is unpublished by the restarted kubelet.
   - `csi-deregistered`: the driver pod deleted, CSINode no longer lists it.
+- **multus** (< 10 min, declared in `test/requires.toml`, run on request, #233):
+  a pod's extra networks by the Multus standard, with the standard CNI plugins
+  in cni-bin (stormcos#495). Three NADs in the run's namespace (host-local
+  IPAM, stores named for the run; bridges `rknt0`/`rknt1` with no address on
+  the host, reused by later runs):
+  - `multus-two-nics`: a `bridge` NAD and a `macvlan` NAD (the default-route
+    interface) give the pod `net1` and `net2`, each with an IPv4 address seen
+    from inside the pod, and the same in `k8s.v1.cni.cncf.io/network-status`
+    (the default first, then `<ns>/<nad>` per network).
+  - `multus-missing-nad`: a pod naming a NAD that does not exist never runs; a
+    FailedCreatePodSandBox Event names it.
+  - `multus-release`: a NAD whose range holds one address, used by two pods in
+    turn: the second gets it only if the first's delete DELed its attachment.
 
 The same image is the workload pods' program (`/test sized <path> <seed>
 <bytes> <lo> <hi>`, `/test echo …`, `sleep`, `exit`, `fail-once`,
-`write-file`, `expect-file`, `expect-env`, and `csi-driver`, `restart-kubelet`
-for the csi suite), so a run pulls nothing else. The crate builds the CSI and
+`write-file`, `expect-file`, `expect-env`, `expect-nics` for the multus suite,
+and `csi-driver`, `restart-kubelet` for the csi suite), so a run pulls nothing else. The crate builds the CSI and
 plugin-registration protos the kubelet vendors, so it needs `protoc` too. Check it builds with
 `sc-build 'cd test && cargo test --locked && cargo build --release --locked'`.
 

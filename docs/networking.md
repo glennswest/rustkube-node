@@ -92,7 +92,9 @@ does what Multus does in front of a CRI runtime:
 - `k8s.v1.cni.cncf.io/network-status`: the default network first (named for its replacement NAD when
   there is one), then one entry per extra network, `name` its `namespace/name`, `default: false`.
 - The plugins a NAD names (`bridge`, `macvlan`, `ipvlan`, …) come from the node's CNI bin directory
-  (`--cni-bin-dir`, `/opt/cni/bin`).
+  (`--cni-bin-dir`, `/opt/cni/bin`). stormcos ships containernetworking/plugins v1.9.1 there, in the
+  cni-bin golden (stormcos#495), and the NAD CRD.
+- Checked on a node by the test container's `multus` suite (README, "Test container").
 
 Not here: a CRI runtime (`--runtime cri`) runs its own CNI and gets no attachments from the kubelet;
 VMs' `networks: - multus:` is the VM manager's (#88 path, stormvm#85, #241): the same NADs, ADDed into
