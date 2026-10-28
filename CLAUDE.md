@@ -58,18 +58,16 @@ by #51.
 
 ## Work plan
 
-### In progress: #292 (P0), ring arena per request; 180 s for a device mount; no root deleted under a mount (stormcos#626)
+### Done: #292 (P0), ring arena per request; 180 s for a device mount; no root deleted under a mount (stormcos#626)
 
-2026-10-28. server1 (X9 SMR HDD), 12.40/12.54: one `mount(2)` of cilium's root took 30.95 s; the ring client's one arena
-(`arena_holder`) parked every later payload request behind it and each ran out its own 30 s; the timed-out
-VolumeRegister's root was then detached and deleted (`discard_root`) while PID 1 was still mounting it (EIO, cilium
-restarted from init 1). stormpump#181 completes the device form deferred. Doing:
-1. [ ] Ring: a first-fit slot allocator over the arena; each payload request its own region, freed at its completion
-       (live or abandoned); requests that do not fit wait in a FIFO, everything else is still submitted.
-2. [ ] Per-request deadline: device-form VolumeRegister 180 s (`MOUNT_DEADLINE`), the rest 30 s.
-3. [ ] A request's "settled" signal (its completion, and a late success's undo completed); `create_container`: a root
-       whose VolumeRegister timed out stays (in `making`) until settled, then is destroyed; never while the mount runs.
-4. [ ] Tests (allocator, settled after undo), README/docs/retries.md, CHANGELOG; sc-build; stage; close.
+2026-10-28. server1 (X9 SMR HDD), 12.40/12.54: one root `mount(2)` took 30.95 s; the one arena parked every later
+payload request, and the timed-out root was deleted under the mount (EIO). c0a5fd4: `Slots` (first fit, 8-aligned,
+freed at completion live or abandoned; no room = FIFO wait, no-payload ops never wait); `MOUNT_DEADLINE` 180 s for
+device-form VolumeRegister; a request's `settled` sender dropped after its completion and a late success's undo;
+`create_container` on a Timeout keeps the root (in `making`) until settled (≤ 1 h), then destroys it. SC_BUILD_VM
+sc-build (jobs 73f593f87e, 4213f3f230): 563 kubelet unit (2 new), all suites, clippy nothing new (`run`'s argument
+count is #227's). Stage build a17d6d9444ca. Closed. Live: the next server1 reboot install, no `within 30s` on
+VolumeRegister, no `I/O error, dev ublkb*` after a slow mount. #296 (409 on detach) is separate.
 
 ### Done: #258 (P1), static pods get no mirror pod in the API (stormcos#559)
 
