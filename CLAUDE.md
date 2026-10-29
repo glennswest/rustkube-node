@@ -2202,7 +2202,7 @@ Steps:
        Failed for good only when the owning VM's runStrategy is Once or Manual. Standalone VMI: retried.
 3. [x] Tests, docs (README), CHANGELOG. sc-build at 20036bf: all pass (kubelet 210). Not run on a node. Unreleased.
 
-### Waiting on stormblock-registry#95 / stormcentral#521 / stormcos_qa#52: #92, a VMI's accessCredentials (keys into the seed and through the agent)
+### Waiting on stormcos_qa#52 (its agent-keys step, behind stormcos#271): #92, a VMI's accessCredentials (keys into the seed and through the agent)
 
 stormvm e5b4d16 (in the dc1b7ea lock): `VmSpec.access_credentials`, `access::keys_in_secret`, `Seed.public_keys`,
 `qga::set_authorized_keys` (reset: true), `access::condition`.
@@ -2223,6 +2223,10 @@ Steps:
        stormcos#337; half 2 still needs stormcos_qa#52.
        2026-10-08: stormcos#337 closed; vm-waves still can't run (test images: stormcentral#521; fresh-node media
        import: stormblock-registry#95). Tests pass on a build VM (fb94c9a). #92 proposed after stormblock-registry#95.
+       2026-10-28: half 1 verified live: vm-waves 572366a0a2 (pvetest2, 12.21, `--seed-key` off) logged in with the
+       `noCloud` key on 6 VMs and every restart. Half 2 = stormcos_qa d85d0d3's `agent-keys` step (after that run's
+       e22a837), never run: every test run dies at the node's fetch (stormcos#271), and vm-waves is stormcos_qa's to queue.
+       #92 proposed after stormcos_qa#52. Resume: read the first vm-waves run with `agent-keys` lines, close or fix.
 
 ### Done: #55, a presentation of rustkube-node (`docs/presentation.md`, Marp)
 

@@ -2,6 +2,9 @@
 
 ## 2026-10-28
 
+- **docs:** #92 half 1 verified live: in vm-waves 572366a0a2 (pvetest2, 12.21), the `noCloud` accessCredentials key
+  let ssh in on 6 VMs. Half 2 ("Add my keys" through the guest agent) waits on stormcos_qa#52's `agent-keys` step.
+
 - **docs:** #91 closed on its live check: in stormcos_qa vm-waves 572366a0a2 (pvetest2, 12.21), each bridged VM
   showed its lease in `status.interfaces[].ipAddress` and accepted ssh within 12–13 s. Filed #298 for the run's
   failed-start failures.
