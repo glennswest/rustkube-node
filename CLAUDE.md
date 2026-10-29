@@ -58,6 +58,28 @@ by #51.
 
 ## Work plan
 
+### In progress: #40 (P3), live migration of stormvm-started VMIs (stormstorage#44 closed 2026-10-29)
+
+2026-10-29. stormstorage 5d68784 has the disk half: `POST /api/v1/nodes/{S}/volumes/{id}/migrate {to}` (T's copy served to
+S over NVMe/TCP, S's mirror), `GET /api/v1/migrations/{mid}` (starting|copying|synced|cut_over|completed|aborted|failed,
+`target.id` = T's engine-local id), `cutover` (guest paused), `complete` (retires S's), `abort`. stormvm a8b509d (the lock)
+has `migration::{INCOMING_DEFER, Tls, Tuning, send_migration, receive_migration_tls}`, `migration()`, public `qmp` (for
+`migrate_cancel`). Contract: rustkube's `apimachinery::kubevirt::active_migration` (status.migrationState). Scope of this
+cut: qemu, VM-owned disks (golden clone, emptyDisk, seed), no pod-network NIC; anything else fails the migration naming
+why (follow-ups). Doing:
+1. [ ] `vm_migration.rs`: role (source/target) from migrationState, preflight, stormstorage client (`--stormstorage`,
+       token file), the disks record (`storm.io/migration-disks` annotation: migrationUid + disk → mid), TLS dir (copies of
+       the node pair: `--migration-tls-{cert,key,ca}`), port (`--migration-port`, 49152).
+2. [ ] VMI lists: a third selector `status.migrationState.targetNode`; target never cold-starts a migrating VMI.
+3. [ ] Source: start each disk's mirror, record mids; on `targetNodeAddress` send over TLS, `startTimestamp`; poll;
+       `completed`/`failed` + `endTimestamp`; abortRequested → `migrate_cancel`, failed, `abortStatus`; after completed
+       force-stop the paused machine (no status write, finalizer left to the target); after failed abort each mirror.
+4. [ ] Target: wait every disk `synced`, attach T's copies (ublk), receiving start (`-incoming defer`), arm TLS listener,
+       write `targetNodeAddress` + port; on completed adopt it (registration, status), cut each disk over and complete it;
+       on failed/abort tear the receiver down.
+5. [ ] Tests (fake apiserver + fake stormstorage + fake machine), README/api.md/configuration.md/status.md, CHANGELOG;
+       sc-build; stage; stormcos issue (flags, port open, CRD stormcos#288). Live: two-node cluster with stormstorage.
+
 ### Done: #160 (P2), pods wait a fixed 2 s for startup admission after every kubelet start (stormcos#300)
 
 2026-10-28. Sample (pvetest2 storm-003102, 12.58, kubelet restarts at 21:41–21:54): every API pod (coredns, flowsdn,
