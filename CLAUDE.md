@@ -643,7 +643,7 @@ may take the log with the container. Done in code: `RuntimeService::logs_survive
 completed init kept in `PodManager::kept_inits` until `stop_pod` where removal would lose the log. Tests (1 changed,
 1 new). sc-build 90c291c0ec: 419 pass (after #196's test updates). Golden e3415aaa02e2. Closed.
 
-### Waiting on stormcos#357 (snapshot-controller) + stormcos#536 (csi-snapshotter): #157 (P3), VM disks on stormblock-csi claims: snapshot by VolumeSnapshot, restore from any leg
+### Waiting on stormcos#357 (snapshot-controller) + stormcos#170 (CRDs) in a release: #157 (P3), VM disks on stormblock-csi claims: snapshot by VolumeSnapshot, restore from any leg
 
 2026-10-10. stormstorage#49 closed (snapshots, one-node group snapshots, `source` clones); stormblock-csi still has
 `snapshots: false` for its stormstorage backend and no csi-snapshotter: filed stormblock-csi#51. stormcos#170 ships the
@@ -668,6 +668,9 @@ D. [ ] Tests (5 new), README, csi.md, status.md, CHANGELOG (0b942e8, c9e168f; #2
        2026-10-10: stormblock-csi#51 closed (golden-stormblock-csi-722fc08812b1, stormcos#462). Not on a cluster yet:
        the snapshot-controller (stormcos#357) and the csi-snapshotter golden (stormcos#536) are open, both behind
        stormcentral#272; stormcos#170 is still open too (the earlier "done" was wrong). #157 proposed after stormcos#357.
+       2026-10-28: stormcos#536 closed (csi-snapshotter golden), stormcos#357 shipped from stormcos (3b30f0f) but open,
+       stormcos#170 open; 12.58 carries no snapshot-controller and no stormblock-csi. #157 proposed after stormcos#357 +
+       stormcos#170. Resume: a release with them + stormblock-csi; snapshot, lose the head, restore, boot; close.
 
 ### Done: #181 item 3 (stormpump#144: /run/stormpump/shutdown)
 
