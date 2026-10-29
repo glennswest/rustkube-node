@@ -388,6 +388,9 @@ pub struct Executor {
     desired: Mutex<Desired>,
     pub reservations: Arc<Reservations>,
     pub load: Arc<Load>,
+    /// Workloads that met startup admission closed (#160), woken together
+    /// when it opens instead of each waiting out its retry.
+    parked: Mutex<HashSet<Key>>,
 }
 impl Executor {
     pub fn new() -> Arc<Self> {
@@ -397,7 +400,31 @@ impl Executor {
             ready,
             desired: Mutex::new(Desired::default()),
             load: Arc::new(Load::default()),
+            parked: Mutex::new(HashSet::new()),
         })
+    }
+
+    /// Park `key` until [`Executor::wake_parked`] (#160).
+    pub fn park(&self, key: &Key) {
+        self.parked.lock().unwrap().insert(key.clone());
+    }
+
+    /// Take `key` off the parked set (it went on after all); whether it was
+    /// there.
+    pub fn unpark(&self, key: &Key) -> bool {
+        self.parked.lock().unwrap().remove(key)
+    }
+
+    /// Wake every parked workload still desired, and empty the set; how many.
+    pub fn wake_parked(&self) -> usize {
+        let keys: Vec<Key> = self.parked.lock().unwrap().drain().collect();
+        let desired = self.desired.lock().unwrap();
+        let mut woken = 0;
+        for key in keys.into_iter().filter(|k| desired.objects.contains_key(k)) {
+            self.ready.add(key);
+            woken += 1;
+        }
+        woken
     }
 
     pub fn replace(&self, kind: Kind, objects: &[Value]) -> anyhow::Result<()> {
@@ -567,6 +594,24 @@ mod tests {
         let work = e.ready.next().await;
         assert_eq!(work.key().uid, "b"); drop(work);
         assert!(tokio::time::timeout(Duration::from_millis(20),e.ready.next()).await.is_err());
+    }
+
+    /// #160: the workloads parked on closed admission are woken together when
+    /// it opens, once; a parked one no longer desired is not.
+    #[tokio::test]
+    async fn parked_keys_wake_once_when_admission_opens() {
+        let e = Executor::new();
+        e.replace(Kind::Pod, &[object("a","data"), object("b","other"), object("c","more")]).unwrap();
+        for _ in 0..3 { drop(e.ready.next().await); }
+        let (a, b) = (key(Kind::Pod, "a"), key(Kind::Pod, "b"));
+        e.park(&a); e.park(&b); e.park(&key(Kind::Pod, "gone"));
+        assert!(e.unpark(&b), "b went on after all");
+        assert!(!e.unpark(&b));
+        assert_eq!(e.wake_parked(), 1);
+        let work = e.ready.next().await;
+        assert_eq!(work.key().uid, "a"); drop(work);
+        assert!(tokio::time::timeout(Duration::from_millis(20),e.ready.next()).await.is_err());
+        assert_eq!(e.wake_parked(), 0, "woken once");
     }
 
     #[tokio::test]

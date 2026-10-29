@@ -931,6 +931,7 @@ impl Kubelet {
                                 Ok(()) => {
                                     if self.workloads.replace_source("api-vmis",Kind::VirtualMachine,&want).is_ok() {
                                         self.vmis_synced.store(true,Ordering::Release);
+                                        self.release_parked().await;
                                     }
                                 }
                                 Err(error) => { apimachinery::reactor::failed(); warn!(%error,"VM admission recovery pending"); }
@@ -947,6 +948,7 @@ impl Kubelet {
                                         // "no such machine", not "cold" (#119).
                                         vms.cache_specs(&[]).await;
                                         self.vmis_synced.store(true,Ordering::Release);
+                                        self.release_parked().await;
                                     }
                                 }
                             }
@@ -1129,8 +1131,11 @@ impl Kubelet {
         // Seen here, as the watch delivers it: not when a worker reaches it (#132).
         self.pod_manager.note_seen(&want).await;
         self.seed_claims(Kind::Pod,&want).await?;
-        self.workloads.replace_source("api-pods",Kind::Pod,&want)?;
+        // Known before the pods it wakes run (#160): stored after, the first
+        // of them met admission closed and waited out the retry.
         self.pods_synced.store(true,Ordering::Release);
+        self.workloads.replace_source("api-pods",Kind::Pod,&want)?;
+        self.release_parked().await;
         self.observe_volume_dependencies();
         // Dependency collection changes wake only affected claim users.
         self.refresh_claim_dependencies().await;
@@ -1816,12 +1821,15 @@ impl workload::Adapter for Kubelet {
         if object["spec"].is_null() {return Ok(Next::After(retry))}
         let static_without_claims=key.kind==Kind::Pod && key.uid.starts_with("static-")
             && !workload::dependencies(key,&object).iter().any(|d| matches!(d,Dependency::Claim(..)));
-        if !static_without_claims {
-            if !self.pods_synced.load(Ordering::Acquire) || !self.vmis_synced.load(Ordering::Acquire)
-                || self.pod_manager.has_unspecified().await
-                || match &self.vms {Some(v)=>v.has_unknown_claims().await,None=>false} {
+        if !static_without_claims && !self.admission_open().await {
+            // Parked, then looked again: an opening between the two finds it
+            // parked, and one before the park lets it through here (#160).
+            self.workloads.park(key);
+            if !self.admission_open().await {
+                debug!(workload = %key.name, "waiting for startup admission (the pod and VMI lists, adopted specs)");
                 return Ok(Next::After(retry));
             }
+            self.workloads.unpark(key);
         }
         let claims=self.claims_for(key,&object).await?;
         if !self.workloads.reservations.acquire(key,&claims) {
@@ -2039,6 +2047,27 @@ impl Kubelet {
                 })
                 .await;
             drop(work);
+        }
+    }
+
+    /// Startup admission (#100): the desired Pods and VMIs are both known,
+    /// every adopted pod has its spec and every VM its claims, so no start can
+    /// take what an adopted workload holds.
+    async fn admission_open(&self) -> bool {
+        self.pods_synced.load(Ordering::Acquire) && self.vmis_synced.load(Ordering::Acquire)
+            && !self.pod_manager.has_unspecified().await
+            && !match &self.vms { Some(v) => v.has_unknown_claims().await, None => false }
+    }
+
+    /// Wake the workloads parked on closed admission once it is open (#160),
+    /// called wherever it can open: a pod list, a VMI list. Without this each
+    /// waited out `sync_interval` (2 s) after every kubelet start.
+    async fn release_parked(&self) {
+        if self.admission_open().await {
+            let n = self.workloads.wake_parked();
+            if n > 0 {
+                info!(workloads = n, "startup admission open: waking the workloads that waited for it");
+            }
         }
     }
 
