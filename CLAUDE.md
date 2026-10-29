@@ -2263,7 +2263,12 @@ primitive for in-use local volumes (migrate → synced → cut over / abort): fi
 it. Kubelet side then: target waits all disks synced → receiving start on its copies → targetNodeAddress; source
 sends → completed/failed; cut over or abort each disk.
 
-### Waiting on stormblock-registry#95 / stormcentral#521: #91, a bridged VM's IP from its tap (stormvm_net::snoop_tap)
+### Done: #91, a bridged VM's IP from its tap (stormvm_net::snoop_tap)
+
+2026-10-28: closed on the live check. stormcos_qa vm-waves 572366a0a2 (pvetest2, 12.21-flowsdn, 2026-10-14): every
+bridged VM (`storm.io/bridge`, Fedora 44) reached Running with its g16 lease in `status.interfaces[].ipAddress`, and ssh
+took the run's key, in 12.3–13.4 s (wave-1 ×2, wave-2 ×3, every restart too). The run's 3 failures are the failed-start
+case: filed #298 (an SR-IOV NIC on a missing NAD reaches Running).
 
 stormvm 2be5900 (lock moves 1b0d941 → dc1b7ea, `cargo update -p stormvm-net` on dev with
 `CARGO_NET_GIT_FETCH_WITH_CLI=true`; the lock diff applied here). `snoop_tap(tap, mac, changed)` → `Snooper`

@@ -2,6 +2,10 @@
 
 ## 2026-10-28
 
+- **docs:** #91 closed on its live check: in stormcos_qa vm-waves 572366a0a2 (pvetest2, 12.21), each bridged VM
+  showed its lease in `status.interfaces[].ipAddress` and accepted ssh within 12–13 s. Filed #298 for the run's
+  failed-start failures.
+
 - **fix:** After every kubelet start, each API pod (coredns, the CNI agent's, every Deployment's) waited a fixed 2 s
   before its first start attempt (#160, stormcos#300): its first pass met startup admission closed (the pod/VMI
   lists, adopted pods' specs, VM claims) and was sent back for `sync_interval`, with nothing to wake it when admission
