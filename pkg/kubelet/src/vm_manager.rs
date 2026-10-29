@@ -1024,6 +1024,38 @@ pub struct VmManager {
     resuming: std::sync::Mutex<HashMap<String, Resume>>,
     /// VMIs whose resume was tried (#251): a second start of one is cold.
     resume_tried: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// stormstorage, the node's certificate and address, for migrations (#40).
+    migration: crate::vm_migration::Config,
+    /// A machine's migration verbs: its control socket, or a fake in tests.
+    migrator: MigrateMachine,
+    /// Machines receiving a migration here, by uid, until it completes (#40).
+    /// Not in `vms`: nothing may report one as this node's until it is.
+    incoming: Mutex<HashMap<String, Incoming>>,
+    /// Machines stopped at once, without asking the guest, by uid (#40): a
+    /// source whose guest now runs on the target, a receiver given up on.
+    forced: std::sync::Mutex<HashMap<String, Vm>>,
+    /// Migrations sent from here, by migration uid, so a status write that
+    /// failed does not send twice (#40).
+    sent: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Migrations whose disks are finished (cut over and completed, or
+    /// aborted), by migration uid (#40).
+    disks_done: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+/// A machine's migration verbs (#40).
+type MigrateMachine = Arc<dyn Fn(&Vm) -> Option<Arc<dyn crate::vm_migration::Migrator>> + Send + Sync>;
+
+/// A machine receiving a migration (#40).
+struct Incoming {
+    /// The migration's uid.
+    migration: String,
+    vm: Vm,
+    spec: VmSpec,
+    port: u16,
+    /// `targetNodeAddress` written.
+    reported: bool,
+    snoopers: Vec<(String, stormvm_net::Snooper)>,
+    registration: stormvm_node::console::Registration,
 }
 
 /// A start from a saved state (#251): the restore that made it, and the
@@ -1270,7 +1302,28 @@ impl VmManager {
             }),
             resuming: Default::default(),
             resume_tried: Default::default(),
+            migration: crate::vm_migration::Config::default(),
+            migrator: Arc::new(|vm: &Vm| {
+                machine_of(vm).map(|m| Arc::new(m) as Arc<dyn crate::vm_migration::Migrator>)
+            }),
+            incoming: Default::default(),
+            forced: Default::default(),
+            sent: Default::default(),
+            disks_done: Default::default(),
         }
+    }
+
+    /// stormstorage, the node's certificate and address, for live
+    /// migrations (#40).
+    pub fn with_migration(mut self, config: crate::vm_migration::Config) -> VmManager {
+        self.migration = config;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_migrator(mut self, migrator: MigrateMachine) -> VmManager {
+        self.migrator = migrator;
+        self
     }
 
     /// Publish each machine's hypervisor identity for cadvisor (#84).
@@ -1771,6 +1824,12 @@ impl VmManager {
             }
         }
         if object.map_or(true, terminating) {
+            // A receiver whose migration went away with it, and anything
+            // being stopped by force (#40).
+            if let Some(inc) = self.incoming.lock().await.remove(uid) {
+                self.force_stop(inc);
+            }
+            anyhow::ensure!(self.finish_forced(uid).await, "VM cleanup pending for {uid}");
             let vm = self.vms.lock().await.get(uid).cloned();
             if let Some(vm) = vm {
                 anyhow::ensure!(self.stop(&vm).await, "VM cleanup pending for {uid}");
@@ -1789,8 +1848,19 @@ impl VmManager {
             return Ok(true);
         }
         let object = object.unwrap();
+        // A machine leaving or arriving (#40): its migration's pass, before
+        // anything reports it as this node's.
+        if !self.finish_forced(uid).await {
+            self.due_in(uid, crate::vm_migration::POLL);
+        }
+        if self.migrate(uid, object).await {
+            return Ok(false);
+        }
         self.absorb_ends_for(Some(uid)).await;
-        if !self.vms.lock().await.contains_key(uid) {
+        if !self.vms.lock().await.contains_key(uid)
+            && !self.forced.lock().unwrap_or_else(|e| e.into_inner()).contains_key(uid)
+            && !crate::vm_migration::moved_away(object, &self.node_name)
+        {
             self.start_with_retry(uid, object).await;
         }
         let running = self.vms.lock().await.get(uid).is_some_and(|vm| !vm.phase.terminal());
@@ -1874,7 +1944,10 @@ impl VmManager {
             .retain(|u, _| want.iter().any(|(w, _)| w == u));
 
         for (uid, obj) in &want {
-            if self.vms.lock().await.contains_key(uid) {
+            if self.vms.lock().await.contains_key(uid)
+                || crate::vm_migration::arriving(obj, &self.node_name)
+                || crate::vm_migration::moved_away(obj, &self.node_name)
+            {
                 continue;
             }
             self.start_with_retry(uid, obj).await;
@@ -2650,6 +2723,16 @@ impl VmManager {
             let observed = tokio::task::spawn_blocking(move || r.query(handle)).await;
             let Ok(Ok(cqe)) = observed else { return false };
             if !exited(cqe.aux) {
+                // Its guest runs on another node now, or it never ran (a
+                // receiver given up on): nothing to ask, and a paused source
+                // must never resume (#40).
+                if self.forced.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&vm.uid) {
+                    let r = ring.clone();
+                    if let Ok(Err(e)) = tokio::task::spawn_blocking(move || r.stop(handle, 0)).await {
+                        warn!(vm = %vm.name, "the engine's stop was refused ({e:?}); retried");
+                    }
+                    return false;
+                }
                 if self.stopping.lock().await.insert(vm.uid.clone()) {
                     // The guest is asked first (#181): the engine's stop is a
                     // SIGTERM to the hypervisor, which to qemu is a power cut,
@@ -4981,6 +5064,597 @@ impl VmManager {
         }
     }
 
+    /// This node's part in `object`'s live migration (#40), if it has one.
+    /// `true`: the pass is done here (the machine is arriving or leaving);
+    /// `false`: the rest of the pass runs as for any machine.
+    async fn migrate(&self, uid: &str, object: &Value) -> bool {
+        use crate::vm_migration::Role;
+        match crate::vm_migration::role(object, &self.node_name) {
+            Some(Role::Target(s)) => self.migrate_in(uid, object, &s).await,
+            Some(Role::Source(s)) => self.migrate_out(uid, object, &s).await,
+            None => false,
+        }
+    }
+
+    /// Merge `fields` into the VMI's `status.migrationState`, if it still
+    /// records migration `migration`.
+    async fn write_migration(&self, object: &Value, migration: &str, fields: Value) -> bool {
+        let current = self.desired.lock().await.get(object["metadata"]["uid"].as_str().unwrap_or("")).cloned();
+        let o = current.as_ref().unwrap_or(object);
+        if o["status"]["migrationState"]["migrationUid"].as_str() != Some(migration) {
+            return false;
+        }
+        if self.api_url.is_empty() {
+            return true;
+        }
+        let ns = object["metadata"]["namespace"].as_str().unwrap_or("default");
+        let name = object["metadata"]["name"].as_str().unwrap_or("");
+        let url = format!("{}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{name}/status", self.api_url);
+        let body = json!({"metadata": {"uid": object["metadata"]["uid"]}, "status": {"migrationState": fields}});
+        match self
+            .api
+            .patch(&url)
+            .header("content-type", "application/merge-patch+json")
+            .json(&body)
+            .send_retrying(retry::Policy::API)
+            .await
+        {
+            Ok(r) if r.status().is_success() => true,
+            Ok(r) => {
+                warn!("{ns}/{name}: migration state not written: {}", r.status());
+                false
+            }
+            Err(e) => {
+                warn!("{ns}/{name}: migration state not written: {e}");
+                false
+            }
+        }
+    }
+
+    /// The migration failed, with why, said on the VMI and as an Event.
+    async fn fail_migration(&self, object: &Value, s: &crate::vm_migration::State, why: &str, aborted: bool) {
+        let ns = object["metadata"]["namespace"].as_str().unwrap_or("default");
+        let name = object["metadata"]["name"].as_str().unwrap_or("");
+        warn!("{ns}/{name}: migration {} failed: {why}", s.uid);
+        if self.write_migration(object, &s.uid, crate::vm_migration::failed(why, aborted)).await {
+            let reason = if aborted { "MigrationAborted" } else { "MigrationFailed" };
+            self.event(object, "Warning", reason, why).await;
+        }
+    }
+
+    /// A machine to stop at once, without asking its guest (#40).
+    fn force_stop(&self, inc: Incoming) {
+        let snoopers = inc.snoopers;
+        if !snoopers.is_empty() {
+            tokio::task::spawn_blocking(move || drop(snoopers));
+        }
+        self.forced.lock().unwrap_or_else(|e| e.into_inner()).insert(inc.vm.uid.clone(), inc.vm);
+    }
+
+    /// Carry on stopping a machine stopped by force. `true` once there is
+    /// none (any more).
+    async fn finish_forced(&self, uid: &str) -> bool {
+        let Some(vm) = self.forced.lock().unwrap_or_else(|e| e.into_inner()).get(uid).cloned() else { return true };
+        if !self.stop(&vm).await {
+            return false;
+        }
+        self.forced.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+        true
+    }
+
+    /// The source's part (#40): mirror the disks, send once the target is
+    /// ready, report how it ended; after a failure abort the mirrors, after
+    /// success let the paused machine go.
+    async fn migrate_out(&self, uid: &str, object: &Value, s: &crate::vm_migration::State) -> bool {
+        use crate::vm_migration::{self as mig, Stormstorage};
+        let poll = mig::POLL;
+        if s.moved() {
+            // The guest runs on the target: this copy is paused and must never
+            // run again. Stopped at once; nothing about it is reported.
+            let left = self.vms.lock().await.remove(uid);
+            if let Some(vm) = left {
+                info!(vm = %vm.name, "moved to {}: stopping the paused source machine",
+                      s.target.as_deref().unwrap_or("?"));
+                self.withdraw_identity(uid);
+                self.drop_snoopers(uid);
+                self.forced.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), vm);
+            }
+            if !self.finish_forced(uid).await {
+                self.due_in(uid, poll);
+            }
+            return true;
+        }
+        if s.failed {
+            self.abort_disks(uid, object, s).await;
+            return false;
+        }
+        let Some(vm) = self.vms.lock().await.get(uid).cloned().filter(|v| !v.phase.terminal()) else {
+            if !s.started {
+                self.fail_migration(object, s, "the machine is not running on its source node", false).await;
+            }
+            return false;
+        };
+        let started = s.started || self.sent.lock().unwrap_or_else(|e| e.into_inner()).contains(&s.uid);
+        if s.abort_requested && !started {
+            self.fail_migration(object, s, "aborted before anything was sent", true).await;
+            return false;
+        }
+        let Some(target) = s.target.clone() else {
+            // The scheduler has not chosen yet.
+            return false;
+        };
+        if let Some(why) = self.migration.missing() {
+            self.fail_migration(object, s, &format!("the source cannot migrate: {why}"), false).await;
+            return false;
+        }
+        let kind = stormvm_node::console::find(RUN_ROOT, &vm.namespace, &vm.name).map(|r| r.vmm).unwrap_or_default();
+        let disks: Vec<(String, Option<String>)> = vm.disks.iter().map(|d| (d.name.clone(), d.volume_id.clone())).collect();
+        let on_pod_network = self.pod_nets.lock().unwrap_or_else(|e| e.into_inner()).contains_key(uid);
+        if let Some(why) = mig::refusal(&kind, &disks, &vm.owned_volumes, on_pod_network) {
+            self.fail_migration(object, s, &why, false).await;
+            return false;
+        }
+        let ss = self.migration.stormstorage.as_ref().expect("checked by missing()");
+        // The disks first: a mirror per volume, recorded on the VMI for the
+        // target. All or none.
+        if mig::disks_of(object, &s.uid).is_none() {
+            let mut made = std::collections::BTreeMap::new();
+            let mut refused = None;
+            for (name, volume) in &disks {
+                let volume = volume.as_deref().unwrap_or_default();
+                match Stormstorage(ss).start(&self.node_name, volume, &target).await {
+                    Ok(m) => {
+                        made.insert(name.clone(), m.id);
+                    }
+                    Err(e) => {
+                        refused = Some(format!("disk {name}: {e}"));
+                        break;
+                    }
+                }
+            }
+            let recorded = refused.is_none() && self.annotate(object, mig::disks_patch(uid, &s.uid, &made)).await;
+            if !recorded {
+                for id in made.values() {
+                    if let Err(e) = Stormstorage(ss).step(id, "abort").await {
+                        warn!(vm = %vm.name, "migration {id}: abort refused, stormstorage's reconciler finishes it: {e}");
+                    }
+                }
+                let why = refused.unwrap_or_else(|| "the disks' migrations could not be recorded on the VMI".into());
+                self.fail_migration(object, s, &why, false).await;
+                return false;
+            }
+            self.event(object, "Normal", "Migrating", &format!("mirroring {} disk(s) to {target}", made.len())).await;
+            self.due_in(uid, poll);
+            return true;
+        }
+        let Some(machine) = (self.migrator)(&vm) else {
+            self.due_in(uid, poll);
+            return true;
+        };
+        if started {
+            if s.abort_requested {
+                match machine.cancel().await {
+                    Ok(()) => self.fail_migration(object, s, "aborted while sending", true).await,
+                    Err(e) => {
+                        warn!(vm = %vm.name, "migration abort not delivered: {e}");
+                        self.due_in(uid, poll);
+                    }
+                }
+                return true;
+            }
+            match machine.progress().await.as_deref() {
+                Ok("completed") => {
+                    if self.write_migration(object, &s.uid, mig::completed()).await {
+                        self.event(object, "Normal", "Migrated", &format!("moved to {target}")).await;
+                    }
+                    self.due_in(uid, poll);
+                }
+                Ok(state @ ("failed" | "cancelled")) => {
+                    self.fail_migration(object, s, &format!("the transfer {state}"), false).await;
+                }
+                Ok(_) => self.due_in(uid, poll),
+                Err(e) => {
+                    warn!(vm = %vm.name, "migration progress unknown: {e}");
+                    self.due_in(uid, poll);
+                }
+            }
+            return true;
+        }
+        let (Some(address), Some(port)) = (s.target_address.clone(), s.target_port) else {
+            // The target is still waiting for its disks to catch up.
+            self.due_in(uid, poll);
+            return true;
+        };
+        let files = self.migration.tls.clone().expect("checked by missing()");
+        let mut tls = match mig::lay_out_tls(&mig::tls_dir_of(&self.hot_dir, &vm.namespace, &vm.name), &files) {
+            Ok(t) => t,
+            Err(e) => {
+                self.fail_migration(object, s, &format!("the node's certificate could not be laid out: {e}"), false).await;
+                return false;
+            }
+        };
+        tls.hostname = Some(target.clone());
+        match machine.send(&mig::send_uri(&address, port), &tls).await {
+            Ok(()) => {
+                self.sent.lock().unwrap_or_else(|e| e.into_inner()).insert(s.uid.clone());
+                info!(vm = %vm.name, "sending to {target} ({address}:{port})");
+                self.write_migration(object, &s.uid, mig::sending()).await;
+                self.due_in(uid, poll);
+                true
+            }
+            Err(e) => {
+                self.fail_migration(object, s, &format!("the transfer would not start: {e}"), false).await;
+                false
+            }
+        }
+    }
+
+    /// Merge a metadata patch into the VMI.
+    async fn annotate(&self, object: &Value, patch: Value) -> bool {
+        if self.api_url.is_empty() {
+            return true;
+        }
+        let ns = object["metadata"]["namespace"].as_str().unwrap_or("default");
+        let name = object["metadata"]["name"].as_str().unwrap_or("");
+        let url = format!("{}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{name}", self.api_url);
+        matches!(
+            self.api.patch(&url).header("content-type", "application/merge-patch+json").json(&patch)
+                .send_retrying(retry::Policy::API).await,
+            Ok(r) if r.status().is_success()
+        )
+    }
+
+    /// A failed migration's mirrors aborted: T's copies deleted, S's
+    /// volumes as they were. Retried until stormstorage takes each.
+    async fn abort_disks(&self, uid: &str, object: &Value, s: &crate::vm_migration::State) {
+        use crate::vm_migration::{self as mig, Stormstorage};
+        if self.disks_done.lock().unwrap_or_else(|e| e.into_inner()).contains(&s.uid) {
+            return;
+        }
+        let (Some(disks), Some(ss)) = (mig::disks_of(object, &s.uid), self.migration.stormstorage.as_ref()) else {
+            self.disks_done.lock().unwrap_or_else(|e| e.into_inner()).insert(s.uid.clone());
+            return;
+        };
+        let mut all = true;
+        for (disk, id) in &disks {
+            match Stormstorage(ss).get(id).await {
+                Ok(m) if matches!(m.state.as_str(), "aborted" | "completed") => {}
+                Ok(_) => {
+                    if let Err(e) = Stormstorage(ss).step(id, "abort").await {
+                        // T's copy is still attached to the receiver: once it
+                        // has gone, the abort goes through.
+                        info!("migration {}: disk {disk}'s abort refused, retried: {e}", s.uid);
+                        all = false;
+                    }
+                }
+                Err(e) if e.contains("404") => {}
+                Err(e) => {
+                    warn!("migration {}: disk {disk}: {e}", s.uid);
+                    all = false;
+                }
+            }
+        }
+        if all {
+            self.disks_done.lock().unwrap_or_else(|e| e.into_inner()).insert(s.uid.clone());
+        } else {
+            self.due_in(uid, mig::POLL);
+        }
+    }
+
+    /// The target's part (#40): wait for every disk to be in sync, start a
+    /// receiving machine on the copies, say where to send; once the guest
+    /// runs here, adopt it and finish the disks.
+    async fn migrate_in(&self, uid: &str, object: &Value, s: &crate::vm_migration::State) -> bool {
+        use crate::vm_migration::{self as mig, Stormstorage};
+        let poll = mig::POLL;
+        if s.moved() {
+            let inc = self.incoming.lock().await.remove(uid);
+            if let Some(inc) = inc {
+                self.arrive(uid, object, s, inc).await;
+            }
+            if self.vms.lock().await.contains_key(uid) {
+                self.finish_disks(uid, object, s).await;
+            }
+            return false;
+        }
+        let found = self.vms.lock().await.remove(uid);
+        if let Some(vm) = found {
+            // A receiver a restarted kubelet found: what it was told is gone.
+            warn!(vm = %vm.name, "a receiving machine from before this kubelet started; giving up the migration");
+            self.forced.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), vm);
+            self.fail_migration(object, s, "the target's kubelet restarted while receiving", false).await;
+            return true;
+        }
+        if s.abort_requested && !s.started {
+            if let Some(inc) = self.incoming.lock().await.remove(uid) {
+                self.force_stop(inc);
+            }
+            return true;
+        }
+        {
+            let mut incoming = self.incoming.lock().await;
+            if let Some(inc) = incoming.get_mut(uid) {
+                if !inc.reported {
+                    inc.reported = self
+                        .write_migration(object, &s.uid, mig::target_ready(&self.migration.node_ip, inc.port))
+                        .await;
+                }
+                self.due_in(uid, poll);
+                return true;
+            }
+        }
+        if let Some(why) = self.migration.missing() {
+            self.fail_migration(object, s, &format!("the target cannot receive: {why}"), false).await;
+            return true;
+        }
+        let Some(disks) = mig::disks_of(object, &s.uid) else {
+            // The source has not started the mirrors yet.
+            self.due_in(uid, poll);
+            return true;
+        };
+        let ss = self.migration.stormstorage.as_ref().expect("checked by missing()");
+        let mut copies = std::collections::BTreeMap::new();
+        for (disk, id) in &disks {
+            match Stormstorage(ss).get(id).await {
+                Ok(m) if m.state == "synced" && m.target_id.is_some() => {
+                    copies.insert(disk.clone(), m.target_id.unwrap_or_default());
+                }
+                Ok(m) if matches!(m.state.as_str(), "failed" | "aborted") => {
+                    let why = format!("disk {disk}'s copy {}: {}", m.state, m.message);
+                    self.fail_migration(object, s, &why, false).await;
+                    return true;
+                }
+                Ok(_) => {}
+                Err(e) => warn!("migration {}: disk {disk}: {e}", s.uid),
+            }
+        }
+        if copies.len() < disks.len() {
+            self.due_in(uid, poll);
+            return true;
+        }
+        match self.receive(uid, object, s, &copies).await {
+            Ok(mut inc) => {
+                inc.reported = self
+                    .write_migration(object, &s.uid, mig::target_ready(&self.migration.node_ip, inc.port))
+                    .await;
+                self.event(object, "Normal", "MigrationTargetReady",
+                           &format!("receiving on {}:{}", self.migration.node_ip, inc.port)).await;
+                self.incoming.lock().await.insert(uid.to_string(), inc);
+            }
+            Err(e) => self.fail_migration(object, s, &format!("the target could not receive: {e}"), false).await,
+        }
+        self.due_in(uid, poll);
+        true
+    }
+
+    /// Attach the copies, start the machine waiting for its memory
+    /// (`-incoming defer`) and arm its TLS listener.
+    async fn receive(
+        &self,
+        uid: &str,
+        object: &Value,
+        s: &crate::vm_migration::State,
+        copies: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Incoming, String> {
+        use crate::vm_migration as mig;
+        let vm: VmSpec = stormvm_spec::kube::from_kube(object).map_err(|e| e.to_string())?;
+        let ns = object["metadata"]["namespace"].as_str().unwrap_or("default").to_string();
+        let ring = self.ring.clone().ok_or("no ring to stormpump: only the engine starts a machine")?;
+        let _lifecycle = self.disk_lifecycle.read().await;
+        let mut disks: Vec<ResolvedDisk> = Vec::new();
+        for d in &vm.disks {
+            let Some(id) = copies.get(&d.name) else {
+                self.give_back(uid, &disks).await;
+                return Err(format!("disk {} has no copy on this node", d.name));
+            };
+            let attached = self
+                .post(&format!("{}/api/v1/volumes/{id}/attach", self.storage), &json!({ "transport": "ublk" }))
+                .await
+                .and_then(|v| v["device_hint"].as_str().map(str::to_string).ok_or(format!("no local device: {v}")));
+            match attached {
+                Ok(device) => disks.push(ResolvedDisk {
+                    name: d.name.clone(),
+                    device,
+                    volume_id: Some(id.clone()),
+                    readonly: d.readonly,
+                    bus: d.bus,
+                }),
+                Err(e) => {
+                    self.give_back(uid, &disks).await;
+                    return Err(format!("attaching disk {}'s copy {id}: {e}", d.name));
+                }
+            }
+        }
+        let dir = format!("{LOG_ROOT}/{ns}_{}_{uid}/{}", vm.name, vm.name);
+        let tls = std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("could not make {dir}: {e}"))
+            .and_then(|()| {
+                let files = self.migration.tls.as_ref().ok_or("no migration certificate")?;
+                mig::lay_out_tls(&mig::tls_dir_of(&self.hot_dir, &ns, &vm.name), files).map_err(|e| format!("the node's certificate: {e}"))
+            });
+        let tls = match tls {
+            Ok(t) => t,
+            Err(e) => {
+                self.give_back(uid, &disks).await;
+                return Err(e);
+            }
+        };
+        let port = {
+            let used: Vec<u16> = self.incoming.lock().await.values().map(|i| i.port).collect();
+            let first = self.migration.port();
+            (first..first.saturating_add(mig::PORTS)).find(|p| !used.contains(p)).unwrap_or(first)
+        };
+        let launched = {
+            let _window = self.deposit_window.lock().await;
+            let launched =
+                self.launch(uid, &ns, &vm, ring, &disks, &dir, None, Some(stormvm_control::migration::INCOMING_DEFER)).await;
+            if launched.is_err() {
+                if let Err(e) = self.unwind_held(uid, false).await {
+                    warn!(vm = %vm.name, "a failed receiver's taps are still held, retried before the next: {e}");
+                }
+            }
+            launched
+        };
+        let (handle, made, registration) = match launched {
+            Ok(l) => l,
+            Err(e) => {
+                self.give_back(uid, &disks).await;
+                return Err(e);
+            }
+        };
+        let owned: Vec<String> = disks.iter().filter_map(|d| d.volume_id.clone()).collect();
+        // Its handle on record at once: a restarted kubelet finds it by this.
+        let mut reg = registration.clone().running_as(handle.0);
+        reg.disks = registered_disks(&disks, &owned);
+        if let Err(e) = stormvm_node::console::write(RUN_ROOT, &reg) {
+            warn!(vm = %vm.name, "could not record the receiving machine's handle: {e}");
+        }
+        let NicsMade { reports, snoopers, .. } = made;
+        let rec = Vm {
+            namespace: ns,
+            name: vm.name.clone(),
+            uid: uid.to_string(),
+            log_dir: dir,
+            handle,
+            disks,
+            phase: Phase::Running,
+            exit_code: 0,
+            started_unix: now_unix(),
+            ready_unix: None,
+            owned_volumes: owned,
+            nics: reports,
+            message: String::new(),
+            access: Access::default(),
+            hot: crate::vm_hotplug::Size::default(),
+        };
+        let inc = Incoming {
+            migration: s.uid.clone(),
+            vm: rec,
+            spec: vm,
+            port,
+            reported: false,
+            snoopers: snoopers.take(),
+            registration: reg,
+        };
+        // The control socket comes up a moment after the spawn.
+        let armed = match (self.migrator)(&inc.vm) {
+            Some(m) => {
+                let mut last = String::from("no answer");
+                let mut ok = false;
+                for _ in 0..50 {
+                    match m.receive(&mig::listen_uri(port), &tls).await {
+                        Ok(()) => {
+                            ok = true;
+                            break;
+                        }
+                        Err(e) => last = e,
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                ok.then_some(()).ok_or(last)
+            }
+            None => Err("the receiving machine has no control socket".to_string()),
+        };
+        match armed {
+            Ok(()) => {
+                info!(vm = %inc.vm.name, "receiving migration {} on port {port}", inc.migration);
+                Ok(inc)
+            }
+            Err(e) => {
+                self.force_stop(inc);
+                Err(format!("the listener would not arm: {e}"))
+            }
+        }
+    }
+
+    /// The memory arrived: the guest runs here now, and the machine is this
+    /// node's like any other.
+    async fn arrive(&self, uid: &str, object: &Value, s: &crate::vm_migration::State, inc: Incoming) {
+        let Incoming { vm: mut rec, spec, snoopers, registration, .. } = inc;
+        // qemu runs the guest when the stream ends; one left paused is run.
+        if let Some(m) = (self.migrator)(&rec) {
+            if let Ok("paused") = m.state().await.as_deref() {
+                if let Err(e) = m.unpause().await {
+                    warn!(vm = %rec.name, "arrived paused and would not run: {e}");
+                }
+            }
+        }
+        // Its disks are its own here as they were there (#75).
+        let owner = self.owner_of(object).await;
+        for id in &rec.owned_volumes {
+            self.set_volume_owner(id, &owner).await;
+        }
+        if let Err(e) = stormvm_node::console::write(RUN_ROOT, &registration) {
+            warn!(vm = %rec.name, "could not record the arrived machine: {e}");
+        }
+        self.publish_identity(uid, &rec.namespace, &spec, rec.handle, false).await;
+        let given = crate::vm_hotplug::Record::from_spec(&spec, nic_records(&rec.namespace, &spec, &rec.nics));
+        rec.hot.topology = Some(crate::vm_hotplug::topology(&spec, given.vcpus));
+        rec.hot.memory = given.memory.map(|m| crate::vm_hotplug::MemoryNow { boot: m, current: m, requested: m });
+        if let Err(e) = crate::vm_hotplug::save(&self.hot_dir, &rec.namespace, &rec.name, &given) {
+            warn!(vm = %rec.name, "could not record what the machine was given: {e}");
+        }
+        self.hot_records.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), given);
+        let generation = object["metadata"]["generation"].as_i64().unwrap_or(0);
+        self.hot_seen.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), generation);
+        rec.started_unix = now_unix();
+        self.vms.lock().await.insert(uid.to_string(), rec.clone());
+        if !snoopers.is_empty() {
+            self.snoopers.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), snoopers);
+        }
+        info!(vm = %rec.name, "arrived from {} (migration {})", s.source, s.uid);
+        self.patch_status(&rec).await;
+        self.event(object, "Normal", "Migrated", &format!("arrived from {}", s.source)).await;
+    }
+
+    /// Each disk cut over to the copy here and completed (the source's
+    /// volume retired). Never aborted: the guest runs on the copies now.
+    async fn finish_disks(&self, uid: &str, object: &Value, s: &crate::vm_migration::State) {
+        use crate::vm_migration::{self as mig, Stormstorage};
+        if self.disks_done.lock().unwrap_or_else(|e| e.into_inner()).contains(&s.uid) {
+            return;
+        }
+        let (Some(disks), Some(ss)) = (mig::disks_of(object, &s.uid), self.migration.stormstorage.as_ref()) else {
+            self.disks_done.lock().unwrap_or_else(|e| e.into_inner()).insert(s.uid.clone());
+            return;
+        };
+        let mut all = true;
+        for (disk, id) in &disks {
+            let step = match Stormstorage(ss).get(id).await {
+                Ok(m) => match m.state.as_str() {
+                    "completed" | "aborted" => continue,
+                    "synced" => "cutover",
+                    // S's volume is retired once its machine has let it go.
+                    "cut_over" => "complete",
+                    // A cut-over refused (S's mirror would not say flushed):
+                    // mirrored again, then cut over again.
+                    "failed" => "retry",
+                    _ => {
+                        all = false;
+                        continue;
+                    }
+                },
+                Err(e) if e.contains("404") => continue,
+                Err(e) => {
+                    warn!("migration {}: disk {disk}: {e}", s.uid);
+                    all = false;
+                    continue;
+                }
+            };
+            all = false;
+            match Stormstorage(ss).step(id, step).await {
+                Ok(m) => info!("migration {}: disk {disk}: {step} → {}", s.uid, m.state),
+                Err(e) => info!("migration {}: disk {disk}: {step} refused, retried: {e}", s.uid),
+            }
+        }
+        if all {
+            self.disks_done.lock().unwrap_or_else(|e| e.into_inner()).insert(s.uid.clone());
+            self.event(object, "Normal", "MigrationDisksMoved", &format!("{} disk(s) now on {}", disks.len(), self.node_name)).await;
+        } else {
+            self.due_in(uid, mig::POLL);
+        }
+    }
+
     async fn post(&self, url: &str, body: &Value) -> Result<Value, String> {
         let resp = self.engine.post(url, body).await.map_err(|e| e.to_string())?;
         let status = resp.status();
@@ -5076,7 +5750,7 @@ pub async fn watch_for_node<F>(
                 }
             }
             let all: Vec<Value> =
-                all.into_values().filter(|o| assigned_to(o, &mine)).cloned().collect();
+                all.into_values().filter(|o| ours(o, &mine)).cloned().collect();
             on_set(all);
         };
         watch_selector(api.clone(), api_url.clone(), node.clone(), field, publish)
@@ -5124,7 +5798,7 @@ async fn watch_selector<F>(
             // apiserver that does not implement the selector answers with
             // everything, and running the cluster's machines on one node is
             // worse than a slow list.
-            if !assigned_to(o, &node) {
+            if !ours(o, &node) {
                 continue;
             }
             if let Some(uid) = o["metadata"]["uid"].as_str() {
@@ -5176,7 +5850,7 @@ async fn watch_selector<F>(
                     let Some(uid) = obj["metadata"]["uid"].as_str() else { continue };
                     match kind {
                         "ADDED" | "MODIFIED" => {
-                            if assigned_to(obj, &node) {
+                            if ours(obj, &node) {
                                 have.insert(uid.to_string(), obj.clone());
                             } else {
                                 // Reassigned away from here — which is a
@@ -5248,8 +5922,16 @@ pub async fn list_for_node(api: &reqwest::Client, api_url: &str, node: &str) -> 
 
 /// The fields a VMI is placed on a node by, in rustkube's scheduler's order
 /// (`pkg/scheduler/src/virtualmachine.rs`): `status.nodeName`, which it
-/// writes, then `spec.nodeName`, which a person sets and it then leaves alone.
-pub const PLACEMENTS: [&str; 2] = ["status.nodeName", "spec.nodeName"];
+/// writes, then `spec.nodeName`, which a person sets and it then leaves alone;
+/// and the target of a live migration (#40), which this node receives before
+/// it is placed here.
+pub const PLACEMENTS: [&str; 3] = ["status.nodeName", "spec.nodeName", "status.migrationState.targetNode"];
+
+/// Whether a VMI is this node's business: placed here ([`assigned_to`]), or
+/// arriving by a live migration (#40).
+pub fn ours(obj: &Value, node: &str) -> bool {
+    assigned_to(obj, node) || crate::vm_migration::arriving(obj, node)
+}
 
 /// This node's VMI list URLs, one per [`PLACEMENTS`] field (#85). Listing
 /// by `status.nodeName` alone never saw a VMI placed by hand.
@@ -5282,7 +5964,7 @@ pub fn placed_on(lists: &[Value], node: &str) -> Vec<Value> {
     lists
         .iter()
         .flat_map(|l| l["items"].as_array().into_iter().flatten())
-        .filter(|o| assigned_to(o, node))
+        .filter(|o| ours(o, node))
         .filter(|o| seen.insert(o["metadata"]["uid"].as_str().unwrap_or("").to_string()))
         .cloned()
         .collect()
@@ -6224,6 +6906,316 @@ mod tests {
         }
     }
 
+    /// What a migration test's fake apiserver and stormstorage saw (#40).
+    #[derive(Default)]
+    struct MigSeen {
+        /// (path, body) of every PATCH.
+        patches: Vec<(String, Value)>,
+        /// stormstorage: id → state.
+        disks: HashMap<String, String>,
+        /// stormstorage: what was asked, `start <node>/<volume>→<to>` or `<step> <id>`.
+        asked: Vec<String>,
+    }
+
+    async fn mig_api(seen: Arc<std::sync::Mutex<MigSeen>>) -> String {
+        use axum::extract::{Path, State};
+        type S = Arc<std::sync::Mutex<MigSeen>>;
+        let app = axum::Router::new()
+            .route(
+                "/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{name}/status",
+                axum::routing::patch(|State(s): State<S>, Path((_, n)): Path<(String, String)>, axum::Json(b): axum::Json<Value>| async move {
+                    s.lock().unwrap().patches.push((format!("{n}/status"), b));
+                    axum::Json(json!({}))
+                }),
+            )
+            .route(
+                "/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{name}",
+                axum::routing::patch(|State(s): State<S>, Path((_, n)): Path<(String, String)>, axum::Json(b): axum::Json<Value>| async move {
+                    s.lock().unwrap().patches.push((n, b));
+                    axum::Json(json!({}))
+                }),
+            )
+            .route("/api/v1/namespaces/{ns}/events", axum::routing::post(|| async { axum::Json(json!({})) }))
+            .route(
+                "/api/v1/nodes/{node}/volumes/{vol}/migrate",
+                axum::routing::post(|State(s): State<S>, Path((node, vol)): Path<(String, String)>, axum::Json(b): axum::Json<Value>| async move {
+                    let mut s = s.lock().unwrap();
+                    let id = format!("vm-{vol}");
+                    s.asked.push(format!("start {node}/{vol}→{}", b["to"].as_str().unwrap_or("")));
+                    s.disks.insert(id.clone(), "copying".into());
+                    axum::Json(json!({"id": id, "state": "starting"}))
+                }),
+            )
+            .route(
+                "/api/v1/migrations/{id}",
+                axum::routing::get(|State(s): State<S>, Path(id): Path<String>| async move {
+                    use axum::response::IntoResponse as _;
+                    match s.lock().unwrap().disks.get(&id) {
+                        Some(st) => axum::Json(json!({"id": id, "state": st, "target": {"id": format!("t-{id}")}})).into_response(),
+                        None => axum::http::StatusCode::NOT_FOUND.into_response(),
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/migrations/{id}/{step}",
+                axum::routing::post(|State(s): State<S>, Path((id, step)): Path<(String, String)>| async move {
+                    let mut s = s.lock().unwrap();
+                    s.asked.push(format!("{step} {id}"));
+                    let next = match step.as_str() { "cutover" => "cut_over", "complete" => "completed", "abort" => "aborted", _ => "copying" };
+                    s.disks.insert(id.clone(), next.into());
+                    axum::Json(json!({"id": id, "state": next}))
+                }),
+            )
+            .with_state(seen);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+
+    /// A machine's migration verbs, recorded.
+    #[derive(Default)]
+    struct FakeMig {
+        calls: std::sync::Mutex<Vec<String>>,
+        progress: std::sync::Mutex<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::vm_migration::Migrator for FakeMig {
+        async fn send(&self, to: &str, tls: &stormvm_control::migration::Tls) -> Result<(), String> {
+            self.calls.lock().unwrap().push(format!("send {to} {}", tls.hostname.as_deref().unwrap_or("")));
+            *self.progress.lock().unwrap() = "active".into();
+            Ok(())
+        }
+        async fn receive(&self, listen: &str, _: &stormvm_control::migration::Tls) -> Result<(), String> {
+            self.calls.lock().unwrap().push(format!("receive {listen}"));
+            Ok(())
+        }
+        async fn progress(&self) -> Result<String, String> {
+            Ok(self.progress.lock().unwrap().clone())
+        }
+        async fn cancel(&self) -> Result<(), String> {
+            self.calls.lock().unwrap().push("cancel".into());
+            Ok(())
+        }
+        async fn state(&self) -> Result<String, String> {
+            Ok("running".into())
+        }
+        async fn unpause(&self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct MigNode {
+        m: VmManager,
+        seen: Arc<std::sync::Mutex<MigSeen>>,
+        fake: Arc<FakeMig>,
+        dir: std::path::PathBuf,
+    }
+
+    async fn mig_node(node: &str) -> MigNode {
+        let seen = Arc::new(std::sync::Mutex::new(MigSeen::default()));
+        let url = mig_api(seen.clone()).await;
+        let dir = std::env::temp_dir().join(format!("rkn-mig-{node}-{}-{}", std::process::id(), now_unix_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |n: &str| {
+            let p = dir.join(n);
+            std::fs::write(&p, n).unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        let config = crate::vm_migration::Config {
+            stormstorage: Some(crate::engine::EngineClient::new(&url, crate::engine::TokenSource::none())),
+            tls: Some(crate::vm_migration::TlsFiles { ca: file("ca.crt"), cert: file("node.crt"), key: file("node.key") }),
+            port: 0,
+            node_ip: format!("10.0.0.{}", if node == "a" { 1 } else { 2 }),
+        };
+        let fake = Arc::new(FakeMig::default());
+        let f = fake.clone();
+        let m = VmManager::new(None, node, reqwest::Client::new(), &url)
+            .with_storage(crate::engine::EngineClient::new(&url, crate::engine::TokenSource::none()))
+            .with_hotplug(&dir, Arc::new(|_: &Vm| None))
+            .with_migration(config)
+            .with_migrator(Arc::new(move |_: &Vm| Some(f.clone() as Arc<dyn crate::vm_migration::Migrator>)));
+        MigNode { m, seen, fake, dir }
+    }
+
+    fn now_unix_nanos() -> u128 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    }
+
+    fn migrating(state: Value) -> Value {
+        json!({
+            "metadata": {"namespace": "default", "name": "vm-u1", "uid": "u1", "generation": 1},
+            "spec": {"domain": {"devices": {"disks": [{"name": "root", "disk": {}}]}},
+                     "volumes": [{"name": "root", "containerDisk": {"image": "fedora"}}]},
+            "status": {"phase": "Running", "nodeName": "a", "migrationState": state},
+        })
+    }
+
+    fn source_vm(volume: &str, owned: bool) -> Vm {
+        let mut vm = vm_at("u1", &[], Phase::Running);
+        vm.disks = vec![ResolvedDisk {
+            name: "root".into(),
+            device: "/dev/ublkb0".into(),
+            volume_id: Some(volume.into()),
+            readonly: false,
+            bus: Default::default(),
+        }];
+        if owned {
+            vm.owned_volumes = vec![volume.into()];
+        }
+        vm
+    }
+
+    fn state_writes(seen: &Arc<std::sync::Mutex<MigSeen>>) -> Vec<Value> {
+        seen.lock().unwrap().patches.iter().filter(|(p, _)| p.ends_with("/status"))
+            .map(|(_, b)| b["status"]["migrationState"].clone()).collect()
+    }
+
+    /// #40, the source: each disk mirrored to the target and recorded; sent
+    /// over TLS (checked against the target's name) once the target says
+    /// where; `startTimestamp`, then `completed`; then the paused machine is
+    /// let go at once and never started here again.
+    #[tokio::test]
+    async fn the_source_mirrors_sends_reports_and_lets_the_machine_go() {
+        let n = mig_node("a").await;
+        n.m.vms.lock().await.insert("u1".into(), source_vm("v-root", true));
+        let mut obj = migrating(json!({"migrationUid": "m1", "sourceNode": "a", "targetNode": "b"}));
+
+        n.m.reconcile_one("u1", Some(&obj)).await.unwrap();
+        let record = {
+            let s = n.seen.lock().unwrap();
+            assert_eq!(s.asked, ["start a/v-root→b"]);
+            let (path, patch) = s.patches.iter().find(|(p, _)| p == "vm-u1").expect("the disks recorded on the VMI");
+            assert_eq!(path, "vm-u1");
+            patch["metadata"]["annotations"].clone()
+        };
+        obj["metadata"]["annotations"] = record;
+        assert_eq!(
+            crate::vm_migration::disks_of(&obj, "m1").unwrap(),
+            std::collections::BTreeMap::from([("root".to_string(), "vm-v-root".to_string())])
+        );
+
+        // The target not ready yet: nothing is sent.
+        n.m.reconcile_one("u1", Some(&obj)).await.unwrap();
+        assert!(n.fake.calls.lock().unwrap().is_empty());
+
+        obj["status"]["migrationState"]["targetNodeAddress"] = json!("10.0.0.2");
+        obj["status"]["migrationState"]["targetDirectMigrationNodePorts"] = json!({"49152": 0});
+        n.m.reconcile_one("u1", Some(&obj)).await.unwrap();
+        assert_eq!(*n.fake.calls.lock().unwrap(), ["send tcp:10.0.0.2:49152 b"]);
+        assert!(state_writes(&n.seen).iter().any(|w| w["startTimestamp"].is_string()));
+        assert!(n.dir.join("default/vm-u1/migration-tls/client-cert.pem").exists());
+
+        // Sent once, even though the status still says nothing was.
+        n.m.reconcile_one("u1", Some(&obj)).await.unwrap();
+        assert_eq!(n.fake.calls.lock().unwrap().len(), 1);
+
+        *n.fake.progress.lock().unwrap() = "completed".into();
+        n.m.reconcile_one("u1", Some(&obj)).await.unwrap();
+        assert!(state_writes(&n.seen).iter().any(|w| w["completed"] == json!(true) && w["endTimestamp"].is_string()));
+
+        obj["status"]["migrationState"]["completed"] = json!(true);
+        n.m.reconcile_one("u1", Some(&obj)).await.unwrap();
+        assert!(!n.m.vms.lock().await.contains_key("u1"), "no longer this node's machine");
+        assert!(n.m.forced.lock().unwrap().contains_key("u1"), "stopped at once, not asked");
+        assert!(!state_writes(&n.seen).iter().any(|w| w["failed"] == json!(true)));
+        let _ = std::fs::remove_dir_all(&n.dir);
+    }
+
+    /// #40: what cannot move yet fails the migration naming why; an abort
+    /// before anything was sent is a failure the abort asked for; one while
+    /// sending cancels the transfer; a failed migration's mirrors are aborted.
+    #[tokio::test]
+    async fn a_source_refuses_aborts_and_cleans_up_after_a_failure() {
+        let n = mig_node("a").await;
+        n.m.vms.lock().await.insert("u1".into(), source_vm("pvc-claim", false));
+        let obj = migrating(json!({"migrationUid": "m1", "sourceNode": "a", "targetNode": "b"}));
+        n.m.reconcile_one("u1", Some(&obj)).await.unwrap();
+        let w = state_writes(&n.seen);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0]["failed"], json!(true));
+        assert!(w[0]["failureReason"].as_str().unwrap().contains("disk root"), "{w:?}");
+        assert!(n.seen.lock().unwrap().asked.is_empty(), "no mirror for a disk that does not move");
+
+        let n = mig_node("a").await;
+        n.m.vms.lock().await.insert("u1".into(), source_vm("v-root", true));
+        let aborting = migrating(json!({"migrationUid": "m1", "sourceNode": "a", "abortRequested": true}));
+        n.m.reconcile_one("u1", Some(&aborting)).await.unwrap();
+        assert_eq!(state_writes(&n.seen)[0]["abortStatus"], json!("Succeeded"));
+
+        let n = mig_node("a").await;
+        n.m.vms.lock().await.insert("u1".into(), source_vm("v-root", true));
+        let mut obj = migrating(json!({"migrationUid": "m1", "sourceNode": "a", "targetNode": "b",
+            "startTimestamp": "2026-10-29T12:00:00Z", "abortRequested": true}));
+        obj["metadata"]["annotations"] = crate::vm_migration::disks_patch(
+            "u1", "m1", &std::collections::BTreeMap::from([("root".to_string(), "vm-v-root".to_string())]),
+        )["metadata"]["annotations"].clone();
+        n.m.reconcile_one("u1", Some(&obj)).await.unwrap();
+        assert_eq!(*n.fake.calls.lock().unwrap(), ["cancel"]);
+        assert_eq!(state_writes(&n.seen)[0]["abortStatus"], json!("Succeeded"));
+
+        n.seen.lock().unwrap().disks.insert("vm-v-root".into(), "synced".into());
+        obj["status"]["migrationState"]["failed"] = json!(true);
+        n.m.reconcile_one("u1", Some(&obj)).await.unwrap();
+        n.m.reconcile_one("u1", Some(&obj)).await.unwrap();
+        assert_eq!(n.seen.lock().unwrap().asked, ["abort vm-v-root"], "aborted once");
+        assert!(n.m.vms.lock().await.contains_key("u1"), "the guest stays where it was");
+    }
+
+    /// #40, the target: listed while a migration brings the VMI here, never
+    /// started cold; it waits for every disk to be in sync, and a copy that
+    /// failed fails the migration.
+    #[tokio::test]
+    async fn the_target_waits_for_its_disks_and_never_starts_the_vmi_cold() {
+        let n = mig_node("b").await;
+        let mut obj = migrating(json!({"migrationUid": "m1", "sourceNode": "a", "targetNode": "b"}));
+        assert!(ours(&obj, "b") && !assigned_to(&obj, "b"));
+        n.m.reconcile_one("u1", Some(&obj)).await.unwrap();
+        assert!(n.m.retries.lock().unwrap().is_empty() && n.m.vms.lock().await.is_empty(), "not started cold");
+
+        obj["metadata"]["annotations"] = crate::vm_migration::disks_patch(
+            "u1", "m1", &std::collections::BTreeMap::from([("root".to_string(), "vm-v-root".to_string())]),
+        )["metadata"]["annotations"].clone();
+        n.seen.lock().unwrap().disks.insert("vm-v-root".into(), "copying".into());
+        n.m.reconcile_one("u1", Some(&obj)).await.unwrap();
+        assert!(state_writes(&n.seen).is_empty(), "still catching up: nothing said");
+        assert!(n.m.take_due("u1").is_some(), "looked at again");
+
+        n.seen.lock().unwrap().disks.insert("vm-v-root".into(), "failed".into());
+        n.m.reconcile_one("u1", Some(&obj)).await.unwrap();
+        let w = state_writes(&n.seen);
+        assert!(w[0]["failureReason"].as_str().unwrap().contains("disk root"), "{w:?}");
+
+        // A receiver a restarted kubelet left is given up on, not adopted.
+        let n = mig_node("b").await;
+        n.m.vms.lock().await.insert("u1".into(), source_vm("t-vm-v-root", true));
+        n.m.reconcile_one("u1", Some(&obj)).await.unwrap();
+        assert!(n.m.vms.lock().await.is_empty() && n.m.forced.lock().unwrap().contains_key("u1"));
+        assert!(state_writes(&n.seen)[0]["failureReason"].as_str().unwrap().contains("restarted"));
+    }
+
+    /// #40: once the guest runs on the target, the target cuts each disk over
+    /// and completes it; it never aborts one.
+    #[tokio::test]
+    async fn the_target_finishes_the_disks_once_the_guest_runs_there() {
+        let n = mig_node("b").await;
+        n.m.vms.lock().await.insert("u1".into(), source_vm("t-vm-v-root", true));
+        let mut obj = migrating(json!({"migrationUid": "m1", "sourceNode": "a", "targetNode": "b", "completed": true}));
+        obj["status"]["nodeName"] = json!("b");
+        obj["metadata"]["annotations"] = crate::vm_migration::disks_patch(
+            "u1", "m1", &std::collections::BTreeMap::from([("root".to_string(), "vm-v-root".to_string())]),
+        )["metadata"]["annotations"].clone();
+        n.seen.lock().unwrap().disks.insert("vm-v-root".into(), "synced".into());
+        for _ in 0..4 {
+            n.m.reconcile_one("u1", Some(&obj)).await.unwrap();
+        }
+        assert_eq!(n.seen.lock().unwrap().asked, ["cutover vm-v-root", "complete vm-v-root"]);
+        assert!(n.m.disks_done.lock().unwrap().contains("m1"));
+        assert!(n.m.vms.lock().await.contains_key("u1"));
+        let _ = std::fs::remove_dir_all(&n.dir);
+    }
+
     fn placed(uid: &str, node: &str) -> Value {
         json!({
             "kind": "VirtualMachineInstance",
@@ -6619,7 +7611,7 @@ mod tests {
             .iter()
             .map(|u| u.query_pairs().find(|(k, _)| k == "fieldSelector").unwrap().1.into_owned())
             .collect();
-        assert_eq!(selectors, ["status.nodeName=n1", "spec.nodeName=n1"]);
+        assert_eq!(selectors, ["status.nodeName=n1", "spec.nodeName=n1", "status.migrationState.targetNode=n1"]);
         assert!(urls.iter().all(|u| u.path() == "/apis/kubevirt.io/v1/virtualmachineinstances"));
 
         let named = |name: &str, uid: &str, spec: Option<&str>, status: Option<&str>| {

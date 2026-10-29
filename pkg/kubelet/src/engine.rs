@@ -119,7 +119,8 @@ impl TokenSource {
         TokenSource { explicit, files: vec![PathBuf::from(file)], env: "$STORMBLOCK_ADMIN_TOKEN" }
     }
 
-    /// Only these files, and no environment. For tests.
+    /// Only these files, and no environment: stormstorage's token (#40), and
+    /// tests.
     pub fn files(files: impl IntoIterator<Item = impl Into<PathBuf>>) -> TokenSource {
         TokenSource { explicit: None, files: files.into_iter().map(Into::into).collect(), env: "" }
     }

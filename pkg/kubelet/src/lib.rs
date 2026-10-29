@@ -54,6 +54,7 @@ pub mod vm_manager;
 pub mod vm_network;
 pub mod vm_restore;
 pub mod vm_migrate;
+pub mod vm_migration;
 pub mod vm_snapshot;
 
 pub use checkpoint::CriuCheckpointer;

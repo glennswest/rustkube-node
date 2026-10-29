@@ -92,6 +92,9 @@ pub struct KubeletConfig {
     /// Container log rotation (`--container-log-max-size`,
     /// `--container-log-max-files`, #216).
     pub container_log: crate::container_logs::Rotation,
+    /// stormstorage and the node's certificate, for live migrations (#40).
+    /// The node's address is filled in by the kubelet.
+    pub migration: crate::vm_migration::Config,
 }
 
 impl Default for KubeletConfig {
@@ -130,6 +133,7 @@ impl Default for KubeletConfig {
             storage: crate::capacity::Policy::default(),
             metadata_max_staleness: crate::vm_manager::METADATA_MAX_STALENESS,
             container_log: Default::default(),
+            migration: Default::default(),
         }
     }
 }
@@ -298,6 +302,8 @@ impl Kubelet {
             .with_claims(self.pod_manager.clone())
             .with_cni(cni)
             .with_max_staleness(self.config.metadata_max_staleness)
+            // Live migrations (#40): the target says this address.
+            .with_migration(crate::vm_migration::Config { node_ip: self.node_ip.clone(), ..self.config.migration.clone() })
             // Each machine's hypervisor identity for cadvisor (#84).
             .with_identities(crate::workload_identity::Publisher::default()),
         ));

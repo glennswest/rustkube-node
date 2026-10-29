@@ -117,6 +117,30 @@ struct Cli {
     #[arg(long, env = "METADATA_MAX_STALENESS", default_value_t = 40)]
     metadata_max_staleness: u64,
 
+    /// stormstorage's API, which mirrors a migrating VM's disks to the target
+    /// node (#40, stormstorage#44). Unset: VMIs are not migrated from or to
+    /// this node, and a migration says why.
+    #[arg(long, env = "STORMSTORAGE_URL")]
+    stormstorage: Option<String>,
+
+    /// stormstorage's API token (its `[api] api_token`), read at each call.
+    #[arg(long, env = "STORMSTORAGE_TOKEN_FILE", default_value = "/run/stormstorage/api_token")]
+    stormstorage_token_file: String,
+
+    /// The node's certificate for live migration's TLS (#40, stormvm#30):
+    /// issued for serverAuth and clientAuth, with its key and the cluster CA.
+    #[arg(long, env = "MIGRATION_TLS_CERT", requires_all = ["migration_tls_key", "migration_tls_ca"])]
+    migration_tls_cert: Option<String>,
+    #[arg(long, env = "MIGRATION_TLS_KEY")]
+    migration_tls_key: Option<String>,
+    #[arg(long, env = "MIGRATION_TLS_CA")]
+    migration_tls_ca: Option<String>,
+
+    /// The first port a VM arriving by live migration listens on; one more
+    /// for each arriving at once, up to 64 (#40).
+    #[arg(long, env = "MIGRATION_PORT", default_value_t = kubelet::vm_migration::DEFAULT_PORT)]
+    migration_port: u16,
+
     /// Pods this node takes: its capacity and allocatable `pods`, which the
     /// scheduler holds it to (#165). Upstream's default; stormcos sets 250.
     #[arg(long, env = "MAX_PODS", default_value_t = kubelet::node_status::DEFAULT_MAX_PODS)]
@@ -660,6 +684,19 @@ async fn main() -> anyhow::Result<()> {
         },
         metadata_max_staleness: std::time::Duration::from_secs(cli.metadata_max_staleness),
         container_log,
+        migration: kubelet::vm_migration::Config {
+            stormstorage: cli.stormstorage.as_deref().map(|url| {
+                kubelet::engine::EngineClient::new(url, kubelet::engine::TokenSource::files([&cli.stormstorage_token_file]))
+            }),
+            tls: match (&cli.migration_tls_cert, &cli.migration_tls_key, &cli.migration_tls_ca) {
+                (Some(cert), Some(key), Some(ca)) => {
+                    Some(kubelet::vm_migration::TlsFiles { ca: ca.clone(), cert: cert.clone(), key: key.clone() })
+                }
+                _ => None,
+            },
+            port: cli.migration_port,
+            node_ip: String::new(),
+        },
         ..Default::default()
     };
     kubelet::startup::mark("credentials");
