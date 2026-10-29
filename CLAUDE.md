@@ -58,7 +58,7 @@ by #51.
 
 ## Work plan
 
-### In progress: #40 (P3), live migration of stormvm-started VMIs (stormstorage#44 closed 2026-10-29)
+### Waiting on stormcos#682 (+ stormcos#288, stormstorage#56) for the live run: #40 (P3), live migration of stormvm-started VMIs
 
 2026-10-29. stormstorage 5d68784 has the disk half: `POST /api/v1/nodes/{S}/volumes/{id}/migrate {to}` (T's copy served to
 S over NVMe/TCP, S's mirror), `GET /api/v1/migrations/{mid}` (starting|copying|synced|cut_over|completed|aborted|failed,
@@ -67,18 +67,22 @@ has `migration::{INCOMING_DEFER, Tls, Tuning, send_migration, receive_migration_
 `migrate_cancel`). Contract: rustkube's `apimachinery::kubevirt::active_migration` (status.migrationState). Scope of this
 cut: qemu, VM-owned disks (golden clone, emptyDisk, seed), no pod-network NIC; anything else fails the migration naming
 why (follow-ups). Doing:
-1. [ ] `vm_migration.rs`: role (source/target) from migrationState, preflight, stormstorage client (`--stormstorage`,
+1. [x] `vm_migration.rs`: role (source/target) from migrationState, preflight, stormstorage client (`--stormstorage`,
        token file), the disks record (`storm.io/migration-disks` annotation: migrationUid + disk → mid), TLS dir (copies of
        the node pair: `--migration-tls-{cert,key,ca}`), port (`--migration-port`, 49152).
-2. [ ] VMI lists: a third selector `status.migrationState.targetNode`; target never cold-starts a migrating VMI.
-3. [ ] Source: start each disk's mirror, record mids; on `targetNodeAddress` send over TLS, `startTimestamp`; poll;
+2. [x] VMI lists: a third selector `status.migrationState.targetNode`; target never cold-starts a migrating VMI.
+3. [x] Source: start each disk's mirror, record mids; on `targetNodeAddress` send over TLS, `startTimestamp`; poll;
        `completed`/`failed` + `endTimestamp`; abortRequested → `migrate_cancel`, failed, `abortStatus`; after completed
        force-stop the paused machine (no status write, finalizer left to the target); after failed abort each mirror.
-4. [ ] Target: wait every disk `synced`, attach T's copies (ublk), receiving start (`-incoming defer`), arm TLS listener,
+4. [x] Target: wait every disk `synced`, attach T's copies (ublk), receiving start (`-incoming defer`), arm TLS listener,
        write `targetNodeAddress` + port; on completed adopt it (registration, status), cut each disk over and complete it;
        on failed/abort tear the receiver down.
-5. [ ] Tests (fake apiserver + fake stormstorage + fake machine), README/api.md/configuration.md/status.md, CHANGELOG;
+5. [x] Tests (fake apiserver + fake stormstorage + fake machine), README/api.md/configuration.md/status.md, CHANGELOG;
        sc-build; stage; stormcos issue (flags, port open, CRD stormcos#288). Live: two-node cluster with stormstorage.
+       Done: 306d475 (code, 11 tests), ca8a9a0 (docs). SC_BUILD_VM sc-build ca8a9a0: 575 kubelet unit, all suites, nothing
+       new from rustc/clippy in the touched files (#299 was my `grep -c`, closed). Stage build 59e3817d1498. Filed
+       stormcos#682 (kubelet flags, node pair with serverAuth+clientAuth and the node name, TCP 49152–49215). #40 proposed
+       after it. Resume: a VMIM between two nodes; guest up and disk intact on the target; close.
 
 ### Done: #160 (P2), pods wait a fixed 2 s for startup admission after every kubelet start (stormcos#300)
 
