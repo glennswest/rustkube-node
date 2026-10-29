@@ -58,6 +58,20 @@ by #51.
 
 ## Work plan
 
+### In progress: #160 (P2), pods wait a fixed 2 s for startup admission after every kubelet start (stormcos#300)
+
+2026-10-28. Sample (pvetest2 storm-003102, 12.58, kubelet restarts at 21:41–21:54): every API pod (coredns, flowsdn,
+snapshot-controller) `wait=2003–2144ms attempts=1`, static pods `wait≈10ms`; CNI ADD 0.62–0.66 s (since #148 the conflist
+wakes waiting pods). Cause: `reconcile` sends a non-static pod back `Next::After(sync_interval)` (2 s) while startup
+admission is closed (`pods_synced`/`vmis_synced`, an adopted pod without its spec, a VM with unknown claims), and nothing
+wakes it when it opens; `pods_synced` is also stored *after* `replace_source("api-pods")` has woken the pods. Doing:
+1. [ ] Executor `park(key)` / `unpark` / `wake_parked()`; reconcile parks a key on a closed gate (re-checked after
+       parking), `release_parked()` wakes them where the gate can open (pod LIST, VMI sync paths); `pods_synced` stored
+       before `replace_source`. The 2 s stays as the fallback. A parked pod's start log/timing says it waited for admission.
+2. [ ] Test (park → wake_parked wakes exactly the parked keys, once), README/event-driven-design.md, CHANGELOG; sc-build;
+       stage; close on the next pvetest kubelet start: API pods' `wait=` in tens of ms.
+   Not here: a failed CNI ADD still retried on a back-off (#201, decided: event-woken waits).
+
 ### Done: #292 (P0), ring arena per request; 180 s for a device mount; no root deleted under a mount (stormcos#626)
 
 2026-10-28. server1 (X9 SMR HDD), 12.40/12.54: one root `mount(2)` took 30.95 s; the one arena parked every later
