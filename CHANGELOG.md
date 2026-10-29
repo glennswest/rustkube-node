@@ -2,6 +2,15 @@
 
 ## 2026-10-28
 
+- **fix:** After every kubelet start, each API pod (coredns, the CNI agent's, every Deployment's) waited a fixed 2 s
+  before its first start attempt (#160, stormcos#300): its first pass met startup admission closed (the pod/VMI
+  lists, adopted pods' specs, VM claims) and was sent back for `sync_interval`, with nothing to wake it when admission
+  opened, and `pods_synced` was stored only after the list had already woken the pods. A pass that meets it closed is
+  now parked (`Executor::park`), and every parked workload is woken the moment a pod or VMI list opens it
+  (`wake_parked`, logged with the count); `pods_synced` is stored before the list wakes the pods. The 2 s stays as the
+  fallback. Seen on pvetest2 (12.58): coredns, flowsdn and snapshot-controller `wait=2003–2144ms` on every kubelet
+  start, static pods ~10 ms.
+
 - **test:** A `multus` suite in the test container (#233's live check): a bridge and a macvlan
   NetworkAttachmentDefinition give a pod `net1`/`net2` with IPv4 addresses, inside the pod (new workload mode
   `expect-nics <hold> <ifname>…`) and in `k8s.v1.cni.cncf.io/network-status`; a missing NAD fails by name
