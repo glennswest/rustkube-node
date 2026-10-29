@@ -2497,7 +2497,7 @@ Steps:
 4. [x] `sc-build 'cargo build --release --locked --target x86_64-unknown-linux-musl'`, then `cargo test --locked`: passed at 6741e93.
 5. [x] Close #58, request the golden.
 
-### Waiting on stormcos#495 (CNI plugins in cni-bin) for the live check: #233, multi-NIC by the Multus standard
+### Waiting on stormcos#271 (test images on nodes) for the live `multus` run: #233, multi-NIC by the Multus standard
 
 2026-10-09. `k8s.v1.cni.cncf.io/networks` (names, ns/name, name@if, or the JSON list with interface/ips/mac) and
 `v1.multus-cni.io/default-network`; NADs `k8s.cni.cncf.io/v1` `spec.config`.
@@ -2521,6 +2521,8 @@ Steps:
        FailedCreatePodSandBox naming it; a one-address host-local NAD used by two pods in turn (DEL released it).
        requires.toml `[multus]`; sc-build `cd test`; propose #233 after stormcos#271; resume: `stormcentral test run
        rustkube-node multus --tag pvetest1`, close on a pass.
+       Done: c10fa21 (suite), 935f2c9 (docs). SC_BUILD_VM sc-build: clippy -D warnings clean, 45 test-crate tests (4 new),
+       release build. Commented on #233; proposed after stormcos#271.
 
 ### Done: #231 + #232 (P0, stormcos#488): verified live on the Dell, 12.07
 
