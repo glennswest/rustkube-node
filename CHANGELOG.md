@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-10-29
+
+- **feat:** Live migration of stormvm-started VMIs (#40), the node half of rustkube#184's
+  `status.migrationState`. The source mirrors each of the machine's volumes to the target through stormstorage
+  (stormstorage#44, `storm.io/migration-disks` on the VMI); the target (listed by
+  `status.migrationState.targetNode`, never started cold) waits until every copy is synced, attaches the copies,
+  starts the machine with `-incoming defer`, arms qemu's TLS listener and writes `targetNodeAddress` +
+  `targetDirectMigrationNodePorts`; the source sends over TLS (stormvm#30: node certificate, verify-peer,
+  multifd 4, auto-converge, 300 ms downtime), writes `startTimestamp`, then `completed`/`failed` and
+  `endTimestamp`; `abortRequested` fails it before sending or cancels the transfer (`abortStatus: Succeeded`).
+  After success the source's paused copy is stopped at once and never restarted there; the target adopts the
+  machine and cuts over and completes each disk. After a failure the source aborts the mirrors and the target
+  drops its receiver. New flags `--stormstorage`, `--stormstorage-token-file`, `--migration-tls-cert`/`-key`/`-ca`,
+  `--migration-port` (49152). Not yet: cloud-hypervisor, a disk the VM does not own (claims), the pod network.
+
 ## 2026-10-28
 
 - **docs:** #92 half 1 verified live: in vm-waves 572366a0a2 (pvetest2, 12.21), the `noCloud` accessCredentials key

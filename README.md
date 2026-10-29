@@ -972,6 +972,49 @@ starts once the VM lets the claim go (#80).
   a VMI with no machine here and not wanted here are swept. The pod sweep
   leaves `vm-` records alone.
 
+### Live migration
+
+A VirtualMachineInstanceMigration (rustkube's controller and scheduler,
+rustkube#184; the CRD is stormcos#288) is carried out by the two kubelets
+through the VMI's `status.migrationState`, upstream KubeVirt's contract (#40):
+
+- **The disks first.** The source asks stormstorage to mirror each of the
+  machine's volumes to a new volume on the target
+  (`POST /api/v1/nodes/{source}/volumes/{id}/migrate`, stormstorage#44: a RAID
+  leg on the destination, the owner's choice on #159) and records which
+  migration is which disk's in the VMI's `storm.io/migration-disks`
+  annotation. The target lists the VMI by
+  `status.migrationState.targetNode`, waits until every copy is `synced`,
+  attaches the copies (ublk), starts the machine with `-incoming defer`, arms
+  its TLS listener and writes `targetNodeAddress` and
+  `targetDirectMigrationNodePorts`. It never starts a migrating VMI cold.
+- **Then the memory, over qemu's own TLS** (stormvm#30): the source sends
+  with the node's certificate, checking the target's against its node name,
+  multifd with 4 channels, auto-converge and a 300 ms downtime limit on both
+  ends; writes `startTimestamp`, then `completed` or `failed` (with
+  `failureReason`) and `endTimestamp`. `abortRequested` before sending fails
+  it at once, while sending cancels the transfer (`abortStatus: Succeeded`).
+- **After.** The source's paused copy is stopped at once (never asked, never
+  resumed, nothing reported), its disks detached; it is not started again
+  while `status.nodeName` still names the source. The target adopts the
+  machine (registration, identity, status, Events `Migrated`), owns its disks
+  as the source did (#75), then cuts each disk over and completes it
+  (stormstorage retires the source's volume). After a failure the source
+  aborts each mirror (the target's copy deleted, its own untouched) and the
+  target stops its receiver.
+
+Configured by `--stormstorage` (and its token file) and
+`--migration-tls-cert`/`-key`/`-ca` (the node pair, issued for serverAuth and
+clientAuth); without them a migration from or to the node fails naming what
+is missing. A target listens from `--migration-port` (49152), one port per
+machine arriving at once. Not migrated yet, refused with the reason on the
+migration: cloud-hypervisor (no TLS migration), a disk the machine does not
+own (a claim, another driver's claim, a `volume:` it was handed: its PV names
+the source node), a VMI on the pod network, and a receiver whose kubelet
+restarted mid-migration (the migration fails; the guest stays on the source).
+Not run against two real nodes yet: stormstorage runs only on `sno` nodes
+until stormstorage#56/stormcos#354.
+
 ## Tests on a node
 
 `test/` is the test container, per stormcentral's `docs/test-standard.md`. It

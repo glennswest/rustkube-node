@@ -91,5 +91,6 @@ apiserver, not a new kubelet HTTP route. It requires the snapshot CRDs,
 `--runtime stormpump`, a locally owned VM and its local storage.
 VirtualMachineRestore is served the same way, by the node that took the
 snapshot (#53, option A of #109: the VM's disks are rewritten to restored
-PVCs; README, "Restores"). Stormvm VMI live migration is not driven yet: the owner chose a RAID leg on the
-destination (#159), which waits on stormstorage#44 (#40).
+PVCs; README, "Restores"). A VMI's live migration is driven by its `status.migrationState` (#40; README, "Live
+migration"): no kubelet route; the memory travels qemu to qemu over TLS on the target's `--migration-port`
+(49152 up, one per arriving machine), which must be reachable from the other nodes.

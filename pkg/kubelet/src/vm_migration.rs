@@ -349,7 +349,7 @@ impl Stormstorage<'_> {
         if !status.is_success() {
             return Err(format!("stormstorage {status}: {}", text.trim()));
         }
-        serde_json::from_str(&text).or_else(|_| Ok(Value::Null))
+        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
     }
 
     /// Start mirroring `volume` (on `source`) to a new volume on `target`.
