@@ -2,6 +2,7 @@
 
 ## 2026-10-30
 
+- **docs:** #86's work plan: stormblock-registry#116 (v0.45.0) fetches `registry/<c>:<sha12>` into `component-<c>-<sha12>` on the contract the kubelet already uses; the live check waits on forge's registry deploy (stormcentral#542) and the nodes' forge peer (stormcos#271).
 - **docs:** Refresh from code since 2026-10-23: status.md (audit header, #40 live migration, #160/#292 startup and ring, the multus suite, gap rows: #181 gone, #298 added, #160 out of the regressions row), CLAUDE.md's implementation reference. README, configuration.md and api.md already carried #40/#160/#292.
 
 ## 2026-10-29

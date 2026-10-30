@@ -59,7 +59,7 @@ a row says so.
 
 Decided 2026-10-09: microVM Pods are stormvisor's ([#13](https://github.com/glennswest/rustkube-node/issues/13), `--runtime vm` retired;
 dispatch by RuntimeClass is [#204](https://github.com/glennswest/rustkube-node/issues/204)), and versioned goldens are copied on demand
-([#86](https://github.com/glennswest/rustkube-node/issues/86), the fetch is stormblock-registry#116).
+([#86](https://github.com/glennswest/rustkube-node/issues/86), the fetch is built in stormblock-registry#116 / v0.45.0; deployed with stormcentral#542 and stormcos#271).
 
 Source entry points: `cmd/kubelet/src/main.rs`, `pkg/kubelet/src/kubelet.rs`,
 `pod_manager.rs`, `stormpump_runtime.rs`, `container_roots.rs`, `vm_manager.rs`,

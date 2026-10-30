@@ -1167,7 +1167,7 @@ claims and pulls already use. Cost on 11.91 warm: ~0.4–1.3 s per start (clone,
 stormpump#107) and a volume per container. Asked on #104: A private by default + readOnlyRootFilesystem keeps the
 shared root (recommended), B private only when asked, C A with pre-minted clones.
 
-### Waiting on stormblock-registry#116: #86 (P2), versioned goldens for pods (owner 10-09: A, copy on demand, as replication)
+### Waiting on stormcentral#542 + stormcos#271 (deploys): #86 (P2), versioned goldens for pods (owner 10-09: A, copy on demand, as replication)
 
 2026-10-09. Found: component goldens are engine volumes on forge, `golden-<c>-<sha12>`, shown as
 `registry/<c>:<sha12>` (stormcentral `goldens::image_ref`), not pushed to forge's sbregistry; the release manifest's
@@ -1182,6 +1182,12 @@ new sbregistry work (file it); the kubelet half rides the existing pull + demand
        7e39e1a). SC_BUILD_VM sc-build 4b96e0c: 475 kubelet unit pass. Stage golden golden-rustkube-node-d3d0359c3aac
        (stormcos#424). Filed stormblock-registry#116 (fetch golden-<c>-<sha12> from forge for registry/<c>:<sha12>).
 4. [ ] After #116 + a release: roll one instance to a version not in the release and back; close.
+       2026-10-30: stormblock-registry#116 closed (v0.45.0, golden-registry-64160cb6351a, stormcos#453): demand/replicate
+       of `registry/<c>:<sha12>` fetches `golden-<c>-<sha12>` from a peer into template `component-<c>-<sha12>` (digest
+       checked), golden record ready, cached (`held`) after. Same contract as 4b96e0c's pull: no kubelet change. Left is
+       deployment: forge's sbregistry ≥ v0.45.0 (stormcentral#542) and nodes naming forge as a peer (stormcos#271).
+       #86 proposed after both. Resume: on a node, a pod `image: <c>:<sha12 not in the release>` runs after one fetch
+       (`storm.io/image-resolved` = registry), back to the release's tag starts on the pallet, forward again no fetch; close.
 
 ### (history) Waiting on the owner: #86 (P2), versioned goldens for pods
 
