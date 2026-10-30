@@ -11,9 +11,9 @@ stage golden through `stormcentral component stage rustkube-node`, not a package
 `0.13.0`. There is one version location: `[workspace.package] version` in
 `Cargo.toml` (every crate uses `version.workspace = true`).
 
-## Current implementation reference (2026-10-09)
+## Current implementation reference (2026-10-30)
 
-Main baseline: 94cd23c (#259 VMI start timing; latest stage golden golden-rustkube-node-3672fc1e06d0, stormcos#424; every git dependency by rev, #210). See
+Main baseline: a3ec977 (#40 live migration kubelet half, #160 parked startup admission, #292 ring arena per request; every git dependency by rev, #210; stage builds are listed per issue in the work plan). See
 `docs/status.md` for changes since October 2, the owner's recorded decisions and issue-backed limitations,
 `docs/configuration.md` for every CLI/env/default, `docs/api.md` for ports and actual routes, `docs/retries.md`
 for every remote call's retry policy. CLI runtime defaults to native; stormcos explicitly chooses stormpump.
@@ -22,7 +22,7 @@ edition (#145, #155). PVCs use the built-in stormblock driver and sealed size-cl
 only for third-party drivers. Every container's root is its own CoW clone of the image's sealed golden (#104,
 owner's option A). Node services' mirror pods take their state and Events from each service's stormd API (#215).
 
-Main has VMI adoption, persistent VM-owned disks, accessCredentials, tap address reporting, snapshots and
+Main has live migration of stormvm-started VMIs (#40: stormstorage disk mirror, qemu TLS; flags `--stormstorage`, `--migration-tls-*`, `--migration-port`), VMI adoption, persistent VM-owned disks, accessCredentials, tap address reporting, snapshots and
 restores (#53), pod-network VMIs under rustkube's launcher Pod (#88), the VM verbs (#94). Exec/attach are served
 on stormpump's exec op (#56). Historical work-plan entries below record what was true at each checkpoint; they are not
 current deployment guarantees. Owner decisions answered: #106 (Pods under one parent cgroup, done), #107

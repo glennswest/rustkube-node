@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-30
+
+- **docs:** Refresh from code since 2026-10-23: status.md (audit header, #40 live migration, #160/#292 startup and ring, the multus suite, gap rows: #181 gone, #298 added, #160 out of the regressions row), CLAUDE.md's implementation reference. README, configuration.md and api.md already carried #40/#160/#292.
+
 ## 2026-10-29
 
 - **feat:** Live migration of stormvm-started VMIs (#40), the node half of rustkube#184's
