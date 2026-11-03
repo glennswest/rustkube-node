@@ -58,6 +58,13 @@ by #51.
 
 ## Work plan
 
+### Doing: #304 (P3), stormvm → 0225218: storm.io/bridge keeps multus/SR-IOV NICs on their network (stormvm#103)
+
+2026-11-03. stormvm 0225218 (7 commits on 01ac271: only stormvm-spec kube.rs, verify, docs; no Cargo.toml change; main
+dc2727c adds docs only). The kubelet calls `from_kube`, so no code change here: rev-only bump in pkg/kubelet/Cargo.toml and
+Cargo.lock, keep stormpump 9877a97. CHANGELOG; SC_BUILD_VM sc-build `--locked`; stage; close (stormvm#103 closes on a
+release: a bridged VM with an unwired SR-IOV NIC refused at start, stormvm medium `failed-start-*` / vm-waves).
+
 ### Done: #302 (P3), move a running VMI's disk off the node (stormstorage migrate → cutover → stormvm switch_disk)
 
 2026-11-03. stormvm 01ac271 (b326f7c main: docs) has `Machine::switch_disk(&DiskSwitch {from, to, discard})` (qemu only;
