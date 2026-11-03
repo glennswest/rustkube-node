@@ -13,7 +13,7 @@ stage golden through `stormcentral component stage rustkube-node`, not a package
 
 ## Current implementation reference (2026-10-30)
 
-Main baseline: f54715e (stormvm 01ac271, #302 disk moves off the node; #301; #40 live migration kubelet half, #160 parked startup admission, #292 ring arena per request; every git dependency by rev, #210; stage builds are listed per issue in the work plan). See
+Main baseline: a30225d (stormvm 0225218, #304 bridge keeps multus/SR-IOV NICs; #302 disk moves off the node; #301; #40 live migration kubelet half, #160 parked startup admission, #292 ring arena per request; every git dependency by rev, #210; stage builds are listed per issue in the work plan). See
 `docs/status.md` for changes since October 2, the owner's recorded decisions and issue-backed limitations,
 `docs/configuration.md` for every CLI/env/default, `docs/api.md` for ports and actual routes, `docs/retries.md`
 for every remote call's retry policy. CLI runtime defaults to native; stormcos explicitly chooses stormpump.
@@ -58,12 +58,14 @@ by #51.
 
 ## Work plan
 
-### Doing: #304 (P3), stormvm → 0225218: storm.io/bridge keeps multus/SR-IOV NICs on their network (stormvm#103)
+### Done: #304 (P3), stormvm → 0225218: storm.io/bridge keeps multus/SR-IOV NICs on their network (stormvm#103)
 
 2026-11-03. stormvm 0225218 (7 commits on 01ac271: only stormvm-spec kube.rs, verify, docs; no Cargo.toml change; main
 dc2727c adds docs only). The kubelet calls `from_kube`, so no code change here: rev-only bump in pkg/kubelet/Cargo.toml and
 Cargo.lock, keep stormpump 9877a97. CHANGELOG; SC_BUILD_VM sc-build `--locked`; stage; close (stormvm#103 closes on a
 release: a bridged VM with an unwired SR-IOV NIC refused at start, stormvm medium `failed-start-*` / vm-waves).
+Done: a30225d. SC_BUILD_VM sc-build (job 034f632e7e) `cargo metadata --locked && cargo build --locked && cargo test --locked`:
+every stormvm crate at 0225218, 586 kubelet unit, all suites pass, warnings = #227's. Stage build 233a3ca2dd4d. Closed.
 
 ### Done: #302 (P3), move a running VMI's disk off the node (stormstorage migrate → cutover → stormvm switch_disk)
 
