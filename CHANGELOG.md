@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-03
+
+- **fix:** stormvm a8b509d → 93cf070 (#301, stormvm#28), every stormvm crate by rev; stormpump stays 9877a97. A VirtualMachineSnapshot of a VM whose guest agent channel has nobody behind it no longer fails after two 30 s waits (`guest-fsfreeze-thaw did not answer`): the agent is pinged first (≤ 5 s), a silent one is `NoGuestAgent`, crash-consistent, no freeze or thaw. A snapshot right after Running no longer fails `control.sock is not connectable`: an unbound control socket gets 5 s. No API change (upstream changed no Cargo manifest; rev-only bump in pkg/kubelet/Cargo.toml and Cargo.lock).
+
 ## 2026-10-30
 
 - **docs:** #86's work plan: stormblock-registry#116 (v0.45.0) fetches `registry/<c>:<sha12>` into `component-<c>-<sha12>` on the contract the kubelet already uses; the live check waits on forge's registry deploy (stormcentral#542) and the nodes' forge peer (stormcos#271).

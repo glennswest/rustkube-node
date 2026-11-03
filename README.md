@@ -875,7 +875,12 @@ starts once the VM lets the claim go (#80).
     takes it in the background.
   - **How:** stormvm freezes the guest (through its agent, when it has one),
     pauses it, takes one stormblock group snapshot of every volume, named
-    `<ns>.<vm>.<snapshot>`, then unpauses and thaws.
+    `<ns>.<vm>.<snapshot>`, then unpauses and thaws. The agent is pinged
+    first (5 s at most): a silent one (a blank disk, an image without
+    qemu-guest-agent) is no agent, so the snapshot is crash-consistent with
+    indication `NoGuestAgent` and no freeze or thaw is sent. A snapshot asked
+    for straight after Running gives the hypervisor's control socket 5 s to
+    be bound (#301, stormvm#28).
   - **Status:** `Succeeded` + `readyToUse`, or `Failed` with the error.
     `virtualMachineSnapshotContentName` is the stormblock group id, and it
     also carries `sourceUID`, `indications` and an Event on the object.
