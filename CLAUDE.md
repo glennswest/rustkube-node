@@ -13,7 +13,7 @@ stage golden through `stormcentral component stage rustkube-node`, not a package
 
 ## Current implementation reference (2026-10-30)
 
-Main baseline: a30225d (stormvm 0225218, #304 bridge keeps multus/SR-IOV NICs; #302 disk moves off the node; #301; #40 live migration kubelet half, #160 parked startup admission, #292 ring arena per request; every git dependency by rev, #210; stage builds are listed per issue in the work plan). See
+Main baseline: f0102a9 (#303 VMI Running once its control socket answers; stormvm 0225218, #304 bridge keeps multus/SR-IOV NICs; #302 disk moves off the node; #301; #40 live migration kubelet half, #160 parked startup admission, #292 ring arena per request; every git dependency by rev, #210; stage builds are listed per issue in the work plan). See
 `docs/status.md` for changes since October 2, the owner's recorded decisions and issue-backed limitations,
 `docs/configuration.md` for every CLI/env/default, `docs/api.md` for ports and actual routes, `docs/retries.md`
 for every remote call's retry policy. CLI runtime defaults to native; stormcos explicitly chooses stormpump.
@@ -58,7 +58,7 @@ by #51.
 
 ## Work plan
 
-### Doing: #303 (P3), a VMI reads Running only once its control socket answers (stormvm#28)
+### Done: #303 (P3), a VMI reads Running only once its control socket answers (stormvm#28)
 
 2026-11-03. `start_attempt` writes Running right after the engine's spawn, before qemu binds QMP (medium 925ac816ff:
 `snapshot-take` 1 s after Running, `control.sock is not connectable`). Chosen (the issue's first option, KubeVirt's
@@ -67,6 +67,9 @@ registration's control socket, bounded 10 s, raced against the machine's exit (r
 the spawn). Answered (even with an error) → Running; exited → as today (the exit marks it); not up in 10 s → Running
 anyway with a Warning `ControlNotReady` Event (the machine runs; nothing killed). Start timing step `control`.
 Tests (answered, exited, never up), README/status.md, CHANGELOG; sc-build; stage; close.
+Done: f0102a9 (1 test). SC_BUILD_VM sc-build (job 69df61a259): 587 kubelet unit, all suites, warnings = #227's (9 lib, unchanged),
+clippy nothing in the new code. Stage build 97d6bc43f77b. Closed. Live: stormvm medium `snapshot-take` right after Running on
+a release carrying it (no `control.sock is not connectable`; start timing's `control=`).
 
 ### Done: #304 (P3), stormvm → 0225218: storm.io/bridge keeps multus/SR-IOV NICs on their network (stormvm#103)
 
