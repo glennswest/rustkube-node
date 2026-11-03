@@ -1020,6 +1020,63 @@ restarted mid-migration (the migration fails; the guest stays on the source).
 Not run against two real nodes yet: stormstorage runs only on `sno` nodes
 until stormstorage#56/stormcos#354.
 
+### A running disk moved off the node
+
+A disk can move to another node's storage while its VM keeps running where
+it is (#302, stormvm#29). Ask for it with the VMI annotation
+`storm.io/move-disks`, a JSON object naming each disk's node:
+
+    kubectl annotate vmi web-1 'storm.io/move-disks={"data":"node-b"}'
+
+The kubelet running the machine:
+
+1. asks stormstorage to mirror the disk's volume to a new volume on that node
+   (`POST /api/v1/nodes/{node}/volumes/{id}/migrate`, stormstorage#44) and
+   writes its record, `storm.io/disk-moves` (per disk: `to`, `node`, `from`,
+   `migration`, `state`, `bytesTotal`, `bytesRemaining`, `volume`, `message`).
+   The record shows the progress, and a restarted kubelet resumes from it.
+2. Once the copy is `synced`, it pauses the guest, cuts the migration over,
+   attaches the copy here through the node's stormblock (a peer's volume over
+   NVMe/TCP, served as ublk, stormblock#328), puts the disk on the copy's
+   device (stormvm's `switch_disk`: the guest's device, serial and slot don't
+   change) and runs the guest again. The guest is paused for one attach and
+   two QMP calls (`paused_ms` in the log).
+3. It detaches the old volume here and completes the migration, which retires
+   the old volume. The machine's registration and the record name the copy,
+   so the next start of the VMI attaches it.
+
+The states are `copying` → `switching` → `switched` → `moved`.
+
+**Failures:**
+- A failure before the switch (pause, cutover, attach) runs the guest again
+  on its own disk and aborts the copy: `failed`.
+- A switch that answers an error is `unknown`. The answer may have been lost
+  after the switch went through, so nothing is deleted or retried, and a
+  person decides.
+
+**Taking a request back:**
+- A copy no longer asked for (or asked elsewhere) is aborted while it is
+  still `copying`.
+- A `failed` record is dropped once its disk is no longer asked for, and
+  asking for another node starts again.
+- Asking for this node moves a disk back.
+
+**What can be moved:** only disks the machine owns (a golden's clone, an
+emptyDisk). These are refused, with the reason on the record:
+- a claim (its driver moves it) and a `volume:` (somebody else's);
+- the cloud-init seed (it is made again at every start);
+- cloud-hypervisor machines;
+- a machine being live-migrated.
+
+A machine with a disk on another node is not live-migrated yet.
+`--stormstorage` is required.
+
+Not yet:
+- The kubelet sets the copy's owner through its own engine, and stormblock
+  does not yet relay `PUT …/owner` to the peer (stormblock#519). Until then,
+  deleting the VM does not delete a disk that moved off the node.
+- Not run on a two-node fabric yet.
+
 ## Tests on a node
 
 `test/` is the test container, per stormcentral's `docs/test-standard.md`. It

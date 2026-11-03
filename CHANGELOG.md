@@ -2,6 +2,15 @@
 
 ## 2026-11-03
 
+- **feat:** A running VMI's disk moves to another node's storage while the VM stays where it is (#302, stormvm#29). The request is the VMI annotation `storm.io/move-disks` (`{"<disk>": "<node>"}`).
+  - The kubelet mirrors the disk's volume through stormstorage (stormstorage#44). It records the move, with its progress, in `storm.io/disk-moves`.
+  - Once the copy is in sync, the kubelet pauses the guest, cuts the migration over and attaches the copy through the node's stormblock (stormblock#328). It puts the disk on the copy's device with stormvm's `Machine::switch_disk`, runs the guest again, detaches the old volume and completes the migration.
+  - The next start uses the copy.
+  - A failure before the switch runs the guest on its own disk and aborts the copy. A switch that answers an error is `unknown`, and nothing is deleted.
+  - A copy no longer asked for is aborted, and so is a copy whose VMI is deleted.
+  - Refused: claims, handed volumes, the seed, cloud-hypervisor, and a machine being live-migrated. A machine with a moved disk is not live-migrated (#40).
+  - stormvm 93cf070 → 01ac271 (rev only).
+  - Filed stormblock#519: relay `PUT …/owner` to the peer, so a moved disk is deleted with its VM.
 - **fix:** stormvm a8b509d → 93cf070 (#301, stormvm#28), every stormvm crate by rev; stormpump stays 9877a97. A VirtualMachineSnapshot of a VM whose guest agent channel has nobody behind it no longer fails after two 30 s waits (`guest-fsfreeze-thaw did not answer`): the agent is pinged first (≤ 5 s), a silent one is `NoGuestAgent`, crash-consistent, no freeze or thaw. A snapshot right after Running no longer fails `control.sock is not connectable`: an unbound control socket gets 5 s. No API change (upstream changed no Cargo manifest; rev-only bump in pkg/kubelet/Cargo.toml and Cargo.lock).
 
 ## 2026-10-30

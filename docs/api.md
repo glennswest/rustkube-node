@@ -93,4 +93,6 @@ VirtualMachineRestore is served the same way, by the node that took the
 snapshot (#53, option A of #109: the VM's disks are rewritten to restored
 PVCs; README, "Restores"). A VMI's live migration is driven by its `status.migrationState` (#40; README, "Live
 migration"): no kubelet route; the memory travels qemu to qemu over TLS on the target's `--migration-port`
-(49152 up, one per arriving machine), which must be reachable from the other nodes.
+(49152 up, one per arriving machine), which must be reachable from the other nodes. A running disk is moved to another
+node's storage by the VMI annotation `storm.io/move-disks` (`{"<disk>": "<node>"}`); the kubelet's progress and
+outcome are in `storm.io/disk-moves` (#302; README, "A running disk moved off the node"): no kubelet route either.
