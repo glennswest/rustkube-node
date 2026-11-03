@@ -13,7 +13,7 @@ stage golden through `stormcentral component stage rustkube-node`, not a package
 
 ## Current implementation reference (2026-10-30)
 
-Main baseline: a3ec977 (#40 live migration kubelet half, #160 parked startup admission, #292 ring arena per request; every git dependency by rev, #210; stage builds are listed per issue in the work plan). See
+Main baseline: f496135 (stormvm 93cf070, #301; #40 live migration kubelet half, #160 parked startup admission, #292 ring arena per request; every git dependency by rev, #210; stage builds are listed per issue in the work plan). See
 `docs/status.md` for changes since October 2, the owner's recorded decisions and issue-backed limitations,
 `docs/configuration.md` for every CLI/env/default, `docs/api.md` for ports and actual routes, `docs/retries.md`
 for every remote call's retry policy. CLI runtime defaults to native; stormcos explicitly chooses stormpump.
@@ -58,13 +58,16 @@ by #51.
 
 ## Work plan
 
-### In progress: #301 (P1), stormvm → 93cf070: snapshot of a VM with no guest agent, or right after Running (stormvm#28)
+### Done: #301 (P1), stormvm → 93cf070: snapshot of a VM with no guest agent, or right after Running (stormvm#28)
 
 2026-11-03. stormvm 93cf070 (8 commits on a8b509d; code only in stormvm-control's snapshot.rs/lib.rs, no Cargo.toml or
 Cargo.lock change upstream; main c487c7a adds docs only). The kubelet passes indications through as strings, so no API
 change here. Doing: rev-only bump of every stormvm crate in pkg/kubelet/Cargo.toml and Cargo.lock; CHANGELOG, README/
 status.md where the lock rev is named; SC_BUILD_VM sc-build `--locked`; stage; close #301 (stormvm#28 closes on medium's
 `snapshot-*` with a release carrying it).
+Done: f496135. SC_BUILD_VM sc-build (job ff68a21efe) `cargo metadata --locked && cargo build --locked && cargo test --locked`:
+every stormvm crate at 93cf070, 575 kubelet unit, all suites pass, warnings = #227's. Stage build 28a1d1ad43c1. Closed.
+Live: stormvm's medium `snapshot-*` on a release carrying it (stormvm#28's).
 
 ### Waiting on stormcos#682 (+ stormcos#288, stormstorage#56) for the live run: #40 (P3), live migration of stormvm-started VMIs
 
