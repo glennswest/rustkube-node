@@ -320,6 +320,7 @@ pub struct DiskMigration {
     /// T's engine-local volume id: what the target attaches.
     pub target_id: Option<String>,
     pub bytes_remaining: u64,
+    pub bytes_total: u64,
 }
 
 impl DiskMigration {
@@ -330,6 +331,7 @@ impl DiskMigration {
             message: v["message"].as_str().unwrap_or_default().to_string(),
             target_id: v["target"]["id"].as_str().or(v["target_local_id"].as_str()).map(str::to_string),
             bytes_remaining: v["bytes_remaining"].as_u64().unwrap_or(0),
+            bytes_total: v["bytes_total"].as_u64().unwrap_or(0),
         }
     }
 }

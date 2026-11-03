@@ -183,6 +183,18 @@ pub trait Hotplug: Send + Sync {
     /// Take a disk out; the guest has to release it. The volume stays
     /// attached: detaching it is the caller's.
     async fn remove_disk(&self, name: &str) -> Result<(), String>;
+    /// Stop the guest's vCPUs (#302: across a disk's cutover and switch).
+    async fn pause(&self) -> Result<(), String> {
+        Err("this machine cannot be paused here".into())
+    }
+    async fn unpause(&self) -> Result<(), String> {
+        Err("this machine cannot be unpaused here".into())
+    }
+    /// Put the disk on device `from` onto device `to`, which holds the same
+    /// bytes (#302, stormvm#29). The old device is free once this returns.
+    async fn switch_disk(&self, _from: &str, _to: &str, _discard: bool) -> Result<(), String> {
+        Err("this machine cannot put a disk on another device".into())
+    }
 }
 
 /// What the guest can use now (`current()`: the balloon's share of the boot
@@ -222,6 +234,16 @@ impl Hotplug for stormvm_control::Machine {
     }
     async fn remove_disk(&self, name: &str) -> Result<(), String> {
         stormvm_control::Machine::remove_disk(self, name).await.map_err(|e| e.to_string())
+    }
+    async fn pause(&self) -> Result<(), String> {
+        stormvm_control::Machine::pause(self).await.map_err(|e| e.to_string())
+    }
+    async fn unpause(&self) -> Result<(), String> {
+        stormvm_control::Machine::unpause(self).await.map_err(|e| e.to_string())
+    }
+    async fn switch_disk(&self, from: &str, to: &str, discard: bool) -> Result<(), String> {
+        let sw = stormvm_control::hotplug::DiskSwitch { from: from.into(), to: to.into(), discard };
+        stormvm_control::Machine::switch_disk(self, &sw).await.map(|_| ()).map_err(|e| e.to_string())
     }
 }
 

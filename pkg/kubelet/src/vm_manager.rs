@@ -1040,6 +1040,12 @@ pub struct VmManager {
     /// Migrations whose disks are finished (cut over and completed, or
     /// aborted), by migration uid (#40).
     disks_done: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Each VMI's disks that sit on a volume a move made (#302), by uid: what
+    /// a start attaches instead of finding the disk by name.
+    moved_disks: std::sync::Mutex<HashMap<String, std::collections::BTreeMap<String, String>>>,
+    /// Each VMI's disk-move record as this kubelet last wrote it (#302), by
+    /// uid: the watch's copy can still be the one before.
+    disk_moves: std::sync::Mutex<HashMap<String, std::collections::BTreeMap<String, crate::vm_disk_move::Move>>>,
 }
 
 /// A machine's migration verbs (#40).
@@ -1310,6 +1316,8 @@ impl VmManager {
             forced: Default::default(),
             sent: Default::default(),
             disks_done: Default::default(),
+            moved_disks: Default::default(),
+            disk_moves: Default::default(),
         }
     }
 
@@ -1824,6 +1832,12 @@ impl VmManager {
             }
         }
         if object.map_or(true, terminating) {
+            // A disk's copy in flight (#302) is for nothing now.
+            if let Some(object) = object {
+                self.abort_disk_moves(object).await;
+            }
+            self.moved_disks.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+            self.disk_moves.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
             // A receiver whose migration went away with it, and anything
             // being stopped by force (#40).
             if let Some(inc) = self.incoming.lock().await.remove(uid) {
@@ -1848,6 +1862,23 @@ impl VmManager {
             return Ok(true);
         }
         let object = object.unwrap();
+        // Disks a move (#302) put on another volume: a start attaches those.
+        {
+            let mut moved = crate::vm_disk_move::moved_volumes(object);
+            if let Some(mine) = self.disk_moves.lock().unwrap_or_else(|e| e.into_inner()).get(uid) {
+                moved = mine
+                    .iter()
+                    .filter(|(_, m)| matches!(m.state.as_str(), crate::vm_disk_move::SWITCHED | crate::vm_disk_move::MOVED))
+                    .map(|(d, m)| (d.clone(), m.volume.clone()))
+                    .collect();
+            }
+            let mut all = self.moved_disks.lock().unwrap_or_else(|e| e.into_inner());
+            if moved.is_empty() {
+                all.remove(uid);
+            } else {
+                all.insert(uid.to_string(), moved);
+            }
+        }
         // A machine leaving or arriving (#40): its migration's pass, before
         // anything reports it as this node's.
         if !self.finish_forced(uid).await {
@@ -1875,6 +1906,8 @@ impl VmManager {
         }
         // A running machine follows its VMI's cpu, memory and interfaces (#246).
         self.hotplug(uid, object).await;
+        // And a disk asked onto another node's storage goes there (#302).
+        self.move_disks(uid, object).await;
         Ok(false)
     }
 
@@ -2864,7 +2897,8 @@ impl VmManager {
                     // `volume_by_name` returned whichever the map iterated
                     // first.
                     let name = stormvm_node::start::volume_name(vm, &d.name);
-                    match self.reuse(&d.name, &name, owner).await {
+                    let moved = self.moved_volume(uid, &d.name);
+                    match match moved { Some(id) => Ok(Some(id)), None => self.reuse(&d.name, &name, owner).await } {
                         Ok(Some(id)) => id,
                         Ok(None) => {
                     let mut body = json!({
@@ -2959,7 +2993,8 @@ impl VmManager {
                 // a restart would lose everything the guest wrote to it.
                 DiskSource::Empty => {
                     let name = stormvm_node::start::volume_name(vm, &d.name);
-                    let found = match self.reuse(&d.name, &name, owner).await {
+                    let moved = self.moved_volume(uid, &d.name);
+                    let found = match match moved { Some(id) => Ok(Some(id)), None => self.reuse(&d.name, &name, owner).await } {
                         Ok(found) => found,
                         Err(e) => {
                             self.give_back_disks(uid, &done, hot.then_some(vm)).await;
@@ -5190,7 +5225,9 @@ impl VmManager {
         let kind = stormvm_node::console::find(RUN_ROOT, &vm.namespace, &vm.name).map(|r| r.vmm).unwrap_or_default();
         let disks: Vec<(String, Option<String>)> = vm.disks.iter().map(|d| (d.name.clone(), d.volume_id.clone())).collect();
         let on_pod_network = self.pod_nets.lock().unwrap_or_else(|e| e.into_inner()).contains_key(uid);
-        if let Some(why) = mig::refusal(&kind, &disks, &vm.owned_volumes, on_pod_network) {
+        if let Some(why) = mig::refusal(&kind, &disks, &vm.owned_volumes, on_pod_network)
+            .or_else(|| crate::vm_disk_move::off_node(object, &self.node_name).map(|d| format!("{d}: not migrated yet")))
+        {
             self.fail_migration(object, s, &why, false).await;
             return false;
         }
@@ -5652,6 +5689,443 @@ impl VmManager {
             self.event(object, "Normal", "MigrationDisksMoved", &format!("{} disk(s) now on {}", disks.len(), self.node_name)).await;
         } else {
             self.due_in(uid, mig::POLL);
+        }
+    }
+
+    /// The volume a move (#302) put disk `disk` of VMI `uid` on, if one did.
+    fn moved_volume(&self, uid: &str, disk: &str) -> Option<String> {
+        self.moved_disks.lock().unwrap_or_else(|e| e.into_inner()).get(uid).and_then(|m| m.get(disk).cloned())
+    }
+
+    /// The disk-move record (#302): what this kubelet last wrote, else the
+    /// VMI's.
+    fn disk_move_records(&self, uid: &str, object: &Value) -> std::collections::BTreeMap<String, crate::vm_disk_move::Move> {
+        if let Some(r) = self.disk_moves.lock().unwrap_or_else(|e| e.into_inner()).get(uid) {
+            return r.clone();
+        }
+        crate::vm_disk_move::records(object)
+    }
+
+    /// Write the disk-move record onto the VMI (and keep it here).
+    async fn write_disk_moves(
+        &self,
+        uid: &str,
+        object: &Value,
+        records: &std::collections::BTreeMap<String, crate::vm_disk_move::Move>,
+    ) -> bool {
+        if !self.annotate(object, crate::vm_disk_move::record_patch(uid, records)).await {
+            warn!(vmi = %object["metadata"]["name"].as_str().unwrap_or(""), "the disk-move record was not written; retried");
+            return false;
+        }
+        self.disk_moves.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), records.clone());
+        let moved: std::collections::BTreeMap<String, String> = records
+            .iter()
+            .filter(|(_, m)| matches!(m.state.as_str(), crate::vm_disk_move::SWITCHED | crate::vm_disk_move::MOVED))
+            .map(|(d, m)| (d.clone(), m.volume.clone()))
+            .collect();
+        let mut all = self.moved_disks.lock().unwrap_or_else(|e| e.into_inner());
+        if moved.is_empty() {
+            all.remove(uid);
+        } else {
+            all.insert(uid.to_string(), moved);
+        }
+        true
+    }
+
+    /// A deleted VMI's disk copies in flight (#302) aborted: the copy goes,
+    /// the source is the machine's as before (and goes with it, #75).
+    async fn abort_disk_moves(&self, object: &Value) {
+        use crate::vm_migration::Stormstorage;
+        let Some(ss) = self.migration.stormstorage.as_ref() else { return };
+        let uid = object["metadata"]["uid"].as_str().unwrap_or("");
+        for (disk, r) in self.disk_move_records(uid, object) {
+            if r.state == crate::vm_disk_move::COPYING && !r.migration.is_empty() {
+                if let Err(e) = Stormstorage(ss).step(&r.migration, "abort").await {
+                    warn!(%disk, "disk move {}: abort refused, stormstorage's reconciler finishes it: {e}", r.migration);
+                }
+            }
+        }
+    }
+
+    /// A running machine's disks moved onto the nodes its VMI asks for
+    /// (#302): see [`crate::vm_disk_move`].
+    async fn move_disks(&self, uid: &str, object: &Value) {
+        use crate::vm_disk_move::{self as dm, Step};
+        let wanted = match dm::requests(object) {
+            Ok(w) => w,
+            Err(e) => {
+                // Read as nothing asked would cancel a copy for a typo.
+                warn!(vmi = %object["metadata"]["name"].as_str().unwrap_or(""), "disk moves not looked at: {e}");
+                return;
+            }
+        };
+        let before = self.disk_move_records(uid, object);
+        if wanted.is_empty() && before.is_empty() {
+            return;
+        }
+        let Some(mut vm) = self.vms.lock().await.get(uid).cloned().filter(|v| !v.phase.terminal()) else { return };
+        let mut records = before.clone();
+        let disks: std::collections::BTreeSet<String> = wanted.keys().chain(before.keys()).cloned().collect();
+        for disk in disks {
+            let rec = records.get(&disk).cloned();
+            match dm::step(wanted.get(&disk).map(String::as_str), rec.as_ref(), &self.node_name) {
+                Step::Nothing => {}
+                Step::Forget => {
+                    records.remove(&disk);
+                }
+                Step::Start(to) => {
+                    let r = self.start_disk_move(object, &vm, &disk, &to, rec.as_ref()).await;
+                    records.insert(disk, r);
+                }
+                Step::Cancel => {
+                    let mut r = rec.expect("a record to cancel");
+                    if let Some(ss) = self.migration.stormstorage.as_ref() {
+                        match crate::vm_migration::Stormstorage(ss).step(&r.migration, "abort").await {
+                            Ok(_) => {
+                                r.state = dm::FAILED.into();
+                                r.message = "cancelled: the request no longer names this node".into();
+                                self.event_of(&vm, "Normal", "DiskMoveCancelled", &format!("disk {disk}: copy to {} aborted", r.to)).await;
+                            }
+                            Err(e) => warn!(vm = %vm.name, %disk, "disk move {}: abort refused, retried: {e}", r.migration),
+                        }
+                    }
+                    records.insert(disk, r);
+                }
+                Step::Continue => {
+                    let mut r = rec.expect("a record to carry on");
+                    self.carry_disk_move(uid, object, &mut vm, &disk, &mut r, &mut records).await;
+                    records.insert(disk, r);
+                }
+            }
+        }
+        if records != before {
+            self.write_disk_moves(uid, object, &records).await;
+        }
+        if records.values().any(dm::Move::active) {
+            self.due_in(uid, dm::POLL);
+        }
+    }
+
+    /// Start moving disk `disk` to node `to`: refused (saying why) or the
+    /// mirror started.
+    async fn start_disk_move(
+        &self,
+        object: &Value,
+        vm: &Vm,
+        disk: &str,
+        to: &str,
+        prior: Option<&crate::vm_disk_move::Move>,
+    ) -> crate::vm_disk_move::Move {
+        use crate::vm_disk_move as dm;
+        let d = vm.disks.iter().find(|d| d.name == disk);
+        let volume = d.and_then(|d| d.volume_id.clone());
+        let node = match prior.and_then(dm::Move::location) {
+            Some((n, _)) => n.to_string(),
+            None => self.node_name.clone(),
+        };
+        let mut r = dm::Move { to: to.into(), node: node.clone(), from: volume.clone().unwrap_or_default(), ..Default::default() };
+        let fail = |mut r: dm::Move, why: String| {
+            r.state = dm::FAILED.into();
+            r.message = why;
+            r
+        };
+        if d.is_none() {
+            return fail(r, format!("the machine has no disk {disk}"));
+        }
+        let kind = stormvm_node::console::find(RUN_ROOT, &vm.namespace, &vm.name).map(|r| r.vmm).unwrap_or_default();
+        let seed = stormvm_spec::kube::from_kube(object)
+            .ok()
+            .and_then(|s: VmSpec| s.disks.into_iter().find(|x| x.name == disk))
+            .is_some_and(|x| matches!(x.from, DiskSource::CloudInit));
+        let owned = volume.as_ref().is_some_and(|v| vm.owned_volumes.contains(v));
+        let migrating = crate::vm_migration::State::of(object).is_some_and(|s| s.active());
+        if let Some(why) = dm::refusal(disk, &kind, volume.as_deref(), owned, seed, migrating) {
+            self.event_of(vm, "Warning", "DiskMoveRefused", &why).await;
+            return fail(r, why);
+        }
+        let Some(ss) = self.migration.stormstorage.as_ref() else {
+            return fail(r, "this node has no stormstorage (--stormstorage)".into());
+        };
+        match crate::vm_migration::Stormstorage(ss).start(&node, &r.from, to).await {
+            Ok(m) => {
+                info!(vm = %vm.name, %disk, "moving to {to}: migration {}", m.id);
+                self.event_of(vm, "Normal", "DiskMoving", &format!("disk {disk}: copying to {to}")).await;
+                r.migration = m.id;
+                r.state = dm::COPYING.into();
+                r.volume = m.target_id.unwrap_or_default();
+                r.bytes_total = m.bytes_total;
+                r.bytes_remaining = m.bytes_remaining;
+                r
+            }
+            Err(e) => {
+                self.event_of(vm, "Warning", "DiskMoveFailed", &format!("disk {disk}: {e}")).await;
+                fail(r, e)
+            }
+        }
+    }
+
+    /// A move in flight, one step further: progress, the switch once the
+    /// copy is in sync, the source retired once the disk is on the copy.
+    async fn carry_disk_move(
+        &self,
+        uid: &str,
+        object: &Value,
+        vm: &mut Vm,
+        disk: &str,
+        r: &mut crate::vm_disk_move::Move,
+        records: &mut std::collections::BTreeMap<String, crate::vm_disk_move::Move>,
+    ) {
+        use crate::vm_disk_move as dm;
+        use crate::vm_migration::Stormstorage;
+        let Some(ss) = self.migration.stormstorage.as_ref() else {
+            r.message = "this node has no stormstorage (--stormstorage) any more".into();
+            return;
+        };
+        let on_copy = !r.volume.is_empty()
+            && vm.disks.iter().any(|d| d.name == disk && d.volume_id.as_deref() == Some(r.volume.as_str()));
+        if r.state == dm::SWITCHING {
+            if on_copy {
+                r.state = dm::SWITCHED.into();
+            } else {
+                // A kubelet that stopped half way: the cutover tells.
+                let machine = (self.hot_machine)(&*vm);
+                let state = Stormstorage(ss).get(&r.migration).await.map(|m| m.state);
+                if let Some(m) = &machine {
+                    if let Err(e) = m.unpause().await {
+                        warn!(vm = %vm.name, "after a switch left half way, the guest would not run: {e}");
+                    }
+                }
+                match state.as_deref() {
+                    Ok("synced" | "copying") => {
+                        r.state = dm::COPYING.into();
+                        r.message = "the switch was left before the cutover; tried again".into();
+                    }
+                    Ok(s) => {
+                        r.state = dm::UNKNOWN.into();
+                        r.message = format!(
+                            "the kubelet stopped during the switch (migration {} is {s}); nothing was deleted: the \
+                             guest is on {} unless the switch went through",
+                            r.migration, r.from
+                        );
+                        self.event_of(vm, "Warning", "DiskMoveUnknown", &format!("disk {disk}: {}", r.message)).await;
+                    }
+                    Err(e) => warn!(vm = %vm.name, %disk, "disk move {}: {e}", r.migration),
+                }
+                return;
+            }
+        }
+        if r.state == dm::SWITCHED {
+            self.retire_disk_source(vm, disk, r).await;
+            return;
+        }
+        // Copying.
+        if on_copy {
+            r.state = dm::SWITCHED.into();
+            self.retire_disk_source(vm, disk, r).await;
+            return;
+        }
+        let m = match Stormstorage(ss).get(&r.migration).await {
+            Ok(m) => m,
+            Err(e) if e.contains("404") => {
+                r.state = dm::FAILED.into();
+                r.message = format!("stormstorage no longer has migration {}", r.migration);
+                return;
+            }
+            Err(e) => {
+                warn!(vm = %vm.name, %disk, "disk move {}: {e}", r.migration);
+                return;
+            }
+        };
+        r.bytes_total = m.bytes_total;
+        r.bytes_remaining = m.bytes_remaining;
+        if let Some(t) = &m.target_id {
+            r.volume = t.clone();
+        }
+        match m.state.as_str() {
+            "failed" | "aborted" => {
+                r.state = dm::FAILED.into();
+                r.message = format!("the copy {}: {}", m.state, m.message);
+                self.event_of(vm, "Warning", "DiskMoveFailed", &format!("disk {disk}: {}", r.message)).await;
+            }
+            "synced" if !r.volume.is_empty() => self.switch_disk_over(uid, object, vm, disk, r, records).await,
+            "cut_over" | "completed" => {
+                // Not this kubelet's cutover: the guest is on the source, which
+                // no longer mirrors. The copy is stale; S is the disk.
+                let why = format!("migration {} was cut over with the guest still on {}", r.migration, r.from);
+                let aborted = Stormstorage(ss).step(&r.migration, "abort").await;
+                r.state = dm::FAILED.into();
+                r.message = match aborted {
+                    Ok(_) => format!("{why}: aborted"),
+                    Err(e) => format!("{why}: the abort was refused ({e})"),
+                };
+                self.event_of(vm, "Warning", "DiskMoveFailed", &format!("disk {disk}: {}", r.message)).await;
+            }
+            _ => {}
+        }
+    }
+
+    /// The copy is in sync: pause, cut over, attach the copy here, switch,
+    /// run. A failure before the switch runs the guest again on the source
+    /// and aborts the copy; a failed switch deletes nothing ([`crate::vm_disk_move::UNKNOWN`]).
+    async fn switch_disk_over(
+        &self,
+        uid: &str,
+        object: &Value,
+        vm: &mut Vm,
+        disk: &str,
+        r: &mut crate::vm_disk_move::Move,
+        records: &mut std::collections::BTreeMap<String, crate::vm_disk_move::Move>,
+    ) {
+        use crate::vm_disk_move as dm;
+        use crate::vm_migration::Stormstorage;
+        let ss = self.migration.stormstorage.as_ref().expect("checked by the caller");
+        let Some(machine) = (self.hot_machine)(&*vm) else { return };
+        let Some(i) = vm.disks.iter().position(|d| d.name == disk) else { return };
+        let discard = stormvm_spec::kube::from_kube(object)
+            .ok()
+            .and_then(|s: VmSpec| s.disks.into_iter().find(|x| x.name == disk))
+            .is_some_and(|x| x.discard);
+        // On record before the guest stops: a kubelet that stops half way
+        // finds it, and the registration says how far it got.
+        r.state = dm::SWITCHING.into();
+        r.message.clear();
+        records.insert(disk.to_string(), r.clone());
+        if !self.write_disk_moves(uid, object, records).await {
+            r.state = dm::COPYING.into();
+            return;
+        }
+        let began = std::time::Instant::now();
+        if let Err(e) = machine.pause().await {
+            r.state = dm::COPYING.into();
+            r.message = format!("the guest would not pause, tried again: {e}");
+            return;
+        }
+        match Stormstorage(ss).step(&r.migration, "cutover").await {
+            Ok(m) if m.state == "cut_over" => {}
+            Ok(m) => {
+                let why = format!("the cutover left the migration {} ({})", m.state, m.message);
+                return self.undo_disk_switch(machine.as_ref(), vm, disk, r, why).await;
+            }
+            Err(e) => return self.undo_disk_switch(machine.as_ref(), vm, disk, r, format!("the cutover was refused: {e}")).await,
+        }
+        let attached = self
+            .post(&format!("{}/api/v1/volumes/{}/attach", self.storage, r.volume), &json!({ "transport": "ublk" }))
+            .await
+            .and_then(|v| v["device_hint"].as_str().map(str::to_string).ok_or(format!("no local device: {v}")));
+        let device = match attached {
+            Ok(d) => d,
+            Err(e) => {
+                let why = format!("the copy {} would not attach here: {e}", r.volume);
+                return self.undo_disk_switch(machine.as_ref(), vm, disk, r, why).await;
+            }
+        };
+        let from_device = vm.disks[i].device.clone();
+        if let Err(e) = machine.switch_disk(&from_device, &device, discard).await {
+            if let Err(e) = machine.unpause().await {
+                warn!(vm = %vm.name, "the guest would not run again: {e}");
+            }
+            r.state = dm::UNKNOWN.into();
+            r.message = format!(
+                "the switch to {device} answered: {e}. Nothing was deleted: migration {} is cut over and the copy {} \
+                 attached here; the guest is on {} unless the switch went through",
+                r.migration, r.volume, r.from
+            );
+            self.event_of(vm, "Warning", "DiskMoveUnknown", &format!("disk {disk}: {}", r.message)).await;
+            return;
+        }
+        // The disk is on the copy: recorded where a restart finds it.
+        vm.disks[i].device = device.clone();
+        vm.disks[i].volume_id = Some(r.volume.clone());
+        for v in vm.owned_volumes.iter_mut() {
+            if *v == r.from {
+                *v = r.volume.clone();
+            }
+        }
+        record_disks(vm);
+        self.vms.lock().await.update(uid, |cur| {
+            cur.disks = vm.disks.clone();
+            cur.owned_volumes = vm.owned_volumes.clone();
+        });
+        r.state = dm::SWITCHED.into();
+        let mut ran = Err(String::new());
+        for _ in 0..3 {
+            ran = machine.unpause().await;
+            if ran.is_ok() {
+                break;
+            }
+        }
+        let paused = began.elapsed().as_millis();
+        if let Err(e) = ran {
+            r.message = format!("on the copy, but the guest would not run again: {e}");
+            self.event_of(vm, "Warning", "DiskMoveUnpause", &format!("disk {disk}: {}", r.message)).await;
+        }
+        info!(vm = %vm.name, %disk, %device, paused_ms = paused as u64, "disk on {}'s copy {}", r.to, r.volume);
+        // Its owner as before (#75), where the engine relays it to the peer.
+        let owner = self.owner_of(object).await;
+        if !owner.is_null() {
+            self.set_volume_owner(&r.volume, &owner).await;
+        }
+        self.retire_disk_source(vm, disk, r).await;
+    }
+
+    /// A switch given up before the disk moved: the guest runs again on the
+    /// source, and the copy is aborted (deleted; the source as it was).
+    async fn undo_disk_switch(
+        &self,
+        machine: &dyn crate::vm_hotplug::Hotplug,
+        vm: &Vm,
+        disk: &str,
+        r: &mut crate::vm_disk_move::Move,
+        why: String,
+    ) {
+        if let Err(e) = machine.unpause().await {
+            warn!(vm = %vm.name, "the guest would not run again: {e}");
+        }
+        let aborted = match self.migration.stormstorage.as_ref() {
+            Some(ss) => crate::vm_migration::Stormstorage(ss).step(&r.migration, "abort").await.map(|_| ()),
+            None => Err("no stormstorage".into()),
+        };
+        r.state = crate::vm_disk_move::FAILED.into();
+        r.message = match aborted {
+            Ok(()) => why,
+            Err(e) => format!("{why}; the copy's abort was refused ({e})"),
+        };
+        self.event_of(vm, "Warning", "DiskMoveFailed", &format!("disk {disk}: {}", r.message)).await;
+    }
+
+    /// The disk is on the copy: the source's attachment here let go, then
+    /// the source's volume retired (`complete`). Retried until both are done.
+    async fn retire_disk_source(&self, vm: &Vm, disk: &str, r: &mut crate::vm_disk_move::Move) {
+        use crate::vm_disk_move as dm;
+        use crate::vm_migration::Stormstorage;
+        let Some(ss) = self.migration.stormstorage.as_ref() else { return };
+        let url = format!("{}/api/v1/volumes/{}/attach", self.storage, r.from);
+        match self.engine.delete(&url).await {
+            Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 404 => {}
+            Ok(resp) => {
+                r.message = format!("the source {} is still attached here: {}", r.from, resp.status());
+                return;
+            }
+            Err(e) => {
+                r.message = format!("the source {} is still attached here: {e}", r.from);
+                return;
+            }
+        }
+        let done = match Stormstorage(ss).step(&r.migration, "complete").await {
+            Ok(m) => m.state == "completed",
+            Err(e) => match Stormstorage(ss).get(&r.migration).await {
+                Ok(m) if m.state == "completed" => true,
+                _ => {
+                    r.message = format!("the source {} is not retired yet: {e}", r.from);
+                    false
+                }
+            },
+        };
+        if done {
+            r.state = dm::MOVED.into();
+            r.message.clear();
+            r.bytes_remaining = 0;
+            self.event_of(vm, "Normal", "DiskMoved", &format!("disk {disk} is on {}'s storage", r.to)).await;
         }
     }
 
