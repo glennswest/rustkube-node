@@ -58,6 +58,26 @@ by #51.
 
 ## Work plan
 
+### In progress: #302 (P3), move a running VMI's disk off the node (stormstorage migrate → cutover → stormvm switch_disk)
+
+2026-11-03. stormvm 01ac271 (b326f7c main: docs) has `Machine::switch_disk(&DiskSwitch {from, to, discard})` (qemu only;
+blockdev-add + blockdev-reopen, no data moved); no Cargo.toml change upstream since 93cf070: rev-only bump. stormstorage#44's
+verbs are in `vm_migration::Stormstorage` (#40). stormblock#328: the local engine attaches a peer's volume by id and
+answers a ublk `device_hint`; only clone/attach/GET/detach are relayed (not `PUT …/owner`, not DELETE). Chosen (the issue
+leaves the ask to the kubelet): VMI annotation `storm.io/move-disks` `{"<disk>": "<node>"}` (the request), kubelet's
+record `storm.io/disk-moves` `{"<disk>": {to, node, from, migration, state, bytesTotal, bytesRemaining, volume, message}}`
+(progress for stormconsole, and the resume point after a restart). Doing:
+1. [ ] Bump every stormvm rev 93cf070 → 01ac271 (Cargo.toml, Cargo.lock).
+2. [ ] `vm_disk_move.rs`: request/record parse, refusals (not the machine's own volume, cloud-hypervisor, a #40
+       migration active, already there), state helpers; `Hotplug` gains pause/unpause/switch_disk.
+3. [ ] VmManager pass (after hotplug): start → `copying` (record); poll (progress); `synced` → pause → cutover → attach
+       T's id here → switch_disk → unpause → detach S → complete → `moved` (vm.disks/owned/registration rewritten,
+       owner set best effort). Failure before the switch: unpause + abort, `failed`; a failed switch: unpause, `failed`,
+       nothing deleted (the answer may have been lost). Restart while switching: the registration says which volume.
+       A start uses a moved disk's recorded volume; a deleted VMI aborts a copy in flight.
+4. [ ] Tests (fake stormstorage + engine + machine), README/api.md/status.md, CHANGELOG; sc-build; stage; file stormblock
+       (relay `PUT …/owner` to the peer, so T's sweep deletes a moved disk); live check on a two-node fabric.
+
 ### Done: #301 (P1), stormvm → 93cf070: snapshot of a VM with no guest agent, or right after Running (stormvm#28)
 
 2026-11-03. stormvm 93cf070 (8 commits on a8b509d; code only in stormvm-control's snapshot.rs/lib.rs, no Cargo.toml or
