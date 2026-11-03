@@ -13,7 +13,7 @@ stage golden through `stormcentral component stage rustkube-node`, not a package
 
 ## Current implementation reference (2026-10-30)
 
-Main baseline: f496135 (stormvm 93cf070, #301; #40 live migration kubelet half, #160 parked startup admission, #292 ring arena per request; every git dependency by rev, #210; stage builds are listed per issue in the work plan). See
+Main baseline: f54715e (stormvm 01ac271, #302 disk moves off the node; #301; #40 live migration kubelet half, #160 parked startup admission, #292 ring arena per request; every git dependency by rev, #210; stage builds are listed per issue in the work plan). See
 `docs/status.md` for changes since October 2, the owner's recorded decisions and issue-backed limitations,
 `docs/configuration.md` for every CLI/env/default, `docs/api.md` for ports and actual routes, `docs/retries.md`
 for every remote call's retry policy. CLI runtime defaults to native; stormcos explicitly chooses stormpump.
@@ -58,7 +58,7 @@ by #51.
 
 ## Work plan
 
-### In progress: #302 (P3), move a running VMI's disk off the node (stormstorage migrate → cutover → stormvm switch_disk)
+### Done: #302 (P3), move a running VMI's disk off the node (stormstorage migrate → cutover → stormvm switch_disk)
 
 2026-11-03. stormvm 01ac271 (b326f7c main: docs) has `Machine::switch_disk(&DiskSwitch {from, to, discard})` (qemu only;
 blockdev-add + blockdev-reopen, no data moved); no Cargo.toml change upstream since 93cf070: rev-only bump. stormstorage#44's
@@ -67,16 +67,20 @@ answers a ublk `device_hint`; only clone/attach/GET/detach are relayed (not `PUT
 leaves the ask to the kubelet): VMI annotation `storm.io/move-disks` `{"<disk>": "<node>"}` (the request), kubelet's
 record `storm.io/disk-moves` `{"<disk>": {to, node, from, migration, state, bytesTotal, bytesRemaining, volume, message}}`
 (progress for stormconsole, and the resume point after a restart). Doing:
-1. [ ] Bump every stormvm rev 93cf070 → 01ac271 (Cargo.toml, Cargo.lock).
-2. [ ] `vm_disk_move.rs`: request/record parse, refusals (not the machine's own volume, cloud-hypervisor, a #40
+1. [x] Bump every stormvm rev 93cf070 → 01ac271 (Cargo.toml, Cargo.lock).
+2. [x] `vm_disk_move.rs`: request/record parse, refusals (not the machine's own volume, cloud-hypervisor, a #40
        migration active, already there), state helpers; `Hotplug` gains pause/unpause/switch_disk.
-3. [ ] VmManager pass (after hotplug): start → `copying` (record); poll (progress); `synced` → pause → cutover → attach
+3. [x] VmManager pass (after hotplug): start → `copying` (record); poll (progress); `synced` → pause → cutover → attach
        T's id here → switch_disk → unpause → detach S → complete → `moved` (vm.disks/owned/registration rewritten,
        owner set best effort). Failure before the switch: unpause + abort, `failed`; a failed switch: unpause, `failed`,
        nothing deleted (the answer may have been lost). Restart while switching: the registration says which volume.
        A start uses a moved disk's recorded volume; a deleted VMI aborts a copy in flight.
-4. [ ] Tests (fake stormstorage + engine + machine), README/api.md/status.md, CHANGELOG; sc-build; stage; file stormblock
+4. [x] Tests (fake stormstorage + engine + machine), README/api.md/status.md, CHANGELOG; sc-build; stage; file stormblock
        (relay `PUT …/owner` to the peer, so T's sweep deletes a moved disk); live check on a two-node fabric.
+       Done: rev bump, f54715e code + 11 tests (5 unit, 6 manager), docs. SC_BUILD_VM sc-build f54715e (job b5464f583b): 586
+       kubelet unit, all suites, nothing from rustc in the touched files (#227's elsewhere). Stage build 5b986cc9e472. Filed
+       stormblock#519 (owner relay). Closed. Live: two-node fabric (stormstorage on more than sno: stormstorage#56/stormcos#354),
+       a write loop in the guest while its data disk moves; by-id unchanged, data there after a reboot.
 
 ### Done: #301 (P1), stormvm → 93cf070: snapshot of a VM with no guest agent, or right after Running (stormvm#28)
 
