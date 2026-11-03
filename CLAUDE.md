@@ -58,6 +58,16 @@ by #51.
 
 ## Work plan
 
+### Doing: #303 (P3), a VMI reads Running only once its control socket answers (stormvm#28)
+
+2026-11-03. `start_attempt` writes Running right after the engine's spawn, before qemu binds QMP (medium 925ac816ff:
+`snapshot-take` 1 s after Running, `control.sock is not connectable`). Chosen (the issue's first option, KubeVirt's
+meaning of Running = the domain is up): after the spawn, `Machine::status_when_up` (stormvm 93cf070+) on the
+registration's control socket, bounded 10 s, raced against the machine's exit (ring exit broadcast, subscribed before
+the spawn). Answered (even with an error) → Running; exited → as today (the exit marks it); not up in 10 s → Running
+anyway with a Warning `ControlNotReady` Event (the machine runs; nothing killed). Start timing step `control`.
+Tests (answered, exited, never up), README/status.md, CHANGELOG; sc-build; stage; close.
+
 ### Done: #304 (P3), stormvm → 0225218: storm.io/bridge keeps multus/SR-IOV NICs on their network (stormvm#103)
 
 2026-11-03. stormvm 0225218 (7 commits on 01ac271: only stormvm-spec kube.rs, verify, docs; no Cargo.toml change; main
