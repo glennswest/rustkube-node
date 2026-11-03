@@ -2,6 +2,8 @@
 
 ## 2026-11-03
 
+- **fix:** stormvm 01ac271 → 0225218 (#304, stormvm#103), every stormvm crate by rev; stormpump stays 9877a97. A VMI with the machine-wide `storm.io/bridge` no longer puts a multus or SR-IOV interface on that bridge: the annotation replaces only the pod network (or no network), so an unwired SR-IOV NIC is refused at start instead of the VM running with a second bridged NIC, and a multus VLAN NIC (#85) stays on its VLAN. `storm.io/bridge.<iface>` on an `sriov` binding is refused by `from_kube`. No API change (rev-only bump in pkg/kubelet/Cargo.toml and Cargo.lock).
+
 - **feat:** A running VMI's disk moves to another node's storage while the VM stays where it is (#302, stormvm#29). The request is the VMI annotation `storm.io/move-disks` (`{"<disk>": "<node>"}`).
   - The kubelet mirrors the disk's volume through stormstorage (stormstorage#44). It records the move, with its progress, in `storm.io/disk-moves`.
   - Once the copy is in sync, the kubelet pauses the guest, cuts the migration over and attaches the copy through the node's stormblock (stormblock#328). It puts the disk on the copy's device with stormvm's `Machine::switch_disk`, runs the guest again, detaches the old volume and completes the migration.
