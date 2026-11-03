@@ -159,8 +159,15 @@ is answered:
 | `window` | waiting for the deposit window: another start's taps (#100) |
 | `launch` | taps, plan and the engine's spawn |
 | `record` | identity published, the registration rewritten with the handle |
+| `control` | the hypervisor's control socket answering a status (#303), at most 10 s; the hypervisor's exit ends it early |
 | `report` | the `Running` status patch |
 | `total` | seen → `Running` answered |
+
+A VMI reads `Running` only once its hypervisor answers on its control socket (QMP for qemu,
+the API socket for cloud-hypervisor; #303). Before, it read `Running` at the engine's spawn, and a
+client acting on it at once (a snapshot, a `/vmVerb`, hotplug) found no socket. A hypervisor that
+runs but has not answered within 10 s is reported `Running` anyway, with a Warning
+`ControlNotReady` Event that names the error.
 
 `attempts` counts start attempts. The `Started` Event is queued after `Running`, not awaited
 before it (an Event POST took 0.5–0.7 s on a busy apiserver).

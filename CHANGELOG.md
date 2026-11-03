@@ -2,6 +2,8 @@
 
 ## 2026-11-03
 
+- **fix:** A VMI reads `Running` only once its hypervisor's control socket answers a status (#303, stormvm#28). Before, it read `Running` at the engine's spawn, before qemu bound QMP, so a snapshot 1 s later failed with `control.sock is not connectable`; every other verb and client acting on Running had the same race. The start waits for `Machine::status_when_up` for up to 10 s and stops early if the hypervisor exits. A socket still not answering after that is reported `Running` with a Warning `ControlNotReady` Event, and the machine is not stopped. The new start-timing step is `control`.
+
 - **fix:** stormvm 01ac271 → 0225218 (#304, stormvm#103), every stormvm crate by rev; stormpump stays 9877a97. A VMI with the machine-wide `storm.io/bridge` no longer puts a multus or SR-IOV interface on that bridge: the annotation replaces only the pod network (or no network), so an unwired SR-IOV NIC is refused at start instead of the VM running with a second bridged NIC, and a multus VLAN NIC (#85) stays on its VLAN. `storm.io/bridge.<iface>` on an `sriov` binding is refused by `from_kube`. No API change (rev-only bump in pkg/kubelet/Cargo.toml and Cargo.lock).
 
 - **feat:** A running VMI's disk moves to another node's storage while the VM stays where it is (#302, stormvm#29). The request is the VMI annotation `storm.io/move-disks` (`{"<disk>": "<node>"}`).

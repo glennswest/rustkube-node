@@ -310,6 +310,49 @@ where
     }
 }
 
+/// How long a started machine's control socket is waited for before the
+/// VMI says Running anyway (#303). qemu binds it in well under a second.
+const CONTROL_UP_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What the wait for a started machine's control socket came to (#303).
+#[derive(Debug, PartialEq)]
+enum ControlUp {
+    /// It answered a status: an error answer counts, the socket is bound.
+    Answered,
+    /// The hypervisor exited first: its exit is what the VMI will say.
+    Exited,
+    /// Nothing answered in time, and why.
+    NotUp(String),
+}
+
+/// Wait for `answer` (a `status_when_up`) or `exited`, whichever comes first,
+/// bounded by `within` (a bound socket that never answers is a hung wait).
+async fn await_control<A, E>(answer: A, exited: E, within: std::time::Duration) -> ControlUp
+where
+    A: std::future::Future<Output = Result<stormvm_control::Status, stormvm_control::ControlError>>,
+    E: std::future::Future<Output = ()>,
+{
+    let raced = async {
+        tokio::select! {
+            r = answer => match r {
+                Err(e @ stormvm_control::ControlError::Unreachable(..)) => ControlUp::NotUp(e.to_string()),
+                _ => ControlUp::Answered,
+            },
+            () = exited => ControlUp::Exited,
+        }
+    };
+    match tokio::time::timeout(within + std::time::Duration::from_secs(1), raced).await {
+        Ok(up) => up,
+        Err(_) => ControlUp::NotUp("its status did not come back".into()),
+    }
+}
+
+/// A just-started machine's control, from the registration `launch` made.
+fn control_of(reg: &stormvm_node::console::Registration) -> Option<stormvm_control::Machine> {
+    let control = reg.control_socket.clone()?;
+    Some(stormvm_control::Machine { kind: stormvm_control::Kind::parse(&reg.vmm), control: Some(control), agent: None })
+}
+
 /// The machine's control, from its registration: what `shut_down` asks.
 fn machine_of(vm: &Vm) -> Option<stormvm_control::Machine> {
     let reg = stormvm_node::console::find(RUN_ROOT, &vm.namespace, &vm.name)?;
@@ -2296,6 +2339,9 @@ impl VmManager {
         // Taps, plan and spawn, inside the deposit window (#100): a failure
         // there is unwound before another start may deposit.
         let mut t = t;
+        // Subscribed before the spawn, so an exit during the wait for the
+        // control socket below is not missed (#303).
+        let mut exits = ring.subscribe_exit_handles();
         let launched = {
             let _window = self.deposit_window.lock().await;
             t = steps.since("window", t);
@@ -2333,6 +2379,35 @@ impl VmManager {
             self.pod_nets.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), net);
         }
         let on_pod_network = self.pod_nets.lock().unwrap_or_else(|e| e.into_inner()).contains_key(uid);
+        // Running means the machine answers (#303): qemu binds its QMP socket
+        // a moment after the spawn, and a client acting on Running at once
+        // (a snapshot, a verb, hotplug) found no socket there.
+        let t = match control_of(&registration) {
+            Some(machine) => {
+                let exited = async {
+                    loop {
+                        match exits.recv().await {
+                            Ok(h) if h == handle.0 => return,
+                            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => std::future::pending::<()>().await,
+                        }
+                    }
+                };
+                match await_control(machine.status_when_up(CONTROL_UP_WITHIN), exited, CONTROL_UP_WITHIN).await {
+                    ControlUp::Answered | ControlUp::Exited => {}
+                    ControlUp::NotUp(why) => {
+                        let why = format!(
+                            "the hypervisor runs, but its control socket did not answer within {}s: {why}",
+                            CONTROL_UP_WITHIN.as_secs()
+                        );
+                        warn!(vm = %vm.name, "{why}");
+                        self.event(obj, "Warning", "ControlNotReady", &why).await;
+                    }
+                }
+                steps.since("control", t)
+            }
+            None => t,
+        };
         if !responders.is_empty() {
             self.responders.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), responders);
         }
@@ -6477,6 +6552,35 @@ pub fn hand_placed_here(obj: &Value, node: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #303: Running waits for the control socket, the exit, or the bound.
+    #[tokio::test]
+    async fn control_up_answered_exited_or_not_up() {
+        use std::time::Duration;
+        let never = || std::future::pending::<()>();
+        let ok = async { Ok(stormvm_control::Status { state: "running".into(), paused: false }) };
+        assert_eq!(await_control(ok, never(), Duration::from_millis(50)).await, ControlUp::Answered);
+        // An error answer is a bound socket.
+        let refused = async { Err(stormvm_control::ControlError::Refused("no".into())) };
+        assert_eq!(await_control(refused, never(), Duration::from_millis(50)).await, ControlUp::Answered);
+        // The hypervisor exits before it binds: no waiting out the bound.
+        let pending = std::future::pending::<Result<stormvm_control::Status, stormvm_control::ControlError>>();
+        let t = std::time::Instant::now();
+        assert_eq!(await_control(pending, async {}, Duration::from_secs(5)).await, ControlUp::Exited);
+        assert!(t.elapsed() < Duration::from_secs(1));
+        // Still no socket when status_when_up gives up.
+        let gone = async {
+            Err(stormvm_control::ControlError::Unreachable(
+                "control.sock".into(),
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            ))
+        };
+        assert!(matches!(await_control(gone, never(), Duration::from_millis(50)).await,
+            ControlUp::NotUp(why) if why.contains("control.sock is not connectable")));
+        // A bound socket that never answers is bounded too.
+        let hung = std::future::pending::<Result<stormvm_control::Status, stormvm_control::ControlError>>();
+        assert!(matches!(await_control(hung, never(), Duration::from_millis(10)).await, ControlUp::NotUp(_)));
+    }
 
     #[tokio::test]
     async fn unknown_vm_exit_retains_record_and_finalizer() {
