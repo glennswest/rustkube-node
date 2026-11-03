@@ -5714,7 +5714,8 @@ impl VmManager {
         records: &std::collections::BTreeMap<String, crate::vm_disk_move::Move>,
     ) -> bool {
         if !self.annotate(object, crate::vm_disk_move::record_patch(uid, records)).await {
-            warn!(vmi = %object["metadata"]["name"].as_str().unwrap_or(""), "the disk-move record was not written; retried");
+            let vmi = object["metadata"]["name"].as_str().unwrap_or("");
+            warn!(%vmi, "the disk-move record was not written; retried");
             return false;
         }
         self.disk_moves.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), records.clone());
@@ -5755,7 +5756,8 @@ impl VmManager {
             Ok(w) => w,
             Err(e) => {
                 // Read as nothing asked would cancel a copy for a typo.
-                warn!(vmi = %object["metadata"]["name"].as_str().unwrap_or(""), "disk moves not looked at: {e}");
+                let vmi = object["metadata"]["name"].as_str().unwrap_or("");
+                warn!(%vmi, "disk moves not looked at: {e}");
                 return;
             }
         };
@@ -6054,12 +6056,12 @@ impl VmManager {
                 break;
             }
         }
-        let paused = began.elapsed().as_millis();
+        let paused_ms = began.elapsed().as_millis() as u64;
         if let Err(e) = ran {
             r.message = format!("on the copy, but the guest would not run again: {e}");
             self.event_of(vm, "Warning", "DiskMoveUnpause", &format!("disk {disk}: {}", r.message)).await;
         }
-        info!(vm = %vm.name, %disk, %device, paused_ms = paused as u64, "disk on {}'s copy {}", r.to, r.volume);
+        info!(vm = %vm.name, %disk, %device, paused_ms, "disk on {}'s copy {}", r.to, r.volume);
         // Its owner as before (#75), where the engine relays it to the peer.
         let owner = self.owner_of(object).await;
         if !owner.is_null() {
@@ -7066,6 +7068,21 @@ mod tests {
             self.calls.lock().unwrap().push(format!("remove_disk {name}"));
             Ok(())
         }
+        async fn pause(&self) -> Result<(), String> {
+            self.calls.lock().unwrap().push("pause".into());
+            Ok(())
+        }
+        async fn unpause(&self) -> Result<(), String> {
+            self.calls.lock().unwrap().push("unpause".into());
+            Ok(())
+        }
+        async fn switch_disk(&self, from: &str, to: &str, discard: bool) -> Result<(), String> {
+            self.calls.lock().unwrap().push(format!("switch {from} {to} {discard}"));
+            if self.refuse.lock().unwrap().contains(&"switch") {
+                return Err("blockdev-reopen: timed out after 10s".into());
+            }
+            Ok(())
+        }
     }
 
     fn hot_manager(dir: &std::path::Path, fake: &Arc<FakeHot>) -> VmManager {
@@ -7389,6 +7406,10 @@ mod tests {
         disks: HashMap<String, String>,
         /// stormstorage: what was asked, `start <node>/<volume>→<to>` or `<step> <id>`.
         asked: Vec<String>,
+        /// stormstorage steps answered 409 (#302).
+        refuse: Vec<String>,
+        /// The engine: `attach <id>` / `detach <id>` (#302).
+        attaches: Vec<String>,
     }
 
     async fn mig_api(seen: Arc<std::sync::Mutex<MigSeen>>) -> String {
@@ -7433,11 +7454,26 @@ mod tests {
             .route(
                 "/api/v1/migrations/{id}/{step}",
                 axum::routing::post(|State(s): State<S>, Path((id, step)): Path<(String, String)>| async move {
+                    use axum::response::IntoResponse as _;
                     let mut s = s.lock().unwrap();
                     s.asked.push(format!("{step} {id}"));
+                    if s.refuse.contains(&step) {
+                        return (axum::http::StatusCode::CONFLICT, format!("{step}: the mirror is not flushed")).into_response();
+                    }
                     let next = match step.as_str() { "cutover" => "cut_over", "complete" => "completed", "abort" => "aborted", _ => "copying" };
                     s.disks.insert(id.clone(), next.into());
-                    axum::Json(json!({"id": id, "state": next}))
+                    axum::Json(json!({"id": id, "state": next})).into_response()
+                }),
+            )
+            .route(
+                "/api/v1/volumes/{id}/attach",
+                axum::routing::post(|State(s): State<S>, Path(id): Path<String>| async move {
+                    s.lock().unwrap().attaches.push(format!("attach {id}"));
+                    axum::Json(json!({"transport": "ublk", "device_hint": format!("/dev/ublk-{id}")}))
+                })
+                .delete(|State(s): State<S>, Path(id): Path<String>| async move {
+                    s.lock().unwrap().attaches.push(format!("detach {id}"));
+                    axum::Json(json!({}))
                 }),
             )
             .with_state(seen);
@@ -7544,6 +7580,221 @@ mod tests {
     fn state_writes(seen: &Arc<std::sync::Mutex<MigSeen>>) -> Vec<Value> {
         seen.lock().unwrap().patches.iter().filter(|(p, _)| p.ends_with("/status"))
             .map(|(_, b)| b["status"]["migrationState"].clone()).collect()
+    }
+
+    /// A node for the disk-move tests (#302): the migration fakes (apiserver,
+    /// stormstorage and engine on one URL) and a machine's verbs recorded.
+    async fn move_node() -> (VmManager, Arc<std::sync::Mutex<MigSeen>>, Arc<FakeHot>, tempfile::TempDir) {
+        let seen = Arc::new(std::sync::Mutex::new(MigSeen::default()));
+        let url = mig_api(seen.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::vm_migration::Config {
+            stormstorage: Some(crate::engine::EngineClient::new(&url, crate::engine::TokenSource::none())),
+            ..Default::default()
+        };
+        let fake = Arc::new(FakeHot::default());
+        let f = fake.clone();
+        let m = VmManager::new(None, "a", reqwest::Client::new(), &url)
+            .with_storage(crate::engine::EngineClient::new(&url, crate::engine::TokenSource::none()))
+            .with_hotplug(dir.path(), Arc::new(move |_: &Vm| Some(f.clone() as Arc<dyn crate::vm_hotplug::Hotplug>)))
+            .with_migration(config);
+        m.vms.lock().await.insert("u1".into(), source_vm("v-root", true));
+        (m, seen, fake, dir)
+    }
+
+    fn move_asked(request: Value) -> Value {
+        let mut obj = migrating(Value::Null);
+        obj["status"]["migrationState"] = Value::Null;
+        obj["metadata"]["annotations"] = json!({crate::vm_disk_move::REQUEST: request.to_string()});
+        obj
+    }
+
+    /// Every disk-move record written onto the VMI, in order.
+    fn move_records(seen: &Arc<std::sync::Mutex<MigSeen>>) -> Vec<Value> {
+        seen.lock().unwrap().patches.iter()
+            .filter(|(p, _)| p == "vm-u1")
+            .filter_map(|(_, b)| b["metadata"]["annotations"].get(crate::vm_disk_move::RECORD).cloned())
+            .map(|v| v.as_str().map(|t| serde_json::from_str(t).unwrap()).unwrap_or(Value::Null))
+            .collect()
+    }
+
+    /// **#302.** A disk asked onto node b: mirrored there, progress reported,
+    /// then (in sync) the guest paused, cut over, b's copy attached here, the
+    /// disk switched onto it, the guest run again; the source let go and
+    /// retired. The machine's record and the next start use the copy.
+    #[tokio::test]
+    async fn a_running_disk_moves_to_another_nodes_storage() {
+        let (m, seen, fake, _dir) = move_node().await;
+        let obj = move_asked(json!({"root": "b"}));
+
+        m.move_disks("u1", &obj).await;
+        assert_eq!(seen.lock().unwrap().asked, ["start a/v-root→b"]);
+        let r = move_records(&seen).last().unwrap().clone();
+        assert_eq!((r["root"]["state"].as_str(), r["root"]["migration"].as_str()), (Some("copying"), Some("vm-v-root")));
+        assert_eq!((r["root"]["node"].as_str(), r["root"]["from"].as_str()), (Some("a"), Some("v-root")));
+        assert!(m.take_due("u1").is_some(), "polled while it copies");
+
+        // Copying: nothing more than a look.
+        m.move_disks("u1", &obj).await;
+        assert!(fake.calls.lock().unwrap().is_empty());
+        assert_eq!(move_records(&seen).last().unwrap()["root"]["volume"], "t-vm-v-root", "the copy named");
+
+        // In sync: the switch.
+        seen.lock().unwrap().disks.insert("vm-v-root".into(), "synced".into());
+        m.move_disks("u1", &obj).await;
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            ["pause", "switch /dev/ublkb0 /dev/ublk-t-vm-v-root false", "unpause"]
+        );
+        {
+            let s = seen.lock().unwrap();
+            assert_eq!(s.asked, ["start a/v-root→b", "cutover vm-v-root", "complete vm-v-root"]);
+            assert_eq!(s.attaches, ["attach t-vm-v-root", "detach v-root"], "the copy attached, then the source let go");
+        }
+        let states: Vec<String> =
+            move_records(&seen).iter().map(|r| r["root"]["state"].as_str().unwrap_or("").to_string()).collect();
+        assert!(states.windows(2).any(|w| w == ["switching", "moved"]), "switching on record before the guest stops: {states:?}");
+        let vm = m.vms.lock().await["u1"].clone();
+        assert_eq!(vm.disks[0].volume_id.as_deref(), Some("t-vm-v-root"));
+        assert_eq!(vm.disks[0].device, "/dev/ublk-t-vm-v-root");
+        assert_eq!(vm.owned_volumes, ["t-vm-v-root"], "the copy is the machine's now (#75)");
+        assert_eq!(m.moved_volume("u1", "root").as_deref(), Some("t-vm-v-root"), "the next start attaches it");
+
+        // Done: nothing more is asked of anyone.
+        let n = (seen.lock().unwrap().asked.len(), fake.calls.lock().unwrap().len());
+        m.move_disks("u1", &obj).await;
+        assert_eq!((seen.lock().unwrap().asked.len(), fake.calls.lock().unwrap().len()), n);
+        // A live migration (#40) does not take a machine whose disk is elsewhere.
+        let mut moved = obj.clone();
+        moved["metadata"]["annotations"][crate::vm_disk_move::RECORD] =
+            json!(move_records(&seen).last().unwrap().to_string());
+        assert!(crate::vm_disk_move::off_node(&moved, "a").unwrap().contains("b's storage"));
+    }
+
+    /// #302: a cutover refused runs the guest again on its own disk and
+    /// aborts the copy; the request taken away forgets the failure.
+    #[tokio::test]
+    async fn a_refused_cutover_runs_the_guest_on_its_disk_and_aborts_the_copy() {
+        let (m, seen, fake, _dir) = move_node().await;
+        let obj = move_asked(json!({"root": "b"}));
+        m.move_disks("u1", &obj).await;
+        {
+            let mut s = seen.lock().unwrap();
+            s.disks.insert("vm-v-root".into(), "synced".into());
+            s.refuse.push("cutover".into());
+        }
+        m.move_disks("u1", &obj).await;
+        assert_eq!(*fake.calls.lock().unwrap(), ["pause", "unpause"]);
+        assert!(seen.lock().unwrap().asked.contains(&"abort vm-v-root".to_string()));
+        assert!(seen.lock().unwrap().attaches.is_empty(), "nothing attached");
+        let r = move_records(&seen).last().unwrap().clone();
+        assert_eq!(r["root"]["state"], "failed");
+        assert!(r["root"]["message"].as_str().unwrap().contains("cutover was refused"), "{r}");
+        assert_eq!(m.vms.lock().await["u1"].disks[0].volume_id.as_deref(), Some("v-root"));
+
+        // Asked the same again: not retried as it stands.
+        let n = seen.lock().unwrap().asked.len();
+        m.move_disks("u1", &obj).await;
+        assert_eq!(seen.lock().unwrap().asked.len(), n);
+        // The request taken away: the failure is forgotten.
+        let mut none = obj.clone();
+        none["metadata"]["annotations"] = json!({});
+        m.move_disks("u1", &none).await;
+        assert!(move_records(&seen).last().unwrap().is_null(), "the record removed");
+    }
+
+    /// #302: a switch that answers an error after the cutover deletes
+    /// nothing (the answer may have been lost) and is left to a person.
+    #[tokio::test]
+    async fn a_failed_switch_deletes_nothing_and_says_so() {
+        let (m, seen, fake, _dir) = move_node().await;
+        let obj = move_asked(json!({"root": "b"}));
+        m.move_disks("u1", &obj).await;
+        seen.lock().unwrap().disks.insert("vm-v-root".into(), "synced".into());
+        fake.refuse.lock().unwrap().push("switch");
+        m.move_disks("u1", &obj).await;
+        assert_eq!(fake.calls.lock().unwrap().last().unwrap(), "unpause", "the guest runs");
+        {
+            let s = seen.lock().unwrap();
+            assert!(!s.asked.iter().any(|a| a.starts_with("abort") || a.starts_with("complete")), "{:?}", s.asked);
+            assert_eq!(s.attaches, ["attach t-vm-v-root"], "neither volume let go");
+        }
+        let r = move_records(&seen).last().unwrap().clone();
+        assert_eq!(r["root"]["state"], "unknown");
+        assert!(r["root"]["message"].as_str().unwrap().contains("Nothing was deleted"), "{r}");
+        let n = (seen.lock().unwrap().asked.len(), fake.calls.lock().unwrap().len());
+        m.move_disks("u1", &obj).await;
+        let mut none = obj.clone();
+        none["metadata"]["annotations"] = json!({});
+        m.move_disks("u1", &none).await;
+        assert_eq!((seen.lock().unwrap().asked.len(), fake.calls.lock().unwrap().len()), n, "never acted on again");
+    }
+
+    /// #302: what is not the machine's own volume is refused before anything
+    /// is copied; a copy no longer asked for is aborted.
+    #[tokio::test]
+    async fn a_borrowed_disk_is_refused_and_a_copy_not_asked_for_is_aborted() {
+        let (m, seen, _fake, _dir) = move_node().await;
+        m.vms.lock().await.insert("u1".into(), source_vm("v-claim", false));
+        let obj = move_asked(json!({"root": "b"}));
+        m.move_disks("u1", &obj).await;
+        assert!(seen.lock().unwrap().asked.is_empty(), "nothing asked of stormstorage");
+        let r = move_records(&seen).last().unwrap().clone();
+        assert_eq!(r["root"]["state"], "failed");
+        assert!(r["root"]["message"].as_str().unwrap().contains("own volume"), "{r}");
+
+        let (m, seen, _fake, _dir) = move_node().await;
+        m.move_disks("u1", &obj).await;
+        let mut elsewhere = obj.clone();
+        elsewhere["metadata"]["annotations"][crate::vm_disk_move::REQUEST] = json!(json!({"root": "a"}).to_string());
+        m.move_disks("u1", &elsewhere).await;
+        assert_eq!(seen.lock().unwrap().asked, ["start a/v-root→b", "abort vm-v-root"]);
+        let r = move_records(&seen).last().unwrap().clone();
+        assert_eq!(r["root"]["state"], "failed");
+        assert!(r["root"]["message"].as_str().unwrap().contains("cancelled"));
+    }
+
+    /// #302: a kubelet that stopped half way through a switch resumes from
+    /// what is on record: the registration names the copy (finish), or the
+    /// migration was never cut over (copy again).
+    #[tokio::test]
+    async fn a_switch_left_half_way_resumes_from_the_record() {
+        let record = |state: &str| {
+            json!({"root": {"to": "b", "node": "a", "from": "v-root", "migration": "vm-v-root", "state": state,
+                            "volume": "t-vm-v-root"}})
+        };
+        // The disk is on the copy: the source let go and retired.
+        let (m, seen, fake, _dir) = move_node().await;
+        m.vms.lock().await.update("u1", |vm| vm.disks[0].volume_id = Some("t-vm-v-root".into()));
+        seen.lock().unwrap().disks.insert("vm-v-root".into(), "cut_over".into());
+        let mut obj = move_asked(json!({"root": "b"}));
+        obj["metadata"]["annotations"][crate::vm_disk_move::RECORD] = json!(record("switching").to_string());
+        m.move_disks("u1", &obj).await;
+        assert_eq!(seen.lock().unwrap().asked, ["complete vm-v-root"]);
+        assert_eq!(move_records(&seen).last().unwrap()["root"]["state"], "moved");
+        assert!(fake.calls.lock().unwrap().is_empty());
+
+        // Never cut over: the guest runs and the switch is tried again.
+        let (m, seen, fake, _dir) = move_node().await;
+        seen.lock().unwrap().disks.insert("vm-v-root".into(), "synced".into());
+        m.move_disks("u1", &obj).await;
+        assert_eq!(*fake.calls.lock().unwrap(), ["unpause"]);
+        assert_eq!(move_records(&seen).last().unwrap()["root"]["state"], "copying");
+    }
+
+    /// #302: a start attaches a moved disk's copy by its id, not a clone
+    /// found (or made) by name.
+    #[tokio::test]
+    async fn a_start_attaches_a_moved_disks_copy() {
+        let e = disk_engine(vec![], vec![]).await;
+        let m = disk_manager(&e, "");
+        m.moved_disks.lock().unwrap().insert("u-test".into(), [("root".to_string(), "vol-moved".to_string())].into());
+        let spec: VmSpec = stormvm_spec::kube::from_kube(&vm_owned_vmi("vmi-1")).unwrap();
+        let (disks, owned) = m.resolve_disks(&spec).await.unwrap();
+        assert_eq!(disks[0].volume_id.as_deref(), Some("vol-moved"));
+        assert_eq!(disks[0].device, "/dev/ublk-vol-moved");
+        assert!(e.cloned.lock().unwrap().is_empty(), "no clone made by name");
+        assert!(owned.contains(&"vol-moved".to_string()), "still the machine's own disk");
     }
 
     /// #40, the source: each disk mirrored to the target and recorded; sent
