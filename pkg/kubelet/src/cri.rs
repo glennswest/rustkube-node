@@ -319,6 +319,35 @@ pub struct SandboxSteps {
     pub cni: std::time::Duration,
 }
 
+/// The runtime's own steps in creating and starting a container (#311), for
+/// the start timing's `container/<name>/…`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContainerSteps {
+    /// The engine's volume listing, to find the image's sealed golden.
+    pub lookup: std::time::Duration,
+    /// The clone of that golden: the container's own root.
+    pub clone: std::time::Duration,
+    /// The root's attach (ublk).
+    pub attach: std::time::Duration,
+    /// PID 1's mount of the root (`VolumeRegister` of the device).
+    pub mount: std::time::Duration,
+    /// The rest of the create: image config, image volumes, `SpecDefine`.
+    pub define: std::time::Duration,
+    /// At the start: the log directory and the pod's mounts registered, a
+    /// claim's filesystem mounted (and its fsGroup applied) among them.
+    pub volumes: std::time::Duration,
+    /// stormpump `Spawn`.
+    pub spawn: std::time::Duration,
+    /// Publishing who it is for cadvisor (#84), its pid asked of the engine.
+    pub identity: std::time::Duration,
+}
+
+impl ContainerSteps {
+    pub fn total(&self) -> std::time::Duration {
+        self.lookup + self.clone + self.attach + self.mount + self.define + self.volumes + self.spawn + self.identity
+    }
+}
+
 /// Image information.
 #[derive(Debug, Clone)]
 pub struct ImageInfo {
@@ -389,6 +418,12 @@ pub trait RuntimeService: Send + Sync + 'static {
     /// (#115), to wake that pod's worker alone when it exits. Default: not
     /// known, and the exit wakes every pod.
     async fn pod_of_workload(&self, _handle: u64) -> Option<String> {
+        None
+    }
+
+    /// How creating and starting a container was spent (#311). Default: not
+    /// timed (a CRI runtime's are its own).
+    async fn container_steps(&self, _container_id: &str) -> Option<ContainerSteps> {
         None
     }
 

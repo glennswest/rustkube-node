@@ -91,6 +91,8 @@ const PROFILE_ISOLATED: u8 = 4;
 
 /// One container the kubelet has asked for.
 struct Container {
+    /// How creating and starting it was spent (#311).
+    steps: crate::cri::ContainerSteps,
     id: String,
     sandbox_id: String,
     name: String,
@@ -1474,6 +1476,10 @@ impl RuntimeService for StormpumpRuntime {
             .collect())
     }
 
+    async fn container_steps(&self, container_id: &str) -> Option<crate::cri::ContainerSteps> {
+        self.containers.lock().await.get(container_id).map(|c| c.steps)
+    }
+
     async fn create_container(
         &self,
         sandbox_id: &str,
@@ -1521,8 +1527,15 @@ impl RuntimeService for StormpumpRuntime {
                 return Err(CriError::Runtime(format!("container {}: its root: {e}", config.name)));
             }
         };
+        let mut steps = crate::cri::ContainerSteps {
+            lookup: made.lookup,
+            clone: made.clone,
+            attach: made.attach,
+            ..Default::default()
+        };
         let mount = crate::container_roots::mount_point(&id);
         let (at, device) = (mount.clone(), made.device.clone());
+        let mounting = std::time::Instant::now();
         let root = self
             .on_ring(move |r| {
                 let (settled, released) = std::sync::mpsc::channel();
@@ -1562,6 +1575,8 @@ impl RuntimeService for StormpumpRuntime {
                 )));
             }
         };
+        steps.mount = mounting.elapsed();
+        let defining = std::time::Instant::now();
         if config.readonly_rootfs {
             tracing::warn!(
                 container = %config.name, pod = %pod,
@@ -1636,6 +1651,7 @@ impl RuntimeService for StormpumpRuntime {
         };
         let exec_base = exec_base.expect("composed when the spec was defined");
 
+        steps.define = defining.elapsed();
         let c = Container {
             id: id.clone(),
             sandbox_id: sandbox_id.to_string(),
@@ -1683,6 +1699,7 @@ impl RuntimeService for StormpumpRuntime {
             removing: None,
             exec_base: Some(exec_base),
             stdio: stdio_wanted(&id, config, &log_dir),
+            steps,
             console: None,
             log_file: log_file_of(config, &log_dir),
             ownership: config.fs_group.map(|gid| Ownership {
@@ -1767,10 +1784,12 @@ impl RuntimeService for StormpumpRuntime {
             None => (None, Vec::new()),
         };
 
-        let (workload, held) = self
+        let (workload, held, volumes_took, spawn_took) = self
             .on_ring(move |r| {
                 let mut held = Vec::new();
                 let mut deposited = Vec::new();
+                let registering = std::time::Instant::now();
+                let (mut volumes_took, mut spawn_took) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
                 let result = (|| {
                 for (name, fd) in deposits {
                     r.deposit_fd(&name, fd)?;
@@ -1834,7 +1853,9 @@ impl RuntimeService for StormpumpRuntime {
                 // container — and the index only means something where the
                 // list that was sent still exists, which is inside this
                 // closure.
-                r.spawn(spec, root, logs, sandbox, &mounts, Domain::Container as u8)
+                volumes_took = registering.elapsed();
+                let spawning = std::time::Instant::now();
+                let spawned = r.spawn(spec, root, logs, sandbox, &mounts, Domain::Container as u8)
                     .map_err(|e| {
                         let named = match &e {
                             RingError::Failed { step, .. } => {
@@ -1849,7 +1870,9 @@ impl RuntimeService for StormpumpRuntime {
                             }
                             None => e,
                         }
-                    })
+                    });
+                spawn_took = spawning.elapsed();
+                spawned
                 })();
                 // Deposits no spawn consumed go back (stormpump#63).
                 if result.is_err() {
@@ -1858,7 +1881,7 @@ impl RuntimeService for StormpumpRuntime {
                     }
                 }
                 // Preserve partial registrations even when a later operation fails.
-                Ok((result, held))
+                Ok((result, held, volumes_took, spawn_took))
             })
             .await?;
 
@@ -1867,6 +1890,8 @@ impl RuntimeService for StormpumpRuntime {
             .get_mut(container_id)
             .ok_or_else(|| CriError::NotFound(format!("container {container_id}")))?;
         c.volume_handles = held;
+        c.steps.volumes = volumes_took;
+        c.steps.spawn = spawn_took;
         let workload = workload.map_err(|e| CriError::Runtime(e.to_string()))?;
         c.workload_handle = Some(workload);
         c.console = console;
@@ -1881,10 +1906,12 @@ impl RuntimeService for StormpumpRuntime {
         drop(containers);
         // Who it is, for cadvisor (#84), from its pid's cgroup.
         if let (Some(record), true) = (identity, self.identities.is_some()) {
+            let publishing = std::time::Instant::now();
             let pid = self.on_ring(move |r| r.query_info(workload)).await.ok().flatten().map(|i| i.pid).unwrap_or(0);
             let file = self.publish_identity(record, pid);
             if let Some(c) = self.containers.lock().await.get_mut(container_id) {
                 c.identity_file = file;
+                c.steps.identity = publishing.elapsed();
             }
         }
         let containers = self.containers.lock().await;
@@ -3239,6 +3266,7 @@ mod tests {
                     removing: None,
                     exec_base: None,
                     stdio: None,
+                    steps: Default::default(),
                     console: None,
                     log_file: Default::default(),
                     ownership: None,
@@ -3444,6 +3472,7 @@ mod tests {
                     removing: None,
                     exec_base: None,
                     stdio: None,
+                    steps: Default::default(),
                     console: None,
                     log_file: Default::default(),
                     ownership: None,
@@ -3953,6 +3982,7 @@ mod tests {
             removing: None,
             exec_base: None,
             stdio: None,
+            steps: Default::default(),
             console: None,
             log_file: Default::default(),
             ownership: None,

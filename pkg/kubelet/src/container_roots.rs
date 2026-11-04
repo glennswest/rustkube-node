@@ -189,6 +189,11 @@ pub fn orphans(listing: &Value, known: &HashSet<String>, own: &str) -> Vec<(Stri
 pub struct Made {
     pub volume_id: String,
     pub device: String,
+    /// The engine's listing (zero for a template, which needs none).
+    pub lookup: std::time::Duration,
+    /// The clone, its owner included.
+    pub clone: std::time::Duration,
+    pub attach: std::time::Duration,
 }
 
 /// The engine half of container roots.
@@ -242,6 +247,7 @@ impl Roots {
     pub async fn make(&self, name: &str, image: &str, owner: &Value) -> Result<Made, String> {
         let golden = golden_of(image, &self.cmdline)
             .ok_or_else(|| format!("image {image} names no golden on this node to clone a root from"))?;
+        let (mut lookup, mut step) = (std::time::Duration::ZERO, std::time::Instant::now());
         let created = match &golden {
             Golden::Template(t) => {
                 let body = json!({ "name": name, "verify": true });
@@ -262,6 +268,8 @@ impl Roots {
                 }
                 let vol = &vol;
                 let g = pallet_golden(&listing, vol)?;
+                lookup = step.elapsed();
+                step = std::time::Instant::now();
                 let mut body = json!({ "name": name, "verify": true });
                 if !owner.is_null() {
                     body["owner"] = owner.clone();
@@ -282,6 +290,8 @@ impl Roots {
                 tracing::debug!(volume = %name, "container root owner not set: {e}");
             }
         }
+        let clone = step.elapsed();
+        let attaching = std::time::Instant::now();
         let attach = json!({ "node": self.node, "transport": "ublk" });
         let r = self.engine.post(&format!("{}/api/v1/volumes/{volume_id}/attach", self.url), &attach).await;
         let device = match self.answer(&format!("attaching {name}"), r).await {
@@ -291,7 +301,7 @@ impl Roots {
             Err(e) => Err(e),
         };
         match device {
-            Ok(device) => Ok(Made { volume_id, device }),
+            Ok(device) => Ok(Made { volume_id, device, lookup, clone, attach: attaching.elapsed() }),
             Err(e) => {
                 if let Err(undo) = self.destroy(&volume_id).await {
                     tracing::warn!(volume = %name, "a root that did not attach was not deleted: {undo}");

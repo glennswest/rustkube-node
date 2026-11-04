@@ -3946,7 +3946,8 @@ impl PodManager {
             )
             .await;
             info!("Started container {container_name} ({container_id}) in {namespace}/{name}");
-            attempt.container(container_name, step.elapsed());
+            let took = step.elapsed();
+            attempt.container(container_name, took, self.runtime.container_steps(&container_id).await);
 
             // A container with a readiness probe starts not-ready until the
             // first probe succeeds; without one it is ready immediately.
@@ -6899,6 +6900,15 @@ pub(crate) mod tests {
             })
         }
 
+        async fn container_steps(&self, _id: &str) -> Option<crate::cri::ContainerSteps> {
+            // As the stormpump runtime reports them (#311).
+            Some(crate::cri::ContainerSteps {
+                clone: std::time::Duration::from_millis(3),
+                spawn: std::time::Duration::from_millis(4),
+                ..Default::default()
+            })
+        }
+
         async fn list_pod_sandbox(&self) -> Result<Vec<PodSandboxSummary>, CriError> {
             Ok(self
                 .sandboxes
@@ -9678,7 +9688,9 @@ pub(crate) mod tests {
         for part in ["wait=", "image=", "volumes=", "sandbox=", "init=", "containers=",
             "report=3.0ms", "total=", "attempts=1", "pending=1", "volume/scratch=", "container/app=",
             // #139: the runtime's steps, the status read and the rest.
-            "sandbox/acquire=1.0ms", "sandbox/cni=2.0ms", "sandbox/status=", "sandbox/other="] {
+            "sandbox/acquire=1.0ms", "sandbox/cni=2.0ms", "sandbox/status=", "sandbox/other=",
+            // #311: the runtime's steps and the rest.
+            "container/app/clone=3.0ms", "container/app/spawn=4.0ms", "container/app/other="] {
             assert!(text.contains(part), "{part} in {text}");
         }
 

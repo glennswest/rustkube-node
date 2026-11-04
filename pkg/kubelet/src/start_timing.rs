@@ -64,6 +64,12 @@ pub const CLAIM_STEPS: &[&str] = &["claim/lookup", "claim/room", "claim/make", "
 /// `sandbox`'s steps (#139), with a histogram each when they were measured.
 pub const SANDBOX_STEPS: &[&str] = &["sandbox/acquire", "sandbox/cni", "sandbox/status", "sandbox/other"];
 
+/// A container's steps (#311), with a histogram each when they were measured.
+pub const CONTAINER_STEPS: &[&str] = &[
+    "container/lookup", "container/clone", "container/attach", "container/mount", "container/define",
+    "container/volumes", "container/spawn", "container/identity", "container/other",
+];
+
 /// One pod's start, as far as it has got.
 #[derive(Debug, Clone)]
 pub struct StartTiming {
@@ -120,7 +126,7 @@ pub struct Attempt {
     sandbox_steps: Option<SandboxSplit>,
     init: Duration,
     containers: Duration,
-    per_container: Vec<(String, Duration)>,
+    per_container: Vec<(String, Duration, Option<crate::cri::ContainerSteps>)>,
     /// The executor's pool when the attempt began, `busy/limit` (#138).
     workers: Option<String>,
     /// Pods seen here and not yet started when it began, this one included.
@@ -169,9 +175,11 @@ impl Attempt {
     pub fn init(&mut self, took: Duration) {
         self.init = took;
     }
-    pub fn container(&mut self, name: &str, took: Duration) {
+    /// A container created and started, with the runtime's steps (`None` from
+    /// one that does not time them, #311).
+    pub fn container(&mut self, name: &str, took: Duration, steps: Option<crate::cri::ContainerSteps>) {
         self.containers += took;
-        self.per_container.push((name.to_string(), took));
+        self.per_container.push((name.to_string(), took, steps));
     }
 }
 
@@ -306,8 +314,24 @@ impl StartTiming {
                     phases.push(("claim/bind", b));
                 }
             }
-            for (name, d) in &a.per_container {
+            for (name, d, steps) in &a.per_container {
                 text.push(format!("container/{name}={}", ms(*d)));
+                let Some(s) = steps else { continue };
+                let split = [
+                    ("lookup", "container/lookup", s.lookup),
+                    ("clone", "container/clone", s.clone),
+                    ("attach", "container/attach", s.attach),
+                    ("mount", "container/mount", s.mount),
+                    ("define", "container/define", s.define),
+                    ("volumes", "container/volumes", s.volumes),
+                    ("spawn", "container/spawn", s.spawn),
+                    ("identity", "container/identity", s.identity),
+                    ("other", "container/other", d.saturating_sub(s.total())),
+                ];
+                for (step, phase, took) in split {
+                    text.push(format!("container/{name}/{step}={}", ms(took)));
+                    phases.push((phase, took));
+                }
             }
         }
         Finished { text: text.join(" "), phases }
@@ -429,8 +453,8 @@ mod tests {
         a.volume("data", Duration::from_micros(4_100));
         a.volumes(Duration::from_millis(5));
         a.sandbox(Duration::from_millis(40));
-        a.container("app", Duration::from_millis(180));
-        a.container("side", Duration::from_millis(20));
+        a.container("app", Duration::from_millis(180), None);
+        a.container("side", Duration::from_millis(20), None);
         t.started(a);
         assert!(t.is_started());
         let f = t.finish(Duration::from_millis(12), seen + Duration::from_millis(800));
@@ -472,6 +496,39 @@ mod tests {
         let claims: Vec<_> = f.phases.iter().map(|(n, _)| *n).filter(|n| n.starts_with("claim/")).collect();
         // The second claim's bind ran off the start path: no `bind` for it.
         assert_eq!(claims, [CLAIM_STEPS, &["claim/lookup", "claim/attach"]].concat());
+    }
+
+    #[test]
+    fn a_container_is_taken_apart_into_its_steps_and_the_rest() {
+        let seen = Instant::now();
+        let mut t = StartTiming::seen_at(&json!({}), seen, at("2026-11-03T10:00:00Z"));
+        let mut a = Attempt::begin();
+        // server7's c3 (#311), as the kubelet logged it.
+        let steps = crate::cri::ContainerSteps {
+            lookup: Duration::from_millis(40),
+            clone: Duration::from_millis(3477),
+            attach: Duration::from_millis(30),
+            mount: Duration::from_millis(200),
+            define: Duration::from_millis(6),
+            volumes: Duration::from_millis(5),
+            spawn: Duration::from_millis(505),
+            identity: Duration::from_millis(1),
+        };
+        a.container("c", Duration::from_millis(4288), Some(steps));
+        a.container("cri", Duration::from_millis(7), None);
+        t.started(a);
+        let f = t.finish(Duration::ZERO, seen);
+        assert!(
+            f.text.contains(
+                " container/c=4288ms container/c/lookup=40ms container/c/clone=3477ms container/c/attach=30ms \
+                 container/c/mount=200ms container/c/define=6.0ms container/c/volumes=5.0ms container/c/spawn=505ms \
+                 container/c/identity=1.0ms container/c/other=24ms container/cri=7.0ms"
+            ),
+            "{}",
+            f.text
+        );
+        let names: Vec<_> = f.phases.iter().map(|(n, _)| *n).filter(|n| n.starts_with("container/")).collect();
+        assert_eq!(names, CONTAINER_STEPS);
     }
 
     #[test]

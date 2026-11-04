@@ -2,6 +2,8 @@
 
 ## 2026-11-03
 
+- **feat:** `container/<name>` is taken apart in the start timing (#311): `/lookup`, `/clone`, `/attach`, `/mount`, `/define`, `/volumes`, `/spawn`, `/identity`, `/other` in `storm.io/start-timing`, the Event and the INFO line, with a `kubelet_pod_start_phase_duration_seconds{phase="container/…"}` histogram per step. What the X9 blades' 4–9 s is made of: on server7 12.58 mostly stormblock's clone (2.0–3.5 s) and stormpump's `Spawn` (0.2–1.4 s), read from the kubelet's lines; the next blade sample says it directly.
+
 - **docs:** #310 diagnosed, no kubelet change: a slow `sandbox/cni` right after a reboot is Cilium's `endpoint-create` API rate limiter (the wait between creates equals the mean processing time of the last 10), not claims or storage. Boot-log replay on the Dell and server7 matches within 0.04 s. README's `sandbox/cni` row and status.md say so; the fix is the agent's `api-rate-limit`, asked on stormcos-cilium#38.
 
 - **fix:** A VMI reads `Running` only once its hypervisor's control socket answers a status (#303, stormvm#28). Before, it read `Running` at the engine's spawn, before qemu bound QMP, so a snapshot 1 s later failed with `control.sock is not connectable`; every other verb and client acting on Running had the same race. The start waits for `Machine::status_when_up` for up to 10 s and stops early if the hypervisor exits. A socket still not answering after that is reported `Running` with a Warning `ControlNotReady` Event, and the machine is not stopped. The new start-timing step is `control`.
