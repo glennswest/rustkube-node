@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-11-04
+
+- **feat:** The kubelet's engine client speaks `https://` (#312, stormblock#203, stormcos#374). New `--stormblock-ca` / `STORMBLOCK_CA_FILE`: the CA an `https://` `--stormblock` is verified against, and the only thing it is verified against (no public roots, no skip).
+  - A certificate from another CA or for another name is refused in the handshake, so the token is never sent.
+  - The file is read at each new connection, so a CA written after the kubelet starts, or renewed, needs no restart. A file that later goes or does not parse keeps the last good CA, logged.
+  - `https://` with no CA stops the kubelet at start. `http://` works as before, with or without a CA.
+  - Not yet: stormvm's own client (snapshot, restore, the console's `snapshot` verb) gets the same URL with no CA (stormvm#110, #318).
+
 ## 2026-11-03
 
 - **feat:** `container/<name>` is taken apart in the start timing (#311): `/lookup`, `/clone`, `/attach`, `/mount`, `/define`, `/volumes`, `/spawn`, `/identity`, `/other` in `storm.io/start-timing`, the Event and the INFO line, with a `kubelet_pod_start_phase_duration_seconds{phase="container/…"}` histogram per step. What the X9 blades' 4–9 s is made of: on server7 12.58 mostly stormblock's clone (2.0–3.5 s) and stormpump's `Spawn` (0.2–1.4 s), read from the kubelet's lines; the next blade sample says it directly.

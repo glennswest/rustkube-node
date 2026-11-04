@@ -65,7 +65,7 @@ new connection: not there yet = refused and retried, renewed = used, unusable af
 CA is fatal at start; `http://` works as before. Not the client pair (not asked; the token stays). Doing:
 1. [ ] engine.rs: `EngineTrust` verifier, `from_env_with_ca`; main.rs flag + check; tests against a TLS stand-in (test CA reached with the
        token, other CA / wrong name / no CA refused with nothing sent, CA late and renewed, plain http); docs, CHANGELOG; sc-build.
-2. [ ] stormvm-block (snapshot, restore, console `snapshot`) gets the same URL and has no CA: stormvm#110; follow-up here, said on stormcos#374.
+2. [ ] stormvm-block (snapshot, restore, console `snapshot`) gets the same URL and has no CA: stormvm#110; follow-up #318, said on stormcos#374.
 
 ### Waiting on a release with 6a3b27a: #311 (P1), X9 blades: container start 4-9 s in `containers`
 

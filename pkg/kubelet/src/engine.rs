@@ -38,8 +38,18 @@
 //! at once, and is never cached, logged or shown by `{:?}`. With no admin
 //! token, or on an engine with one token for everything, nothing changes: the
 //! 401 goes back to the caller, which reports it and retries on its next pass.
+//!
+//! **TLS (#312, stormblock#203, stormcos#374).** The URL's scheme decides. An
+//! `https://` engine is verified against the CA file named by
+//! `--stormblock-ca`, and only that: no public roots, and no way to skip the
+//! check. [`EngineTrust`] reads the file at each new connection, so a CA that
+//! stormcert writes after the kubelet starts, or renews, is used without a
+//! restart. Until there is one every connection is refused before a request
+//! (and so the token) is sent. `http://` keeps working until the engine's
+//! `tls_mode = "required"`. The token is still what identifies the kubelet:
+//! it presents no client pair.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -172,6 +182,146 @@ struct Inner {
     accepted: AtomicBool,
     /// The token a wait gave up on: not waited for again until it changes.
     gave_up_on: Mutex<Option<Option<String>>>,
+    /// The CA an `https://` engine is verified against, for `{:?}`.
+    ca: Option<PathBuf>,
+}
+
+/// What an `https://` engine's certificate is checked against (#312): the CA
+/// file, read at each new connection.
+///
+/// A file that is not there yet, or has never held a usable CA, refuses the
+/// connection. Once one has been used, a file that goes or stops parsing (a
+/// half-written renewal) keeps the last good CA, said in the log: it was
+/// trusted a moment ago, and losing the engine would not make anything safer.
+#[derive(Debug)]
+pub struct EngineTrust {
+    ca: Option<PathBuf>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    /// The CA's bytes as last used, and the verifier made from them.
+    current: Mutex<Option<(Vec<u8>, Arc<rustls::client::WebPkiServerVerifier>)>>,
+    /// The last problem logged: said once, not on every connection.
+    said: Mutex<Option<String>>,
+}
+
+impl EngineTrust {
+    pub fn new(ca: Option<&Path>) -> EngineTrust {
+        EngineTrust {
+            ca: ca.map(Path::to_path_buf),
+            provider: Arc::new(rustls::crypto::ring::default_provider()),
+            current: Mutex::new(None),
+            said: Mutex::new(None),
+        }
+    }
+
+    fn say(&self, what: String) {
+        let mut said = self.said.lock().unwrap_or_else(|e| e.into_inner());
+        if said.as_deref() != Some(what.as_str()) {
+            warn!("stormblock engine TLS: {what}");
+            *said = Some(what);
+        }
+    }
+
+    /// A verifier for what the file holds now.
+    fn build(&self, pem: &[u8]) -> Result<Arc<rustls::client::WebPkiServerVerifier>, String> {
+        use rustls::pki_types::pem::PemObject;
+        let mut roots = rustls::RootCertStore::empty();
+        for c in rustls::pki_types::CertificateDer::pem_slice_iter(pem) {
+            roots.add(c.map_err(|e| format!("{e:?}"))?).map_err(|e| e.to_string())?;
+        }
+        if roots.is_empty() {
+            return Err("no certificate in it".to_string());
+        }
+        rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), self.provider.clone())
+            .build()
+            .map_err(|e| e.to_string())
+    }
+
+    /// The verifier to use for a connection being made now.
+    fn verifier(&self) -> Result<Arc<rustls::client::WebPkiServerVerifier>, String> {
+        let Some(path) = &self.ca else {
+            return Err("an https engine URL needs a CA, and no --stormblock-ca was given".to_string());
+        };
+        let read = std::fs::read(path);
+        let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
+        let problem = match read {
+            Ok(pem) => {
+                if let Some((_, verifier)) = current.as_ref().filter(|(held, _)| *held == pem) {
+                    return Ok(verifier.clone());
+                }
+                match self.build(&pem) {
+                    Ok(verifier) => {
+                        info!("stormblock engine TLS: verifying against {}", path.display());
+                        *current = Some((pem, verifier.clone()));
+                        return Ok(verifier);
+                    }
+                    Err(e) => format!("CA file {} is not usable: {e}", path.display()),
+                }
+            }
+            Err(e) => format!("CA file {} cannot be read: {e}", path.display()),
+        };
+        match current.as_ref() {
+            Some((_, verifier)) => {
+                self.say(format!("{problem}; keeping the CA last read from it"));
+                Ok(verifier.clone())
+            }
+            None => Err(problem),
+        }
+    }
+
+    /// The client TLS config: this verifier, no client certificate.
+    fn client_config(self) -> rustls::ClientConfig {
+        rustls::ClientConfig::builder_with_provider(self.provider.clone())
+            .with_safe_default_protocol_versions()
+            .expect("ring's provider supports the default TLS versions")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(self))
+            .with_no_client_auth()
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for EngineTrust {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let verifier = self.verifier().map_err(|e| {
+            self.say(format!("connection refused: {e}"));
+            rustls::Error::General(e)
+        })?;
+        let checked = verifier.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now);
+        match &checked {
+            // reqwest's error says only "error sending request": the reason is here.
+            Err(e) => self.say(format!("the engine's certificate was refused: {e}")),
+            Ok(_) => *self.said.lock().unwrap_or_else(|e| e.into_inner()) = None,
+        }
+        checked
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
+    }
 }
 
 /// A client for this node's stormblock engine that carries its token.
@@ -190,6 +340,7 @@ impl std::fmt::Debug for EngineClient {
             .field("url", &self.inner.url)
             .field("token_from", &self.inner.source.describe())
             .field("admin_token_from", &self.inner.admin.describe())
+            .field("ca", &self.inner.ca)
             .finish()
     }
 }
@@ -207,6 +358,12 @@ impl EngineClient {
         EngineClient::with_admin(url, TokenSource::from_env(), TokenSource::admin_from_env())
     }
 
+    /// [`Self::from_env`], with the CA an `https://` engine is verified
+    /// against (#312).
+    pub fn from_env_with_ca(url: &str, ca: Option<&Path>) -> EngineClient {
+        EngineClient::with_tls(url, TokenSource::from_env(), TokenSource::admin_from_env(), ca)
+    }
+
     /// The node token only: destructive verbs are refused on an enforcing
     /// engine.
     pub fn new(url: &str, source: TokenSource) -> EngineClient {
@@ -216,12 +373,24 @@ impl EngineClient {
     /// The node token, and the admin token for what the node token is
     /// refused (#105).
     pub fn with_admin(url: &str, source: TokenSource, admin: TokenSource) -> EngineClient {
+        EngineClient::with_tls(url, source, admin, None)
+    }
+
+    /// Both tokens, and the CA file an `https://` engine is verified against.
+    /// With no CA an `https://` engine is refused: public roots never apply.
+    pub fn with_tls(url: &str, source: TokenSource, admin: TokenSource, ca: Option<&Path>) -> EngineClient {
         // Timed on its own (#262): a boot spent 3 s between the line before
         // this client and the line after it, with nothing logged.
         let building = std::time::Instant::now();
         // No client-wide timeout: each request carries its own, and the
         // volume watch carries none (#99).
-        let http = reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT).build().unwrap_or_default();
+        // Built or nothing: `unwrap_or_default` here would be a client that
+        // trusts the public roots.
+        let http = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .use_preconfigured_tls(EngineTrust::new(ca).client_config())
+            .build()
+            .expect("the engine's HTTP client builds with its own rustls config");
         if building.elapsed() > std::time::Duration::from_millis(100) {
             tracing::warn!("building the stormblock engine's HTTP client took {} ms", building.elapsed().as_millis());
         }
@@ -236,6 +405,7 @@ impl EngineClient {
                 said_none: AtomicBool::new(false),
                 accepted: AtomicBool::new(false),
                 gave_up_on: Mutex::new(None),
+                ca: ca.map(Path::to_path_buf),
             }),
         }
     }
@@ -863,5 +1033,166 @@ mod tests {
         let _ = c.token();
         let shown = format!("{c:?}");
         assert!(!shown.contains("secret"), "{shown}");
+    }
+
+    /// A CA for the TLS tests, and a server certificate from it.
+    struct TestCa {
+        cert: rcgen::Certificate,
+        key: rcgen::KeyPair,
+    }
+
+    impl TestCa {
+        fn new() -> TestCa {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            TestCa { cert: params.self_signed(&key).unwrap(), key }
+        }
+
+        fn pem(&self) -> String {
+            self.cert.pem()
+        }
+
+        /// A TLS stand-in for the engine with a certificate from this CA for
+        /// `name`: its URL, and the tokens of the requests that reached it.
+        async fn engine(&self, name: &str) -> (String, Arc<Mutex<Vec<String>>>) {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let key = rcgen::KeyPair::generate().unwrap();
+            let cert = rcgen::CertificateParams::new(vec![name.to_string()])
+                .unwrap()
+                .signed_by(&key, &self.cert, &self.key)
+                .unwrap();
+            let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+            let log = seen.clone();
+            let app = axum::Router::new().route(
+                "/api/v1/volumes",
+                axum::routing::any(move |headers: axum::http::HeaderMap| {
+                    let log = log.clone();
+                    async move {
+                        let got = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+                        log.lock().unwrap().push(got.to_string());
+                        "[]"
+                    }
+                }),
+            );
+            let tls = axum_server::tls_rustls::RustlsConfig::from_pem(
+                cert.pem().into_bytes(),
+                key.serialize_pem().into_bytes(),
+            )
+            .await
+            .unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(axum_server::from_tcp_rustls(listener, tls).serve(app.into_make_service()));
+            (format!("https://127.0.0.1:{port}"), seen)
+        }
+    }
+
+    fn tls_client(url: &str, ca: Option<&Path>) -> EngineClient {
+        let token = TokenSource { explicit: Some("node".into()), files: vec![], env: "$X" };
+        EngineClient::with_tls(url, token, TokenSource::none(), ca)
+    }
+
+    /// An engine serving TLS from the configured CA answers, GET and POST, and
+    /// the token goes with them (#312's done-when, first half).
+    #[tokio::test]
+    async fn an_https_engine_from_the_configured_ca_is_reached_with_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = TestCa::new();
+        let file = dir.path().join("ca.crt");
+        std::fs::write(&file, ca.pem()).unwrap();
+        let (url, seen) = ca.engine("127.0.0.1").await;
+        let c = tls_client(&url, Some(&file));
+        let path = format!("{url}/api/v1/volumes");
+        assert_eq!(c.get(&path).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(c.post(&path, &serde_json::json!({})).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(*seen.lock().unwrap(), ["Bearer node", "Bearer node"]);
+    }
+
+    /// The other half: another CA's certificate fails the handshake, so
+    /// nothing, the token included, reaches the server.
+    #[tokio::test]
+    async fn a_certificate_from_another_ca_is_refused_and_no_token_is_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ca.crt");
+        std::fs::write(&file, TestCa::new().pem()).unwrap();
+        let (url, seen) = TestCa::new().engine("127.0.0.1").await;
+        let c = tls_client(&url, Some(&file));
+        assert!(c.get(&format!("{url}/api/v1/volumes")).await.is_err());
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_certificate_for_another_name_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = TestCa::new();
+        let file = dir.path().join("ca.crt");
+        std::fs::write(&file, ca.pem()).unwrap();
+        let (url, seen) = ca.engine("other.example").await;
+        let c = tls_client(&url, Some(&file));
+        assert!(c.get(&format!("{url}/api/v1/volumes")).await.is_err());
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// No CA configured: refused, never verified against anything else.
+    #[tokio::test]
+    async fn an_https_engine_with_no_ca_configured_is_refused() {
+        let (url, seen) = TestCa::new().engine("127.0.0.1").await;
+        let c = tls_client(&url, None);
+        assert!(c.get(&format!("{url}/api/v1/volumes")).await.is_err());
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// stormcert may write the CA after the kubelet starts, and renews it: the
+    /// next connection reads the file, with no restart. The old CA's
+    /// certificates are refused once it has been replaced.
+    #[tokio::test]
+    async fn the_ca_file_is_read_again_for_each_new_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ca.crt");
+        let (old, new) = (TestCa::new(), TestCa::new());
+        let (old_url, _) = old.engine("127.0.0.1").await;
+        let c = tls_client(&old_url, Some(&file));
+        let path = |u: &str| format!("{u}/api/v1/volumes");
+
+        assert!(c.get(&path(&old_url)).await.is_err(), "the CA is not there yet");
+        std::fs::write(&file, old.pem()).unwrap();
+        assert_eq!(c.get(&path(&old_url)).await.unwrap().status(), StatusCode::OK);
+
+        std::fs::write(&file, new.pem()).unwrap();
+        let (new_url, _) = new.engine("127.0.0.1").await;
+        assert_eq!(c.get(&path(&new_url)).await.unwrap().status(), StatusCode::OK);
+        let (old_again, _) = old.engine("127.0.0.1").await;
+        assert!(c.get(&path(&old_again)).await.is_err());
+    }
+
+    #[test]
+    fn a_file_that_goes_bad_keeps_the_last_good_ca_and_one_never_good_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ca.crt");
+        let trust = EngineTrust::new(Some(&file));
+        assert!(trust.verifier().unwrap_err().contains("cannot be read"));
+        std::fs::write(&file, "half a renewal").unwrap();
+        assert!(trust.verifier().unwrap_err().contains("not usable"));
+        std::fs::write(&file, TestCa::new().pem()).unwrap();
+        let good = trust.verifier().unwrap();
+        std::fs::write(&file, "half a renewal").unwrap();
+        assert!(Arc::ptr_eq(&trust.verifier().unwrap(), &good));
+        std::fs::remove_file(&file).unwrap();
+        assert!(Arc::ptr_eq(&trust.verifier().unwrap(), &good));
+        assert!(EngineTrust::new(None).verifier().unwrap_err().contains("--stormblock-ca"));
+    }
+
+    /// `http://` is untouched by a CA being configured: stormcos can set the
+    /// CA before it moves the URL.
+    #[tokio::test]
+    async fn a_plain_engine_still_works_with_a_ca_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ca.crt");
+        std::fs::write(&file, TestCa::new().pem()).unwrap();
+        let (url, seen) = gated("node", None).await;
+        let c = tls_client(&url, Some(&file));
+        assert_eq!(c.get(&format!("{url}/api/v1/fstemplates/t")).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(*seen.lock().unwrap(), ["node"]);
     }
 }

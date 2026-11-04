@@ -22,7 +22,8 @@ An em dash means there is no environment binding or the value is unset.
 | `--pod-manifest-path` | `POD_MANIFEST_PATH` | `/etc/kubernetes/manifests`; empty string disables static Pods |
 | `--runtime` | — | `native`; choices `native`, `cri`, `stormpump` (`vm` and `--vmm` retired, #13) |
 | `--registry` | — | `http://127.0.0.1:5100`; sbregistry (stormblock-registry), which mints image clones, with `--runtime stormpump` |
-| `--stormblock` | `STORMBLOCK_URL` | `http://127.0.0.1:9090`; engine for claims, VM disks and images |
+| `--stormblock` | `STORMBLOCK_URL` | `http://127.0.0.1:9090`; engine for claims, VM disks and images. `https://` needs `--stormblock-ca` (#312) |
+| `--stormblock-ca` | `STORMBLOCK_CA_FILE` | none; the CA file an `https://` `--stormblock` is verified against, and nothing else is. Unused with `http://` |
 | `--cri-socket` | `CRI_SOCKET` | CRI auto-detection, or `/run/stormpump.sock` for stormpump |
 | `--cni-conf-dir` | `CNI_CONF_DIR` | `/etc/cni/net.d`; watched (inotify) unless `--no-cni`: a change wakes the Pods waiting for a network config (#148) |
 | `--cni-bin-dir` | `CNI_BIN_DIR` | `/opt/cni/bin` |
@@ -148,6 +149,17 @@ retrying once only if changed. Until the engine has accepted a token (a boot,
 50 ms, up to 3 s) and retries with the new token: the engine can answer before
 it writes this boot's token, and a fallback file can still hold last boot's.
 A wait that gives up is not repeated for the same token.
+
+Engine TLS (#312, stormcos#374): the URL's scheme decides. `https://` with no
+`--stormblock-ca` stops the kubelet at start; there are no public roots and no
+skip. The file is read at each new connection: until it holds a usable CA every
+connection is refused before a request is sent (logged once, with the reason),
+a renewed CA is used with no restart, and a file that later goes or does not
+parse keeps the last good CA, logged. A certificate from another CA or for
+another name is refused. The token is still the kubelet's identity; it presents
+no client pair. What goes through stormvm's own client (snapshot, restore, the
+console's `snapshot` verb) gets the same URL with no CA yet, so those fail on an
+`https://` engine until stormvm#110 and #318.
 
 Admin credential (#105), for what stormblock's admin gate (stormblock#274)
 refuses to the node token: deleting a template (#140's rebuild of a broken

@@ -6,7 +6,7 @@ Audited from `pkg/kubelet/src/server.rs` and the CLI at main 06b91b5 (2026-10-09
 |---|---|
 | `0.0.0.0:10250` HTTPS | Kubelet listener, configurable with `--kubelet-port` |
 | `127.0.0.1:6443` HTTP | CLI's outbound apiserver default; stormcos overrides to node HTTPS |
-| `127.0.0.1:9090` HTTP | Outbound stormblock management API, `--stormblock` |
+| `127.0.0.1:9090` HTTP, or HTTPS with `--stormblock-ca` (#312) | Outbound stormblock management API, `--stormblock` |
 | `127.0.0.1:5100` HTTP | Outbound sbregistry (stormblock-registry, the registry that mints image clones), `--registry` |
 | `/run/stormpump.sock` Unix socket | Default stormpump ring bootstrap; stormcos uses `/hostrun/stormpump.sock` |
 | `/var/lib/kubelet/plugins_registry/*` Unix sockets | CSI registrar discovery, then node-plugin Unix endpoints |

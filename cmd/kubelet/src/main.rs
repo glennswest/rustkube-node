@@ -68,6 +68,13 @@ struct Cli {
     #[arg(long, env = "STORMBLOCK_URL", default_value = "http://127.0.0.1:9090")]
     stormblock: String,
 
+    /// The CA file an https:// --stormblock is verified against, and nothing
+    /// else is (#312). Read at each new connection, so it may be written after
+    /// the kubelet starts and renewed under it. Required with https://, unused
+    /// with http://.
+    #[arg(long, env = "STORMBLOCK_CA_FILE")]
+    stormblock_ca: Option<String>,
+
     /// CRI socket path (only used with --runtime=cri).
     #[arg(long, env = "CRI_SOCKET")]
     cri_socket: Option<String>,
@@ -280,6 +287,17 @@ fn container_log_rotation(size: &str, files: usize) -> anyhow::Result<kubelet::c
     Ok(kubelet::container_logs::Rotation { max_size, max_files: files })
 }
 
+/// The engine's CA (#312): an empty value is none, and an `https://` engine
+/// with none could never be reached, so that is said at start.
+fn engine_ca(url: &str, ca: Option<&str>) -> anyhow::Result<Option<std::path::PathBuf>> {
+    let ca = ca.map(str::trim).filter(|c| !c.is_empty());
+    anyhow::ensure!(
+        ca.is_some() || !url.to_ascii_lowercase().starts_with("https://"),
+        "--stormblock {url} needs --stormblock-ca: an https engine is verified against that CA and nothing else"
+    );
+    Ok(ca.map(std::path::PathBuf::from))
+}
+
 async fn named(flag: &str, path: Option<&str>) -> anyhow::Result<Option<Vec<u8>>> {
     match path {
         Some(p) => Ok(Some(wait_for_file(flag, p, CREDENTIAL_WAIT).await?)),
@@ -434,7 +452,8 @@ async fn main() -> anyhow::Result<()> {
     // The node's stormblock engine, with its token (#66): one client, shared
     // by claims, VM disks and image pulls. The token may not exist yet (the
     // engine mints it at start), and the client keeps looking for it.
-    let engine = kubelet::engine::EngineClient::from_env(&cli.stormblock);
+    let engine_ca = engine_ca(&cli.stormblock, cli.stormblock_ca.as_deref())?;
+    let engine = kubelet::engine::EngineClient::from_env_with_ca(&cli.stormblock, engine_ca.as_deref());
     tracing::info!("stormblock engine: {engine:?}");
     kubelet::startup::mark("engine");
 
@@ -756,6 +775,17 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn an_https_engine_needs_its_ca_and_a_plain_one_does_not() {
+        assert!(engine_ca("https://127.0.0.1:9090", None).is_err());
+        assert!(engine_ca("HTTPS://127.0.0.1:9090", Some(" ")).is_err());
+        assert_eq!(
+            engine_ca("https://127.0.0.1:9090", Some("/data/stormcert/ca.crt")).unwrap(),
+            Some(std::path::PathBuf::from("/data/stormcert/ca.crt"))
+        );
+        assert_eq!(engine_ca("http://127.0.0.1:9090", None).unwrap(), None);
+    }
 
     fn scratch(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("kubelet-main-{}-{name}", std::process::id()));
