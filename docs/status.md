@@ -74,6 +74,7 @@ Each gap has an owning issue. These are limitations, not supported features.
 
 | Unsupported or incomplete claim | Tracking |
 |---|---|
+| VM snapshot, restore and the console's `snapshot` verb on an `https://` engine: stormvm's client has no CA setting yet (the kubelet's own client does, `--stormblock-ca`, #312) | [#318](https://github.com/glennswest/rustkube-node/issues/318), stormvm#110 |
 | OOMKilled, termination messages, hugepages, in-place resize, `activeDeadlineSeconds` on a running pod | [#194](https://github.com/glennswest/rustkube-node/issues/194), [#162](https://github.com/glennswest/rustkube-node/issues/162), [#195](https://github.com/glennswest/rustkube-node/issues/195), [#192](https://github.com/glennswest/rustkube-node/issues/192), [#185](https://github.com/glennswest/rustkube-node/issues/185) |
 | `runtimeClassName` (microVM Pods go to stormvisor through it) and AppArmor profiles applied | [#204](https://github.com/glennswest/rustkube-node/issues/204), [#197](https://github.com/glennswest/rustkube-node/issues/197) |
 | Reservations enforced as a cgroup limit (they are advertised only) | [#205](https://github.com/glennswest/rustkube-node/issues/205) |
