@@ -58,14 +58,16 @@ by #51.
 
 ## Work plan
 
-### In progress: #312 (P2), the engine client over https with the node CA (stormcos#374)
+### Done: #312 (P2), the engine client over https with the node CA (stormcos#374)
 
 2026-11-04. `--stormblock-ca` / `STORMBLOCK_CA_FILE` (the CA is the whole trust: no public roots, no skip). The file is read at each
 new connection: not there yet = refused and retried, renewed = used, unusable after a good one = the good one kept. `https://` with no
 CA is fatal at start; `http://` works as before. Not the client pair (not asked; the token stays). Doing:
-1. [ ] engine.rs: `EngineTrust` verifier, `from_env_with_ca`; main.rs flag + check; tests against a TLS stand-in (test CA reached with the
+1. [x] engine.rs: `EngineTrust` verifier, `from_env_with_ca`; main.rs flag + check; tests against a TLS stand-in (test CA reached with the
        token, other CA / wrong name / no CA refused with nothing sent, CA late and renewed, plain http); docs, CHANGELOG; sc-build.
-2. [ ] stormvm-block (snapshot, restore, console `snapshot`) gets the same URL and has no CA: stormvm#110; follow-up #318, said on stormcos#374.
+       Done: 55eb751 (8 tests). SC_BUILD_VM sc-build (job 6090e2f2b8): 595 kubelet unit, all suites, nothing from rustc or clippy in the changed files
+       (#227's elsewhere). Live: not run on a node or a real engine; stormcos sets `--stormblock https://127.0.0.1:9090 --stormblock-ca /data/stormcert/ca.crt`.
+2. [x] stormvm-block (snapshot, restore, console `snapshot`) gets the same URL and has no CA: follow-up #318, proposed after stormvm#110; said on stormcos#374.
 
 ### Waiting on a release with 6a3b27a: #311 (P1), X9 blades: container start 4-9 s in `containers`
 
