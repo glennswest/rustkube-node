@@ -13,7 +13,7 @@ stage golden through `stormcentral component stage rustkube-node`, not a package
 
 ## Current implementation reference (2026-10-30)
 
-Main baseline: f0102a9 (#303 VMI Running once its control socket answers; stormvm 0225218, #304 bridge keeps multus/SR-IOV NICs; #302 disk moves off the node; #301; #40 live migration kubelet half, #160 parked startup admission, #292 ring arena per request; every git dependency by rev, #210; stage builds are listed per issue in the work plan). See
+Main baseline: f0102a9 (#310 diagnosed, no code: Cilium's `endpoint-create` limiter; #303 VMI Running once its control socket answers; stormvm 0225218, #304 bridge keeps multus/SR-IOV NICs; #302 disk moves off the node; #301; #40 live migration kubelet half, #160 parked startup admission, #292 ring arena per request; every git dependency by rev, #210; stage builds are listed per issue in the work plan). See
 `docs/status.md` for changes since October 2, the owner's recorded decisions and issue-backed limitations,
 `docs/configuration.md` for every CLI/env/default, `docs/api.md` for ports and actual routes, `docs/retries.md`
 for every remote call's retry policy. CLI runtime defaults to native; stormcos explicitly chooses stormpump.
@@ -57,6 +57,19 @@ owner built the stage golden for v0.12.0: golden-rustkube-node-ce66e97945ad
 by #51.
 
 ## Work plan
+
+### Waiting on stormcos-cilium#38 (the agent's `api-rate-limit`): #310 (P1), Dell: a claim pod's `sandbox/cni` ~7 s since 12.37
+
+2026-11-03. Not the kubelet, not storage, and not claims: **Cilium's API rate limiter on `endpoint-create`** (v1.20.2, `daemon/restapi/api_limits.go`:
+rate 0.5/s, burst 4, skip-initial 4, auto-adjust, estimated 2 s). Rate = 0.5 x 2 s / mean, so the wait between creates is the mean processing time of the last
+10 creates. After a reboot the first endpoints wait for the first BPF template compile (Dell 21-24 s, server7 48-50 s, pvetest1 2-3 s), so the mean starts high.
+`Wait` runs in the PUT handler before the agent logs `Create endpoint request`: that is the plugin's "gap".
+Replay of the boot logs (`/var/lib/stormcentral/bootlog/<machine>-<id>/pods.log`), gap between creates vs the mean: Dell 12.58 p2-p5 9.30/9.28, 8.15/8.14, 7.25/7.24,
+6.54/6.53; Dell 12.37 9.84/9.82, 8.62/8.61, 7.67/7.66, 6.91/6.90; server7 12.58 21.43/21.39, 18.79/18.76, 16.72/16.70, 15.07/15.05.
+Why claim pods: they are the probe's 5th+ creates after the reboot. Why 12.27 was fine: its reboot made one endpoint (coredns), so c1-c3 were under skip-initial and
+p took a burst token; 12.37+ make three (coredns, snapshot-controller x2), and stormcentral#245 (10-18) made the claim probe 5 runs.
+No kubelet change. Resume: on a release with stormcos-cilium#38's setting, the Dell's `warm_claim_bind_and_mount_timing` (`sandbox/cni` ~0.1 s on all 5 runs,
+`GET /api/v1/metrics`); close. Not re-verified live: the agent's `cilium_api_limiter_*` are on loopback and its limiter lines at debug.
 
 ### Done: #303 (P3), a VMI reads Running only once its control socket answers (stormvm#28)
 

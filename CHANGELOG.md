@@ -2,6 +2,8 @@
 
 ## 2026-11-03
 
+- **docs:** #310 diagnosed, no kubelet change: a slow `sandbox/cni` right after a reboot is Cilium's `endpoint-create` API rate limiter (the wait between creates equals the mean processing time of the last 10), not claims or storage. Boot-log replay on the Dell and server7 matches within 0.04 s. README's `sandbox/cni` row and status.md say so; the fix is the agent's `api-rate-limit`, asked on stormcos-cilium#38.
+
 - **fix:** A VMI reads `Running` only once its hypervisor's control socket answers a status (#303, stormvm#28). Before, it read `Running` at the engine's spawn, before qemu bound QMP, so a snapshot 1 s later failed with `control.sock is not connectable`; every other verb and client acting on Running had the same race. The start waits for `Machine::status_when_up` for up to 10 s and stops early if the hypervisor exits. A socket still not answering after that is reported `Running` with a Warning `ControlNotReady` Event, and the machine is not stopped. The new start-timing step is `control`.
 
 - **fix:** stormvm 01ac271 → 0225218 (#304, stormvm#103), every stormvm crate by rev; stormpump stays 9877a97. A VMI with the machine-wide `storm.io/bridge` no longer puts a multus or SR-IOV interface on that bridge: the annotation replaces only the pod network (or no network), so an unwired SR-IOV NIC is refused at start instead of the VM running with a second bridged NIC, and a multus VLAN NIC (#85) stays on its VLAN. `storm.io/bridge.<iface>` on an `sriov` binding is refused by `from_kube`. No API change (rev-only bump in pkg/kubelet/Cargo.toml and Cargo.lock).
