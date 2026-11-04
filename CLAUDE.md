@@ -58,6 +58,15 @@ by #51.
 
 ## Work plan
 
+### In progress: #312 (P2), the engine client over https with the node CA (stormcos#374)
+
+2026-11-04. `--stormblock-ca` / `STORMBLOCK_CA_FILE` (the CA is the whole trust: no public roots, no skip). The file is read at each
+new connection: not there yet = refused and retried, renewed = used, unusable after a good one = the good one kept. `https://` with no
+CA is fatal at start; `http://` works as before. Not the client pair (not asked; the token stays). Doing:
+1. [ ] engine.rs: `EngineTrust` verifier, `from_env_with_ca`; main.rs flag + check; tests against a TLS stand-in (test CA reached with the
+       token, other CA / wrong name / no CA refused with nothing sent, CA late and renewed, plain http); docs, CHANGELOG; sc-build.
+2. [ ] stormvm-block (snapshot, restore, console `snapshot`) gets the same URL and has no CA: stormvm#110; follow-up here, said on stormcos#374.
+
 ### Waiting on a release with 6a3b27a: #311 (P1), X9 blades: container start 4-9 s in `containers`
 
 2026-11-03. From the kubelet's own lines (bootlog server7-1793752767, 12.58 warm c1/c2/c3, seconds): engine clone 1.96/2.57/3.48, mount + the rest of create
