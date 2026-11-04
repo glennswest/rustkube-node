@@ -61,7 +61,7 @@ by #51.
 ### Waiting on a release with 6a3b27a: #311 (P1), X9 blades: container start 4-9 s in `containers`
 
 2026-11-03. From the kubelet's own lines (bootlog server7-1793752767, 12.58 warm c1/c2/c3, seconds): engine clone 1.96/2.57/3.48, mount + the rest of create
-0.6/0.5/0.2, spawn 1.44/0.20/0.51; total 4.05/3.34/4.29 (Dell 0.26-0.45, pvetest1 0.07). server1 (server1-1793278829, later in that boot): clone 10-17 s,
+0.64/0.56/0.30, spawn 1.44/0.20/0.51; total 4.05/3.34/4.29 (Dell 0.26-0.45, pvetest1 0.07). server1 (server1-1793278829, later in that boot): clone 10-17 s,
 VolumeRegister 1.8-21.7 s, spawn 1.4-1.9 s. stormblock's own lines put the wait in I/O, not its lock (12.3 s clones, lock-wait 1-314 ms). `verify: true` is not
 the cost: a sealed source gets no fsck (stormblock `clone_volume_impl`, "a full fsck only for a source that is not sealed"). Doing:
 1. [x] Split `container/<name>` as the issue asks: `/lookup`, `/clone`, `/attach`, `/mount`, `/define` (create), `/volumes`, `/spawn`, `/identity` (start), `/other`;
