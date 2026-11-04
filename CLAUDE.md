@@ -68,6 +68,7 @@ Replay of the boot logs (`/var/lib/stormcentral/bootlog/<machine>-<id>/pods.log`
 6.54/6.53; Dell 12.37 9.84/9.82, 8.62/8.61, 7.67/7.66, 6.91/6.90; server7 12.58 21.43/21.39, 18.79/18.76, 16.72/16.70, 15.07/15.05.
 Why claim pods: they are the probe's 5th+ creates after the reboot. Why 12.27 was fine: its reboot made one endpoint (coredns), so c1-c3 were under skip-initial and
 p took a burst token; 12.37+ make three (coredns, snapshot-controller x2), and stormcentral#245 (10-18) made the claim probe 5 runs.
+Docs 5bf5db4, SC_BUILD sc-build `cargo build --locked`: exit 0 (VM sc-build-d6e38a1f5e). No golden (docs only). Evidence on stormcos-cilium#38; #310 proposed after it.
 No kubelet change. Resume: on a release with stormcos-cilium#38's setting, the Dell's `warm_claim_bind_and_mount_timing` (`sandbox/cni` ~0.1 s on all 5 runs,
 `GET /api/v1/metrics`); close. Not re-verified live: the agent's `cilium_api_limiter_*` are on loopback and its limiter lines at debug.
 
