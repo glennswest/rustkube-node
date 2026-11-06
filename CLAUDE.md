@@ -1696,6 +1696,7 @@ every suite needs to resolve STORM_NODE). Pods are pinned with `spec.nodeName` (
        2026-11-06 (17:15Z): 12.62 (cilium) is composed and carries registry f2f13ad (1 commit after 9912c98), so the after-release hold has cleared, but no machine runs it:
        pvetest1 12.58.4, pvetest2 12.61-flowsdn, C2NR0Q2 12.58; `release tests 12.62` = no-installs; 12.62-flowsdn still composing. No run queued (same 404 expected: eb5b18ef34,
        the newest, on pvetest2). Install is the master's: asked by `stormcentral note`. Resume: `testhost installs pvetest1` shows 12.62 passed, then the runs above.
+       2026-11-06 (17:40Z): 12.62 tombstoned (stormcos#814, see #52). #61 proposed after stormcos#812. Resume: the runs above once #812 closes.
 
 ### Done: #171 (P2), fsGroup / supplementalGroups onto the engine
 
@@ -2738,6 +2739,9 @@ kubelet's (stormcos `volume kubeletdir`), so a driver pod's hostPath reaches wha
        (stormblock-registry#150; #61's 023f853fba on pvetest1, 12.61). No csi run queued while it stands. #52 proposed after it. Resume as above.
        2026-11-06 (later): #150 closed (v0.55.1, 9912c98), not on a node: the newest registry image is da53e0e, behind it, and 12.61 predates it. No run queued.
        #52 proposed `--after-release registry>=9912c98`. Resume as above.
+       2026-11-06 (17:40Z): the hold cleared on 12.62 (registry f2f13ad), but 12.62 was tombstoned: pvetest1's install failed at `local boot: the apiserver answers` (stormcos#814,
+       P0: stormcert and rustkube-node `failed while attaching mounts`, errno 11, the boot unit's mounts, no kubelet code ran). So still no machine has the fix; no run queued.
+       #52 proposed after stormcos#812 (install a release carrying registry>=9912c98 on a pve machine). Resume as above.
 
 (earlier) 2026-10-21. stormcentral#479 landed (`cluster_write`, `service_account_cluster_rules`). Blocker found: no stormcos node
 can run csi-driver-host-path's `hostpathplugin` (upstream images only as pinned imports; `pinned-images.txt` has the
