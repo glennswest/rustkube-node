@@ -2487,6 +2487,7 @@ Steps:
 
 2026-11-06. stormcos#271 closed, but no run reaches a test: the fetched image's tag answers 404 on the node (stormblock-registry#150; #61's 023f853fba, stormcos-cilium 8036d8a602 on pvetest1, 12.61). No medium queued while it stands. #64 proposed after it. Resume as below.
 2026-11-06 (later). #150 closed (v0.55.1, 9912c98). Registry image golden-registry-e7abc9eefceb (f2f13ad) has the fix; no release carries it yet (newest 12.61). No run queued. #64 proposed `--after-release registry>=9912c98`. Resume as below.
+2026-11-06 (17:40Z): 12.62 carried it but was tombstoned (stormcos#814, see #52). #64 proposed after stormcos#812. Resume as below once #812 closes.
 
 2026-10-21. stormblock#331 closed. Every test run since stormcentral#697 that finds its image on forge dies at the node's
 fetch (`forge.g16.lo:5100 is not a peer of this registry`, stormcos#271); pvetest1/2 are refused ("sbregistry failing"),
@@ -2699,6 +2700,7 @@ Steps:
        queued while it stands. #233 proposed after it. Resume: `stormcentral test run rustkube-node multus --tag pvetest1`, close on a pass.
        2026-11-06 (later): #150 closed (v0.55.1, 9912c98); registry image e7abc9eefceb (f2f13ad) has it, no release carries it (newest 12.61; rustkube rigs 5e9f2f7a9c, pvetest1,
        same 404). No run queued. #233 proposed `--after-release registry>=9912c98`. Resume as above; the prerequisites were checked on 12.58, not rechecked since.
+       2026-11-06 (17:40Z): 12.62 carried it but was tombstoned (stormcos#814, see #52). #233 proposed after stormcos#812. Resume as above once #812 closes.
 
 ### Done: #231 + #232 (P0, stormcos#488): verified live on the Dell, 12.07
 
