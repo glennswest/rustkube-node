@@ -444,7 +444,7 @@ mod tests {
 
     #[test]
     fn a_case_above_the_node_is_a_refusal_check() {
-        let case = |r: &str, block| Case { name: "x".into(), request: r.into(), block };
+        let case = |r: &str, block| Case { name: "x".into(), request: r.into(), block, device_at: None };
         // C2NR0Q2: a 1.8 TB slab publishes 1Ti.
         let max = Ok(("1Ti".to_string(), 1u64 << 40));
         assert!(too_large(&case("600Gi", false), &max).is_none());
