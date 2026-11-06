@@ -19,8 +19,10 @@
 //! Every class is an ext4 blank too, up to 1Pi (#149): a 20Ti *filesystem*
 //! claim is a size case of the 64Ti class like any other.
 //!
-//! **Above the ladder** (2Pi): refused, not stuck. The pod waits with the
-//! reason ("larger than the largest size class") on its status or in an
+//! **Above the ladder** (2Pi): refused, not stuck. The pod is placed with
+//! `spec.nodeName`, since a scheduler reading the node's capacity would refuse
+//! it first and the kubelet's own check would never be reached. It waits with
+//! the reason ("larger than the largest size class") on its status or in an
 //! Event, and the claim is never Bound.
 //!
 //! **Minting.** A class with no blank on the node is minted on first use,
@@ -159,7 +161,7 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report, pod_cases: PodCases) {
             let _turn = gate.acquire_owned().await;
             let t = Instant::now();
             let o = match too_large(&c, &max) {
-                Some(why) => match refused(&env, &api, &format!("sz-{}", c.name.replace('.', "-")), &c.request, &ROOM, c.block, true).await {
+                Some(why) => match refused(&env, &api, &format!("sz-{}", c.name.replace('.', "-")), &c.request, &ROOM, c.block, Pin::Selector).await {
                     Outcome::Pass(d) => Outcome::Pass(format!("{why}: {d}")),
                     other => other,
                 },
@@ -263,8 +265,15 @@ async fn size_case(env: &Env, api: &Api, c: &Case, seed: u64) -> Outcome {
         Ok(d) => d,
         Err(e) => return Outcome::Fail(e),
     };
+    // The workload's own line: the status has no termination message (#162).
+    let said = if done.message.is_empty() {
+        k8s::log(env, api, &name, false).await.unwrap_or_else(|e| format!("(no log: {e})"))
+    } else {
+        done.message.clone()
+    };
+    let said = said.trim();
     if done.phase != "Succeeded" {
-        return Outcome::Fail(format!("request {}: pod failed on {}: {}", c.request, done.node, done.message));
+        return Outcome::Fail(format!("request {}: pod failed on {}: {said}", c.request, done.node));
     }
     let class = LADDER.iter().find(|(_, b)| *b == hi).map(|(q, _)| *q).unwrap_or("?");
 
@@ -304,7 +313,7 @@ async fn size_case(env: &Env, api: &Api, c: &Case, seed: u64) -> Outcome {
         "request {} -> {class} on {}: {}; claim status {status:?}; deleted and reclaimed in {} s",
         c.request,
         done.node,
-        done.message,
+        said,
         t.elapsed().as_secs()
     );
     if wrong.is_empty() {
@@ -316,7 +325,7 @@ async fn size_case(env: &Env, api: &Api, c: &Case, seed: u64) -> Outcome {
 
 /// 2Pi: the pod waits with the reason, and the claim is never Bound.
 async fn above_ladder(env: &Env, api: &Api) -> Outcome {
-    refused(env, api, "sz-above-ladder", "2Pi", &["larger than the largest size class"], false, false).await
+    refused(env, api, "sz-above-ladder", "2Pi", &["larger than the largest size class"], false, Pin::Node).await
 }
 
 /// One class above what the test node says it can still take (#62).
@@ -334,17 +343,26 @@ async fn overcommit_refused(env: &Env, api: &Api) -> Outcome {
     };
     // Block, so a class past the ext4 ones is refused for room, not for
     // having no filesystem.
-    match refused(env, api, "sz-overcommit", request, &ROOM, true, true).await {
+    match refused(env, api, "sz-overcommit", request, &ROOM, true, Pin::Selector).await {
         Outcome::Pass(d) => Outcome::Pass(format!("{request} with maximumVolumeSize {}: {d}", s(&cap, "/maximumVolumeSize"))),
         other => other,
     }
 }
 
+/// How a refused case's pod reaches the test node.
+#[derive(Clone, Copy)]
+enum Pin {
+    /// Through the scheduler, kept to the node (a scheduler that does not read
+    /// capacity cannot place it elsewhere): the scheduler's refusal counts.
+    Selector,
+    /// `spec.nodeName`, past the scheduler: the kubelet's own check is reached.
+    Node,
+}
+
 /// A claim of `request` that the node refuses: the pod waits with a reason
 /// containing one of `why`, and the claim is never Bound. `block`: a Block
-/// claim. `pinned`: its pod pinned to the test node (so a scheduler that does
-/// not read capacity cannot place it elsewhere).
-async fn refused(env: &Env, api: &Api, name: &str, request: &str, why: &[&str], block: bool, pinned: bool) -> Outcome {
+/// claim.
+async fn refused(env: &Env, api: &Api, name: &str, request: &str, why: &[&str], block: bool, pin: Pin) -> Outcome {
     let claim = if block { k8s::block_claim(env, name, request) } else { k8s::claim(env, name, request) };
     if let Err(e) = api.create(&k8s::pvcs(env), &claim).await {
         return Outcome::Infra(e);
@@ -355,8 +373,9 @@ async fn refused(env: &Env, api: &Api, name: &str, request: &str, why: &[&str], 
     } else {
         k8s::work(env, name, name, "sized", &args)
     };
-    if pinned {
-        pod["spec"]["nodeSelector"] = serde_json::json!({ "kubernetes.io/hostname": env.node_name });
+    match pin {
+        Pin::Selector => pod["spec"]["nodeSelector"] = serde_json::json!({ "kubernetes.io/hostname": env.node_name }),
+        Pin::Node => pod["spec"]["nodeName"] = serde_json::json!(env.node_name),
     }
     if let Err(e) = api.create(&k8s::pods(env), &pod).await {
         return Outcome::Infra(e);
