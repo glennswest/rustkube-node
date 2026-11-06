@@ -1686,6 +1686,8 @@ every suite needs to resolve STORM_NODE). Pods are pinned with `spec.nodeName` (
        2026-10-28: stormcos#129 closed, pvetest1/2 on 12.58 (passed); every run (ours c3a7f40a13, 184f62a70d) errors at the
        node's fetch, `forge.g16.lo:5100 is not a peer` = stormcos#271. Test crate builds clean (45 tests). #61 proposed
        after stormcos#271. Resume: medium on pvetest1, long at night, close on their results.
+       2026-11-06: stormcos#271 closed (pvetest1/2 on 12.61 take forge as a peer). Medium queued: 023f853fba (pvetest1, 1c94f30).
+       Read with `stormcentral test show <id>`; fix what fails; then long at night; close on both.
 
 ### Done: #171 (P2), fsGroup / supplementalGroups onto the engine
 
