@@ -2771,6 +2771,7 @@ kubelet's (stormcos `volume kubeletdir`), so a driver pod's hostPath reaches wha
        P0: stormcert and rustkube-node `failed while attaching mounts`, errno 11, the boot unit's mounts, no kubelet code ran). So still no machine has the fix; no run queued.
        #52 proposed after stormcos#812 (install a release carrying registry>=9912c98 on a pve machine). Resume as above.
        2026-11-06 (21:43Z): stormcos#812 closed; pvetest2 passed 12.63-flowsdn and medium ran there (#61). Queued csi 562ae87cdb (pvetest2, 84c7223). Read with `stormcentral test show 562ae87cdb`, fix what fails, close on a pass.
+       2026-11-06 (22:03Z): 562ae87cdb: `csi-setup` 409 on the run's own CSIDriver name (unexplained). 045726d654: no results; pvetest2's apiserver gone during the Job, wedged 13+ min (6443/9094 refused; stormd APIs and :10250 accept, no answer). Cause unknown; may be the suite (privileged Bidirectional driver pod, hostPID kubelet restart). Don't run csi on another machine until the console says. Master asked to read the console. Resume: its answer, then rerun on a fresh install. Consider: csi suite writes results as it goes, so a lost node still says which case it reached.
 
 (earlier) 2026-10-21. stormcentral#479 landed (`cluster_write`, `service_account_cluster_rules`). Blocker found: no stormcos node
 can run csi-driver-host-path's `hostpathplugin` (upstream images only as pinned imports; `pinned-images.txt` has the
