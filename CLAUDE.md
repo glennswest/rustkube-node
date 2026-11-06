@@ -1642,7 +1642,7 @@ is live GETs already.
 2026-10-07. de51950: README, BUILD.md, status.md, presentation, CLAUDE.md (flowsdn owns Services in its edition,
 #145; checked against stormcos main). sc-build: deck renders (12 slides), `cargo build --locked` ok. Closed.
 
-### Waiting on stormcos#271 (test images on nodes): #61, short, medium and long test suites (stormcentral docs/test-standard.md)
+### Waiting on stormblock-registry#150 (test images on nodes): #61, short, medium and long test suites (stormcentral docs/test-standard.md)
 
 2026-10-06. `test/` has medium's storage cases (#64, #59, #62, #67); short and long are one skip each. The
 runner's namespace Role is `*`; cluster reads come from `test/requires.toml` (only [medium] declares `nodes`, which
@@ -2476,7 +2476,9 @@ Steps:
        assets.json) for stormblock/registry/timesync; #87 keeps those and the stale-status half. Not run on a node:
        whether `/hostroot/logs/<svc>` shows the mounted volume is unchecked (C2NR0Q2 down). Unreleased.
 
-### Waiting on stormcos#271 (nodes' forge peer for test images): #64, PVC size test (the medium suite's first test)
+### Waiting on stormblock-registry#150 (test images on nodes): #64, PVC size test (the medium suite's first test)
+
+2026-11-06. stormcos#271 closed, but no run reaches a test: the fetched image's tag answers 404 on the node (stormblock-registry#150; #61's 023f853fba, stormcos-cilium 8036d8a602 on pvetest1, 12.61). No medium queued while it stands. #64 proposed after it. Resume as below.
 
 2026-10-21. stormblock#331 closed. Every test run since stormcentral#697 that finds its image on forge dies at the node's
 fetch (`forge.g16.lo:5100 is not a peer of this registry`, stormcos#271); pvetest1/2 are refused ("sbregistry failing"),
