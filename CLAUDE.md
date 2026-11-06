@@ -69,12 +69,13 @@ CA is fatal at start; `http://` works as before. Not the client pair (not asked;
        (#227's elsewhere). Live: not run on a node or a real engine; stormcos sets `--stormblock https://127.0.0.1:9090 --stormblock-ca /data/stormcert/ca.crt`.
 2. [x] stormvm-block (snapshot, restore, console `snapshot`) gets the same URL and has no CA: follow-up #318, proposed after stormvm#110; said on stormcos#374.
 
-### In progress: #325 (P2), VM start: `control` a flat ~102 ms, `report` grew (stormcos#804, fix 17)
+### Waiting on a release with 2e27288: #325 (P2), VM start: `control` a flat ~102 ms, `report` grew (stormcos#804, fix 17)
 
 2026-11-06. `control`: stormvm's `status_when_up` sleeps a fixed 100 ms after a refused connect, so a socket bound within that costs 100 ms. Target: under 20 ms on a VM, VM Running ~150 ms warm.
 `report`: one merge PATCH. pvetest1 12.61 VMIs 3.7-139 ms, pvetest2 12.61-flowsdn 2.8-118 ms, while pods in the same boots stay 2.5-5.8 ms (12.58.4 VMIs 3.7-22 ms). Not explained yet. Doing:
-1. [ ] vm_manager: `control_when_up` over `Machine::status`: every 5 ms for the first 100 ms, then 25 ms to 1 s, then 100 ms. Tests (paused clock), README, CHANGELOG; sc-build; stage.
-2. [ ] Read `VMI … started:` on a release with it: `control` and `report`; close, or file what `report` turns out to be.
+1. [x] vm_manager: `control_when_up` over `Machine::status`: every 5 ms for the first 100 ms, then 25 ms to 1 s, then 100 ms. Test, README, CHANGELOG. Done: 2e27288. SC_BUILD_VM sc-build (VM sc-build-98024a5371): 596 kubelet unit, all suites. Stage requested. Proposed `--after-release rustkube-node>=2e27288`.
+2. [ ] Resume: `/var/lib/stormcentral/bootlog/<pve machine>-<install>/pods.log`, `VMI … started:` on a release with it: `control` < 20 ms, VM Running ~150 ms warm (`vm_start_*`, `/api/v1/metrics`). If `report` is still bimodal, find out why; close when both hold.
+       `report` so far: no PATCH in the 12.61 bundle logged a retry (first delay is at least 125 ms anyway); pods' status writes in those boots 2.5-5.8 ms. The apiserver's logs aren't in the bundle or on the console. Not known: whether the 100 ms wait moved the write into another writer's way (a `finalizer not updated: 409` follows right after), or the apiserver.
 
 ### Waiting on stormblock#521 + stormpump#199: #311 (P1), X9 blades: container start 4-9 s in `containers`
 
