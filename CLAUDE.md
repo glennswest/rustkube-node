@@ -1693,6 +1693,9 @@ every suite needs to resolve STORM_NODE). Pods are pinned with `spec.nodeName` (
        2026-11-06 (later): #150 closed (v0.55.1, 9912c98), not on a node: the newest registry image is da53e0e, 5 commits behind it, and 12.61 predates it.
        No run queued (it would stop at the same 404). #61 proposed `--after-release registry>=9912c98`. short also passed on pvetest1 (f490bbfc50, c0a5fd4, 4/0/0).
        Resume: `stormcentral test run rustkube-node medium --tag pvetest1`, long at night, close on their results.
+       2026-11-06 (17:15Z): 12.62 (cilium) is composed and carries registry f2f13ad (1 commit after 9912c98), so the after-release hold has cleared, but no machine runs it:
+       pvetest1 12.58.4, pvetest2 12.61-flowsdn, C2NR0Q2 12.58; `release tests 12.62` = no-installs; 12.62-flowsdn still composing. No run queued (same 404 expected: eb5b18ef34,
+       the newest, on pvetest2). Install is the master's: asked by `stormcentral note`. Resume: `testhost installs pvetest1` shows 12.62 passed, then the runs above.
 
 ### Done: #171 (P2), fsGroup / supplementalGroups onto the engine
 
