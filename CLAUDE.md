@@ -773,7 +773,7 @@ may take the log with the container. Done in code: `RuntimeService::logs_survive
 completed init kept in `PodManager::kept_inits` until `stop_pod` where removal would lose the log. Tests (1 changed,
 1 new). sc-build 90c291c0ec: 419 pass (after #196's test updates). Golden e3415aaa02e2. Closed.
 
-### Waiting on stormcos#357 (snapshot-controller) + stormcos#170 (CRDs) in a release: #157 (P3), VM disks on stormblock-csi claims: snapshot by VolumeSnapshot, restore from any leg
+### Waiting on stormcos#820 (a release that runs stormblock-csi) + stormcos#354 (one cluster stormstorage): #157 (P3), VM disks on stormblock-csi claims: snapshot by VolumeSnapshot, restore from any leg
 
 2026-10-10. stormstorage#49 closed (snapshots, one-node group snapshots, `source` clones); stormblock-csi still has
 `snapshots: false` for its stormstorage backend and no csi-snapshotter: filed stormblock-csi#51. stormcos#170 ships the
@@ -801,6 +801,10 @@ D. [ ] Tests (5 new), README, csi.md, status.md, CHANGELOG (0b942e8, c9e168f; #2
        2026-10-28: stormcos#536 closed (csi-snapshotter golden), stormcos#357 shipped from stormcos (3b30f0f) but open,
        stormcos#170 open; 12.58 carries no snapshot-controller and no stormblock-csi. #157 proposed after stormcos#357 +
        stormcos#170. Resume: a release with them + stormblock-csi; snapshot, lose the head, restore, boot; close.
+       2026-11-06: stormcos#357 closed and 12.63 (composed; installs still running) records the snapshot-controller golden as shipped with its apiserver and
+       stormpump; the CRDs have shipped since 10-07 (#170 stays open for the controller and stormvm's live check, so it is no blocker here). Not re-run: no kubelet change, and
+       the five #157 tests are still in main. Left: nothing runs stormblock-csi (not in 12.63, no manifest in stormcos; filed stormcos#820), and "lose the node" needs
+       two nodes on one stormstorage (stormcos#354, stormstorage#56). #157 proposed after stormcos#820 + stormcos#354. Resume: snapshot a VM on a stormblock-csi claim, lose the head, restore, boot; close.
 
 ### Done: #181 item 3 (stormpump#144: /run/stormpump/shutdown)
 
