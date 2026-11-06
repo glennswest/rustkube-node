@@ -1719,6 +1719,7 @@ every suite needs to resolve STORM_NODE). Pods are pinned with `spec.nodeName` (
        pvetest1 12.58.4, pvetest2 12.61-flowsdn, C2NR0Q2 12.58; `release tests 12.62` = no-installs; 12.62-flowsdn still composing. No run queued (same 404 expected: eb5b18ef34,
        the newest, on pvetest2). Install is the master's: asked by `stormcentral note`. Resume: `testhost installs pvetest1` shows 12.62 passed, then the runs above.
        2026-11-06 (17:40Z): 12.62 tombstoned (stormcos#814, see #52). #61 proposed after stormcos#812. Resume: the runs above once #812 closes.
+       2026-11-06 (20:33Z): stormcos#812/#814 closed; pvetest2 passed 12.63-flowsdn (registry f2f13ad, has 9912c98) and other components' shorts pass there. Queued medium ce5d01a254 (pvetest2, c4b5643). Read with `stormcentral test show ce5d01a254`; long at night (`stormcentral test run rustkube-node long --tag pvetest2`).
 
 ### Done: #171 (P2), fsGroup / supplementalGroups onto the engine
 
