@@ -2728,7 +2728,7 @@ Steps:
        2026-11-06 (later): #150 closed (v0.55.1, 9912c98); registry image e7abc9eefceb (f2f13ad) has it, no release carries it (newest 12.61; rustkube rigs 5e9f2f7a9c, pvetest1,
        same 404). No run queued. #233 proposed `--after-release registry>=9912c98`. Resume as above; the prerequisites were checked on 12.58, not rechecked since.
        2026-11-06 (17:40Z): 12.62 carried it but was tombstoned (stormcos#814, see #52). #233 proposed after stormcos#812. Resume as above once #812 closes.
-       2026-11-06 (22:07Z): stormcos#812 closed. pvetest2 is down (#52); pvetest1 (12.58.5, predates the registry fix, but a short passed there) is free. Queued multus 400 (pvetest1). Read with `stormcentral test show 400`; close on a pass, or fix what fails.
+       2026-11-06 (22:08Z): stormcos#812 closed, but no machine can take the run. pvetest2 (12.63-flowsdn, has the registry fix) is down (#52). pvetest1 (12.58.5) is refused: its sbregistry refuses forge's test images (stormcos#271's peer, not on this release). C2NR0Q2 and server7 have 12.63, but #791 wants a pve run first. No run queued, no code changed. Resume when pvetest2's apiserver answers, or pvetest1 runs >= 12.63: `stormcentral test run rustkube-node multus --tag <that machine>`; close on a pass, or fix what fails.
 
 ### Done: #231 + #232 (P0, stormcos#488): verified live on the Dell, 12.07
 
