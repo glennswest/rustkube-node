@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-06
+
+- **docs:** Refresh from code since 2026-10-30: status.md (audit header, rows for #312 engine TLS, #311 container start steps, the stormvm 0225218 pin; test runs now wait on registry 9912c98, stormcos#271 closed), CLAUDE.md's reference. README, configuration.md, api.md and metrics.md already carried #301-#304, #311, #312; checked against the code, no promise without an issue.
+
 ## 2026-11-04
 
 - **feat:** The kubelet's engine client speaks `https://` (#312, stormblock#203, stormcos#374). New `--stormblock-ca` / `STORMBLOCK_CA_FILE`: the CA an `https://` `--stormblock` is verified against, and the only thing it is verified against (no public roots, no skip).

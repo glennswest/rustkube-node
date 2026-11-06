@@ -11,9 +11,9 @@ stage golden through `stormcentral component stage rustkube-node`, not a package
 `0.13.0`. There is one version location: `[workspace.package] version` in
 `Cargo.toml` (every crate uses `version.workspace = true`).
 
-## Current implementation reference (2026-10-30)
+## Current implementation reference (2026-11-06)
 
-Main baseline: f0102a9 (#310 diagnosed, no code: Cilium's `endpoint-create` limiter; #303 VMI Running once its control socket answers; stormvm 0225218, #304 bridge keeps multus/SR-IOV NICs; #302 disk moves off the node; #301; #40 live migration kubelet half, #160 parked startup admission, #292 ring arena per request; every git dependency by rev, #210; stage builds are listed per issue in the work plan). See
+Main baseline: 36149de (#312 the engine client over https with `--stormblock-ca`, 55eb751; #311 `container/<name>` steps, 6a3b27a; #310 diagnosed, no code: Cilium's `endpoint-create` limiter; #303 VMI Running once its control socket answers; stormvm 0225218, #304 bridge keeps multus/SR-IOV NICs; #302 disk moves off the node; #301; #40 live migration kubelet half, #160 parked startup admission, #292 ring arena per request; every git dependency by rev, #210; stage builds are listed per issue in the work plan). See
 `docs/status.md` for changes since October 2, the owner's recorded decisions and issue-backed limitations,
 `docs/configuration.md` for every CLI/env/default, `docs/api.md` for ports and actual routes, `docs/retries.md`
 for every remote call's retry policy. CLI runtime defaults to native; stormcos explicitly chooses stormpump.

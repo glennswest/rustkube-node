@@ -1,6 +1,6 @@
 # Implementation and documentation audit
 
-Reviewed 2026-10-30 against main **a3ec977** and `git log --since=2026-10-23`
+Reviewed 2026-11-06 against main **36149de** (last code change 55eb751) and `git log --since=2026-10-30`
 (earlier audits: 2026-10-09 at 06b91b5, 2026-10-02 at fecb331).
 Version 0.13.0 is the workspace version; changes after its tag (e8211b6) are
 unreleased as a version, though stage goldens of main are requested as issues
@@ -36,7 +36,10 @@ a row says so.
 | Disk moved off the node (#302) | A running qemu VMI's own disk (golden clone, emptyDisk) moves to another node's storage at `storm.io/move-disks`: stormstorage mirror, pause, cutover, the copy attached through the node's stormblock, stormvm `switch_disk`, unpause, the source retired; progress and outcome in `storm.io/disk-moves`; a failed switch deletes nothing (`unknown`). Unit-tested against fake apiserver/stormstorage/engine/machine; not run on a two-node fabric; a moved disk is not deleted with its VM until stormblock#519 |
 | VMI Running (#303) | A VMI reads `Running` once its control socket answers a status (`status_when_up`, ≤ 10 s, cut short by the hypervisor's exit), not at the spawn; a socket not up by then is `Running` with a `ControlNotReady` Warning |
 | Startup admission and the ring (#160, #292) | Pods that meet closed startup admission are parked and woken when it opens (no fixed 2 s); each ring payload has its own arena region, a device mount waits 180 s, and a timed-out root is not deleted under its mount |
-| Test container (#233) | A `multus` suite (bridge + macvlan NADs, a missing NAD, DEL releasing an address); runs wait on stormcos#271 |
+| Engine over TLS (#312) | `--stormblock https://…` is verified against `--stormblock-ca` only (no public roots, no skip); the CA file is read at each new connection; `https://` with no CA stops the kubelet at start |
+| Container start steps (#311) | `container/<name>` is split into `/lookup`, `/clone`, `/attach`, `/mount`, `/define`, `/volumes`, `/spawn`, `/identity`, `/other` in `storm.io/start-timing`, with a histogram per step |
+| stormvm pin (#301, #302, #304) | Every stormvm crate at 0225218 (stormpump stays 9877a97): snapshots of agent-less VMs, `switch_disk`, `storm.io/bridge` keeps multus/SR-IOV NICs |
+| Test container (#233) | A `multus` suite (bridge + macvlan NADs, a missing NAD, DEL releasing an address); runs wait on a release carrying registry 9912c98 (stormblock-registry#150: the fetched test image's tag answered 404 on the node); stormcos#271 is closed |
 | Workload identity (#84) | `/run/rustkube/workloads/<cgroup>.json` per stormpump workload (pods, sandboxes, VMs) for cadvisor |
 | 1.36 pod status (#275) | `observedGeneration` on the status and its conditions; containers' and sidecars' `allocatedResources`/`resources` and the pod's `status.resources` from the spec (no in-place resize yet). k8s-openapi only through rustkube's apimachinery (0.24/v1_32 until rustkube#285) |
 | CRI runtime (#116) | `GetContainerEvents` followed; the 2 s fallback only without it |
@@ -61,7 +64,7 @@ a row says so.
 
 Decided 2026-10-09: microVM Pods are stormvisor's ([#13](https://github.com/glennswest/rustkube-node/issues/13), `--runtime vm` retired;
 dispatch by RuntimeClass is [#204](https://github.com/glennswest/rustkube-node/issues/204)), and versioned goldens are copied on demand
-([#86](https://github.com/glennswest/rustkube-node/issues/86), the fetch is built in stormblock-registry#116 / v0.45.0; deployed with stormcentral#542 and stormcos#271).
+([#86](https://github.com/glennswest/rustkube-node/issues/86), the fetch is built in stormblock-registry#116 / v0.45.0; deployed with stormcentral#542; the nodes' forge peer, stormcos#271, is closed).
 
 Source entry points: `cmd/kubelet/src/main.rs`, `pkg/kubelet/src/kubelet.rs`,
 `pod_manager.rs`, `stormpump_runtime.rs`, `container_roots.rs`, `vm_manager.rs`,
