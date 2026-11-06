@@ -587,7 +587,9 @@ the class's size (`POST /api/v1/volumes`, `role: data`; no template, no mkfs),
 attached over ublk like any claim, and bound at the container's
 `volumeDevices[].devicePath` as the device itself (no filesystem). A Block claim
 named in `volumeMounts`, or a Filesystem claim in `volumeDevices`, keeps the pod
-waiting with the reason. The PV's `volumeMode` follows the claim when the node writes it; the control
+waiting with the reason. **A `devicePath` under `/dev` does not work yet:** stormpump
+covers `/dev` with its default tmpfs after the binds, so the workload finds no device and
+a write creates a regular file on the tmpfs (stormpump#222); a path elsewhere gets the device. The PV's `volumeMode` follows the claim when the node writes it; the control
 plane's provisioner writes Filesystem until rustkube#201. A VM disk
 naming a Block claim gets the raw volume. Raw block from third-party CSI drivers
 is refused (`docs/csi.md`). Sizes go to stormblock as `<MiB>M`, since it has no
@@ -1117,12 +1119,15 @@ kubelet is under test, not the scheduler.
   - It makes a claim at every filesystem size class (1Mi … 16Ti) and at
     arbitrary sizes: 1 byte, 1Mi+1, 17Mi, 1500M, 3.5Gi and 600Gi, and raw block
     claims of 1Mi, 20Ti and 1Pi (`volumeDevices`; the device must be exactly its
-    class). The claims run in parallel.
+    class), plus a 1Mi one with its device at `/block/xvda`, outside `/dev`.
+    The cases run three at a time, largest first. `pvc-size-block-1mi` fails until
+    stormpump#222. A class above the node's `maximumVolumeSize` is checked as a refusal.
   - For each one, a pod writes and reads back 64 KiB and checks that `df` is
     within the class the request rounds to. The test then checks that the claim
     is Bound with that class as its status capacity, and deletes the pod and
     the claim. The PV must be reclaimed.
-  - A 2Pi claim must be refused with the reason, and never bound; a 20Ti
+  - A 2Pi claim, placed with `spec.nodeName` so the kubelet's own check is what
+    answers, must be refused with the reason, and never bound; a 20Ti
     filesystem claim (64Ti class, no ext4 blank yet) must wait naming
     `volumeMode: Block`.
   - Every case has `RUSTKUBE_NODE_TEST_MINT_BUDGET` (default 1200 s), because a
