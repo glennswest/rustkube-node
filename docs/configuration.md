@@ -218,7 +218,9 @@ for VM registration, `/run/stormpump/assets.json` for service mirrors,
 `/run/stormpump/roots/<container>` where PID 1 mounts each container's own root: engine volume
 `ctr-<container>`, a clone of the image's sealed golden (a pallet's `<volume>.golden`, a pull's
 sbregistry fstemplate, referred to as `template:<name>`), deleted with the container (#104).
-The kernel command line's `rd.stormblock.mount=` maps a pallet path to its slab volume.
+The kernel command line's `rd.stormblock.mount=`, else `/etc/stormblock/mounts`, maps a pallet path to its slab volume.
+`/etc/stormblock/carried` (same grammar, `<vol>:/p/<image>`; under `/hostroot`, else the kubelet's own view; read once at start)
+names goldens a release carries and does not mount at boot: an image named after one runs from the engine's sealed golden with nothing at `/pallets/<image>` (#294).
 The kubelet views host files under `/hostroot` in stormcos; the stage/boot
 configuration must provide those mounts.
 

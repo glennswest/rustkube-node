@@ -2,6 +2,12 @@
 
 ## 2026-11-06
 
+- **feat:** A golden the release carries runs with nothing mounted at `/pallets/<name>` (#294, stormcos#647, stormcos#820). New list `/etc/stormblock/carried`, one `<vol>:/p/<image>` per line, the grammar of `/etc/stormblock/mounts`; the initramfs does not read it, so a server moves from one file to the other with no stormblock change and saves its attach and mount on every boot.
+  - A listed image reads as present and needs no registry golden, once the engine holds its sealed `<vol>.golden`. Each container's root is a clone by volume name, as every root already is, and argv[0] and user names are read from that clone. The config is still the registry's record.
+  - A mount-list entry that did not mount resolves the same way.
+  - A listed golden the slab does not hold goes to the registry as before. An engine that does not answer is ErrImagePull, retried.
+  - A name on neither list is never looked for in the engine: the slab also holds blanks like `fastetcd-data.golden`, and other images cost no listing.
+  - Not yet run on a node: no release has the list.
 - **perf:** A VM start no longer waits a flat ~100 ms for the hypervisor's control socket (#325, stormcos#804). stormvm's `status_when_up` slept a fixed 100 ms after a refused connect. The kubelet now asks `Machine::status` itself: every 5 ms for the first 100 ms, then every 25 ms to 1 s, then every 100 ms. The 10 s bound and the rule that any answer counts are unchanged. Not yet measured on a node.
 - **docs:** Refresh from code since 2026-10-30: status.md (audit header, rows for #312 engine TLS, #311 container start steps, the stormvm 0225218 pin; test runs now wait on registry 9912c98, stormcos#271 closed), CLAUDE.md's reference. README, configuration.md, api.md and metrics.md already carried #301-#304, #311, #312; checked against the code, no promise without an issue.
 

@@ -23,6 +23,9 @@
 //!   as `rd.stormblock.mount=<vol>:/p/<path>` says (`/pallets` links to `/p`;
 //!   `cilium-operator:/p/operator-generic` is why the path is not the name).
 //!   Cloned through `POST /api/v1/volumes/{golden}/clone`.
+//! - **A carried golden** (#294): the same, with nothing mounted at its path.
+//!   The slab holds `<vol>.golden` and `/etc/stormblock/carried` names it, so
+//!   a server no node starts by default costs no attach and no mount per boot.
 //!
 //! The clone is attached here over ublk and PID 1 mounts it at
 //! `/run/stormpump/roots/<container>`; that registration is the root handle
@@ -70,24 +73,42 @@ pub fn golden_of(image: &str, cmdline: &str) -> Option<Golden> {
     if path.is_empty() || path.contains('/') {
         return None;
     }
-    let mounted = format!("/p/{path}");
-    let volume = cmdline
-        .split_whitespace()
-        .find_map(|w| w.strip_prefix("rd.stormblock.mount="))
-        .and_then(|list| {
-            list.split(',').find_map(|e| {
-                let (vol, at) = e.split_once(':')?;
-                (at == mounted || at == format!("{PALLET_ROOT}/{path}")).then(|| vol.to_string())
-            })
+    Some(Golden::Pallet(listed_volume(cmdline, path).unwrap_or_else(|| path.to_string())))
+}
+
+/// The volume a mount list on `line` names for the pallet path `path`
+/// (`/p/<path>` or `/pallets/<path>`). Other mounts (`kubelet-data:/var/lib/kubelet`)
+/// are no pallet, so no image can name them.
+pub fn listed_volume(line: &str, path: &str) -> Option<String> {
+    let wanted = [format!("/p/{path}"), format!("{PALLET_ROOT}/{path}")];
+    line.split_whitespace()
+        .filter_map(|w| w.strip_prefix("rd.stormblock.mount="))
+        .flat_map(|list| list.split(','))
+        .find_map(|e| {
+            let (vol, at) = e.split_once(':')?;
+            wanted.iter().any(|w| w == at).then(|| vol.to_string())
         })
-        .unwrap_or_else(|| path.to_string());
-    Some(Golden::Pallet(volume))
 }
 
 /// Where the node's mount list lives since stormcos#259 (#231): the root
 /// volume's `/etc/stormblock/mounts`, seen from the kubelet under the node's
 /// root (`/hostroot`), else in its own view.
 pub const MOUNT_LISTS: [&str; 2] = ["/hostroot/etc/stormblock/mounts", "/etc/stormblock/mounts"];
+
+/// The goldens a release carries and does not mount at boot (#294), found the
+/// same way. One `<vol>:/p/<image>` per line, the grammar of the mount list, so
+/// a server moves from one file to the other with its line unchanged. The
+/// initramfs reads only the mount list.
+pub const CARRIED_LISTS: [&str; 2] = ["/hostroot/etc/stormblock/carried", "/etc/stormblock/carried"];
+
+/// A list file's entries: `#` comments and blanks gone, a leading `?` dropped.
+fn list_entries(file: &str) -> Vec<&str> {
+    file.lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .map(|l| l.trim_start_matches('?'))
+        .filter(|l| l.contains(':'))
+        .collect()
+}
 
 /// The kernel command line as [`golden_of`] reads it (#231): `cmdline`, with
 /// the mount list from `mounts_file` (stormblock's format: one `<vol>:<path>`
@@ -98,24 +119,31 @@ pub fn with_mount_list(cmdline: &str, mounts_file: Option<&str>) -> String {
     if cmdline.split_whitespace().any(|w| w.starts_with("rd.stormblock.mount=")) {
         return cmdline.to_string();
     }
-    let entries: Vec<&str> = mounts_file
-        .unwrap_or("")
-        .lines()
-        .map(|l| l.split('#').next().unwrap_or("").trim())
-        .map(|l| l.trim_start_matches('?'))
-        .filter(|l| l.contains(':'))
-        .collect();
-    if entries.is_empty() {
-        return cmdline.to_string();
-    }
-    format!("{} rd.stormblock.mount={}", cmdline.trim_end(), entries.join(","))
+    append_list(cmdline, mounts_file)
 }
 
-/// The node's command line and mount list, read now ([`with_mount_list`]).
+/// `line` with the carried list appended (#294), whatever else is on it: a
+/// mount list on the line says nothing about what is carried. [`listed_volume`]
+/// reads every list on the line, the mounted ones first.
+pub fn with_carried(line: &str, carried_file: Option<&str>) -> String {
+    append_list(line, carried_file)
+}
+
+fn append_list(line: &str, file: Option<&str>) -> String {
+    let entries = list_entries(file.unwrap_or(""));
+    if entries.is_empty() {
+        return line.to_string();
+    }
+    format!("{} rd.stormblock.mount={}", line.trim_end(), entries.join(","))
+}
+
+/// The node's command line with its mount list and carried list, read now
+/// ([`with_mount_list`], [`with_carried`]).
 pub fn node_mount_list() -> String {
     let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
-    let file = MOUNT_LISTS.iter().find_map(|p| std::fs::read_to_string(p).ok());
-    with_mount_list(&cmdline, file.as_deref())
+    let mounts = MOUNT_LISTS.iter().find_map(|p| std::fs::read_to_string(p).ok());
+    let carried = CARRIED_LISTS.iter().find_map(|p| std::fs::read_to_string(p).ok());
+    with_carried(&with_mount_list(&cmdline, mounts.as_deref()), carried.as_deref())
 }
 
 /// The pallet path of an image reference (`/pallets/<path>`), if it is one.
@@ -225,6 +253,29 @@ impl Roots {
     /// The engine volume a pallet path was last found mounted from (#231).
     pub fn pallet_volume_of(&self, path: &str) -> Option<String> {
         self.pallets.lock().unwrap_or_else(|e| e.into_inner()).get(path).cloned()
+    }
+
+    /// Whether the node's lists name a pallet path: nothing else costs a
+    /// listing (#294), and a name no list has is never looked for in the
+    /// engine, whose slab also holds blanks like `fastetcd-data.golden`.
+    pub fn lists(&self, path: &str) -> bool {
+        listed_volume(&self.cmdline, path).is_some()
+    }
+
+    /// The reference to create a container from for a listed golden with
+    /// nothing mounted at its path (#294), when the engine holds it sealed.
+    /// `Ok(None)` means it is not on this node (a `?` entry a release left
+    /// out, or no list names it); `Err` means the engine did not say.
+    pub async fn carried(&self, path: &str) -> Result<Option<String>, String> {
+        let Some(vol) = listed_volume(&self.cmdline, path) else { return Ok(None) };
+        let listing = self.listing().await?;
+        match pallet_golden(&listing, &vol) {
+            Ok(_) => Ok(Some(format!("{PALLET_ROOT}/{path}"))),
+            Err(why) => {
+                tracing::debug!(path = %path, "listed golden not on this node: {why}");
+                Ok(None)
+            }
+        }
     }
 
     async fn answer(&self, what: &str, resp: reqwest::Result<reqwest::Response>) -> Result<Value, String> {
@@ -423,6 +474,52 @@ mod tests {
         assert_eq!(with_mount_list("quiet", None), "quiet");
     }
 
+    /// #294: what is carried is listed beside the mounts, on any node's line;
+    /// a mount that is no pallet, and a name no list has, are not images.
+    #[test]
+    fn a_carried_list_names_goldens_nothing_mounts() {
+        let carried = "# not mounted at boot\nnextnfs:/p/nextnfs\ncsi-attacher:/p/attacher\n";
+        for base in ["BOOT_IMAGE=/vmlinuz", CMDLINE] {
+            let line = with_carried(base, Some(carried));
+            assert_eq!(listed_volume(&line, "nextnfs").as_deref(), Some("nextnfs"), "{base}");
+            assert_eq!(golden_of("/pallets/attacher", &line), Some(Golden::Pallet("csi-attacher".into())), "{base}");
+            assert_eq!(listed_volume(&line, "fastetcd-data"), None, "{base}");
+        }
+        let line = with_carried(CMDLINE, Some(carried));
+        assert_eq!(listed_volume(&line, "busybox").as_deref(), Some("busybox"), "the mounts still read");
+        assert_eq!(listed_volume(&line, "kubelet-data"), None, "mounted, but no pallet");
+        assert_eq!(with_carried(CMDLINE, None), CMDLINE);
+        assert_eq!(with_carried(CMDLINE, Some("# nothing\n")), CMDLINE);
+    }
+
+    /// #294: a carried golden is found and cloned by its volume name with no
+    /// mount at its path; one the release left out is not on this node.
+    #[tokio::test]
+    async fn a_carried_golden_is_cloned_with_nothing_mounted() {
+        let (url, calls) = fake_engine().await;
+        let line = with_carried("BOOT_IMAGE=/vmlinuz", Some("csi-attacher:/p/attacher\nnfsop:/p/nfsop\n"));
+        let roots = Roots::with_cmdline(crate::engine::EngineClient::new(&url, crate::engine::TokenSource::none()), "n1", line);
+        let owner = json!({"kind": "Pod", "namespace": "ns", "name": "a", "uid": "u"});
+
+        assert!(!roots.lists("quay"), "another image is not an engine question");
+        assert_eq!(roots.carried("quay").await.unwrap(), None);
+        assert!(calls.lock().unwrap().is_empty(), "{:?}", calls.lock().unwrap());
+
+        assert_eq!(roots.carried("attacher").await.unwrap().as_deref(), Some("/pallets/attacher"));
+        assert_eq!(roots.carried("nfsop").await.unwrap(), None, "listed, not in the slab");
+
+        roots.make(&volume_name("ct-a"), "/pallets/attacher", &owner).await.unwrap();
+        assert!(calls.lock().unwrap().iter().any(|c| c == "clone volume g9 as ctr-ct-a"), "{:?}", calls.lock().unwrap());
+        assert_eq!(roots.pallet_volume_of("attacher").as_deref(), Some("csi-attacher"));
+
+        let down = Roots::with_cmdline(
+            crate::engine::EngineClient::new("http://127.0.0.1:9", crate::engine::TokenSource::none()),
+            "n1",
+            with_carried("", Some("nfsop:/p/nfsop\n")),
+        );
+        assert!(down.carried("nfsop").await.is_err(), "an engine that did not answer has not said no");
+    }
+
     #[test]
     fn only_unheld_container_roots_are_orphans() {
         let listing = json!({"items": [
@@ -468,7 +565,9 @@ mod tests {
                     // #231: a pallet whose path is not its volume's name.
                     {"name": "cilium-operator", "id": "c7", "parent": "g7", "sealed": false,
                      "attachments": [{"device": "/dev/ublkb6", "mounted_at": "/p/operator-generic"}]},
-                    {"name": "cilium-operator-golden", "id": "g7", "sealed": true}]})) }
+                    {"name": "cilium-operator-golden", "id": "g7", "sealed": true},
+                    // #294: carried, nothing attached or mounted.
+                    {"name": "csi-attacher.golden", "id": "g9", "sealed": true}]})) }
             }))
             .route("/api/v1/fstemplates/{t}/clone", post(move |Path(t): Path<String>, Json(b): Json<Value>| {
                 c2.lock().unwrap().push(format!("clone template {t} as {}", b["name"].as_str().unwrap()));

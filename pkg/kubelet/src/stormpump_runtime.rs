@@ -533,8 +533,8 @@ impl StormpumpRuntime {
     }
 
     /// The engine that makes each container's own root (#104).
-    pub fn with_roots(mut self, roots: crate::container_roots::Roots) -> Self {
-        self.roots = Some(Arc::new(roots));
+    pub fn with_roots(mut self, roots: impl Into<Arc<crate::container_roots::Roots>>) -> Self {
+        self.roots = Some(roots.into());
         self
     }
 
@@ -2441,6 +2441,8 @@ pub struct StormpumpImages {
     /// This node's NVMe host NQN (#236), sent as `host_nqn` on a clone
     /// request so the clone's export admits this host alone (stormblock#212).
     host_nqn: Option<String>,
+    /// The node's engine, for goldens a list names and nothing mounted (#294).
+    roots: Option<Arc<crate::container_roots::Roots>>,
 }
 
 /// Find `argv0` on the standard PATH *inside* an image root.
@@ -2497,7 +2499,15 @@ impl StormpumpImages {
             configs: Arc::default(),
             release_manifest: None,
             host_nqn: node_host_nqn(),
+            roots: None,
         }
+    }
+
+    /// Find goldens the node's lists name and nothing mounted (#294) through
+    /// this engine. The runtime clones each container's root with the same one.
+    pub fn with_roots(mut self, roots: Arc<crate::container_roots::Roots>) -> StormpumpImages {
+        self.roots = Some(roots);
+        self
     }
 
     /// Ask for clones as this host (#236), not the node's own NQN: for tests.
@@ -2615,17 +2625,7 @@ impl StormpumpImages {
     }
 
     fn local_path_in(image: &str, pallets: &std::path::Path) -> Option<std::path::PathBuf> {
-        // `scheme://…` is not an image reference: `stormpump://sshd` is PID
-        // 1's sshd, and its last component must never pick the pallet (#249).
-        if image.contains("://") {
-            return None;
-        }
-        let last = image.rsplit('/').next().unwrap_or(image);
-        let name = last.split(['@', ':']).next().unwrap_or(last);
-        if name.is_empty() {
-            return None;
-        }
-        let p = pallets.join(name);
+        let p = pallets.join(pallet_name(image)?);
         // A directory that exists but is not a mount is an empty mount point —
         // the initramfs makes those for volumes it could not attach. Running a
         // container on one gives an empty root and a confusing failure, so it
@@ -2633,6 +2633,43 @@ impl StormpumpImages {
         let has_content = std::fs::read_dir(&p).map(|mut d| d.next().is_some()).unwrap_or(false);
         has_content.then_some(p)
     }
+
+    /// A golden a node's list names with nothing mounted at its path (#294):
+    /// the reference a container is created from (`/pallets/<name>`, which the
+    /// root's clone resolves by volume name). Found once, then remembered in
+    /// `pulled`. The config is the registry's record, as for a mounted pallet.
+    /// `Ok(None)` is not this node's golden, so the registry is asked as ever;
+    /// an engine that did not answer is a pull that failed for now.
+    async fn carried(&self, image: &str) -> Result<Option<String>, CriError> {
+        let (Some(roots), Some(name)) = (&self.roots, pallet_name(image)) else { return Ok(None) };
+        if !roots.lists(name) {
+            return Ok(None);
+        }
+        let known = self.pulled.lock().await.get(image).cloned();
+        let path = match known {
+            Some(p) => p,
+            None => {
+                let Some(p) = roots.carried(name).await.map_err(CriError::ImagePull)? else { return Ok(None) };
+                tracing::info!(image = %image, path = %p, "image is a golden this node carries, not mounted");
+                self.pulled.lock().await.insert(image.to_string(), p.clone());
+                p
+            }
+        };
+        self.learn_config(image, &path).await;
+        Ok(Some(path))
+    }
+}
+
+/// The golden an image is named after: `docker.io/library/busybox:latest` is
+/// `busybox`. `scheme://…` is not an image reference: `stormpump://sshd` is PID
+/// 1's sshd, and its last component must never pick the pallet (#249).
+fn pallet_name(image: &str) -> Option<&str> {
+    if image.contains("://") {
+        return None;
+    }
+    let last = image.rsplit('/').next().unwrap_or(image);
+    let name = last.split(['@', ':']).next().unwrap_or(last);
+    (!name.is_empty()).then_some(name)
 }
 
 #[async_trait]
@@ -2648,6 +2685,8 @@ impl ImageService for StormpumpImages {
     ///
     /// 1. **A pallet.** The image shipped with the node: its golden is in the
     ///    slab. The reference is the pallet's path (`/pallets/<x>`).
+    ///    One a list names with nothing mounted (#294) is the same reference,
+    ///    once the engine says it holds the golden.
     /// 2. **Already found.** A previous container of this image asked.
     /// 3. **The registry's.** sbregistry's golden record for the image names
     ///    the fstemplate it sealed in this node's engine: `template:<name>`.
@@ -2686,6 +2725,9 @@ impl ImageService for StormpumpImages {
             self.learn_config(image, &path).await;
             return Ok(path);
         }
+        if let Some(path) = self.carried(image).await? {
+            return Ok(path);
+        }
         if let Some(found) = self.pulled.lock().await.get(image).cloned() {
             return Ok(found);
         }
@@ -2700,9 +2742,26 @@ impl ImageService for StormpumpImages {
     /// every time and the cache above never gets consulted. A golden version
     /// (#86) counts only once pulled: the pallet is another version.
     async fn image_status(&self, image: &str) -> Result<Option<ImageInfo>, CriError> {
-        let path = match Self::local_path(image).filter(|_| self.version_of(image).is_none()) {
+        let is_version = self.version_of(image).is_some();
+        let mounted = Self::local_path(image).filter(|_| !is_version);
+        let path = match mounted {
             Some(p) => Some(p.to_string_lossy().into_owned()),
-            None => self.pulled.lock().await.get(image).cloned(),
+            None => {
+                // A carried golden (#294) is present once the engine says so.
+                // Not said now: the pull that follows gets the engine's words.
+                let carried = if is_version {
+                    None
+                } else {
+                    self.carried(image).await.unwrap_or_else(|e| {
+                        tracing::debug!(image = %image, "carried golden not looked up: {e}");
+                        None
+                    })
+                };
+                match carried {
+                    Some(p) => Some(p),
+                    None => self.pulled.lock().await.get(image).cloned(),
+                }
+            }
         };
         Ok(path.map(|id| ImageInfo {
             id,
@@ -2746,7 +2805,8 @@ impl StormpumpImages {
                 .find_map(|p| std::fs::read_to_string(p).ok())
                 .unwrap_or_default()
         });
-        crate::image_config::golden_version(image, &manifest, |n| Self::local_path(n).is_some())
+        let carried = |n: &str| self.roots.as_ref().is_some_and(|r| r.lists(n));
+        crate::image_config::golden_version(image, &manifest, |n| Self::local_path(n).is_some() || carried(n))
     }
 
     /// The registry's ready golden for `image`, as the reference a container
@@ -3863,6 +3923,62 @@ mod tests {
         assert!(img.version_of("nextnfs:1111aaaa2222").is_none());
         assert!(img.version_of("nextnfs").is_none());
         assert_eq!(reg.lock().unwrap().golden_lookups.len(), before);
+    }
+
+    /// #294: a golden a list names and nothing mounted is found through the
+    /// engine, no registry golden needed; it reads as present; what the slab
+    /// does not hold, or no list names, is the registry's as ever.
+    #[tokio::test]
+    async fn a_carried_golden_needs_no_mount_and_no_pull() {
+        use crate::container_roots::{with_carried, Roots};
+        use crate::engine::{EngineClient, TokenSource};
+        let (url, reg) = fake_registry().await;
+        let listing = axum::Router::new().route(
+            "/api/v1/volumes",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"items": [
+                    {"name": "carriedtest.golden", "id": "g1", "sealed": true},
+                    {"name": "fastetcd-data.golden", "id": "g2", "sealed": true}
+                ]}))
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let engine = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, listing).await.unwrap() });
+        let line = with_carried("", Some("carriedtest:/p/carriedtest\nleftouttest:/p/leftouttest\n"));
+        let roots = Roots::with_cmdline(EngineClient::new(&engine, TokenSource::none()), "n1", line);
+        let img = StormpumpImages::new(&url).with_roots(Arc::new(roots));
+
+        let image = "quay.io/storm/carriedtest:v1";
+        assert_eq!(img.image_status(image).await.unwrap().unwrap().id, "/pallets/carriedtest", "present before any pull");
+        assert_eq!(img.pull_image(image).await.unwrap(), "/pallets/carriedtest");
+        assert!(reg.lock().unwrap().clones.is_empty(), "nothing demanded of the cluster");
+        assert!(reg.lock().unwrap().golden_lookups.iter().any(|g| g == image), "its config is the registry's record");
+
+        // Read from the container's own root: the path holds nothing here.
+        let empty = tempfile::tempdir().unwrap();
+        std::fs::create_dir(empty.path().join("carriedtest")).unwrap();
+        assert_eq!(image_root_in("/pallets/carriedtest", empty.path()), None);
+
+        // Listed, not in the slab; and never listed, though the slab has it.
+        for other in ["leftouttest", "fastetcd-data"] {
+            assert!(img.image_status(other).await.unwrap().is_none(), "{other}");
+            assert!(matches!(img.pull_image(other).await, Err(CriError::ImagePull(_))), "{other}");
+            assert!(reg.lock().unwrap().golden_lookups.iter().any(|g| g == other), "{other}: the registry was asked");
+        }
+
+        // An engine that did not answer: not the registry's question yet.
+        let down = Roots::with_cmdline(
+            EngineClient::new("http://127.0.0.1:9", TokenSource::none()),
+            "n1",
+            with_carried("", Some("downtest:/p/downtest\n")),
+        );
+        let img = StormpumpImages::new(&url).with_roots(Arc::new(down));
+        match img.pull_image("downtest").await {
+            Err(CriError::ImagePull(why)) => assert!(why.contains("stormblock did not answer"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(!reg.lock().unwrap().golden_lookups.iter().any(|g| g == "downtest"));
     }
 
     /// #98: the image service learns an image's config from its golden record

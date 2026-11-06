@@ -479,10 +479,11 @@ async fn main() -> anyhow::Result<()> {
                     let configs = Arc::new(kubelet::image_config::ImageConfigs::default());
                     // Each container's own root is cloned from its image's
                     // golden through the node's engine (#104).
+                    let roots = Arc::new(kubelet::container_roots::Roots::new(engine.clone(), node_name.clone()));
                     let rt = Arc::new(
                         rt.with_cni(cni_invoker)
                             .with_image_configs(configs.clone())
-                            .with_roots(kubelet::container_roots::Roots::new(engine.clone(), node_name.clone()))
+                            .with_roots(roots.clone())
                             // Each workload's identity for cadvisor (#84).
                             .with_identities(kubelet::workload_identity::Publisher::default()),
                     );
@@ -504,7 +505,9 @@ async fn main() -> anyhow::Result<()> {
                         kubelet::stormpump_runtime::StormpumpImages::new(
                             cli.registry.clone(),
                         )
-                        .with_image_configs(configs),
+                        .with_image_configs(configs)
+                        // Goldens carried and not mounted are found there (#294).
+                        .with_roots(roots),
                     );
                     let mig = Arc::new(NativeRuntime::new())
                         as Arc<dyn kubelet::cri::MigrationService>;
