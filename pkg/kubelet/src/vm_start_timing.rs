@@ -19,6 +19,7 @@
 //! | `resume`   | a restore's saved state prepared (#251) |
 //! | `window`   | waiting for the deposit window (another start's taps, #100) |
 //! | `launch`   | taps, plan and the engine's spawn |
+//! | `control`  | the hypervisor's control socket answering a status (#303); `control/answer` is its part after the socket took a connection (#325) |
 //! | `record`   | identity published, the registration rewritten with the handle |
 //! | `report`   | the `Running` status patch sent → answered |
 //! | `total`    | seen → `Running` answered |
@@ -65,11 +66,13 @@ pub struct Steps {
     pub began: Instant,
     steps: Vec<(&'static str, Duration)>,
     disks: Vec<(String, Duration)>,
+    /// `control`'s part after the socket took a connection (#325).
+    pub control_answer: Option<Duration>,
 }
 
 impl Steps {
     pub fn begin() -> Self {
-        Self { began: Instant::now(), steps: Vec::new(), disks: Vec::new() }
+        Self { began: Instant::now(), steps: Vec::new(), disks: Vec::new(), control_answer: None }
     }
 
     /// `name` took `took`; a step met twice is added up.
@@ -109,6 +112,9 @@ impl Steps {
         for (name, d) in &self.disks {
             text.push(format!("disk/{name}={}", ms(*d)));
         }
+        if let Some(d) = self.control_answer {
+            text.push(format!("control/answer={}", ms(d)));
+        }
         text.join(" ")
     }
 }
@@ -135,7 +141,7 @@ mod tests {
         let seen_at = Instant::now();
         let mut seen = Seen::at(&vmi, seen_at, now);
         seen.attempts = 2;
-        let mut s = Steps { began: seen_at + Duration::from_millis(1000), steps: Vec::new(), disks: Vec::new() };
+        let mut s = Steps { began: seen_at + Duration::from_millis(1000), steps: Vec::new(), disks: Vec::new(), control_answer: None };
         s.put("lock", Duration::from_millis(6300));
         s.put("disks", Duration::from_micros(4200));
         s.put("disks", Duration::from_micros(800));
@@ -148,9 +154,13 @@ mod tests {
         );
         // A VMI with no creation time, first attempt: no `created`, attempts 1.
         let bare = Seen::at(&json!({}), seen_at, now);
-        assert!(Steps { began: seen_at, steps: Vec::new(), disks: Vec::new() }
+        assert!(Steps { began: seen_at, steps: Vec::new(), disks: Vec::new(), control_answer: None }
             .finish(Some(&bare), seen_at)
             .starts_with("wait=0.0ms total=0.0ms attempts=1"));
+        // `control`'s part after the connect goes last, once it answered (#325).
+        let mut answered = s.clone();
+        answered.control_answer = Some(Duration::from_millis(28));
+        assert!(answered.finish(Some(&seen), seen_at).ends_with(" disk/root=5.0ms control/answer=28ms"));
         // Clocks that disagree say so rather than hiding it.
         let ahead = Seen::at(&json!({"metadata": {"creationTimestamp": "2026-10-14T18:52:06.174Z"}}), seen_at, now);
         assert!(s.finish(Some(&ahead), seen_at).starts_with("created=-500ms "));

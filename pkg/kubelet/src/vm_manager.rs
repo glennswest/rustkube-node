@@ -311,11 +311,12 @@ where
 }
 
 /// How long a started machine's control socket is waited for before the
-/// VMI says Running anyway (#303). qemu binds it in well under a second.
+/// VMI says Running anyway (#303). Tens of ms on a warm VM; 1.3-7.2 s for the
+/// first VM of a pass on real disks (12.63), so this bound can be met (#319).
 const CONTROL_UP_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long to wait before asking a started machine's control socket again,
-/// `elapsed` into the wait (#325). qemu binds it within milliseconds of the
+/// `elapsed` into the wait (#325). qemu is often up within tens of ms of the
 /// spawn, so a fixed 100 ms (`Machine::status_when_up`) cost a flat ~102 ms on
 /// every start. A refused connect costs microseconds, so ask often at first.
 fn control_poll_delay(elapsed: std::time::Duration) -> std::time::Duration {
@@ -332,9 +333,14 @@ fn control_poll_delay(elapsed: std::time::Duration) -> std::time::Duration {
 /// `status` until the control socket can be connected to, for at most `within`.
 /// Only "not connectable" is waited out: any answer, an error too, means it is
 /// bound. A socket still missing after `within` is that error.
+///
+/// `last_ask` is when the latest `status` began. Every earlier one was refused,
+/// so the socket took a connection then, give or take a poll, and the time since
+/// is the wait for its answer: qemu greets from its main loop, later than it binds.
 async fn control_when_up<F, Fut>(
     mut status: F,
     within: std::time::Duration,
+    last_ask: &std::sync::Mutex<std::time::Instant>,
 ) -> Result<stormvm_control::Status, stormvm_control::ControlError>
 where
     F: FnMut() -> Fut,
@@ -342,6 +348,7 @@ where
 {
     let started = std::time::Instant::now();
     loop {
+        *last_ask.lock().unwrap_or_else(|e| e.into_inner()) = std::time::Instant::now();
         match status().await {
             Err(stormvm_control::ControlError::Unreachable(..)) if started.elapsed() < within => {
                 tokio::time::sleep(control_poll_delay(started.elapsed())).await;
@@ -2430,8 +2437,12 @@ impl VmManager {
                         }
                     }
                 };
-                match await_control(control_when_up(|| machine.status(), CONTROL_UP_WITHIN), exited, CONTROL_UP_WITHIN).await {
-                    ControlUp::Answered | ControlUp::Exited => {}
+                let last_ask = std::sync::Mutex::new(t);
+                match await_control(control_when_up(|| machine.status(), CONTROL_UP_WITHIN, &last_ask), exited, CONTROL_UP_WITHIN).await {
+                    ControlUp::Answered => {
+                        steps.control_answer = Some(last_ask.lock().unwrap_or_else(|e| e.into_inner()).elapsed());
+                    }
+                    ControlUp::Exited => {}
                     ControlUp::NotUp(why) => {
                         let why = format!(
                             "the hypervisor runs, but its control socket did not answer within {}s: {why}",
@@ -6604,6 +6615,8 @@ mod tests {
         let unreachable =
             || ControlError::Unreachable("control.sock".into(), std::io::Error::from(std::io::ErrorKind::NotFound));
 
+        let last_ask = std::sync::Mutex::new(std::time::Instant::now());
+
         // Three refused connects, then bound: well under one old 100 ms sleep each.
         let asked = Cell::new(0);
         let t = std::time::Instant::now();
@@ -6616,16 +6629,23 @@ mod tests {
                     if n <= 3 {
                         Err(unreachable())
                     } else {
+                        // Bound, and slow to answer: what `control/answer` is for.
+                        tokio::time::sleep(Duration::from_millis(40)).await;
                         Ok(Status { state: "running".into(), paused: false })
                     }
                 }
             },
             Duration::from_secs(5),
+            &last_ask,
         )
         .await;
         assert!(up.is_ok());
         assert_eq!(asked.get(), 4);
         assert!(t.elapsed() < Duration::from_millis(300), "took {:?}", t.elapsed());
+        // The latest ask began after the three refusals and took the answer's time.
+        let answer = last_ask.lock().unwrap().elapsed();
+        assert!(answer >= Duration::from_millis(40), "{answer:?}");
+        assert!(answer < t.elapsed(), "{answer:?} of {:?}", t.elapsed());
 
         // An error answer is a bound socket: asked once.
         let asked = Cell::new(0);
@@ -6635,6 +6655,7 @@ mod tests {
                 async { Err(ControlError::Refused("no".into())) }
             },
             Duration::from_secs(5),
+            &last_ask,
         )
         .await;
         assert!(matches!(up, Err(ControlError::Refused(_))));
@@ -6643,7 +6664,7 @@ mod tests {
         // Never bound: that error, once the bound has passed.
         let t = std::time::Instant::now();
         let within = Duration::from_millis(30);
-        let up = control_when_up(|| { let unreachable = &unreachable; async move { Err(unreachable()) } }, within).await;
+        let up = control_when_up(|| { let unreachable = &unreachable; async move { Err(unreachable()) } }, within, &last_ask).await;
         assert!(matches!(up, Err(ControlError::Unreachable(..))));
         assert!(t.elapsed() >= within);
     }
