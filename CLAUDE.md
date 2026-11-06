@@ -2665,7 +2665,7 @@ Steps:
 4. [x] `sc-build 'cargo build --release --locked --target x86_64-unknown-linux-musl'`, then `cargo test --locked`: passed at 6741e93.
 5. [x] Close #58, request the golden.
 
-### Waiting on stormblock-registry#150 (test images on nodes) for the live `multus` run: #233, multi-NIC by the Multus standard
+### Waiting on a release with registry>=9912c98 (stormblock-registry#150, test images on nodes) for the live `multus` run: #233, multi-NIC by the Multus standard
 
 2026-10-09. `k8s.v1.cni.cncf.io/networks` (names, ns/name, name@if, or the JSON list with interface/ips/mac) and
 `v1.multus-cni.io/default-network`; NADs `k8s.cni.cncf.io/v1` `spec.config`.
@@ -2693,6 +2693,8 @@ Steps:
        release build. Commented on #233; proposed after stormcos#271.
        2026-11-06: stormcos#271 closed; every run now stops at the fetched image's tag, 404 on the node (stormblock-registry#150). No multus run
        queued while it stands. #233 proposed after it. Resume: `stormcentral test run rustkube-node multus --tag pvetest1`, close on a pass.
+       2026-11-06 (later): #150 closed (v0.55.1, 9912c98); registry image e7abc9eefceb (f2f13ad) has it, no release carries it (newest 12.61; rustkube rigs 5e9f2f7a9c, pvetest1,
+       same 404). No run queued. #233 proposed `--after-release registry>=9912c98`. Resume as above; the prerequisites were checked on 12.58, not rechecked since.
 
 ### Done: #231 + #232 (P0, stormcos#488): verified live on the Dell, 12.07
 
