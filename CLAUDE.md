@@ -77,13 +77,15 @@ CA is fatal at start; `http://` works as before. Not the client pair (not asked;
        (#227's elsewhere). Live: not run on a node or a real engine; stormcos sets `--stormblock https://127.0.0.1:9090 --stormblock-ca /data/stormcert/ca.crt`.
 2. [x] stormvm-block (snapshot, restore, console `snapshot`) gets the same URL and has no CA: follow-up #318, proposed after stormvm#110; said on stormcos#374.
 
-### Waiting on a release with 2e27288: #325 (P2), VM start: `control` a flat ~102 ms, `report` grew (stormcos#804, fix 17)
+### In progress: #325 (P2), VM start: `control` a flat ~102 ms, `report` grew (stormcos#804, fix 17)
 
 2026-11-06. `control`: stormvm's `status_when_up` sleeps a fixed 100 ms after a refused connect, so a socket bound within that costs 100 ms. Target: under 20 ms on a VM, VM Running ~150 ms warm.
 `report`: one merge PATCH. pvetest1 12.61 VMIs 3.7-139 ms, pvetest2 12.61-flowsdn 2.8-118 ms, while pods in the same boots stay 2.5-5.8 ms (12.58.4 VMIs 3.7-22 ms). Not explained yet. Doing:
 1. [x] vm_manager: `control_when_up` over `Machine::status`: every 5 ms for the first 100 ms, then 25 ms to 1 s, then 100 ms. Test, README, CHANGELOG. Done: 2e27288. SC_BUILD_VM sc-build (VM sc-build-98024a5371): 596 kubelet unit, all suites. Stage requested. Proposed `--after-release rustkube-node>=2e27288`.
-2. [ ] Resume: `/var/lib/stormcentral/bootlog/<pve machine>-<install>/pods.log`, `VMI … started:` on a release with it: `control` < 20 ms, VM Running ~150 ms warm (`vm_start_*`, `/api/v1/metrics`). If `report` is still bimodal, find out why; close when both hold.
-       `report` so far: no PATCH in the 12.61 bundle logged a retry (first delay is at least 125 ms anyway); pods' status writes in those boots 2.5-5.8 ms. The apiserver's logs aren't in the bundle or on the console. Not known: whether the 100 ms wait moved the write into another writer's way (a `finalizer not updated: 409` follows right after), or the apiserver.
+2. [x] Read 2026-11-06 on 12.63, 12.63-flowsdn, 12.64 (all carry 2e27288; `VMI … started:` in the bootlogs). The flat 102 ms is gone, target not met. `control` on pve, second VM on: 29-43 ms (85, 97, 187 once each); first VM of a pass 132-391 ms; hardware 35-193 ms, first VM 479-7220 ms. Polling is at most 5 ms of it, so the rest is qemu until its answer. `report` warm on pve: 3.1-12 ms, one 154 of 12; first boot 3.1-62 ms; pods in the same bundles p90 21-45, max 89-117.
+3. [ ] Doing: say how much of `control` is the socket's bind and how much the answer after it (qemu's QMP greets only from its main loop): `control/answer=` on the `VMI … started:` line, from the start of the last status call (connect refused before it). Test, README, CHANGELOG; sc-build; stage. Proposed `--after-release rustkube-node>=<commit>`.
+4. [ ] Resume: read `control/answer=`. Mostly the answer: "connected" could be Running, which changes #303's rule: ask the owner, recommendation in hand. Mostly the bind: qemu's own start, filed on stormvm with the numbers. Either way the < 20 ms target is the owner's to keep or move; #319 is the 10 s bound on the same wait.
+       `report` on 12.61, before the fix: no PATCH in the bundle logged a retry; pods' status writes in those boots 2.5-5.8 ms. The apiserver's slow lines are in the newer bundles from the reboot on: server7 VMI status PATCHes 223-1562 ms (the kubelet's and others'), so hardware outliers are at least partly the apiserver.
 
 ### Waiting on stormblock#521 + stormpump#199: #311 (P1), X9 blades: container start 4-9 s in `containers`
 
