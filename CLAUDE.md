@@ -2514,6 +2514,7 @@ Steps:
 2026-11-06. stormcos#271 closed, but no run reaches a test: the fetched image's tag answers 404 on the node (stormblock-registry#150; #61's 023f853fba, stormcos-cilium 8036d8a602 on pvetest1, 12.61). No medium queued while it stands. #64 proposed after it. Resume as below.
 2026-11-06 (later). #150 closed (v0.55.1, 9912c98). Registry image golden-registry-e7abc9eefceb (f2f13ad) has the fix; no release carries it yet (newest 12.61). No run queued. #64 proposed `--after-release registry>=9912c98`. Resume as below.
 2026-11-06 (17:40Z): 12.62 carried it but was tombstoned (stormcos#814, see #52). #64 proposed after stormcos#812. Resume as below once #812 closes.
+2026-11-06 (22:10Z): medium on pvetest2 (5d70bf4679, 12.63-flowsdn): classes 1Mi-16Gi and sizes 1, 1Mi+1, 17Mi, 1500M, 3.5Gi pass (df in range, claim capacity, reclaim); 2Pi refused by the kubelet; overcommit refused by the scheduler. 64Gi, 256Gi, 600Gi, 1Ti only refused (16Gi maximum), so no 1Ti mint yet. C2NR0Q2 run 167642695f skipped by #791; `--force-hardware` refused by this session's permissions. Waiting on the owner (question on #64: A force it, recommended; B wait for stormpump#222 + a pve machine; C close). Resume from the answer: medium on C2NR0Q2, close on the size cases or file each failure.
 
 2026-10-21. stormblock#331 closed. Every test run since stormcentral#697 that finds its image on forge dies at the node's
 fetch (`forge.g16.lo:5100 is not a peer of this registry`, stormcos#271); pvetest1/2 are refused ("sbregistry failing"),
