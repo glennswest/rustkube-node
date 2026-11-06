@@ -59,11 +59,16 @@ pub fn block_claim(env: &Env, name: &str, request: &str) -> Value {
 /// [`work`], with the claim a raw block device at [`DEV_PATH`]
 /// (`volumeDevices`) and that path given to the workload.
 pub fn work_device(env: &Env, name: &str, claim: &str, mode: &str, args: &[String]) -> Value {
+    work_device_at(env, name, claim, DEV_PATH, mode, args)
+}
+
+/// [`work_device`], with the device at `path`.
+pub fn work_device_at(env: &Env, name: &str, claim: &str, path: &str, mode: &str, args: &[String]) -> Value {
     let mut p = work(env, name, claim, mode, args);
     let c = &mut p["spec"]["containers"][0];
-    c["args"][1] = json!(DEV_PATH);
+    c["args"][1] = json!(path);
     c.as_object_mut().unwrap().remove("volumeMounts");
-    c["volumeDevices"] = json!([{ "name": "claim", "devicePath": DEV_PATH }]);
+    c["volumeDevices"] = json!([{ "name": "claim", "devicePath": path }]);
     p
 }
 

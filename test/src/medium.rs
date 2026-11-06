@@ -17,7 +17,9 @@
 //! class) and 1Pi, each a device at `volumeDevices[].devicePath`; the pod
 //! writes and reads back at offset 0 and the device is exactly its class.
 //! Every class is an ext4 blank too, up to 1Pi (#149): a 20Ti *filesystem*
-//! claim is a size case of the 64Ti class like any other.
+//! claim is a size case of the 64Ti class like any other. One more 1Mi claim
+//! has its device outside `/dev`, which tells the kubelet's half of a raw
+//! block claim from what the engine does to `/dev` afterwards.
 //!
 //! **Above the ladder** (2Pi): refused, not stuck. The pod is placed with
 //! `spec.nodeName`, since a scheduler reading the node's capacity would refuse
@@ -86,13 +88,15 @@ pub struct Case {
     pub name: String,
     pub request: String,
     pub block: bool,
+    /// A block claim's `devicePath`, when not [`k8s::DEV_PATH`].
+    pub device_at: Option<&'static str>,
 }
 
 /// Every class, then the arbitrary sizes. 2Ti is separate (`above-ladder`).
 pub fn cases() -> Vec<Case> {
     let mut v: Vec<Case> = LADDER
         .iter()
-        .map(|(q, _)| Case { name: format!("class-{}", q.to_ascii_lowercase()), request: q.to_string(), block: false })
+        .map(|(q, _)| Case { name: format!("class-{}", q.to_ascii_lowercase()), request: q.to_string(), block: false, device_at: None })
         .collect();
     for (name, request) in [
         ("smallest", "1"),
@@ -103,11 +107,12 @@ pub fn cases() -> Vec<Case> {
         ("600gi", "600Gi"),
         ("20ti", "20Ti"),
     ] {
-        v.push(Case { name: name.into(), request: request.into(), block: false });
+        v.push(Case { name: name.into(), request: request.into(), block: false, device_at: None });
     }
     for (name, request) in BLOCK_CASES {
-        v.push(Case { name: format!("block-{name}"), request: request.to_string(), block: true });
+        v.push(Case { name: format!("block-{name}"), request: request.to_string(), block: true, device_at: None });
     }
+    v.push(Case { name: "block-1mi-outside-dev".into(), request: "1Mi".into(), block: true, device_at: Some("/block/xvda") });
     v
 }
 
@@ -254,7 +259,7 @@ async fn size_case(env: &Env, api: &Api, c: &Case, seed: u64) -> Outcome {
     let lo = if c.block { hi - 1 } else { lo };
     let args = [seed.to_string(), BYTES.to_string(), lo.to_string(), hi.to_string()];
     let pod = if c.block {
-        k8s::work_device(env, &name, &name, "sized", &args)
+        k8s::work_device_at(env, &name, &name, c.device_at.unwrap_or(k8s::DEV_PATH), "sized", &args)
     } else {
         k8s::work(env, &name, &name, "sized", &args)
     };
@@ -454,7 +459,7 @@ mod tests {
     #[test]
     fn every_class_and_the_arbitrary_sizes_are_cases() {
         let c = cases();
-        assert_eq!(c.len(), LADDER.len() + 7 + BLOCK_CASES.len());
+        assert_eq!(c.len(), LADDER.len() + 7 + BLOCK_CASES.len() + 1);
         assert!(c.iter().all(|c| class_range(&c.request, c.block).is_some()));
         // Names are unique, and make valid object names.
         let mut names: Vec<String> = c.iter().map(|c| format!("sz-{}", c.name.replace('.', "-"))).collect();

@@ -1721,6 +1721,7 @@ every suite needs to resolve STORM_NODE). Pods are pinned with `spec.nodeName` (
        2026-11-06 (17:40Z): 12.62 tombstoned (stormcos#814, see #52). #61 proposed after stormcos#812. Resume: the runs above once #812 closes.
        2026-11-06 (20:33Z): stormcos#812/#814 closed; pvetest2 passed 12.63-flowsdn (registry f2f13ad, has 9912c98) and other components' shorts pass there. Queued medium ce5d01a254 (pvetest2, c4b5643). Read with `stormcentral test show ce5d01a254`; long at night (`stormcentral test run rustkube-node long --tag pvetest2`).
        2026-11-06 (21:04Z): ce5d01a254 (c4b5643): 31 pass, 2 fail, 1 skip, the first real medium. Fails: `pvc-size-above-ladder` (test: the scheduler refuses on capacity before the kubelet's check; now `spec.nodeName`), `pvc-size-block-1mi` (pod Failed after ~3 s, reason unknown: no termination message, #162; a size case now reports the pod's log). Only 1Mi Block ran: 20Ti/1Pi are above pvetest2's 16Gi maximum. Next: rerun, read block-1mi's line, fix or file it.
+       2026-11-06 (21:30Z): b7f6ccdd26 (1f297d7): 32 pass, 1 fail, 1 skip. above-ladder passes through the kubelet's check. block-1mi: `/dev/xvda is 65536 bytes`, a regular file. From stormpump 9877a97 exec.rs (read, not yet proved live): the bind lands at /dev/xvda, then a 64k tmpfs goes over /dev unless a mount is exactly /dev, and the workload's create makes a file there. Doing: case `block-1mi-outside-dev` (/block/xvda) to prove it; then file on stormpump.
 
 ### Done: #171 (P2), fsGroup / supplementalGroups onto the engine
 

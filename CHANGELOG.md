@@ -2,7 +2,7 @@
 
 ## 2026-11-06
 
-- **test:** Medium's first real run (ce5d01a254, pvetest2, 12.63-flowsdn: 31 pass, 2 fail, 1 skip) led to two suite changes (#61). `pvc-size-above-ladder` now places its pod with `spec.nodeName`, because the scheduler refused it on capacity before the kubelet's own check was reached. A size case now reports the pod's log, because the status has no termination message (#162) and a failed case said nothing.
+- **test:** Medium's first real run (ce5d01a254, pvetest2, 12.63-flowsdn: 31 pass, 2 fail, 1 skip) led to two suite changes (#61). `pvc-size-above-ladder` now places its pod with `spec.nodeName`, because the scheduler refused it on capacity before the kubelet's own check was reached. A size case now reports the pod's log, because the status has no termination message (#162) and a failed case said nothing. New case `pvc-size-block-1mi-outside-dev`: a 1Mi raw block claim with its device at `/block/xvda`, to tell the kubelet's half from stormpump's tmpfs over `/dev`.
 - **feat:** A golden the release carries runs with nothing mounted at `/pallets/<name>` (#294, stormcos#647, stormcos#820). New list `/etc/stormblock/carried`, one `<vol>:/p/<image>` per line, the grammar of `/etc/stormblock/mounts`; the initramfs does not read it, so a server moves from one file to the other with no stormblock change and saves its attach and mount on every boot.
   - A listed image reads as present and needs no registry golden, once the engine holds its sealed `<vol>.golden`. Each container's root is a clone by volume name, as every root already is, and argv[0] and user names are read from that clone. The config is still the registry's record.
   - A mount-list entry that did not mount resolves the same way.
