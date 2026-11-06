@@ -58,6 +58,17 @@ by #51.
 
 ## Work plan
 
+### In progress: #294 (P2), run a carried golden that is not mounted at boot (stormcos#647, #820)
+
+2026-11-06. A pallet image today needs `/pallets/<name>` with content. Found: the image's config comes from the registry's record, never the tree; argv[0] and user names
+already fall back to the container's own root; `Roots::make` clones `<vol>.golden` by name. So only the pull's yes/no and the path-to-volume map depend on the mount.
+Chosen format: **a separate file**, `/etc/stormblock/carried`, same grammar as `/etc/stormblock/mounts` (`<vol>:/p/<image>`). stormcos moves a line from one to the other; stormblock's initramfs
+reads only `mounts`, so no stormblock change (a `~` marker in `mounts` would make today's initramfs fail on a volume named `~x`). A list and not "any engine volume": the slab also holds
+`fastetcd-data.golden`, `pvc-ext4j-64m.golden`, and any other image name must not cost an engine listing. Doing:
+1. [ ] container_roots: `with_carried`, `listed_volume`, `Roots::lists` / `Roots::carried` (listed and the engine holds a sealed golden). An entry in `mounts` that did not mount resolves the same way.
+2. [ ] StormpumpImages: `with_roots`, `carried` after the mounted-pallet check, before the registry; `image_status`; `version_of`'s known component. Engine not answering = ErrImagePull, not the registry.
+3. [ ] Tests, README, configuration.md, status.md, CHANGELOG; sc-build; stage; file stormcos's half (`[mounts]` carried list; live check there); close.
+
 ### Done: #312 (P2), the engine client over https with the node CA (stormcos#374)
 
 2026-11-04. `--stormblock-ca` / `STORMBLOCK_CA_FILE` (the CA is the whole trust: no public roots, no skip). The file is read at each
