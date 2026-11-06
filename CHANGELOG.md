@@ -2,6 +2,7 @@
 
 ## 2026-11-06
 
+- **perf:** A VM start no longer waits a flat ~100 ms for the hypervisor's control socket (#325, stormcos#804). stormvm's `status_when_up` slept a fixed 100 ms after a refused connect. The kubelet now asks `Machine::status` itself: every 5 ms for the first 100 ms, then every 25 ms to 1 s, then every 100 ms. The 10 s bound and the rule that any answer counts are unchanged. Not yet measured on a node.
 - **docs:** Refresh from code since 2026-10-30: status.md (audit header, rows for #312 engine TLS, #311 container start steps, the stormvm 0225218 pin; test runs now wait on registry 9912c98, stormcos#271 closed), CLAUDE.md's reference. README, configuration.md, api.md and metrics.md already carried #301-#304, #311, #312; checked against the code, no promise without an issue.
 
 ## 2026-11-04

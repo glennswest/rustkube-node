@@ -159,7 +159,7 @@ is answered:
 | `window` | waiting for the deposit window: another start's taps (#100) |
 | `launch` | taps, plan and the engine's spawn |
 | `record` | identity published, the registration rewritten with the handle |
-| `control` | the hypervisor's control socket answering a status (#303), at most 10 s; the hypervisor's exit ends it early |
+| `control` | the hypervisor's control socket answering a status (#303), at most 10 s, asked every 5 ms for the first 100 ms, then every 25 ms to 1 s, then every 100 ms (#325); the hypervisor's exit ends it early |
 | `report` | the `Running` status patch |
 | `total` | seen → `Running` answered |
 

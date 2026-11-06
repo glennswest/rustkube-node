@@ -314,6 +314,43 @@ where
 /// VMI says Running anyway (#303). qemu binds it in well under a second.
 const CONTROL_UP_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long to wait before asking a started machine's control socket again,
+/// `elapsed` into the wait (#325). qemu binds it within milliseconds of the
+/// spawn, so a fixed 100 ms (`Machine::status_when_up`) cost a flat ~102 ms on
+/// every start. A refused connect costs microseconds, so ask often at first.
+fn control_poll_delay(elapsed: std::time::Duration) -> std::time::Duration {
+    use std::time::Duration;
+    if elapsed < Duration::from_millis(100) {
+        Duration::from_millis(5)
+    } else if elapsed < Duration::from_secs(1) {
+        Duration::from_millis(25)
+    } else {
+        Duration::from_millis(100)
+    }
+}
+
+/// `status` until the control socket can be connected to, for at most `within`.
+/// Only "not connectable" is waited out: any answer, an error too, means it is
+/// bound. A socket still missing after `within` is that error.
+async fn control_when_up<F, Fut>(
+    mut status: F,
+    within: std::time::Duration,
+) -> Result<stormvm_control::Status, stormvm_control::ControlError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<stormvm_control::Status, stormvm_control::ControlError>>,
+{
+    let started = std::time::Instant::now();
+    loop {
+        match status().await {
+            Err(stormvm_control::ControlError::Unreachable(..)) if started.elapsed() < within => {
+                tokio::time::sleep(control_poll_delay(started.elapsed())).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// What the wait for a started machine's control socket came to (#303).
 #[derive(Debug, PartialEq)]
 enum ControlUp {
@@ -325,7 +362,7 @@ enum ControlUp {
     NotUp(String),
 }
 
-/// Wait for `answer` (a `status_when_up`) or `exited`, whichever comes first,
+/// Wait for `answer` (a `control_when_up`) or `exited`, whichever comes first,
 /// bounded by `within` (a bound socket that never answers is a hung wait).
 async fn await_control<A, E>(answer: A, exited: E, within: std::time::Duration) -> ControlUp
 where
@@ -2393,7 +2430,7 @@ impl VmManager {
                         }
                     }
                 };
-                match await_control(machine.status_when_up(CONTROL_UP_WITHIN), exited, CONTROL_UP_WITHIN).await {
+                match await_control(control_when_up(|| machine.status(), CONTROL_UP_WITHIN), exited, CONTROL_UP_WITHIN).await {
                     ControlUp::Answered | ControlUp::Exited => {}
                     ControlUp::NotUp(why) => {
                         let why = format!(
@@ -6553,6 +6590,64 @@ pub fn hand_placed_here(obj: &Value, node: &str) -> bool {
 mod tests {
     use super::*;
 
+    // #325: a socket bound a moment after the spawn is found at once, not at
+    // the next 100 ms; only "not connectable" is waited out; the bound holds.
+    #[tokio::test]
+    async fn control_when_up_asks_soon_and_stops_at_an_answer() {
+        use std::cell::Cell;
+        use std::time::Duration;
+        use stormvm_control::{ControlError, Status};
+        assert_eq!(control_poll_delay(Duration::ZERO), Duration::from_millis(5));
+        assert_eq!(control_poll_delay(Duration::from_millis(99)), Duration::from_millis(5));
+        assert_eq!(control_poll_delay(Duration::from_millis(100)), Duration::from_millis(25));
+        assert_eq!(control_poll_delay(Duration::from_secs(1)), Duration::from_millis(100));
+        let unreachable =
+            || ControlError::Unreachable("control.sock".into(), std::io::Error::from(std::io::ErrorKind::NotFound));
+
+        // Three refused connects, then bound: well under one old 100 ms sleep each.
+        let asked = Cell::new(0);
+        let t = std::time::Instant::now();
+        let up = control_when_up(
+            || {
+                asked.set(asked.get() + 1);
+                let n = asked.get();
+                let unreachable = &unreachable;
+                async move {
+                    if n <= 3 {
+                        Err(unreachable())
+                    } else {
+                        Ok(Status { state: "running".into(), paused: false })
+                    }
+                }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(up.is_ok());
+        assert_eq!(asked.get(), 4);
+        assert!(t.elapsed() < Duration::from_millis(300), "took {:?}", t.elapsed());
+
+        // An error answer is a bound socket: asked once.
+        let asked = Cell::new(0);
+        let up = control_when_up(
+            || {
+                asked.set(asked.get() + 1);
+                async { Err(ControlError::Refused("no".into())) }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(matches!(up, Err(ControlError::Refused(_))));
+        assert_eq!(asked.get(), 1);
+
+        // Never bound: that error, once the bound has passed.
+        let t = std::time::Instant::now();
+        let within = Duration::from_millis(30);
+        let up = control_when_up(|| { let unreachable = &unreachable; async move { Err(unreachable()) } }, within).await;
+        assert!(matches!(up, Err(ControlError::Unreachable(..))));
+        assert!(t.elapsed() >= within);
+    }
+
     // #303: Running waits for the control socket, the exit, or the bound.
     #[tokio::test]
     async fn control_up_answered_exited_or_not_up() {
@@ -6568,7 +6663,7 @@ mod tests {
         let t = std::time::Instant::now();
         assert_eq!(await_control(pending, async {}, Duration::from_secs(5)).await, ControlUp::Exited);
         assert!(t.elapsed() < Duration::from_secs(1));
-        // Still no socket when status_when_up gives up.
+        // Still no socket when control_when_up gives up.
         let gone = async {
             Err(stormvm_control::ControlError::Unreachable(
                 "control.sock".into(),
