@@ -2704,7 +2704,7 @@ cmdline's absence). #232 (my #71 regression): kind: clone / fsType: ext4 accepte
 sc-build ca44386: 475 kubelet unit pass. Golden golden-rustkube-node-9b876df216c9 (stormcos#424), master told; close
 both when the Dell runs cilium-operator and a new claim. #21 paused on branch wip/21-rebased.
 
-### Waiting on stormblock-registry#150 (test images on nodes): #52, external StorageClasses: the end-to-end with the test container's own CSI driver (master: A)
+### Waiting on a release with registry>=9912c98 (stormblock-registry#150, test images on nodes): #52, external StorageClasses: the end-to-end with the test container's own CSI driver (master: A)
 
 2026-10-21. Master's decision on #52: **A**, the suite brings its own driver. Host `/var/lib/kubelet` is the
 kubelet's (stormcos `volume kubeletdir`), so a driver pod's hostPath reaches what the kubelet watches. Doing:
@@ -2730,6 +2730,8 @@ kubelet's (stormcos `volume kubeletdir`), so a driver pod's hostPath reaches wha
        with `test show`, fix what fails, close on a pass.
        2026-11-06: stormcos#271 closed, but no run got past the image: a tag fetched from forge by digest answers 404 on the node
        (stormblock-registry#150; #61's 023f853fba on pvetest1, 12.61). No csi run queued while it stands. #52 proposed after it. Resume as above.
+       2026-11-06 (later): #150 closed (v0.55.1, 9912c98), not on a node: the newest registry image is da53e0e, behind it, and 12.61 predates it. No run queued.
+       #52 proposed `--after-release registry>=9912c98`. Resume as above.
 
 (earlier) 2026-10-21. stormcentral#479 landed (`cluster_write`, `service_account_cluster_rules`). Blocker found: no stormcos node
 can run csi-driver-host-path's `hostpathplugin` (upstream images only as pinned imports; `pinned-images.txt` has the
