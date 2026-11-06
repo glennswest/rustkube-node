@@ -2770,6 +2770,7 @@ kubelet's (stormcos `volume kubeletdir`), so a driver pod's hostPath reaches wha
        2026-11-06 (17:40Z): the hold cleared on 12.62 (registry f2f13ad), but 12.62 was tombstoned: pvetest1's install failed at `local boot: the apiserver answers` (stormcos#814,
        P0: stormcert and rustkube-node `failed while attaching mounts`, errno 11, the boot unit's mounts, no kubelet code ran). So still no machine has the fix; no run queued.
        #52 proposed after stormcos#812 (install a release carrying registry>=9912c98 on a pve machine). Resume as above.
+       2026-11-06 (21:43Z): stormcos#812 closed; pvetest2 passed 12.63-flowsdn and medium ran there (#61). Queued csi 562ae87cdb (pvetest2, 84c7223). Read with `stormcentral test show 562ae87cdb`, fix what fails, close on a pass.
 
 (earlier) 2026-10-21. stormcentral#479 landed (`cluster_write`, `service_account_cluster_rules`). Blocker found: no stormcos node
 can run csi-driver-host-path's `hostpathplugin` (upstream images only as pinned imports; `pinned-images.txt` has the
