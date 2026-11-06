@@ -58,16 +58,13 @@ by #51.
 
 ## Work plan
 
-### In progress: #294 (P2), run a carried golden that is not mounted at boot (stormcos#647, #820)
+### Done: #294 (P2), run a carried golden that is not mounted at boot (stormcos#647, #820)
 
-2026-11-06. A pallet image today needs `/pallets/<name>` with content. Found: the image's config comes from the registry's record, never the tree; argv[0] and user names
-already fall back to the container's own root; `Roots::make` clones `<vol>.golden` by name. So only the pull's yes/no and the path-to-volume map depend on the mount.
-Chosen format: **a separate file**, `/etc/stormblock/carried`, same grammar as `/etc/stormblock/mounts` (`<vol>:/p/<image>`). stormcos moves a line from one to the other; stormblock's initramfs
-reads only `mounts`, so no stormblock change (a `~` marker in `mounts` would make today's initramfs fail on a volume named `~x`). A list and not "any engine volume": the slab also holds
-`fastetcd-data.golden`, `pvc-ext4j-64m.golden`, and any other image name must not cost an engine listing. Doing:
-1. [ ] container_roots: `with_carried`, `listed_volume`, `Roots::lists` / `Roots::carried` (listed and the engine holds a sealed golden). An entry in `mounts` that did not mount resolves the same way.
-2. [ ] StormpumpImages: `with_roots`, `carried` after the mounted-pallet check, before the registry; `image_status`; `version_of`'s known component. Engine not answering = ErrImagePull, not the registry.
-3. [ ] Tests, README, configuration.md, status.md, CHANGELOG; sc-build; stage; file stormcos's half (`[mounts]` carried list; live check there); close.
+2026-11-06. Found: the image's config comes from the registry's record, never the tree; argv[0] and user names already fall back to the container's own root; `Roots::make` clones `<vol>.golden` by name.
+So only the pull's yes/no and the path-to-volume map depended on the mount. Chosen format: **a separate file**, `/etc/stormblock/carried`, the grammar of `/etc/stormblock/mounts`. stormblock's initramfs reads only `mounts`,
+so no stormblock change (a `~` marker would make today's initramfs look for a volume named `~x`). A list, not "any engine volume": the slab also holds `fastetcd-data.golden`, `pvc-ext4j-64m.golden`, and other images must not cost a listing.
+Done: cfb9471 (`with_carried`, `listed_volume`, `Roots::lists`/`carried`, `StormpumpImages::carried`; 3 tests). SC_BUILD_VM sc-build (jobs a9d1e5a53e, b733ac981a): 599 kubelet unit, all suites, clippy nothing on the changed lines (#227's elsewhere). Closed.
+Filed stormcos#826 (compose writes the list, moves the servers; the live check is there). Not run on a node: tests use a fake engine and registry.
 
 ### Done: #312 (P2), the engine client over https with the node CA (stormcos#374)
 
