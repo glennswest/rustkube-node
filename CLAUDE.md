@@ -2479,9 +2479,10 @@ Steps:
        assets.json) for stormblock/registry/timesync; #87 keeps those and the stale-status half. Not run on a node:
        whether `/hostroot/logs/<svc>` shows the mounted volume is unchecked (C2NR0Q2 down). Unreleased.
 
-### Waiting on stormblock-registry#150 (test images on nodes): #64, PVC size test (the medium suite's first test)
+### Waiting on a release with registry>=9912c98 (stormblock-registry#150, test images on nodes): #64, PVC size test (the medium suite's first test)
 
 2026-11-06. stormcos#271 closed, but no run reaches a test: the fetched image's tag answers 404 on the node (stormblock-registry#150; #61's 023f853fba, stormcos-cilium 8036d8a602 on pvetest1, 12.61). No medium queued while it stands. #64 proposed after it. Resume as below.
+2026-11-06 (later). #150 closed (v0.55.1, 9912c98). Registry image golden-registry-e7abc9eefceb (f2f13ad) has the fix; no release carries it yet (newest 12.61). No run queued. #64 proposed `--after-release registry>=9912c98`. Resume as below.
 
 2026-10-21. stormblock#331 closed. Every test run since stormcentral#697 that finds its image on forge dies at the node's
 fetch (`forge.g16.lo:5100 is not a peer of this registry`, stormcos#271); pvetest1/2 are refused ("sbregistry failing"),
