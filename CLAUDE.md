@@ -1642,7 +1642,7 @@ is live GETs already.
 2026-10-07. de51950: README, BUILD.md, status.md, presentation, CLAUDE.md (flowsdn owns Services in its edition,
 #145; checked against stormcos main). sc-build: deck renders (12 slides), `cargo build --locked` ok. Closed.
 
-### Waiting on stormblock-registry#150 (test images on nodes): #61, short, medium and long test suites (stormcentral docs/test-standard.md)
+### Waiting on a release with registry>=9912c98 (stormblock-registry#150, test images on nodes): #61, short, medium and long test suites (stormcentral docs/test-standard.md)
 
 2026-10-06. `test/` has medium's storage cases (#64, #59, #62, #67); short and long are one skip each. The
 runner's namespace Role is `*`; cluster reads come from `test/requires.toml` (only [medium] declares `nodes`, which
@@ -1690,6 +1690,9 @@ every suite needs to resolve STORM_NODE). Pods are pinned with `spec.nodeName` (
        pushed to forge, fetched by digest, then the Pod's `ImagePullBackOff`: tag "not on this node" (404, no ready golden), so the suite never
        started = stormblock-registry#150 (every component's runs since the peer). #61 proposed after it. Resume: medium on pvetest1, long at
        night, close on their results.
+       2026-11-06 (later): #150 closed (v0.55.1, 9912c98), not on a node: the newest registry image is da53e0e, 5 commits behind it, and 12.61 predates it.
+       No run queued (it would stop at the same 404). #61 proposed `--after-release registry>=9912c98`. short also passed on pvetest1 (f490bbfc50, c0a5fd4, 4/0/0).
+       Resume: `stormcentral test run rustkube-node medium --tag pvetest1`, long at night, close on their results.
 
 ### Done: #171 (P2), fsGroup / supplementalGroups onto the engine
 
