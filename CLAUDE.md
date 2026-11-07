@@ -58,11 +58,12 @@ by #51.
 
 ## Work plan
 
-### In progress: #337 (P3), stormvm → 6e188a6: no guest agent by default on cloud-hypervisor (stormvm#1)
+### Done: #337 (P3), stormvm → 6e188a6: no guest agent by default on cloud-hypervisor (stormvm#1)
 
 2026-11-07. 55 commits on 0225218; manifests: stormvm-block gains `rustls` 0.23 (in our graph), rcgen as a dev-dependency only; stormvm-verify is not in our graph.
 API additive (`stormvm_block::Ca`, `Client::with_ca`: #318's, not here). Doing: rev bump in Cargo.toml + Cargo.lock by hand (+ `rustls` under stormvm-block), status.md, CHANGELOG;
 SC_BUILD_VM sc-build `cargo metadata --locked && cargo build --locked && cargo test --locked`; stage; close (stormvm#1's display checks are stormvm's medium).
+Done: 5d70be0. SC_BUILD_VM sc-build (VM sc-build-c5dd0aef91): `--locked` build, 600 kubelet unit, all suites; 9 stormvm lock entries at 6e188a6; warnings = #227's 9. Stage build e49faae4a64e. Closed.
 
 ### Done: #335 (P3), a refused VM spawn quotes what the helper printed (stormvm#7's passt)
 
