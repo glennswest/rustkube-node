@@ -68,6 +68,20 @@ impl Api {
         }
     }
 
+    /// [`create`](Self::create) of an object named for this run, so a 409 is
+    /// this run's own earlier try and not somebody else's object (#52: a first
+    /// POST answered 409 on a flapping apiserver). It says so on stdout.
+    pub async fn create_run_object(&self, path: &str, body: &Value) -> Result<(), String> {
+        match self.send(reqwest::Method::POST, path, Some(body)).await? {
+            (200..=202, _) => Ok(()),
+            (409, _) => {
+                println!("{path}: {} already exists: this run's own, kept", body["metadata"]["name"]);
+                Ok(())
+            }
+            (c, v) => Err(Self::fail("POST", path, c, &v)),
+        }
+    }
+
     pub async fn create(&self, path: &str, body: &Value) -> Result<Value, String> {
         match self.send(reqwest::Method::POST, path, Some(body)).await? {
             (200..=202, v) => Ok(v),

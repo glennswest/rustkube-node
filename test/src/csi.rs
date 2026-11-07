@@ -194,10 +194,10 @@ impl Suite {
     }
 
     async fn setup(&self) -> Result<(), String> {
-        self.api.create(CSIDRIVERS, &csidriver(&self.env, &self.driver)).await?;
-        self.api.create(k8s::PVS, &pv(&self.env, &self.driver)).await?;
-        self.api.create(&k8s::pvcs(&self.env), &claim(&self.env)).await?;
-        self.api.create(&k8s::pods(&self.env), &driver_pod(&self.env, &self.driver)).await?;
+        self.api.create_run_object(CSIDRIVERS, &csidriver(&self.env, &self.driver)).await?;
+        self.api.create_run_object(k8s::PVS, &pv(&self.env, &self.driver)).await?;
+        self.api.create_run_object(&k8s::pvcs(&self.env), &claim(&self.env)).await?;
+        self.api.create_run_object(&k8s::pods(&self.env), &driver_pod(&self.env, &self.driver)).await?;
         Ok(())
     }
 

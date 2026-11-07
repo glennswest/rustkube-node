@@ -2,6 +2,7 @@
 
 ## 2026-11-06
 
+- **test:** The `csi` suite's setup accepts a 409 on an object named for its own run, and says so on stdout (#52). A first run stopped there on a flapping apiserver; why the first POST met a 409 is still unknown.
 - **docs:** The medium suite passes on a node for the first time (#61): d80cfd8e8c, pvetest2, 12.64-flowsdn, 34 pass, 0 fail, 1 skip by design. A raw block claim at `/dev/xvda` now gets the device, exactly 1048576 bytes (stormpump#222, 12.64 on). The README and status no longer say it doesn't work. The long suite has not run yet.
 - **feat:** `VMI … started:` and `storm.io/start-timing` gain `control/answer=` (#325): the part of `control` after the hypervisor's socket took a connection. On 12.63 and 12.64 the flat ~102 ms is gone, but `control` is still 29-43 ms on a warm pve VM and 132-391 ms for the first VM of a pass, above the 20 ms target. Polling is at most 5 ms of that, and this line says whether the rest is qemu's bind or its answer. The `report` step is back to 3.1-12 ms warm on pve, with one 154 ms of 12.
 - **docs:** The PVC size cases passed live for the first time (#64, medium 5d70bf4679, pvetest2): classes 1Mi to 16Gi and the arbitrary sizes below that. Classes above 16Gi and the 1Ti mint have not run: pvetest2's maximum is 16Gi, and hardware runs wait on the owner's answer.
