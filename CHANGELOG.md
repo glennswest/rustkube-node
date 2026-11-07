@@ -2,6 +2,14 @@
 
 ## 2026-11-07
 
+- **feat:** A stopped VM's disks move to another node, and it starts there (#339, stormcos#806 test 3). Ask with `storm.io/move-to: <node>` on the VirtualMachine. The kubelet whose engine holds the VM's own disks (golden clones, emptyDisks) mirrors each one with stormstorage's migrate, then cuts over once it is in sync (nothing is attached, so no pause) and retires the source. The record is #302's `storm.io/disk-moves`, written on the VM's template so the next VMI carries it and its start attaches the moved volumes. Once every disk is there, the template's `nodeSelector` names the node, so the scheduler places the next VMI on it. Progress is in `storm.io/move-status` on the VM, with Events.
+  - Refused while a VMI exists, and said on the VM.
+  - A VMI that appears mid-copy aborts the copy.
+  - A failed disk aborts the others still copying.
+  - A start waits while a move is in flight, or while the disks are on two nodes.
+  - A start on a moved volume sets the VM as its owner in that engine.
+  - Not run on two nodes yet.
+
 - **chore:** stormvm 0225218 → 6e188a6 (#337, stormvm#1). A cloud-hypervisor VMI that doesn't mention the guest agent no longer gets one by default; before, it was refused at render ("it has no virtio-serial; use vsock"). A VMI that asks for the agent by name is still refused, and says why. No kubelet code change: `VmSpec` and `from_kube` are unchanged. stormvm-block gains `rustls` in the lock, already in the graph at 0.23. Its new `with_ca` is not used here yet: that is #318.
 - **fix:** A VM start the engine refuses says why (#335, stormvm#7). The VMI read `stormpump refused: Failed { op: 18, errno: 10, step: 9 }`; it now reads the op, errno and step in words, says when a helper exited before it was ready (ECHILD at the helper's step), and quotes the last lines `hypervisor.log` gained in that attempt, where the helper (passt) prints its reason. Only this attempt's lines: a retry never quotes the previous one's.
 - **test:** Two new medium cases for carried images (#332, #294, stormcos#826). `pod-carried-image` runs `nextnfs --help` from a golden the release lists in `/etc/stormblock/carried` and doesn't mount at boot, and checks it Succeeds on its own `ctr-…` root. It skips, saying why, on a release that doesn't show that. `pod-image-on-no-list` checks a bare image on neither list gets the registry's 404.

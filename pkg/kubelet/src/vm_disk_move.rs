@@ -36,6 +36,13 @@ pub const REQUEST: &str = "storm.io/move-disks";
 /// The kubelet's record: `{"<disk>": Move}`.
 pub const RECORD: &str = "storm.io/disk-moves";
 
+/// A stopped VirtualMachine's request (#339): the node its disks go to.
+pub const MOVE_TO: &str = "storm.io/move-to";
+/// The kubelet's one-line account of a stopped VM's move, on the VM.
+pub const MOVE_STATUS: &str = "storm.io/move-status";
+/// The node label the template's `nodeSelector` names once the disks moved.
+pub const HOSTNAME: &str = "kubernetes.io/hostname";
+
 /// How often a move in flight is looked at with no event.
 pub const POLL: std::time::Duration = std::time::Duration::from_secs(3);
 
@@ -79,6 +86,10 @@ pub struct Move {
     pub volume: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub message: String,
+    /// Moved while the VM was stopped (#339): no switch, and the record is
+    /// the VirtualMachine's, carried onto each VMI.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stopped: bool,
 }
 
 impl Move {
@@ -146,6 +157,104 @@ pub fn off_node(vmi: &Value, node: &str) -> Option<String> {
         Some((n, _)) => Some(format!("disk {d} is on {n}'s storage (#302)")),
         None => Some(format!("disk {d}'s move ended unknown (#302)")),
     })
+}
+
+/// The node a stopped VirtualMachine's disks are asked onto (#339).
+pub fn stopped_request(vm: &Value) -> Option<String> {
+    vm["metadata"]["annotations"][MOVE_TO].as_str().map(str::trim).filter(|n| !n.is_empty()).map(String::from)
+}
+
+/// The record on a VirtualMachine's template (#339). One that does not
+/// parse is none.
+pub fn template_records(vm: &Value) -> BTreeMap<String, Move> {
+    vm["spec"]["template"]["metadata"]["annotations"][RECORD]
+        .as_str()
+        .and_then(|t| serde_json::from_str(t).ok())
+        .unwrap_or_default()
+}
+
+/// The merge patch of a stopped VM's move: the record on its template, the
+/// account on the VM, and (`place_on`) the template's node. Guarded by the
+/// VM's `resourceVersion`: two kubelets each write the disks they hold.
+pub fn vm_patch(rv: &str, records: &BTreeMap<String, Move>, status: Option<&str>, place_on: Option<&str>) -> Value {
+    let text = if records.is_empty() { Value::Null } else { json!(serde_json::to_string(records).unwrap_or_default()) };
+    let mut p = json!({
+        "metadata": {"resourceVersion": rv},
+        "spec": {"template": {"metadata": {"annotations": {RECORD: text}}}},
+    });
+    if let Some(s) = status {
+        p["metadata"]["annotations"] = json!({ MOVE_STATUS: s });
+    }
+    if let Some(n) = place_on {
+        p["spec"]["template"]["spec"] = json!({"nodeSelector": {HOSTNAME: n}});
+    }
+    p
+}
+
+/// Why a VMI must not start yet because of a stopped VM's move (#339), given
+/// the record it is started with: a disk still being moved, or the disks
+/// left on more than one node's storage (a move that failed half way).
+/// Records of running moves (#302) alone never hold a start.
+pub fn start_hold(records: &BTreeMap<String, Move>) -> Option<String> {
+    if !records.values().any(|m| m.stopped) {
+        return None;
+    }
+    if let Some((d, m)) = records.iter().find(|(_, m)| m.stopped && m.active()) {
+        return Some(format!("disk {d} is being moved to {}'s storage (#339): the VM starts once it is there", m.to));
+    }
+    let mut on: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (d, m) in records {
+        match m.location() {
+            Some((n, _)) => on.entry(n).or_default().push(d),
+            None => return Some(format!("disk {d}'s move ended unknown (#339): a person decides which volume it is")),
+        }
+    }
+    (on.len() > 1).then(|| {
+        let where_: Vec<String> = on.iter().map(|(n, ds)| format!("{} on {n}", ds.join(", "))).collect();
+        format!(
+            "the disks are on more than one node's storage ({}): move them to one node (storm.io/move-to) first (#339)",
+            where_.join("; ")
+        )
+    })
+}
+
+/// Every disk recorded is on `node` and done: where the next start goes.
+pub fn all_moved_to(records: &BTreeMap<String, Move>, node: &str) -> bool {
+    !records.is_empty() && records.values().all(|m| m.state == MOVED && m.to == node)
+}
+
+/// The one-line account of a stopped VM's move, for [`MOVE_STATUS`].
+pub fn summary(to: Option<&str>, records: &BTreeMap<String, Move>) -> String {
+    if let Some(to) = to.filter(|t| all_moved_to(records, t)) {
+        return format!("moved: every disk is on {to}'s storage; the next start is scheduled there");
+    }
+    let mut parts = Vec::new();
+    for (d, m) in records {
+        let p = match m.state.as_str() {
+            COPYING if m.bytes_total > 0 => format!(
+                "{d} copying to {} ({}%)",
+                m.to,
+                100 - (m.bytes_remaining.min(m.bytes_total) * 100 / m.bytes_total)
+            ),
+            COPYING => format!("{d} copying to {}", m.to),
+            SWITCHED => format!("{d} cut over to {}, retiring the source", m.to),
+            MOVED => format!("{d} on {}", m.to),
+            FAILED => format!("{d} failed, on {}: {}", m.node, m.message),
+            other => format!("{d} {other}: {}", m.message),
+        };
+        parts.push(p);
+    }
+    let mut s = if records.values().any(Move::active) {
+        format!("moving: {}", parts.join("; "))
+    } else if records.values().any(|m| m.state == FAILED) {
+        format!("failed: {}", parts.join("; "))
+    } else {
+        parts.join("; ")
+    };
+    if let Some(why) = start_hold(records).filter(|_| !records.values().any(Move::active)) {
+        s.push_str(&format!(". It will not start: {why}"));
+    }
+    s
 }
 
 /// What a pass does about one disk.
@@ -296,6 +405,67 @@ mod tests {
         assert_eq!(rec(SWITCHED).location(), Some(("b", "v-b")));
         assert_eq!(rec(MOVED).location(), Some(("b", "v-b")));
         assert_eq!(rec(UNKNOWN).location(), None);
+    }
+
+    fn stopped(state: &str, node: &str, to: &str) -> Move {
+        Move { node: node.into(), to: to.into(), stopped: true, ..rec(state) }
+    }
+
+    #[test]
+    fn a_stopped_vms_request_and_record_live_on_the_vm() {
+        let vm = json!({"metadata": {"annotations": {MOVE_TO: " b "}}, "spec": {"template": {"metadata": {"annotations": {
+            RECORD: serde_json::to_string(&BTreeMap::from([("root".to_string(), stopped(COPYING, "a", "b"))])).unwrap()
+        }}}}});
+        assert_eq!(stopped_request(&vm).as_deref(), Some("b"));
+        assert!(stopped_request(&json!({"metadata": {"annotations": {MOVE_TO: ""}}})).is_none());
+        let r = template_records(&vm);
+        assert!(r["root"].stopped && r["root"].state == COPYING);
+        assert!(serde_json::to_value(rec(COPYING)).unwrap().get("stopped").is_none(), "#302's records unchanged");
+
+        let p = vm_patch("42", &r, Some("moving"), Some("b"));
+        assert_eq!(p["metadata"]["resourceVersion"], "42");
+        assert_eq!(p["metadata"]["annotations"][MOVE_STATUS], "moving");
+        assert_eq!(p["spec"]["template"]["spec"]["nodeSelector"][HOSTNAME], "b");
+        let mut carried = json!({"spec": {"template": {"metadata": {}}}});
+        carried["spec"]["template"]["metadata"] = p["spec"]["template"]["metadata"].clone();
+        assert_eq!(template_records(&carried), r, "round trip");
+        let bare = vm_patch("42", &BTreeMap::new(), None, None);
+        assert!(bare["spec"]["template"]["metadata"]["annotations"][RECORD].is_null() && bare["spec"]["template"]["spec"].is_null());
+    }
+
+    #[test]
+    fn a_start_waits_for_a_stopped_vms_move() {
+        let one = |d: &str, m: Move| BTreeMap::from([(d.to_string(), m)]);
+        assert_eq!(start_hold(&BTreeMap::new()), None);
+        assert_eq!(start_hold(&one("root", rec(COPYING))), None, "a running move (#302) never holds a start");
+        assert!(start_hold(&one("root", stopped(COPYING, "a", "b"))).unwrap().contains("being moved to b"));
+        assert!(start_hold(&one("root", stopped(SWITCHED, "a", "b"))).is_some(), "the source is not retired yet");
+        assert_eq!(start_hold(&one("root", stopped(MOVED, "a", "b"))), None);
+        assert_eq!(start_hold(&one("root", stopped(FAILED, "a", "b"))), None, "failed: still on a, one node");
+        let half = BTreeMap::from([
+            ("root".to_string(), stopped(MOVED, "a", "b")),
+            ("data".to_string(), stopped(FAILED, "a", "b")),
+        ]);
+        let why = start_hold(&half).unwrap();
+        assert!(why.contains("data on a") && why.contains("root on b"), "{why}");
+        assert!(start_hold(&one("root", stopped(UNKNOWN, "a", "b"))).unwrap().contains("unknown"));
+    }
+
+    #[test]
+    fn a_stopped_vms_move_reads_in_one_line() {
+        let mut copying = stopped(COPYING, "a", "b");
+        copying.bytes_total = 200;
+        copying.bytes_remaining = 50;
+        let r = BTreeMap::from([("root".to_string(), copying), ("data".to_string(), stopped(MOVED, "a", "b"))]);
+        assert_eq!(summary(Some("b"), &r), "moving: data on b; root copying to b (75%)");
+        let done = BTreeMap::from([("root".to_string(), stopped(MOVED, "a", "b"))]);
+        assert!(all_moved_to(&done, "b") && !all_moved_to(&done, "c") && !all_moved_to(&BTreeMap::new(), "b"));
+        assert!(summary(Some("b"), &done).starts_with("moved: every disk is on b"));
+        let mut f = stopped(FAILED, "a", "b");
+        f.message = "the copy failed".into();
+        let half = BTreeMap::from([("root".to_string(), stopped(MOVED, "a", "b")), ("data".to_string(), f)]);
+        let s = summary(Some("b"), &half);
+        assert!(s.starts_with("failed: data failed, on a: the copy failed; root on b") && s.contains("will not start"), "{s}");
     }
 
     #[test]

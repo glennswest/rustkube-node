@@ -1092,6 +1092,46 @@ Not yet:
   deleting the VM does not delete a disk that moved off the node.
 - Not run on a two-node fabric yet.
 
+### A stopped VM's disks moved to another node
+
+A stopped VirtualMachine (no VMI) can have its disks moved to another node,
+so its next start is there (#339, stormcos#806 test 3). Ask on the VM:
+
+    kubectl annotate vm web-1 storm.io/move-to=node-b
+
+The kubelet whose stormblock holds the disks (by their record, else a volume
+`<ns>.<vm>-<disk>` owned by the VM) moves each disk the VM owns (a golden's
+clone, an emptyDisk) with stormstorage's migrate, as above but with no guest
+to pause: `copying` → (in sync, nothing attached) cutover → `switched` →
+complete → `moved`. The record is the same `storm.io/disk-moves`, each entry
+`stopped: true`, written on the VM's `spec.template.metadata.annotations`, so
+rustkube's VM controller copies it onto the next VMI and that start attaches
+the moved volumes. A one-line account for a person is `storm.io/move-status`
+on the VM (`moving: root copying to node-b (40%)`, `moved: …`, `failed: …`,
+`refused: …`), with Events on the VM.
+
+Once every disk is on `node-b`, the kubelet sets the template's
+`nodeSelector` `kubernetes.io/hostname: node-b` (replacing any hostname there:
+the request is to run there), so rustkube's scheduler places the next VMI on
+node-b. That start sets the VM as the moved volumes' owner in node-b's engine
+(#75), so deleting the VM deletes them.
+
+**Refused or stopped:**
+- A VMI exists (the VM is running): refused, said on the VM. Its disks move by
+  `storm.io/move-disks` (above) or with it by a live migration (#40).
+- A disk still attached (a stop not finished): waited for.
+- A VMI that appears during the copy: the copy is aborted, the disk stays.
+- Any disk's copy failing: the disks still copying are aborted, so the VM
+  stays on its node. A start waits while a move is in flight, and while the
+  disks are on more than one node's storage (one moved before another failed):
+  the status says where each is. Take the request off and put it back to try
+  the failed ones again.
+
+Not moved here: a claim (its own move, #338), a `volume:`, the seed (made
+again at every start). Not run on two nodes yet (stormcentral#360's pvetest
+pair, stormcos#806 test 3); a migrate of a detached volume is confirmed on
+stormstorage's side by stormstorage#106.
+
 ## Tests on a node
 
 `test/` is the test container, per stormcentral's `docs/test-standard.md`. It

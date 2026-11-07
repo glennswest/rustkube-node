@@ -726,7 +726,8 @@ impl Kubelet {
         }
     }
 
-    // Snapshots and the VM disk-owner sweep, independent of UID work, on
+    // Snapshots, the VM disk-owner sweep and stopped VMs' disk moves (#339),
+    // independent of UID work, on
     // events only (#101): snapshot watches and take completions; VM/VMI
     // watches (an owner going) and engine volume changes (a disk let go).
     async fn vm_maintenance_loop(&self) -> anyhow::Result<()> {
@@ -752,7 +753,10 @@ impl Kubelet {
                     }
                 }
                 if let Some(snapshots) = &self.snapshots { snapshots.sync().await; }
-                if let Some(after) = vms.sweep_orphans().await {
+                let swept = vms.sweep_orphans().await;
+                // Stopped VMs' disks asked onto another node (#339).
+                let moving = vms.move_stopped_vms().await;
+                if let Some(after) = [swept, moving].into_iter().flatten().min() {
                     apimachinery::reactor::requeue_after(after);
                 }
             }).await;
