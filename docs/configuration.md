@@ -292,6 +292,6 @@ Missing required inputs exit 2. short: Node Ready and heartbeat, a pod's run, ad
 code and delete; medium: pod features (restart, init, configMap/env, missing image) and the
 storage cases (PVC sizes, raw block, node volumes, overcommit refusal; at most three size cases
 at once); long: waves of pods at the node's capacity; csi: the CSI node side against the image's
-own driver (registration, publish, unpublish, a kubelet restart, deregistration). The runner's own pod is never deleted by
-the cleanup (#217). Live: short passed on C2NR0Q2 at 9229603; medium, long and csi have no complete
+own driver (registration, publish, unpublish, deregistration; a kubelet restart is skipped until #334). The runner's own pod is never deleted by
+the cleanup (#217). Live: short passed on C2NR0Q2 at 9229603, medium d80cfd8e8c on pvetest2, csi 876bbe55ab on pvetest1; long has no complete
 live pass yet (#61, #64, #52).

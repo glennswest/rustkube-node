@@ -127,7 +127,7 @@ makes the bind. So:
   engine refuses a propagating mount on anything but a bind in a container,
   and every pod mount is a bind. A spec with a propagating mount is payload
   v6, which an engine older than stormpump#35 refuses rather than running
-  private. Not yet seen end to end with a real driver (#52); the mountinfo
+  private. Seen end to end with the test image's own driver (`csi` 876bbe55ab, #52); the mountinfo
   check still keeps a consumer waiting when a mount has not reached the node.
 - **The kubelet's own view** of `/var/lib/kubelet` (stormcos: `mount
   kubeletdir /var/lib/kubelet`) does not need to see the mounts. The kubelet
@@ -157,6 +157,8 @@ pinning csi-driver-host-path in stormcos, would add it).
 
 ## Not yet
 
+- NodeStage and `attachRequired: true` on a node: the suite's driver has neither, so
+  they are covered by unit tests against a mock driver only. No third-party driver has been run.
 - A kubelet restart with a CSI volume in use: a restarted kubelet adopts no pods
   on stormpump yet (#334), so `csi-kubelet-restart` is skipped.
 - Generic ephemeral volumes: the kubelet resolves them to the claim

@@ -29,7 +29,7 @@ current deployment guarantees. Owner decisions answered: #106 (Pods under one pa
 (`<volume>-<node>`, done), #108 (class size at bind, done), #109 (option A, done), #110/#158 (C2NR0Q2's day
 suite is the acceptance, #102), #104 (A), #3 (no NotReady gating; #201), #68 (stormblock-csi owns replicas),
 #159 (RAID leg on the destination, #40 after stormstorage#44), stormimds#12 (stormimds asks `/vmInstance`).
-Waiting on the owner: #102 (acceptance machine: the Dell's tests valve is closed).
+Open: #334 (a kubelet restart adopts no pods on stormpump). Waiting on the owner: #102 (acceptance machine: the Dell's tests valve is closed).
 
 ## Build and test
 
@@ -2745,7 +2745,7 @@ cmdline's absence). #232 (my #71 regression): kind: clone / fsType: ext4 accepte
 sc-build ca44386: 475 kubelet unit pass. Golden golden-rustkube-node-9b876df216c9 (stormcos#424), master told; close
 both when the Dell runs cilium-operator and a new claim. #21 paused on branch wip/21-rebased.
 
-### Waiting on a release with registry>=9912c98 (stormblock-registry#150, test images on nodes): #52, external StorageClasses: the end-to-end with the test container's own CSI driver (master: A)
+### Done: #52, external StorageClasses: the end-to-end with the test container's own CSI driver (master: A)
 
 2026-10-21. Master's decision on #52: **A**, the suite brings its own driver. Host `/var/lib/kubelet` is the
 kubelet's (stormcos `volume kubeletdir`), so a driver pod's hostPath reaches what the kubelet watches. Doing:
@@ -2779,6 +2779,7 @@ kubelet's (stormcos `volume kubeletdir`), so a driver pod's hostPath reaches wha
        2026-11-06 (21:43Z): stormcos#812 closed; pvetest2 passed 12.63-flowsdn and medium ran there (#61). Queued csi 562ae87cdb (pvetest2, 84c7223). Read with `stormcentral test show 562ae87cdb`, fix what fails, close on a pass.
        2026-11-06 (22:03Z): 562ae87cdb: `csi-setup` 409 on the run's own CSIDriver name (unexplained). 045726d654: no results; pvetest2's apiserver gone during the Job, wedged 13+ min (6443/9094 refused; stormd APIs and :10250 accept, no answer). Cause unknown; may be the suite (privileged Bidirectional driver pod, hostPID kubelet restart). Don't run csi on another machine until the console says. Master asked to read the console. Resume: its answer, then rerun on a fresh install. Consider: csi suite writes results as it goes, so a lost node still says which case it reached.
        2026-11-07 (00:40Z): 3265d7a21a (befb0da, pvetest2) with ports and logs sampled: 9 `Kubelet starting` in 2 min. The first attempt got to `csi-restart-kubelet`; the new kubelet adopts nothing on stormpump (`list_pod_sandbox` is in memory), starts every pod again, the restart pod signals again: a loop. The runner re-ran too, so the 409s were its own objects (562ae87cdb the same). Probably 045726d654's wedge, logs lost. Filed #334 (P1). `csi-kubelet-restart` skipped until it's fixed (`KUBELET_RESTART_ADOPTS`). pvetest2 now has duplicate unsupervised pods: it needs a fresh install, master asked. Doing: rerun csi on pvetest1 (12.64), close on a pass; the restart check moves to #334.
+       2026-11-07 (00:46Z): csi 876bbe55ab (ea2692a, pvetest1, 12.64): 5 pass, 1 skip (`csi-kubelet-restart`, #334). Closed. On a node: registration, publish, unpublish, read back, deregistration. Unit tests only: NodeStage, attachRequired. Not run: a third-party driver, a kubelet restart (#334).
 
 (earlier) 2026-10-21. stormcentral#479 landed (`cluster_write`, `service_account_cluster_rules`). Blocker found: no stormcos node
 can run csi-driver-host-path's `hostpathplugin` (upstream images only as pinned imports; `pinned-images.txt` has the

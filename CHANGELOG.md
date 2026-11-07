@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-07
+
+- **docs:** External CSI drivers verified on a node (#52): `csi` 876bbe55ab (ea2692a, pvetest1, 12.64) passed 5 with 1 skip, covering registration, a pod writing through NodePublish, NodeUnpublish on delete, a new pod reading the data back, and deregistration. Not covered on a node: NodeStage, `attachRequired: true`, a third-party driver, and a kubelet restart (#334).
+
 ## 2026-11-06
 
 - **test:** `csi-kubelet-restart` is skipped until a restarted kubelet adopts its pods (#52, #334). Each new kubelet starts every pod again, including the suite's runner and its restart pod, which signals the new kubelet, so the case looped the node's kubelet: 9 starts in 2 minutes on pvetest2. That rerun of the runner also explains the 409s on the suite's own objects, and probably the control plane lost on 2026-11-06.
