@@ -58,6 +58,21 @@ by #51.
 
 ## Work plan
 
+### In progress: #339 (P1), move a stopped VM's disks to another node, so it starts there (stormcos#806 test 3)
+
+2026-11-07. Found: #302's record (`storm.io/disk-moves`) lives on the VMI and goes with it; rustkube's VM controller copies
+`spec.template.metadata.annotations` onto each new VMI, and its scheduler honours the VMI's `nodeSelector`. stormstorage's
+migrate mirrors in S's engine (stormblock `/volumes/{id}/mirror`), nothing in it needs an attach (stormstorage#106 asks to confirm).
+Chosen: request `storm.io/move-to: <node>` on the VirtualMachine; the record is #302's, written on the VM's
+`spec.template.metadata.annotations` (so the next VMI carries it and its start attaches the moved volumes), each entry
+`stopped: true`; a one-line `storm.io/move-status` on the VM; once every disk is on B, `spec.template.spec.nodeSelector`
+`kubernetes.io/hostname: B` (the next start is scheduled there). Driven by the kubelet whose engine holds the disk
+(the record's location, else a volume `<ns>.<vm>-<disk>` owned by the VM). No pause: synced → cutover → complete.
+Refused while a VMI exists or a disk is attached; a VMI appearing mid-copy aborts it. A failure aborts the disks still
+copying. A start waits while a stopped-move is active or its disks are on two nodes. B's start sets the VM's owner on the moved volume.
+Doing: vm_disk_move.rs (request/record/status/hold helpers), VmManager `move_stopped_vms` (maintenance loop), the start
+hold, tests (fake apiserver + stormstorage + engine), README/status.md, CHANGELOG; sc-build; stage; live check = stormcos#806 test 3.
+
 ### Done: #337 (P3), stormvm → 6e188a6: no guest agent by default on cloud-hypervisor (stormvm#1)
 
 2026-11-07. 55 commits on 0225218; manifests: stormvm-block gains `rustls` 0.23 (in our graph), rcgen as a dev-dependency only; stormvm-verify is not in our graph.
