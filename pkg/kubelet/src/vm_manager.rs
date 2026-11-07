@@ -8420,7 +8420,8 @@ mod tests {
             "apiVersion": "kubevirt.io/v1", "kind": "VirtualMachine",
             "metadata": {"namespace": "default", "name": "web", "uid": "vm-1", "resourceVersion": "1", "annotations": {}},
             "spec": {"runStrategy": "Halted", "template": {"metadata": {}, "spec": {
-                "domain": {"devices": {"disks": [{"name": "root", "disk": {}}, {"name": "data", "disk": {}}]}},
+                "domain": {"memory": {"guest": "1Gi"},
+                           "devices": {"disks": [{"name": "root", "disk": {}}, {"name": "data", "disk": {}}]}},
                 "volumes": [{"name": "root", "containerDisk": {"image": "fedora"}},
                             {"name": "data", "emptyDisk": {"capacity": "1Gi"}}]}}},
         });
