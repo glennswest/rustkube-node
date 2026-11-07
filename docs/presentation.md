@@ -115,7 +115,7 @@ From the code (`storage.rs`, `capacity.rs`, `system_claims.rs`, `csi*.rs`):
 
 - **Built-in class `stormblock`:** a claim rounds up to a size class (1Mi … **1Pi**, ×4 steps) and is a
   CoW clone of that class's sealed ext4 blank, attached over ublk; blanks are minted on first use (#67)
-- **`volumeMode: Block`:** a plain thin volume, bound at `volumeDevices[].devicePath` (#67; not yet under `/dev`, stormpump#222)
+- **`volumeMode: Block`:** a plain thin volume, bound at `volumeDevices[].devicePath` (#67; under `/dev` from 12.64, stormpump#222)
 - **Room is enforced:** a claim is charged its full class; the node publishes `CSIStorageCapacity`
   `kube-system/stormblock-<node>` and refuses a claim that does not fit; `SlabFilling` warnings (#62)
 - **Node volumes as objects:** every `*-data`/`*-state`/`*-logs` volume is a bound PV+PVC,

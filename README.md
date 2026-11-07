@@ -587,9 +587,9 @@ the class's size (`POST /api/v1/volumes`, `role: data`; no template, no mkfs),
 attached over ublk like any claim, and bound at the container's
 `volumeDevices[].devicePath` as the device itself (no filesystem). A Block claim
 named in `volumeMounts`, or a Filesystem claim in `volumeDevices`, keeps the pod
-waiting with the reason. **A `devicePath` under `/dev` does not work yet:** stormpump
-covers `/dev` with its default tmpfs after the binds, so the workload finds no device and
-a write creates a regular file on the tmpfs (stormpump#222); a path elsewhere gets the device. The PV's `volumeMode` follows the claim when the node writes it; the control
+waiting with the reason. A `devicePath` under `/dev` needs stormpump
+ca2fece or later (12.64 on): before it, the default `/dev` tmpfs covered the bind and a write made a regular
+file there (stormpump#222). The PV's `volumeMode` follows the claim when the node writes it; the control
 plane's provisioner writes Filesystem until rustkube#201. A VM disk
 naming a Block claim gets the raw volume. Raw block from third-party CSI drivers
 is refused (`docs/csi.md`). Sizes go to stormblock as `<MiB>M`, since it has no
@@ -1120,8 +1120,8 @@ kubelet is under test, not the scheduler.
     arbitrary sizes: 1 byte, 1Mi+1, 17Mi, 1500M, 3.5Gi and 600Gi, and raw block
     claims of 1Mi, 20Ti and 1Pi (`volumeDevices`; the device must be exactly its
     class), plus a 1Mi one with its device at `/block/xvda`, outside `/dev`.
-    The cases run three at a time, largest first. `pvc-size-block-1mi` fails until
-    stormpump#222. A class above the node's `maximumVolumeSize` is checked as a refusal.
+    The cases run three at a time, largest first. `pvc-size-block-1mi` needs
+    stormpump#222's fix (12.64 on). A class above the node's `maximumVolumeSize` is checked as a refusal.
   - For each one, a pod writes and reads back 64 KiB and checks that `df` is
     within the class the request rounds to. The test then checks that the claim
     is Bound with that class as its status capacity, and deletes the pod and

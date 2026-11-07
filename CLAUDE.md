@@ -1667,7 +1667,7 @@ is live GETs already.
 2026-10-07. de51950: README, BUILD.md, status.md, presentation, CLAUDE.md (flowsdn owns Services in its edition,
 #145; checked against stormcos main). sc-build: deck renders (12 slides), `cargo build --locked` ok. Closed.
 
-### Waiting on a release with registry>=9912c98 (stormblock-registry#150, test images on nodes): #61, short, medium and long test suites (stormcentral docs/test-standard.md)
+### Waiting on the night's long run f47d49df0d: #61, short, medium and long test suites (stormcentral docs/test-standard.md)
 
 2026-10-06. `test/` has medium's storage cases (#64, #59, #62, #67); short and long are one skip each. The
 runner's namespace Role is `*`; cluster reads come from `test/requires.toml` (only [medium] declares `nodes`, which
@@ -1726,6 +1726,7 @@ every suite needs to resolve STORM_NODE). Pods are pinned with `spec.nodeName` (
        2026-11-06 (21:04Z): ce5d01a254 (c4b5643): 31 pass, 2 fail, 1 skip, the first real medium. Fails: `pvc-size-above-ladder` (test: the scheduler refuses on capacity before the kubelet's check; now `spec.nodeName`), `pvc-size-block-1mi` (pod Failed after ~3 s, reason unknown: no termination message, #162; a size case now reports the pod's log). Only 1Mi Block ran: 20Ti/1Pi are above pvetest2's 16Gi maximum. Next: rerun, read block-1mi's line, fix or file it.
        2026-11-06 (21:30Z): b7f6ccdd26 (1f297d7): 32 pass, 1 fail, 1 skip. above-ladder passes through the kubelet's check. block-1mi: `/dev/xvda is 65536 bytes`, a regular file. From stormpump 9877a97 exec.rs (read, not yet proved live): the bind lands at /dev/xvda, then a 64k tmpfs goes over /dev unless a mount is exactly /dev, and the workload's create makes a file there. Doing: case `block-1mi-outside-dev` (/block/xvda) to prove it; then file on stormpump.
        2026-11-06 (21:45Z): 5d70bf4679 (a2c02a2, pvetest2): 33 pass, 1 fail, 1 skip. `block-1mi-outside-dev` passes (/block/xvda is 1048576 bytes), `block-1mi` doesn't (/dev/xvda is 65536 bytes): proved, filed stormpump#222. The skip (`node-volumes-restored`) is the runner's cluster-reads-only, by design. Long f47d49df0d queued on pvetest2 (night window 22:00-07:00 Chicago). #61 proposed after stormpump#222. Resume: `stormcentral test show f47d49df0d` (fix or file what fails); a node release with #222: medium on pvetest2, `pvc-size-block-1mi` passes; close on both.
+       2026-11-07 (00:15Z): stormpump#222 is in 12.64. Medium d80cfd8e8c (a1ea812, pvetest2, 12.64-flowsdn): 34 pass, 0 fail, 1 skip (`node-volumes-restored`, by design); `pvc-size-block-1mi` /dev/xvda is 1048576 bytes. Only long is left: f47d49df0d queued on pvetest2, night window opens 04:00Z. #61 proposed `--night`. Resume: `stormcentral test show f47d49df0d`; still running, propose `--night` again; fix or file what fails; close on a pass.
 
 ### Done: #171 (P2), fsGroup / supplementalGroups onto the engine
 
