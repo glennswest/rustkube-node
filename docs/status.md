@@ -45,7 +45,7 @@ a row says so.
 | 1.36 pod status (#275) | `observedGeneration` on the status and its conditions; containers' and sidecars' `allocatedResources`/`resources` and the pod's `status.resources` from the spec (no in-place resize yet). k8s-openapi only through rustkube's apimachinery (0.24/v1_32 until rustkube#285) |
 | CRI runtime (#116) | `GetContainerEvents` followed; the 2 s fallback only without it |
 | A kubelet restart on stormpump (#334) | Adopts no pods: every pod starts a second time and the first set runs on unsupervised. A node reboot is not affected. VMs are adopted (#35) |
-| Tests (#61, #64, #97, #209, #217) | short, medium and long suites in `test/`; the runner's own pod is never cleaned up. Live: short 4fe3fb250e passed on C2NR0Q2 (4/0/0) at 9229603; medium d80cfd8e8c passed on pvetest2 (12.64-flowsdn, a1ea812): 34 pass, 0 fail, 1 skip by design; classes above that node's 16Gi maximum checked only as refusals (#64); long f47d49df0d queued for the night window |
+| Tests (#61, #64, #97, #209, #217) | short, medium and long suites in `test/`; the runner's own pod is never cleaned up. Live: short 4fe3fb250e passed on C2NR0Q2 (4/0/0) at 9229603; medium d80cfd8e8c passed on pvetest2 (12.64-flowsdn, a1ea812): 34 pass, 0 fail, 1 skip by design; and e129544315 on C2NR0Q2 (12.64), the same, with real claims to 1Ti; long f47d49df0d queued for the night window |
 | Docs | [retries.md](retries.md), [networking.md](networking.md), [presentation.md](presentation.md) |
 
 ## Owner decisions recorded
@@ -99,7 +99,7 @@ Each gap has an owning issue. These are limitations, not supported features.
 | VirtualMachineSnapshot/Restore on a node (needs the CRDs; CSI-claim disks need stormblock-csi#51); pod-network VMIs live; accessCredentials and tap addresses live | [stormcos#170](https://github.com/glennswest/stormcos/issues/170), [#88](https://github.com/glennswest/rustkube-node/issues/88), [#92](https://github.com/glennswest/rustkube-node/issues/92), [#91](https://github.com/glennswest/rustkube-node/issues/91) |
 | Subsecond starts measured; regressions seen on 11.91 | [#95](https://github.com/glennswest/rustkube-node/issues/95), [#99](https://github.com/glennswest/rustkube-node/issues/99), [#102](https://github.com/glennswest/rustkube-node/issues/102), [#190](https://github.com/glennswest/rustkube-node/issues/190), [#191](https://github.com/glennswest/rustkube-node/issues/191), [#207](https://github.com/glennswest/rustkube-node/issues/207) |
 | `sandbox/cni` of seconds right after a reboot: Cilium's `endpoint-create` rate limiter, not the kubelet (nothing to change here; the agent's `api-rate-limit`) | [#310](https://github.com/glennswest/rustkube-node/issues/310), [stormcos-cilium#38](https://github.com/glennswest/stormcos-cilium/issues/38) |
-| Complete live acceptance of the medium and long suites; cases that need node access | [#61](https://github.com/glennswest/rustkube-node/issues/61), [#64](https://github.com/glennswest/rustkube-node/issues/64), [#163](https://github.com/glennswest/rustkube-node/issues/163), [#186](https://github.com/glennswest/rustkube-node/issues/186) |
+| Complete live acceptance of the long suite; cases that need node access | [#61](https://github.com/glennswest/rustkube-node/issues/61), [#163](https://github.com/glennswest/rustkube-node/issues/163), [#186](https://github.com/glennswest/rustkube-node/issues/186) |
 
 The former CRI-O/crun/conmon-rs default-stack roadmap (#22/#28) is superseded
 by the platform's stormpump selection. An eBPF kube-proxy in this repository
