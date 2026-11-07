@@ -2,6 +2,7 @@
 
 ## 2026-11-07
 
+- **test:** Two new medium cases for carried images (#332, #294, stormcos#826). `pod-carried-image` runs `nextnfs --help` from a golden the release lists in `/etc/stormblock/carried` and doesn't mount at boot, and checks it Succeeds on its own `ctr-…` root. It skips, saying why, on a release that doesn't show that. `pod-image-on-no-list` checks a bare image on neither list gets the registry's 404.
 - **docs:** The PVC size test passes on real disks (#64): medium e129544315 (a1ea812, C2NR0Q2, 12.64) passed 34 with 1 skip by design, with real claims in every class from 1Mi to 1Ti, arbitrary sizes, raw block at `/dev/xvda`, and refusals above the node's maximum and above the ladder. Classes from 4Ti to 1Pi have only been refused, because no test machine has that room.
 - **docs:** External CSI drivers verified on a node (#52): `csi` 876bbe55ab (ea2692a, pvetest1, 12.64) passed 5 with 1 skip, covering registration, a pod writing through NodePublish, NodeUnpublish on delete, a new pod reading the data back, and deregistration. Not covered on a node: NodeStage, `attachRequired: true`, a third-party driver, and a kubelet restart (#334).
 

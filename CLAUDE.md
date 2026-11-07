@@ -58,6 +58,10 @@ by #51.
 
 ## Work plan
 
+### In progress: #332, medium: a pod from a carried image with no boot mount (stormcos#826, #294)
+
+2026-11-07. Doing: `pod-carried-image` (reads the node's `/etc/stormblock/{carried,mounts}` by a hostPath pod, runs nextnfs `--help`, root from `storm.io/instance.main`) and `pod-image-on-no-list` in test/src/pods.rs; README, CHANGELOG; sc-build `cd test`; medium on a machine with 12.64 (pvetest1/2 VMs destroyed at 01:31Z, see #233); close on a pass.
+
 ### Done: #294 (P2), run a carried golden that is not mounted at boot (stormcos#647, #820)
 
 2026-11-06. Found: the image's config comes from the registry's record, never the tree; argv[0] and user names already fall back to the container's own root; `Roots::make` clones `<vol>.golden` by name.

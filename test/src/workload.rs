@@ -27,6 +27,9 @@
 //!   process holds (Running, SIGTERM ends it with 0) so the suite can read
 //!   the pod while it has its networks. Exits 1 at once when one is missing.
 //!
+//! - `read-file <path>` (#332): the file's content as the line's `detail`, or
+//!   `(absent)` when there is none. Exit 0 either way.
+//!
 //! A directory `path` means a filesystem volume: the data goes in
 //! `<path>/rustkube-node-test.bin`. Anything else is a raw block device,
 //! written from offset 0. Exit 0 on success, 1 on a mismatch or error; one
@@ -44,7 +47,7 @@ pub fn is_workload(args: &[String]) -> bool {
         args.first().map(String::as_str),
         Some(
             "fill" | "verify" | "size-at-least" | "sized" | "echo" | "exit" | "sleep" | "fail-once"
-                | "write-file" | "expect-file" | "expect-env" | "expect-nics"
+                | "write-file" | "expect-file" | "expect-env" | "expect-nics" | "read-file"
         )
     )
 }
@@ -141,6 +144,14 @@ fn run(args: &[String]) -> Result<String, String> {
             let (p, text) = (arg(1, "path")?, arg(2, "text")?);
             let have = std::fs::read_to_string(&p).map_err(|e| format!("read {p}: {e}"))?;
             if have == text { Ok(format!("{p} holds {text:?}")) } else { Err(format!("{p} holds {have:?}, not {text:?}")) }
+        }
+        "read-file" => {
+            let path = arg(1, "path")?;
+            match std::fs::read_to_string(&path) {
+                Ok(text) => Ok(text),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok("(absent)".to_string()),
+                Err(e) => Err(format!("{path}: {e}")),
+            }
         }
         "expect-env" => {
             let (k, v) = (arg(1, "name")?, arg(2, "value")?);
