@@ -58,7 +58,7 @@ by #51.
 
 ## Work plan
 
-### In progress: #338 (P1), move a bound built-in claim to another node: mirror, stop, cut over, rebind (stormcos#806 tests 1, 5)
+### Done: #338 (P1), move a bound built-in claim to another node: mirror, stop, cut over, rebind (stormcos#806 tests 1, 5)
 
 2026-11-07. The names are stormcluster#104's and stormcos_qa#84's (comments on #338): request `storm.io/move-to` (+ `storm.io/move-set`) on
 the PVC; `storm.io/move-state` (`copying`, `synced` = the drain evicts, `cutting-over`, `complete`; `failed`/`aborted`/`refused` with
@@ -71,6 +71,7 @@ node-service volume; migrate (placement `{"array": set}`); synced; when no pod h
 cutover, complete, rebind PV, `complete`; any failure before cutover: abort. A start here waits on a claim being cut over or whose
 PV is another node's (never a fresh blank beside a moved volume). `--stormstorage` into the pod manager. Tests, README/status.md,
 CHANGELOG; sc-build; stage; answer stormcluster's question (after cutover: `complete`); live = stormcos#806 test 1.
+Done: 78bf751 (8 tests). SC_BUILD_VM sc-build (VM sc-build-2cbc435aa7): 615 kubelet unit, all suites, no new rustc warning (#227's, shifted). Stage build c5780361b7e0. Closed. Live: stormcos#806 tests 1/5, stormcos_qa#84 `move/claim-node` on the pvetest pair.
 
 ### Done: #339 (P1), move a stopped VM's disks to another node, so it starts there (stormcos#806 test 3)
 
