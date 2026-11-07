@@ -58,12 +58,15 @@ by #51.
 
 ## Work plan
 
-### In progress: #342 (P?), /vmInstance: a host-network pod's bound token answered 404 (stormimds#19, pvetest2)
+### Waiting on a release with 6f94966 + a stormimds `node` run: #342 (P2), /vmInstance: a host-network pod's bound token answered 404 (stormimds#19, pvetest2)
 
 2026-11-07. Reading the code doesn't say which of `pod_by_token`'s five silent `None`s it is. rustkube's TokenReview fills `extra` pod-name/pod-uid/node-name (auth.rs).
 One real weakness: `node_ip_holds` ran `ip -o addr show`; an `ip` that ran and failed printed nothing, so "not the node's" → machine index → 404.
 Doing: `instance_lookup` → `Result<Value, reason>`; each refusal a WARN and the 404's `error`; node addresses by getifaddrs; test (fake apiserver: answered, not authenticated,
 unbound, other node, pod elsewhere, no apiserver); api.md, CHANGELOG; sc-build; stage; ask stormimds to rerun `node`; fix what the reason names; close on a pass.
+Done: 6f94966. SC_BUILD_VM sc-build (VM sc-build-c190f556df): 616 kubelet unit (1 new), all suites; clippy nothing on the new lines. node_reregister's two failures in that
+run pass 4/4 alone (VM sc-build-58b60d0015): a flake, not this change. Stage build c293a652fe3e. Proposed `--after-release rustkube-node>=6f94966`; asked on stormimds#19.
+Resume: the `stormimds node` run's 404 `error` (or `testhost logs <m> kubelet --search vmInstance`) names the check; fix it here or file it where it lies; close on a pass.
 
 ### Waiting on stormcentral#1274 (the cluster test's pod timing): #340 (P1), first pod on a cluster worker 2.1 s (flowsdn) / 4.1 s (cilium) vs 160 ms on one node
 
