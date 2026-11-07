@@ -265,25 +265,74 @@ pub struct BoundPod {
 /// (`system:serviceaccount:<ns>:<sa>`), and bound to a pod
 /// (`authentication.kubernetes.io/pod-name`/`pod-uid` in `status.user.extra`).
 pub fn bound_pod(review: &serde_json::Value) -> Option<BoundPod> {
+    bound_pod_why(review).ok()
+}
+
+/// [`bound_pod`], saying which part was missing (#342).
+pub fn bound_pod_why(review: &serde_json::Value) -> Result<BoundPod, String> {
     let st = &review["status"];
     if st["authenticated"].as_bool() != Some(true) {
-        return None;
+        let why = st["error"].as_str().filter(|e| !e.is_empty()).unwrap_or("no reason given");
+        return Err(format!("the apiserver did not authenticate the token: {why}"));
     }
-    let namespace = st["user"]["username"].as_str()?.strip_prefix("system:serviceaccount:")?.split(':').next()?.to_string();
+    let username = st["user"]["username"].as_str().unwrap_or("");
+    let namespace = username
+        .strip_prefix("system:serviceaccount:")
+        .and_then(|r| r.split(':').next())
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| format!("the token is {username:?}'s, not a ServiceAccount's"))?
+        .to_string();
     let extra = |k: &str| -> Option<String> {
         let v = &st["user"]["extra"][format!("authentication.kubernetes.io/{k}")];
         v.as_array().and_then(|a| a.first()).or(Some(v)).and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(String::from)
     };
-    Some(BoundPod { namespace, name: extra("pod-name")?, uid: extra("pod-uid")?, node: extra("node-name") })
+    let unbound = |k: &str| {
+        format!(
+            "the review names no {k} (status.user.extra authentication.kubernetes.io/{k}): the token of {username} is not bound to a pod, or the apiserver does not say so"
+        )
+    };
+    Ok(BoundPod {
+        namespace,
+        name: extra("pod-name").ok_or_else(|| unbound("pod-name"))?,
+        uid: extra("pod-uid").ok_or_else(|| unbound("pod-uid"))?,
+        node: extra("node-name"),
+    })
 }
 
 /// Does this pod object answer for a token bound to `uid` on `node`: the same
 /// pod (a recreated one of the name is not), placed here, not ending?
 pub fn pod_answers(pod: &serde_json::Value, uid: &str, node: &str) -> bool {
-    pod["metadata"]["uid"].as_str() == Some(uid)
-        && pod["spec"]["nodeName"].as_str() == Some(node)
-        && pod["metadata"]["deletionTimestamp"].is_null()
-        && !matches!(pod["status"]["phase"].as_str(), Some("Succeeded") | Some("Failed"))
+    pod_answers_why(pod, uid, node).is_ok()
+}
+
+/// [`pod_answers`], saying which rule refused it (#342).
+pub fn pod_answers_why(pod: &serde_json::Value, uid: &str, node: &str) -> Result<(), String> {
+    let m = &pod["metadata"];
+    let who = format!("pod {}/{}", m["namespace"].as_str().unwrap_or(""), m["name"].as_str().unwrap_or(""));
+    let have = m["uid"].as_str().unwrap_or("");
+    if have != uid {
+        return Err(format!("{who} is uid {have:?}, the token is bound to uid {uid:?} (a recreated pod of the name)"));
+    }
+    let placed = pod["spec"]["nodeName"].as_str().unwrap_or("");
+    if placed != node {
+        return Err(format!("{who} is placed on {placed:?}, not this node ({node})"));
+    }
+    if !m["deletionTimestamp"].is_null() {
+        return Err(format!("{who} is being deleted"));
+    }
+    if let Some(p @ ("Succeeded" | "Failed")) = pod["status"]["phase"].as_str() {
+        return Err(format!("{who} has ended ({p})"));
+    }
+    Ok(())
+}
+
+/// The first 300 characters of an answer, for a log line or a 404's body.
+pub fn excerpt(text: &str) -> String {
+    let t = text.trim();
+    if t.chars().count() <= 300 {
+        return t.to_string();
+    }
+    format!("{}…", t.chars().take(300).collect::<String>())
 }
 
 /// A pod's instance metadata (#122), shaped as a machine's: the pod's own
@@ -534,6 +583,7 @@ mod tests {
         let mut ending = pod.clone();
         ending["metadata"]["deletionTimestamp"] = serde_json::json!("2026-10-05T01:00:00Z");
         assert!(!pod_answers(&ending, "p-1", "n1"));
+        assert!(pod_answers_why(&ending, "p-1", "n1").unwrap_err().contains("deleted"));
         let md = pod_metadata(&pod, "192.168.30.2", "n1");
         assert_eq!(md["instance_id"], "p-1");
         assert_eq!(md["storm.io/kind"], "Pod");

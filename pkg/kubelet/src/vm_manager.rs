@@ -4693,21 +4693,23 @@ impl VmManager {
     ///
     /// Read from the interfaces rather than compared against a configured
     /// node IP: a node has several, and the one a host-network container
-    /// happens to source from is whichever the route chose.
-    async fn node_ip_holds(&self, ip: &str) -> bool {
-        let Ok(out) = tokio::process::Command::new("ip")
-            .args(["-o", "addr", "show"])
-            .output()
-            .await
-        else {
+    /// happens to source from is whichever the route chose (a metadata
+    /// address on `lo`, such as 169.254.169.254, is the source of a request
+    /// to itself).
+    ///
+    /// Read with getifaddrs(3) (#342), not by running `ip`: the kubelet's
+    /// golden need not carry it, and an `ip` that ran and failed printed
+    /// nothing, which read as "not ours".
+    fn node_ip_holds(&self, ip: &str) -> bool {
+        match node_addresses() {
+            Ok(have) => have.iter().any(|a| a == ip),
             // Cannot tell, so do not guess. Refusing costs a guest its
             // metadata; guessing gives it somebody else's.
-            return true;
-        };
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter_map(|l| l.split_whitespace().nth(3))
-            .any(|cidr| cidr.split('/').next() == Some(ip))
+            Err(e) => {
+                warn!("/vmInstance: cannot list this node's addresses ({e}); treating {ip} as the node's");
+                true
+            }
+        }
     }
 
     /// Who is at this address, as instance metadata.
@@ -4737,6 +4739,13 @@ impl VmManager {
     /// address, so its address names nobody, and its pod's token is its
     /// identity instead. Only consulted for a node address.
     pub async fn instance_for(&self, ip: &str, workload_token: Option<&str>) -> Option<Value> {
+        self.instance_lookup(ip, workload_token).await.ok()
+    }
+
+    /// [`Self::instance_for`], saying why there is no answer (#342): a
+    /// host-network workload's refusal had five silent causes, and a node
+    /// log or the 404's body is the only place they can be told apart.
+    pub async fn instance_lookup(&self, ip: &str, workload_token: Option<&str>) -> Result<Value, String> {
         // An address the node itself holds identifies nobody.
         //
         // A container on the host network shares the node's address, and so
@@ -4748,14 +4757,26 @@ impl VmManager {
         // Refusing is the only correct answer. A host-network workload that
         // needs an identity needs a different mechanism than an address, and
         // inventing one here quietly would be the worst version of that.
-        if self.node_ip_holds(ip).await {
+        let token = workload_token.filter(|t| !t.is_empty());
+        if self.node_ip_holds(ip) {
             // Unless it says who it is, with a token bound to a pod here.
-            return match workload_token {
-                Some(t) if !t.is_empty() => self.pod_by_token(ip, t).await,
-                _ => None,
+            return match token {
+                Some(t) => self.pod_by_token(ip, t).await.map_err(|why| {
+                    warn!("/vmInstance/{ip}: a workload token was presented and not answered: {why}");
+                    why
+                }),
+                None => Err(format!("{ip} is this node's own address, and no workload token was presented")),
             };
         }
-        self.machine_at(ip).await
+        if token.is_some() {
+            // Said, because it is the first thing to rule out when a
+            // host-network pod's token gets a 404 (#342).
+            info!(
+                "/vmInstance/{ip}: a workload token was presented, but {ip} is not one of this node's addresses ({}); answering by address",
+                node_addresses().map(|a| a.join(", ")).unwrap_or_else(|e| e)
+            );
+        }
+        self.machine_at(ip).await.ok_or_else(|| format!("no machine at {ip} on this node"))
     }
 
     /// The pod a ServiceAccount token is bound to, as metadata, when that pod
@@ -4763,9 +4784,9 @@ impl VmManager {
     /// (TokenReview names the pod in `status.user.extra`, rustkube#182), and
     /// the pod's own object is the truth (#119's rule): its uid must match,
     /// it must be placed here, and not be ending. Anything else is no answer.
-    async fn pod_by_token(&self, ip: &str, token: &str) -> Option<Value> {
+    async fn pod_by_token(&self, ip: &str, token: &str) -> Result<Value, String> {
         if self.api_url.is_empty() {
-            return None;
+            return Err("this kubelet has no apiserver to review the token with".into());
         }
         let review = json!({ "apiVersion": "authentication.k8s.io/v1", "kind": "TokenReview", "spec": { "token": token } });
         let r = self
@@ -4774,23 +4795,44 @@ impl VmManager {
             .json(&review)
             .send_repeatable(retry::Policy::API)
             .await
-            .ok()?;
-        let review: Value = r.json().await.ok()?;
-        let b = crate::vm_network::bound_pod(&review)?;
-        if b.node.as_deref().is_some_and(|n| n != self.node_name) {
-            return None;
+            .map_err(|e| format!("the TokenReview was not answered: {e}"))?;
+        let status = r.status();
+        let body = r.text().await.map_err(|e| format!("the TokenReview's answer could not be read: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("the TokenReview was refused: {status}: {}", crate::vm_network::excerpt(&body)));
         }
-        let pod: Value = self
+        let review: Value = serde_json::from_str(&body)
+            .map_err(|e| format!("the TokenReview's answer is not JSON ({e}): {}", crate::vm_network::excerpt(&body)))?;
+        let b = crate::vm_network::bound_pod_why(&review)?;
+        if b.node.as_deref().is_some_and(|n| n != self.node_name) {
+            return Err(format!(
+                "the token is bound to pod {}/{} on node {}, not this node ({})",
+                b.namespace,
+                b.name,
+                b.node.as_deref().unwrap_or(""),
+                self.node_name
+            ));
+        }
+        let r = self
             .api
             .get(format!("{}/api/v1/namespaces/{}/pods/{}", self.api_url, b.namespace, b.name))
             .send_retrying(retry::Policy::API)
             .await
-            .ok()?
-            .json()
-            .await
-            .ok()?;
-        crate::vm_network::pod_answers(&pod, &b.uid, &self.node_name)
-            .then(|| crate::vm_network::pod_metadata(&pod, ip, &self.node_name))
+            .map_err(|e| format!("pod {}/{} could not be read: {e}", b.namespace, b.name))?;
+        let status = r.status();
+        let body = r.text().await.map_err(|e| format!("pod {}/{} could not be read: {e}", b.namespace, b.name))?;
+        if !status.is_success() {
+            return Err(format!(
+                "pod {}/{} could not be read: {status}: {}",
+                b.namespace,
+                b.name,
+                crate::vm_network::excerpt(&body)
+            ));
+        }
+        let pod: Value = serde_json::from_str(&body)
+            .map_err(|e| format!("pod {}/{}'s object is not JSON: {e}", b.namespace, b.name))?;
+        crate::vm_network::pod_answers_why(&pod, &b.uid, &self.node_name)?;
+        Ok(crate::vm_network::pod_metadata(&pod, ip, &self.node_name))
     }
 
     /// [`Self::instance_at`] past the node's own addresses.
@@ -7100,6 +7142,25 @@ pub fn hand_placed_here(obj: &Value, node: &str) -> bool {
         && obj["spec"]["nodeName"].as_str() == Some(node)
 }
 
+/// Every address on this node's interfaces (the kubelet's network
+/// namespace, which is the node's), as text (#342).
+fn node_addresses() -> Result<Vec<String>, String> {
+    let addrs = nix::ifaddrs::getifaddrs().map_err(|e| format!("getifaddrs: {e}"))?;
+    let mut out: Vec<String> = addrs
+        .filter_map(|a| a.address)
+        .filter_map(|sa| {
+            if let Some(v4) = sa.as_sockaddr_in() {
+                Some(std::net::SocketAddrV4::from(*v4).ip().to_string())
+            } else {
+                sa.as_sockaddr_in6().map(|v6| std::net::SocketAddrV6::from(*v6).ip().to_string())
+            }
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7277,6 +7338,72 @@ mod tests {
     }
 
     /// Boot keys come from the Secrets, `stringData` included; a missing one,
+    /// A host-network workload's token on a node address (#342): answered
+    /// with its pod, and every refusal says why, never a bare 404.
+    #[tokio::test]
+    async fn a_workload_token_on_a_node_address_names_its_pod_or_why_not() {
+        use axum::routing::{get, post};
+        assert!(node_addresses().unwrap().iter().any(|a| a == "127.0.0.1"), "lo's address is listed");
+        let review = |token: &str| match token {
+            "good" | "elsewhere-pod" => json!({"status": {"authenticated": true, "user": {
+                "username": "system:serviceaccount:t:sa",
+                "extra": {"authentication.kubernetes.io/pod-name": [if token == "good" { "p" } else { "q" }],
+                          "authentication.kubernetes.io/pod-uid": ["u-1"],
+                          "authentication.kubernetes.io/node-name": ["n1"]}}}}),
+            "other-node" => json!({"status": {"authenticated": true, "user": {
+                "username": "system:serviceaccount:t:sa",
+                "extra": {"authentication.kubernetes.io/pod-name": ["p"],
+                          "authentication.kubernetes.io/pod-uid": ["u-1"],
+                          "authentication.kubernetes.io/node-name": ["n2"]}}}}),
+            "unbound" => json!({"status": {"authenticated": true, "user": {"username": "system:serviceaccount:t:sa"}}}),
+            _ => json!({"status": {"authenticated": false, "error": "token is invalid"}}),
+        };
+        let app = axum::Router::new()
+            .route(
+                "/apis/authentication.k8s.io/v1/tokenreviews",
+                post(move |axum::Json(b): axum::Json<Value>| async move {
+                    (axum::http::StatusCode::CREATED, axum::Json(review(b["spec"]["token"].as_str().unwrap_or(""))))
+                }),
+            )
+            .route(
+                "/api/v1/namespaces/t/pods/p",
+                get(|| async {
+                    axum::Json(json!({"metadata": {"name": "p", "namespace": "t", "uid": "u-1"},
+                                      "spec": {"nodeName": "n1", "serviceAccountName": "sa"},
+                                      "status": {"phase": "Running"}}))
+                }),
+            )
+            .route(
+                "/api/v1/namespaces/t/pods/q",
+                get(|| async {
+                    axum::Json(json!({"metadata": {"name": "q", "namespace": "t", "uid": "u-1"},
+                                      "spec": {"nodeName": "n9"}, "status": {"phase": "Running"}}))
+                }),
+            )
+            .fallback(|| async { (axum::http::StatusCode::FORBIDDEN, "nodes may not") });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), &url);
+
+        let md = m.instance_lookup("127.0.0.1", Some("good")).await.unwrap();
+        assert_eq!(md["storm.io/kind"], "Pod");
+        assert_eq!(md["instance_id"], "u-1");
+
+        let why = |t: Option<&'static str>| {
+            let m = &m;
+            async move { m.instance_lookup("127.0.0.1", t).await.unwrap_err() }
+        };
+        assert!(why(None).await.contains("no workload token"), "{}", why(None).await);
+        assert!(why(Some("bad")).await.contains("token is invalid"));
+        assert!(why(Some("unbound")).await.contains("pod-name"));
+        assert!(why(Some("other-node")).await.contains("on node n2"));
+        assert!(why(Some("elsewhere-pod")).await.contains("placed on \"n9\""));
+
+        let offline = VmManager::new(None, "n1", reqwest::Client::new(), "");
+        assert!(offline.instance_lookup("127.0.0.1", Some("good")).await.unwrap_err().contains("no apiserver"));
+    }
+
     /// or a machine with no seed to carry them, is a reason, not a failed
     /// start (#92).
     #[tokio::test]

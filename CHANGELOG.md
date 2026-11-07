@@ -2,6 +2,12 @@
 
 ## 2026-11-07
 
+- **fix:** `/vmInstance` says why it refuses a host-network pod's token (#342, seen by stormimds#19 on pvetest2). Before, five checks failed silently into the same `404 no machine at …`.
+  - The 404's `error` and a WARN line now name the check: the TokenReview unanswered or refused, the token not authenticated (with the apiserver's words), not bound to a pod, bound to a pod on another node, or the pod unreadable, recreated, placed elsewhere or ending.
+  - A token presented for an address that isn't the node's is logged with the node's addresses.
+  - The node's addresses come from getifaddrs(3), not `ip -o addr show`. An `ip` that ran and failed printed nothing, so every address read as "not the node's", and a host-network pod went to the machine index.
+  - Not run on a node yet: the next `stormimds node` run says which check it was.
+
 - **docs:** #340's "first pod on a cluster worker" is mostly a measurement artifact. The cluster test polls every 2 s, so its pod steps read 2.0, 2.1 or 4.1 s. The worker kubelet's own start timing in the same runs is 0.2 s on flowsdn; on cilium the slow part is the CNI (stormcos-cilium#51). Filed stormcentral#1274 for pod timing from the pod's own timestamps, with the kubelet's phases. No kubelet change.
 
 - **feat:** A bound built-in claim can move to another node under the same PVC (#338, stormcos#806 tests 1 and 5). Ask with `storm.io/move-to: <node>` (optionally `storm.io/move-set: <RAID set>`) on the PVC.

@@ -499,14 +499,14 @@ async fn vm_instance(
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "this node runs no machines"})))
             .into_response();
     };
-    match vms.instance_for(&address, workload_token.as_deref()).await {
+    match vms.instance_lookup(&address, workload_token.as_deref()).await {
         // A cold cache is 503, not 404.
         //
         // "I have not synced" and "no such machine" are different answers and
         // only one is safe to act on: a guest told the second at boot
         // configures itself as nobody and does not ask again. 503 with
         // Retry-After is what a client already knows to wait on.
-        Some(v) if v.get("storm.io/cold").is_some() => (
+        Ok(v) if v.get("storm.io/cold").is_some() => (
             StatusCode::SERVICE_UNAVAILABLE,
             [("retry-after", "2")],
             Json(serde_json::json!({"error": "this node has not synced yet"})),
@@ -514,7 +514,7 @@ async fn vm_instance(
             .into_response(),
         // A cache the apiserver has not confirmed within the bound (#156):
         // the machine may have moved while this node was cut off.
-        Some(v) if v.get("storm.io/stale").is_some() => (
+        Ok(v) if v.get("storm.io/stale").is_some() => (
             StatusCode::SERVICE_UNAVAILABLE,
             [("retry-after", "5")],
             Json(serde_json::json!({"error": format!(
@@ -523,10 +523,14 @@ async fn vm_instance(
             )})),
         )
             .into_response(),
-        Some(v) => Json(v).into_response(),
-        None => (
+        Ok(v) => Json(v).into_response(),
+        // Why, in the body (#342): a host-network workload's refusal has
+        // several causes, and the caller (the metadata service) is the one
+        // who can say which it met. Nothing in it is a secret: the token is
+        // never echoed, only what the apiserver said about it.
+        Err(why) => (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("no machine at {address} on this node")})),
+            Json(serde_json::json!({"error": why})),
         )
             .into_response(),
     }
