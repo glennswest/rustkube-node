@@ -58,9 +58,11 @@ by #51.
 
 ## Work plan
 
-### In progress: #332, medium: a pod from a carried image with no boot mount (stormcos#826, #294)
+### Waiting on a test machine: #332, medium: a pod from a carried image with no boot mount (stormcos#826, #294)
 
 2026-11-07. Doing: `pod-carried-image` (reads the node's `/etc/stormblock/{carried,mounts}` by a hostPath pod, runs nextnfs `--help`, root from `storm.io/instance.main`) and `pod-image-on-no-list` in test/src/pods.rs; README, CHANGELOG; sc-build `cd test`; medium on a machine with 12.64 (pvetest1/2 VMs destroyed at 01:31Z, see #233); close on a pass.
+1. [x] Done: 39ea42f, docs. sc-build `cd test`: clippy -D warnings clean, 46 tests, release build. Not run on a node: pvetest1/2's VMs were destroyed at 01:31Z, and C2NR0Q2 is off 19:00-06:00 Chicago. Held by `wait-owner --probe tcp://192.168.31.172:6443`.
+2. [ ] Resume: `stormcentral test run rustkube-node medium --tag pvetest1` (a passing pve run lets the Dell follow in the morning). `pod-carried-image` must pass, not skip; close on that, and tell stormcos#826. If nextnfs fails on its own (`--help`'s exit, the path), read the log, as the issue's command is untested.
 
 ### Done: #294 (P2), run a carried golden that is not mounted at boot (stormcos#647, #820)
 
