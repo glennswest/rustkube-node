@@ -58,7 +58,7 @@ by #51.
 
 ## Work plan
 
-### In progress: #339 (P1), move a stopped VM's disks to another node, so it starts there (stormcos#806 test 3)
+### Done: #339 (P1), move a stopped VM's disks to another node, so it starts there (stormcos#806 test 3)
 
 2026-11-07. Found: #302's record (`storm.io/disk-moves`) lives on the VMI and goes with it; rustkube's VM controller copies
 `spec.template.metadata.annotations` onto each new VMI, and its scheduler honours the VMI's `nodeSelector`. stormstorage's
@@ -72,6 +72,7 @@ Refused while a VMI exists or a disk is attached; a VMI appearing mid-copy abort
 copying. A start waits while a stopped-move is active or its disks are on two nodes. B's start sets the VM's owner on the moved volume.
 Doing: vm_disk_move.rs (request/record/status/hold helpers), VmManager `move_stopped_vms` (maintenance loop), the start
 hold, tests (fake apiserver + stormstorage + engine), README/status.md, CHANGELOG; sc-build; stage; live check = stormcos#806 test 3.
+Done: a5182ad (+ 6ac5d40, aa15125 test fixes: a fixture without memory, and two locks of one std mutex in one statement that hung the first test job). SC_BUILD_VM sc-build aa15125 (VM sc-build-48b58a60c9): 607 kubelet unit (8 new), all suites, no rustc warning in the touched files (#227's elsewhere). Stage build 759e4e3f039e. Closed. Live: stormcos#806 test 3 on stormcentral#360's pvetest pair (needs stormstorage#106's detached migrate).
 
 ### Done: #337 (P3), stormvm → 6e188a6: no guest agent by default on cloud-hypervisor (stormvm#1)
 
