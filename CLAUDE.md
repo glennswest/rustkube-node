@@ -58,6 +58,13 @@ by #51.
 
 ## Work plan
 
+### In progress: #335 (P3), a refused VM spawn quotes what the helper printed (stormvm#7's passt)
+
+2026-11-07. `launch` turns a refused Spawn into `stormpump refused: {e:?}` (Debug: `Failed { op: 18, errno: 10, step: 9 }`), while
+`RingError`'s Display already names the op, errno and step. Doing: Display, a hint for ECHILD at a helper step ("the helper exited
+before it was ready"), and the tail of `hypervisor.log` written *since this attempt began* (size noted before the spawn, so a
+retry never quotes the last attempt's lines). Test, README, CHANGELOG; sc-build; stage; close.
+
 ### Waiting on a test machine: #332, medium: a pod from a carried image with no boot mount (stormcos#826, #294)
 
 2026-11-07. Doing: `pod-carried-image` (reads the node's `/etc/stormblock/{carried,mounts}` by a hostPath pod, runs nextnfs `--help`, root from `storm.io/instance.main`) and `pod-image-on-no-list` in test/src/pods.rs; README, CHANGELOG; sc-build `cd test`; medium on a machine with 12.64 (pvetest1/2 VMs destroyed at 01:31Z, see #233); close on a pass.
