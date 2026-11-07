@@ -157,8 +157,8 @@ pinning csi-driver-host-path in stormcos, would add it).
 
 ## Not yet
 
-- A live pass of the `csi` suite (below). The end-to-end is written; its run
-  waits on a test node that can fetch the test image (#52).
+- A kubelet restart with a CSI volume in use: a restarted kubelet adopts no pods
+  on stormpump yet (#334), so `csi-kubelet-restart` is skipped.
 - Generic ephemeral volumes: the kubelet resolves them to the claim
   `<pod>-<volume>` and waits for it. rustkube has no controller that creates
   that claim (rustkube#94).

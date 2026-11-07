@@ -1168,6 +1168,7 @@ kubelet is under test, not the scheduler.
     (`restart-kubelet`) SIGTERMs the kubelet and waits for the new one. The
     holder keeps its container, the driver is registered again, a new pod reads
     the file, and the holder's delete is unpublished by the restarted kubelet.
+    Skipped until a restarted kubelet adopts its pods (#334): today it loops the kubelet.
   - `csi-deregistered`: the driver pod deleted, CSINode no longer lists it.
 - **multus** (< 10 min, declared in `test/requires.toml`, run on request, #233):
   a pod's extra networks by the Multus standard, with the standard CNI plugins

@@ -44,6 +44,7 @@ a row says so.
 | Workload identity (#84) | `/run/rustkube/workloads/<cgroup>.json` per stormpump workload (pods, sandboxes, VMs) for cadvisor |
 | 1.36 pod status (#275) | `observedGeneration` on the status and its conditions; containers' and sidecars' `allocatedResources`/`resources` and the pod's `status.resources` from the spec (no in-place resize yet). k8s-openapi only through rustkube's apimachinery (0.24/v1_32 until rustkube#285) |
 | CRI runtime (#116) | `GetContainerEvents` followed; the 2 s fallback only without it |
+| A kubelet restart on stormpump (#334) | Adopts no pods: every pod starts a second time and the first set runs on unsupervised. A node reboot is not affected. VMs are adopted (#35) |
 | Tests (#61, #64, #97, #209, #217) | short, medium and long suites in `test/`; the runner's own pod is never cleaned up. Live: short 4fe3fb250e passed on C2NR0Q2 (4/0/0) at 9229603; medium d80cfd8e8c passed on pvetest2 (12.64-flowsdn, a1ea812): 34 pass, 0 fail, 1 skip by design; classes above that node's 16Gi maximum checked only as refusals (#64); long f47d49df0d queued for the night window |
 | Docs | [retries.md](retries.md), [networking.md](networking.md), [presentation.md](presentation.md) |
 
