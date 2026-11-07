@@ -8507,9 +8507,13 @@ mod tests {
         assert_eq!(moved["data"], "t-vm-v-data");
 
         // Nothing more is asked or written.
-        let n = (seen.lock().unwrap().asked.len(), seen.lock().unwrap().patches.len());
+        let counts = |s: &Arc<std::sync::Mutex<MigSeen>>| {
+            let s = s.lock().unwrap();
+            (s.asked.len(), s.patches.len())
+        };
+        let n = counts(&seen);
         assert_eq!(m.move_stopped_vms().await, None);
-        assert_eq!((seen.lock().unwrap().asked.len(), seen.lock().unwrap().patches.len()), n);
+        assert_eq!(counts(&seen), n);
     }
 
     /// #339: the VM running (a VMI) is refused, saying so on the VM; a VMI
@@ -8563,7 +8567,8 @@ mod tests {
         m.move_stopped_vms().await;
         seen.lock().unwrap().disks.insert("vm-v-data".into(), "failed".into());
         m.move_stopped_vms().await;
-        assert!(seen.lock().unwrap().asked.contains(&"abort vm-v-root".to_string()), "{:?}", seen.lock().unwrap().asked);
+        let asked = seen.lock().unwrap().asked.clone();
+        assert!(asked.contains(&"abort vm-v-root".to_string()), "{asked:?}");
         let r = dm::template_records(&the_vm(&seen));
         assert_eq!((r["root"].state.as_str(), r["data"].state.as_str()), (dm::FAILED, dm::FAILED));
         assert!(r["root"].message.contains("data's move failed"), "{}", r["root"].message);
