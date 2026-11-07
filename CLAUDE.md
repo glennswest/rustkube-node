@@ -2734,6 +2734,7 @@ Steps:
        same 404). No run queued. #233 proposed `--after-release registry>=9912c98`. Resume as above; the prerequisites were checked on 12.58, not rechecked since.
        2026-11-06 (17:40Z): 12.62 carried it but was tombstoned (stormcos#814, see #52). #233 proposed after stormcos#812. Resume as above once #812 closes.
        2026-11-06 (22:08Z): stormcos#812 closed, but no machine can take the run. pvetest2 (12.63-flowsdn, has the registry fix) is down (#52). pvetest1 (12.58.5) is refused: its sbregistry refuses forge's test images (stormcos#271's peer, not on this release). C2NR0Q2 and server7 have 12.63, but #791 wants a pve run first. No run queued, no code changed. Resume when pvetest2's apiserver answers, or pvetest1 runs >= 12.63: `stormcentral test run rustkube-node multus --tag <that machine>`; close on a pass, or fix what fails.
+       2026-11-07 (01:35Z): pvetest1 and pvetest2 got 12.64 at about 00:52Z, then multus 87bbed77d9 (55484ca, pvetest1) errored at `power`: `no VM 3101 on pve node pve`. Both VMs are being destroyed and remade from pve (qmdestroy 3101, 3102 at 01:31Z; stormcentral#360's multi-node install is dispatched, not confirmed as the cause). The suite still hasn't run. Held by `wait-owner --probe tcp://192.168.31.172:6443`. Resume: `stormcentral test run rustkube-node multus --tag pvetest1`; close on a pass, or fix what fails. A pvetest1 in a two-node cluster may need another look at the suite's single-node assumption.
 
 ### Done: #231 + #232 (P0, stormcos#488): verified live on the Dell, 12.07
 
