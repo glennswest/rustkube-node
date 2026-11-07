@@ -1116,6 +1116,10 @@ kubelet is under test, not the scheduler.
     ImagePullBackOff and never runs.
 
   And claims of the built-in `stormblock` class (#64):
+  - `pod-carried-image` (#332): `nextnfs --help` from a golden the release lists in
+    `/etc/stormblock/carried` and doesn't mount at boot Succeeds on its own `ctr-…` root.
+    Skipped, saying why, on a release that doesn't show that.
+  - `pod-image-on-no-list` (#332): a bare image on neither list gets the registry's 404.
   - It makes a claim at every filesystem size class (1Mi … 16Ti) and at
     arbitrary sizes: 1 byte, 1Mi+1, 17Mi, 1500M, 3.5Gi and 600Gi, and raw block
     claims of 1Mi, 20Ti and 1Pi (`volumeDevices`; the device must be exactly its
