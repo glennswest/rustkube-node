@@ -2656,6 +2656,9 @@ impl VmManager {
         // is let go the moment the spawn succeeds — here, not after the await,
         // so an abandoned start's record is right either way (#100).
         let (ledger, owner) = (self.partial.clone(), uid.to_string());
+        // Where this attempt's output starts in the log (#335): a refusal
+        // quotes what was written after it, never the last attempt's lines.
+        let log_mark = log_len(dir);
         let started = tokio::task::spawn_blocking(move || -> Result<Handle, RingError> {
             let mut handles = Vec::with_capacity(volumes.len());
             for path in &volumes {
@@ -2690,7 +2693,7 @@ impl VmManager {
             Ok(Ok(handle)) => Ok((handle, made, registration)),
             Ok(Err(e)) => {
                 deregister(&vm.namespace, &vm.name);
-                Err(format!("stormpump refused: {e:?}"))
+                Err(refusal_message(&e, hypervisor_said_since(dir, log_mark)))
             }
             Err(e) => {
                 deregister(&vm.namespace, &vm.name);
@@ -6272,11 +6275,63 @@ impl VmManager {
 /// megabyte. The tail rather than the head — a hypervisor that refuses
 /// something says so last, after whatever it managed first.
 fn hypervisor_said(log_dir: &str) -> Option<String> {
-    const KEEP: usize = 400;
     if log_dir.is_empty() {
         return None;
     }
     let text = std::fs::read_to_string(format!("{log_dir}/hypervisor.log")).ok()?;
+    log_tail(&text)
+}
+
+/// The log's size now, the mark [`hypervisor_said_since`] reads from.
+fn log_len(log_dir: &str) -> u64 {
+    if log_dir.is_empty() {
+        return 0;
+    }
+    std::fs::metadata(format!("{log_dir}/hypervisor.log")).map_or(0, |m| m.len())
+}
+
+/// What the machine's log gained since `mark` (#335).
+///
+/// A refused start is retried, and each attempt appends to the same file: the
+/// tail of the whole file after an attempt that printed nothing would be the
+/// previous attempt's reason, read as this one's. A file shorter than the mark
+/// was started over, so all of it is this attempt's.
+fn hypervisor_said_since(log_dir: &str, mark: u64) -> Option<String> {
+    if log_dir.is_empty() {
+        return None;
+    }
+    let bytes = std::fs::read(format!("{log_dir}/hypervisor.log")).ok()?;
+    let from = if (bytes.len() as u64) < mark { 0 } else { mark as usize };
+    log_tail(&String::from_utf8_lossy(&bytes[from..]))
+}
+
+/// The engine's refusal of a machine's spawn, as the VMI says it (#335).
+///
+/// The error's own text names the op, the errno and the step. ECHILD at a
+/// helper's step is stormpump's "the helper is gone": said in words, because
+/// "No child processes" reads as the kubelet's problem. Then what the
+/// hypervisor or its helper printed, from the workload's log: that is the
+/// reason, and the node has no shell to go and read it with.
+fn refusal_message(e: &RingError, said: Option<String>) -> String {
+    let mut msg = e.to_string();
+    if let RingError::Failed { errno, step, .. } = e {
+        let helper = matches!(
+            stormpump_abi::ExecStep::from_u32(*step & 0xFFFF),
+            stormpump_abi::ExecStep::Helper | stormpump_abi::ExecStep::HelperReady
+        );
+        if helper && *errno == libc::ECHILD {
+            msg.push_str(" [ECHILD: the helper exited before it was ready]");
+        }
+    }
+    match said {
+        Some(said) => format!("{msg}; hypervisor.log: {said}"),
+        None => format!("{msg}; hypervisor.log has nothing from this attempt"),
+    }
+}
+
+/// The last few non-blank lines, joined and bounded.
+fn log_tail(text: &str) -> Option<String> {
+    const KEEP: usize = 400;
     let tail: String = text
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -8643,6 +8698,45 @@ mod tests {
         std::fs::write(&path, "\n\n").unwrap();
         assert_eq!(hypervisor_said(dir.to_str().unwrap()), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A spawn refused at a helper's readiness says the step in words, that
+    /// the helper went, and what it printed this attempt (#335): the run that
+    /// found it said only `Failed { op: 18, errno: 10, step: 9 }`.
+    #[test]
+    fn a_refused_spawn_quotes_this_attempts_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap();
+        let path = dir.path().join("hypervisor.log");
+        std::fs::write(&path, "passt: an earlier attempt's reason\n").unwrap();
+        let mark = log_len(d);
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"\npasst: Failed to bind UNIX domain socket: Permission denied\n")
+            .unwrap();
+        let e = RingError::Failed { op: stormpump_abi::Op::Spawn as u8, errno: libc::ECHILD, step: 9 };
+        let msg = refusal_message(&e, hypervisor_said_since(d, mark));
+        assert!(msg.contains("Spawn"), "{msg}");
+        assert!(msg.contains("waiting for a helper to be ready"), "{msg}");
+        assert!(msg.contains("ECHILD: the helper exited"), "{msg}");
+        assert!(msg.contains("Failed to bind UNIX domain socket"), "{msg}");
+        assert!(!msg.contains("earlier attempt"), "another attempt's lines: {msg}");
+        assert!(!msg.contains("Failed {"), "the Debug form: {msg}");
+
+        // Nothing new: said so, not the last attempt's reason.
+        let msg = refusal_message(&e, hypervisor_said_since(d, log_len(d)));
+        assert!(msg.ends_with("hypervisor.log has nothing from this attempt"), "{msg}");
+
+        // A log started over since the mark is all this attempt's.
+        std::fs::write(&path, "qemu: short\n").unwrap();
+        assert_eq!(hypervisor_said_since(d, mark + 1000).as_deref(), Some("qemu: short"));
+
+        // Another errno at another step gets no helper hint.
+        let other = RingError::Failed { op: stormpump_abi::Op::Spawn as u8, errno: libc::ENOENT, step: 4 };
+        assert!(!refusal_message(&other, None).contains("helper exited"));
     }
 
     /// A VM with no uid cannot be told apart from the next one of the same

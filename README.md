@@ -719,6 +719,12 @@ starts once the VM lets the claim go (#80).
 - **A failed start is retried**, with backoff from 10 s doubling to 5 min.
   - The VMI stays Pending with reason `FailedStart` and a message giving the
     attempt, the wait and the error. Each attempt also has a Warning Event.
+  - An engine refusal of the spawn names the op, the errno and the step in
+    words, says when a helper (passt) exited before it was ready (ECHILD), and
+    quotes the last lines `hypervisor.log` gained in that attempt (#335):
+    `stormpump refused Spawn: No child processes (os error 10) (waiting for a
+    helper to be ready) [ECHILD: the helper exited before it was ready];
+    hypervisor.log: passt: …`.
   - A new spec (`metadata.generation`) is tried at once.
   - A missing golden is not a failure: it waits, and is tried again on the
     waiting-start deadline (a quarter of the wait so far, 1–30 s).
