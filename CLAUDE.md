@@ -58,12 +58,14 @@ by #51.
 
 ## Work plan
 
-### In progress: #335 (P3), a refused VM spawn quotes what the helper printed (stormvm#7's passt)
+### Done: #335 (P3), a refused VM spawn quotes what the helper printed (stormvm#7's passt)
 
 2026-11-07. `launch` turns a refused Spawn into `stormpump refused: {e:?}` (Debug: `Failed { op: 18, errno: 10, step: 9 }`), while
 `RingError`'s Display already names the op, errno and step. Doing: Display, a hint for ECHILD at a helper step ("the helper exited
 before it was ready"), and the tail of `hypervisor.log` written *since this attempt began* (size noted before the spawn, so a
 retry never quotes the last attempt's lines). Test, README, CHANGELOG; sc-build; stage; close.
+Done: 0c059da (1 test). SC_BUILD_VM sc-build (VM sc-build-bf776538a7): full build + all suites; the new test and `what_the_hypervisor_said` pass (VM sc-build-7524458193),
+clippy nothing on the new lines. Stage build 579d76b33857. Closed. Live: stormvm medium's `pod:passt` VMI on a release with it says passt's own words.
 
 ### Waiting on a test machine: #332, medium: a pod from a carried image with no boot mount (stormcos#826, #294)
 
