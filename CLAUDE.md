@@ -63,6 +63,7 @@ by #51.
 2026-11-07. Doing: `pod-carried-image` (reads the node's `/etc/stormblock/{carried,mounts}` by a hostPath pod, runs nextnfs `--help`, root from `storm.io/instance.main`) and `pod-image-on-no-list` in test/src/pods.rs; README, CHANGELOG; sc-build `cd test`; medium on a machine with 12.64 (pvetest1/2 VMs destroyed at 01:31Z, see #233); close on a pass.
 1. [x] Done: 39ea42f, docs. sc-build `cd test`: clippy -D warnings clean, 46 tests, release build. Not run on a node: pvetest1/2's VMs were destroyed at 01:31Z, and C2NR0Q2 is off 19:00-06:00 Chicago. Held by `wait-owner --probe tcp://192.168.31.172:6443`.
 2. [ ] Resume: `stormcentral test run rustkube-node medium --tag pvetest1` (a passing pve run lets the Dell follow in the morning). `pod-carried-image` must pass, not skip; close on that, and tell stormcos#826. If nextnfs fails on its own (`--help`'s exit, the path), read the log, as the issue's command is untested.
+   2026-11-07 (09:50Z): queued medium 244ab5c336 (2e51c48, pvetest1). It waits behind cluster test b786ac9768 (#360, lease to 19:37Z) and a line of 12.67 installs (stormcentral#1266). pvetest2 is in the same install loop; C2NR0Q2 is refused in its power-off window (#372). #332 proposed after stormcentral#1266. Resume: `stormcentral test show 244ab5c336`; on a `no VM` error, queue again on a pve machine that has passed a release.
 
 ### Done: #294 (P2), run a carried golden that is not mounted at boot (stormcos#647, #820)
 
