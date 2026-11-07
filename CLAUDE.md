@@ -58,6 +58,20 @@ by #51.
 
 ## Work plan
 
+### In progress: #338 (P1), move a bound built-in claim to another node: mirror, stop, cut over, rebind (stormcos#806 tests 1, 5)
+
+2026-11-07. The names are stormcluster#104's and stormcos_qa#84's (comments on #338): request `storm.io/move-to` (+ `storm.io/move-set`) on
+the PVC; `storm.io/move-state` (`copying`, `synced` = the drain evicts, `cutting-over`, `complete`; `failed`/`aborted`/`refused` with
+`storm.io/move-reason`), `storm.io/move-progress`; cut over is read from the PV's node. Found: stormstorage's migrate takes a detached
+volume, `name` and `placement` (#106's code), and names B's copy like A's (`pvc-<ns>-<claim>`), which is the PV's `volumeHandle`, so
+the rebind is the PV's `nodeAffinity` + `storm.io/node` only; rustkube's apiserver has no PV update validation (no rustkube change).
+Doing: `claim_move.rs` (names, step, refusals, PV patch, start hold), PodManager `move_claims` on A (the PV's node, or `storm.io/move-from`
+while active) in the CSI-sweep loop (PVC + node-pod watches): refuse RWX / pods on another node / target not Ready or no room / a
+node-service volume; migrate (placement `{"array": set}`); synced; when no pod here holds it (reclaim guard): `cutting-over`, detach,
+cutover, complete, rebind PV, `complete`; any failure before cutover: abort. A start here waits on a claim being cut over or whose
+PV is another node's (never a fresh blank beside a moved volume). `--stormstorage` into the pod manager. Tests, README/status.md,
+CHANGELOG; sc-build; stage; answer stormcluster's question (after cutover: `complete`); live = stormcos#806 test 1.
+
 ### Done: #339 (P1), move a stopped VM's disks to another node, so it starts there (stormcos#806 test 3)
 
 2026-11-07. Found: #302's record (`storm.io/disk-moves`) lives on the VMI and goes with it; rustkube's VM controller copies
