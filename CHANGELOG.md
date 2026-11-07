@@ -2,6 +2,16 @@
 
 ## 2026-11-07
 
+- **feat:** A bound built-in claim can move to another node under the same PVC (#338, stormcos#806 tests 1 and 5). Ask with `storm.io/move-to: <node>` (optionally `storm.io/move-set: <RAID set>`) on the PVC.
+  - The kubelet holding the claim mirrors its volume there with stormstorage's migrate and reports `storm.io/move-state` `copying`, then `synced`. At `synced`, stormcluster's drain evicts the pod.
+  - Once no pod here runs on the claim: `cutting-over`. The kubelet detaches the volume, cuts over, retires the source, and points the PV's `nodeAffinity` and `storm.io/node` at the target. Then `complete`.
+  - Progress is in `storm.io/move-progress`; failures and refusals in `storm.io/move-reason`, with Events. These are the names stormcluster#104 and stormcos_qa#84 read.
+  - Refused: RWX/ROX claims, a claim pods on another node use, node-service volumes, and a target that doesn't exist, isn't Ready, or has no room.
+  - A failed copy, a refused cutover, or a request taken off before the cutover leaves the claim where it was.
+  - A pod on the old node now waits on a claim being cut over, or whose PV names another node. Before, it got a fresh, empty volume beside the moved one.
+  - The pod manager takes `--stormstorage`.
+  - Not run on two nodes yet.
+
 - **feat:** A stopped VM's disks move to another node, and it starts there (#339, stormcos#806 test 3). Ask with `storm.io/move-to: <node>` on the VirtualMachine. The kubelet whose engine holds the VM's own disks (golden clones, emptyDisks) mirrors each one with stormstorage's migrate, then cuts over once it is in sync (nothing is attached, so no pause) and retires the source. The record is #302's `storm.io/disk-moves`, written on the VM's template so the next VMI carries it and its start attaches the moved volumes. Once every disk is there, the template's `nodeSelector` names the node, so the scheduler places the next VMI on it. Progress is in `storm.io/move-status` on the VM, with Events.
   - Refused while a VMI exists, and said on the VM.
   - A VMI that appears mid-copy aborts the copy.

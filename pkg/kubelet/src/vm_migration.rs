@@ -356,8 +356,18 @@ impl Stormstorage<'_> {
 
     /// Start mirroring `volume` (on `source`) to a new volume on `target`.
     pub async fn start(&self, source: &str, volume: &str, target: &str) -> Result<DiskMigration, String> {
+        self.start_on(source, volume, target, None).await
+    }
+
+    /// [`Self::start`], with the copy carved on `placement` on the target
+    /// (`{"array"|"slab"|"drive": <id>}`, stormstorage#106).
+    pub async fn start_on(&self, source: &str, volume: &str, target: &str, placement: Option<Value>) -> Result<DiskMigration, String> {
         let url = self.url(&format!("nodes/{source}/volumes/{volume}/migrate"));
-        let v = Self::answer(self.0.post(&url, &json!({"to": target})).await).await?;
+        let mut body = json!({"to": target});
+        if let Some(p) = placement {
+            body["placement"] = p;
+        }
+        let v = Self::answer(self.0.post(&url, &body).await).await?;
         let m = DiskMigration::of(&v);
         if m.id.is_empty() {
             return Err(format!("stormstorage answered no migration id: {v}"));

@@ -497,6 +497,8 @@ pub struct PodManager {
     engine: crate::engine::EngineClient,
     /// How a claim is charged against the data slabs (#62).
     storage_policy: crate::capacity::Policy,
+    /// stormstorage, which mirrors a claim's volume to another node (#338).
+    stormstorage: Option<crate::engine::EngineClient>,
     /// Held from a new claim's capacity check to its volume's creation (#62),
     /// so two claims cannot both take the last of the room.
     capacity_lock: tokio::sync::Mutex<()>,
@@ -641,6 +643,7 @@ impl PodManager {
             images,
             pods: RwLock::new(HashMap::new()),
             admission: None,
+            stormstorage: None,
             load: None,
             start_images: Default::default(),
             image_inflight: Default::default(),
@@ -860,6 +863,12 @@ impl PodManager {
     pub fn with_engine(mut self, engine: crate::engine::EngineClient) -> Self {
         self.storage_url = engine.url().to_string();
         self.engine = engine;
+        self
+    }
+
+    /// stormstorage's API, for moving a claim to another node (#338).
+    pub fn with_stormstorage(mut self, stormstorage: Option<crate::engine::EngineClient>) -> Self {
+        self.stormstorage = stormstorage;
         self
     }
 
@@ -1721,6 +1730,321 @@ impl PodManager {
         Ok(VolumeRelease::Released)
     }
 
+    /// Built-in claims asked onto another node (#338): see
+    /// [`crate::claim_move`]. Each claim is moved by the node whose storage
+    /// holds it. `Some(wait)` while a move is in flight.
+    pub async fn move_claims(&self) -> Option<std::time::Duration> {
+        use crate::claim_move as cm;
+        if self.api_url.is_empty() {
+            return None;
+        }
+        let list = self.api_get("/api/v1/persistentvolumeclaims").await?;
+        let mut again = None;
+        for pvc in list["items"].as_array().into_iter().flatten() {
+            let m = cm::Move::of(pvc);
+            if !m.any() {
+                continue;
+            }
+            if self.move_claim(pvc, &m).await {
+                again = Some(cm::POLL);
+            }
+        }
+        again
+    }
+
+    /// One claim's move (#338). `true` while there is more to do.
+    async fn move_claim(&self, pvc: &Value, m: &crate::claim_move::Move) -> bool {
+        use crate::claim_move::{self as cm, Step};
+        let here = self.node_name.as_str();
+        let ns = pvc["metadata"]["namespace"].as_str().unwrap_or("default").to_string();
+        let claim = pvc["metadata"]["name"].as_str().unwrap_or("").to_string();
+        let Some(pv_name) = pvc["spec"]["volumeName"].as_str().filter(|v| !v.is_empty()) else { return false };
+        let Some(pv) = self.api_get(&format!("/api/v1/persistentvolumes/{pv_name}")).await else { return m.active() };
+        if !cm::is_builtin(&pv) {
+            return false;
+        }
+        // Whose is it: the node driving a move in flight, else the PV's.
+        let mine = if m.active() { m.from == here } else { cm::pv_node(&pv).as_deref() == Some(here) };
+        if !mine {
+            return false;
+        }
+        match cm::step(m, here) {
+            Step::Nothing => false,
+            Step::Abort(why) => {
+                self.abort_claim_move(pvc, m, cm::ABORTED, &why).await;
+                false
+            }
+            Step::Start(to) => {
+                self.start_claim_move(pvc, &pv, &ns, &claim, &to, m.set.as_deref()).await
+            }
+            Step::Carry => self.carry_claim_move(pvc, &pv, &ns, &claim, m).await,
+        }
+    }
+
+    /// Write the PVC's move annotations.
+    async fn mark_claim(&self, pvc: &Value, pairs: &[(&str, Option<&str>)]) -> bool {
+        let ns = pvc["metadata"]["namespace"].as_str().unwrap_or("default");
+        let name = pvc["metadata"]["name"].as_str().unwrap_or("");
+        let url = format!("{}/api/v1/namespaces/{ns}/persistentvolumeclaims/{name}", self.api_url);
+        let ok = matches!(
+            self.api_client.patch(&url).header("content-type", "application/merge-patch+json")
+                .json(&crate::claim_move::annotations(pairs)).send_retrying(retry::Policy::API).await,
+            Ok(r) if r.status().is_success()
+        );
+        if !ok {
+            warn!("PVC {ns}/{name}: the move's state was not written; retried");
+        }
+        ok
+    }
+
+    /// A move given up: the copy aborted (if there is one), the claim where
+    /// it was, `state` and why on the PVC.
+    async fn abort_claim_move(&self, pvc: &Value, m: &crate::claim_move::Move, state: &str, why: &str) -> bool {
+        use crate::claim_move as cm;
+        let ns = pvc["metadata"]["namespace"].as_str().unwrap_or("default");
+        let name = pvc["metadata"]["name"].as_str().unwrap_or("");
+        let mut reason = why.to_string();
+        if !m.migration.is_empty() {
+            if let Some(ss) = &self.stormstorage {
+                if let Err(e) = crate::vm_migration::Stormstorage(ss).step(&m.migration, "abort").await {
+                    if !e.contains("404") {
+                        warn!("PVC {ns}/{name}: abort of {} refused, retried: {e}", m.migration);
+                        return false;
+                    }
+                }
+            }
+            reason.push_str(&format!("; the copy is aborted, the claim stays on {}", self.node_name));
+        }
+        self.claim_event(pvc, "Warning", "MoveFailed", &reason).await;
+        self.mark_claim(pvc, &[(cm::STATE, Some(state)), (cm::REASON, Some(&reason)), (cm::PROGRESS, None)]).await
+    }
+
+    async fn start_claim_move(&self, pvc: &Value, pv: &Value, ns: &str, claim: &str, to: &str, set: Option<&str>) -> bool {
+        use crate::claim_move as cm;
+        let here = self.node_name.as_str();
+        let refuse = |why: String| async move {
+            self.claim_event(pvc, "Warning", "MoveRefused", &why).await;
+            self.mark_claim(pvc, &[
+                (cm::STATE, Some(cm::REFUSED)), (cm::REASON, Some(&why)), (cm::PROGRESS, None),
+                (cm::TARGET, Some(to)), (cm::FROM, Some(here)), (cm::MIGRATION, None),
+            ]).await;
+            false
+        };
+        // The facts the refusals need.
+        let mut facts = cm::Facts {
+            size: pv["spec"]["capacity"]["storage"].as_str().and_then(crate::storage::parse_quantity).unwrap_or(0),
+            stormstorage: self.stormstorage.is_some(),
+            ..Default::default()
+        };
+        let Some(pods) = self.api_get(&format!("/api/v1/namespaces/{ns}/pods")).await else { return true };
+        let mut elsewhere: std::collections::BTreeSet<String> = Default::default();
+        for p in pods["items"].as_array().into_iter().flatten() {
+            let uses = p["spec"]["volumes"].as_array().into_iter().flatten()
+                .any(|v| v["persistentVolumeClaim"]["claimName"].as_str() == Some(claim));
+            let done = matches!(p["status"]["phase"].as_str(), Some("Succeeded" | "Failed"));
+            if let Some(n) = p["spec"]["nodeName"].as_str().filter(|n| uses && !done && !n.is_empty() && *n != self.node_name) {
+                elsewhere.insert(n.to_string());
+            }
+        }
+        facts.used_elsewhere = elsewhere.into_iter().collect();
+        facts.target_ready = match self.api_get_checked(&format!("/api/v1/nodes/{to}")).await {
+            Ok(None) => None,
+            Ok(Some(n)) => Some(n["status"]["conditions"].as_array().into_iter().flatten()
+                .any(|c| c["type"] == "Ready" && c["status"] == "True")),
+            Err(_) => return true,
+        };
+        facts.target_room = self
+            .api_get(&format!("/apis/storage.k8s.io/v1/namespaces/kube-system/csistoragecapacities/stormblock-{to}"))
+            .await
+            .and_then(|c| {
+                c["maximumVolumeSize"].as_str().or(c["capacity"].as_str()).and_then(crate::storage::parse_quantity)
+            });
+        if let Some(why) = cm::refusal(pvc, pv, to, &facts) {
+            return refuse(why).await;
+        }
+        let handle = pv["spec"]["csi"]["volumeHandle"].as_str().unwrap_or("");
+        let id = self.storage_get("/api/v1/volumes").await.and_then(|l| {
+            l["items"].as_array()?.iter().find(|v| v["name"].as_str() == Some(handle))?["id"].as_str().map(String::from)
+        });
+        let Some(id) = id else {
+            return refuse(format!("this node's storage has no volume {handle}")).await;
+        };
+        let ss = self.stormstorage.as_ref().expect("refused above without one");
+        let placement = set.map(|s| serde_json::json!({ "array": s }));
+        match crate::vm_migration::Stormstorage(ss).start_on(here, &id, to, placement).await {
+            Ok(mig) => {
+                info!("PVC {ns}/{claim}: moving {handle} to {to}: migration {}", mig.id);
+                self.claim_event(pvc, "Normal", "Moving", &format!("copying {handle} to {to}")).await;
+                let progress = cm::progress(mig.bytes_total, mig.bytes_remaining);
+                self.mark_claim(pvc, &[
+                    (cm::STATE, Some(cm::COPYING)), (cm::REASON, None), (cm::PROGRESS, Some(&progress)),
+                    (cm::MIGRATION, Some(&mig.id)), (cm::TARGET, Some(to)), (cm::FROM, Some(here)),
+                ]).await;
+                true
+            }
+            Err(e) => {
+                self.claim_event(pvc, "Warning", "MoveFailed", &e).await;
+                self.mark_claim(pvc, &[
+                    (cm::STATE, Some(cm::FAILED)), (cm::REASON, Some(&e)), (cm::PROGRESS, None),
+                    (cm::TARGET, Some(to)), (cm::FROM, Some(here)), (cm::MIGRATION, None),
+                ]).await;
+                false
+            }
+        }
+    }
+
+    /// A move in flight, one step further: progress; `synced`; once no pod
+    /// here holds the claim, the cutover, the source retired and the PV
+    /// pointed at the target.
+    async fn carry_claim_move(&self, pvc: &Value, pv: &Value, ns: &str, claim: &str, m: &crate::claim_move::Move) -> bool {
+        use crate::claim_move as cm;
+        use crate::vm_migration::Stormstorage;
+        let Some(ss) = self.stormstorage.as_ref() else {
+            return self.abort_claim_move(pvc, m, cm::FAILED, "this node has no stormstorage (--stormstorage) any more").await;
+        };
+        let progress_now = pvc["metadata"]["annotations"][cm::PROGRESS].as_str().unwrap_or("");
+        let mig = match Stormstorage(ss).get(&m.migration).await {
+            Ok(mig) => mig,
+            Err(e) if e.contains("404") && m.state != cm::CUTTING_OVER => {
+                let why = format!("stormstorage no longer has migration {}", m.migration);
+                self.abort_claim_move(pvc, &cm::Move { migration: String::new(), ..m.clone() }, cm::FAILED, &why).await;
+                return false;
+            }
+            Err(e) => {
+                warn!("PVC {ns}/{claim}: move {}: {e}", m.migration);
+                return true;
+            }
+        };
+        match mig.state.as_str() {
+            "failed" | "aborted" => {
+                let why = format!("the copy {}: {}", mig.state, mig.message);
+                self.abort_claim_move(pvc, &cm::Move { migration: String::new(), ..m.clone() }, cm::FAILED, &why).await;
+                return false;
+            }
+            "synced" | "cut_over" | "completed" => {}
+            _ => {
+                let p = cm::progress(mig.bytes_total, mig.bytes_remaining);
+                if p != progress_now {
+                    self.mark_claim(pvc, &[(cm::PROGRESS, Some(&p))]).await;
+                }
+                return true;
+            }
+        }
+        if mig.state == "synced" {
+            if m.state == cm::COPYING {
+                info!("PVC {ns}/{claim}: in sync with {}", m.target);
+                self.claim_event(pvc, "Normal", "MoveSynced", &format!("in sync with {}: the pod may stop", m.target)).await;
+                if !self.mark_claim(pvc, &[(cm::STATE, Some(cm::SYNCED)), (cm::PROGRESS, Some("in sync"))]).await {
+                    return true;
+                }
+            }
+            // The cutover waits for every pod here to let the claim go, and
+            // holds its start out while it runs.
+            match self.claim_running_here(ns, claim).await {
+                Ok(Some(pod)) => {
+                    let p = format!("in sync; the cutover waits for pod {ns}/{pod} to stop");
+                    if p != progress_now {
+                        self.mark_claim(pvc, &[(cm::PROGRESS, Some(&p))]).await;
+                    }
+                    return true;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    debug!("PVC {ns}/{claim}: holders not known, the cutover waits: {e}");
+                    return true;
+                }
+            }
+            let _guard = match &self.admission {
+                Some(a) => match a.reclaim(ns, claim) {
+                    Some(g) => Some(g),
+                    None => return true,
+                },
+                None => None,
+            };
+            if m.state != cm::CUTTING_OVER
+                && !self.mark_claim(pvc, &[(cm::STATE, Some(cm::CUTTING_OVER)), (cm::PROGRESS, Some("cutting over"))]).await
+            {
+                return true;
+            }
+            let handle = pv["spec"]["csi"]["volumeHandle"].as_str().unwrap_or("");
+            let id = self.storage_get("/api/v1/volumes").await.and_then(|l| {
+                l["items"].as_array()?.iter().find(|v| v["name"].as_str() == Some(handle))?["id"].as_str().map(String::from)
+            });
+            if let Some(id) = id {
+                if let Err(e) = self.storage_delete(&format!("/api/v1/volumes/{id}/attach")).await {
+                    warn!("PVC {ns}/{claim}: {handle} is still attached here, the cutover waits: {e}");
+                    return true;
+                }
+            }
+            match Stormstorage(ss).step(&m.migration, "cutover").await {
+                Ok(c) if c.state == "cut_over" => {}
+                Ok(c) => {
+                    warn!("PVC {ns}/{claim}: the cutover left {} {} ({}), tried again", m.migration, c.state, c.message);
+                    return true;
+                }
+                Err(e) => {
+                    let why = format!("the cutover was refused: {e}");
+                    self.abort_claim_move(pvc, m, cm::FAILED, &why).await;
+                    return false;
+                }
+            }
+        }
+        // Cut over: the copy is the claim's. Retire the source, then point
+        // the PV at the target, then say so.
+        if mig.state != "completed" {
+            let done = match Stormstorage(ss).step(&m.migration, "complete").await {
+                Ok(c) => c.state == "completed",
+                Err(e) => {
+                    warn!("PVC {ns}/{claim}: the source is not retired yet, retried: {e}");
+                    false
+                }
+            };
+            if !done {
+                return true;
+            }
+        }
+        let url = format!("{}/api/v1/persistentvolumes/{}", self.api_url, pv["metadata"]["name"].as_str().unwrap_or(""));
+        let rebound = matches!(
+            self.api_client.patch(&url).header("content-type", "application/merge-patch+json")
+                .json(&cm::rebind_patch(pv, &m.target)).send_retrying(retry::Policy::API).await,
+            Ok(r) if r.status().is_success()
+        );
+        if !rebound {
+            warn!("PVC {ns}/{claim}: the PV was not pointed at {} yet, retried", m.target);
+            return true;
+        }
+        info!("PVC {ns}/{claim}: on {}'s storage", m.target);
+        self.claim_event(pvc, "Normal", "Moved", &format!("the claim is on {}'s storage", m.target)).await;
+        !self.mark_claim(pvc, &[(cm::STATE, Some(cm::COMPLETE)), (cm::PROGRESS, None), (cm::REASON, None)]).await
+    }
+
+    /// A pod on this node that runs on `claim` (#338): one started here, or
+    /// Running in the API (adopted after a restart). Unlike
+    /// [`Self::claim_holder_here`], a Pending pod scheduled here is not one:
+    /// a replacement waiting for the cutover must not hold it up. A pod part
+    /// way through its start holds the claim's admission, which the cutover
+    /// takes ([`crate::workload::Reservations::reclaim`]).
+    async fn claim_running_here(&self, namespace: &str, claim: &str) -> Result<Option<String>, String> {
+        if let Some(holder) = self.other_pod_holding(namespace, claim, "").await {
+            return Ok(Some(holder));
+        }
+        if self.api_url.is_empty() {
+            return Ok(None);
+        }
+        let pods = self
+            .api_get(&format!("/api/v1/namespaces/{namespace}/pods"))
+            .await
+            .ok_or_else(|| "the apiserver pod list is unavailable".to_string())?;
+        Ok(pods["items"].as_array().into_iter().flatten()
+            .find(|p| {
+                p["spec"]["nodeName"].as_str() == Some(&self.node_name)
+                    && p["status"]["phase"].as_str() == Some("Running")
+                    && pod_claims(p).any(|c| c == claim)
+            })
+            .and_then(|p| p["metadata"]["name"].as_str())
+            .map(String::from))
+    }
+
     /// The name of a pod on this node that still uses `claim`, if there is one.
     ///
     /// Asks twice, because neither source is sufficient alone. Local state
@@ -1980,6 +2304,11 @@ impl PodManager {
             },
             self.storage_get("/api/v1/volumes"),
         );
+        // A claim being cut over, or moved to another node's storage
+        // (#338): never a fresh volume here beside the real one.
+        if let Some(why) = crate::claim_move::start_hold(&pvc, pv.as_ref(), &self.node_name) {
+            return Err(ClaimError::InUse(why));
+        }
         if let Some(pv) = &pv {
             if pv["metadata"]["labels"][crate::system_claims::LABEL].as_str() == Some("true") {
                 return Err(ClaimError::InUse(format!(
@@ -9853,5 +10182,214 @@ pub(crate) mod tests {
         assert!(mgr.waiting_for_network_config().contains("uid-gone"));
         mgr.sync_pods(&[]).await;
         assert!(mgr.waiting_for_network_config().is_empty());
+    }
+
+    /// The apiserver, stormblock and stormstorage of a claim move (#338),
+    /// on one URL: one PVC `db/data` bound to PV `pvc-db-data` on
+    /// [`NODE`], its volume `v-1` in the engine, node `b` Ready.
+    #[derive(Default)]
+    struct MoveFake {
+        pvc: Value,
+        pv: Value,
+        pods: Vec<Value>,
+        /// stormstorage: id → state.
+        migrations: HashMap<String, String>,
+        /// Everything asked of stormstorage and the engine, in order.
+        asked: Vec<String>,
+    }
+
+    fn merge(target: &mut Value, patch: &Value) {
+        let Some(p) = patch.as_object() else { *target = patch.clone(); return };
+        if !target.is_object() {
+            *target = json!({});
+        }
+        let t = target.as_object_mut().unwrap();
+        for (k, v) in p {
+            if v.is_null() {
+                t.remove(k);
+            } else {
+                merge(t.entry(k.clone()).or_insert(Value::Null), v);
+            }
+        }
+    }
+
+    async fn move_fake(ann: Value) -> (PodManager, Arc<std::sync::Mutex<MoveFake>>) {
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse as _;
+        use axum::routing::{get as http_get, patch as http_patch, post as http_post, delete as http_delete};
+        type S = Arc<std::sync::Mutex<MoveFake>>;
+        let state: S = Arc::new(std::sync::Mutex::new(MoveFake {
+            pvc: json!({"metadata": {"namespace": "db", "name": "data", "uid": "pvc-1", "annotations": ann},
+                        "spec": {"accessModes": ["ReadWriteOnce"], "volumeName": "pvc-db-data", "storageClassName": "stormblock"}}),
+            pv: json!({"metadata": {"name": "pvc-db-data", "uid": "pv-1", "annotations": {"storm.io/node": NODE}},
+                       "spec": {"csi": {"driver": "stormblock.storm.io", "volumeHandle": "pvc-db-data"},
+                                "capacity": {"storage": "1Gi"},
+                                "nodeAffinity": {"required": {"nodeSelectorTerms": [{"matchExpressions": [
+                                    {"key": "kubernetes.io/hostname", "operator": "In", "values": [NODE]}]}]}}}}),
+            ..Default::default()
+        }));
+        let app = axum::Router::new()
+            .route("/api/v1/persistentvolumeclaims", http_get(|State(s): State<S>| async move {
+                axum::Json(json!({"items": [s.lock().unwrap().pvc.clone()]}))
+            }))
+            .route("/api/v1/namespaces/{ns}/persistentvolumeclaims/{n}",
+                http_get(|State(s): State<S>| async move { axum::Json(s.lock().unwrap().pvc.clone()) })
+                .patch(|State(s): State<S>, axum::Json(b): axum::Json<Value>| async move {
+                    let mut s = s.lock().unwrap();
+                    merge(&mut s.pvc, &b);
+                    axum::Json(s.pvc.clone())
+                }))
+            .route("/api/v1/persistentvolumes/{n}",
+                http_get(|State(s): State<S>| async move { axum::Json(s.lock().unwrap().pv.clone()) })
+                .merge(http_patch(|State(s): State<S>, axum::Json(b): axum::Json<Value>| async move {
+                    let mut s = s.lock().unwrap();
+                    s.asked.push("rebind".into());
+                    merge(&mut s.pv, &b);
+                    axum::Json(s.pv.clone())
+                })))
+            .route("/api/v1/namespaces/{ns}/pods", http_get(|State(s): State<S>| async move {
+                axum::Json(json!({"items": s.lock().unwrap().pods.clone()}))
+            }))
+            .route("/api/v1/pods", http_get(|State(s): State<S>| async move {
+                axum::Json(json!({"items": s.lock().unwrap().pods.clone()}))
+            }))
+            .route("/api/v1/nodes/{n}", http_get(|Path(n): Path<String>| async move {
+                if n == "b" {
+                    axum::Json(json!({"status": {"conditions": [{"type": "Ready", "status": "True"}]}})).into_response()
+                } else {
+                    axum::http::StatusCode::NOT_FOUND.into_response()
+                }
+            }))
+            .route("/api/v1/namespaces/{ns}/events", http_post(|| async { (axum::http::StatusCode::CREATED, axum::Json(json!({}))) }))
+            .route("/api/v1/volumes", http_get(|| async { axum::Json(json!({"items": [{"id": "v-1", "name": "pvc-db-data"}]})) }))
+            .route("/api/v1/volumes/{id}/attach", http_delete(|State(s): State<S>, Path(id): Path<String>| async move {
+                s.lock().unwrap().asked.push(format!("detach {id}"));
+                axum::Json(json!({}))
+            }))
+            .route("/api/v1/nodes/{n}/volumes/{v}/migrate", http_post(
+                |State(s): State<S>, Path((n, v)): Path<(String, String)>, axum::Json(b): axum::Json<Value>| async move {
+                    let mut s = s.lock().unwrap();
+                    s.asked.push(format!("start {n}/{v}→{} {}", b["to"].as_str().unwrap_or(""), b["placement"]));
+                    s.migrations.insert("m-1".into(), "copying".into());
+                    axum::Json(json!({"id": "m-1", "state": "starting", "bytes_total": 1024, "bytes_remaining": 1024}))
+                }))
+            .route("/api/v1/migrations/{id}", http_get(|State(s): State<S>, Path(id): Path<String>| async move {
+                match s.lock().unwrap().migrations.get(&id) {
+                    Some(st) => axum::Json(json!({"id": id, "state": st, "bytes_total": 1024, "bytes_remaining": 256})).into_response(),
+                    None => axum::http::StatusCode::NOT_FOUND.into_response(),
+                }
+            }))
+            .route("/api/v1/migrations/{id}/{step}", http_post(
+                |State(s): State<S>, Path((id, step)): Path<(String, String)>| async move {
+                    let mut s = s.lock().unwrap();
+                    s.asked.push(format!("{step} {id}"));
+                    let next = match step.as_str() { "cutover" => "cut_over", "complete" => "completed", "abort" => "aborted", _ => "copying" };
+                    s.migrations.insert(id.clone(), next.into());
+                    axum::Json(json!({"id": id, "state": next}))
+                }))
+            .with_state(state.clone());
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let rt = Arc::new(FakeRuntime::default());
+        let mgr = PodManager::with_api(rt.clone(), rt, NODE, &url, "127.0.0.1", reqwest::Client::new());
+        let mgr = with_stormblock(mgr, &url)
+            .with_stormstorage(Some(crate::engine::EngineClient::new(&url, crate::engine::TokenSource::none())));
+        (mgr, state)
+    }
+
+    fn annotation(s: &Arc<std::sync::Mutex<MoveFake>>, key: &str) -> String {
+        s.lock().unwrap().pvc["metadata"]["annotations"][key].as_str().unwrap_or("").to_string()
+    }
+
+    fn asked(s: &Arc<std::sync::Mutex<MoveFake>>) -> Vec<String> {
+        s.lock().unwrap().asked.clone()
+    }
+
+    /// **#338.** A claim asked onto b: mirrored there (onto the set asked
+    /// for), `synced`; the cutover waits for the pod running on it here;
+    /// once it is gone, detached, cut over, the source retired, the PV
+    /// pointed at b, `complete`. A pod here then waits rather than getting a
+    /// fresh volume.
+    #[tokio::test]
+    async fn a_claim_moves_to_another_node_once_its_pod_stops() {
+        use crate::claim_move as cm;
+        let (mgr, s) = move_fake(json!({cm::MOVE_TO: "b", cm::MOVE_SET: "r1"})).await;
+        assert_eq!(mgr.move_claims().await, Some(cm::POLL));
+        assert_eq!(asked(&s), [r#"start test-node/v-1→b {"array":"r1"}"#]);
+        assert_eq!(annotation(&s, cm::STATE), cm::COPYING);
+        assert_eq!((annotation(&s, cm::MIGRATION), annotation(&s, cm::TARGET), annotation(&s, cm::FROM)),
+                   ("m-1".into(), "b".into(), NODE.into()));
+
+        // Copying: progress.
+        mgr.move_claims().await;
+        assert!(annotation(&s, cm::PROGRESS).starts_with("75%"), "{}", annotation(&s, cm::PROGRESS));
+
+        // In sync, with a pod running on it here: synced, and it waits.
+        {
+            let mut f = s.lock().unwrap();
+            f.migrations.insert("m-1".into(), "synced".into());
+            f.pods = vec![json!({"metadata": {"name": "db-0", "namespace": "db"}, "spec": {"nodeName": NODE,
+                "volumes": [{"name": "d", "persistentVolumeClaim": {"claimName": "data"}}]}, "status": {"phase": "Running"}})];
+        }
+        assert_eq!(mgr.move_claims().await, Some(cm::POLL));
+        assert_eq!(annotation(&s, cm::STATE), cm::SYNCED);
+        assert!(annotation(&s, cm::PROGRESS).contains("waits for pod db/db-0"));
+        assert_eq!(asked(&s).len(), 1, "no cutover while it runs");
+
+        // Its replacement, Pending here, does not hold it up.
+        s.lock().unwrap().pods[0]["status"]["phase"] = json!("Pending");
+        assert_eq!(mgr.move_claims().await, None, "done");
+        assert_eq!(asked(&s), [r#"start test-node/v-1→b {"array":"r1"}"#, "detach v-1", "cutover m-1", "complete m-1", "rebind"]);
+        assert_eq!(annotation(&s, cm::STATE), cm::COMPLETE);
+        let pv = s.lock().unwrap().pv.clone();
+        assert_eq!(cm::pv_node(&pv).as_deref(), Some("b"), "the PV names b");
+        assert_eq!(pv["spec"]["nodeAffinity"]["required"]["nodeSelectorTerms"][0]["matchExpressions"][0]["values"][0], "b");
+        assert_eq!(pv["spec"]["csi"]["volumeHandle"], "pvc-db-data", "b's copy has the same name");
+
+        // A pod still here waits; nothing more is asked of anyone.
+        let pvc = s.lock().unwrap().pvc.clone();
+        assert!(cm::start_hold(&pvc, Some(&pv), NODE).unwrap().contains("on b's storage"));
+        assert_eq!(cm::start_hold(&pvc, Some(&pv), "b"), None, "b starts it");
+        let n = asked(&s).len();
+        assert_eq!(mgr.move_claims().await, None);
+        assert_eq!(asked(&s).len(), n);
+    }
+
+    /// #338: what is not moved is refused, with the reason on the PVC; a
+    /// failed copy and a request taken off mid-copy leave the claim here.
+    #[tokio::test]
+    async fn a_claim_move_refused_failed_or_taken_back_leaves_it_here() {
+        use crate::claim_move as cm;
+        let (mgr, s) = move_fake(json!({cm::MOVE_TO: "c"})).await;
+        mgr.move_claims().await;
+        assert_eq!(annotation(&s, cm::STATE), cm::REFUSED);
+        assert!(annotation(&s, cm::REASON).contains("node c does not exist"));
+        assert!(asked(&s).is_empty());
+        mgr.move_claims().await;
+        assert!(asked(&s).is_empty(), "not retried until asked again");
+
+        let (mgr, s) = move_fake(json!({cm::MOVE_TO: "b"})).await;
+        s.lock().unwrap().pvc["spec"]["accessModes"] = json!(["ReadWriteMany"]);
+        mgr.move_claims().await;
+        assert!(annotation(&s, cm::REASON).contains("ReadWriteMany"));
+
+        // The copy fails: failed, the reason stormstorage gave.
+        let (mgr, s) = move_fake(json!({cm::MOVE_TO: "b"})).await;
+        mgr.move_claims().await;
+        s.lock().unwrap().migrations.insert("m-1".into(), "failed".into());
+        assert_eq!(mgr.move_claims().await, None);
+        assert_eq!(annotation(&s, cm::STATE), cm::FAILED);
+        assert!(annotation(&s, cm::REASON).contains("the copy failed"));
+        assert_eq!(cm::pv_node(&s.lock().unwrap().pv).as_deref(), Some(NODE), "the claim stays here");
+
+        // Taken off mid-copy: aborted.
+        let (mgr, s) = move_fake(json!({cm::MOVE_TO: "b"})).await;
+        mgr.move_claims().await;
+        s.lock().unwrap().pvc["metadata"]["annotations"][cm::MOVE_TO] = Value::Null;
+        mgr.move_claims().await;
+        assert_eq!(asked(&s).last().map(String::as_str), Some("abort m-1"));
+        assert_eq!(annotation(&s, cm::STATE), cm::ABORTED);
+        assert!(annotation(&s, cm::REASON).contains("taken off"));
     }
 }

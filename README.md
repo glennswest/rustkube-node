@@ -1132,6 +1132,58 @@ again at every start). Not run on two nodes yet (stormcentral#360's pvetest
 pair, stormcos#806 test 3); a migrate of a detached volume is confirmed on
 stormstorage's side by stormstorage#106.
 
+### A built-in claim moved to another node
+
+A bound claim of the built-in class moves to another node's storage under
+the same PVC (#338, stormcos#806 tests 1 and 5). stormcluster's drain asks
+for it (stormcluster#104), and so can a person:
+
+    kubectl annotate pvc -n db data storm.io/move-to=node-b [storm.io/move-set=<RAID set on node-b>]
+
+The kubelet whose storage holds the claim (the PV's node) drives it, and
+reports on the PVC:
+
+- `storm.io/move-state`: `copying` (stormstorage mirrors the volume to a new
+  one on node-b, onto the RAID set if one is named; the pod keeps running and
+  every write lands on both), then `synced`. At `synced` the drain evicts.
+- Once no pod on this node runs on the claim (a replacement Pending here does
+  not count), and none is starting on it: `cutting-over`. The kubelet detaches
+  the volume here, cuts the migration over, retires the source, and points the
+  PV's `nodeAffinity` (and `storm.io/node`) at node-b. Then the state is
+  `complete`. A claim no pod uses is cut over as soon as it is in sync.
+- `storm.io/move-progress`: how much is copied, or what the cutover waits for.
+- `failed` / `aborted` / `refused`, with `storm.io/move-reason`, and Events on
+  the PVC.
+
+stormcluster reads "cut over" from the PV. The PV keeps its `volumeHandle`:
+the copy on node-b is named like the source (`pvc-<ns>-<claim>`). The
+scheduler then places the pod on node-b through the PV's affinity, and node-b's
+kubelet attaches its own volume as for any claim. rustkube's apiserver takes
+the PV's new affinity. Upstream only allows that with MutablePVNodeAffinity
+(KEP-5381).
+
+**Refused:** a ReadWriteMany/ReadOnlyMany claim; a claim pods on another node
+use; a node service's own data volume; a target that does not exist or isn't
+Ready; a target whose CSIStorageCapacity has no room for it; a node with no
+`--stormstorage`.
+
+**Given up** (the claim stays where it was):
+- A failed copy.
+- A refused cutover (the copy is aborted).
+- The request taken off, or changed to another node, before the cutover
+  (`aborted`).
+
+A failed or refused move stays as it is until the request is made again
+(stormcluster clears the state when it asks).
+
+**A pod on the old node** waits on the claim while it is cut over, and once
+the PV names another node: it is never given a fresh volume beside the moved
+one. A pod already bound to the old node stays Pending there, saying where the
+claim went. A drain cordons the node first, so the replacement goes to node-b.
+
+Not run on two nodes yet (stormcos#806 tests 1 and 5, stormcos_qa#84's
+`move/claim-node`).
+
 ## Tests on a node
 
 `test/` is the test container, per stormcentral's `docs/test-standard.md`. It

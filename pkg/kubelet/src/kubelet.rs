@@ -240,6 +240,7 @@ impl Kubelet {
             )
             .with_ca_pem(config.apiserver_ca.clone())
             .with_engine(config.engine.clone())
+            .with_stormstorage(config.migration.stormstorage.clone())
             .with_storage_policy(config.storage)
             .with_csi(csi.clone())
             .with_admission(workloads.reservations.clone())
@@ -893,9 +894,14 @@ impl Kubelet {
                 self.watches.observe(&self.api_client, format!("{api}/api/v1/persistentvolumeclaims"));
                 let teardown = self.pod_manager.sweep_csi_volumes().await;
                 let expansion = self.pod_manager.expand_csi_volumes().await;
+                // A built-in claim asked onto another node (#338): its pod
+                // going here is what its cutover waits for.
+                let moving = self.pod_manager.move_claims().await;
                 if teardown || expansion {
                     crate::metrics::observe_timed("csi-sweep", "deadline");
-                    apimachinery::reactor::requeue_after(CSI_TEARDOWN_PENDING);
+                    apimachinery::reactor::requeue_after(CSI_TEARDOWN_PENDING.min(moving.unwrap_or(CSI_TEARDOWN_PENDING)));
+                } else if let Some(after) = moving {
+                    apimachinery::reactor::requeue_after(after);
                 }
             }).await;
             drop(work);

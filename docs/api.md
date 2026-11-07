@@ -97,4 +97,5 @@ migration"): no kubelet route; the memory travels qemu to qemu over TLS on the t
 node's storage by the VMI annotation `storm.io/move-disks` (`{"<disk>": "<node>"}`); the kubelet's progress and
 outcome are in `storm.io/disk-moves` (#302; README, "A running disk moved off the node"): no kubelet route either. A stopped
 VirtualMachine's disks move by `storm.io/move-to: <node>` on the VM, reported in `storm.io/move-status` and the template's
-`storm.io/disk-moves` (#339; README, "A stopped VM's disks moved to another node").
+`storm.io/disk-moves` (#339; README, "A stopped VM's disks moved to another node"). A bound built-in claim moves by `storm.io/move-to` on its PVC, reported in
+`storm.io/move-state`, `storm.io/move-progress` and `storm.io/move-reason` (#338; README, "A built-in claim moved to another node").
