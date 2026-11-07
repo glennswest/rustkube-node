@@ -2,6 +2,8 @@
 
 ## 2026-11-07
 
+- **docs:** #340's "first pod on a cluster worker" is mostly a measurement artifact. The cluster test polls every 2 s, so its pod steps read 2.0, 2.1 or 4.1 s. The worker kubelet's own start timing in the same runs is 0.2 s on flowsdn; on cilium the slow part is the CNI (stormcos-cilium#51). Filed stormcentral#1274 for pod timing from the pod's own timestamps, with the kubelet's phases. No kubelet change.
+
 - **feat:** A bound built-in claim can move to another node under the same PVC (#338, stormcos#806 tests 1 and 5). Ask with `storm.io/move-to: <node>` (optionally `storm.io/move-set: <RAID set>`) on the PVC.
   - The kubelet holding the claim mirrors its volume there with stormstorage's migrate and reports `storm.io/move-state` `copying`, then `synced`. At `synced`, stormcluster's drain evicts the pod.
   - Once no pod here runs on the claim: `cutting-over`. The kubelet detaches the volume, cuts over, retires the source, and points the PV's `nodeAffinity` and `storm.io/node` at the target. Then `complete`.

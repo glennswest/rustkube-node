@@ -58,6 +58,17 @@ by #51.
 
 ## Work plan
 
+### Waiting on stormcentral#1274 (the cluster test's pod timing): #340 (P1), first pod on a cluster worker 2.1 s (flowsdn) / 4.1 s (cilium) vs 160 ms on one node
+
+2026-11-07. Found, no kubelet change: the cluster test's `pinned_pod` GETs once, then sleeps `poll()` = 2000 ms, so every pod step is a
+2 s tick. First pod across six runs: 2.0, 2.1, 4.1, 2.1, 4.1, 2.0 s; the new pod after the reboot reads 2.0 or 8.0 s. The worker kubelet's own `storm.io/start-timing` in the same runs
+(the claim pod): flowsdn dc28256b39 total 0.2 s (scheduled 0.2, volumes 0.1, containers 0.1, report 0.0); cilium's claim pod is the CNI
+(stormcos-cilium#51: wait ~290-319 s, sandbox 1.7-29.7 s). `scheduled` on a worker spans the seed's and the worker's clocks (b786ac9768: -0.3 s),
+as README already says. The first pod's own split was never printed (only past 30 s). Filed stormcentral#1274 (time from the pod's
+timestamps, print the kubelet's phases for every pod step). Worker console rings no longer hold those boots. #340 proposed after it.
+Resume: the next cluster test on both flavours with #1274: if the first pod reads within ~300 ms of a single node, close; else fix the
+kubelet phase that is slow, or file it where it lies (cilium `sandbox/cni` = stormcos-cilium; `scheduled` = rustkube's scheduler / the VIP watch).
+
 ### Done: #338 (P1), move a bound built-in claim to another node: mirror, stop, cut over, rebind (stormcos#806 tests 1, 5)
 
 2026-11-07. The names are stormcluster#104's and stormcos_qa#84's (comments on #338): request `storm.io/move-to` (+ `storm.io/move-set`) on
