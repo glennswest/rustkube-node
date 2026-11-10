@@ -1254,9 +1254,11 @@ kubelet is under test, not the scheduler.
   - `pod-missing-image`: an image no registry has waits as ErrImagePull or
     ImagePullBackOff and never runs.
   - `pod-carried-image` (#332): `nextnfs --help` from a golden the release lists in
-    `/etc/stormblock/carried` and doesn't mount at boot Succeeds on its own `ctr-…` root.
-    Skipped, saying why, on a release that doesn't show that.
-  - `pod-image-on-no-list` (#332): a bare image on neither list gets the registry's 404.
+    `/etc/stormblock/carried` and doesn't mount at boot Succeeds on its own root
+    (`storm.io/instance.main` is the engine volume id of its `ctr-…` clone, not the listed
+    volume). Skipped, saying why, on a release that doesn't show that.
+  - `pod-image-on-no-list` (#332): a bare image on neither list waits with the registry's
+    "not here": its 404, or on a node with peers the cluster demand's "no peer has it" (#79).
 
   And claims of the built-in `stormblock` class (#64):
   - It makes a claim at every filesystem size class (1Mi … 16Ti) and at

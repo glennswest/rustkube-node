@@ -14,10 +14,12 @@
 //!   ImagePullBackOff with a message, and never runs.
 //! - `pod-carried-image` (#332, #294): a pod of a golden the release carries
 //!   with nothing mounted at boot (`/etc/stormblock/carried`) runs to Succeeded
-//!   on its own `ctr-…` root. A release with no list, or one that mounts the
+//!   on its own root (`storm.io/instance.main`, the engine volume id of its
+//!   `ctr-…` clone, not the listed volume). A release with no list, or one that mounts the
 //!   image anyway, cannot show that, so the case skips and says which.
 //! - `pod-image-on-no-list` (#332): a bare image name on neither list gets the
-//!   registry's 404 and never runs.
+//!   registry's "not here" (its 404, or with peers the cluster demand's "no peer
+//!   has it", #79) and never runs.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -262,10 +264,13 @@ async fn carried_image(env: &Env, api: &Api) -> Outcome {
         }
     })
     .await;
+    // `storm.io/instance.<c>` is the root's engine volume id (the volume named
+    // `ctr-…`, which no pod can list): a root at all, and not the listed
+    // volume itself, is what a pod can see of "its own clone".
     match root {
-        Ok((root, _)) if !root.starts_with("ctr-") => Outcome::Fail(format!("its root is {root:?}, not a ctr-… clone")),
+        Ok((root, _)) if root == volume => Outcome::Fail(format!("its root is the listed volume {volume} itself, not a clone")),
         Ok((root, golden)) => Outcome::Pass(format!(
-            "{CARRIED_IMAGE} (volume {volume}, listed, not mounted at boot) Succeeded on root {root}; golden {golden:?}"
+            "{CARRIED_IMAGE} (volume {volume}, listed, not mounted at boot) Succeeded on its own root volume {root}; golden {golden:?}"
         )),
         Err(e) => Outcome::Fail(format!("Succeeded, but its root is not known: {e}")),
     }
@@ -273,9 +278,15 @@ async fn carried_image(env: &Env, api: &Api) -> Outcome {
 
 async fn image_on_no_list(env: &Env, api: &Api) -> Outcome {
     match waits_for_image(env, api, "medium-no-list", NO_LIST_IMAGE).await {
-        Outcome::Pass(d) if !d.contains("404") => Outcome::Fail(format!("not the registry's 404: {d}")),
+        Outcome::Pass(d) if !registry_has_none(&d) => Outcome::Fail(format!("not the registry's \"not here\": {d}")),
         other => other,
     }
+}
+
+/// The registry said it has no such image: its 404, or, on a node with peers,
+/// the cluster demand's answer (#79) that it is not here and no peer has it.
+pub fn registry_has_none(detail: &str) -> bool {
+    detail.contains("404") || (detail.contains("is not on this node") && detail.contains("no peer has it"))
 }
 
 /// A pod of `image` waits as ErrImagePull or ImagePullBackOff and never runs.
@@ -321,6 +332,18 @@ mod tests {
         assert_eq!(listed_volume(list, "operator-generic"), Some("cilium-operator"));
         assert_eq!(listed_volume(list, "next"), None);
         assert_eq!(listed_volume("(absent)", "nextnfs"), None);
+    }
+
+    #[test]
+    fn the_registry_has_none_by_404_or_by_the_cluster_demand() {
+        // pvetest2/pvetest3, 12.74 (medium 3d67200f62, 2510dd9b19).
+        let demand = "waiting ErrImagePull: image pull error: rknt-on-no-list is not on this node (503 Service Unavailable): \
+            rknt-on-no-list is not on this node: fetching it from the cluster (job demand:rknt-on-no-list, queued, last attempt: \
+            rknt-on-no-list:latest: no peer has it (forge: not there)); retry shortly";
+        assert!(registry_has_none(demand));
+        assert!(registry_has_none("waiting ErrImagePull: x: 404 Not Found"));
+        assert!(!registry_has_none("waiting ErrImagePull: x is not on this node: fetching it from the cluster (job demand:x, running)"));
+        assert!(!registry_has_none("waiting ImagePullBackOff: connection refused"));
     }
 
     #[test]
