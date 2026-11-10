@@ -58,7 +58,7 @@ by #51.
 
 ## Work plan
 
-### Doing: #348 (P3), RDMA verbs for a pod that asks (stormcos#914)
+### Waiting on a release with e8242e9 on an X9 blade: #348 (P3), RDMA verbs for a pod that asks (stormcos#914)
 
 2026-11-10. Found: stormpump (9877a97 and main) has no device list and no rlimit in `Spec`; its container /dev is a tmpfs without
 nodev, binds under /dev land since stormpump#222, and it attaches no cgroup device filter (every device usable once its node is there).
@@ -68,6 +68,11 @@ binds of `/dev/infiniband/<uverbsN|rdma_cm>` (as a Block claim's device) and `CA
 CAP_IPC_LOCK pin past RLIMIT_MEMLOCK), in `create_container`; none on the node = refused (CreateContainerError, retried). (3) File
 stormpump: `Spec` rlimits (MEMLOCK) so the limit itself can be raised; then swap. Tests, README/configuration.md, CHANGELOG; sc-build;
 stage. Live: needs a RoCE node with the verbs modules (stormcos#914).
+Done: e8242e9 (code, 7 tests), 9581611/482bddd (docs), 5d5542f (medium `pod-rdma`, workload `rdma-view`). SC_BUILD_VM sc-build (VM sc-build-ab97f42d1b):
+631 kubelet unit, all suites, same warnings as before (#227's), clippy nothing in the new code; `cd test` (VM sc-build-5be21b4531): clippy -D warnings, 50 tests.
+Stage build dfc286e1e525. Filed stormpump#230 (Spec rlimits, MEMLOCK), rustkube#315 (scheduler: extended resources). Proposed `--after-release rustkube-node>=e8242e9`.
+Resume: an X9 blade (ConnectX-3, stormcos#914's modules) on a release with it: Node shows `rdma.storm.io/hca`; `stormcentral test run rustkube-node medium --tag
+server8` (after a pve pass, #791): `pod-rdma` passes (not skipped); close. If the blade shows no resource: `/sys/class/infiniband_verbs` on it (stormcos#914).
 
 ### Done: #352 (P2), stormvm → 71bf5b5: machine.type (pc/i440fx) and the ide bus (stormvm#117)
 
