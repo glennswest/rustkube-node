@@ -1878,10 +1878,8 @@ impl VmManager {
         {
             let mut records = self.vms.lock().await;
             for reg in stormvm_node::console::list(RUN_ROOT) {
-                if !reg.uid.is_empty() && !crate::vm_golden::is_sealer(&reg.uid) {
-                    if !records.contains_key(&reg.uid) {
-                        records.insert(reg.uid.clone(), vm_of(&reg));
-                    }
+                if !reg.uid.is_empty() && !crate::vm_golden::is_sealer(&reg.uid) && !records.contains_key(&reg.uid) {
+                    records.insert(reg.uid.clone(), vm_of(&reg));
                 }
             }
         }
