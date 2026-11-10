@@ -1328,10 +1328,20 @@ kubelet is under test, not the scheduler.
     FailedCreatePodSandBox Event names it.
   - `multus-release`: a NAD whose range holds one address, used by two pods in
     turn: the second gets it only if the first's delete DELed its attachment.
+- **metadata** (< 5 min, declared in `test/requires.toml` with `host_network`,
+  run on request, #342): a host-network pod asks its node's kubelet
+  (`https://127.0.0.1:10250/vmInstance/<address>`) for its own instance
+  metadata, with its own bound ServiceAccount token as `Authorization` and as
+  `X-Storm-Workload-Token` (what stormimds forwards, #122):
+  - `metadata-own-token-loopback`, `metadata-own-token-node-ip`: at 127.0.0.1
+    and at the node's InternalIP, 200 with `storm.io/kind: Pod` and the pod's
+    own namespace, name and uid. A refusal reports the kubelet's `error`.
+  - `metadata-no-workload-token`: the node's address with no workload token is
+    404.
 
 The same image is the workload pods' program (`/test sized <path> <seed>
 <bytes> <lo> <hi>`, `/test echo …`, `sleep`, `exit`, `fail-once`,
-`write-file`, `expect-file`, `expect-env`, `expect-nics` for the multus suite,
+`write-file`, `expect-file`, `expect-env`, `expect-nics` for the multus suite, `vm-instance` for the metadata suite,
 and `csi-driver`, `restart-kubelet` for the csi suite), so a run pulls nothing else. The crate builds the CSI and
 plugin-registration protos the kubelet vendors, so it needs `protoc` too. Check it builds with
 `sc-build 'cd test && cargo test --locked && cargo build --release --locked'`.

@@ -104,6 +104,9 @@ unbound, other node, pod elsewhere, no apiserver); api.md, CHANGELOG; sc-build; 
 Done: 6f94966. SC_BUILD_VM sc-build (VM sc-build-c190f556df): 616 kubelet unit (1 new), all suites; clippy nothing on the new lines. node_reregister's two failures in that
 run pass 4/4 alone (VM sc-build-58b60d0015): a flake, not this change. Stage build c293a652fe3e. Proposed `--after-release rustkube-node>=6f94966`; asked on stormimds#19.
 Resume: the `stormimds node` run's 404 `error` (or `testhost logs <m> kubelet --search vmInstance`) names the check; fix it here or file it where it lies; close on a pass.
+2026-11-10: 12.74 carries 6f94966, but no stormimds `node` run since (its last, 4b9245e5d6, is on 7797220 before it). Doing: our own `metadata` suite
+(host_network): a hostNetwork pod asks https://127.0.0.1:10250/vmInstance/{127.0.0.1, node IP} with its token (+ no-workload-token case); workload
+`vm-instance`; requires.toml, README, CHANGELOG; sc-build `cd test`; run on pvetest3; fix what its `error` names; close on a pass (tell stormimds#19).
 
 ### Waiting on stormcentral#1274 (the cluster test's pod timing): #340 (P1), first pod on a cluster worker 2.1 s (flowsdn) / 4.1 s (cilium) vs 160 ms on one node
 

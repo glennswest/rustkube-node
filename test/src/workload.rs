@@ -29,6 +29,13 @@
 //!
 //! - `read-file <path>` (#332): the file's content as the line's `detail`, or
 //!   `(absent)` when there is none. Exit 0 either way.
+//! - `vm-instance <address> [no-workload-token]` (#342): from a host-network
+//!   pod, ask the node's kubelet `GET /vmInstance/<address>` on
+//!   `https://127.0.0.1:10250`, with the pod's own ServiceAccount token as
+//!   `Authorization` and (unless `no-workload-token`) as
+//!   `X-Storm-Workload-Token`, as stormimds forwards it. The detail is
+//!   `<status> <body>`; exit 0 whatever the kubelet answered (the suite
+//!   judges), 1 when it could not be asked.
 //!
 //! A directory `path` means a filesystem volume: the data goes in
 //! `<path>/rustkube-node-test.bin`. Anything else is a raw block device,
@@ -47,7 +54,7 @@ pub fn is_workload(args: &[String]) -> bool {
         args.first().map(String::as_str),
         Some(
             "fill" | "verify" | "size-at-least" | "sized" | "echo" | "exit" | "sleep" | "fail-once"
-                | "write-file" | "expect-file" | "expect-env" | "expect-nics" | "read-file"
+                | "write-file" | "expect-file" | "expect-env" | "expect-nics" | "read-file" | "vm-instance"
         )
     )
 }
@@ -83,6 +90,36 @@ pub fn main(args: &[String]) -> i32 {
     code
 }
 
+/// Where a pod's ServiceAccount token is mounted.
+pub const SA_TOKEN: &str = "/var/run/secrets/kubernetes.io/serviceaccount/token";
+
+/// `GET https://127.0.0.1:10250/vmInstance/<address>` as a host-network
+/// workload (#342): `<status> <body>`.
+fn vm_instance(address: &str, workload: bool) -> Result<String, String> {
+    let token = std::fs::read_to_string(SA_TOKEN).map_err(|e| format!("{SA_TOKEN}: {e}"))?;
+    let token = token.trim().to_string();
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| format!("runtime: {e}"))?;
+    rt.block_on(async move {
+        // The kubelet serves its node's pair, not one for 127.0.0.1: the
+        // name is not what is under test, the token path is.
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| format!("client: {e}"))?;
+        let mut req = client
+            .get(format!("https://127.0.0.1:10250/vmInstance/{address}"))
+            .bearer_auth(&token);
+        if workload {
+            req = req.header("X-Storm-Workload-Token", &token);
+        }
+        let r = req.send().await.map_err(|e| format!("GET /vmInstance/{address}: {e}"))?;
+        let status = r.status().as_u16();
+        let body = r.text().await.unwrap_or_default();
+        Ok(format!("{status} {}", body.trim()))
+    })
+}
+
 extern "C" fn on_term(_: libc::c_int) {
     // SAFETY: _exit is async-signal-safe.
     unsafe { libc::_exit(0) }
@@ -92,6 +129,11 @@ fn run(args: &[String]) -> Result<String, String> {
     let arg = |i: usize, what: &str| args.get(i).cloned().ok_or_else(|| format!("missing {what}"));
     let num = |i: usize, what: &str| arg(i, what)?.parse::<u64>().map_err(|e| format!("{what}: {e}"));
     match args[0].as_str() {
+        "vm-instance" => {
+            let address = arg(1, "address")?;
+            let workload = args.get(2).map(String::as_str) != Some("no-workload-token");
+            vm_instance(&address, workload)
+        }
         "fill" => {
             let (p, seed, n) = (target(&arg(1, "path")?), num(2, "seed")?, num(3, "bytes")?);
             fill(&p, seed, n)?;

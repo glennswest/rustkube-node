@@ -58,3 +58,14 @@ budget_secs = 600
 cluster_read = [
   { apiGroup = "", resource = "nodes" },
 ]
+
+[metadata]
+# A host-network pod's own instance metadata from its node's kubelet by its
+# bound ServiceAccount token (#342, #122): the pods are on the host network
+# and ask https://127.0.0.1:10250/vmInstance/<address> themselves. Which Node
+# STORM_NODE is, and its address. By day: 5 min.
+budget_secs = 300
+host_network = true
+cluster_read = [
+  { apiGroup = "", resource = "nodes" },
+]
