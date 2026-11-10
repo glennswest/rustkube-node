@@ -1498,6 +1498,19 @@ impl RuntimeService for StormpumpRuntime {
             }
         }
         self.probe()?;
+        // The node's RDMA verbs devices and CAP_IPC_LOCK for a container that
+        // asks (#348): binds of the node's `/dev/infiniband/*`, made as a raw
+        // block claim's device is. Read now, so a device that went away is a
+        // refused create (retried on the create back-off), not an empty bind.
+        let rdma_config;
+        let config = if config.rdma {
+            let mut c = config.clone();
+            crate::rdma::apply(&mut c, &crate::rdma::Devices::now()).map_err(CriError::Runtime)?;
+            rdma_config = c;
+            &rdma_config
+        } else {
+            config
+        };
         let (namespace, pod, pod_uid) = {
             let sandboxes = self.sandboxes.lock().await;
             sandboxes
@@ -3037,6 +3050,24 @@ mod tests {
         assert_eq!(spec.groups, [2000, 3000, 4000]);
         spec.validate().unwrap();
         assert!(spec_of(&ContainerConfig::default(), &PodSandboxConfig::default()).groups.is_empty());
+    }
+
+    /// #348: an RDMA container's device nodes reach the engine as binds at the
+    /// same paths, and `IPC_LOCK` as an added capability the engine accepts;
+    /// one that asks for nothing gets neither.
+    #[test]
+    fn rdma_devices_and_ipc_lock_reach_the_spec() {
+        let dev = crate::rdma::Devices { uverbs: vec!["uverbs0".into(), "uverbs1".into()], rdma_cm: true };
+        let mut cc = ContainerConfig { command: vec!["/bin/true".into()], rdma: true, ..Default::default() };
+        crate::rdma::apply(&mut cc, &dev).unwrap();
+        let spec = spec_of(&cc, &PodSandboxConfig::default());
+        let dsts: Vec<&str> = spec.mounts.iter().map(|m| m.dst.as_str()).collect();
+        assert_eq!(dsts, ["/dev/infiniband/uverbs0", "/dev/infiniband/uverbs1", "/dev/infiniband/rdma_cm"]);
+        assert!(spec.mounts.iter().all(|m| m.fstype.is_none() && !m.readonly));
+        assert_eq!(spec.caps.add, ["IPC_LOCK"]);
+        spec.validate().unwrap();
+        let plain = spec_of(&ContainerConfig { command: vec!["/bin/true".into()], ..Default::default() }, &PodSandboxConfig::default());
+        assert!(plain.mounts.is_empty() && plain.caps.add.is_empty());
     }
 
     /// Capabilities reach the engine (#118): a pod that asks for nothing gets

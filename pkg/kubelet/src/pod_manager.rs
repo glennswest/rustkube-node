@@ -6908,6 +6908,8 @@ fn build_container_config(
         fs_group: None,
         fs_group_change_policy: None,
         supplemental_groups: Vec::new(),
+        // The node's RDMA verbs devices, when asked for (#348).
+        rdma: crate::rdma::requested(spec),
     }
 }
 
@@ -9166,6 +9168,16 @@ pub(crate) mod tests {
         let mut none = build_container_config(&simple_container(), "img", vec![], vec![]);
         apply_pod_namespaces(&mut none, &json!({"spec": {}}));
         assert_eq!((none.run_as_user, none.run_as_group, none.run_as_non_root), (None, None, None));
+    }
+
+    /// #348: a container asking for `rdma.storm.io/hca` is marked for the
+    /// runtime; one that does not is not.
+    #[test]
+    fn a_container_asking_for_rdma_is_marked() {
+        let mut c = simple_container();
+        c["resources"] = json!({"limits": {"rdma.storm.io/hca": "1"}, "requests": {"rdma.storm.io/hca": "1"}});
+        assert!(build_container_config(&c, "img", vec![], vec![]).rdma);
+        assert!(!build_container_config(&simple_container(), "img", vec![], vec![]).rdma);
     }
 
     #[test]

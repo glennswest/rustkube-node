@@ -402,6 +402,9 @@ impl Kubelet {
                 if runs_vms {
                     // KVM on the Node (#65): only where VMs can run at all.
                     reporter = reporter.with_kvm(Arc::new(crate::node_status::kvm_available));
+                    // RDMA verbs (#348): the stormpump runtime is what binds
+                    // them into a container, and VMs run only on it.
+                    reporter = reporter.with_rdma(Arc::new(crate::rdma::units_now));
                 }
                 let mut backoff = Duration::from_secs(1);
                 loop {
@@ -477,6 +480,7 @@ impl Kubelet {
                 .with_client(hb_client);
             if hb_vms.is_some() {
                 reporter = reporter.with_kvm(Arc::new(crate::node_status::kvm_available));
+                reporter = reporter.with_rdma(Arc::new(crate::rdma::units_now));
             }
             let mut interval = time::interval(heartbeat_interval);
             loop {

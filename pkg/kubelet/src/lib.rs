@@ -19,6 +19,7 @@ pub mod multus;
 pub mod network_status;
 pub mod node_health;
 pub mod node_logs;
+pub mod rdma;
 pub mod start_timing;
 pub mod static_mirror;
 pub mod startup;

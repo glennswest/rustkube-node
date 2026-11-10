@@ -175,6 +175,10 @@ pub struct ContainerConfig {
     /// needs `Unconfined`, or the runtime's default profile fails its syscalls
     /// with EPERM — stalling even the `config` init container on an HTTPS call.
     pub seccomp_profile: Option<SeccompProfile>,
+    /// The container asks for the node's RDMA verbs devices
+    /// (`rdma.storm.io/hca` in its resources, #348): the stormpump runtime
+    /// binds them in and adds `CAP_IPC_LOCK` (`crate::rdma`).
+    pub rdma: bool,
 }
 
 /// SELinux label parts (user/role/type/level) for a container.

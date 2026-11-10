@@ -117,8 +117,15 @@ pub struct NodeReporter {
     /// The KVM labels last written to the Node, so they are patched only when
     /// they change.
     kvm_labelled: std::sync::Mutex<Option<bool>>,
+    /// How many RDMA verbs devices this node has (#348), asked each status
+    /// pass. `None` on a node whose runtime cannot give them to a container.
+    rdma: Option<RdmaProbe>,
     client: reqwest::Client,
 }
+
+/// Asks how many RDMA verbs units the node has now; [`crate::rdma::units_now`]
+/// outside tests.
+pub type RdmaProbe = std::sync::Arc<dyn Fn() -> u32 + Send + Sync>;
 
 /// Asks whether KVM is usable now; [`kvm_available`] outside tests.
 pub type KvmProbe = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
@@ -177,6 +184,7 @@ impl NodeReporter {
             taints: Vec::new(),
             kvm: None,
             kvm_labelled: std::sync::Mutex::new(None),
+            rdma: None,
             client: reqwest::Client::new(),
         }
     }
@@ -219,6 +227,14 @@ impl NodeReporter {
     /// `probe` on each status pass.
     pub fn with_kvm(mut self, probe: KvmProbe) -> Self {
         self.kvm = Some(probe);
+        self
+    }
+
+    /// This node's runtime can give a container its RDMA verbs devices
+    /// (#348): advertise `rdma.storm.io/hca`, counted through `probe` on each
+    /// status pass.
+    pub fn with_rdma(mut self, probe: RdmaProbe) -> Self {
+        self.rdma = Some(probe);
         self
     }
 
@@ -593,6 +609,13 @@ impl NodeReporter {
         if self.kvm.as_ref().is_some_and(|probe| probe()) {
             for side in ["capacity", "allocatable"] {
                 status[side][KVM_RESOURCE] = json!(KVM_QUANTITY);
+            }
+        }
+        // RDMA verbs, one unit per uverbs device (#348). Likewise dropped on
+        // the next pass when the devices go.
+        if let Some(units) = self.rdma.as_ref().map(|probe| probe()).filter(|n| *n > 0) {
+            for side in ["capacity", "allocatable"] {
+                status[side][crate::rdma::RESOURCE] = json!(units.to_string());
             }
         }
         status
@@ -1073,6 +1096,20 @@ mod tests {
         assert!(!info["kernelVersion"].as_str().unwrap().is_empty());
         assert_eq!(info["bootID"].as_str().unwrap().len(), 36, "{info}");
         assert!(info["machineID"].is_string() && info["systemUUID"].is_string());
+    }
+
+    /// #348: RDMA verbs as `rdma.storm.io/hca`, one unit per uverbs device;
+    /// none (or no probe: a runtime that cannot bind them) says nothing.
+    #[test]
+    fn a_node_with_rdma_verbs_advertises_them() {
+        let units = |n: u32| -> RdmaProbe { std::sync::Arc::new(move || n) };
+        let st = NodeReporter::new("http://x", "n1").with_rdma(units(2)).build_status(&[]);
+        assert_eq!(st["capacity"][crate::rdma::RESOURCE], "2");
+        assert_eq!(st["allocatable"][crate::rdma::RESOURCE], "2");
+        let none = NodeReporter::new("http://x", "n1").with_rdma(units(0)).build_status(&[]);
+        assert!(none["capacity"].get(crate::rdma::RESOURCE).is_none());
+        let no_probe = NodeReporter::new("http://x", "n1").build_status(&[]);
+        assert!(no_probe["allocatable"].get(crate::rdma::RESOURCE).is_none());
     }
 
     /// #165: capacity and allocatable `pods` are `--max-pods`, 110 unless set.
