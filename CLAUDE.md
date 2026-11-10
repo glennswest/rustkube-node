@@ -107,6 +107,10 @@ Resume: the `stormimds node` run's 404 `error` (or `testhost logs <m> kubelet --
 2026-11-10: 12.74 carries 6f94966, but no stormimds `node` run since (its last, 4b9245e5d6, is on 7797220 before it). Doing: our own `metadata` suite
 (host_network): a hostNetwork pod asks https://127.0.0.1:10250/vmInstance/{127.0.0.1, node IP} with its token (+ no-workload-token case); workload
 `vm-instance`; requires.toml, README, CHANGELOG; sc-build `cd test`; run on pvetest3; fix what its `error` names; close on a pass (tell stormimds#19).
+Done: 3ba401f (2 tests; SC_BUILD_VM sc-build `cd test`: clippy -D warnings, 49 tests, release). metadata c890193e1a (pvetest3, 12.74 = rustkube-node 78bf751,
+which does NOT carry 6f94966): loopback and node IP both `404 no machine at <ip>` (and no-token too): `ip -o addr show` matched nothing, not even 127.0.0.1,
+so every address read as "not the node's". Cause proven; 6f94966 (getifaddrs) is the fix. 12.74.7/.9, 12.77, 12.78 carry 8b8ebef (has it). Queued metadata on
+pvetest1 (installing 12.78). Resume: that run passes both own-token cases → close, tell stormimds#19 to rerun `node`.
 
 ### Waiting on stormcentral#1274 (the cluster test's pod timing): #340 (P1), first pod on a cluster worker 2.1 s (flowsdn) / 4.1 s (cilium) vs 160 ms on one node
 
