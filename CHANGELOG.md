@@ -7,6 +7,7 @@
   - **Container:** one that asks for it in `resources` gets the node's `/dev/infiniband/{uverbsN,rdma_cm}` bound at the same paths, plus `CAP_IPC_LOCK`, so it can register memory regions past `RLIMIT_MEMLOCK`. One that doesn't ask gets neither.
   - **No devices:** a create on a node without them is refused, naming what is missing, and retried.
   - **Follow-ups:** a real `RLIMIT_MEMLOCK` waits on stormpump#230 (no rlimit in its spec). Placement by extended resources is rustkube#315.
+  - **Test:** medium's `pod-rdma` (workload `rdma-view`) checks it where a node advertises the resource, and is skipped elsewhere.
   - Not run on a node: no test machine has RoCE verbs loaded yet (stormcos#914).
 
 - **test:** A `metadata` suite (#342, run on request, `host_network`). A host-network pod asks its node's kubelet `GET /vmInstance/<address>` with its own bound ServiceAccount token, as stormimds forwards it, at 127.0.0.1 and at the node's InternalIP, and expects its own Pod metadata. With no workload token it expects 404. A refusal reports the kubelet's `error` (6f94966), so the run names which check stormimds#19's 404 met, without waiting on a stormimds run. New workload mode `vm-instance`. Result: on 12.74 (rustkube-node 78bf751) all three answered `404 no machine at <ip>`, because `ip -o addr show` matched none of the node's addresses, not even 127.0.0.1. That was #342's cause. On 12.78, which has 6f94966's getifaddrs, the suite passes 3/0/0 (run ccb750ba4b).

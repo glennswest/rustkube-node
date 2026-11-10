@@ -702,6 +702,10 @@ retried on the create back-off). rustkube's scheduler does not yet place by
 extended resources (rustkube#315), so such a pod can land on a node without
 devices and wait there.
 
+Checked by medium's `pod-rdma` (skipped on a node that advertises none). A pod
+asking for one unit must see every `uverbsN` and `rdma_cm` as character devices,
+with `CAP_IPC_LOCK` effective. A pod that doesn't ask must see neither.
+
 ### Virtual machine lifecycle
 
 - **A VM-capable node says so (#65).** With the stormpump engine (the only
@@ -1368,7 +1372,7 @@ kubelet is under test, not the scheduler.
 
 The same image is the workload pods' program (`/test sized <path> <seed>
 <bytes> <lo> <hi>`, `/test echo …`, `sleep`, `exit`, `fail-once`,
-`write-file`, `expect-file`, `expect-env`, `expect-nics` for the multus suite, `vm-instance` for the metadata suite,
+`write-file`, `expect-file`, `expect-env`, `expect-nics` for the multus suite, `vm-instance` for the metadata suite, `rdma-view` for medium's `pod-rdma`,
 and `csi-driver`, `restart-kubelet` for the csi suite), so a run pulls nothing else. The crate builds the CSI and
 plugin-registration protos the kubelet vendors, so it needs `protoc` too. Check it builds with
 `sc-build 'cd test && cargo test --locked && cargo build --release --locked'`.

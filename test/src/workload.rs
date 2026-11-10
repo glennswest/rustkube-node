@@ -29,6 +29,9 @@
 //!
 //! - `read-file <path>` (#332): the file's content as the line's `detail`, or
 //!   `(absent)` when there is none. Exit 0 either way.
+//! - `rdma-view` (#348): the character devices under `/dev/infiniband`
+//!   and whether `CAP_IPC_LOCK` is effective, as
+//!   `devices=<a,b|none> ipc_lock=<yes|no>`. Exit 0 either way.
 //! - `vm-instance <address> [no-workload-token]` (#342): from a host-network
 //!   pod, ask the node's kubelet `GET /vmInstance/<address>` on
 //!   `https://127.0.0.1:10250`, with the pod's own ServiceAccount token as
@@ -54,7 +57,7 @@ pub fn is_workload(args: &[String]) -> bool {
         args.first().map(String::as_str),
         Some(
             "fill" | "verify" | "size-at-least" | "sized" | "echo" | "exit" | "sleep" | "fail-once"
-                | "write-file" | "expect-file" | "expect-env" | "expect-nics" | "read-file" | "vm-instance"
+                | "write-file" | "expect-file" | "expect-env" | "expect-nics" | "read-file" | "vm-instance" | "rdma-view"
         )
     )
 }
@@ -88,6 +91,30 @@ pub fn main(args: &[String]) -> i32 {
         std::thread::sleep(std::time::Duration::from_secs(secs));
     }
     code
+}
+
+/// What a container sees of RDMA (#348): its `/dev/infiniband` character
+/// devices, sorted, and whether CAP_IPC_LOCK (14) is in its effective set.
+fn rdma_view() -> String {
+    use std::os::unix::fs::FileTypeExt;
+    let mut devices: Vec<String> = std::fs::read_dir("/dev/infiniband")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_char_device()) || std::fs::metadata(e.path()).is_ok_and(|m| m.file_type().is_char_device()))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    devices.sort();
+    let cap_eff = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("CapEff:").map(|v| v.trim().to_string())))
+        .and_then(|h| u64::from_str_radix(&h, 16).ok())
+        .unwrap_or(0);
+    format!(
+        "devices={} ipc_lock={}",
+        if devices.is_empty() { "none".to_string() } else { devices.join(",") },
+        if cap_eff & (1 << 14) != 0 { "yes" } else { "no" }
+    )
 }
 
 /// Where a pod's ServiceAccount token is mounted.
@@ -129,6 +156,7 @@ fn run(args: &[String]) -> Result<String, String> {
     let arg = |i: usize, what: &str| args.get(i).cloned().ok_or_else(|| format!("missing {what}"));
     let num = |i: usize, what: &str| arg(i, what)?.parse::<u64>().map_err(|e| format!("{what}: {e}"));
     match args[0].as_str() {
+        "rdma-view" => Ok(rdma_view()),
         "vm-instance" => {
             let address = arg(1, "address")?;
             let workload = args.get(2).map(String::as_str) != Some("no-workload-token");

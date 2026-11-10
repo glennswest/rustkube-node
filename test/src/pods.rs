@@ -36,13 +36,14 @@ const MARGIN: Duration = Duration::from_secs(120);
 /// Each case, run in parallel by `medium::run`: (test name, outcome, ms).
 pub async fn run(env: Arc<Env>, api: Api) -> Vec<(String, Outcome, u128)> {
     type Case = fn(Arc<Env>, Api) -> std::pin::Pin<Box<dyn std::future::Future<Output = Outcome> + Send>>;
-    let cases: [(&str, Case); 6] = [
+    let cases: [(&str, Case); 7] = [
         ("pod-restart-on-failure", |e, a| Box::pin(async move { restart_on_failure(&e, &a).await })),
         ("pod-init-first", |e, a| Box::pin(async move { init_first(&e, &a).await })),
         ("pod-config", |e, a| Box::pin(async move { config(&e, &a).await })),
         ("pod-missing-image", |e, a| Box::pin(async move { missing_image(&e, &a).await })),
         ("pod-carried-image", |e, a| Box::pin(async move { carried_image(&e, &a).await })),
         ("pod-image-on-no-list", |e, a| Box::pin(async move { image_on_no_list(&e, &a).await })),
+        ("pod-rdma", |e, a| Box::pin(async move { rdma(&e, &a).await })),
     ];
     let tasks: Vec<_> = cases
         .into_iter()
@@ -178,6 +179,77 @@ async fn config(env: &Env, api: &Api) -> Outcome {
 
 /// An image name no registry serves: `.invalid` never resolves (RFC 2606).
 pub const MISSING_IMAGE: &str = "registry.invalid/rustkube-node-test/missing:1";
+
+/// The extended resource for the node's RDMA verbs devices (#348).
+pub const RDMA: &str = "rdma.storm.io/hca";
+
+/// The `rdma-view` pod: asking for one unit of [`RDMA`] or not.
+pub fn rdma_pod(env: &Env, name: &str, asks: bool) -> Value {
+    let mut p = k8s::pod(env, name, &["rdma-view"]);
+    if asks {
+        p["spec"]["containers"][0]["resources"] = json!({ "limits": { RDMA: "1" }, "requests": { RDMA: "1" } });
+    }
+    p
+}
+
+/// What is wrong with what the asking and the plain container saw, given the
+/// node advertises `units` uverbs devices.
+pub fn rdma_check(asked: &str, plain: &str, units: u32) -> Result<String, String> {
+    let field = |line: &str, k: &str| -> String {
+        line.split_whitespace().find_map(|w| w.strip_prefix(&format!("{k}="))).unwrap_or("").to_string()
+    };
+    let mut want: Vec<String> = (0..units).map(|n| format!("uverbs{n}")).collect();
+    want.push("rdma_cm".into());
+    want.sort();
+    let devices = field(asked, "devices");
+    let got: Vec<String> = devices.split(',').map(str::to_string).collect();
+    for w in &want {
+        if !got.contains(w) {
+            return Err(format!("the asking container has no /dev/infiniband/{w}: {asked}"));
+        }
+    }
+    if field(asked, "ipc_lock") != "yes" {
+        return Err(format!("the asking container has no CAP_IPC_LOCK: {asked}"));
+    }
+    if field(plain, "devices") != "none" || field(plain, "ipc_lock") != "no" {
+        return Err(format!("a container that did not ask got something: {plain}"));
+    }
+    Ok(format!("asked: {asked}; plain: {plain}"))
+}
+
+async fn rdma(env: &Env, api: &Api) -> Outcome {
+    let node = match api.get(&format!("/api/v1/nodes/{}", env.node_name)).await {
+        Ok(Some(n)) => n,
+        Ok(None) => return Outcome::Infra(format!("Node {} is not there", env.node_name)),
+        Err(e) => return Outcome::Infra(e),
+    };
+    let units: u32 = match node["status"]["allocatable"][RDMA].as_str().and_then(|q| q.parse().ok()) {
+        Some(n) if n > 0 => n,
+        _ => return Outcome::Skip(format!("{} advertises no {RDMA} (no RDMA verbs devices)", env.node_name)),
+    };
+    let mut seen = Vec::new();
+    for (name, asks) in [("medium-rdma-asks", true), ("medium-rdma-plain", false)] {
+        let done = match finished(env, api, &rdma_pod(env, name, asks)).await {
+            Ok(p) => p,
+            Err(o) => return o,
+        };
+        let log = k8s::log(env, api, name, false).await.unwrap_or_default();
+        if s(&done, "/status/phase") != "Succeeded" {
+            return Outcome::Fail(format!("{name} ended {}: {log}", s(&done, "/status/phase")));
+        }
+        let detail = log
+            .lines()
+            .rev()
+            .find_map(|l| serde_json::from_str::<Value>(l).ok())
+            .map(|l| s(&l, "/detail").to_string())
+            .unwrap_or_default();
+        seen.push(detail);
+    }
+    match rdma_check(&seen[0], &seen[1], units) {
+        Ok(d) => Outcome::Pass(d),
+        Err(e) => Outcome::Fail(e),
+    }
+}
 
 async fn missing_image(env: &Env, api: &Api) -> Outcome {
     waits_for_image(env, api, "medium-missing-image", MISSING_IMAGE).await
@@ -324,6 +396,21 @@ async fn waits_for_image(env: &Env, api: &Api, name: &str, image: &str) -> Outco
 mod tests {
     use super::*;
     use crate::k8s::tests::env;
+
+    /// #348: the asking pod requests one unit; the plain one nothing; the
+    /// check wants every uverbs device and rdma_cm plus IPC_LOCK on the one,
+    /// and neither on the other.
+    #[test]
+    fn rdma_pods_and_their_check() {
+        let e = env();
+        assert_eq!(rdma_pod(&e, "a", true)["spec"]["containers"][0]["resources"]["limits"][RDMA], "1");
+        assert!(rdma_pod(&e, "p", false)["spec"]["containers"][0].get("resources").is_none());
+        let plain = "devices=none ipc_lock=no";
+        assert!(rdma_check("devices=rdma_cm,uverbs0,uverbs1 ipc_lock=yes", plain, 2).is_ok());
+        assert!(rdma_check("devices=rdma_cm,uverbs0 ipc_lock=yes", plain, 2).unwrap_err().contains("uverbs1"));
+        assert!(rdma_check("devices=rdma_cm,uverbs0 ipc_lock=no", plain, 1).unwrap_err().contains("CAP_IPC_LOCK"));
+        assert!(rdma_check("devices=rdma_cm,uverbs0 ipc_lock=yes", "devices=uverbs0 ipc_lock=no", 1).unwrap_err().contains("did not ask"));
+    }
 
     #[test]
     fn a_listed_image_names_its_volume() {
