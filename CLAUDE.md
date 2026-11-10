@@ -193,7 +193,7 @@ CA is fatal at start; `http://` works as before. Not the client pair (not asked;
        (#227's elsewhere). Live: not run on a node or a real engine; stormcos sets `--stormblock https://127.0.0.1:9090 --stormblock-ca /data/stormcert/ca.crt`.
 2. [x] stormvm-block (snapshot, restore, console `snapshot`) gets the same URL and has no CA: follow-up #318, proposed after stormvm#110; said on stormcos#374.
 
-### In progress: #325 (P2), VM start: `control` a flat ~102 ms, `report` grew (stormcos#804, fix 17)
+### Waiting on the owner: #325 (P2), VM start: `control` a flat ~102 ms, `report` grew (stormcos#804, fix 17)
 
 2026-11-06. `control`: stormvm's `status_when_up` sleeps a fixed 100 ms after a refused connect, so a socket bound within that costs 100 ms. Target: under 20 ms on a VM, VM Running ~150 ms warm.
 `report`: one merge PATCH. pvetest1 12.61 VMIs 3.7-139 ms, pvetest2 12.61-flowsdn 2.8-118 ms, while pods in the same boots stay 2.5-5.8 ms (12.58.4 VMIs 3.7-22 ms). Not explained yet. Doing:
@@ -202,6 +202,11 @@ CA is fatal at start; `http://` works as before. Not the client pair (not asked;
 3. [x] Say how much of `control` is the socket's bind and how much the answer after it (qemu's QMP greets only from its main loop): `control/answer=` on the `VMI … started:` line, from the start of the last status call (connect refused before it). Test, README, CHANGELOG; sc-build; stage.
        Done: 9828650. SC_BUILD_VM sc-build (VM sc-build-999dd82107): 599 kubelet unit, all suites. clippy: nothing on the new lines; its never_loop at pod_manager.rs:3435 (2026-07 code) filed #333, closed into #227. Stage build 3268a22b88a2. Proposed `--after-release rustkube-node>=9828650`.
 4. [ ] Resume: read `control/answer=`. Mostly the answer: "connected" could be Running, which changes #303's rule: ask the owner, recommendation in hand. Mostly the bind: qemu's own start, filed on stormvm with the numbers. Either way the < 20 ms target is the owner's to keep or move; #319 is the 10 s bound on the same wait.
+       2026-11-10: read on 12.74-era bootlogs (tmp/ctl325.py; ~370 starts). First VM of a pass: bind p50 156 ms on pve, 443 on server8, 1.7-4.7 s on the Dell,
+       with an answer of 16-170 ms. That is qemu's start before listening (cold page cache?), filed stormvm#123. Later VMs: bind 12 / answer 19-20 ms, control p50 33 on pve.
+       server7: answer 1-5 s (X9 disk). `report` fixed: pve p50 5, p90 13-21. Asked on #325: A Running at the first connect (recommended, ~12 ms), B keep the rule and
+       move the target to ~50 ms, C keep both and look inside qemu. `wait-owner` run. Resume: A = `control_when_up` stops at the first accepted connect
+       (`control/answer` is then 0, or dropped), tests, README/status.md, CHANGELOG, sc-build, stage, close on the next pve bootlog; B = close with the new target.
        `report` on 12.61, before the fix: no PATCH in the bundle logged a retry; pods' status writes in those boots 2.5-5.8 ms. The apiserver's slow lines are in the newer bundles from the reboot on: server7 VMI status PATCHes 223-1562 ms (the kubelet's and others'), so hardware outliers are at least partly the apiserver.
 
 ### Waiting on stormblock#521 + stormpump#199: #311 (P1), X9 blades: container start 4-9 s in `containers`
