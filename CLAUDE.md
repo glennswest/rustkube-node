@@ -153,12 +153,16 @@ retry never quotes the last attempt's lines). Test, README, CHANGELOG; sc-build;
 Done: 0c059da (1 test). SC_BUILD_VM sc-build (VM sc-build-bf776538a7): full build + all suites; the new test and `what_the_hypervisor_said` pass (VM sc-build-7524458193),
 clippy nothing on the new lines. Stage build 579d76b33857. Closed. Live: stormvm medium's `pod:passt` VMI on a release with it says passt's own words.
 
-### Waiting on a test machine: #332, medium: a pod from a carried image with no boot mount (stormcos#826, #294)
+### In progress: #332, medium: a pod from a carried image with no boot mount (stormcos#826, #294)
 
 2026-11-07. Doing: `pod-carried-image` (reads the node's `/etc/stormblock/{carried,mounts}` by a hostPath pod, runs nextnfs `--help`, root from `storm.io/instance.main`) and `pod-image-on-no-list` in test/src/pods.rs; README, CHANGELOG; sc-build `cd test`; medium on a machine with 12.64 (pvetest1/2 VMs destroyed at 01:31Z, see #233); close on a pass.
 1. [x] Done: 39ea42f, docs. sc-build `cd test`: clippy -D warnings clean, 46 tests, release build. Not run on a node: pvetest1/2's VMs were destroyed at 01:31Z, and C2NR0Q2 is off 19:00-06:00 Chicago. Held by `wait-owner --probe tcp://192.168.31.172:6443`.
 2. [ ] Resume: `stormcentral test run rustkube-node medium --tag pvetest1` (a passing pve run lets the Dell follow in the morning). `pod-carried-image` must pass, not skip; close on that, and tell stormcos#826. If nextnfs fails on its own (`--help`'s exit, the path), read the log, as the issue's command is untested.
    2026-11-07 (09:50Z): queued medium 244ab5c336 (2e51c48, pvetest1). It waits behind cluster test b786ac9768 (#360, lease to 19:37Z) and a line of 12.67 installs (stormcentral#1266). pvetest2 is in the same install loop; C2NR0Q2 is refused in its power-off window (#372). #332 proposed after stormcentral#1266. Resume: `stormcentral test show 244ab5c336`; on a `no VM` error, queue again on a pve machine that has passed a release.
+   2026-11-10: medium 3d67200f62 (pvetest2) and 2510dd9b19 (pvetest3), 12.74, 8b8ebef: nextnfs ran to Succeeded, but both cases failed on their own checks.
+   `instance.main` is the root's engine volume id (a UUID), not its `ctr-` name, and the no-list image got the #79 demand's 503 "not on this node … no peer has it", not a 404.
+   Fixed the test in 7f76e29. sc-build `cd test` passed (clippy -D warnings, tests, release build). Queued medium 3de88a5e17 on pvetest3; pvetest1/2 are refused because they run no known release.
+   Resume: `stormcentral test show 3de88a5e17`; close #332 if both cases pass.
 
 ### Done: #294 (P2), run a carried golden that is not mounted at boot (stormcos#647, #820)
 
