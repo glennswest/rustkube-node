@@ -58,6 +58,17 @@ by #51.
 
 ## Work plan
 
+### Doing: #348 (P3), RDMA verbs for a pod that asks (stormcos#914)
+
+2026-11-10. Found: stormpump (9877a97 and main) has no device list and no rlimit in `Spec`; its container /dev is a tmpfs without
+nodev, binds under /dev land since stormpump#222, and it attaches no cgroup device filter (every device usable once its node is there).
+So: (1) `rdma.rs`: devices from sysfs (`/sys/class/infiniband_verbs/uverbsN`, `/sys/class/misc/rdma_cm`); `rdma.storm.io/hca: <uverbs
+count>` on capacity/allocatable where both exist (stormpump engine only, as KVM). (2) A container whose requests/limits ask for it:
+binds of `/dev/infiniband/<uverbsN|rdma_cm>` (as a Block claim's device) and `CAP_IPC_LOCK` added (the kernel's `ib_umem_get` lets
+CAP_IPC_LOCK pin past RLIMIT_MEMLOCK), in `create_container`; none on the node = refused (CreateContainerError, retried). (3) File
+stormpump: `Spec` rlimits (MEMLOCK) so the limit itself can be raised; then swap. Tests, README/configuration.md, CHANGELOG; sc-build;
+stage. Live: needs a RoCE node with the verbs modules (stormcos#914).
+
 ### Done: #352 (P2), stormvm → 71bf5b5: machine.type (pc/i440fx) and the ide bus (stormvm#117)
 
 2026-11-10. 12 commits on 893b2e8, no manifest change (stormvm-spec lib/kube/validate/boot, stormvm-vmm qemu, stormvm-control hotplug's
