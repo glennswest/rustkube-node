@@ -675,6 +675,33 @@ containers `ContainerCreating` with "claim ns/c is a disk of
 VirtualMachineInstance ns/vm on this node" and a FailedMount Event, and
 starts once the VM lets the claim go (#80).
 
+### RDMA verbs for a pod that asks
+
+With the stormpump engine, a node whose kernel has RDMA verbs devices
+advertises `rdma.storm.io/hca: <n>` in capacity and allocatable (#348,
+stormcos#914). `n` is the number of `uverbsN` devices, and it is advertised only
+while `rdma_cm` is there too. The count is read from sysfs on each heartbeat
+(`/sys/class/infiniband_verbs/uverbs*`, `/sys/class/misc/rdma_cm`), with no
+device plugin process.
+
+A container that puts `rdma.storm.io/hca` in its `resources.limits` (or
+`requests`) gets:
+
+- every node device under `/dev/infiniband` (`uverbsN`, `rdma_cm`), bound at the
+  same path, as a raw block claim's device is. stormpump attaches no cgroup
+  device filter, so they are usable as bound;
+- `CAP_IPC_LOCK`, so memory regions register past `RLIMIT_MEMLOCK` (the kernel
+  pins against the rlimit unless the task has the capability). stormpump's spec
+  has no rlimit yet (stormpump#230); when it does, the kubelet raises
+  `RLIMIT_MEMLOCK` instead. A non-root container keeps the capability only if
+  it is in its effective set.
+
+A container that doesn't ask gets neither. A node whose devices are gone when the
+container is created refuses it (`CreateContainerError` naming what is missing,
+retried on the create back-off). rustkube's scheduler does not yet place by
+extended resources (rustkube#315), so such a pod can land on a node without
+devices and wait there.
+
 ### Virtual machine lifecycle
 
 - **A VM-capable node says so (#65).** With the stormpump engine (the only
