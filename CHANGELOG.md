@@ -2,6 +2,8 @@
 
 ## 2026-11-10
 
+- **fix:** stormvm → 13a0781 (#355, stormvm#7). A `pod:passt` VMI's passt now starts on a node. It runs `--runas 65534:65534` by number, because a stormcos node has no passwd entry for `nobody`, so passt exited before binding its socket and every start was refused at `HelperReady`. Its socket moves to `<socket_dir>/passt/<tap>.sock`, a directory owned by 65534 with mode 0700. Rev-only bump: no API the kubelet uses changed, and no kubelet code names the socket path.
+
 - **feat:** RDMA verbs for a pod that asks (#348, stormcos#914).
   - **Node:** with the stormpump engine, a node advertises `rdma.storm.io/hca: <n>` in capacity and allocatable, one unit per `/sys/class/infiniband_verbs/uverbsN`. It is advertised only while `/sys/class/misc/rdma_cm` is there, and read on each heartbeat, with no device plugin.
   - **Container:** one that asks for it in `resources` gets the node's `/dev/infiniband/{uverbsN,rdma_cm}` bound at the same paths, plus `CAP_IPC_LOCK`, so it can register memory regions past `RLIMIT_MEMLOCK`. One that doesn't ask gets neither.

@@ -58,6 +58,12 @@ by #51.
 
 ## Work plan
 
+### Doing: #355 (P3), stormvm → 13a0781: passt as 65534 by number (stormvm#7)
+
+2026-11-10. 5 commits on 71bf5b5, no manifest change (stormvm-vmm passt/qemu, stormvm-net linux.rs, stormvm-node plan.rs, control hotplug).
+No kubelet code names the passt socket path. Rev-only bump; README/status.md, CHANGELOG; SC_BUILD_VM sc-build `--locked`; stage; close (stormvm#7
+closes on medium's `passt-reached` on a pve machine with a release carrying it).
+
 ### Waiting on a release with e8242e9 on an X9 blade: #348 (P3), RDMA verbs for a pod that asks (stormcos#914)
 
 2026-11-10. Found: stormpump (9877a97 and main) has no device list and no rlimit in `Spec`; its container /dev is a tmpfs without

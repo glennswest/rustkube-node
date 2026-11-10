@@ -1159,7 +1159,7 @@ VM manager's orphan and adoption passes leave to its request.
 
 Limits: the engine calls go through stormvm's client, so an `https://` engine
 URL needs #318 (as snapshots do). On one node, `volume_from_snapshot` relies on
-stormvm 893b2e8 or later (#345: no slave replicas on a restore); the kubelet pins 71bf5b5 (#352). The kubelet's
+stormvm 893b2e8 or later (#345: no slave replicas on a restore); the kubelet pins 13a0781 (#352, #355). The kubelet's
 identity (`system:nodes`) is bound to cluster-admin by rustkube's bootstrap, so
 no RBAC is added; a tightened node role needs `get/list/watch` on
 `virtualmachinegoldens` and `patch` on `virtualmachinegoldens/status`.
