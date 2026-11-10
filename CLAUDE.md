@@ -2813,6 +2813,7 @@ Steps:
        2026-11-07 (03:55Z): pvetest1 and pvetest2 passed 12.65. multus 27cb670ba3 (94f0fc0, pvetest1) is queued, first in line behind cluster test c9aafb939f (#360, lease until 12:44Z, at `release the worker`). Read with `stormcentral test show 27cb670ba3`; close on a pass, or fix what fails.
        2026-11-07 (07:05Z): 27cb670ba3 errored `no VM 3101` (the cluster test's end removes the VMs). adf8a72317 (87e2f2d, pvetest1) is queued behind repeated 12.66 installs (filed on stormcentral); a second multus is queued on pvetest2, whose line is empty. Read whichever finishes first (`stormcentral test list rustkube-node`); close on a pass, or fix what fails.
        2026-11-07 (09:45Z): adf8a72317 errored `no VM 3101` too. 6eaa04e0e7 (pvetest2) waited from 07:43Z while pvetest2 installed and passed 12.67 eight times, and it was never dispatched (stormcentral#1266, evidence added). Queued fc7746d676 (b874e96, pvetest1, idle at 12.67 passed). #233 proposed after stormcentral#1266. Resume: `stormcentral test list rustkube-node`, read whichever multus run finished (`test show <id>`); close on a pass, or fix what fails; on another machine error, queue on a pve machine that has passed a release.
+       2026-11-10: fc7746d676 errored `no VM 3101` too. pvetest1/2/3 have all passed 12.74. Queued multus 131ea41fe0 (8b8ebef, pvetest1). Resume: `stormcentral test show 131ea41fe0`; close on a pass, or fix what fails.
 
 ### Done: #231 + #232 (P0, stormcos#488): verified live on the Dell, 12.07
 
