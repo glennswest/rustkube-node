@@ -58,6 +58,19 @@ by #51.
 
 ## Work plan
 
+### In progress: #344 (P3), the golden-from-VM sealer: reconcile storm.io VirtualMachineGolden (vmcloud-image-operator#50)
+
+2026-11-10. stormvm 6e188a6 (the lock) has `stormvm_node::golden` (root_disk, sealer_spec, DEIDENTIFY/DEIDENTIFIED, provenance) and the
+flow in its CLI (`make_golden`). Not in a library, so the kubelet runs the steps itself. Chosen: no owner on the golden (#75's sweep deletes
+VM-owned volumes once the VM is gone; a golden outlives it). A volume already named `spec.golden` is refused (stormblock's create-by-name
+would answer it, and the sealer would boot an existing golden). The sealer is launched through the kubelet's own path (`launch`, deposit
+window) under uid `vmgolden-<request uid>`, which `reconcile_registered`/`adopt_registered` leave alone. A request found Snapshotting/Sealing
+by this node and not in flight (a kubelet restart) is Failed and cleaned up (once only). Doing:
+1. [ ] `vm_golden.rs`: decide, claim (status.node + phase, rv-guarded), run (snapshot root, copy, sealer, DEIDENTIFY, stop, seal, digest,
+       delete group), Failed + cleanup; `Engine`/`Machines` seams; tests with fakes.
+2. [ ] VmManager: `start_sealer`/`stop_sealer`/snapshot/agent; kubelet wiring (maintenance loop, watch); docs, CHANGELOG; sc-build; stage.
+3. [ ] RBAC for the kubelet (stormcos); live: vmimages' request on a node (needs #345's stormvm for `volume_from_snapshot` on one node).
+
 ### Waiting on a release with 6f94966 + a stormimds `node` run: #342 (P2), /vmInstance: a host-network pod's bound token answered 404 (stormimds#19, pvetest2)
 
 2026-11-07. Reading the code doesn't say which of `pod_by_token`'s five silent `None`s it is. rustkube's TokenReview fills `extra` pod-name/pod-uid/node-name (auth.rs).
