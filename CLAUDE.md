@@ -58,12 +58,14 @@ by #51.
 
 ## Work plan
 
-### In progress: #345 (P3), stormvm → 893b2e8: restore with no slave replicas, sizes in stormblock's units (stormvm#28)
+### Done: #345 (P3), stormvm → 893b2e8: restore with no slave replicas, sizes in stormblock's units (stormvm#28)
 
 2026-11-10. 893b2e8 on 6e188a6: code only in stormvm-block lib.rs (`restore_body` replica_tier.slaves 0, `engine_size`), no manifest
 or Cargo.lock change upstream: rev-only bump in pkg/kubelet/Cargo.toml + Cargo.lock. Also unblocks #344's live run (one node).
 Doing: bump, status.md, CHANGELOG; SC_BUILD_VM sc-build `cargo metadata --locked && cargo build --locked && cargo test --locked`; stage; close
 (stormvm#28/#37 close on stormvm's medium run on a release carrying it).
+Done: 7c37659. SC_BUILD_VM sc-build (VM sc-build-a6a630cdc5): `--locked` metadata/build/test, 624 kubelet unit, all suites; 9 stormvm lock entries at 893b2e8.
+Stage build 1e5aa3c76f78. Closed. Live: stormvm medium `snapshot-restore` / `memsnap-*` on a release carrying it; #344's live run follows.
 
 ### Waiting on #345 (stormvm 893b2e8) for the live run: #344 (P3), the golden-from-VM sealer: reconcile storm.io VirtualMachineGolden (vmcloud-image-operator#50)
 
