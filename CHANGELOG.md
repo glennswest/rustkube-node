@@ -2,6 +2,8 @@
 
 ## 2026-11-10
 
+- **feat:** stormvm → 71bf5b5 (#352, stormvm#117). A VMI's `spec.domain.machine.type` is honoured instead of refused: `q35` (the default), `pc`, `pc-q35-X.Y` or `pc-i440fx-X.Y`. A `pc` (i440fx) machine takes `ide` disks (up to four), for guests such as ReactOS. stormvm refuses `ide` on q35, `sata`, secure boot or `pcie` passthrough on `pc`, and `pc` on cloud-hypervisor. Hot-adding a NIC or virtio disk to a `pc` VM is refused, naming its missing PCIe hot-plug ports; an `ide` disk is start-only, like `sata` (`vm_hotplug`'s existing refusal). Rev-only bump: no API the kubelet uses changed.
+
 - **test:** The two #332 medium cases match what a real node says (medium 3d67200f62 pvetest2, 2510dd9b19 pvetest3, 12.74: both failed only on their own checks). `pod-carried-image` read `storm.io/instance.main` as the root's `ctr-…` name; it is the engine volume id, so the case now needs a root that is not the listed volume itself. `pod-image-on-no-list` wanted a 404; with forge as a peer the kubelet's cluster demand (#79) gets the registry's 503 "not on this node … no peer has it", which is the same "no such image" and is now accepted. Both pass on pvetest3 (3de88a5e17).
 
 - **fix:** stormvm → 893b2e8 (#345, stormvm#28). A VM snapshot restore now asks stormblock for no slave replicas: before, every restore on a single node was refused `507 out_of_space: need 1 distinct node(s) for slave replicas, found 0`. A memory snapshot's state volume is created with stormblock's size units (`512M`, not `512Mi`), which it refused. The same restore call makes #344's golden copy. Rev-only bump: no API changed.

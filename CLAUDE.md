@@ -58,6 +58,13 @@ by #51.
 
 ## Work plan
 
+### Doing: #352 (P2), stormvm → 71bf5b5: machine.type (pc/i440fx) and the ide bus (stormvm#117)
+
+2026-11-10. 12 commits on 893b2e8, no manifest change (stormvm-spec lib/kube/validate/boot, stormvm-vmm qemu, stormvm-control hotplug's
+no-port message). `VmSpec.machine` has a default (no literal here); `DiskBus::Ide` falls into `hot_disk`'s catch-all refusal. Rev-only bump
+in pkg/kubelet/Cargo.toml + Cargo.lock; README/status.md, CHANGELOG; SC_BUILD_VM sc-build `cargo metadata --locked && cargo build --locked
+&& cargo test --locked`; stage; close (stormvm#117 closes on stormvm's medium `pc-running` on a release carrying it).
+
 ### Done: #345 (P3), stormvm → 893b2e8: restore with no slave replicas, sizes in stormblock's units (stormvm#28)
 
 2026-11-10. 893b2e8 on 6e188a6: code only in stormvm-block lib.rs (`restore_body` replica_tier.slaves 0, `engine_size`), no manifest
