@@ -1127,8 +1127,8 @@ vmimages' step. The sealer is registered as `vmgolden-<request uid>`, which the
 VM manager's orphan and adoption passes leave to its request.
 
 Limits: the engine calls go through stormvm's client, so an `https://` engine
-URL needs #318 (as snapshots do). On one node, `volume_from_snapshot` needs
-stormvm ≥ 893b2e8 (#345: no slave replicas on a restore). The kubelet's
+URL needs #318 (as snapshots do). On one node, `volume_from_snapshot` relies on
+stormvm 893b2e8 (#345: no slave replicas on a restore), which the kubelet now pins. The kubelet's
 identity (`system:nodes`) is bound to cluster-admin by rustkube's bootstrap, so
 no RBAC is added; a tightened node role needs `get/list/watch` on
 `virtualmachinegoldens` and `patch` on `virtualmachinegoldens/status`.

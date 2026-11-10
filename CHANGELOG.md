@@ -2,6 +2,8 @@
 
 ## 2026-11-10
 
+- **fix:** stormvm → 893b2e8 (#345, stormvm#28). A VM snapshot restore now asks stormblock for no slave replicas: before, every restore on a single node was refused `507 out_of_space: need 1 distinct node(s) for slave replicas, found 0`. A memory snapshot's state volume is created with stormblock's size units (`512M`, not `512Mi`), which it refused. The same restore call makes #344's golden copy. Rev-only bump: no API changed.
+
 - **feat:** The kubelet makes a golden from a running VM (#344, vmcloud-image-operator#50, stormvm#17). It reconciles `VirtualMachineGolden` (`storm.io/v1alpha1`) requests whose `spec.vm` runs on this node.
   - Steps: the root disk snapshotted alone, a copy made under `spec.golden`, the copy booted as stormvm's sealer (no NIC, no seed, agent on), de-identified through the agent (its end marker checked), powered off and detached, sealed, the group snapshot deleted.
   - Status: `Snapshotting`, `Sealing` (with `volumeId`), then `Sealed` with `node`, `volumeId`, `volume`, `sha256`, `arch`, `firmware`, `provenance` and `sealedAt`, or `Failed` with the reason. On a failure the sealer, the copy and the group are removed.
