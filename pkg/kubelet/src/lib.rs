@@ -49,6 +49,7 @@ pub mod runtime;
 pub mod server;
 pub mod spdy;
 pub mod vm_disk_move;
+pub mod vm_golden;
 pub mod vm_hotplug;
 pub mod volume_ownership;
 pub mod vm_start_timing;

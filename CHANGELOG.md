@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-11-10
+
+- **feat:** The kubelet makes a golden from a running VM (#344, vmcloud-image-operator#50, stormvm#17). It reconciles `VirtualMachineGolden` (`storm.io/v1alpha1`) requests whose `spec.vm` runs on this node.
+  - Steps: the root disk snapshotted alone, a copy made under `spec.golden`, the copy booted as stormvm's sealer (no NIC, no seed, agent on), de-identified through the agent (its end marker checked), powered off and detached, sealed, the group snapshot deleted.
+  - Status: `Snapshotting`, `Sealing` (with `volumeId`), then `Sealed` with `node`, `volumeId`, `volume`, `sha256`, `arch`, `firmware`, `provenance` and `sealedAt`, or `Failed` with the reason. On a failure the sealer, the copy and the group are removed.
+  - A guest with no agent fails. A volume already named `spec.golden` is refused before anything is made. A request runs once; one interrupted by a kubelet restart is failed and cleaned up.
+  - The golden has no owner: it outlives its VM, and #75's sweep would delete a VM-owned volume once the VM goes.
+  - The sealer is launched through the kubelet's own VM start (the deposit window) under uid `vmgolden-<request uid>`; the orphan and adoption passes leave it alone.
+  - Not run on a node yet. On one node it needs #345's stormvm (a restore with no slave replicas).
+
 ## 2026-11-07
 
 - **fix:** `/vmInstance` says why it refuses a host-network pod's token (#342, seen by stormimds#19 on pvetest2). Before, five checks failed silently into the same `404 no machine at …`.

@@ -152,6 +152,8 @@ pub struct Kubelet {
     /// VirtualMachineSnapshots of the machines this node runs (#53). Present
     /// exactly when `vms` is.
     snapshots: Option<Arc<crate::vm_snapshot::Snapshots>>,
+    /// Goldens made from running VMs (#344).
+    goldens: Option<Arc<crate::vm_golden::Goldens>>,
     migration: Arc<dyn MigrationService>,
     runtime: Arc<dyn RuntimeService>,
     api_client: reqwest::Client,
@@ -252,6 +254,7 @@ impl Kubelet {
             pod_manager,
             vms: None,
             snapshots: None,
+            goldens: None,
             migration,
             runtime,
             api_client,
@@ -316,6 +319,16 @@ impl Kubelet {
             crate::vm_snapshot::stormvm_take(self.config.engine.url().to_string(), self.api_client.clone(), self.config.api_server_url.clone()),
         )
         .with_restore_engine(Arc::new(crate::vm_restore::Stormblock(self.config.engine.url().to_string())))));
+        if let Some(vms) = &self.vms {
+            self.goldens = Some(Arc::new(crate::vm_golden::Goldens::new(
+                self.api_client.clone(),
+                &self.config.api_server_url,
+                &self.config.node_name,
+                crate::vm_manager::RUN_ROOT,
+                Arc::new(crate::vm_golden::Stormblock { client: self.config.engine.clone() }),
+                vms.clone(),
+            )));
+        }
         self
     }
 
@@ -735,18 +748,21 @@ impl Kubelet {
         let Some(vms) = &self.vms else { return std::future::pending().await; };
         let worker = self.watches.worker("kubelet-vm-maintenance");
         let completed = self.snapshots.as_ref().map(|s| s.completions());
+        let sealed = self.goldens.as_ref().map(|g| g.completions());
         let mut volumes = Some(self.engine_volumes.subscribe());
         let api = &self.config.api_server_url;
         loop {
             let work = tokio::select! {
                 work = worker.next() => work,
                 _ = notified(&completed) => { worker.enqueue(); continue; },
+                _ = notified(&sealed) => { worker.enqueue(); continue; },
                 _ = runtime_changed(&mut volumes) => { worker.enqueue(); continue; },
             };
             worker.run(async {
                 if !api.is_empty() {
                     for path in [
                         "/apis/snapshot.kubevirt.io/v1beta1/virtualmachinesnapshots",
+                        "/apis/storm.io/v1alpha1/virtualmachinegoldens",
                         "/apis/kubevirt.io/v1/virtualmachines",
                         "/apis/kubevirt.io/v1/virtualmachineinstances",
                     ] {
@@ -754,6 +770,7 @@ impl Kubelet {
                     }
                 }
                 if let Some(snapshots) = &self.snapshots { snapshots.sync().await; }
+                if let Some(goldens) = &self.goldens { goldens.sync().await; }
                 let swept = vms.sweep_orphans().await;
                 // Stopped VMs' disks asked onto another node (#339).
                 let moving = vms.move_stopped_vms().await;

@@ -89,6 +89,8 @@ apiserver's proxy to them is rustkube#141.
 VirtualMachineSnapshot is reconciled as a Kubernetes resource through the
 apiserver, not a new kubelet HTTP route. It requires the snapshot CRDs,
 `--runtime stormpump`, a locally owned VM and its local storage.
+VirtualMachineGolden (`storm.io/v1alpha1`, #344) is served the same way, by
+the node its VM runs on (README, "A golden made from a running VM").
 VirtualMachineRestore is served the same way, by the node that took the
 snapshot (#53, option A of #109: the VM's disks are rewritten to restored
 PVCs; README, "Restores"). A VMI's live migration is driven by its `status.migrationState` (#40; README, "Live

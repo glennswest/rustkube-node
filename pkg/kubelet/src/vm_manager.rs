@@ -1878,7 +1878,7 @@ impl VmManager {
         {
             let mut records = self.vms.lock().await;
             for reg in stormvm_node::console::list(RUN_ROOT) {
-                if !reg.uid.is_empty() {
+                if !reg.uid.is_empty() && !crate::vm_golden::is_sealer(&reg.uid) {
                     if !records.contains_key(&reg.uid) {
                         records.insert(reg.uid.clone(), vm_of(&reg));
                     }
@@ -4946,7 +4946,8 @@ impl VmManager {
         let Some(ring) = self.ring.clone() else { return };
         let known: std::collections::HashSet<String> = self.vms.lock().await.keys().cloned().collect();
         for reg in stormvm_node::console::list(RUN_ROOT) {
-            if reg.uid.is_empty() || known.contains(&reg.uid) {
+            // A golden's sealer (#344) is no VMI's: its request stops it.
+            if reg.uid.is_empty() || known.contains(&reg.uid) || crate::vm_golden::is_sealer(&reg.uid) {
                 continue;
             }
             let obj = want.iter().find(|(u, _)| *u == reg.uid).map(|(_, o)| o);
@@ -7159,6 +7160,135 @@ fn node_addresses() -> Result<Vec<String>, String> {
     out.sort();
     out.dedup();
     Ok(out)
+}
+
+/// The machine half of a golden made from a running VM (#344): the
+/// snapshot of its root disk, and the sealer started, de-identified and
+/// stopped through this manager's own start and stop, so it is held in the
+/// deposit window and released like any machine.
+#[async_trait::async_trait]
+impl crate::vm_golden::Machines for VmManager {
+    async fn snapshot_root(
+        &self,
+        reg: &stormvm_node::console::Registration,
+        root_id: &str,
+        group: &str,
+    ) -> Result<stormvm_block::GroupSnapshot, String> {
+        let machine = control_of(reg).ok_or_else(|| format!("{}/{} has no control socket", reg.namespace, reg.name))?;
+        let machine = stormvm_control::Machine { agent: reg.agent_socket.clone(), ..machine };
+        let (base, group, members) = (self.storage.clone(), group.to_string(), vec![root_id.to_string()]);
+        let out = stormvm_control::snapshot::take(&machine, Default::default(), move || async move {
+            tokio::task::spawn_blocking(move || {
+                stormvm_block::Client::new(base).group_snapshot(&group, &members).map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        })
+        .await;
+        let error = out.error();
+        match (out.disks, error) {
+            (Ok(g), None) => Ok(g),
+            (Ok(g), Some(e)) => {
+                // Taken, but the guest was left paused or frozen: said, and
+                // the group not kept for a golden that is not made.
+                let (base, id) = (self.storage.clone(), g.id.clone());
+                let _ = tokio::task::spawn_blocking(move || stormvm_block::Client::new(base).delete_group_snapshot(&id)).await;
+                Err(e)
+            }
+            (Err(e), _) => Err(e),
+        }
+    }
+
+    async fn start_sealer(&self, uid: &str, spec: &VmSpec) -> Result<stormvm_node::console::Registration, String> {
+        let ring = self.ring.clone().ok_or_else(|| "no ring to stormpump: only the engine starts a machine".to_string())?;
+        let (mut fresh, mut times) = (Vec::new(), Vec::new());
+        let (disks, _) = self
+            .resolve_disks_as(uid, spec, &[], &Value::Null, &mut fresh, Resolving::Start(&mut times))
+            .await
+            .map_err(|e| e.message().to_string())?;
+        let dir = format!("{LOG_ROOT}/{}_{}_{uid}/{}", spec.namespace, spec.name, spec.name);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.give_back(uid, &disks).await;
+            return Err(format!("could not make {dir}: {e}"));
+        }
+        let launched = {
+            let _window = self.deposit_window.lock().await;
+            let launched = self.launch(uid, &spec.namespace, spec, ring, &disks, &dir, None, None).await;
+            if launched.is_err() {
+                if let Err(e) = self.unwind_held(uid, false).await {
+                    warn!(vm = %spec.name, "a failed sealer start's deposits are still held: {e}");
+                }
+            }
+            launched
+        };
+        let (handle, _made, registration) = match launched {
+            Ok(l) => l,
+            Err(e) => {
+                self.give_back(uid, &disks).await;
+                return Err(e);
+            }
+        };
+        let mut reg = registration.running_as(handle.0);
+        reg.disks = registered_disks(&disks, &[]);
+        if let Err(e) = stormvm_node::console::write(RUN_ROOT, &reg) {
+            warn!(vm = %spec.name, "could not record the sealer's handle: {e}");
+        }
+        info!(vm = %spec.name, namespace = %spec.namespace, ?handle, "golden sealer started");
+        Ok(reg)
+    }
+
+    async fn deidentify(&self, reg: &stormvm_node::console::Registration, within: std::time::Duration) -> Result<(), String> {
+        let agent = reg.agent_socket.clone().ok_or_else(|| "the sealer has no agent channel".to_string())?;
+        let gone_now = || async {
+            let (Some(ring), Some(h)) = (self.ring.clone(), reg.workload) else { return false };
+            matches!(tokio::task::spawn_blocking(move || ring.query(Handle(h))).await, Ok(Ok(c)) if exited(c.aux))
+        };
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            if stormvm_control::qga::ping(&agent).await.is_ok() {
+                break;
+            }
+            if gone_now().await {
+                return Err("the sealer exited before its guest agent answered".into());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "the copy's guest agent did not answer within {}s: a golden is de-identified by the guest's \
+                     own agent, and an image without qemu-guest-agent can't be (stormvm#17)",
+                    within.as_secs()
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+        let script = stormvm_node::golden::DEIDENTIFY;
+        let r = stormvm_control::qga::exec(&agent, "/bin/sh", &["-c", script], std::time::Duration::from_secs(300))
+            .await
+            .map_err(|e| format!("de-identifying the copy: {e}"))?;
+        if r.exit != 0 || !r.stdout.contains(stormvm_node::golden::DEIDENTIFIED) {
+            return Err(format!("de-identifying the copy failed (exit {}): {}{}", r.exit, r.stdout.trim(), r.stderr.trim()));
+        }
+        stormvm_control::qga::power_off(&agent).await.map_err(|e| format!("powering the sealer off: {e}"))?;
+        // Waited for; one that does not go is stopped by `stop_sealer`.
+        let gone = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !gone_now().await && tokio::time::Instant::now() < gone {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        Ok(())
+    }
+
+    async fn stop_sealer(&self, reg: &stormvm_node::console::Registration) -> Result<(), String> {
+        let vm = vm_of(reg);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(180);
+        loop {
+            if self.stop(&vm).await {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("not stopped and let go within 180s".into());
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1092,6 +1092,47 @@ Not yet:
   deleting the VM does not delete a disk that moved off the node.
 - Not run on a two-node fabric yet.
 
+### A golden made from a running VM
+
+A `VirtualMachineGolden` (`storm.io/v1alpha1`, short name `vmg`) asks for a
+golden made from a running VMI's root disk (#344, vmcloud-image-operator#50,
+stormvm#17). vmimages writes it (`spec.vm`, `spec.golden`, `spec.image`); the
+kubelet of the node the VM runs on does the work, because it owns the machine,
+its disks and its guest agent. The steps are stormvm's (`stormvm_node::golden`):
+
+1. The root disk alone is snapshotted (frozen and paused for an instant). The
+   source keeps running and is otherwise untouched. `status.phase: Snapshotting`.
+2. A volume is made from the snapshot under `spec.golden`, and booted once as
+   a *sealer*: the source's machine with the copy as its only disk, no NIC, no
+   seed, the guest agent on. `Sealing`, with `status.volumeId`.
+3. Through the agent, the sealer runs stormvm's de-identify script (cloud-init
+   state, machine-id, SSH host keys, hostname, logs) and must print its end
+   marker; it powers off and the copy is detached.
+4. The copy is sealed and the group snapshot deleted. `Sealed`, with `node`,
+   `volumeId`, `volume`, `sha256` (the engine's digest), `arch`, `firmware`,
+   `provenance` (`vm:<ns>/<vm>@<time>`) and `sealedAt`.
+
+Any failure is `Failed` with the reason, and the sealer, the copy and the
+group are removed. A guest with no agent is `Failed`: a golden that was not
+de-identified is worse than none. A request runs once: `Sealed` and `Failed`
+are left alone, and one this node was running when its kubelet restarted is
+`Failed` and cleaned up (ask again). A volume already named `spec.golden` is
+refused before anything is made (stormblock's create by name would answer it,
+and the sealer would rewrite it).
+
+The golden gets **no owner**: it outlives its VM (the registry adopts it, and
+other machines boot it), and a VM-owned volume is deleted by the orphan sweep
+once its VM is gone (#75). Having the node's registry adopt it as media is
+vmimages' step. The sealer is registered as `vmgolden-<request uid>`, which the
+VM manager's orphan and adoption passes leave to its request.
+
+Limits: the engine calls go through stormvm's client, so an `https://` engine
+URL needs #318 (as snapshots do). On one node, `volume_from_snapshot` needs
+stormvm ≥ 893b2e8 (#345: no slave replicas on a restore). The kubelet's
+identity (`system:nodes`) is bound to cluster-admin by rustkube's bootstrap, so
+no RBAC is added; a tightened node role needs `get/list/watch` on
+`virtualmachinegoldens` and `patch` on `virtualmachinegoldens/status`.
+
 ### A stopped VM's disks moved to another node
 
 A stopped VirtualMachine (no VMI) can have its disks moved to another node,
