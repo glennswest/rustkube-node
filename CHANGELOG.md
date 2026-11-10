@@ -1032,6 +1032,9 @@
 
 ## [Unreleased]
 
+### 2026-11-10
+- **docs:** #233 verified on a node: the `multus` suite passed on pvetest1 (12.74, run 131ea41fe0): two NADs as net1/net2, missing NAD refused, address released on DEL.
+
 ### 2026-10-28
 - **fix:** one slow root mount no longer fails every container start behind it, and a root is never deleted while PID 1 is still mounting it (#292; server1, X9 SMR HDD, 12.40/12.54, stormcos#626: one `mount(2)` of cilium's root took 30.95 s, three `VolumeRegister`s gave up at 30 s, and the timed-out root was detached and deleted under the mount: `I/O error, dev ublkb90`, cilium back to init 1). The ring client gives each request with a payload its own region of the arena (first fit, 8-byte aligned, freed at its completion whether its caller still waits or gave up) instead of one arena for every payload request; a request with no room waits without holding the others. A device-form `VolumeRegister` waits 180 s (`MOUNT_DEADLINE`), every other op 30 s as before. A root whose mount timed out stays (and stays out of the orphan sweep) until the ring has the late answer and, for a late success, the release that undoes it; then it is deleted. Needs stormpump#181 on the node for the other ops to be answered during a mount.
 

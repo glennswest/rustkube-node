@@ -2777,7 +2777,7 @@ Steps:
 4. [x] `sc-build 'cargo build --release --locked --target x86_64-unknown-linux-musl'`, then `cargo test --locked`: passed at 6741e93.
 5. [x] Close #58, request the golden.
 
-### Waiting on a release with registry>=9912c98 (stormblock-registry#150, test images on nodes) for the live `multus` run: #233, multi-NIC by the Multus standard
+### Done: #233, multi-NIC by the Multus standard (verified live: multus 131ea41fe0, pvetest1, 12.74)
 
 2026-10-09. `k8s.v1.cni.cncf.io/networks` (names, ns/name, name@if, or the JSON list with interface/ips/mac) and
 `v1.multus-cni.io/default-network`; NADs `k8s.cni.cncf.io/v1` `spec.config`.
@@ -2814,6 +2814,7 @@ Steps:
        2026-11-07 (07:05Z): 27cb670ba3 errored `no VM 3101` (the cluster test's end removes the VMs). adf8a72317 (87e2f2d, pvetest1) is queued behind repeated 12.66 installs (filed on stormcentral); a second multus is queued on pvetest2, whose line is empty. Read whichever finishes first (`stormcentral test list rustkube-node`); close on a pass, or fix what fails.
        2026-11-07 (09:45Z): adf8a72317 errored `no VM 3101` too. 6eaa04e0e7 (pvetest2) waited from 07:43Z while pvetest2 installed and passed 12.67 eight times, and it was never dispatched (stormcentral#1266, evidence added). Queued fc7746d676 (b874e96, pvetest1, idle at 12.67 passed). #233 proposed after stormcentral#1266. Resume: `stormcentral test list rustkube-node`, read whichever multus run finished (`test show <id>`); close on a pass, or fix what fails; on another machine error, queue on a pve machine that has passed a release.
        2026-11-10: fc7746d676 errored `no VM 3101` too. pvetest1/2/3 have all passed 12.74. Queued multus 131ea41fe0 (8b8ebef, pvetest1). Resume: `stormcentral test show 131ea41fe0`; close on a pass, or fix what fails.
+       2026-11-10: 131ea41fe0 passed 3/0/0: bridge on net1 + macvlan on net2 with IPv4, network-status default first; a missing NAD = Pending with FailedCreatePodSandBox naming it; a one-address host-local range released by DEL and reused. Closed.
 
 ### Done: #231 + #232 (P0, stormcos#488): verified live on the Dell, 12.07
 
