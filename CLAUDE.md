@@ -58,11 +58,13 @@ by #51.
 
 ## Work plan
 
-### Doing: #355 (P3), stormvm → 13a0781: passt as 65534 by number (stormvm#7)
+### Done: #355 (P3), stormvm → 13a0781: passt as 65534 by number (stormvm#7)
 
 2026-11-10. 5 commits on 71bf5b5, no manifest change (stormvm-vmm passt/qemu, stormvm-net linux.rs, stormvm-node plan.rs, control hotplug).
 No kubelet code names the passt socket path. Rev-only bump; README/status.md, CHANGELOG; SC_BUILD_VM sc-build `--locked`; stage; close (stormvm#7
 closes on medium's `passt-reached` on a pve machine with a release carrying it).
+Done: 1a8b492. SC_BUILD_VM sc-build (VM sc-build-888bde7fc4): `--locked` metadata/build/test, 631 kubelet unit, all suites; 9 stormvm lock entries at 13a0781;
+warnings unchanged (#227's). Stage build 795af1305809. Closed. Live: stormvm medium `passt-reached` on a pve machine with a release carrying it.
 
 ### Waiting on a release with e8242e9 on an X9 blade: #348 (P3), RDMA verbs for a pod that asks (stormcos#914)
 
