@@ -67,7 +67,7 @@ Doing: bump, status.md, CHANGELOG; SC_BUILD_VM sc-build `cargo metadata --locked
 Done: 7c37659. SC_BUILD_VM sc-build (VM sc-build-a6a630cdc5): `--locked` metadata/build/test, 624 kubelet unit, all suites; 9 stormvm lock entries at 893b2e8.
 Stage build 1e5aa3c76f78. Closed. Live: stormvm medium `snapshot-restore` / `memsnap-*` on a release carrying it; #344's live run follows.
 
-### Waiting on #345 (stormvm 893b2e8) for the live run: #344 (P3), the golden-from-VM sealer: reconcile storm.io VirtualMachineGolden (vmcloud-image-operator#50)
+### Waiting on a release with 7c37659 for the live run: #344 (P3), the golden-from-VM sealer: reconcile storm.io VirtualMachineGolden (vmcloud-image-operator#50)
 
 2026-11-10. stormvm 6e188a6 (the lock) has `stormvm_node::golden` (root_disk, sealer_spec, DEIDENTIFY/DEIDENTIFIED, provenance) and the
 flow in its CLI (`make_golden`). Not in a library, so the kubelet runs the steps itself. Chosen: no owner on the golden (#75's sweep deletes
@@ -84,6 +84,7 @@ by this node and not in flight (a kubelet restart) is Failed and cleaned up (onc
        `volume_from_snapshot` is refused by stormblock without #345's stormvm (no slave replicas). #344 proposed after #345.
        Resume: on a release with #345 + this, a vmimages golden-from-VM request (or a hand-made `VirtualMachineGolden`) on a VM with
        qemu-guest-agent: `Sealed` with volumeId/sha256, the golden clones and boots with a new machine-id; a no-agent guest `Failed`, nothing left.
+       2026-11-10: #345 done (7c37659, has 613dbed). No release carries it: 12.74.7 has 8b8ebef, 12.75 has 78bf751. Proposed `--after-release rustkube-node>=7c37659`.
 
 ### Waiting on a release with 6f94966 + a stormimds `node` run: #342 (P2), /vmInstance: a host-network pod's bound token answered 404 (stormimds#19, pvetest2)
 
