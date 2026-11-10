@@ -95,7 +95,7 @@ by this node and not in flight (a kubelet restart) is Failed and cleaned up (onc
        qemu-guest-agent: `Sealed` with volumeId/sha256, the golden clones and boots with a new machine-id; a no-agent guest `Failed`, nothing left.
        2026-11-10: #345 done (7c37659, has 613dbed). No release carries it: 12.74.7 has 8b8ebef, 12.75 has 78bf751. Proposed `--after-release rustkube-node>=7c37659`.
 
-### Waiting on a release with 6f94966 + a stormimds `node` run: #342 (P2), /vmInstance: a host-network pod's bound token answered 404 (stormimds#19, pvetest2)
+### Done: #342 (P2), /vmInstance: a host-network pod's bound token answered 404 (stormimds#19, pvetest2)
 
 2026-11-07. Reading the code doesn't say which of `pod_by_token`'s five silent `None`s it is. rustkube's TokenReview fills `extra` pod-name/pod-uid/node-name (auth.rs).
 One real weakness: `node_ip_holds` ran `ip -o addr show`; an `ip` that ran and failed printed nothing, so "not the node's" → machine index → 404.
@@ -111,6 +111,8 @@ Done: 3ba401f (2 tests; SC_BUILD_VM sc-build `cd test`: clippy -D warnings, 49 t
 which does NOT carry 6f94966): loopback and node IP both `404 no machine at <ip>` (and no-token too): `ip -o addr show` matched nothing, not even 127.0.0.1,
 so every address read as "not the node's". Cause proven; 6f94966 (getifaddrs) is the fix. 12.74.7/.9, 12.77, 12.78 carry 8b8ebef (has it). Queued metadata on
 pvetest1 (installing 12.78). Resume: that run passes both own-token cases → close, tell stormimds#19 to rerun `node`.
+metadata ccb750ba4b (bd7097d, pvetest1, 12.78 = 8b8ebef): 3/0/0, own token at 127.0.0.1 and 192.168.31.172 → 200 with its own Pod; no token → 404
+"is this node's own address". Closed; stormimds#19 asked to rerun `node` on a release >= 12.74.7.
 
 ### Waiting on stormcentral#1274 (the cluster test's pod timing): #340 (P1), first pod on a cluster worker 2.1 s (flowsdn) / 4.1 s (cilium) vs 160 ms on one node
 
