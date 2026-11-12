@@ -13,6 +13,7 @@ a row says so.
 
 | Area | Current code and issues |
 |---|---|
+| Pod condition times (#340) | every condition the kubelet writes has `lastTransitionTime`: kept while its status holds, the write's time on a flip, PodScheduled the bind's (`storm.io/scheduled-at`). A projected volume's sources (token, ConfigMap, Secret, downwardAPI) are fetched concurrently |
 | Each container its own root (#104, owner's option A) | `create_container` clones the image's sealed golden (a pallet's `<volume>.golden`, a pull's sbregistry fstemplate) into engine volume `ctr-<container>`, attached over ublk and mounted by PID 1 at `/run/stormpump/roots/<container>`; deleted with the container, a restart gets a fresh one; orphans swept at start. A pull clones nothing any more (#143's image-level clone and #161 are superseded). `readOnlyRootFilesystem` still mounts it writable (stormpump#108) |
 | A carried golden with no boot mount (#294) | `/etc/stormblock/carried` (`<vol>:/p/<image>`) or an unmounted mount-list entry resolves through the engine's sealed `<vol>.golden`. stormcos's half (moving the optional servers to that list) and the live check are stormcos#826; not yet run on a node |
 | fsGroup (#171) | the pod's fsGroup + supplementalGroups are the container's groups (`Spec.groups`); a claim's filesystem is given to fsGroup before the start (group rw, setgid dirs; `OnRootMismatch` honoured) |

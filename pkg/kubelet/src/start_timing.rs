@@ -365,7 +365,7 @@ pub const SCHEDULED_AT: &str = "storm.io/scheduled-at";
 /// else its `PodScheduled` condition's transition; else its creation (a pod
 /// made with `nodeName` set never passes the scheduler). The last two are
 /// metav1.Time, whole seconds, so they carry up to a second of truncation.
-fn scheduled_at(pod: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+pub(crate) fn scheduled_at(pod: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
     let parse = |t: &str| chrono::DateTime::parse_from_rfc3339(t).ok().map(|t| t.with_timezone(&chrono::Utc));
     if let Some(t) = pod["metadata"]["annotations"][SCHEDULED_AT].as_str().and_then(parse) {
         return Some(t);

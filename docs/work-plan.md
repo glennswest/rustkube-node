@@ -93,6 +93,7 @@ compiling BPF). 1439e5f1ee (12.74.7-flowsdn) never joined (flowsdn#404, closed).
 The pod's own timestamps read "scheduled not set, Ready not set": the kubelet writes conditions with no `lastTransitionTime` and drops the
 scheduler's. Doing: (1) conditions carry `lastTransitionTime` (kept while unchanged, now on a flip, PodScheduled's from the scheduler);
 (2) a projected volume's sources fetched concurrently. Then sc-build, stage, and the next cluster test on both flavours decides close.
+Done in code: `stamp_condition_transitions` (kubelet.rs, test `conditions_carry_their_transition_times`), `materialize_projected` → `try_join_all`.
 
 ### Earlier: waiting on stormcentral#1274 (the cluster test's pod timing): #340 (P1), first pod on a cluster worker 2.1 s (flowsdn) / 4.1 s (cilium) vs 160 ms on one node
 

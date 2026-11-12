@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-11-12
+
+- **fix:** Pod conditions carry `lastTransitionTime` (#340). The kubelet wrote PodScheduled, Initialized, ContainersReady and Ready with no transition time, and overwrote the scheduler's, so a reader of the pod (the cluster test's "pod's own timestamps", stormcentral#1274) saw "scheduled not set, Ready not set". Each condition now keeps its time from the last status while its value holds, and takes the write's time when it flips or is new. PodScheduled takes the bind's (`storm.io/scheduled-at`, else creation). An unchanged status still compares equal to the last one, so it is still not written again.
+
+- **perf:** A projected volume's sources are fetched at once, not one after another (#340). On a worker, kube-api-access's TokenRequest and its kube-root-ca.crt ConfigMap each cross to the apiserver; in a row they were 328 ms of a worker's first pod (5 ms on one node).
+
 ## 2026-11-10
 
 - **fix:** stormvm → 13a0781 (#355, stormvm#7). A `pod:passt` VMI's passt now starts on a node. It runs `--runas 65534:65534` by number, because a stormcos node has no passwd entry for `nobody`, so passt exited before binding its socket and every start was refused at `HelperReady`. Its socket moves to `<socket_dir>/passt/<tap>.sock`, a directory owned by 65534 with mode 0700. Rev-only bump: no API the kubelet uses changed, and no kubelet code names the socket path.

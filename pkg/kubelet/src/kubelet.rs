@@ -1789,7 +1789,8 @@ impl Kubelet {
         let acked = self.acked_status.lock().unwrap_or_else(|e| e.into_inner()).get(&uid).cloned();
         let (base, revision) = status_base(source, acked.as_ref());
         // What this kubelet says, kept apart from any base it is merged onto.
-        let ours = status;
+        let mut ours = status;
+        stamp_condition_transitions(&mut ours, &base, source, &now);
         let status = merge_status(&base, &ours);
         if status == base {
             crate::metrics::observe_status_write("skipped");
@@ -3037,6 +3038,36 @@ fn merge_status(base: &Value, status: &Value) -> Value {
     Value::Object(merged)
 }
 
+/// Each condition's `lastTransitionTime` (#340), as upstream's kubelet
+/// writes it: carried from the same condition in `base` while its status
+/// holds, `now` when it flips or is new. A `PodScheduled` the base has no
+/// time for takes the bind's (`storm.io/scheduled-at`, else creation). The
+/// kubelet wrote none, and dropped the scheduler's, so a reader of the pod
+/// could not tell when it was scheduled or became Ready. Carried, not
+/// restamped, so an unchanged status still compares equal and is not written.
+fn stamp_condition_transitions(status: &mut Value, base: &Value, source: &Value, now: &str) {
+    let before = |kind: &Value| {
+        base["conditions"].as_array().into_iter().flatten().find(|c| &c["type"] == kind).cloned()
+    };
+    for c in status["conditions"].as_array_mut().into_iter().flatten() {
+        let prior = before(&c["type"]);
+        let carried = prior
+            .as_ref()
+            .filter(|p| p["status"] == c["status"])
+            .and_then(|p| p["lastTransitionTime"].as_str().map(String::from));
+        let at = carried.unwrap_or_else(|| {
+            let scheduled_before = prior.as_ref().is_none_or(|p| p["status"] == "True");
+            if c["type"] == "PodScheduled" && c["status"] == "True" && scheduled_before {
+                if let Some(t) = crate::start_timing::scheduled_at(source) {
+                    return t.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                }
+            }
+            now.to_string()
+        });
+        c["lastTransitionTime"] = Value::String(at);
+    }
+}
+
 /// The status to compare a new one with, and the revision to write it on
 /// (#141). The watch's copy (`source`), unless it is still at the revision
 /// this kubelet's last acknowledged write was made on: then that write is
@@ -3069,6 +3100,38 @@ mod status_base_tests {
 
     fn pod(rv: &str, phase: &str) -> Value {
         serde_json::json!({"metadata": {"uid": "u", "resourceVersion": rv}, "status": {"phase": phase}})
+    }
+
+    /// #340: a condition keeps its transition while its status holds, takes
+    /// `now` when it flips, and PodScheduled takes the bind's time.
+    #[test]
+    fn conditions_carry_their_transition_times() {
+        let source = serde_json::json!({"metadata": {"creationTimestamp": "2026-11-12T10:00:00Z",
+            "annotations": {"storm.io/scheduled-at": "2026-11-12T10:00:01.250000Z"}}});
+        let base = serde_json::json!({"conditions": [
+            {"type": "PodScheduled", "status": "True"},
+            {"type": "Initialized", "status": "True", "lastTransitionTime": "2026-11-12T10:00:02Z"},
+            {"type": "Ready", "status": "False", "lastTransitionTime": "2026-11-12T10:00:02Z"}]});
+        let mut ours = serde_json::json!({"conditions": [
+            {"type": "PodScheduled", "status": "True"},
+            {"type": "Initialized", "status": "True"},
+            {"type": "ContainersReady", "status": "True"},
+            {"type": "Ready", "status": "True"}]});
+        stamp_condition_transitions(&mut ours, &base, &source, "2026-11-12T10:00:03Z");
+        let at = |k: &str| ours["conditions"].as_array().unwrap().iter().find(|c| c["type"] == k).unwrap()["lastTransitionTime"].clone();
+        assert_eq!(at("PodScheduled"), "2026-11-12T10:00:01Z", "the bind's time");
+        assert_eq!(at("Initialized"), "2026-11-12T10:00:02Z", "held: carried");
+        assert_eq!(at("ContainersReady"), "2026-11-12T10:00:03Z", "new: now");
+        assert_eq!(at("Ready"), "2026-11-12T10:00:03Z", "flipped: now");
+
+        // The same status again, an hour later, is the same status: nothing to write.
+        let mut again = serde_json::json!({"conditions": [
+            {"type": "PodScheduled", "status": "True"},
+            {"type": "Initialized", "status": "True"},
+            {"type": "ContainersReady", "status": "True"},
+            {"type": "Ready", "status": "True"}]});
+        stamp_condition_transitions(&mut again, &ours, &source, "2026-11-12T11:00:00Z");
+        assert_eq!(again, ours);
     }
 
     /// #275: observedGeneration on the status and every condition; the spec's

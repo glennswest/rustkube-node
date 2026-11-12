@@ -2887,6 +2887,10 @@ impl PodManager {
 
     /// Materialize a projected volume's sources into `dir`: serviceAccountToken
     /// (via TokenRequest, best-effort), configMap, secret, and downwardAPI.
+    /// The sources are fetched at once, not one after another (#340): each
+    /// writes its own paths, and on a worker every fetch crosses to the
+    /// apiserver, so kube-api-access's token and kube-root-ca.crt took two
+    /// round trips in a row (328 ms of a worker's first pod).
     async fn materialize_projected(
         &self,
         pod: &Value,
@@ -2894,39 +2898,52 @@ impl PodManager {
         dir: &str,
         sources: &[Value],
     ) -> std::io::Result<()> {
-        for src in sources {
-            if let Some(sat) = src.get("serviceAccountToken").filter(|v| !v.is_null()) {
-                let path = sat["path"].as_str().unwrap_or("token");
-                let aud = sat["audience"].as_str();
-                // Bound to the pod, for the projection's own lifetime
-                // (upstream's default 3600 s), refreshed at 80% (#122).
-                let secs = sat["expirationSeconds"].as_i64().unwrap_or(3600).max(600);
-                self.write_bound_token(pod, dir, path, aud, secs).await?;
-            } else if let Some(cm) = src.get("configMap").filter(|v| !v.is_null()) {
-                let name = cm["name"].as_str().unwrap_or("");
-                let data = self
-                    .fetch_configmap(namespace, name)
-                    .await
-                    .and_then(|o| o["data"].as_object().cloned());
-                write_projected_items(dir, cm["items"].as_array(), data.as_ref())?;
-            } else if let Some(sec) = src.get("secret").filter(|v| !v.is_null()) {
-                let name = sec["name"].as_str().unwrap_or("");
-                let decoded = self.fetch_secret_decoded(namespace, name).await;
-                if let Some(data) = decoded {
-                    let asmap: serde_json::Map<String, Value> = data
-                        .into_iter()
-                        .map(|(k, v)| (k, Value::String(v)))
-                        .collect();
-                    write_projected_items(dir, sec["items"].as_array(), Some(&asmap))?;
-                }
-            } else if let Some(dw) = src.get("downwardAPI").filter(|v| !v.is_null()) {
-                if let Some(items) = dw["items"].as_array() {
-                    for it in items {
-                        let path = it["path"].as_str().unwrap_or("");
-                        if let Some(fp) = it["fieldRef"]["fieldPath"].as_str() {
-                            if let Some(val) = self.downward_field(pod, fp, None) {
-                                std::fs::write(format!("{dir}/{path}"), val)?;
-                            }
+        futures::future::try_join_all(
+            sources.iter().map(|src| self.materialize_projected_source(pod, namespace, dir, src)),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// One source of a projected volume (see `materialize_projected`).
+    async fn materialize_projected_source(
+        &self,
+        pod: &Value,
+        namespace: &str,
+        dir: &str,
+        src: &Value,
+    ) -> std::io::Result<()> {
+        if let Some(sat) = src.get("serviceAccountToken").filter(|v| !v.is_null()) {
+            let path = sat["path"].as_str().unwrap_or("token");
+            let aud = sat["audience"].as_str();
+            // Bound to the pod, for the projection's own lifetime
+            // (upstream's default 3600 s), refreshed at 80% (#122).
+            let secs = sat["expirationSeconds"].as_i64().unwrap_or(3600).max(600);
+            self.write_bound_token(pod, dir, path, aud, secs).await?;
+        } else if let Some(cm) = src.get("configMap").filter(|v| !v.is_null()) {
+            let name = cm["name"].as_str().unwrap_or("");
+            let data = self
+                .fetch_configmap(namespace, name)
+                .await
+                .and_then(|o| o["data"].as_object().cloned());
+            write_projected_items(dir, cm["items"].as_array(), data.as_ref())?;
+        } else if let Some(sec) = src.get("secret").filter(|v| !v.is_null()) {
+            let name = sec["name"].as_str().unwrap_or("");
+            let decoded = self.fetch_secret_decoded(namespace, name).await;
+            if let Some(data) = decoded {
+                let asmap: serde_json::Map<String, Value> = data
+                    .into_iter()
+                    .map(|(k, v)| (k, Value::String(v)))
+                    .collect();
+                write_projected_items(dir, sec["items"].as_array(), Some(&asmap))?;
+            }
+        } else if let Some(dw) = src.get("downwardAPI").filter(|v| !v.is_null()) {
+            if let Some(items) = dw["items"].as_array() {
+                for it in items {
+                    let path = it["path"].as_str().unwrap_or("");
+                    if let Some(fp) = it["fieldRef"]["fieldPath"].as_str() {
+                        if let Some(val) = self.downward_field(pod, fp, None) {
+                            std::fs::write(format!("{dir}/{path}"), val)?;
                         }
                     }
                 }
