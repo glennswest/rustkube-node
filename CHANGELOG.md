@@ -1060,6 +1060,9 @@
 
 ## [Unreleased]
 
+### 2026-11-12
+- **docs:** the work plan and session history move from CLAUDE.md to docs/work-plan.md, unchanged. At their old size CLAUDE.md filled the session's context window, so the session compacted over and over.
+
 ### 2026-11-10
 - **docs:** #233 verified on a node: the `multus` suite passed on pvetest1 (12.74, run 131ea41fe0): two NADs as net1/net2, missing NAD refused, address released on DEL.
 

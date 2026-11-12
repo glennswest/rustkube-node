@@ -1,0 +1,2953 @@
+# rustkube-node — work plan
+
+Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context window, so the session compacted again and again without doing any work. Nothing was removed; this is the full plan and its history, as it was.
+
+## Work plan
+
+### Done: #355 (P3), stormvm → 13a0781: passt as 65534 by number (stormvm#7)
+
+2026-11-10. 5 commits on 71bf5b5, no manifest change (stormvm-vmm passt/qemu, stormvm-net linux.rs, stormvm-node plan.rs, control hotplug).
+No kubelet code names the passt socket path. Rev-only bump; README/status.md, CHANGELOG; SC_BUILD_VM sc-build `--locked`; stage; close (stormvm#7
+closes on medium's `passt-reached` on a pve machine with a release carrying it).
+Done: 1a8b492. SC_BUILD_VM sc-build (VM sc-build-888bde7fc4): `--locked` metadata/build/test, 631 kubelet unit, all suites; 9 stormvm lock entries at 13a0781;
+warnings unchanged (#227's). Stage build 795af1305809. Closed. Live: stormvm medium `passt-reached` on a pve machine with a release carrying it.
+
+### Waiting on a release with e8242e9 on an X9 blade: #348 (P3), RDMA verbs for a pod that asks (stormcos#914)
+
+2026-11-10. Found: stormpump (9877a97 and main) has no device list and no rlimit in `Spec`; its container /dev is a tmpfs without
+nodev, binds under /dev land since stormpump#222, and it attaches no cgroup device filter (every device usable once its node is there).
+So: (1) `rdma.rs`: devices from sysfs (`/sys/class/infiniband_verbs/uverbsN`, `/sys/class/misc/rdma_cm`); `rdma.storm.io/hca: <uverbs
+count>` on capacity/allocatable where both exist (stormpump engine only, as KVM). (2) A container whose requests/limits ask for it:
+binds of `/dev/infiniband/<uverbsN|rdma_cm>` (as a Block claim's device) and `CAP_IPC_LOCK` added (the kernel's `ib_umem_get` lets
+CAP_IPC_LOCK pin past RLIMIT_MEMLOCK), in `create_container`; none on the node = refused (CreateContainerError, retried). (3) File
+stormpump: `Spec` rlimits (MEMLOCK) so the limit itself can be raised; then swap. Tests, README/configuration.md, CHANGELOG; sc-build;
+stage. Live: needs a RoCE node with the verbs modules (stormcos#914).
+Done: e8242e9 (code, 7 tests), 9581611/482bddd (docs), 5d5542f (medium `pod-rdma`, workload `rdma-view`). SC_BUILD_VM sc-build (VM sc-build-ab97f42d1b):
+631 kubelet unit, all suites, same warnings as before (#227's), clippy nothing in the new code; `cd test` (VM sc-build-5be21b4531): clippy -D warnings, 50 tests.
+Stage build dfc286e1e525. Filed stormpump#230 (Spec rlimits, MEMLOCK), rustkube#315 (scheduler: extended resources). Proposed `--after-release rustkube-node>=e8242e9`.
+Resume: an X9 blade (ConnectX-3, stormcos#914's modules) on a release with it: Node shows `rdma.storm.io/hca`; `stormcentral test run rustkube-node medium --tag
+server8` (after a pve pass, #791): `pod-rdma` passes (not skipped); close. If the blade shows no resource: `/sys/class/infiniband_verbs` on it (stormcos#914).
+
+### Done: #352 (P2), stormvm → 71bf5b5: machine.type (pc/i440fx) and the ide bus (stormvm#117)
+
+2026-11-10. 12 commits on 893b2e8, no manifest change (stormvm-spec lib/kube/validate/boot, stormvm-vmm qemu, stormvm-control hotplug's
+no-port message). `VmSpec.machine` has a default (no literal here); `DiskBus::Ide` falls into `hot_disk`'s catch-all refusal. Rev-only bump
+in pkg/kubelet/Cargo.toml + Cargo.lock; README/status.md, CHANGELOG; SC_BUILD_VM sc-build `cargo metadata --locked && cargo build --locked
+&& cargo test --locked`; stage; close (stormvm#117 closes on stormvm's medium `pc-running` on a release carrying it).
+Done: f4b9c92. SC_BUILD_VM sc-build (VM sc-build-3b7219c862): `--locked` metadata/build/test, 624 kubelet unit, all suites; 9 stormvm lock entries at 71bf5b5;
+warnings = #227's 9. Stage build 911ec2ba4513. Closed. Live: stormvm medium `pc-running` on a release carrying it.
+
+### Done: #345 (P3), stormvm → 893b2e8: restore with no slave replicas, sizes in stormblock's units (stormvm#28)
+
+2026-11-10. 893b2e8 on 6e188a6: code only in stormvm-block lib.rs (`restore_body` replica_tier.slaves 0, `engine_size`), no manifest
+or Cargo.lock change upstream: rev-only bump in pkg/kubelet/Cargo.toml + Cargo.lock. Also unblocks #344's live run (one node).
+Doing: bump, status.md, CHANGELOG; SC_BUILD_VM sc-build `cargo metadata --locked && cargo build --locked && cargo test --locked`; stage; close
+(stormvm#28/#37 close on stormvm's medium run on a release carrying it).
+Done: 7c37659. SC_BUILD_VM sc-build (VM sc-build-a6a630cdc5): `--locked` metadata/build/test, 624 kubelet unit, all suites; 9 stormvm lock entries at 893b2e8.
+Stage build 1e5aa3c76f78. Closed. Live: stormvm medium `snapshot-restore` / `memsnap-*` on a release carrying it; #344's live run follows.
+
+### Waiting on a release with 7c37659 for the live run: #344 (P3), the golden-from-VM sealer: reconcile storm.io VirtualMachineGolden (vmcloud-image-operator#50)
+
+2026-11-10. stormvm 6e188a6 (the lock) has `stormvm_node::golden` (root_disk, sealer_spec, DEIDENTIFY/DEIDENTIFIED, provenance) and the
+flow in its CLI (`make_golden`). Not in a library, so the kubelet runs the steps itself. Chosen: no owner on the golden (#75's sweep deletes
+VM-owned volumes once the VM is gone; a golden outlives it). A volume already named `spec.golden` is refused (stormblock's create-by-name
+would answer it, and the sealer would boot an existing golden). The sealer is launched through the kubelet's own path (`launch`, deposit
+window) under uid `vmgolden-<request uid>`, which `reconcile_registered`/`adopt_registered` leave alone. A request found Snapshotting/Sealing
+by this node and not in flight (a kubelet restart) is Failed and cleaned up (once only). Doing:
+1. [x] `vm_golden.rs`: decide, claim (status.node + phase, rv-guarded), run (snapshot root, copy, sealer, DEIDENTIFY, stop, seal, digest,
+       delete group), Failed + cleanup; `Engine`/`Machines` seams; tests with fakes.
+2. [x] VmManager: `start_sealer`/`stop_sealer`/snapshot/agent; kubelet wiring (maintenance loop, watch); docs, CHANGELOG; sc-build; stage.
+       Done: 613dbed (+ f26ada1 style). SC_BUILD_VM sc-build (VM sc-build-ff26dfe520): 624 kubelet unit (8 new), all suites; nothing from
+       clippy/rustc in the new code (#227's 9 elsewhere). Stage build 416df36080f8.
+3. [ ] RBAC: none needed (rustkube binds system:nodes to cluster-admin; README names the rules for a tightened role). Live: on one node
+       `volume_from_snapshot` is refused by stormblock without #345's stormvm (no slave replicas). #344 proposed after #345.
+       Resume: on a release with #345 + this, a vmimages golden-from-VM request (or a hand-made `VirtualMachineGolden`) on a VM with
+       qemu-guest-agent: `Sealed` with volumeId/sha256, the golden clones and boots with a new machine-id; a no-agent guest `Failed`, nothing left.
+       2026-11-10: #345 done (7c37659, has 613dbed). No release carries it: 12.74.7 has 8b8ebef, 12.75 has 78bf751. Proposed `--after-release rustkube-node>=7c37659`.
+
+### Done: #342 (P2), /vmInstance: a host-network pod's bound token answered 404 (stormimds#19, pvetest2)
+
+2026-11-07. Reading the code doesn't say which of `pod_by_token`'s five silent `None`s it is. rustkube's TokenReview fills `extra` pod-name/pod-uid/node-name (auth.rs).
+One real weakness: `node_ip_holds` ran `ip -o addr show`; an `ip` that ran and failed printed nothing, so "not the node's" → machine index → 404.
+Doing: `instance_lookup` → `Result<Value, reason>`; each refusal a WARN and the 404's `error`; node addresses by getifaddrs; test (fake apiserver: answered, not authenticated,
+unbound, other node, pod elsewhere, no apiserver); api.md, CHANGELOG; sc-build; stage; ask stormimds to rerun `node`; fix what the reason names; close on a pass.
+Done: 6f94966. SC_BUILD_VM sc-build (VM sc-build-c190f556df): 616 kubelet unit (1 new), all suites; clippy nothing on the new lines. node_reregister's two failures in that
+run pass 4/4 alone (VM sc-build-58b60d0015): a flake, not this change. Stage build c293a652fe3e. Proposed `--after-release rustkube-node>=6f94966`; asked on stormimds#19.
+Resume: the `stormimds node` run's 404 `error` (or `testhost logs <m> kubelet --search vmInstance`) names the check; fix it here or file it where it lies; close on a pass.
+2026-11-10: 12.74 carries 6f94966, but no stormimds `node` run since (its last, 4b9245e5d6, is on 7797220 before it). Doing: our own `metadata` suite
+(host_network): a hostNetwork pod asks https://127.0.0.1:10250/vmInstance/{127.0.0.1, node IP} with its token (+ no-workload-token case); workload
+`vm-instance`; requires.toml, README, CHANGELOG; sc-build `cd test`; run on pvetest3; fix what its `error` names; close on a pass (tell stormimds#19).
+Done: 3ba401f (2 tests; SC_BUILD_VM sc-build `cd test`: clippy -D warnings, 49 tests, release). metadata c890193e1a (pvetest3, 12.74 = rustkube-node 78bf751,
+which does NOT carry 6f94966): loopback and node IP both `404 no machine at <ip>` (and no-token too): `ip -o addr show` matched nothing, not even 127.0.0.1,
+so every address read as "not the node's". Cause proven; 6f94966 (getifaddrs) is the fix. 12.74.7/.9, 12.77, 12.78 carry 8b8ebef (has it). Queued metadata on
+pvetest1 (installing 12.78). Resume: that run passes both own-token cases → close, tell stormimds#19 to rerun `node`.
+metadata ccb750ba4b (bd7097d, pvetest1, 12.78 = 8b8ebef): 3/0/0, own token at 127.0.0.1 and 192.168.31.172 → 200 with its own Pod; no token → 404
+"is this node's own address". Closed; stormimds#19 asked to rerun `node` on a release >= 12.74.7.
+
+### Waiting on stormcentral#1274 (the cluster test's pod timing): #340 (P1), first pod on a cluster worker 2.1 s (flowsdn) / 4.1 s (cilium) vs 160 ms on one node
+
+2026-11-07. Found, no kubelet change: the cluster test's `pinned_pod` GETs once, then sleeps `poll()` = 2000 ms, so every pod step is a
+2 s tick. First pod across six runs: 2.0, 2.1, 4.1, 2.1, 4.1, 2.0 s; the new pod after the reboot reads 2.0 or 8.0 s. The worker kubelet's own `storm.io/start-timing` in the same runs
+(the claim pod): flowsdn dc28256b39 total 0.2 s (scheduled 0.2, volumes 0.1, containers 0.1, report 0.0); cilium's claim pod is the CNI
+(stormcos-cilium#51: wait ~290-319 s, sandbox 1.7-29.7 s). `scheduled` on a worker spans the seed's and the worker's clocks (b786ac9768: -0.3 s),
+as README already says. The first pod's own split was never printed (only past 30 s). Filed stormcentral#1274 (time from the pod's
+timestamps, print the kubelet's phases for every pod step). Worker console rings no longer hold those boots. #340 proposed after it.
+Resume: the next cluster test on both flavours with #1274: if the first pod reads within ~300 ms of a single node, close; else fix the
+kubelet phase that is slow, or file it where it lies (cilium `sandbox/cni` = stormcos-cilium; `scheduled` = rustkube's scheduler / the VIP watch).
+
+### Done: #338 (P1), move a bound built-in claim to another node: mirror, stop, cut over, rebind (stormcos#806 tests 1, 5)
+
+2026-11-07. The names are stormcluster#104's and stormcos_qa#84's (comments on #338): request `storm.io/move-to` (+ `storm.io/move-set`) on
+the PVC; `storm.io/move-state` (`copying`, `synced` = the drain evicts, `cutting-over`, `complete`; `failed`/`aborted`/`refused` with
+`storm.io/move-reason`), `storm.io/move-progress`; cut over is read from the PV's node. Found: stormstorage's migrate takes a detached
+volume, `name` and `placement` (#106's code), and names B's copy like A's (`pvc-<ns>-<claim>`), which is the PV's `volumeHandle`, so
+the rebind is the PV's `nodeAffinity` + `storm.io/node` only; rustkube's apiserver has no PV update validation (no rustkube change).
+Doing: `claim_move.rs` (names, step, refusals, PV patch, start hold), PodManager `move_claims` on A (the PV's node, or `storm.io/move-from`
+while active) in the CSI-sweep loop (PVC + node-pod watches): refuse RWX / pods on another node / target not Ready or no room / a
+node-service volume; migrate (placement `{"array": set}`); synced; when no pod here holds it (reclaim guard): `cutting-over`, detach,
+cutover, complete, rebind PV, `complete`; any failure before cutover: abort. A start here waits on a claim being cut over or whose
+PV is another node's (never a fresh blank beside a moved volume). `--stormstorage` into the pod manager. Tests, README/status.md,
+CHANGELOG; sc-build; stage; answer stormcluster's question (after cutover: `complete`); live = stormcos#806 test 1.
+Done: 78bf751 (8 tests). SC_BUILD_VM sc-build (VM sc-build-2cbc435aa7): 615 kubelet unit, all suites, no new rustc warning (#227's, shifted). Stage build c5780361b7e0. Closed. Live: stormcos#806 tests 1/5, stormcos_qa#84 `move/claim-node` on the pvetest pair.
+
+### Done: #339 (P1), move a stopped VM's disks to another node, so it starts there (stormcos#806 test 3)
+
+2026-11-07. Found: #302's record (`storm.io/disk-moves`) lives on the VMI and goes with it; rustkube's VM controller copies
+`spec.template.metadata.annotations` onto each new VMI, and its scheduler honours the VMI's `nodeSelector`. stormstorage's
+migrate mirrors in S's engine (stormblock `/volumes/{id}/mirror`), nothing in it needs an attach (stormstorage#106 asks to confirm).
+Chosen: request `storm.io/move-to: <node>` on the VirtualMachine; the record is #302's, written on the VM's
+`spec.template.metadata.annotations` (so the next VMI carries it and its start attaches the moved volumes), each entry
+`stopped: true`; a one-line `storm.io/move-status` on the VM; once every disk is on B, `spec.template.spec.nodeSelector`
+`kubernetes.io/hostname: B` (the next start is scheduled there). Driven by the kubelet whose engine holds the disk
+(the record's location, else a volume `<ns>.<vm>-<disk>` owned by the VM). No pause: synced → cutover → complete.
+Refused while a VMI exists or a disk is attached; a VMI appearing mid-copy aborts it. A failure aborts the disks still
+copying. A start waits while a stopped-move is active or its disks are on two nodes. B's start sets the VM's owner on the moved volume.
+Doing: vm_disk_move.rs (request/record/status/hold helpers), VmManager `move_stopped_vms` (maintenance loop), the start
+hold, tests (fake apiserver + stormstorage + engine), README/status.md, CHANGELOG; sc-build; stage; live check = stormcos#806 test 3.
+Done: a5182ad (+ 6ac5d40, aa15125 test fixes: a fixture without memory, and two locks of one std mutex in one statement that hung the first test job). SC_BUILD_VM sc-build aa15125 (VM sc-build-48b58a60c9): 607 kubelet unit (8 new), all suites, no rustc warning in the touched files (#227's elsewhere). Stage build 759e4e3f039e. Closed. Live: stormcos#806 test 3 on stormcentral#360's pvetest pair (needs stormstorage#106's detached migrate).
+
+### Done: #337 (P3), stormvm → 6e188a6: no guest agent by default on cloud-hypervisor (stormvm#1)
+
+2026-11-07. 55 commits on 0225218; manifests: stormvm-block gains `rustls` 0.23 (in our graph), rcgen as a dev-dependency only; stormvm-verify is not in our graph.
+API additive (`stormvm_block::Ca`, `Client::with_ca`: #318's, not here). Doing: rev bump in Cargo.toml + Cargo.lock by hand (+ `rustls` under stormvm-block), status.md, CHANGELOG;
+SC_BUILD_VM sc-build `cargo metadata --locked && cargo build --locked && cargo test --locked`; stage; close (stormvm#1's display checks are stormvm's medium).
+Done: 5d70be0. SC_BUILD_VM sc-build (VM sc-build-c5dd0aef91): `--locked` build, 600 kubelet unit, all suites; 9 stormvm lock entries at 6e188a6; warnings = #227's 9. Stage build e49faae4a64e. Closed.
+
+### Done: #335 (P3), a refused VM spawn quotes what the helper printed (stormvm#7's passt)
+
+2026-11-07. `launch` turns a refused Spawn into `stormpump refused: {e:?}` (Debug: `Failed { op: 18, errno: 10, step: 9 }`), while
+`RingError`'s Display already names the op, errno and step. Doing: Display, a hint for ECHILD at a helper step ("the helper exited
+before it was ready"), and the tail of `hypervisor.log` written *since this attempt began* (size noted before the spawn, so a
+retry never quotes the last attempt's lines). Test, README, CHANGELOG; sc-build; stage; close.
+Done: 0c059da (1 test). SC_BUILD_VM sc-build (VM sc-build-bf776538a7): full build + all suites; the new test and `what_the_hypervisor_said` pass (VM sc-build-7524458193),
+clippy nothing on the new lines. Stage build 579d76b33857. Closed. Live: stormvm medium's `pod:passt` VMI on a release with it says passt's own words.
+
+### Done: #332, medium: a pod from a carried image with no boot mount (stormcos#826, #294)
+
+2026-11-07. Doing: `pod-carried-image` (reads the node's `/etc/stormblock/{carried,mounts}` by a hostPath pod, runs nextnfs `--help`, root from `storm.io/instance.main`) and `pod-image-on-no-list` in test/src/pods.rs; README, CHANGELOG; sc-build `cd test`; medium on a machine with 12.64 (pvetest1/2 VMs destroyed at 01:31Z, see #233); close on a pass.
+1. [x] Done: 39ea42f, docs. sc-build `cd test`: clippy -D warnings clean, 46 tests, release build. Not run on a node: pvetest1/2's VMs were destroyed at 01:31Z, and C2NR0Q2 is off 19:00-06:00 Chicago. Held by `wait-owner --probe tcp://192.168.31.172:6443`.
+2. [ ] Resume: `stormcentral test run rustkube-node medium --tag pvetest1` (a passing pve run lets the Dell follow in the morning). `pod-carried-image` must pass, not skip; close on that, and tell stormcos#826. If nextnfs fails on its own (`--help`'s exit, the path), read the log, as the issue's command is untested.
+   2026-11-07 (09:50Z): queued medium 244ab5c336 (2e51c48, pvetest1). It waits behind cluster test b786ac9768 (#360, lease to 19:37Z) and a line of 12.67 installs (stormcentral#1266). pvetest2 is in the same install loop; C2NR0Q2 is refused in its power-off window (#372). #332 proposed after stormcentral#1266. Resume: `stormcentral test show 244ab5c336`; on a `no VM` error, queue again on a pve machine that has passed a release.
+   2026-11-10: medium 3d67200f62 (pvetest2) and 2510dd9b19 (pvetest3), 12.74, 8b8ebef: nextnfs ran to Succeeded, but both cases failed on their own checks.
+   `instance.main` is the root's engine volume id (a UUID), not its `ctr-` name, and the no-list image got the #79 demand's 503 "not on this node … no peer has it", not a 404.
+   Fixed the test in 7f76e29. sc-build `cd test` passed (clippy -D warnings, tests, release build). Queued medium 3de88a5e17 on pvetest3; pvetest1/2 are refused because they run no known release.
+   3de88a5e17 (7f76e29, pvetest3): `pod-carried-image` and `pod-image-on-no-list` both pass. Closed; told stormcos#826. The same run's three 4Gi-class size cases were never scheduled: filed #350.
+
+### Done: #294 (P2), run a carried golden that is not mounted at boot (stormcos#647, #820)
+
+2026-11-06. Found: the image's config comes from the registry's record, never the tree; argv[0] and user names already fall back to the container's own root; `Roots::make` clones `<vol>.golden` by name.
+So only the pull's yes/no and the path-to-volume map depended on the mount. Chosen format: **a separate file**, `/etc/stormblock/carried`, the grammar of `/etc/stormblock/mounts`. stormblock's initramfs reads only `mounts`,
+so no stormblock change (a `~` marker would make today's initramfs look for a volume named `~x`). A list, not "any engine volume": the slab also holds `fastetcd-data.golden`, `pvc-ext4j-64m.golden`, and other images must not cost a listing.
+Done: cfb9471 (`with_carried`, `listed_volume`, `Roots::lists`/`carried`, `StormpumpImages::carried`; 3 tests). SC_BUILD_VM sc-build (jobs a9d1e5a53e, b733ac981a): 599 kubelet unit, all suites, clippy nothing on the changed lines (#227's elsewhere). Closed.
+Filed stormcos#826 (compose writes the list, moves the servers; the live check is there). Not run on a node: tests use a fake engine and registry.
+
+### Done: #312 (P2), the engine client over https with the node CA (stormcos#374)
+
+2026-11-04. `--stormblock-ca` / `STORMBLOCK_CA_FILE` (the CA is the whole trust: no public roots, no skip). The file is read at each
+new connection: not there yet = refused and retried, renewed = used, unusable after a good one = the good one kept. `https://` with no
+CA is fatal at start; `http://` works as before. Not the client pair (not asked; the token stays). Doing:
+1. [x] engine.rs: `EngineTrust` verifier, `from_env_with_ca`; main.rs flag + check; tests against a TLS stand-in (test CA reached with the
+       token, other CA / wrong name / no CA refused with nothing sent, CA late and renewed, plain http); docs, CHANGELOG; sc-build.
+       Done: 55eb751 (8 tests). SC_BUILD_VM sc-build (job 6090e2f2b8): 595 kubelet unit, all suites, nothing from rustc or clippy in the changed files
+       (#227's elsewhere). Live: not run on a node or a real engine; stormcos sets `--stormblock https://127.0.0.1:9090 --stormblock-ca /data/stormcert/ca.crt`.
+2. [x] stormvm-block (snapshot, restore, console `snapshot`) gets the same URL and has no CA: follow-up #318, proposed after stormvm#110; said on stormcos#374.
+
+### Waiting on the owner: #325 (P2), VM start: `control` a flat ~102 ms, `report` grew (stormcos#804, fix 17)
+
+2026-11-06. `control`: stormvm's `status_when_up` sleeps a fixed 100 ms after a refused connect, so a socket bound within that costs 100 ms. Target: under 20 ms on a VM, VM Running ~150 ms warm.
+`report`: one merge PATCH. pvetest1 12.61 VMIs 3.7-139 ms, pvetest2 12.61-flowsdn 2.8-118 ms, while pods in the same boots stay 2.5-5.8 ms (12.58.4 VMIs 3.7-22 ms). Not explained yet. Doing:
+1. [x] vm_manager: `control_when_up` over `Machine::status`: every 5 ms for the first 100 ms, then 25 ms to 1 s, then 100 ms. Test, README, CHANGELOG. Done: 2e27288. SC_BUILD_VM sc-build (VM sc-build-98024a5371): 596 kubelet unit, all suites. Stage requested. Proposed `--after-release rustkube-node>=2e27288`.
+2. [x] Read 2026-11-06 on 12.63, 12.63-flowsdn, 12.64 (all carry 2e27288; `VMI … started:` in the bootlogs). The flat 102 ms is gone, target not met. `control` on pve, second VM on: 29-43 ms (85, 97, 187 once each); first VM of a pass 132-391 ms; hardware 35-479 ms, first VM of a pass 490-7220 ms. Polling is at most 5 ms of it, so the rest is qemu until its answer. `report` warm on pve: 3.1-12 ms, one 154 of 12; first boot 3.1-62 ms; pods in the same bundles p90 21-45, max 88-117.
+3. [x] Say how much of `control` is the socket's bind and how much the answer after it (qemu's QMP greets only from its main loop): `control/answer=` on the `VMI … started:` line, from the start of the last status call (connect refused before it). Test, README, CHANGELOG; sc-build; stage.
+       Done: 9828650. SC_BUILD_VM sc-build (VM sc-build-999dd82107): 599 kubelet unit, all suites. clippy: nothing on the new lines; its never_loop at pod_manager.rs:3435 (2026-07 code) filed #333, closed into #227. Stage build 3268a22b88a2. Proposed `--after-release rustkube-node>=9828650`.
+4. [ ] Resume: read `control/answer=`. Mostly the answer: "connected" could be Running, which changes #303's rule: ask the owner, recommendation in hand. Mostly the bind: qemu's own start, filed on stormvm with the numbers. Either way the < 20 ms target is the owner's to keep or move; #319 is the 10 s bound on the same wait.
+       2026-11-10: read on 12.74-era bootlogs (tmp/ctl325.py; ~370 starts). First VM of a pass: bind p50 156 ms on pve, 443 on server8, 1.7-4.7 s on the Dell,
+       with an answer of 16-170 ms. That is qemu's start before listening (cold page cache?), filed stormvm#123. Later VMs: bind 12 / answer 19-20 ms, control p50 33 on pve.
+       server7: answer 1-5 s (X9 disk). `report` fixed: pve p50 5, p90 13-21. Asked on #325: A Running at the first connect (recommended, ~12 ms), B keep the rule and
+       move the target to ~50 ms, C keep both and look inside qemu. `wait-owner` run. Resume: A = `control_when_up` stops at the first accepted connect
+       (`control/answer` is then 0, or dropped), tests, README/status.md, CHANGELOG, sc-build, stage, close on the next pve bootlog; B = close with the new target.
+       `report` on 12.61, before the fix: no PATCH in the bundle logged a retry; pods' status writes in those boots 2.5-5.8 ms. The apiserver's slow lines are in the newer bundles from the reboot on: server7 VMI status PATCHes 223-1562 ms (the kubelet's and others'), so hardware outliers are at least partly the apiserver.
+
+### Waiting on stormblock#521 + stormpump#199: #311 (P1), X9 blades: container start 4-9 s in `containers`
+
+2026-11-03. From the kubelet's own lines (bootlog server7-1793752767, 12.58 warm c1/c2/c3, seconds): engine clone 1.96/2.57/3.48, mount + the rest of create
+0.64/0.56/0.30, spawn 1.44/0.20/0.51; total 4.05/3.34/4.29 (Dell 0.26-0.45, pvetest1 0.07). server1 (server1-1793278829, later in that boot): clone 10-17 s,
+VolumeRegister 1.8-21.7 s, spawn 1.4-1.9 s. stormblock's own lines put the wait in I/O, not its lock (12.3 s clones, lock-wait 1-314 ms). `verify: true` is not
+the cost: a sealed source gets no fsck (stormblock `clone_volume_impl`, "a full fsck only for a source that is not sealed"). Doing:
+1. [x] Split `container/<name>` as the issue asks: `/lookup`, `/clone`, `/attach`, `/mount`, `/define` (create), `/volumes`, `/spawn`, `/identity` (start), `/other`;
+       a histogram per step. `RuntimeService::container_steps`, as `sandbox/*` (#139). Tests, README/metrics.md, CHANGELOG; sc-build; stage.
+       Done: 6a3b27a. sc-build (VM sc-build-d63755cfb6): 588 kubelet unit, all suites; clippy nothing on the new lines (#227's elsewhere). Stage build 7cb26a9a9753.
+2. [x] Findings on stormblock#521 (clone) and stormpump#199 (mount, spawn). Proposed `--after-release rustkube-node>=6a3b27a`.
+3. [x] Split confirmed live: server1 12.61 (install server1-1793831579), warm c: containers 1434/3723/5224, clone 472/1010/3725, mount 273/1009/1044, spawn 376/1504/258, lookup ~100, attach ~80;
+       cold c on the same disk before the reboot: clone 183, mount 67, spawn 48. Findings on stormblock#521, stormpump#199. `lookup` filed as #326 (P3).
+4. [ ] Target since stormcos#804 (fix 7): warm container < 1.5 s on an X9. Not met, nearly all engine time. Proposed after stormblock#521 + stormpump#199. Resume: on a release with both, `warm_container_start_timing` on an X9; close on < 1.5 s, else file the step that misses.
+
+### Waiting on stormcos-cilium#38 (the agent's `api-rate-limit`): #310 (P1), Dell: a claim pod's `sandbox/cni` ~7 s since 12.37
+
+2026-11-03. Not the kubelet, not storage, and not claims: **Cilium's API rate limiter on `endpoint-create`** (v1.20.2, `daemon/restapi/api_limits.go`:
+rate 0.5/s, burst 4, skip-initial 4, auto-adjust, estimated 2 s). Rate = 0.5 x 2 s / mean, so the wait between creates is the mean processing time of the last
+10 creates. After a reboot the first endpoints wait for the first BPF template compile (Dell 21-24 s, server7 48-50 s, pvetest1 2-3 s), so the mean starts high.
+`Wait` runs in the PUT handler before the agent logs `Create endpoint request`: that is the plugin's "gap".
+Replay of the boot logs (`/var/lib/stormcentral/bootlog/<machine>-<id>/pods.log`), gap between creates vs the mean: Dell 12.58 p2-p5 9.30/9.28, 8.15/8.14, 7.25/7.24,
+6.54/6.53; Dell 12.37 9.84/9.82, 8.62/8.61, 7.67/7.66, 6.91/6.90; server7 12.58 21.43/21.39, 18.79/18.76, 16.72/16.70, 15.07/15.05.
+Why claim pods: they are the probe's 5th+ creates after the reboot. Why 12.27 was fine: its reboot made one endpoint (coredns), so c1-c3 were under skip-initial and
+p took a burst token; 12.37+ make three (coredns, snapshot-controller x2), and stormcentral#245 (10-18) made the claim probe 5 runs.
+Docs 5bf5db4, SC_BUILD sc-build `cargo build --locked`: exit 0 (VM sc-build-d6e38a1f5e). No golden (docs only). Evidence on stormcos-cilium#38; #310 proposed after it.
+No kubelet change. Resume: on a release with stormcos-cilium#38's setting, the Dell's `warm_claim_bind_and_mount_timing` (`sandbox/cni` ~0.1 s on all 5 runs,
+`GET /api/v1/metrics`); close. Not re-verified live: the agent's `cilium_api_limiter_*` are on loopback and its limiter lines at debug.
+
+### Done: #303 (P3), a VMI reads Running only once its control socket answers (stormvm#28)
+
+2026-11-03. `start_attempt` writes Running right after the engine's spawn, before qemu binds QMP (medium 925ac816ff:
+`snapshot-take` 1 s after Running, `control.sock is not connectable`). Chosen (the issue's first option, KubeVirt's
+meaning of Running = the domain is up): after the spawn, `Machine::status_when_up` (stormvm 93cf070+) on the
+registration's control socket, bounded 10 s, raced against the machine's exit (ring exit broadcast, subscribed before
+the spawn). Answered (even with an error) → Running; exited → as today (the exit marks it); not up in 10 s → Running
+anyway with a Warning `ControlNotReady` Event (the machine runs; nothing killed). Start timing step `control`.
+Tests (answered, exited, never up), README/status.md, CHANGELOG; sc-build; stage; close.
+Done: f0102a9 (1 test). SC_BUILD_VM sc-build (job 69df61a259): 587 kubelet unit, all suites, warnings = #227's (9 lib, unchanged),
+clippy nothing in the new code. Stage build 97d6bc43f77b. Closed. Live: stormvm medium `snapshot-take` right after Running on
+a release carrying it (no `control.sock is not connectable`; start timing's `control=`).
+
+### Done: #304 (P3), stormvm → 0225218: storm.io/bridge keeps multus/SR-IOV NICs on their network (stormvm#103)
+
+2026-11-03. stormvm 0225218 (7 commits on 01ac271: only stormvm-spec kube.rs, verify, docs; no Cargo.toml change; main
+dc2727c adds docs only). The kubelet calls `from_kube`, so no code change here: rev-only bump in pkg/kubelet/Cargo.toml and
+Cargo.lock, keep stormpump 9877a97. CHANGELOG; SC_BUILD_VM sc-build `--locked`; stage; close (stormvm#103 closes on a
+release: a bridged VM with an unwired SR-IOV NIC refused at start, stormvm medium `failed-start-*` / vm-waves).
+Done: a30225d. SC_BUILD_VM sc-build (job 034f632e7e) `cargo metadata --locked && cargo build --locked && cargo test --locked`:
+every stormvm crate at 0225218, 586 kubelet unit, all suites pass, warnings = #227's. Stage build 233a3ca2dd4d. Closed.
+
+### Done: #302 (P3), move a running VMI's disk off the node (stormstorage migrate → cutover → stormvm switch_disk)
+
+2026-11-03. stormvm 01ac271 (b326f7c main: docs) has `Machine::switch_disk(&DiskSwitch {from, to, discard})` (qemu only;
+blockdev-add + blockdev-reopen, no data moved); no Cargo.toml change upstream since 93cf070: rev-only bump. stormstorage#44's
+verbs are in `vm_migration::Stormstorage` (#40). stormblock#328: the local engine attaches a peer's volume by id and
+answers a ublk `device_hint`; only clone/attach/GET/detach are relayed (not `PUT …/owner`, not DELETE). Chosen (the issue
+leaves the ask to the kubelet): VMI annotation `storm.io/move-disks` `{"<disk>": "<node>"}` (the request), kubelet's
+record `storm.io/disk-moves` `{"<disk>": {to, node, from, migration, state, bytesTotal, bytesRemaining, volume, message}}`
+(progress for stormconsole, and the resume point after a restart). Doing:
+1. [x] Bump every stormvm rev 93cf070 → 01ac271 (Cargo.toml, Cargo.lock).
+2. [x] `vm_disk_move.rs`: request/record parse, refusals (not the machine's own volume, cloud-hypervisor, a #40
+       migration active, already there), state helpers; `Hotplug` gains pause/unpause/switch_disk.
+3. [x] VmManager pass (after hotplug): start → `copying` (record); poll (progress); `synced` → pause → cutover → attach
+       T's id here → switch_disk → unpause → detach S → complete → `moved` (vm.disks/owned/registration rewritten,
+       owner set best effort). Failure before the switch: unpause + abort, `failed`; a failed switch: unpause, `failed`,
+       nothing deleted (the answer may have been lost). Restart while switching: the registration says which volume.
+       A start uses a moved disk's recorded volume; a deleted VMI aborts a copy in flight.
+4. [x] Tests (fake stormstorage + engine + machine), README/api.md/status.md, CHANGELOG; sc-build; stage; file stormblock
+       (relay `PUT …/owner` to the peer, so T's sweep deletes a moved disk); live check on a two-node fabric.
+       Done: rev bump, f54715e code + 11 tests (5 unit, 6 manager), docs. SC_BUILD_VM sc-build f54715e (job b5464f583b): 586
+       kubelet unit, all suites, nothing from rustc in the touched files (#227's elsewhere). Stage build 5b986cc9e472. Filed
+       stormblock#519 (owner relay). Closed. Live: two-node fabric (stormstorage on more than sno: stormstorage#56/stormcos#354),
+       a write loop in the guest while its data disk moves; by-id unchanged, data there after a reboot.
+
+### Done: #301 (P1), stormvm → 93cf070: snapshot of a VM with no guest agent, or right after Running (stormvm#28)
+
+2026-11-03. stormvm 93cf070 (8 commits on a8b509d; code only in stormvm-control's snapshot.rs/lib.rs, no Cargo.toml or
+Cargo.lock change upstream; main c487c7a adds docs only). The kubelet passes indications through as strings, so no API
+change here. Doing: rev-only bump of every stormvm crate in pkg/kubelet/Cargo.toml and Cargo.lock; CHANGELOG, README/
+status.md where the lock rev is named; SC_BUILD_VM sc-build `--locked`; stage; close #301 (stormvm#28 closes on medium's
+`snapshot-*` with a release carrying it).
+Done: f496135. SC_BUILD_VM sc-build (job ff68a21efe) `cargo metadata --locked && cargo build --locked && cargo test --locked`:
+every stormvm crate at 93cf070, 575 kubelet unit, all suites pass, warnings = #227's. Stage build 28a1d1ad43c1. Closed.
+Live: stormvm's medium `snapshot-*` on a release carrying it (stormvm#28's).
+
+### Waiting on stormcos#682 (+ stormcos#288, stormstorage#56) for the live run: #40 (P3), live migration of stormvm-started VMIs
+
+2026-10-29. stormstorage 5d68784 has the disk half: `POST /api/v1/nodes/{S}/volumes/{id}/migrate {to}` (T's copy served to
+S over NVMe/TCP, S's mirror), `GET /api/v1/migrations/{mid}` (starting|copying|synced|cut_over|completed|aborted|failed,
+`target.id` = T's engine-local id), `cutover` (guest paused), `complete` (retires S's), `abort`. stormvm a8b509d (the lock)
+has `migration::{INCOMING_DEFER, Tls, Tuning, send_migration, receive_migration_tls}`, `migration()`, public `qmp` (for
+`migrate_cancel`). Contract: rustkube's `apimachinery::kubevirt::active_migration` (status.migrationState). Scope of this
+cut: qemu, VM-owned disks (golden clone, emptyDisk, seed), no pod-network NIC; anything else fails the migration naming
+why (follow-ups). Doing:
+1. [x] `vm_migration.rs`: role (source/target) from migrationState, preflight, stormstorage client (`--stormstorage`,
+       token file), the disks record (`storm.io/migration-disks` annotation: migrationUid + disk → mid), TLS dir (copies of
+       the node pair: `--migration-tls-{cert,key,ca}`), port (`--migration-port`, 49152).
+2. [x] VMI lists: a third selector `status.migrationState.targetNode`; target never cold-starts a migrating VMI.
+3. [x] Source: start each disk's mirror, record mids; on `targetNodeAddress` send over TLS, `startTimestamp`; poll;
+       `completed`/`failed` + `endTimestamp`; abortRequested → `migrate_cancel`, failed, `abortStatus`; after completed
+       force-stop the paused machine (no status write, finalizer left to the target); after failed abort each mirror.
+4. [x] Target: wait every disk `synced`, attach T's copies (ublk), receiving start (`-incoming defer`), arm TLS listener,
+       write `targetNodeAddress` + port; on completed adopt it (registration, status), cut each disk over and complete it;
+       on failed/abort tear the receiver down.
+5. [x] Tests (fake apiserver + fake stormstorage + fake machine), README/api.md/configuration.md/status.md, CHANGELOG;
+       sc-build; stage; stormcos issue (flags, port open, CRD stormcos#288). Live: two-node cluster with stormstorage.
+       Done: 306d475 (code, 11 tests), ca8a9a0 (docs). SC_BUILD_VM sc-build ca8a9a0: 575 kubelet unit, all suites, nothing
+       new from rustc/clippy in the touched files (#299 was my `grep -c`, closed). Stage build 59e3817d1498. Filed
+       stormcos#682 (kubelet flags, node pair with serverAuth+clientAuth and the node name, TCP 49152–49215). #40 proposed
+       after it. Resume: a VMIM between two nodes; guest up and disk intact on the target; close.
+
+### Done: #160 (P2), pods wait a fixed 2 s for startup admission after every kubelet start (stormcos#300)
+
+2026-10-28. Sample (pvetest2 storm-003102, 12.58, kubelet restarts at 21:41–21:54): every API pod (coredns, flowsdn,
+snapshot-controller) `wait=2003–2144ms attempts=1`, static pods `wait≈10ms`; CNI ADD 0.62–0.66 s (since #148 the conflist
+wakes waiting pods). Cause: `reconcile` sends a non-static pod back `Next::After(sync_interval)` (2 s) while startup
+admission is closed (`pods_synced`/`vmis_synced`, an adopted pod without its spec, a VM with unknown claims), and nothing
+wakes it when it opens; `pods_synced` is also stored *after* `replace_source("api-pods")` has woken the pods. Doing:
+1. [x] Executor `park(key)` / `unpark` / `wake_parked()`; reconcile parks a key on a closed gate (re-checked after
+       parking), `release_parked()` wakes them where the gate can open (pod LIST, VMI sync paths); `pods_synced` stored
+       before `replace_source`. The 2 s stays as the fallback. A parked pod's start log/timing says it waited for admission.
+2. [x] Test (park → wake_parked wakes exactly the parked keys, once), README/event-driven-design.md, CHANGELOG; sc-build;
+       stage; close on the next pvetest kubelet start: API pods' `wait=` in tens of ms.
+       Done: a84bf09, docs 88d1982. SC_BUILD_VM sc-build a84bf09 (job 027345a426): 564 kubelet unit (1 new), all suites, clippy
+       nothing new (#227's). Stage build dbf8fadc44f5. `shipped`. Live: `testhost logs pvetest2 kubelet --search 'started:'`
+       after a release with it: API pods' `wait=` well under 2 s, and `startup admission open: waking …`.
+   Not here: a failed CNI ADD still retried on a back-off (#201, decided: event-woken waits).
+
+### Done: #292 (P0), ring arena per request; 180 s for a device mount; no root deleted under a mount (stormcos#626)
+
+2026-10-28. server1 (X9 SMR HDD), 12.40/12.54: one root `mount(2)` took 30.95 s; the one arena parked every later
+payload request, and the timed-out root was deleted under the mount (EIO). c0a5fd4: `Slots` (first fit, 8-aligned,
+freed at completion live or abandoned; no room = FIFO wait, no-payload ops never wait); `MOUNT_DEADLINE` 180 s for
+device-form VolumeRegister; a request's `settled` sender dropped after its completion and a late success's undo;
+`create_container` on a Timeout keeps the root (in `making`) until settled (≤ 1 h), then destroys it. SC_BUILD_VM
+sc-build (jobs 73f593f87e, 4213f3f230): 563 kubelet unit (2 new), all suites, clippy nothing new (`run`'s argument
+count is #227's). Stage build a17d6d9444ca. Closed. Live: the next server1 reboot install, no `within 30s` on
+VolumeRegister, no `I/O error, dev ublkb*` after a slow mount. #296 (409 on detach) is separate.
+
+### Done: #258 (P1), static pods get no mirror pod in the API (stormcos#559)
+
+2026-10-21. 81dc1bd: `static_mirror.rs` (plan: create / delete stale+orphans / current), static pods named `<name>-<node>`
+with `config.hash`, mirrors never run, a static pod's status on its mirror. SC_BUILD_VM sc-build (job da1a62723b): 561
+kubelet unit (4 new), all suites, nothing from clippy in the new code. Stage build a29c9aa0af69. Closed. Live (a release with it and
+stormcos#559): `get pods -n kube-system` shows `etcd-<node>`, `kube-apiserver-<node>` … with their status; `logs` reads them;
+deleting one brings it back. Note: a kubelet restarted onto this build in a running boot sees its static pods renamed (same
+uid): expect one restart of each; a reboot (the release path) does not.
+
+### Done: #291 (P1), static pods wait for the kubelet's own credentials (2.0–5.6 s per first boot)
+
+2026-10-21. fba93ec (+ clippy aliases, 8d77eb2): a named client pair not written yet is given later to a client behind
+`CredentialGate` (no connection until then, never anonymous); a serving pair not written yet starts `:10250` when it is;
+60 s then fatal, as before. SC_BUILD_VM sc-build (job 68dd887ab3): 557 kubelet unit, 8 main, all suites, nothing from
+clippy in the changed code. Stage build 0309eb42bc93. Closed. Live: `first static pod … credentials=` in tens of ms on a first boot,
+then `apiserver client certificate … arrived; connecting`.
+
+### Done: #290 (P2), a stale engine token at boot: the 401 went back to the caller
+
+2026-10-21. df1d832: until a token is accepted, a 401 with nothing new on disk polls the token file (50 ms, ≤ 3 s, once per
+refused token) and retries with the new one. SC_BUILD_VM sc-build (job 458882288f): 556 kubelet unit (2 new), all suites,
+warnings = #227's, nothing from clippy in engine.rs. Stage build fc48d8a31464. Closed. Live: a boot's `stormblock engine token
+rewritten; waited for it ms=…` instead of a refused first listing.
+
+### Done: #289 (P0), a transient engine error on a static pod waits the 10 s start back-off
+
+2026-10-21. #287 put CreateContainerError (root attach/mount) on `create_backoff`; 4850e00 puts RunContainerError (claim
+mounts registered in `start_container`) on it too. SC_BUILD_VM sc-build (job 7e447bd6c5): 554 kubelet unit, all suites,
+warnings = #227's. Stage build 4cc9b7543164. Closed. Live: a boot's refused first create/start retried in 0.5 s (`next try in 500 ms`).
+
+### Done: #288 (P0), the start-up root sweep deletes a static pod's fresh root (same `ctr-ct-N` as last boot)
+
+2026-10-21. `run_tag` (8 hex, random per start) in every minted id; `Roots::sweep(own, known)`: `known` read after the
+listing, this start's `ctr-ct-<tag>-` never orphans. Done: 08cb1a0. SC_BUILD_VM sc-build (job 43297f873a): 554 kubelet
+unit, all suites, warnings = #227's, nothing from clippy in the changed code. Stage build c23589fc239a. Closed. Live: no
+`deleted a container root` for this start's names in the next boots; with #287, a refused first create costs 0.5 s.
+
+### Done: #287 (P0), a refused container create waits 10 s; the apiserver starts 10 s late after a boot (rustkube#286)
+
+2026-10-21. `create_backoff(n, waited)`: 0.5 s doubling while < 10 s, then `start_backoff`; `PodManager.create_refusals`
+per uid (cleared on start/removal). Done: 008304b. SC_BUILD_VM sc-build: 553 kubelet unit (2 new), all suites, clippy
+nothing new in the touched code (#227's). Stage build 2bbf7f53f745. Closed. Live: the next pvetest boot's
+`kube-apiserver started: wait=` under ~1.5 s when a first create is refused (`next try in 500 ms`).
+
+### Done: #285 (P0), an init container's exit noticed only at the pod's next pass, minutes late (server1 12.37)
+
+2026-10-21. The exit is an event: the ring thread broadcasts the handle, `exit_router` maps it to a pod (runtime's
+containers lock) or a VMI (`vms.lock()`, the VM manager's lock, held across slow work) and wakes that worker; the state
+itself is read only when a pass calls `container_status` (absorb_exits). Found: (a) the router awaits the VM manager's
+lock for every exit, pods' too, one exit at a time: a VM pass holding it stalls every wake behind it; (b) an exit that
+arrives before `start_container` records its handle (a quick init: Cilium's `config`) is drained by any other pod's
+status call, matches nothing and is dropped: the container stays Running in the record; (c) "container exited" is
+logged only when some pass drains it, so the log shows when it was read, not when it happened. Doing:
+1. [x] Router: drain and record the exits at arrival (logged then); pod lookup first, the VM lookup only for a handle
+       no container has, bounded (1 s, then every VMI woken, said); routing over 1 s warned naming the lookup.
+2. [x] Runtime: an exit no container claims is kept (last 256) and applied by `start_container` when it records that
+       handle.
+3. [x] Engine waits said: a ring call over 1 s warned (op, ms, whether it waited for the arena); an engine HTTP call
+       over 1 s warned (method, path, ms).
+4. [x] Tests (early exit kept and applied; `route_exit` with the VM lock held: a pod's exit at once, an unclaimed one
+       gives up after 1 s → every VMI), README/CHANGELOG (75de9f1, a60c7d9, 453d083). SC_BUILD_VM sc-build 453d083: 551
+       kubelet unit, all suites, warnings = #227's. Stage build bdcded773dac. Closed. Live: the next reboot install
+       (stormcos#626): `stormpump: container exited` within a second of each init's start, no "routing an engine exit" WARN.
+
+### In progress: #275 (P2), the kubelet on the Kubernetes 1.36 API (k8s-openapi 0.28 v1_36, kube 4.2)
+
+2026-10-21. Found: nothing here depends on k8s-openapi or kube. k8s-openapi 0.24 (v1_32) comes only through
+rustkube's `apimachinery` (Cargo.lock), and every API object here is `serde_json::Value`. So step 1 (crates) here is the
+`apimachinery` rev bump after rustkube#285 moves it (chrono → jiff only if apimachinery's API exposes it).
+`kubeletVersion` already says v1.36.0 (#23).
+Steps 2–7 are kubelet behaviour on JSON, independent of the crates. Doing:
+1. [x] Step 2 here (f727862): `status.observedGeneration` and each condition's `observedGeneration` from `metadata.generation`
+       (GA 1.35); `containerStatuses[].resources` / `allocatedResources` (and sidecars'), pod `status.resources` from
+       `spec.resources` (no in-place resize yet: what is applied is the spec). Tests, README/status.md, CHANGELOG.
+2. [x] Steps 3–7 filed: #276 in-place resize (needs a stormpump per-workload limits verb), #277 stopSignal + sleep
+       (stormpump's Signal op is enough), #278 sidecar edge cases, #279 image volumes (stormpump#108 for read-only),
+       #280 user namespaces (needs stormpump Spec userns).
+3. [x] SC_BUILD_VM sc-build (job f8d8e62af8): 547 kubelet unit, all suites, warnings = #227's. Stage build d3c3e72b4eaf.
+       #275 proposed `--after` rustkube#285.
+4. [ ] Resume after rustkube#285: bump `apimachinery`'s rev (Cargo.toml + lock from a build VM), fix what its 0.28 /
+       jiff API breaks, sc-build `--locked` with zero new warnings; then the issue's done-when (stormcos suites on pve
+       and the Dell, kubectl 1.36, a release carrying it).
+
+### Done (not reproducing since 12.30): #259 (P2), the second VM of the install probe starts late on pvetest1 (3.5 s → 6.7 s since 12.19)
+
+2026-10-14. Samples (stormcentral /api/v1/metrics): the Dell's `vm_start_ready_ms` is 1.19–2.12 s on every release
+since 11.88 (12.27's 1.64 is in range: noise). pvetest1: the first VM (`vm_start_ms`) 117–184 ms throughout; the
+second (`vm_start_ready_ms`, created right after) 115–428 ms to 12.18, then 3.5 s (12.19, 12.21), 6.7 s (12.27); its
+guest still came up on time (`vm_guest_up_ready_ms` 10.4 s vs the first's 10.2 s). 12.18 → 12.19 moved rustkube-node
+c6f01d65b9b7 → 5265b2973b7c (our range: #210 deps, #245 seed, not on this VM's path: no cloud-init) plus stormblock,
+stormpump, stormvm goldens. Node log (storm-84b7e0, 12.27, via the Dell's console ring): VMI v2 created 18:52:05.17, no
+kubelet line for it until `vm started` 18:52:11.94: no Waiting, no retry: 6.3 s inside one start attempt. Nothing on
+the VMI start path is timed. Suspect (unproven): `sweep_orphans` holds `disk_lifecycle.write()` across an apiserver GET
+per owned volume and the deletes, and every start waits on its read. Doing:
+1. [x] `vm_start_timing.rs`: per-VMI steps (created, wait, unwind, lock, seed, keys, owner, disks + disk/<name>,
+       network, resume, window, launch, record, report, total) → `storm.io/start-timing` on the VMI, Event, INFO line,
+       after Running; the `Started` Event queued after the Running patch (an Event POST took 0.5–0.7 s there).
+       `resolve_disks_as(.., Resolving::Start(times) | Hot)` (seven arguments, as before).
+2. [x] Test, README "VMI start timing", CHANGELOG (48fa308, 94cd23c). SC_BUILD_VM sc-build 94cd23c (job af635df991):
+       525 kubelet unit, all suites pass, warnings = the #227 baseline. Stage golden golden-rustkube-node-3672fc1e06d0
+       (stormcos#424); release agent asked to carry it to pvetest1. Findings on #259.
+3. [ ] After pvetest1 installs a release with it: `stormcentral testhost logs <m> kubelet --search 'started:'` (the
+       Dell's console ring also holds pvetest1's lines, host storm-…), the probe's v2 line; fix the step that grew (the
+       sweep's `lock`: GETs/deletes out from under the write lock), or file it on stormblock (`disks`) / stormpump
+       (`launch`); close.
+       2026-10-14: 12.28 (carries 3672fc1e06d0) failed on pvetest1 before the probes (stormcos#587: static-pod.sh
+       `mkdir: not found`, no control plane); the golden rolls into the next release; queued `--after` stormcos#587.
+       2026-10-21: closed on the samples (stormcentral /api/v1/metrics). pvetest1's second VM (`vm_start_ready_ms`) since
+       12.30 (carries 3672fc1e06d0): 107–461 ms on nine installs (one 1360 on 12.35; pvetest2 one 1199 on 12.36); 12.37 118.
+       Dell since 11.88: `vm_start_ms` median 1010 (619–2336), 12.37 1043; `vm_start_ready_ms` 1191–2119, 12.37 1559.
+       The VMI `started:` lines had rolled out of every console ring (probe VMIs are deleted, so no annotation). The
+       sweep-lock suspect stays unproven; a recurrence reads the step that grew from `VMI … started:`.
+
+### Done: #255 (P3), stormvm → a8b509d: pod:passt's passt as a stormpump helper (stormvm#7), chv display (stormvm#1)
+
+2026-10-13. stormvm main a8b509d (has d0313bc, fb77c46, 2d6fe95). Manifests: only the `stormvm` binary crate gains
+stormvm-display (not in our graph), so a rev-only bump in Cargo.toml and Cargo.lock. API: new console `Config` fields
+(`admitted_by_host`, `migration_tls`) are covered by `..Default::default()`; `Alloc.display` is not built here.
+1. [x] Bump every stormvm rev e929b8f → a8b509d; CHANGELOG, README (56cbda7). SC_BUILD_VM sc-build 56cbda7 (job
+       334a512dab) `cargo metadata --locked && cargo build --locked && cargo test --locked`: 524 kubelet unit, all suites
+       pass, warnings unchanged (#227's).
+2. [ ] Stage golden: build 07ccb0dcaf50 failed at forge's `in` mount (`/dev/nvme0c0n1: Can't lookup blockdev`) =
+       stormcentral#838 (commented). 2026-10-14: #838 closed as #841's dup (fix 5feb778 needs a root bootstrap install);
+       stage e6aeeed6a1c1 failed the same way; #255 proposed after stormcentral#841. #841 also says forge lost most
+       goldens (rustkube-node's among them): the stage's inputs may need rebuilding first, the master's to order.
+       2026-10-14: #841 live (multipath off on build VMs); the master's 12.23 wave built golden-rustkube-node-2baf56788fea
+       from b9dbbf4 (HEAD, has 56cbda7; stormcos#424). Closed. Resume: `stormcentral component stage rustkube-node --url
+       http://stormcentral.g8.lo`, then close #255 (live: a pod:passt VMI after stormcos#565 ships /pallets/passt).
+
+### Done: #252 (P3), a running VMI's memory below its boot size (stormvm#19's balloon)
+
+2026-10-13. Item 1 (stormvm e929b8f, `Registration.memory_min` in the two test literals) landed with #251 (7f36be0).
+Left: #246's memory step through `set_memory_within(bytes, floor)`, floor = the machine's registration
+`memory_min` (else the spec's `memory.min` below its size, the same rule); `status.memory.guestCurrent` =
+`MemorySize::current()` (balloon + hot-added); `guestRequested` = what was asked; a squeeze the guest cannot finish
+stops being polled after 5 min. Tests (squeeze within the floor, below it refused), docs, CHANGELOG; sc-build; golden.
+Done: 46a364b. SC_BUILD_VM sc-build (job 4661717ecb): 524 kubelet unit, all suites pass. Stage golden
+golden-rustkube-node-b89f9d8278a0 (stormcos#424). Closed.
+
+### Done: #251 (P3), VM snapshots with memory, and a restore that resumes from it (stormvm#37)
+
+2026-10-13. stormvm main e929b8f (dcbbb14/cd90296: `console::snapshot::take_with_memory`, `state_volume_name`,
+`Outcome.memory`, `qemu::incoming_from_state`; also #19's balloon: `Registration.memory_min`, `MemorySize.balloon`).
+No Cargo change upstream. rustkube's VM controller copies `spec.template.metadata.annotations` onto the VMI
+(controller-manager virtualmachine.rs), which carries a resume to the next start. Today nothing handles a
+VirtualMachineSnapshot's deletion (no finalizer, no group deleted). Branch wip/251:
+1. [x] Bump stormvm 7a7baf2 → e929b8f (Registration literals gain `memory_min`).
+2. [x] Opt-in `metadata.annotations["storm.io/memory"] = "true"` → `take_with_memory` (the stormblock-only path; a
+       VM with disks on other drivers' claims is refused, naming it). Status `storm.io/memory: true` and
+       `storm.io/stateVolume` (the group member that is no disk's).
+3. [x] Deletion (KubeVirt's `spec.deletionPolicy`, default Delete; Retain keeps): finalizer `storm.io/snapshot` at
+       claim (only with an engine); on deletion, the group snapshot and the state volume deleted, then the finalizer.
+4. [x] Restore of a memory snapshot: disks as now, plus `<ns>.<vm>-state-restore-<restore>` from the state member;
+       the VM template gets `storm.io/resume-state` {volume, restore}; restore status says the memory is pending.
+5. [x] Start of a VMI with `storm.io/resume-state` (once per VMI): attach it, `plan::build_receiving` with
+       `incoming_from_state(dev)`; a watcher: guest running → resumed; hypervisor gone or not running in time → cold
+       boot (the #76 retry starts it without incoming), with the hypervisor's words. Either way: the restore's
+       status (`storm.io/memory: resumed | cold-boot` + message), an Event, the state volume detached and deleted,
+       the annotation taken off the VM template. No volume (gone, a kubelet restart) = cold boot, said.
+6. [x] Tests, README, CHANGELOG; sc-build; merge; golden; close.
+       Done: main 7f36be0. SC_BUILD_VM sc-build (job 19c4ae7f48): 523 kubelet unit (4 new), all suites pass; clippy
+       nothing new (launch's argument count was already over, #227). Stage golden golden-rustkube-node-8aae99144ff9
+       (stormcos#424). Closed. Live: needs the snapshot CRDs (stormcos#170), qemu, a running VM.
+
+### Done: #187 (P3), VirtualMachineSnapshot status: the step, the disks and the size (stormvm#45)
+
+2026-10-13. The lock's stormvm (7a7baf2) has `take_with_progress` (console and control), `Step::as_str`,
+`console::snapshot::detail`, `spec::snapshot_status_with`. Doing in vm_snapshot.rs:
+1. [x] `TakeFn` gains a `Progress` (`Fn(&'static str)`); `stormvm_take` and the CSI path use `take_with_progress`;
+       `Taken.detail` (`SnapshotDetail`: console's `detail` for stormblock-only; for #157 the group's disks plus the CSI
+       disks, size only when every member's is known).
+2. [x] The spawn site: each step → a writer task merge-patching `status["storm.io/step"]` (InProgress), joined before
+       `finish`, which writes `snapshot_status_with(result, detail)`.
+3. [x] Tests (steps written in order then the result's step/included/excluded/size; a failed pause reads Failed +
+       `freezing`), README, CHANGELOG; sc-build; golden; close.
+       Done: 436bd8b. SC_BUILD_VM sc-build (job 18d7603741): 519 kubelet unit, all suites pass. Stage golden
+       golden-rustkube-node-b62d1f3a06bf (stormcos#424). Closed. Live: needs the CRDs (stormcos#170) and a running VM.
+
+### Done: #249 (P1), can the kubelet start a `stormpump://` asset pod? (stormcos#547: a second sshd on :22)
+
+2026-10-13. 12.21's data (comment on #249): :22 held by PID 1's own sshd, stormcos#547 closed. From the code: no path
+starts one today: every API path (LIST and the watch, which only wakes the LIST) drops `config.source: stormpump`
+(kubelet.rs sync, since cdb0a4b/f6b00f1), `recover_state` only adopts sandboxes the engine has, static pods come only
+from the manifest dir. But it rests on one annotation, and a mirror pod that lost it would run: `stormpump://sshd`
+resolves by its last path component to `/pallets/sshd`, on the host network (mirror pods are hostNetwork), which is
+#249's symptom exactly. Doing (no runtime path ever starts a node service):
+1. [x] `mirror::is_node_service(pod)`: the annotation, `storm.io/mirror`, the `storm.io/component=node-service` label
+       or any `stormpump://` image; used for API and static pods (a static manifest naming one is skipped, said).
+2. [x] `StormpumpImages`: a `stormpump://` image is refused (ErrImagePull naming PID 1), never resolved to a pallet;
+       `local_path_in` takes no `scheme://` reference.
+3. [x] Tests, README/CHANGELOG; sc-build; golden; answer and close #249.
+       Done: fix + 97754e7 docs. SC_BUILD_VM sc-build (job 964d550df4): 519 kubelet unit, all suites pass, clippy
+       nothing new. Stage golden golden-rustkube-node-d814f8ef6f80 (stormcos#424). Closed.
+
+### Waiting on stormcos_qa#78 (someone with stormcos_qa's token queues the run): #102 (P1), turbomode acceptance on C2NR0Q2 (owner via master, 10-13: option A)
+
+2026-10-13 ~20:45Z. The Dell's `tests` valve is open again (`valve list` shows only buildvms drains); C2NR0Q2 is
+installing 12.21. A run there (94caeb79d0, stormcos_qa 22a4f567f886) errored: apiserver no /readyz in 10 min (the
+install was not done). Doing: queue `stormcentral test run stormcos_qa turbomode --tag C2NR0Q2 --no-wait` (waits behind
+the install in the machine's line), read it with `test show`, compare with the Dell's 11.50/11.51 baseline (container
+start 20.8/21.2 s, claim 75.5/67.2 s; the target is warm start ≤ 2 s / claim ≤ 1 s, #95), post on #102, close if met.
+pvetest1 data point (not gating): a5c0e611fe (12.21): scheduled→running p50 6.0 s, p95 9.7 s; 2 then 6 of 100 sleep
+Pods never reached Succeeded in 4 min: filed #250 (P1).
+~21:05Z: the Dell's 12.21 install (20:49Z) failed at `media booted: stormbootx claims its boot clone` (600 s, after a
+hard cut), right after stormcentral#459's media decision; a run is refused (no release). Evidence on stormcentral#459;
+#102 proposed after it. Resume: `stormcentral test run stormcos_qa turbomode --tag C2NR0Q2` once the Dell runs a
+release (`stormcentral testhost list`: last=… passed), compare, post, close.
+2026-10-21: stormcentral#459 closed; the Dell passed 12.37, every valve open. `test run stormcos_qa turbomode` is
+403 for this session's token (stormcentral#829: own project only). Asked on stormcos_qa#78 + master note; #102 proposed
+after stormcos_qa#78. Resume: read the run id posted there with `stormcentral test show <id>`, compare, post, close.
+
+### Done: #247 (P1), hot-add and remove a running VMI's disks (stormvm#23)
+
+2026-10-13. stormvm main 7a7baf2 (c185f4b: `Machine::add_disk(&HotDisk)` on a free `hpN` / `scsi0.0` / chv
+`vm.add-disk`; `remove_disk(name)` refuses a boot disk; the volume stays attached). Only stormvm-verify's lock entry
+changed upstream (not in our graph): rev-only bump. On #246's pass (`hotplug`, once per generation):
+1. [x] Bump stormvm e1a84f1 → 7a7baf2. Hotplug seam gains add_disk/remove_disk.
+2. [x] Diff spec disks against `vm.disks` (the registration's disks; none known = no disk diff). Added: resolved and
+       attached by `resolve_disks_with_keys` on a one-disk spec (clone / emptyDisk / claim, owner as at start; a seed
+       disk is start-only), then `add_disk` (bus virtio|scsi, `direct` from cache, `discard`); a refused add detaches
+       it (CSI: that disk only, `teardown_vm_csi_disk`) and deletes what was made for it; a wait (claim not bound) is
+       retried. Removed: `remove_disk`, then detach (CSI: that disk); the volume is kept (#75). `vm.disks`,
+       `owned_volumes` and the registration's disks rewritten.
+3. [x] `status.volumeStatus[]`: each disk `Ready` (a hot one's target), a refused one with the verb's message.
+4. [x] Tests (fake engine + fake machine: emptyDisk added → attached + add_disk; refused → detached, made volume
+       deleted; removed → remove_disk + detach, volume kept; seed disk refused), README, CHANGELOG; sc-build; golden;
+       close. Live after rustkube#269 (volumes in the VM → VMI propagation).
+       Done: `resolve_disks_as(.., hot)` (a hot failure gives back only its disk, never the running VM's other CSI
+       disks), `teardown_vm_csi_disk`, add/remove_hot_disk, `record_disks`; 2 tests. SC_BUILD_VM sc-build 307e673 (job
+       8ed4e3b464): 518 kubelet unit, all suites pass; clippy nothing new. Stage golden golden-rustkube-node-b76b70a2ca55
+       (stormcos#424). Closed.
+
+### Done: #246 (P1), a running VMI's cpu, memory and interface changes through stormvm's hotplug verbs (stormvm#24)
+
+2026-10-13. stormvm main e1a84f1 (a223f04 hotplug verbs, 503434c qemu `-smp` fix stormvm#92: `cores: 2, sockets: 2` ran
+8 vCPUs, now 4; `CoresNotDivisible` refused). Lock: only stormvm-control gains `libc` + `stormvm-vmm` (both in the graph).
+Production path is `reconcile_one` (the per-UID executor); `sync` is the legacy/test path. Work on branch wip/246.
+1. [x] Bump stormvm d16a49b → e1a84f1 (Cargo.toml rev, lock by hand).
+2. [x] `vm_hotplug.rs`: `Hotplug` trait (vcpus/set_vcpus/memory/set_memory/add_nic/remove_nic) for
+       `stormvm_control::Machine`, injectable in tests; pure diff `changes(spec, have)`; the NIC record the machine
+       has (`<RUN_ROOT>/<ns>/<name>/kubelet-nics.json`: name, mac, binding, tap, multus ifname), written at start and
+       on every change, read at adoption (absent: the spec at adoption is the baseline).
+3. [x] `reconcile_one`, running machine, on a new generation (or never looked at, or memory still settling): vCPUs
+       (`cpu.cores` total) → `set_vcpus`; `memory.guest` → `set_memory`; NIC added: host-bridge (realise, `add_nic`
+       Tap, snoop) or secondary multus in the VMI's sandbox (NAD, recorded, CNI ADD, realise, `add_nic`, DHCP/snoop,
+       network-status); pod / default-multus NICs refused (start only); NIC removed: `remove_nic`, then snooper,
+       responder, lease, CNI DEL + attachment. Snoopers/responders keyed by MAC, not index (removal shifts indices).
+4. [x] Status: `currentCPUTopology`, `memory {guestAtBoot, guestCurrent, guestRequested}`, `interfaces[]`; condition
+       `HotplugSynchronized` (False + each verb's refusal; never a failed start).
+5. [x] Tests (diff, apply with a fake machine: grow/shrink/refusal → condition, NIC removal undoes, pod NIC refused,
+       record round trip, adoption baseline), README/api.md, CHANGELOG (incl. stormvm#92's vCPU count); sc-build; merge;
+       golden; close. Live: rustkube#269 (VM → VMI propagation) for a VirtualMachine edit.
+       Done: bump (stormvm e1a84f1), vm_hotplug.rs, MAC-keyed watchers/responders, `watch_and_serve` shared with start; 6 new tests.
+       SC_BUILD_VM sc-build 0eab793 (job 6b9f3fa8e8): 516 kubelet unit, all suites pass; clippy: nothing new (#227's
+       old ones remain). Stage golden golden-rustkube-node-282970b3214d (stormcos#424). Closed. Not run on a node: NIC
+       add needs a tap (root), live check = a VMI edit with maxSockets/maxGuest after rustkube#269 and the release.
+
+### Done: #245 (P3), the VM seed through stormvm_cloudinit::medium (combustion, stormvm#63)
+
+2026-10-13. stormvm e67a34a (main def7521; after d16a49b no Cargo.toml change, so only the rev moves in Cargo.toml and
+Cargo.lock) delivers combustion on the seed disk and drops `Invalid::CombustionNotDelivered`. Same commit as the bump:
+`seed_volume` asks `stormvm_cloudinit::medium(vm, &seed)` before creating the volume, then posts `medium.body()` to
+`/cidata` (cloud-init = `CIDATA` as before, no `keep_case`; combustion = `combustion`, `keep_case`, `/combustion/script`;
+ignition/storm = refused). Fake stormblock records the cidata body; test both. Docs, CHANGELOG; sc-build; golden; close.
+Done: 909962f (1 test). SC_BUILD_VM sc-build 909962f (job c4e82e8876): 510 kubelet unit, all suites pass. Stage golden
+golden-rustkube-node-5265b2973b7c (stormcos#424; combustion needs stormblock 62caa6e on the node). Closed. Live: a
+combustion VMI (openSUSE MicroOS) boots configured, after a release with both.
+
+### Done: #244 (P1), :10250/pods stalls ~15 s once per install (stormd's API probe)
+
+2026-10-13. Consoles (pvetest1 15:50Z, pvetest2): both stalls at the moment cadvisor hit max restarts and PID 1
+restarted it; the nodes no longer answer (12.16 installs failed), so the kubelet's own log is not readable. Code:
+`/pods` waits on only two things: the pods RwLock (never held across an await: checked every guard) and `auth_mw`'s
+TokenReview, sent on **every** request (no cache) under `Policy::API` (4 tries, 30 s each, 60 s deadline), so any
+apiserver hiccup holds the probe. The ring's blocking calls are all in spawn_blocking.
+1. [x] server.rs: TokenReview answers cached by token SHA-256 (ok 2 min = upstream's webhook TTL, refused 10 s);
+       review bounded (2 tries × 3 s, outer timeout), unanswered/failed = 503 + Retry-After, not cached; WARN when the
+       token check or the answer takes > 1 s, naming which. 3 tests (cache, 500 → 503 uncached, hung apiserver < 9 s).
+2. [x] Docs (api.md, README, retries.md), CHANGELOG (66ad8de). sc-build 66ad8de: 37 server tests pass (3 new).
+3. [x] SC_BUILD_VM sc-build 2388508: full suite (509 kubelet unit), clippy clean on server.rs. Stage golden
+       golden-rustkube-node-c6f01d65b9b7 (stormcos#424). Closed. Live: the next pvetest install, no STALLED on `pods`. Not done: SubjectAccessReview
+       (stormcos's API-HEALTH.md says the kubelet authorises through it; it does not yet): #180.
+
+### Done: documentation refresh from code since 2026-10-02 (#54-style audit; #166, #220)
+
+2026-10-09, on main at 06b91b5. Audit README, docs/, CLAUDE.md against code and `git log --since=2026-10-02`.
+1. [x] status.md rewritten (changes since 10-02, decisions, gaps with issues); configuration.md (stale #24/#69/#89/#126
+       lines), api.md (route table, stormimds#12 decided = #166, ports), README, metrics.md (#104 roots), BUILD.md,
+       csi.md, event-driven-design.md, presentation.md; CLAUDE.md reference + #220's unblocked entries.
+2. [x] Issues for doc promises with no owner (#222, #223); CHANGELOG; commit, push; sc-build `cargo build --locked`; #166/#220.
+
+### Done: #217 (P0), Job pods exit 0 but never reach Succeeded (Dell 11.99)
+
+2026-10-09. Traced live in the node log store (`:9094/api/plugins/logs/events`, short 30ca46356e): each runner pod
+was **deleted** as its suite finished (Stop at the same instant the Job created the next pod: test-f89f4, test-1e14d,
+test-260dd), because `test/` `drain` deletes every pod labelled `storm.io/test-run`, its own runner included. Also:
+every status write after a start met 409 (the start-timing PATCH moves the pod on; cilium-operator too) and was
+dropped until the next pass.
+1. [x] kubelet `write_pod_status`: 409 → GET (uid checked) → merge onto the fresh status → PUT on its revision, ≤5
+       tries; `conflict` metric; 2 tests against a fake apiserver (009d006).
+2. [x] test `drain` skips the runner (`HOSTNAME` or a Job-owned pod); test (d4abb1d).
+3. [x] Docs (metrics.md), CHANGELOG; sc-build 009d006 (P0): 465 kubelet unit pass. Test crate build; stage golden;
+       close. Live: short 4fe3fb250e (9229603, C2NR0Q2) passed 4/0/0, one runner, Job completed 1/1. Stage golden
+       golden-rustkube-node-2eabd6fc174b (stormcos#424) carries the 409 fix. Closed.
+
+### Done: #215 (P0), mirror pods carry stormd's probe state, restarts/CrashLoopBackOff and events (stormd#48)
+
+2026-10-08. stormd#48 done (golden-stormd-9bd45189d9a8): `GET /api/v1/processes` (state running | CrashLoopBackOff |
+stopped | failed | starting…, ready from the readiness probe, restarts, exit_code, started_at, stopped_at) and
+`GET /api/v1/events?since=<seq>` (upstream reasons, count bumps seq). stormcos's stormd APIs: plain HTTP, no auth,
+`[api] bind` per golden (9081–9085, service port + 100).
+1. [x] `stormd_api.rs`: endpoints from boot.d + golden config (`[api]` with TLS/credential = not read, said once),
+       processes/events parse, `representative` (process named as the asset, else the worst), `event_object` (named by
+       identity: process, reason, message, first time; count/lastTimestamp patched). 40aef87.
+2. [x] `mirror::with_stormd`: Running / Waiting CrashLoopBackOff|ContainerCreating / Terminated, restartCount (stormd's +
+       PID 1's), lastState, Ready = readiness with ContainersNotReady; status_current sees a waiting reason change.
+3. [x] kubelet `stormd_poll` (5 s): processes → map (change = mirror pass), events since the last written seq (reset on
+       a PID 1 restart of the service) → Events on the mirror pod. node_health probe only where stormd does not answer.
+4. [x] Tests (6 new: endpoint parse, boot.d roots, representative, event object identity, status mapping incl.
+       status_current, create-then-patch against a fake apiserver), README/api.md, CHANGELOG (0aae9a3). SC_BUILD_VM
+       sc-build 304926a (P0 slot): 463 kubelet unit, all suites pass. Stage golden golden-rustkube-node-8ebdf0576fd2
+       (stormcos#424; needs golden-stormd-9bd45189d9a8 in the same release for the events route). Closed. Live check
+       after the release: `kubectl describe pod -n kube-system fastetcd-<node>`.
+
+### Done: #216, per-container logs at upstream parity (stormconsole#124, stormcos_qa#48)
+
+2026-10-08. Found: each container has its dir and `<restart>.log` (app restarts), `previous=N` (#131), init logs kept
+(#47), mirror pods serve stormd's volume (#72/#87/#124). Gaps: (a) init containers and native sidecars always write
+`0.log`, so a retried init / restarted sidecar has no `--previous` (and a kubelet restart resets a crash-looping
+container's count to the last file's number); (b) runs are never pruned (a crash loop leaves a file per restart);
+(c) no rotation (`containerLogMaxSize`/`MaxFiles`); (d) stormpump writes raw output (Logs::Combined, "a writer is a
+process": no timestamps, no stream, no P/F), so `timestamps`/`sinceSeconds` cannot apply to a stormpump container:
+engine work, filed on stormpump (CRI-format log + reopen); this repo serves CRI lines already (filter_log).
+1. [x] `container_logs.rs`: `next_run(dir, at_least)` (max existing N + 1, ≥ the restart count) used at every create
+       (apps, restarts, inits, sidecars); `prune_runs` keeps the current + 5 previous (#131's window; upstream keeps 1).
+2. [x] Rotation as upstream's ContainerLogManager: every 10 s, the live `<N>.log` of each running container past
+       `--container-log-max-size` (10Mi) → `<N>.log.<YYYYMMDD-HHMMSS>`, older rotations gzip'd, at most
+       `--container-log-max-files` (5) files incl. the live one. Copy-truncate (the engine holds an O_APPEND fd and has
+       no reopen); the window between copy and truncate named in docs, gone with the stormpump op.
+3. [x] Tests (5 new), docs (configuration.md, api.md, README), CHANGELOG (4d7619c, 226e6a0); stormpump#129 filed (CRI
+       lines + reopen). Mirror pods: `--previous` = newest finished stormd run, failed or exited (owner's #216 rule
+       supersedes #72's failed-only; 8705023). SC_BUILD_VM sc-build at 7a96a08: 457 kubelet unit, 6 main, all suites pass.
+       Stage golden golden-rustkube-node-a779e87a8d78 (stormcos#424; first try hit stormcentral#549). Closed.
+       Timestamps/since on stormpump containers follow stormpump#129 (nothing more here).
+
+### Done: #211 (P1), every remote call retries (code review)
+
+2026-10-08. Owner: "sounds like it doesn't retry … needs a code review". Inventory: ~90 call sites; apiserver
+(raw reqwest in each module, 30 s timeout, no retry: the reconcile pass is the only retry), stormblock engine (one
+choke point, `EngineClient::send_within`, retries only a 401 token re-read), registry (stormpump_runtime image service),
+stormdrive (pv_placement), CSI/CRI gRPC (local sockets), probes (must not retry), watches (own reconnect loops),
+kube-proxy's apiserver client, the test container's `Api`.
+1. [x] `pkg/retry` crate (shared by kubelet, proxy, test): `Policy` (attempts, first/max delay, deadline; API, ENGINE,
+       REGISTRY, PEER, LOCAL), `Class` Infra|Real (408/429/500/502/503/504, timeout/connect/reset = infra), `send`
+       (reqwest; GET/PUT/DELETE/PATCH repeat, POST only when never sent or 429; `send_repeatable` for named
+       creates/reviews), `with_backoff` (generic), Retry-After, jitter, attempts logged. Lock entries by hand.
+2. [x] Route every site through it; a site that must not retry says why in a comment (0a7bc7c, 27fb11e; test container and its lock a333c3a).
+3. [x] docs/retries.md (every site, before/after), README/CHANGELOG (8253c0c); 13 retry tests (15ab836: 11 passed
+       on a build VM; blocking + message tests added after).
+4. [x] SC_BUILD_VM sc-build 2d92875 `cargo build --locked && cargo test --locked`: 453 kubelet unit, 13 retry, 34 proxy,
+       25 CNI, integration pass (first run: #212, a VM test reading its backoff after the now-retried API calls;
+       fixed). `cd test && cargo test --locked && cargo build --release --locked` at a333c3a: 29 pass, release builds.
+       Stage golden golden-rustkube-node-00d7475efba3 (105be87), release request stormcos#424. Closed.
+
+### Done: #210, git dependencies pinned by rev (stormcentral#571's SBOM refusal)
+
+2026-10-13. Upstream pins landed: stormpump#123 (272470b pins stormcast 3cec734), stormvm#82 (5f724c4 pins stormpump +
+stormpump-abi at 9877a97). stormpump/stormpump-abi `rev = 9877a97…`, every stormvm crate `rev = d16a49b…` (stormvm main;
+after b2f88b8 only the pin and stormvm-verify changed) (4b4afef); lock from build job 1dd3eae08c (`cargo metadata`,
+carried back with SC_BUILD_OUT, sha checked; ab461d6): one stormpump, no git source without `?rev=`. SC_BUILD_VM
+sc-build bf3d225 (job 2c167356d6) `cargo metadata --locked && cargo build --locked && cargo test --locked`: 509 kubelet
+unit, all suites pass. Stage golden golden-rustkube-node-c426c0ae96ed (stormcos#424). Closed.
+
+(earlier)
+
+2026-10-08. stormcentral's `sbom` reads `cargo metadata` and refuses any resolved git package whose source has no
+`rev=`, transitive ones included. Ours: stormpump 13cf2c9, stormvm 180fa13 (direct, `branch = "main"`), stormcast
+3cec734 (only through stormvm/stormpump, whose own manifests say `branch = "main"`).
+Tried (8774f06, reverted 4f3ef17): `rev` on the direct deps + root `[patch]` for the stormpump/stormcast URLs. Cargo
+refuses it: "patch for `stormcast` points to the same source, but patches must point to different sources" (it
+compares canonical URLs, not the ref; build job becd99d679). Without the patch the graph has two stormpump sources
+(our rev, stormvm's branch). So the pins have to come from upstream: stormpump#123 (stormcast by rev, filed),
+stormvm#82 (stormpump by rev, asked to name the rev). Resume: pin stormpump + stormvm at those commits (stormpump
+equal to stormvm's), `cargo metadata` lock job on the build box, check every git source `?rev=` and one stormpump,
+fix what the newer stormvm/stormpump APIs break (the stormvm move is #181's lock step too), sc-build, CHANGELOG, close.
+
+### Done: #209 (P2), a class blank being minted is charged as committed; medium's 1Ti case starts late
+
+2026-10-08. Found: stormblock formats a template on `fstemplate-<name>-raw` and seals it as `fstemplate-<fs>-<name>`
+(stormblock src/serve/reap.rs TEMPLATE_PREFIX). capacity.rs `is_source` knew only the bare blank name and sealed
+volumes, so the raw volume (unsealed while formatting) was charged its full size: 1 TiB + the 1Ti claim > 1.8 TB.
+Suite: cases larger than the node can hold (block 1Pi/20Ti, 16Ti, 4Ti on a 1.8 TB slab) sat in their slot for the
+whole 20-min mint budget each, so the 1Ti mint started 20 min in.
+1. [x] capacity.rs: every `fstemplate-` volume is a source (raw and sealed); test with the issue's numbers.
+2. [x] test/medium.rs: read the node's maximumVolumeSize first; a case whose class is above it is checked as a
+       refusal ("not enough room", 180 s), not a 20-min mint wait.
+3. [x] README, CHANGELOG (739fe93). SC_BUILD_VM sc-build: 453 kubelet unit pass, test crate tests + release build.
+       Stage golden golden-rustkube-node-16db12268fc3 (stormcos#424). Closed. Live: the next medium run on C2NR0Q2.
+
+### Done: #105, an admin credential for the engine's destructive verbs
+
+2026-10-08. stormblock#274 gates DELETE of templates and sealed volumes (and array/slab verbs) behind the admin
+token or a Kubernetes bearer allowed by SubjectAccessReview; the kubelet's one such call is #140's template rebuild.
+stormcos#296 chose SA tokens for destructive callers (the admin token never leaves the engine); the kubelet is not
+among them (stormcos#368 will enforce).
+1. [x] engine.rs: `TokenSource::admin_from_env` (`STORMBLOCK_ADMIN_TOKEN`, `_FILE`), `EngineClient::with_admin`;
+       non-GET still 401 after the node token's reread → once with the admin credential, read at each use. Tests (3:
+       distinct tokens + rotation + GET not escalated; missing then provided, stale refused once; single token).
+       Docs (README, configuration.md), CHANGELOG (6cf96e1).
+2. [x] SC_BUILD_VM sc-build 6cf96e1 `cargo build --locked && cargo test --locked`: 423 kubelet unit pass (3 new).
+       stormcos#402 filed (kubelet SA token + `STORMBLOCK_ADMIN_TOKEN_FILE`, before #368). Stage golden
+       golden-rustkube-node-dc81277f6b12 (stormcos#366). Closed. Live check is stormcos#402/#368's audit log.
+
+### Done: #193, mirror startTime from started_secs
+
+2026-10-08. stormpump#67 (golden 07243f4976bd, stormcos#309): assets.json written on change only, `started_secs`
+(CLOCK_BOOTTIME). `Asset.started_secs`, `Asset::age(uptime)`, `node_uptime()`; both mirror sites. Test, README,
+CHANGELOG (9f7850f). SC_BUILD_VM sc-build: musl release + 452 kubelet unit pass. Stage golden
+golden-rustkube-node-eebefa906279 (stormcos#366). Closed; stormpump#110 told.
+
+### Done: #172, image Volumes become mount points
+
+2026-10-08. stormblock-registry#58 closed; its ImageConfig has `Volumes`. Chosen: CRI-O's default (`mkdir` in the
+container's root), not containerd's copied volume: since #104 the root is private and writable, so a directory there
+keeps the image's content and dies with the container; an empty bind would hide it. `ImageConfig.volumes`,
+`declared_volumes` (mount at/above covers), `make_in_root` (no symlink followed); create_container. Tests (2),
+README, CHANGELOG (d104cb5). SC_BUILD_VM sc-build: musl release + 451 kubelet unit pass. Stage golden
+golden-rustkube-node-c3b4f7e086ea (stormcos#366). Closed.
+
+### Done: #130 (P3), lastState, terminated reason, imageID, image provenance (stormconsole#69/#75)
+
+2026-10-08. (1/2) PodManager.last_terminated (uid → container → LastTerminated, recorded in the Exited branch before
+a restart/back-off, dropped at stop_pod) rendered as `lastState`; `terminated_reason`. (3) image_config::Provenance
+(`provenance_of_record`, `release_golden_in` on /etc/stormcos/release/manifest.json); runtime Container.provenance +
+resolved_at at create; `image_id(c)`; `RuntimeService::container_image_info`. (4/5 + instance) annotations
+`storm.io/{image-resolved,instance,golden,image-build}.<c>` (start patch + after restart). Mirror: `with_provenance`
+(imageID, hostIP, storm.io/golden, -provenance; metadata patched when different; status_current compares).
+stormblock-registry#100 filed (registry keeps no OCI created/Labels). Tests (6), README, CHANGELOG (89ee657).
+SC_BUILD_VM sc-build: musl release + 449 kubelet unit pass. Stage golden golden-rustkube-node-1a3a82685db9
+(stormcos#366). Closed.
+
+### Done: #131 (P3), pod network counters, network-status, older runs' logs (stormconsole#69)
+
+2026-10-08. (1) InterfaceStats + packets/errors/drops; cAdvisor families; /stats/summary `network`. (2) cni:
+CniResult.network/plugins (invoker), CniInterface.mtu; `network_status.rs` (Multus entries + addresses/routes/
+plugins; `mtu_in_netns` SIOCGIFMTU, no setns when already there); stormpump Sandbox.network_status;
+`RuntimeService::pod_network_status`; written with the start-timing patch. (3) `previous=N` (`runs_back`,
+`pick_run`, `failed_run`, `Record::ended_run`); rustkube's pods/log forwards it as is. VM tap counters not done
+(stormvm#48 is the guest view). Tests, docs, CHANGELOG (f4e863a; f5819b6 = build failure #199; d14ab4d musl ioctl
+type). SC_BUILD_VM sc-build: musl release + 443 kubelet unit pass. Stage golden golden-rustkube-node-f88fa2d3245d
+(stormcos#366; first try hit the intermittent empty stormd input, noted on stormcentral#362). Closed.
+
+### Done: #136, /log strips three words of every plain line
+
+2026-10-08. `filter_log` took any 4-way split as `<ts> <stream> <tag> <msg>`. Now `cri_line`: RFC 3339 first field
+and CRI's stdout|stderr + P|F, or stormd's stream + severity words (node-service logs go through the same filter);
+else whole. P lines joined; a final unterminated line returned (plain read; `rest_from` when a follow ends). Tests
+(the issue's lines, partials, unterminated), api.md, CHANGELOG (9f39b3f). SC_BUILD_VM sc-build: 436 kubelet unit pass.
+Stage golden golden-rustkube-node-1a2f55a3b2f5 (stormcos#366). Closed; stormcos_qa#26 told.
+
+### Done: #135, start timing's `scheduled` from storm.io/scheduled-at
+
+2026-10-08. rustkube (5d74187) writes `storm.io/scheduled-at` (RFC3339, µs) with the bind. `scheduled_at` prefers
+it, then PodScheduled, then creationTimestamp; `scheduled_us` (µs) printed with `ms()` (tenths below 10 ms). Test,
+README, CHANGELOG (df4380a). SC_BUILD_VM sc-build: 434 kubelet unit pass. Stage golden golden-rustkube-node-c525fe79725a
+(stormcos#366). Closed. rustkube#190's burst acceptance is theirs, after the release.
+
+### Done: #24 (P3), --system-reserved, --kube-reserved, --cgroup-driver
+
+2026-10-08. Labels/taints done before, max-pods #165. Left: reservations (allocatable was capacity − 256Mi, CPU and
+ephemeral none) and the cgroup driver (the CRI path sent no cgroup_parent). Done in code (63029cc): `Reserved` (cpu,
+memory, ephemeral-storage; pid refused), `allocatable()` (− reserved − 100Mi / 10%); `cgroups.rs` (driver, upstream
+parent names); CriGrpcClient `resolve_cgroup_driver` (RuntimeConfig wins, then the flag, then cgroupfs) and the
+sandbox's cgroup_parent from `PodSandboxConfig.qos_class`. Tests (unit 3, CRI double 1), docs, CHANGELOG (d1b4e09).
+SC_BUILD_VM sc-build: 433 kubelet unit + CRI round trip pass. Stage golden golden-rustkube-node-1ff1325fb538
+(stormcos#366); stormcos#403 (size --system-reserved). Closed.
+
+### Done: #32 (P3), the node/CNI networking contract (docs only)
+
+2026-10-08. Readiness half decided by #3 (no NotReady gating; verified live). Left: the written contract. Facts
+checked: stormcos `ip=dhcp` (kernel DHCP: address, gateway, DNS), Cilium tunnel/VXLAN + masquerade + kube-proxy
+replacement (50-cilium-config.yaml), network-operator 0.3.0 (Network CR), CLUSTER.md "Choosing the network".
+docs/networking.md, README link, CHANGELOG (c93fb49, 7d7dbac: NetworkUnavailable is cilium-operator's, from Cilium's
+node_taint.go). sc-build `cargo build --locked` ok. No golden (docs only). Closed.
+
+### Done: #116 (P3), the CRI backend follows GetContainerEvents
+
+2026-10-08. `next_look` gave every Pod `sync_interval` unless the engine reports exits; nothing called CRI
+`GetContainerEvents`. Done in code: `RuntimeService::follow_container_events` (RuntimeEvent Connected/Container,
+EventStream Unsupported/Ended), the gRPC client's stream (pod uid from the sandbox status metadata), kubelet
+`runtime_event_router` (live flag; Connected → every Pod once; event → that Pod's worker, else by container id via
+`pod_of_container`; end → back on the clock, reopened 1–30 s; Unimplemented → stays on the clock), `evented()`.
+Tests (CRI double: events + Unimplemented; evented truth table), docs, CHANGELOG (a76489f). SC_BUILD_VM sc-build:
+430 kubelet unit + CRI round trip pass. Stage golden golden-rustkube-node-187eeaaebe79 (stormcos#366). Closed.
+
+### Done: #23 (P3), the node side of the 1.36 posture
+
+2026-10-08. Audit: kubeProxyVersion written and kubeletVersion v1.32 (fix); AppArmor read nowhere, so a confined pod
+ran unconfined (upstream admission refusal; stormcos's only user is Cilium's Unconfined); gitRepo already waits
+(message names the removal); containerd < 2.0 (refused at startup); cgroups v2 only (workload_identity skips v1);
+no IPVS mode; cgroup driver = #24; k8s-openapi unused here (apimachinery pins its own, rustkube's). Code, tests (4),
+README/status.md, CHANGELOG (91ca976). SC_BUILD_VM sc-build: 429 kubelet unit pass. Follow-up #197 (AppArmor
+applied). Stage golden golden-rustkube-node-1a6eef824e07 (stormcos#366). Closed.
+
+### Done: #113 (P3), a given --apiserver equal to the default overrides the kubeconfig
+
+2026-10-08. main.rs chose the CLI URL only when `!= DEFAULT_APISERVER`. Now `apiserver: Option<String>` (no clap
+default) and `api_server_url(given, kubeconfig)`: given → kubeconfig → default. Test (omitted, non-default, explicit
+default, and the CLI parse). Docs (configuration.md, status.md), CHANGELOG (46510b2). SC_BUILD_VM sc-build: passes
+(main.rs 5, kubelet 425). Stage golden golden-rustkube-node-163852d29fad (stormcos#366). Closed.
+
+### Done: #78 (P3), nodeInfo kernelVersion / bootID / machineID / systemUUID
+
+2026-10-08. node_status.rs hard-coded all four as "". Upstream's sources: osrelease, boot_id, machine-id (the node's
+at /hostroot first: the kubelet's root is its golden), DMI product_uuid. `first_value(paths)`; tests (2); docs
+(configuration.md), CHANGELOG (956668a). SC_BUILD_VM sc-build: 425 kubelet unit pass. Stage golden
+golden-rustkube-node-dc9c42e9ad95 (stormcos#366). Closed. Live check: `kubectl get nodes -o wide` after a release.
+
+### Done: #13 (P3), microVM Pods: owner chose A (stormvisor's) — `--runtime vm` retired
+
+2026-10-09. Owner (via master, 10-09): A. microVM Pods are stormvisor's; the kubelet's part is RuntimeClass dispatch
+(#204). Here: delete `vm_runtime.rs`, `--runtime vm` and `--vmm` (nothing deploys them: stormcos runs stormpump),
+docs, CHANGELOG (breaking, pre-1.0) (74c5972); SC_BUILD_VM sc-build: 482 kubelet unit, all suites pass. #13 and #221
+closed, superseded by #204 (commented there).
+
+### (history) Waiting on the owner: #13 (P3), microVM Pods (`--runtime vm`)
+
+2026-10-08. Stopped before code. Found: stormvisor (created 07-16, minutes before #13) is the platform's microVM-Pod
+runtime (OCI RuntimeClass shim, stormfork microVMs, guest agent + youki; stormcos kubernetes edition ships
+`stormvisor-shim`, cloud-hypervisor, firecracker), and #13's items 2-4 are its scope. `--runtime vm` is node-wide
+(no stormpump Pods/VMIs on that node), start/stop are Phase-1 stubs, one rootfs template; the kubelet ignores
+`runtimeClassName` (CRI `runtime_handler` always ""). Asked on #13: A RuntimeClass dispatch to stormvisor, retire
+vm_runtime (recommended); B finish `--runtime vm`; C microVM Pods via stormvm on stormpump. `wait-owner` run.
+
+### Closed: #142 (P3), the kubelet's own NVMe/TCP connect: not planned
+
+2026-10-08. Nothing on the current path needs it: replicated claims are stormblock-csi's (owner on #68; its node
+plugin connects in NodeStage), migration is a RAID leg on the destination (owner on #159, stormstorage#44), #157 goes
+through CSI snapshots. Only #86's option B (remote golden attach) would; reopen then (and a connect would be the
+engine's, PID 1 holds /dev/nvme-fabrics). The explicit refusal stays.
+
+### Done: #112 (P3), restart backoff across a kubelet restart
+
+2026-10-08. `crashloop.rs` was memory only. Done in code: `persist_to(<state root>/crashloop.json)` from
+`recover_state` (loads, drops entries past STABLE), every change saved atomically in wall-clock seconds; keyed by pod
+uid, so a recreated Pod inherits nothing. 1 test (restart carries the delay and its doubling, new uid nothing, forget
+on disk, forgiven not carried, garbage file). sc-build 6a02fa0796: 420 pass. Golden 68e86077a3c7. Closed.
+
+### Done: #47 (P3), the last part: an init container's log after it completes
+
+2026-10-08. Status half done (4fefda1, ece4211); the fixed init deadline went with #126. Left: `run_init_containers`
+removes a completed init container at once. The native runtime writes no logs; stormpump's removal never deletes the
+log file (the engine writes it in the pod's log dir), so `kubectl logs -c <init>` already answers there; a CRI runtime
+may take the log with the container. Done in code: `RuntimeService::logs_survive_removal` (false; stormpump true); a
+completed init kept in `PodManager::kept_inits` until `stop_pod` where removal would lose the log. Tests (1 changed,
+1 new). sc-build 90c291c0ec: 419 pass (after #196's test updates). Golden e3415aaa02e2. Closed.
+
+### Waiting on stormcos#820 (a release that runs stormblock-csi) + stormcos#354 (one cluster stormstorage): #157 (P3), VM disks on stormblock-csi claims: snapshot by VolumeSnapshot, restore from any leg
+
+2026-10-10. stormstorage#49 closed (snapshots, one-node group snapshots, `source` clones); stormblock-csi still has
+`snapshots: false` for its stormstorage backend and no csi-snapshotter: filed stormblock-csi#51. stormcos#170 ships the
+VolumeSnapshot CRDs (external-snapshotter v8.6.0) + snapshot-controller. A RAID twin exists only for a VM disk on a
+stormblock-csi claim (owner on #68), so the kubelet's half is KubeVirt's way, driver-agnostic:
+A. [x] A VM disk on another driver's claim: the PV must be `volumeMode: Block` (no disk.img on a Filesystem claim);
+       stage + publish as a raw block (`VolumeCapability.block`), recorded under `vm-<uid>` (not a pod uid, so the
+       pod sweep leaves it; the VM manager tears it down at stop / failed start, and sweeps records with no machine).
+       The published path is the disk's device; no volume id (the claim is not the VM's).
+B. [x] Snapshot: freeze → pause (stormvm_control::snapshot::take with the kubelet's closure) → stormblock group of the
+       built-in volumes (if any) + one VolumeSnapshot per CSI-claim disk (`vmsnapshot-<snap uid>-volume-<disk>`, the
+       driver's default class), waited to `creationTime` → unpause → thaw. Recorded `storm.io/snapshot-volumesnapshots`
+       (disk → VolumeSnapshot + the claim's class, modes, size).
+C. [x] Restore: those disks become claims with `dataSource: VolumeSnapshot` (class/modes/volumeMode as snapshotted,
+       size ≥ restoreSize), no node pinning: the driver serves them from whichever leg holds them. A restore whose
+       disks are all CSI is not the snapshot's node's: any node may claim it (rv-guarded).
+D. [ ] Tests (5 new), README, csi.md, status.md, CHANGELOG (0b942e8, c9e168f; #243 = test callers, fixed 52dfe91).
+       SC_BUILD_VM sc-build 52dfe91: 506 kubelet unit, all suites pass. Stage: three tries hit the empty stormd input
+       (stormcentral#549); the fourth found golden-rustkube-node-3071252337cd already holding this content (kubelet
+       sha 2cbe48be… = 52dfe91's; stormcos#424). Resume after stormblock-csi#51 + a release: snapshot a VM on a
+       stormblock-csi claim, lose the head, restore; close.
+       2026-10-10: stormblock-csi#51 closed (golden-stormblock-csi-722fc08812b1, stormcos#462). Not on a cluster yet:
+       the snapshot-controller (stormcos#357) and the csi-snapshotter golden (stormcos#536) are open, both behind
+       stormcentral#272; stormcos#170 is still open too (the earlier "done" was wrong). #157 proposed after stormcos#357.
+       2026-10-28: stormcos#536 closed (csi-snapshotter golden), stormcos#357 shipped from stormcos (3b30f0f) but open,
+       stormcos#170 open; 12.58 carries no snapshot-controller and no stormblock-csi. #157 proposed after stormcos#357 +
+       stormcos#170. Resume: a release with them + stormblock-csi; snapshot, lose the head, restore, boot; close.
+       2026-11-06: stormcos#357 closed and 12.63 (composed; installs still running) records the snapshot-controller golden as shipped with its apiserver and
+       stormpump; the CRDs have shipped since 10-07 (#170 stays open for the controller and stormvm's live check, so it is no blocker here). Not re-run: no kubelet change, and
+       the five #157 tests are still in main. Left: nothing runs stormblock-csi (not in 12.63, no manifest in stormcos; filed stormcos#820), and "lose the node" needs
+       two nodes on one stormstorage (stormcos#354, stormstorage#56). #157 proposed after stormcos#820 + stormcos#354. Resume: snapshot a VM on a stormblock-csi claim, lose the head, restore, boot; close.
+
+### Done: #181 item 3 (stormpump#144: /run/stormpump/shutdown)
+
+2026-10-09. The engine writes `/run/stormpump/shutdown` ({reason, started_unix, vm_shutdown_max_secs, why}) before
+stopping any workload, and removes a stale one at every start. Doing: `VmManager::power_down_all` (every running VM's
+`shut_down` started at once, nothing forced, bounded wait), triggered (a) by the marker appearing (fs_watch on
+/run/stormpump) and (b) by SIGTERM when the marker is there (then exit); SIGTERM without it = a restart, VMs untouched.
+ecc6cc6 (+ docs f38eb3d). SC_BUILD_VM sc-build ecc6cc6: 483 kubelet unit pass. Stage golden
+golden-rustkube-node-ac027e155623 (stormcos#424). #181 closed. Live: a power-off with a VM running, the guest down
+before its hypervisor is signalled (stormvm's medium shutdown case), on a release with stormpump bdcc7eafef47.
+
+### (earlier) #181 items 1+2 + spec grace done 2026-10-09
+
+2026-10-09. Merged to main (c9cec31): items 1+2 (37a5843, rebased), `shutdown_grace_secs` from the VMI on the machine
+spec (stormpump#56; retried without on an older engine), lock stormvm a88c809 (has shut_down; stormvm main fails to
+build, stormvm#81) + stormpump cc878b9. sc-build c9cec31: 477 kubelet unit pass (#234 was a test path). Item 3 (power
+off every VM at once on a node shutdown): nothing tells the kubelet the node is going (its SIGTERM = a restart's);
+filed stormpump#144 (a marker in /run/stormpump); #181 proposed after it. Stage golden golden-rustkube-node-2c941c8bcbec
+(f9b7996, stormcos#424): a release with it needs stormpump >= #56 for the grace (else the spec is retried without).
+
+### (history) Waiting on stormpump#56 + a build: #181 (P2), a VM stopped gracefully: Machine::shut_down(grace) before the engine's stop
+
+2026-10-08. `stop` sends the engine's stop (SIGTERM to the hypervisor = a power cut) at once when there is a handle;
+only `stop_by_control` asks the guest. stormvm main (409e0fc, has 94004b7) offers `Machine::shut_down(grace) ->
+PoweredOff | AlreadyGone | StillRunning(why)`; the lock has stormvm 180fa13 (without it).
+1. [ ] Lock: stormvm 180fa13 → 409e0fc (all its crates), on branch wip/181-graceful-stop, built on the build box
+       against stormpump 13cf2c9.
+2. [ ] `stop`: shut_down(grace) in the background (grace = the VMI's terminationGracePeriodSeconds, default 30),
+       the engine's stop only on StillRunning; `stop_by_control` uses shut_down too.
+3. [ ] Node shutdown (item 3) waits on stormpump#56 (the engine stops the kubelet before the hypervisors; the guest's
+       grace is an owner decision there). Tests, docs, CHANGELOG; sc-build; golden; leave #181 open on item 3.
+       2026-10-08: items 1+2 coded on branch wip/181-graceful-stop (37a5843): `graceful_then_forced` (shut_down → force
+       only on StillRunning, or on PoweredOff/AlreadyGone when the engine still sees it running 5 s later), `grace_from`
+       (terminationGracePeriodSeconds, default 30), `stopping` an Arc, `stop_by_control` uses shut_down; 1 test. NOT
+       built: the lock job (`sc-build 'cargo update -p stormvm-control --precise 409e0fc…; git diff Cargo.lock; cargo
+       build'` on the branch) waited out its hour behind the master's build drain for the 11.95 test (owner: builds
+       off). Resume: rerun it on the branch, apply the diff, build/test the branch, docs + CHANGELOG, merge, golden.
+       Item 3 (node shutdown) after stormpump#56's grace decision. #181 proposed after stormpump#56.
+
+### Done from this side: #57 step 4, CPU requests as Pod cgroup weights (stormpump#68's Pod group, OpenShift's shape)
+
+2026-10-08. stormpump#68 done (golden-stormpump-accd1a3e8e61, stormpump@13cf2c9, release request stormcos#309):
+`Spec.group` (node | pods | pods/burstable | pods/besteffort, payload v8) and `GROUP_SET` (a Pod group's cpu.weight
+/ memory.max). Also QUERY `MEMORY` (anon, file, inactive_file, working_set; stormpump#64).
+1. [x] Lock: stormpump 795b92e → 13cf2c9 (`--precise`), stormvm stays 180fa13; build on the build box.
+2. [x] `spec_for`: group by the pod's QoS class; `cpu_weight` from `cpu_shares` by upstream's conversion;
+       `GROUP_SET pods` weight from allocatable CPU at start. Working set from QUERY MEMORY when the engine has it.
+3. [x] Tests, docs, CHANGELOG; sc-build; golden (ships with stormpump's accd1a3e8e61: an older engine refuses a v8
+       spec, so the release must carry both); close.
+       Done on wip/57-pod-groups (f6312e9 code, f2163fd lock; lock diff from build job 15d6107177, whole workspace built
+       against stormvm 180fa13), fast-forwarded to main. sc-build fe6f90d674: 418 kubelet unit pass (3 new/changed).
+       Stage golden golden-rustkube-node-2842aefdb2cf (a87d82e), stormcos#366; must ship with golden-stormpump-accd1a3e8e61
+       (stormcos#309), said on both. #57 closed.
+
+### Done: #50 (P2), node services' lifecycle Events
+
+2026-10-08. Done before: Started/Stopped/BackOff on transitions (7e6f4b0), NotStarted (7f4f3d1), exit and tail on
+Stopped/BackOff (#82). Left: first sight said nothing, events carried observation time, a failure read as Stopped.
+1. [x] `mirror::transition`: first sight judged against the API's mirror pod (same startedAt ±5 s and restartCount =
+       the same run, nothing; else Started with the real start time; down while the API says running = ended);
+       non-zero exit / signal = Warning Failed. mirror_node_services reads the mirror list first, then the events.
+2. [x] Test, README, CHANGELOG (700d134). sc-build job 5246ba2d95: 416 pass. In golden c2f201fd4cb5 (stage: unchanged).
+       Closed.
+
+### Done: #42 (P2), the node half of volume expansion (ReadWriteOncePod done in v0.8.0)
+
+2026-10-08. rustkube#63 done: a grown claim has `allocatedResourceStatuses.storage: NodeResizePending`,
+`Resizing` + `FileSystemResizePending`, PV capacity = new size, claim capacity old. Upstream then: NodeExpandVolume,
+capacity = new, both conditions removed, allocatedResourceStatuses dropped.
+1. [x] `csi.rs`: `expand_volume` capability, `node_expand`. `csi_volumes.rs`: `resize_due`, `resized_status`,
+       `expand_csi_volumes` (records → PV → claim; driver call; status merge patch; Events). csi sweep loop watches PVCs.
+2. [x] Tests (2), csi.md, status.md, CHANGELOG (1af5ece). sc-build job 8d5ba26c64: 415 kubelet unit pass. Stage golden
+       golden-rustkube-node-0ee0277c7dba (stormcos#366). Closed. Live with #52's driver (stormblock-registry#99).
+
+### Done: #241 (P2), VM multus NICs (stormvm#85: stormvm b2f88b8)
+
+2026-10-10. stormvm b2f88b8 (10 commits on c7a7859, no Cargo.toml change, same stormpump f466116): `Attach::Multus
+{network, ifname, default}` (net1.. by order, eth0 for `multus: {default: true}`), `realise` bridges the sandbox's
+`ifname` to the tap on `vm<ifname>` → `Made {binding "multus", bridge, address (NAD IPAM, gateway 0.0.0.0)}`;
+`serve_dhcp_on(netns, bridge, lease)`, `snoop_tap_in(netns, tap, mac, seen)`, `sandbox_bridge`.
+1. [x] Lock: stormvm rev c7a7859 → b2f88b8 (Cargo.toml + Cargo.lock by hand: only the rev moves).
+2. [x] vm_network: `wants_sandbox` for Multus; PodNet records `default_network` / `attachments` (NAD name, ifname,
+       config: DEL after a restart needs it) and `network_status`; LeaseRecord `bridge`.
+3. [x] vm_manager: resolve each NAD (VMI namespace unless `ns/name`; missing = Waiting NetworkNotReady); default NAD's
+       ADD instead of the cluster's on eth0; then each attachment's ADD on its ifname, recorded first; DEL reverse then
+       the default. resolve_nics: Multus arm (the sandbox), DHCP on `made.bridge` (secondary: no DNS/search/router),
+       else `snoop_tap_in`; restore answers on the recorded bridge. network-status annotation on the launcher Pod.
+4. [x] Tests (4 new: NAD resolution + wait, ADD/DEL order + network-status, record compat, plan), README,
+       networking.md, CHANGELOG (b4438ba). SC_BUILD_VM sc-build b4438ba: 501 kubelet unit, all suites pass. Stage golden
+       golden-rustkube-node-33c20753224a (stormcos#424; first try hit stormcentral#362's empty stormd input). Closed.
+       Live = stormvm#85's VLAN checks (VM + pod on one VLAN, two VLANs, no cross-VLAN reach).
+
+### Done: #240 (P0), stormvm → c7a7859 (stormvm#87: pod-network VMs "stormbr0 … has no address")
+
+2026-10-10. stormvm f561d97 reads the sandbox's routes from `/proc/thread-self/net` (the lock's a88c809 read the
+node's). Bump every stormvm crate to `rev = "c7a7859f88bb205506a8ebf9cae2f1957112bf7d"` (stormcentral#571).
+Found: stormvm now pins stormpump by rev f466116 (stormvm#82), 91 commits behind ours (cc878b9, branch main): the
+graph gets two stormpump packages. Nothing crosses between them (the kubelet takes the plan's spec as bytes; spec
+payloads are versioned and an older one decodes in ours), so it builds; one stormpump needs stormvm to move its rev
+(file it). Also in the bump: stormvm#60 (`from_kube` refuses unknown VMI keys by path).
+1. [x] Branch wip/240: Cargo.toml rev pins; lock from a build VM (`cargo metadata`, `git diff Cargo.lock`); apply.
+2. [x] Lock job (cargo metadata + build + test) then SC_BUILD_VM sc-build 9b26801 `--locked`: 497 kubelet unit, all suites
+       pass. Fast-forwarded to main (847d0fe), CHANGELOG + status.md. Stage golden golden-rustkube-node-885c18965611
+       (stormcos#424). stormvm#82 asked to move its stormpump rev to ours. Closed; live proof = stormvm#87's (a pod-network
+       VMI starts on the Dell and pvetest2, stormcos_qa medium `up/vm-*`).
+
+### Done: #219 (P0), node_health's fallback reads stormd's probe tables
+
+2026-10-10. stormd (probes.rs, stormd#48) retired `[process.liveness]` (parsed, never acted on); goldens move to
+`[process.readiness_probe]` / `liveness_probe` / `startup_probe` (Kubernetes fields: `http_get {path, port, host,
+scheme, http_headers}`, `tcp_socket {port, host}`, `exec`, `grpc`; period 10, timeout 1, failure 3, success 1;
+camelCase aliases). `node_health::liveness_url` reads only the old table, so a golden on the new ones has no check.
+1. [x] node_health: parse the config as TOML (`toml`, already in the lock via stormvm-spec); per `[[process]]` (the one
+       named as the asset first) readiness_probe, then liveness_probe, then the old liveness http url; `http_get` =
+       GET (200–399, no redirects, any cert, as stormd/upstream), `tcp_socket` = connect; exec/grpc not probed, said
+       once. The probe's period/timeout/failure/success thresholds; the loop ticks 1 s, probes each when due.
+2. [x] Tests (8 new/changed), README, CHANGELOG (7318d26). SC_BUILD_VM sc-build 7318d26: 497 kubelet unit pass, all
+       suites. Stage golden golden-rustkube-node-60ab11be0d6f (stormcos#424). Closed. Live: a node whose stormd API does
+       not answer, a golden on `[process.readiness_probe]`: its mirror goes not ready when the port is refused.
+
+### Done: #239 (P1), after a keep-data reboot: kept pods' status, node Ready, new pods > 5 min
+
+2026-10-10. pvetest2 (storm-003102, 12.13-flowsdn) log store (:9094 on 192.168.31.173, `host=`, `search=`):
+- **5 min**: every CNI ADD 14:33–14:58+ failed in flowsdn's agent, `HTTP 500 No space left on device (os error 28)`;
+  the kubelet retried (~2 s) and DEL'd each failed ADD. Kernel 14:32:57: `EXT4-fs error (device ublkb0):
+  ext4_free_inode: comm flowsdn-routes: bit already cleared`. flowsdn's (or the kept volume's): file on flowsdn.
+- **'cilium' DEL**: from storm-06f96d and storm-003101 (other nodes; the store mixes hosts). Every DEL on storm-003102
+  went via 'flowsdn' (00-flowsdn.conflist, the only config there).
+- **Kept pods**: restarted (new containers, CNI ADD) but `startTime` kept (`source.startTime`), and start timing's
+  `scheduled` measured from the old bind (5346327ms). Node Ready always True, so its transition never moved.
+1. [x] Node: the Node's `nodeInfo.bootID` ≠ this boot's → that write Ready=False (KubeletNotReady, why), Warning
+       `Rebooted` Event (upstream's); the next update Ready again (fresh transition). Test (stub apiserver).
+2. [x] Pods: `startTime` before this boot → now; start timing: no `scheduled` for a pod bound before this boot. Tests.
+3. [x] flowsdn#374 filed (ENOSPC); docs (README, configuration.md), CHANGELOG (8983f14, d2eac0c). SC_BUILD_VM sc-build
+       d2eac0c: 491 kubelet unit + node_reregister 4 pass (4 new tests). Stage golden golden-rustkube-node-8b9c15f19053
+       (stormcos#424). Closed. Live: the next keep-data reboot (Node Ready transition + Rebooted Event, kept pods' startTime).
+
+### Done: #236, host_nqn on sbregistry clone requests (stormblock-registry#102, stormblock#212)
+
+2026-10-10. The kubelet's only sbregistry clone request is the cluster demand (`StormpumpImages::demand`, #79; its
+clone is deleted at once); container roots are engine clones over ublk (#104), no NVMe export. Add `host_nqn` (the
+node's `/etc/nvme/hostnqn`, seen at `/hostroot/etc/nvme/hostnqn`, read once; omitted when there is none) to that body.
+Test with the fake registry, docs, CHANGELOG; sc-build; golden; close.
+Done: 4d8df3c, 84a4af0 (2 tests). SC_BUILD_VM sc-build 84a4af0: 488 kubelet unit pass. Stage golden
+golden-rustkube-node-cd559c0641e8 (kubelet sha fec45e89…, stormcos#424). Closed. No live check of its own: the engine
+still admits any host (`allow_any_host`) until stormblock#212 binds by NQN.
+
+### Done: #21 (P2), cadvisor's library for node / machine / filesystem stats and eviction signals
+
+2026-10-09. Resumed the branch rebased (wip/21-rebased): cadvisor pinned by full rev afb46a0e…, lock from a build
+VM (cadvisor-host/model, inotify), #230 (a test's HELP line), and a guard: the root cgroup's CPU is read only
+outside a cgroup namespace (`/proc/self/cgroup` path not `/`). Docs (metrics.md, api.md, README), CHANGELOG.
+SC_BUILD_VM sc-build cb8ff94 (rebased on main): 486 kubelet unit pass; fast-forwarded to main. Stage golden golden-rustkube-node-f6c3161f5376 (stormcos#424). Closed. Live:
+`/stats/summary` node cpu/memory and `/metrics/cadvisor` machine_* on a node after the release.
+
+### (history) Paused (P0 #104 first): #21 (P2), cadvisor's library for node / machine / filesystem stats and eviction signals
+
+2026-10-08. Work is on branch `wip/21-cadvisor-node` (5f81dec), reverted on main (290938e) so main keeps building:
+the dependency needs Cargo.lock entries made on the build box. Scoping answered on the issue (owner: glennswest/cadvisor;
+upstream split cadvisor into a kubelet library: node/fs/machine there, containers on CRI). On the branch:
+- `cadvisor-host` + `cadvisor-model` (git, rev afb46a0) in Cargo.toml; **lock not made yet**: `cargo update -p` cannot
+  name a new package, so run `sc-build 'cargo metadata --format-version 1 >/dev/null; git diff Cargo.lock'` on the
+  branch and apply the printed diff (that job was started at 5f81dec; read it or rerun).
+- `node_stats.rs`: root cgroup CPU (`CgroupReader::read_stats("/")`), root memory as cAdvisor computes it (usage =
+  MemTotal − MemFree, working set = usage − inactive_file, available = total − working set), machine info once;
+  `render` (machine_*, root memory usage/rss); 2 tests.
+- `metrics::render_cadvisor_with_node` (root `id="/"` series in the cpu/working-set families); `/stats/summary`
+  node cpu/memory from the root (container sums only as fallback); MemoryPressure on capacity − working set.
+Resume: lock, merge the branch to main, sc-build, live check (/stats/summary, /metrics/cadvisor on a node), close.
+Not here: PSI, imagefs (images are stormblock volumes on stormcos).
+
+### Done (closed): #60 (P2), each PV's storage placement: volume, drives, shelf/bay, RAID partners
+
+2026-10-08. Both sources exist: stormblock `GET /api/v1/volumes?placement=true` (`placement.drives[]` serial/wwn,
+`legs` policy/health/missing, `rebuild`, `arrays[].members[]` state/drive/node = RAID partners; stormblock#136) and
+stormdrive `GET https://<node>:9092/api/v1/placement` (drives with wwn/serial, `shelf.key`, `labels.shelf`, `bay`,
+health, designation; TLS with the node CA, a node-CA client cert reads it, stormdrive#19). The kubelet's apiserver
+client is that CA + `kubelet.crt`. The node-volume mirror covers only `-data/-state/-logs`; built-in claim PVs are
+never refreshed, so placement is its own pass over every PV of this node's stormblock volumes.
+1. [x] `pv_placement.rs`: drive index (wwn, else serial); annotations `storm.io/volume-id`, `storm.io/golden`,
+       `storm.io/redundancy`, `storm.io/health`, `storm.io/rebuild`, `storm.io/drives` (JSON: wwn, serial, model,
+       node, shelf, bay), `storm.io/raid-partners` (JSON: array, level, index, drive, node, state); labels
+       `storm.io/shelf` (one shelf), `storm.io/redundancy`, `storm.io/health` (label-safe); Events on change
+       (VolumeDegraded / VolumeHealthy, RebuildStarted / RebuildFinished, VolumeMoved, RaidPartnerChanged).
+2. [x] `placement_loop`: engine volume changes + 60 s; merge-patch only what changed. stormdrive unreachable:
+       stormblock's half alone, said once.
+3. [ ] Tests, docs (node-volumes.md, README), CHANGELOG; sc-build (stormcentral#544); close.
+       Done: 6610901, b1e91d6 (TLS then plain HTTP: 11.91's stormdrive is plain; its /api/v1/placement shape checked
+       live on server3, read-only: wwn `naa.…`, no shelf/bay on a blade). 4 tests. Paused for P0 #104; the sc-build of
+       b1e91d6 (which carries #104) is running. Resume: read that build, then a live PV check, close.
+
+### Shipped (golden 0fc1a74fff24): #84 (P2), each stormpump workload's cgroup → pod/container identity, for cadvisor
+
+2026-10-08. cadvisor (cadvisor#3, #15) waits on this repo to pick the shape. Found: stormpump does not report a
+workload's cgroup name, but QUERY's info block gives its pid (`stormpump_abi::query::info`) and the kubelet shares the
+host pid namespace, so `/proc/<pid>/cgroup` names it; a sandbox's holder pid comes from SANDBOX_ACQUIRE. cadvisor
+(stormcos boot unit) mounts only its data and logs, so either shape needs a stormcos mount.
+Shape chosen: one JSON file per workload, `/run/rustkube/workloads/<cgroup basename>.json` (host /run, the kubelet's
+own /run): cgroup, pid, kind (container | sandbox), reports_network (the pod-network sandbox only), namespace, pod,
+pod_uid, container, container_id, image, labels (`io.kubernetes.*` + the CRI labels), annotations. Written atomically at
+container start / sandbox made, removed at removal; files whose pid no longer has that cgroup swept at start. No
+auth, inotify-watchable, survives a kubelet restart.
+1. [x] `workload_identity.rs` (record, cgroup_of, publish/withdraw/sweep); `RingClient::query_info`.
+2. [x] stormpump runtime: publish at start/sandbox, withdraw at removal; sweep at connect.
+3. [ ] Tests, docs (README, api.md), CHANGELOG; file stormcos (cadvisor mounts host /run ro) and comment cadvisor#3/#15;
+       sc-build (stormcentral#544); close. VMs (cadvisor#15) next: same record, kind vm, from the VM manager.
+       Done: dcdc68c (pods), 728c185 (VMs: kind vm, withdraw by id); stormcos#391 filed (cadvisor mounts host /run);
+       cadvisor#3/#15 told. sc-build refused (stormcentral#544); #84 proposed after it. Then golden, live check, close.
+       2026-10-08: built at c8256ac (job 61569b65c2), 413 kubelet unit pass incl. the 3 identity tests. Stage golden
+       aborts (stormcentral#362); #84 proposed after it. Live check then: files in /run/rustkube/workloads on a node.
+
+### Done: #70 (P2), Events on the claim while its blank mints, and when a mint or clone fails
+
+2026-10-08. Done before: a blank not `ready` is a wait (c78baf0, #63), the mint is background and bounded by
+`MINT_TIMEOUT` and found again by name (db9b783, #99); the pod gets FailedMount. Left: Events on the **PVC**.
+1. [x] `clone_blank(class, name, claim)`: Normal `Provisioning` (minting / waiting for the blank's format and
+       seal), Warning `ProvisioningFailed` (a refused mint or clone, the engine's words), Normal
+       `ProvisioningSucceeded` (cloned). External-provisioner's reasons; the recorder aggregates repeats.
+2. [ ] Tests (fake apiserver + stormblock: the claim's Events), README, CHANGELOG; sc-build (stormcentral#544); close.
+       Done: ad70ee9 (1 test). sc-build refused (409 build VMs are off, stormcentral#544); #70 proposed after it.
+
+### Done: #79 (P2), an image the node's registry has no golden of: ask the cluster, else a pull failure
+
+2026-10-08. The kubelet sent `POST /v1/clones {golden, remote_image}`; sbregistry dropped `remote_image` (f9bcfdd), so
+an unknown image 404'd. Since #104 (0241211) a pull is `GET /v1/goldens/{image}` and a miss is ErrImagePull with
+the registry's answer, option (b). Found: that GET does not start sbregistry's cluster fetch (`repljobs::demand`
+runs only on the clone routes, 503 "fetching it from the cluster … retry shortly"; `/v1/replicate` is admin), so
+#104 lost it. Option (a) (build from upstream, `POST /v1/goldens` pull-through) waits on stormblock-registry#50.
+1. [x] A 404 golden: `POST /v1/clones {golden}` as the demand; 503/404 → ErrImagePull with its message (retried on
+       the pull back-off); a clone minted because the golden turned ready meanwhile is deleted and the record read.
+2. [x] File sbregistry (stormblock-registry#98): a demand that mints nothing (`GET /v1/goldens/{name}?demand=true`).
+3. [ ] Tests (fake registry: demand 503, 404, ready-in-between deletes the clone), README, CHANGELOG; sc-build
+       (stormcentral#544); close.
+       Done: 3822c45 (1 new test, 1 extended). sc-build refused (409 build VMs are off, stormcentral#544); #79
+       proposed after it.
+
+### Shipped (golden 0fc1a74fff24): #104 (P0), every container its own CoW root (owner: A, no exceptions)
+
+2026-10-08. Owner (#104, 10-07): every container's root is its own CoW clone of the image's **sealed golden**,
+writable, deleted with the container; a restart gets a fresh clone; never shared; exactly one layer between
+golden and what the workload writes (no image-level clone, no clone of a clone). `readOnlyRootFilesystem` mounts
+the container's own clone read-only. Found:
+- Today: `create_container` roots every container at the image *path* (`/pallets/<x>`, or the pull's shared
+  mount `/run/stormpump/images/<clone>`), and `start_container` registers that directory: shared roots.
+- Pallets: the slab holds `<vol>.golden` (sealed) and its first clone `<vol>`, mounted at `/p/<path>` by
+  `rd.stormblock.mount=<vol>:/p/<path>` on the kernel command line (`/pallets` → `/p`; e.g.
+  `cilium-operator:/p/operator-generic`). Engine listing: `parent`, `sealed`, `in_use`, `owner`.
+- Pulls: sbregistry's golden record (`GET /v1/goldens/{image}`) names `template_name`, an fstemplate in this
+  node's engine; `POST /v1/clones` minted the per-image clone that every container shared (#143's binding).
+- stormpump (lock 795b92e) has no read-only root: VOLUME_REGISTER takes no flag, `Root` is Inherit|Chroot.
+Steps:
+1. [x] Image service: a pull only makes sure the golden is ready (registry record → `template:<name>`); no clone,
+       no attach, no mount, no bind. Pallets resolve as before (`/pallets/<x>`).
+2. [x] Runtime (engine client + node): `create_container` clones the golden (`template:` → fstemplate clone;
+       pallet → `<vol>.golden` via /proc/cmdline, else `<vol>`'s sealed parent), attaches (ublk), has PID 1 mount
+       it at `/run/stormpump/roots/<cid>` (the root handle); argv[0] and user names are read from that mount.
+       `start_container` spawns on that handle. Removal (and a failed create) releases the handle, detaches and
+       deletes the volume; a refusal is retried (#90). Orphan sweep: `ctr-*` volumes not in use and not ours.
+3. [x] readOnlyRootFilesystem: file stormpump (read-only device mount / root); until then the clone is private
+       and writable, said in the log.
+4. [ ] Tests (one clone per container start, two containers of one image get two roots, removal deletes it,
+       failed create cleans up), docs (README, status.md, configuration.md), CHANGELOG; sc-build; golden; close.
+       Supersedes #143's image-level clone and #161 (image GC: nothing image-level is held any more).
+       Done: container_roots.rs (d6e0aaa), wiring 0241211, docs c393372; stormpump#108 filed (read-only device
+       mount). Tests (8 new). NOT built: sc-build refused `409 build VMs are off: set [buildvms] pve_host`
+       (stormcentral#544, commented: holds this P0). #104 proposed after it. Then build, golden, live check
+       (two pods of one image write the same root path, read back different), close; close #161 as superseded.
+       2026-10-08: built at c8256ac (job 61569b65c2, after #189's two compile errors): 413 kubelet unit pass, every #104
+       test by name. `component stage` aborted twice (`[platform in] …/stormd`, `[platform abort]`, exit 255) =
+       stormcentral#362 (stormd golden lacks bin/stormd), commented; #104 proposed after it. Then stage, shipped, live check.
+       #362 fixed: stage golden golden-rustkube-node-0fc1a74fff24 (7df677b = c8256ac code), stormcos#366 (asked the gate for
+       the isolation / one-clone / pods-start checks); `stormcentral shipped`. Close #161 as superseded once released.
+
+### Done: #226 (P1), mirror pods: rustkube-apiserver "Running (Completed) 0/1" while serving; stormvm 0/1
+
+2026-10-09. Live (master, Dell 12.03): stormd :9082 lists `apiserver` running/ready, `stormcert` running, nine
+`stormcert-client-*` one-shots stopped exit 0. No process is named `rustkube-apiserver`, so #215's `representative`
+took the worst process, and a finished one-shot outranks running. stormvm: its API answers 404 on /healthz and /readyz,
+so the readiness probe can't pass (stormvm's, filed there); the mirror is right to say not ready.
+1. [x] stormd_api: one-shots from the golden's config (`[[process]]` `on_exit = "stop"`, `restart_policy` OnFailure
+       or Never), else a process stopped with exit 0; `representative` over the long-running processes only (named
+       one first, else the worst; restarts summed; ready only if all are); a failed one-shot makes it not ready,
+       naming it.
+2. [x] Tests (the 12.03 process list; config one-shots), README, CHANGELOG (9b04c1c, 8a0fe6e; build failures #228,
+       #229 fixed 4e64ed3, 6a5317e). SC_BUILD_VM sc-build 6a5317e: 473 kubelet unit, all suites pass. 12.03 carries
+       golden-rustkube-node-2eabd6fc174b (#215's mapping with this bug). Stage golden golden-rustkube-node-3413c7a7330d
+       (stormcos#424). stormvm half = stormvm#84 (no /healthz). Closed.
+
+### Done: #225 (P1), pod delete stops every container with 30 s, not terminationGracePeriodSeconds
+
+2026-10-09. `stop_pod` passed a literal 30 (stormpump grace-kill: killed 30163 ms after a delete of a 5 s pod).
+1. [x] `termination_grace(pod)`: `metadata.deletionGracePeriodSeconds` (the delete's, when the object still carries
+       it), else `spec.terminationGracePeriodSeconds`, else 30; negative → 0. `stop_pod_within(uid, grace)`; the
+       deletion path passes the deleting object's; app containers stopped together (one grace for the pod, as
+       upstream), then sidecars last-declared first.
+2. [x] FakeRuntime records each stop's grace; test (ff878a6); CHANGELOG. SC_BUILD_VM sc-build at the changelog commit:
+       471 kubelet unit, all suites pass. Stage golden golden-rustkube-node-a6c0102dc25b (stormcos#424). Closed. Live
+       check: stormpump medium grace-kill after the release. Filed #227 (zero warnings, pre-existing). Next: #226.
+
+### Done: #71 (P2), built-in driver: redundancy / spread / tier from the StorageClass
+
+2026-10-09, resumed. stormblock#151 closed (golden-stormblock-abcd60bee6e2, stormcos#467): `POST /api/v1/fstemplates`
+takes `redundancy` + `spread` (= `@rung`), a clone inherits them, an unplaceable policy is 409 `conflict` (the same
+409 as "exists": tell them apart by the text); `tier` only on volumes (raw), not fstemplates/clones (filed on
+stormblock). Volume listing has `redundancy`. Default (nothing named) stays `none` (design's owner decision 2 open,
+engine keeps none). Only the class named `stormblock` is provisioned here (rustkube matches the name too): its
+parameters apply; a second class needs rustkube + #200.
+1. [x] storage.rs `ClaimPolicy::from_class`: redundancy (none|mirror[:N]|raid1|raid10|raid5:D+1|raid5:N|raid6:D+2|
+       raid6:N|parity:D+P, `@rung`), spread (stormblock's rungs), tier (hot|warm|cool|cold); other keys refused except
+       `csi.storage.k8s.io/*`. `blank_name(class)` = template name + `-mirror2-shelf` etc.; `overhead()`.
+2. [x] pod_manager: read the class (checked GET: unreadable = wait, 404 = none) for a new volume; mint/clone the
+       policy's blank (`redundancy`/`spread` in the mint body); raw Block volumes get redundancy/spread/tier; a
+       refused policy (409 not "exists") = ProvisioningFailed on the PVC; tier on a filesystem claim = Warning Event.
+3. [x] capacity: a claim charged class × overhead; committed volumes × their `redundancy`; policy blanks are sources.
+4. [x] Tests (5 new: policy parse/names, capacity, mint body + TierNotApplied, Block policy + tier, unplaceable →
+       ProvisioningFailed / no-class default / unknown parameter), README, CHANGELOG (4dee10f, aa5d2cb, bed74fc).
+       SC_BUILD_VM sc-build aa5d2cb: 470 kubelet unit, all suites pass. Stage golden golden-rustkube-node-0c8d465503ed
+       (stormcos#424; a policy class needs stormblock abcd60bee6e2, stormcos#467). Filed stormblock#377 (tier on
+       blanks), rustkube#261 (provision every stormblock.storm.io class; then #200). Closed.
+
+### (history) Paused (P0 #104 first): #71 (P2), built-in driver: redundancy / spread / tier from the StorageClass
+
+2026-10-08. Stopped before code at stormcentral's word (P0 #104 waited 40 h). Findings:
+- Engine: `POST /api/v1/fstemplates` and `/api/v1/volumes` take `redundancy`, spelled with the spread:
+  `mirror:2@shelf` (stormblock `RedundancyPolicy::parse`, `@rung` suffix); a clone inherits its template's
+  policy. **No `tier` field** on fstemplates: that is stormblock#151 (open; also /v1 for stormblock-csi).
+- The default for a class naming no policy is stormblock's design "owner decision 2" (`none` vs `mirror`),
+  unanswered: keep today's `none`, and today's blank names, so shipped blanks still hit.
+- Both halves match the class *name* `stormblock`: `storage::provisioned_here` here, rustkube
+  `controller-manager/src/stormblock.rs` STORAGE_CLASS. stormcos's class: provisioner `stormblock.storm.io`,
+  WFFC. A second class (e.g. `stormblock-mirror`) needs rustkube to match by provisioner too: file there.
+Design (resume here):
+1. [ ] storage.rs `Policy::from_class(sc)`: parameters `redundancy` (none|mirror|mirror:N|raid5:D+1|raid6:D+2),
+       `spread` (rung), `tier` (absent/`hot` only, else refused naming stormblock#151); unknown keys refused.
+       `engine()` → `<redundancy>[@<spread>]` or None; blank name `template_name(class)` + `-<slug>-<spread>`
+       when not none (`pvc-ext4j-1048576m-mirror2-shelf`).
+2. [ ] pod_manager `provision_claim_volume`: resolve the class (GET storageclasses/{name}; provisioner
+       `stormblock.storm.io` = ours; unset = ours, default policy; `""` = not ours; unreadable = wait, never
+       "none"); pass the policy to `clone_blank`/`mint_template`/`mint_blank` (`redundancy` in the body) and
+       `raw_volume`. A refused mint (InsufficientDomains) also as an Event on the PVC (`events.object_event`).
+3. [ ] Tests (policy parse, names, mint body against the fake stormblock), README/csi.md, CHANGELOG; sc-build
+       (submit when the slot is free: stormcentral#541); file rustkube (provisioner match); golden; close.
+
+### Shipped (golden 670219fd054b): #82 (P2), a node service's last exit and output on its mirror pod
+
+2026-10-08. stormpump#51 (adc64f8) writes `last_exit_code` | `last_exit_signal`, `last_exit` and `last_output` (20
+lines) per asset in assets.json, once it has exited, kept across the restart. fc867c1 (#124) reads `last_exit` /
+`last_output` for pods/log only (`node_logs.rs`). `container_failing` is stormd's own event (stormd README,
+"Events"), not the kubelet's: the kubelet's counterpart is the mirror's BackOff/Stopped Event.
+1. [x] `mirror::Asset.last_exit` (code, signal, text, output); `mirror_pod_with`: `lastState.terminated`
+       (exitCode, or 128+signal, signal, reason Error, message = output tail ≤ 80 lines / 4 KiB) and the same on a
+       stopped service's `state.terminated`; `status_current` and `table_key` see a new exit.
+2. [x] BackOff/Stopped Events carry the exit and the tail.
+3. [x] Tests (2), README, CHANGELOG (8a8007e). sc-build 8a8007e (job 2eb0ae2979, submitted once the slot was free:
+       queued jobs are cancelled, stormcentral#541): 400 kubelet unit pass. Stage golden
+       golden-rustkube-node-670219fd054b (stormcos#366; the first stage try hit a transient GitHub fetch error),
+       `stormcentral shipped`.
+
+### 2026-10-08: the build backlog ran
+
+The build-VM slot came free; sc-build 134fd60 (job 9161dda65c) `cargo build --locked && cargo test --locked`: 398 kubelet unit pass, plus 34 proxy, 25 CNI and the integration tests; every waiting issue's own
+tests by name. First run 924aaaa811 found two #85 compile errors (#188, fixed 134fd60). Closed: #89, #147, #87, #94,
+#96, #77, #85, #65, #80, #188. Stage golden golden-rustkube-node-6894f5af0f45 (134fd60, 3m42s), release request
+stormcos#366: `stormcentral shipped` for #126, #115, #165, #174, #111, #133 (told stormcos#329 about --max-pods).
+#141 proposed after stormcentral#526 (live burst), #95 after stormpump#107 (claim target).
+
+### Waiting on the owner: #68 (P2), replicated claims (a StorageClass asks for replicas on other servers)
+
+2026-10-08. Since the issue (09-25) replicated claims went to stormblock-csi (owner, stormblock-csi#29, 10-06):
+class `stormblock-csi`, params `replicaSlaves`/`pool`/`tier`/`spread`, a stormstorage distributed volume served
+over NVMe/TCP, operator failover. stormstorage has `prefer_node` (#50) and the RAID shape is decided (#41, option
+1). The kubelet already runs third-party CSI (#52, propagation #81). Multi-node blockers either way: one cluster
+stormstorage (stormstorage#56, stormcos#354), NVMe/TCP attach from a non-head node (#142). Asked on #68: A
+stormblock-csi owns it (recommended; built-in stays node-local, #71 for in-node redundancy), B the built-in driver
+too (head-local only), C the built-in class sends replicas>1 to stormblock-csi. `wait-owner` run. No code.
+
+### Done: #80 (P2), a Pod blocked on a claim a VM here holds says why
+
+2026-10-08. The two-writer case is closed by admission since #100/#114: a VMI's claims are reserved Exclusive
+(`claims_for`), so a Pod wanting the same claim is not admitted (`reconcile` → `AwaitEvent`). Left (owner's recheck
+on #80): the blocked Pod gets no reason (no waiting status, no Event), no test, README/status.md say the check is
+missing.
+1. [x] `Reservations::blockers(key, claims)`: each claim held against this request and who holds it.
+2. [x] `reconcile`: a Pod refused on a claim gets Pending + `ContainerCreating` "claim ns/c is in use by
+       VirtualMachineInstance ns/vm on this node" (or by Pod … for RWOP) and a FailedMount Event
+       (`PodManager::claim_held`); still AwaitEvent (the release wakes it).
+3. [ ] Tests (blockers; a Pod after a VM), README/status.md, CHANGELOG; sc-build; close.
+       Done: 43ab0e9 (1 test). Job 560e7c6206 cancelled while queued (stormcentral#541); #80 proposed after it.
+
+### Done: #65 (P2), the Node advertises KVM
+
+2026-10-08. `node_status.rs` reports no KVM, so a test Job (no /dev/kvm in its container) cannot tell a VM-capable
+node (`requires: [kvm]`, stormcos_qa vm-lifecycle). VMs run only with the stormpump engine (`Kubelet.vms`). The
+kubelet's own container has no /dev/kvm (the engine spawns the VMM in the node's mount view), so detection reads
+the kernel: `/sys/class/misc/kvm` (the kernel registered the device), or /dev/kvm (or /hostroot/dev/kvm) opens.
+1. [x] `kvm_available()`; NodeReporter `with_kvm` (only with the VM manager); capacity/allocatable
+       `devices.kubevirt.io/kvm: 1k` (KubeVirt's), every heartbeat; labels `storm.io/kvm=true`,
+       `kubevirt.io/schedulable=true` at registration and patched on an existing node whenever they differ
+       (`false`/removed when KVM is gone).
+   Done: 8fb1461 (2 tests).
+2. [ ] Tests, docs (README, configuration.md), CHANGELOG (8fb1461); sc-build; close (tell stormcos_qa#16 how to
+       check: `-l storm.io/kvm=true`). Job d23dc7b9a5 cancelled while queued (stormcentral#541); #65 proposed after it.
+
+### Done: #85, a VMI placed with spec.nodeName is never started
+
+2026-10-07. Found: vm_loop lists VMIs with `fieldSelector=status.nodeName=<node>` and filters `want` on
+status.nodeName, so a hand-placed VMI (spec.nodeName only) never reaches `assigned_to`. rustkube's scheduler
+(`virtualmachine.rs`) places by status.nodeName, else spec.nodeName, and skips a VMI that has either.
+1. [x] One rule (`assigned_to`, rustkube's): status.nodeName when set, else spec.nodeName.
+2. [x] vm_loop and `list_for_node`/`watch_for_node`: a second list (and watch) by `spec.nodeName`, merged by
+       uid, narrowed by `assigned_to` (`placement_urls`, `placed_on`).
+3. [x] A hand-placed VMI taken here gets `status.nodeName` written (`take_hand_placed`, uid-guarded).
+4. [ ] Tests (2), docs, CHANGELOG (c71b858); sc-build at c71b858 (stormcentral#536 closed, so this one build
+       also covers #126, #115, #147, #89, #87, #94, #96, #77); close.
+       Job a8e2791d84 cancelled while queued: the master's deliberate drain (1 slot, queued jobs cancelled until
+       stormcentral's bootstrap job 03e9cbfde9 installs; said on stormcentral#536). `tmp/wait-drain.sh` reruns
+       the build once that job is done or the slots come back.
+       The bootstrap job was cancelled too; 5fd1caed32 (ee08d48) cancelled the same way. Filed stormcentral#541,
+       #85 proposed after it. Rerun `SC_BUILD_VM=1 sc-build 'cargo build --locked && cargo test --locked'`, close.
+
+### Done: #77, the client certificate reloaded when stormcert renews it
+
+2026-10-08. The apiserver client (one `reqwest::Client`, cloned into every module) takes the client pair once.
+Rather than rebuild it everywhere: a rustls `ClientConfig` (CA roots + a `ResolvesClientCert` whose pair can be
+swapped) via `use_preconfigured_tls`; every clone's next handshake presents the current pair. The pair's directory
+is watched (+ hourly); a new pair that does not parse or whose key does not match is refused, the old one kept.
+Only with a CA and verification on (stormcos); insecure / no-CA keep the static identity, said in the log.
+1. [x] client.rs `ReloadingClientCert` + `build_authed_client_reloadable`; KubeletConfig cert/key paths; reload
+       task; tests (rcgen pairs: swap, unchanged, mismatched key refused); docs, CHANGELOG; sc-build.
+       Done: d1ad901 (2 tests). NOT yet built: the SC_BUILD_VM job was cancelled while queued. Rerun, close.
+
+### Done: #96, a node service's mirror pod is Ready only while it answers
+
+2026-10-08. Each service golden's stormd config declares its liveness (`[process.liveness] type = "http"`, `url =
+http://127.0.0.1:<port><health>`, stormcos `service_golden`); its boot unit names the golden (`root <volume>`) and
+`profile host`. `node_health.rs`: the URLs from boot.d + the goldens under `/hostroot`; probed every 10 s (2 s);
+3 failures → not ready, one answer → ready; a flip queues a mirror pass. `mirror_pod_with`: Running, ready false,
+Ready/ContainersReady False, reason Unhealthy; a Warning `Unhealthy` Event on the flip.
+1. [ ] Code + tests (5) + README, CHANGELOG (ff7000c; the push needed 11 tries, GitHub 500s). NOT yet built: the
+       SC_BUILD_VM job was cancelled while queued (stormcentral#536). Rerun, close; live check on a node.
+
+### Done: #94, the VMI verbs on :10250 (`PUT /vmVerb/{ns}/{name}/{verb}`)
+
+2026-10-08. stormvm's router (lock 180fa13) serves `PUT /api/v1/vms/{ns}/{name}/{verb}`: pause, unpause,
+softreboot, reset, status, freeze, thaw, snapshot (and migrate/receive, not for here: migration is #40's, by the
+VMI's status). rustkube#141 (the apiserver's verb proxy) is open and has not fixed a path: this route is the one #94
+proposed, said on rustkube#141. KubeVirt says `unfreeze` where stormvm says `thaw`: both accepted.
+1. [x] `vm_verb`: verb allow-list, query forwarded without `token`, the console's handover (`to_console`, shared
+       with `/vmConsole`). Tests through the kubelet router; docs (api.md, README), CHANGELOG; sc-build.
+       Done: 8674302 (2 tests; contract on rustkube#141). NOT yet built: the SC_BUILD_VM job was cancelled while
+       queued. Rerun, close; real-node snapshot check after rustkube#141.
+
+### Done: #89, the serving pair: never a silent self-signed fallback; reloaded when renewed
+
+2026-10-08. The wait-then-fatal half was #69 (5d869b9): `--tls-cert-file`/`--tls-private-key-file` wait 60 s, then
+exit naming the flag. Left: say which pair :10250 serves, and reload it when stormcert renews it (at boot,
+stormcert#14) instead of serving the old one until the kubelet restarts.
+1. [x] Paths into `ServerConfig`; log "configured pair <path>" or "self-signed (no --tls-cert-file)"; watch the
+       pair's directory (fs_watch) and `reload_from_pem` when its bytes change; a half-written pair fails and the
+       old one stays. Test; docs (configuration.md), CHANGELOG; sc-build (stormcentral#536).
+       Done: dd3df0b (1 test). NOT yet built: the SC_BUILD_VM job was cancelled while queued. Rerun, close.
+
+### Superseded (owner answered A, done above): #104 (P2), private writable container roots
+
+2026-10-08. stormpump's rule ("one storage primitive … no overlay, no tmpfs layering", spec.rs) makes a private
+root a CoW clone per container (clone the golden, attach, PID 1 mount as root, delete on removal/restart), the path
+claims and pulls already use. Cost on 11.91 warm: ~0.4–1.3 s per start (clone, attach, mount: #95, stormblock#327,
+stormpump#107) and a volume per container. Asked on #104: A private by default + readOnlyRootFilesystem keeps the
+shared root (recommended), B private only when asked, C A with pre-minted clones.
+
+### Waiting on stormcentral#542 + stormcos#271 (deploys): #86 (P2), versioned goldens for pods (owner 10-09: A, copy on demand, as replication)
+
+2026-10-09. Found: component goldens are engine volumes on forge, `golden-<c>-<sha12>`, shown as
+`registry/<c>:<sha12>` (stormcentral `goldens::image_ref`), not pushed to forge's sbregistry; the release manifest's
+golden asset is `{kind: golden, name: <c>, digest: <device sha256>, provenance: golden-<c>-<sha12>}`. So the fetch is
+new sbregistry work (file it); the kubelet half rides the existing pull + demand flow.
+1. [x] `image_config::golden_version(image, manifest, pallet?)`: tag `<sha12>` or `golden-<c>-<sha12>` of a known
+       component (manifest asset or /pallets/<c>) that is not the release's → `registry/<c>:<sha12>`; the release's
+       own, untagged, any other tag or digest → the pallet as today.
+2. [x] StormpumpImages: a versioned image skips the pallet and pulls `registry/<c>:<sha12>` through the registry
+       (GET record → template; 404 → demand → 503 retried on the pull back-off); image_status by the pull only.
+3. [x] Tests (2: selection rules; pull through a fake registry incl. the demand's 503), README, CHANGELOG (4b96e0c,
+       7e39e1a). SC_BUILD_VM sc-build 4b96e0c: 475 kubelet unit pass. Stage golden golden-rustkube-node-d3d0359c3aac
+       (stormcos#424). Filed stormblock-registry#116 (fetch golden-<c>-<sha12> from forge for registry/<c>:<sha12>).
+4. [ ] After #116 + a release: roll one instance to a version not in the release and back; close.
+       2026-10-30: stormblock-registry#116 closed (v0.45.0, golden-registry-64160cb6351a, stormcos#453): demand/replicate
+       of `registry/<c>:<sha12>` fetches `golden-<c>-<sha12>` from a peer into template `component-<c>-<sha12>` (digest
+       checked), golden record ready, cached (`held`) after. Same contract as 4b96e0c's pull: no kubelet change. Left is
+       deployment: forge's sbregistry ≥ v0.45.0 (stormcentral#542) and nodes naming forge as a peer (stormcos#271).
+       #86 proposed after both. Resume: on a node, a pod `image: <c>:<sha12 not in the release>` runs after one fetch
+       (`storm.io/image-resolved` = registry), back to the release's tag starts on the pallet, forward again no fetch; close.
+
+### (history) Waiting on the owner: #86 (P2), versioned goldens for pods
+
+2026-10-08. Kubelet half clear: the release manifest (`/etc/stormcos/release/manifest.json`, `assets[kind=golden]`
+name → digest) says each pallet's golden; a tag/digest naming another version selects `golden-<name>-<sha12>`,
+cloned CoW and mounted like a pulled image. Missing: the source when the node lacks the version. sbregistry's
+catalog lists forge goldens but "nothing is copied" (#43), and cross-engine clones need NVMe/TCP (#142).
+Asked on #86: A copy on demand (recommended), B remote attach, C node-local only. A tag/digest matching no known
+golden version keeps running the pallet (upstream OCI tags/digests, Cilium's `@sha256:`).
+
+### Done: #147 (P2), kube-proxy clears stale UDP conntrack entries
+
+2026-10-08. kube-proxy rewrites the DNAT when an endpoint goes but leaves conntrack: a UDP flow to a ClusterIP
+(kube-dns) keeps its NAT to the old backend for 30–120 s. (No stormcos edition runs kube-proxy since #145/#155;
+the binary ships and this is its correctness.) Upstream: `conntrack -D -p udp --orig-dst <svc> --dst-nat <ep>`
+per removed UDP endpoint, `--dport <nodePort>` for NodePorts, and `--orig-dst <svc>` when a UDP Service gains its
+first endpoint.
+1. [x] `conntrack.rs`: the stale set from the last applied and new UDP backends; a `Conntrack` seam (the
+       `conntrack` binary: exit 1 with "0 flow entries" is fine, a missing binary warns once). Deletes after a
+       successful apply. Tests (fake apiserver: endpoint replaced, NodePort, first endpoint, TCP untouched); docs
+       (configuration.md, README), CHANGELOG; sc-build (blocked: stormcentral#536).
+       Done: 033a05a (4 tests). NOT yet built: the SC_BUILD_VM job was cancelled while queued. Rerun, close.
+       2026-10-08: e58d5ed7fc (97801bc) cancelled the same way; #147 proposed after stormcentral#541.
+
+### Shipped (golden 6894f5af0f45): #115 (P2), a stormpump exit wakes its own workload only
+
+2026-10-08. An unsolicited exit bumps the ring's counter; `pod_loop`/`vm_loop` answer with `wake_kind` **and**
+`worker.enqueue()` (a full list sync), so one exit wakes every Pod and VMI worker and re-syncs every pod.
+1. [x] Ring: a broadcast of exiting handles beside the drained queue. Router task: the Pod runtime maps handle →
+       container → sandbox → pod uid (`RuntimeService::pod_of_workload`), the VM manager handle → VMI uid; wake that
+       uid only (`wake_where`). Unknown handle or a lagged channel: wake both kinds (the old behaviour). The loops'
+       exit arms go (the counter stays: it says the runtime has exit events).
+2. [ ] Tests (3), README, event-driven-design.md, CHANGELOG (92cd9ef). NOT yet built: the SC_BUILD_VM job was
+       cancelled while queued (stormcentral#535/#536). Rerun, then golden (stormcentral#527) and close.
+       2026-10-08: e58d5ed7fc (97801bc) cancelled the same way; #115 proposed after stormcentral#541.
+
+### Shipped (golden 6894f5af0f45): #126 (P2), no fixed init deadline; activeDeadlineSeconds bounds it
+
+2026-10-08. `run_init_containers` stops an init still running after 120 s (`DeadlineExceeded`, exit -1). Upstream:
+an init runs until it exits; only the pod's `activeDeadlineSeconds` (from its startTime) limits it. The admission
+path (production) already waits on the exit event; the non-admission path slept 500 ms on the worker.
+1. [x] Drop MAX_WAIT; `active_deadline_left` (startTime, else first seen); past it the init is stopped and reported
+       DeadlineExceeded ("Pod was active on the node longer than the specified deadline"); both paths Pending
+       (deadline as the due time when set). Tests; README/status.md/CHANGELOG; sc-build. File: activeDeadlineSeconds
+       for a running pod is enforced nowhere (follow-up).
+       Done: 9a39a40 (3 tests), #185 filed. NOT yet built: both SC_BUILD_VM runs cancelled while queued (platform-wide,
+       stormcentral#535/#536). Rerun `SC_BUILD_VM=1 sc-build 'cargo build --locked && cargo test --locked'`, then
+       golden (stormcentral#527) and close.
+       2026-10-08: e58d5ed7fc (97801bc) cancelled too; #126 proposed after stormcentral#541.
+
+### Waiting on stormcentral#526 (live run; golden 6894f5af0f45 built): #141 (P2), the probe pass's status PUT skipped when nothing changed
+
+2026-10-08. `report_pod_status` skips when the merged status equals `source["status"]`, but `source` is the
+watch's copy, which can still be the version before this kubelet's own last PUT: the comparison runs against the
+pre-Running status and an unchanged status is written again (and with a stale resourceVersion).
+1. [x] Keep, per UID, what this kubelet last had acknowledged (the RV it wrote on, the RV the PUT returned, the
+       status). `status_base`: while the watch's copy is still at the RV our write was based on, compare and write
+       against the acknowledged status and RV; otherwise the watch's copy. Skip when unchanged. Forgotten on delete.
+2. [x] `kubelet_pod_status_writes_total{result="written|skipped"}`; tests (2); metrics.md, CHANGELOG (743c0f6).
+       SC_BUILD_VM sc-build: 376 kubelet unit pass.
+3. [ ] Golden (stormcentral#527), then a turbomode burst on pvetest1 (stormcentral#526): no second PUT, wait p90
+       < 100 ms. #141 proposed after stormcentral#527.
+
+### Shipped (golden 6894f5af0f45): #133 (P2), a start error is never "terminal with no container state"
+
+2026-10-08. The 10-02 trigger was #103 (a pulled image's root unresolved → start_container failed; fixed 4263d80,
+shipped). The behaviour it exposed stands: every start error not matched as a wait (image pull, create, start,
+runtime unreachable, init failure) made the pod **Failed with no container statuses**, and `logs` 404'd. A failed
+pull was also cached for the pod for good. Upstream: image/create errors are waits with the container's reason
+(ErrImagePull → ImagePullBackOff, CreateContainerError), a start failure under restartPolicy Never is Failed with
+the container terminated `StartError` (exit 128).
+1. [x] `CriError::Container{container, reason, message}` from start_pod's create/start; sync arms: ImagePull (forget
+       the cached failure; ErrImagePull → ImagePullBackOff; 10 s–5 min back-off), Container (Never + StartError:
+       Failed with the terminated status; else Pending with the reason, partial start torn down, first_seen kept so
+       the back-off grows), Connection (a wait); the rest Failed *with* init statuses and app containers
+       PodInitializing/StartError. `WaitingPod.kind`; logs answer 400 with it (never 404 for an admitted pod).
+2. [x] Tests (3 new, 1 extended), README, CHANGELOG (dc3eed0, 2910b5a: a failed init's report kept, #183).
+       SC_BUILD_VM sc-build: 374 kubelet unit pass. Golden after stormcentral#527 (with #165, #95, #174, #111).
+
+### Shipped (golden 6894f5af0f45): #111 (P2), restartable init containers (native sidecars, restartPolicy: Always)
+
+2026-10-08. `run_init_containers` runs each init to exit 0 (120 s deadline) and removes it; a sidecar blocks the
+start and is killed. Upstream (KEP-753): a sidecar is started in its init slot, the next init waits only until it
+has *started* (running; its startupProbe passed, if it has one), it runs and restarts (Always, whatever the pod's
+policy) for the pod's life, its readiness counts toward Ready, it does not count toward the phase, it is stopped
+after the app containers finish (Never/OnFailure) and torn down after them, in reverse order.
+1. [x] `InitContainerStatusReport` + restartable/started/ready/restart_count, `initialized()`; status JSON (ready,
+       started, restartCount, waiting); `pod_initialized` and ContainersReady/Ready count sidecars.
+2. [x] `run_init_containers`: a sidecar is started and kept (no removal, no deadline); exit before started =
+       restart with backoff (Pending), never Failed; startupProbe run from the init path.
+3. [x] `start_pod` carries sidecar records into the tracked state; `check_pod_status` probes/restarts sidecars
+       (Always), reports them as init statuses, leaves them out of the phase, stops them once the apps finished.
+4. [x] `stop_pod`: apps first, then sidecars in reverse declaration order.
+5. [x] Tests (5 new), docs (README, status.md, planning/container-startup.md), CHANGELOG (d5c3d85). SC_BUILD_VM
+       sc-build: 371 kubelet unit pass. Golden after stormcentral#527 (with #165, #95, #174). Not run on a node.
+
+### Shipped (golden 6894f5af0f45): #174, a stop's grace goes where STOP reads it
+
+2026-10-08. `RingClient::stop` put the grace in `inline_a` (seconds); STOP reads `inline_b` in ms (0 = 30 s) and
+`flags::FORCE` for "now" (stormpump docs/ABI.md op 20, same at the lock's 795b92e). Every stop waited 30 s.
+1. [x] `stop_sqe`: `inline_b = grace_secs * 1000`, grace 0 → FORCE; unit test; CHANGELOG; sc-build (build VM);
+       golden when component stage works (stormcentral#527); close.
+       Done: a6b3155; SC_BUILD_VM sc-build: 366 kubelet unit pass. One golden after #527 carries #165, #95, #174.
+
+### Shipped (golden 6894f5af0f45): #165 (P1), --max-pods (owner: option A on rustkube#205; stormcos sets 250)
+
+2026-10-08. `node_status.rs` reports a fixed `pods: "110"` in capacity and allocatable. The kubelet reads no
+KubeletConfiguration file and admits Pods against no count of its own, so the flag and the status are all.
+1. [x] `--max-pods` / `MAX_PODS` (default 110) → `KubeletConfig.max_pods` → `NodeReporter::with_max_pods` →
+       capacity and allocatable `pods`; test; docs (configuration.md, README, status.md), CHANGELOG; sc-build;
+       golden; close; tell stormcos it can set 250 (its /24 pod range note stays theirs).
+       Done: c635c02; sc-build `cargo build --locked && cargo test --locked`: 365 kubelet unit pass (1 new);
+       `kubelet --help` lists `--max-pods <MAX_PODS>` [env: MAX_PODS]. (#179 was my bad extra command, closed.)
+       Rerun on a build VM (dev.g8.lo is retired): `SC_BUILD_VM=1 sc-build …` at fb94c9a, exit 0, same results.
+2. [ ] Stage golden: `component stage` is blocked until stormcentral#521. #165 proposed after it. Then close #165
+       and tell stormcos#329 (which sets 250).
+
+### Done: #81, pod mount propagation onto stormpump's `Mount.propagation`
+
+2026-10-08. Unblocked: stormvm#65 closed (stormvm main builds against stormpump main f466116, stormcast bba68c9).
+The lock pins stormpump 30a76d3, stormvm dc1b7ea, stormcast 801f822; all three move together.
+1. [x] Lock: `cargo update -p stormpump -p stormvm-node -p stormcast` on dev (CARGO_NET_GIT_FETCH_WITH_CLI), diff
+       applied here; fix what the newer stormvm/stormpump APIs break.
+2. [x] `spec_for` maps it (599a86e; lock as cargo resolved it f4de851; tests 4545e23, which also covers #164's
+       byte-sized emptyDisk). sc-build 4545e23: 364 kubelet unit pass. Golden golden-rustkube-node-a97563b0a5c7
+       (stormcos#366). #81 closed, #164 shipped. #52's step 6 is done; its end-to-end with a real driver stays.
+
+### Done: #149 (P3), 64T/256T/1P classes to ext4 (stormblock#289 closed: mkfs-ext4 v4.1.1 in golden-stormblock-12891c0025b2+)
+
+2026-10-21. stormblock verified a 1 PiB template (1016 s, 1.6 GiB peak) and 16T/64T/256T formats (70/264/781 s) on a
+16 GB build VM; MINT_TIMEOUT is 1 h. Doing: `SIZE_CLASSES` 64T/256T/1P → `ClassFs::Ext4` (BlockOnly kept, unused; its
+two reason consts gone); storage + pod_manager tests (a 20Ti and a 300Ti filesystem claim mint `pvc-ext4j-<mib>m`
+with `<mib>M`, ext4); test/ medium `LADDER` gets the three, `BLOCK_ONLY` and the 20Ti refused case go (a `20ti`
+size case instead); README, status.md, presentation, CHANGELOG; sc-build (root + test/); stage golden; close.
+Done: 377d7e7 (+ 8d9… test count fix, #273). SC_BUILD_VM sc-build (job 091fffdddf): 541 kubelet unit, all suites, `test/`
+30 + release build, warnings = #227's. Stage golden golden-rustkube-node-9cea8d70a3db (stormcos#628). Closed. Live: a
+64Ti+ ext4 claim needs a node with that room (none of the test machines; medium checks it as a refusal there).
+
+### Done: #262 (P1), static pods behind kubelet startup: read on 12.38+b383dad
+
+2026-10-21 (later). Read (`testhost logs pvetest1|2 kubelet --search 'first static pod'`): the stall is page-in: `flags=1495ms
+(cpu 0ms, 16 faults, 16 waits)`, `engine=1532ms(cpu 1ms, 22 faults, 22 waits)`: waits = major faults, ~70–95 ms each
+(fast starts: 16 faults in 57 ms). `credentials` 2.5–5.6 s = stormcert writing kubelet.crt, then kubelet-serving.crt late,
+each wait polled at 500 ms. Doing: poll 50 ms (test, docs, CHANGELOG); file stormblock (root-volume page-in at boot, cf.
+stormblock#409's one ublk queue); sc-build; stage; close #262 (the rest is stormblock's / stormcert's boot order).
+Done: b9429d4; stormblock#484 filed. SC_BUILD_VM sc-build (job 0a7a3bf151): 551 kubelet unit, all suites, nothing from clippy
+in main.rs, warnings = #227's. Stage build 914e949f166a. Closed.
+
+### (earlier) Waiting on a release with b383dad: #262 (P1), static pods behind kubelet startup: the stall's kind
+
+2026-10-21. 12.38 carries 2bf962a (golden d3c3e72b4eaf). Read on pvetest1/2 (`testhost logs <m> kubelet --search 'first
+static pod'`): (2) fixed live: static pods' `volumes` 0.1–9 ms (was 1142). (1) first static pod 1.8–3.0 s after the
+kubelet's start; one stall of ~1.2–1.6 s per start, in `flags` (1356–2050 ms: tracing init, clap, node name, one log line)
+or once in `engine` (1575 ms, of which the HTTP client 300 ms). Not CPU work: paging in from the root volume, a
+descheduled vCPU (the node logged `clocksource: Watchdog remote CPU 2 read timed out`) or a blocked first stdout write.
+Doing:
+1. [x] startup.rs: per step CPU (user+sys), major faults, voluntary / involuntary switches (getrusage); `exec` = process
+       start → main (/proc/self/stat starttime vs CLOCK_BOOTTIME); `flags` split into `logging`, `flags`, `hello`.
+2. [x] Tests, README, CHANGELOG (b383dad, 4f3e70f). SC_BUILD_VM sc-build: 549 kubelet unit, all suites, nothing new from rustc
+       or clippy in the touched files (#284 was my `grep -c`, closed). Stage build 18e651ad4f93. Proposed
+       `--after-release rustkube-node>=b383dad`.
+3. [ ] Resume: `stormcentral testhost logs pvetest1 kubelet --search 'first static pod'` (and pvetest2): the slow step's
+       `(cpu …, N faults, N waits, N preempted)` and `exec=`; fix where it points (majflt: the root volume's reads at
+       boot, stormblock/stormcos; preempted: the VM host, pve; a blocked write: the log path); or close if it is gone.
+
+### (earlier) Waiting on a release with 2bf962a: #262 (P1), static pods wait ~4 s behind kubelet startup (12.30 reboot, stormcos#596)
+
+2026-10-21. Found: (2) `volumes=1142ms` on hostPath-only static pods is `service_account_mount`: every pod without
+`automountServiceAccountToken: false` gets a kube-api-access token asked of the apiserver (`Policy::API`), which at
+boot is the static pod being started, so ~1.1 s of refused retries and no token. Upstream never gives a static pod a
+token. (1) the 3 s is between the CNI line and `EngineClient::from_env`'s log line: env reads and a
+`reqwest::Client` build (rustls + webpki roots, no http3/native roots, `cargo tree` on a build VM); nothing in the
+code explains seconds, and no node's console ring still holds a boot. Doing:
+1. [x] Static pods marked `kubernetes.io/config.source: file` (upstream's); `service_account_mount` skips them.
+2. [x] `startup.rs`: each `main` step timed (flags, cni, engine, runtime, credentials, kubelet) → `Kubelet starting for
+       node … (startup: …)`; the engine client's HTTP build warned when > 100 ms; `first static pod … running N ms
+       after the kubelet started` once.
+3. [x] Tests, README, CHANGELOG (2bf962a, 6c8d04d). SC_BUILD_VM sc-build (job ad11738c5b): 541 kubelet unit, all
+       suites, warnings = #227's. Stage golden golden-rustkube-node-bb53f0c47eb4 (stormcos#628). #262 proposed
+       `--after-release rustkube-node>=2bf962a`. (#272 was my `cargo tree -i getrandom` diagnostic: closed.)
+4. [ ] Resume: `stormcentral testhost logs pvetest2 kubelet --search startup` after its next boot (or the stormd
+       API on :9085): `volumes` in ms, the `engine` step and the HTTP-client warning. Then read the next pvetest boot's `startup:` line: if
+       `engine` is still ~3 s, the warning says whether it is the HTTP client (then the step moves or is filed where it
+       lies); close on the numbers.
+
+### Shipped (golden aeeaa02c3099): #56 (P1), exec, attach and portForward on :10250 (stormpump#103's exec op)
+
+2026-10-21. Lock's stormpump 9877a97 (≥ 0093db4): SPAWN with a running workload's handle in `inline_a` runs the spec in
+it (its namespaces, root, cgroup); stdio from `fds` slots 0/1/2 naming deposits (pipes or one pty slave), `logs
+discard|inherit`, no root/mounts/limits/terminal; the result is a workload (Exit event, STOP, WORKLOAD_RELEASE).
+Found on the way: `spec_for` sets `Spec.tty = config.tty`, which in stormpump is *the node's console* (one per node):
+a `tty: true` pod claims the node's console. Doing, on main, each step pushed:
+1. [x] Ring `spawn_exec(spec, target, slots)`; runtime `exec_process(container, cmd, ExecIo{stdin, tty})`: pipes or a
+       pty (posix_openpt), deposits `exec-<n>-<fd>`, spec (the container's env/cwd/uid/gid, logs discard), exit waiter
+       fed by `note_exits` (+ early exits kept by handle), withdraw on a failed spawn, release after exit.
+2. [x] `exec_sync` on it (probes): output capped, timeout → force stop, exit code.
+3. [x] `/exec`: SPDY `v4.channel.k8s.io` (v3/v2 too: same streams, v4's error is a Status) and WebSocket
+       `v5.channel.k8s.io`/`v4.channel.k8s.io` (channel byte); resize → TIOCSWINSZ; Status with ExitCode.
+4. [x] `/attach`: a `stdin: true` container gets a stdin pipe deposited at fd 0 (writer kept); a `tty` container a
+       kubelet pty on 0/1/2 instead of `Spec.tty` (its output copied to the CRI log by the kubelet); attach = stdin +
+       the log followed (non-tty) or the pty (tty).
+5. [x] Tests, README/api.md/status.md, CHANGELOG; sc-build; stage golden; live `kubectl exec -it` after a release.
+       Done: exec.rs (pipes, pty, Console, follow), remotecommand.rs, RingClient::wait_exit (an exec's exit is its
+       waiter's only), runtime exec_process/exec_sync/attach_process, server /exec /attach (297c789..6a345af, fixes for
+       build failures #270/#271), docs 6b150a9. SC_BUILD_VM sc-build (job ac9b5cdbf7): 539 kubelet unit, all suites,
+       warnings = #227's. Stage golden golden-rustkube-node-aeeaa02c3099 (stormcos#628). `stormcentral shipped`.
+       Live after the release: `kubectl exec -it <pod> -- sh`, `kubectl exec <pod> -- sh -c 'exit 3'` (kubectl exits 3),
+       an exec readiness probe, `kubectl run -it --rm busybox -- sh` (tty attach). stormpump#103 notes a container
+       exec has only been exercised on root-less tasks there.
+(earlier) 
+2026-10-09 (#220): stormpump#103 is done from its side (golden-stormpump-a2523c9c9406, stormcos#309) and the lock
+pins stormpump 13cf2c9, which carries the exec/attach op. Next: item 5 below (exec, exec_sync for probes, attach,
+the channel protocols). Exec probes fail on every stormpump pod until then.
+
+2026-10-08. rustkube's apiserver splices the upgrade transparently (streaming.rs: headers and bytes as they are,
+query translated to `input/output/error/tty/command`, `port=`), so the kubelet speaks SPDY/3.1 itself, and
+WebSocket for a newer kubectl (client-go falls back to SPDY when the WebSocket upgrade is refused).
+Found: stormpump has no op that runs a process inside a running workload, and deposited fds reach only VM domains,
+so exec/attach (and `exec_sync`, exec probes) need the engine: filed stormpump#103. Port-forward needs nothing from
+it: the kubelet connects inside the sandbox's netns (as health.rs dials) and splices.
+1. [x] `spdy.rs`: SPDY/3.1 server session (frames, zlib header blocks with the SPDY/3 dictionary: inflate via
+       miniz_oxide's core with the window preloaded, deflate as stored blocks; PING, WINDOW_UPDATE sent as data
+       is read, RST, GOAWAY).
+2. [x] `portforward.rs` + `/portForward/{ns}/{pod}`: streams paired by requestID (error + data), connect to the
+       port in the pod's netns (host network: the node's), splice; errors on the error stream.
+3. [x] WebSocket: port-forward's `SPDY/3.1+portforward.k8s.io` tunnel; exec/attach answer 501 naming stormpump#103.
+4. [x] Tests (10 new), docs (README, api.md, status.md), CHANGELOG (886ce15, 82769d2; lock 8224957; #173/#175
+       were the build/test failures on the way). sc-build 82769d2: 363 kubelet unit pass. Golden
+       golden-rustkube-node-ff480857443c (stormcos#366). #127 closed. Not run with a real kubectl/node.
+5. [ ] After stormpump#103: exec (and exec_sync) through the engine's op; SPDY `v4.channel.k8s.io` streams
+       (stdin/stdout/stderr/error/resize) and WebSocket `v5.channel.k8s.io`; attach on a container's stdin; live
+       `kubectl exec -it` / `port-forward` on a node; close #56. #56 proposed after stormpump#103.
+
+### Done: #98 (P1), the image config applied under the pod spec
+
+2026-10-08. sbregistry serves a pushed image's OCI config (`Entrypoint`, `Cmd`, `Env`, `WorkingDir`, `User`) as
+`config` on `GET /v1/goldens/{name}`; boot pallets have none until stormblock-registry#58 (open; `Volumes` too).
+stormpump's Spec has `uid`/`gid` and the engine drops to them (exec.rs). Found: `runAsUser`/`runAsGroup`/
+`runAsNonRoot` are read nowhere, so every container is root; no stormcos manifest sets them or `fsGroup`.
+1. [x] `image_config.rs`: the config, a cache by image root (a miss re-asked after 5 min), `compose` (CRI rules:
+       command replaces Entrypoint, args replaces Cmd, args alone after Entrypoint; image Env under the pod's;
+       WorkingDir/User when the pod leaves them unset; user names via the image's /etc/passwd and /etc/group).
+       No config and an empty argv or one starting with `-`: an error naming the image.
+2. [x] StormpumpImages fetches the config when it resolves a root (pallet or pull); the runtime composes in
+       `create_container`. ContainerConfig `run_as_user`/`run_as_group`/`run_as_non_root` (container, else pod),
+       forwarded on CRI gRPC too. emptyDir 0777 as upstream (a non-root user must write it).
+3. [x] Tests (8 new; `command_and_args_become_one_argv` had lost its #[test]), docs (README, status.md), CHANGELOG
+       (bbbb96a; build fix 01361c6 = #170). sc-build 31e53c6 `cargo build --locked && cargo test --locked`: 353
+       kubelet unit pass. Golden golden-rustkube-node-04134493c42a (stormcos#366). Follow-ups #171 (fsGroup), #172
+       (image Volumes, after stormblock-registry#58). Closed. Not run on a node.
+
+### Waiting on stormcos-cilium#38 (+ stormblock#327/#434): #95 (P1), pod/claim start toward ≤2 s / ≤1 s
+
+2026-10-21. stormcentral's install probes (`/api/v1/metrics`, 12.21–12.37). Container start meets ≤ 2 s everywhere:
+pvetest1/2 0.2–0.3 s, the Dell 0.5–0.9 s (baseline 21 s). Claim meets ≤ 1 s on pvetest1/2 (0.40–0.55 s end to end,
+kubelet 0.23–0.30 s) and misses on the Dell (12.37: cold 1.39 s, kubelet 1.10 s = lookup 161, blank 206 [stormblock#327],
+cni 142, container/p 489; warm 9.5 s, of which `sandbox/cni` 7.4 s = Cilium's ADD, no kubelet lock around it). Under the
+probe's 2 GiB rewrite loop the Dell's claim/d/lookup is 10.6 s (pvetest 0.4–0.9 s): lookup is ~8 serial calls (PVC, PV
+twice, the engine's whole volume list up to 3×, StorageClass, slabs). Doing (the kubelet's share):
+1. [x] provision_claim_volume: one PV GET and one volume listing (handle + name), in parallel; StorageClass read while
+       the capacity lock is awaited; capacity::read's slabs + volumes in parallel. `ClaimSteps.room` (policy + capacity,
+       inside lookup) → `claim/<v>/room=`, histogram `claim/room`.
+2. [x] Tests (existing claim tests; room timed), README/metrics.md, CHANGELOG; sc-build; stage golden.
+3. [x] File the rest: Cilium's 7.4 s ADD on the Dell = stormcos-cilium#38; the I/O-stress collapse added to
+       stormblock#434 (engine lock held by GET /slabs). Done: 78bbe92 (+ docs). SC_BUILD_VM sc-build 78bbe92 (job
+       cc31d4be02): 526 kubelet unit, all suites, warnings = #227's. Stage golden golden-rustkube-node-4ce19b8a7ee9
+       (stormcos#628). Numbers on #95; proposed after stormcos-cilium#38.
+4. [ ] Resume: on a release with 4ce19b8a7ee9 and #38's fix, the Dell's `warm_claim_bind_and_mount_timing` (and
+       `claim/d/room`) from `/api/v1/metrics`; close when the claim is ≤ 1 s there, else file the step that misses.
+(earlier) 
+2026-10-09 (#220): stormpump#107 is closed (a warm claim's ext4 mount is 5.4 ms on 11.95). Next: the kubelet's own
+warm-probe measurement of claims on a node; what is left beyond that is stormblock#327 (clone) and rustkube#147.
+
+2026-10-08. Done elsewhere: phases on the pod (#132), `sandbox` split (#139); the traced causes (2 s pass, serial
+starts, unbounded CNI, inline events, per-pass PUTs) by #99/#100/#101/#134/#138. Still undone from item 1: "the same
+for a claim". A claim's volume is one `volume/<name>`; its steps are lookup (PVC, PV, existing volume), make (clone
+of the class blank / of a source / raw volume; none when reused), attach (ublk), bind (PV/PVC writes). The
+filesystem mount is PID 1's, at container create (in `containers`).
+1. [x] `ClaimSteps` from `provision_claim_volume`; `claim/<volume>/{lookup,blank|clone|raw,attach,bind}` in the
+       annotation, Event and log line. Tests, docs (README, status.md), CHANGELOG; sc-build; golden.
+       Done: 9d7b454; sc-build `cargo build --locked && cargo test --locked`: 345 kubelet unit pass (2 new). Stage
+       golden golden-rustkube-node-a259ec6b4c3d (stormcos#366). Status commented on #95.
+2. [x] Measured (2026-10-08, 11.91 = ff480857443c; stormcentral `/api/v1/testhosts/<tag>` `last.log`, warm probes):
+       container start 0.2–1.0 s (met, pvetest1 + server3); claim 0.8–4.0 s (missed). Kubelet claim total 0.5–0.7 s
+       cold / 1.5–1.7 s warm: bind 150–220 ms (ours), PID 1's ext4 mount 0.55–0.88 s warm (stormpump#107), blank
+       clone 0.3–0.37 s warm (stormblock#327); control plane 0.3–3.1 s (rustkube#147, commented). The Dell's 11.91
+       failed its fresh-slab gate: no samples there.
+3. [x] Bind off a pod's start path (d758167): `ClaimBinder` task after the attach; VM path still inline; `ClaimSteps.bind`
+       optional. SC_BUILD_VM sc-build: 365 kubelet unit pass.
+4. [ ] Golden (stormcentral#527); then the claim target behind stormpump#107, stormblock#327, rustkube#147. #95
+       proposed after stormcentral#527.
+
+### Done: #3 (P1), the node side Cilium needs
+
+2026-10-08. Already on main (validated 09-29): CNI ADD with the sandbox's netns, `K8S_POD_*` CNI_ARGS, the IP into
+status, a failed ADD fails the sandbox (DEL first), DEL at stop (#137), host network skips it. Item 1 holds: stormcos
+mounts the host's /etc/cni/net.d and /opt/cni/bin at the kubelet's defaults (build-goldens.sh:2590).
+**Item 2 needs the owner:** rustkube's scheduler refuses every pod on a node whose Ready is not True
+(filter.rs:65, no toleration helps), so a kubelet that posts Ready=False without a CNI config would keep Cilium's
+own agent off the node: never Ready. And rustkube's node controller removes `not-ready` taints while the Lease is
+healthy. stormcos registers no `node.cilium.io/agent-not-ready` taint. Options posted on #3.
+1. [x] Test: run_pod_sandbox for a host-network pod with a CNI but no config succeeds with no address; a pod-network
+       one is NetworkNotConfigured. `--no-cni` help: pods get an isolated namespace with loopback only (#54 audit).
+       Done: 2a2b463; sc-build `cargo build --locked && cargo test --locked`: 343 kubelet unit pass.
+2. [x] Question on #3 (A upstream shape + rustkube scheduler/taint change, recommended; B stormcos registers
+       Cilium's agent-not-ready taint; C kubelet-managed network-unavailable taint), `stormcentral wait-owner`. Live checks (pod CIDR address, coredns leaves Pending, endpoint
+       released, agent stopped → sandbox fails) wait on a test machine (stormcos#337). Resume from the answer.
+
+**Owner (2026-10-07): no NotReady gating** ("we want to get working early"). 2026-10-08: verified live on server3
+(11.91, lease c5ccab77ea): pod-to-pod, endpoint released on delete, sandbox fails with the agent gone and starts by
+itself when it is back; coredns on the Dell left Pending by itself. Gap found and fixed: network waits had no Event
+(02a5b2e, NetworkNotReady / FailedCreatePodSandBox; build waits on stormcentral#544 with #104/#79/#70). Closed.
+### Done: #69, a named credential that is missing is waited for, then fatal (never anonymous)
+
+2026-10-08. `main.rs` waited (60 s, then fatal) only for `--apiserver-ca`; `--client-certificate`, `--client-key`,
+`--token-file` were read once and skipped when missing, so the kubelet ran as `system:anonymous` (cluster-admin on
+sno). The serving pair (`--tls-cert-file`/`--tls-private-key-file`, else self-signed) and `--server-token-file`
+had the same silent fallback; stormcos names the client and serving pairs under /data/stormcert, all minted by
+the boot (build-goldens.sh:5353), so a wait is safe for them.
+1. [x] `wait_for_ca` → `wait_for_file(flag, path, limit)` for every named credential file and `--kubeconfig`;
+       absent after 60 s: exit naming the flag. Unit tests (appears late, never appears, empty = not yet).
+2. [x] Docs (configuration.md), CHANGELOG (5d869b9; 0f4cc7d restores `DEFAULT_APISERVER`, which the edit dropped:
+       build-failure #169, closed). sc-build 0f4cc7d `cargo build --locked && cargo test --locked`: exit 0, 4 new
+       main.rs tests pass. Stage golden golden-rustkube-node-236e69973cf6 (stormcos#366). Closed. Not run on a node.
+
+### Done: #139, start timing: `sandbox` split into acquire / cni / status
+
+2026-10-08. `start_pod` times `sandbox` around `run_pod_sandbox` + `pod_sandbox_status`; on stormpump that is
+SandboxAcquire, network_ready and the CNI ADD (no stormblock call). Wanted: `acquire`, `cni`, `status` sub-phases
+in `storm.io/start-timing`, so the blade's next measurement names the slow step.
+1. [x] Runtime reports the sandbox's own split; start timing records it; annotation/Event/histogram/log.
+2. [x] Tests (1 new, the end-to-end timing test extended), docs (README, metrics.md, status.md), CHANGELOG (fa18eaf).
+       sc-build 0f4cc7d: 342 kubelet unit pass. Golden golden-rustkube-node-236e69973cf6 (stormcos#366). Closed.
+       Live check after the release: busybox pods on server3 show `sandbox/acquire|cni|status|other`.
+
+### Done: #51, retire `scripts/build-golden.sh` (the second golden builder)
+
+2026-10-07. Authority is decided: `stormcentral component stage rustkube-node` (stormcos `deploy/build-goldens.sh`
+in stage mode). README/BUILD.md already say so (ad43ee9); the script remains. Nothing calls it: stormcentral runs
+stormcos's stage recipe or a repo's `deploy/build-golden.sh` (none here); no stormcos/stormpump/master reference.
+1. [x] Deleted `scripts/build-golden.sh`; README, BUILD.md, CLAUDE.md, CHANGELOG (10d859c). sc-build `cargo build
+       --locked && cargo test --locked`: exit 0, 341 kubelet unit pass. No golden (nothing shipped changed). Closed.
+
+### Done: #156 (P3), /vmInstance refuses metadata from a cache past a staleness bound
+
+2026-10-07. A VMI cache answer is fresh only while the apiserver has been heard from within a bound: the node
+Lease renewed (heartbeat, 10 s) or a VMI LIST (`cache_specs`, a live LIST). Past `--metadata-max-staleness`
+(default 40 s, the Lease duration; 0 disables) a machine found here answers 503 + Retry-After, not its identity.
+An address with no machine here stays 404 (the local record is the truth for "not here"); the token path (#122)
+is live GETs already.
+1. [x] `heartbeat` returns whether the Lease was renewed; VmManager `note_apiserver_contact`, bound, stale → 503.
+2. [x] Flag/env/config, tests (2 new), docs (README, api.md, configuration.md, status.md), CHANGELOG (5ae5c2e). sc-build
+       `cargo build --locked && cargo test --locked`: 341 kubelet unit, 3 node_reregister pass. Stage golden
+       golden-rustkube-node-c539820ae4ec, release request stormcos#366. Closed. Not run on a node (no live partition).
+
+### Done: #155, docs: no stormcos edition runs kube-proxy
+
+2026-10-07. de51950: README, BUILD.md, status.md, presentation, CLAUDE.md (flowsdn owns Services in its edition,
+#145; checked against stormcos main). sc-build: deck renders (12 slides), `cargo build --locked` ok. Closed.
+
+### Waiting on the night's long run f47d49df0d: #61, short, medium and long test suites (stormcentral docs/test-standard.md)
+
+2026-10-06. `test/` has medium's storage cases (#64, #59, #62, #67); short and long are one skip each. The
+runner's namespace Role is `*`; cluster reads come from `test/requires.toml` (only [medium] declares `nodes`, which
+every suite needs to resolve STORM_NODE). Pods are pinned with `spec.nodeName` (the kubelet, not the scheduler).
+1. [x] Workload modes (scratch image, no shell): `echo`, `exit <code>`, `sleep` (exits 0 on SIGTERM),
+       `fail-once <dir>`, `write-file`, `expect-file`, `expect-env`.
+2. [x] short (< 2 min): node Ready + heartbeat + no pressure; a pod runs, has a pod IP, its log reads back through
+       the apiserver; a pod exiting 3 is Failed with exit code 3; a running pod deleted is gone within its grace.
+3. [x] medium pod cases (with or without the storage class): OnFailure restart (restartCount 1, `previous` log),
+       init container before the main one (emptyDir), configMap volume + configMapKeyRef + fieldRef env, a missing
+       image waits with ErrImagePull/ImagePullBackOff and never runs.
+4. [x] long (night, pve VM): waves of pods sized from the node's allocatable pods (every 4th with a 16Mi built-in
+       claim when the class is there); per wave p50/p95 start, drain, leftover pods/PVs; a wave > 2× the first's
+       p95 (+2 s) or any residue is a failure. VM waves are stormcos_qa's vm-waves.
+5. [ ] requires.toml [short]/[long], Job yaml notes, docs, CHANGELOG; sc-build `cd test && cargo test && build`;
+       runs on C2NR0Q2 (short, medium) when the queue moves. Gaps that need node access (#35 restart adoption,
+       #75 guest persistence, #72 mirror-pod logs, #83 snapshot) filed as a follow-up.
+       #97: short 89e5de132e (pvetest1) dropped by a stormcentral restart (stormcentral#466), bb31b533fe: no VM 3101.
+       #97 proposed after stormcos#337; any suite's run past `environment` closes it (a blade after 06:00 Chicago too).
+       Done: d20ef52; sc-build `cd test && cargo test --locked; cargo build --release --locked`: 28 pass, release
+       builds. Filed #162 (terminationMessagePath never read), #163 (node-access medium gaps). Live: short
+       c822f4832d, medium 5d9d765385 dropped by a stormcentral restart; requeued short e4bbc4ea0f, medium
+       2434af9cf2 (C2NR0Q2; pvetest1 erroring: no VM 3101). Earlier medium fff1f4d9d9 (65e3c3c): the Dell's
+       apiserver stopped answering mid-run (no results; 6443 refused after). If 2434af9cf2 does it again, suspect
+       the storage cases' load and file it. Close #61 on their results.
+       Both errored: the Dell's apiserver is down (stormcos#337: engine :9090 and :6443 gone since 20:55Z, reinstall
+       queued; commented that fff1f4d9d9 already lost the apiserver at 17:35Z). Now queued: short 6ab7e3709e
+       (pvetest2), medium 1538b1fa13 (pvetest2), short 48f97966b0 (server1).
+       All three errored on the machines (pvetest2: no VM 3102; server1: a stormcentral restart). No test machine
+       works (pvetest1/2 VMs missing, the Dell down; blades are off 19:00–06:00 Chicago). #61 proposed after
+       stormcos#337. Resume: `stormcentral test run rustkube-node short|medium --tag C2NR0Q2` once it is reinstalled.
+       2026-10-08: the Dell is back (11.89) but test images are still built on the retired dev.g8.lo (stormcentral#521;
+       stormcos_qa turbomode 630379c31b failed there). Test crate passes on a build VM (28 tests). #97 proposed after
+       stormcentral#521; fff1f4d9d9 reached `running` but its log was lost with the Dell's apiserver.
+       #521 closed early; #61 and #97 proposed after stormcentral#526 (test-image builds still go to dev).
+       2026-10-13: short passes on C2NR0Q2 (4fe3fb250e … 10f84b5467, 4/0/0 each; #97 closed). Medium's last runs
+       (1239d5335f Dell, 17983aa5e3 pvetest1, 26bab08, 10-08) predate #217's drain fix (the runner deleted itself).
+       No medium/long run possible: owner closed every machine's `tests` valve but pvetest (10-10), and pvetest1/2's
+       12.16 installs failed (Fedora-44 VM image never arrived: stormcos#129). #61 proposed after stormcos#129;
+       then `stormcentral test run rustkube-node medium --tag pvetest1`, long at night, close on their results.
+       2026-10-28: stormcos#129 closed, pvetest1/2 on 12.58 (passed); every run (ours c3a7f40a13, 184f62a70d) errors at the
+       node's fetch, `forge.g16.lo:5100 is not a peer` = stormcos#271. Test crate builds clean (45 tests). #61 proposed
+       after stormcos#271. Resume: medium on pvetest1, long at night, close on their results.
+       2026-11-06: stormcos#271 closed (pvetest1/2 on 12.61 take forge as a peer). Medium 023f853fba (pvetest1, 1c94f30): image built,
+       pushed to forge, fetched by digest, then the Pod's `ImagePullBackOff`: tag "not on this node" (404, no ready golden), so the suite never
+       started = stormblock-registry#150 (every component's runs since the peer). #61 proposed after it. Resume: medium on pvetest1, long at
+       night, close on their results.
+       2026-11-06 (later): #150 closed (v0.55.1, 9912c98), not on a node: the newest registry image is da53e0e, 5 commits behind it, and 12.61 predates it.
+       No run queued (it would stop at the same 404). #61 proposed `--after-release registry>=9912c98`. short also passed on pvetest1 (f490bbfc50, c0a5fd4, 4/0/0).
+       Resume: `stormcentral test run rustkube-node medium --tag pvetest1`, long at night, close on their results.
+       2026-11-06 (17:15Z): 12.62 (cilium) is composed and carries registry f2f13ad (1 commit after 9912c98), so the after-release hold has cleared, but no machine runs it:
+       pvetest1 12.58.4, pvetest2 12.61-flowsdn, C2NR0Q2 12.58; `release tests 12.62` = no-installs; 12.62-flowsdn still composing. No run queued (same 404 expected: eb5b18ef34,
+       the newest, on pvetest2). Install is the master's: asked by `stormcentral note`. Resume: `testhost installs pvetest1` shows 12.62 passed, then the runs above.
+       2026-11-06 (17:40Z): 12.62 tombstoned (stormcos#814, see #52). #61 proposed after stormcos#812. Resume: the runs above once #812 closes.
+       2026-11-06 (20:33Z): stormcos#812/#814 closed; pvetest2 passed 12.63-flowsdn (registry f2f13ad, has 9912c98) and other components' shorts pass there. Queued medium ce5d01a254 (pvetest2, c4b5643). Read with `stormcentral test show ce5d01a254`; long at night (`stormcentral test run rustkube-node long --tag pvetest2`).
+       2026-11-06 (21:04Z): ce5d01a254 (c4b5643): 31 pass, 2 fail, 1 skip, the first real medium. Fails: `pvc-size-above-ladder` (test: the scheduler refuses on capacity before the kubelet's check; now `spec.nodeName`), `pvc-size-block-1mi` (pod Failed after ~3 s, reason unknown: no termination message, #162; a size case now reports the pod's log). Only 1Mi Block ran: 20Ti/1Pi are above pvetest2's 16Gi maximum. Next: rerun, read block-1mi's line, fix or file it.
+       2026-11-06 (21:30Z): b7f6ccdd26 (1f297d7): 32 pass, 1 fail, 1 skip. above-ladder passes through the kubelet's check. block-1mi: `/dev/xvda is 65536 bytes`, a regular file. From stormpump 9877a97 exec.rs (read, not yet proved live): the bind lands at /dev/xvda, then a 64k tmpfs goes over /dev unless a mount is exactly /dev, and the workload's create makes a file there. Doing: case `block-1mi-outside-dev` (/block/xvda) to prove it; then file on stormpump.
+       2026-11-06 (21:45Z): 5d70bf4679 (a2c02a2, pvetest2): 33 pass, 1 fail, 1 skip. `block-1mi-outside-dev` passes (/block/xvda is 1048576 bytes), `block-1mi` doesn't (/dev/xvda is 65536 bytes): proved, filed stormpump#222. The skip (`node-volumes-restored`) is the runner's cluster-reads-only, by design. Long f47d49df0d queued on pvetest2 (night window 22:00-07:00 Chicago). #61 proposed after stormpump#222. Resume: `stormcentral test show f47d49df0d` (fix or file what fails); a node release with #222: medium on pvetest2, `pvc-size-block-1mi` passes; close on both.
+       2026-11-07 (00:15Z): stormpump#222 is in 12.64. Medium d80cfd8e8c (a1ea812, pvetest2, 12.64-flowsdn): 34 pass, 0 fail, 1 skip (`node-volumes-restored`, by design); `pvc-size-block-1mi` /dev/xvda is 1048576 bytes. Only long is left: f47d49df0d queued on pvetest2, night window opens 04:00Z. `propose --night` is refused on a dispatched item and nothing holds an item behind a test run, so #61 is proposed `--after-release rustkube-node>=9828650`, which may be after the long run or before it. Resume: `stormcentral test show f47d49df0d`; still queued or running, hold it again; fix or file what fails; close on a pass.
+       2026-11-10: f47d49df0d (a2c02a2, pvetest2) waited for the window until 11-10, then error: the Job reached `running` and the apiserver stopped answering (no
+       results). Not the suite: pve shut VM 3102 down at 04:14:13Z (`pvesh qmshutdown:3102`, timeout, then off, started again 04:16:11Z) while the run held the
+       machine; the node's syslog has nothing before that boot. Master told (stormcentral note). Queued long ef37856d6b (3dc1ddf, pvetest3, window 04:00Z). #61 proposed
+       `--after-release rustkube-node>=3dc1ddf`. Resume: `stormcentral test show ef37856d6b`; fix or file what fails; close on a pass. (#350 is medium's own flake on a 4Gi node.)
+
+### Done: #171 (P2), fsGroup / supplementalGroups onto the engine
+
+2026-10-21. Lock's stormpump 9877a97 has `Spec.groups` (stormpump#104: setgroups before gid/uid). The kubelet sees PID 1's
+claim mounts (`/run/stormpump/pvc/<dev>`, host /run bound at /run, as it reads /run/stormpump/roots), right after
+`volume_register_device` and before the spawn: upstream's SetVolumeOwnership point. Doing:
+1. [x] ContainerConfig `fs_group`, `fs_group_change_policy`, `supplemental_groups` (pod-level, `apply_pod_namespaces`);
+       CRI gRPC `supplemental_groups` (+ fsGroup in it, as upstream's kuberuntime does).
+2. [x] `spec_for` and `exec_spec`: `groups` = fsGroup + supplementalGroups, deduplicated.
+3. [x] Ownership (`volume_ownership.rs`): each claim filesystem mount (fstype set) before the spawn: OnRootMismatch
+       skips a root already right; else the tree, symlinks skipped: chown(-1, fsGroup), files |0660 (|0440 ro), dirs
+       |0660|0110|setgid. A failure fails the start naming the path.
+4. [x] Tests, README ("Not yet"), status.md, CHANGELOG; sc-build; stage golden; close.
+       Done (+ #274, my test's empty argv). SC_BUILD_VM sc-build (job 34670a02d1): 546 kubelet unit, all suites, warnings =
+       #227's. Stage golden golden-rustkube-node-cb08ee3dbf99 (stormcos#628). Closed. Live: a pod with runAsUser 1000,
+       fsGroup 2000 writing its claim, after the release (blocked like #64 on stormcos#271 for a test-standard run).
+
+
+2026-10-09 (#220): a claim is root's, so a non-root container cannot write it (#98 follow-up). The lock's stormpump
+13cf2c9 carries `Spec.groups`. Next: supplementalGroups + fsGroup into `Spec.groups` in `spec_for`; fsGroup's
+ownership change of a claim's filesystem at mount (upstream's recursive chown/chmod, `fsGroupChangePolicy`
+OnRootMismatch); tests; docs (README "Not yet"); CHANGELOG; sc-build; golden.
+
+### Done: #118 (P1), pod capabilities onto the ring (stormpump#47's `Spec.caps`)
+
+2026-10-21. Lock's stormpump 9877a97 has `Spec.caps: Caps {base: Full|Standard, add, drop, no_new_privs}` (names as
+Kubernetes spells them, drop before add, unknown name = spec code 54; default Full = what every pod gets today:
+stormpump's node suite saw `CapEff 000001ffffffffff` on a plain pod, e4c7c276ed). Doing:
+1. [x] `ContainerConfig.no_new_privs` (`allowPrivilegeEscalation: false`), forwarded on CRI gRPC too.
+2. [x] `spec_for`: `caps_for(config)`: privileged → Full (add/drop ignored, as upstream); else Standard + add/drop +
+       no_new_privs. Module doc "What this does not do yet" updated.
+3. [x] Tests (Standard by default, add/drop carried, privileged Full, `resolve` of Cilium's drop ALL + add list),
+       README/status.md, CHANGELOG; sc-build; stage golden (needs stormpump accd1a3e8e61+, already required); close.
+       Live: `stormcentral test run stormpump node` `pod-capabilities` after a release (stormpump's suite).
+       Done: f57a7c0 (+ test fix 43020cd = #269), docs d5a4e9b. SC_BUILD_VM sc-build 43020cd (job 0d2d1dc87b): 526 kubelet
+       unit, all suites pass, warnings = #227's. Stage golden golden-rustkube-node-72c9244f0ffc (stormcos#628). Closed.
+(earlier) 
+2026-10-09 (#220): the lock's stormpump 13cf2c9 carries `Spec.caps` (stormpump golden accd1a3e8e61), and the stormvm#65
+lock blocker is gone. Next: item 2 below (map add/drop/privileged into `Spec.caps` in `spec_for`, test CapEff).
+
+2026-10-06. stormpump main (819b55d) has no capability field in `Spec`; #47 (open) is the engine side (owner on
+stormpump#59: pods get the runtime's 14 + their `add`, boot.d services the full set). The lock's stormpump
+(30a76d3) cannot move until stormvm#65 either.
+1. [x] Now: `securityContext.capabilities.drop` parsed (`ContainerConfig.drop_capabilities`) and forwarded on the
+       CRI gRPC path (`Capability.drop_capabilities`), which also ignored it. Test, docs, CHANGELOG. c934c5f; sc-build
+       `cargo build --locked && cargo test --locked`: 340 kubelet unit + CRI round trip pass. No golden (CRI path only).
+2. [ ] After stormpump#47 (and stormvm#65 for the lock): map add/drop/privileged into `Spec`'s field in `spec_for`;
+       test `CapEff` (NET_ADMIN added, NET_RAW dropped). #118 proposed after stormpump#47 (commented there: names
+       add/drop + privileged, or a resolved mask if the engine prefers).
+
+### Done from this side: #90 (P1), descriptors in PID 1: refused workload release after a stop
+
+2026-10-06. Half 1 (a failed start's volumes) was af1704b: handles kept on the record, the Cleanup pass's
+`stop_pod` releases them. Half 2: `restart_container` and the init deadline path stop then remove with `let _`;
+the engine refuses `WorkloadRelease` (EBUSY) until the exit, the kubelet forgets the old cid, nothing retries,
+and `remove_pod_sandbox` then waits on that record forever (pod deletion stuck too).
+1. [x] Runtime-owned: `Container.removing` (asked at / last tried); a removed record is hidden (list, status,
+       stats); `removals_due` = its workload's exit or ≥ 10 s since the last try, from `note_exits` (every
+       absorb_exits); `remove_pod_sandbox` retries its sandbox's pending removals first.
+2. [x] Test (1 new, no engine), CHANGELOG (1afb7e4). sc-build 1afb7e4 `cargo test --locked`: 340 kubelet unit,
+       25 CNI, 30 proxy, integration and doc-tests pass. Not run on a node.
+3. [x] Stage golden golden-rustkube-node-ddcdf8b8bb73 (8664370); stage filed no release request (commented on
+       stormcentral#117); `stormcentral shipped`. #143's golden 65e3c3c shipped in 11.88 (stormcos#305).
+
+### Done from this side: #143 (P1), pull_image binds its registry clone (stormblock#267)
+
+2026-10-06. Found: `pull_image` mints (`POST /v1/clones`, state claimed), attaches and mounts, never binds; the
+registry reaps a claimed clone after 900 s. sbregistry 0.26: `POST /v1/clones/{id}/bind {consumer}`,
+`POST /v1/clones/{id}/release`, `GET /v1/clones?consumer=&state=` ("recovered by asking", #19). Nothing in the
+kubelet unmounts/detaches a pulled image (no image GC; `remove_image` is a no-op), and a kubelet restart forgets
+`pulled`, so the next pull mints a second clone: once clones are bound that would leak one per restart.
+1. [x] Consumer `kubelet/<node>/<image>`. A pull first asks for a clone bound to it (found again after a restart:
+       attach and mount are idempotent); else mints. After the mount, bind; a refused bind keeps the image
+       usable and is retried on the next pull of it (warned). A failed lookup fails the pull (no duplicate mint).
+2. [x] Tests (3 new, fake registry), docs (configuration.md, status.md), CHANGELOG (38bf04e). sc-build 38bf04e
+       `cargo build --locked && cargo test --locked`: exit 0; 339 kubelet unit pass. Not run on a node.
+3. [x] Release = an image GC (unmount, detach, release when no container uses it): filed as #161.
+
+### Done: #62, slab capacity: publish, refuse, alert (#108 decided)
+
+2026-10-05. Owner (#108): a claim's full class size counts at bind, overcommit ratio 1.0, clones keep the class
+size. Engine: `/api/v1/slabs` items `role`, `total_bytes`, `free_bytes`; volumes `role`, `sealed`,
+`virtual_size_bytes`. rustkube's scheduler (`capacity_fits`) reads `maximumVolumeSize` (else `capacity`) of a
+CSIStorageCapacity matching the class and node topology, against the raw request.
+1. [x] `capacity.rs`: `Capacity::of` (data slabs; committed = writable data volumes' virtual size, not
+       sealed/goldens/class blanks/standbys), available = min(total×ratio − committed, free) − reserve,
+       `largest_class`, `refusal`. Flags `--storage-overcommit` 1.0, `--storage-reserve-percent` 5,
+       `--storage-alert-percent` 85 (`KubeletConfig.storage`).
+2. [x] `capacity_loop`: CSIStorageCapacity `kube-system/stormblock-<node>` on engine volume changes + 60 s.
+3. [x] Refusal in `provision_claim_volume` for a new volume, under `capacity_lock`; no slab API = unchecked.
+4. [x] Gauges `kubelet_stormblock_data_bytes{kind}`, `_used_percent`; `SlabFilling` per crossing on PVs.
+5. [x] Tests (5 new), docs, CHANGELOG (700483a, 1c5db42). sc-build 700483a `cargo build --locked && cargo
+       test --locked`: 322 kubelet unit pass; `cd test && cargo test --locked && cargo build --release
+       --locked` at 1c5db42: 17 pass. Medium `pvc-overcommit-refused` enabled. Not run on a node.
+       stormcos#151 (storageCapacity: true) flips once every node runs this release.
+
+### In progress: #88 (P1), a VMI on the pod network gets its own sandbox (stormvm#16)
+
+2026-10-05. stormvm dc1b7ea (in the lock) has `realise(p, Some(netns), …)` (bridge binding: pod IP/MAC off the
+CNI's interface onto `vmbr0` with the tap), `serve_dhcp(netns, lease)` and `Made.binding`. stormpump 30a76d3
+joins a machine-domain spawn to a client-held sandbox (`inline_a`, `ns_fds`), as for a container.
+1. [x] `vm_network.rs` (record, store, lease round trip, ClusterFirst DNS); `acquire_pod_network`
+       (sandbox_acquire + CNI ADD `vm-<uid>`, recorded first; failed ADD → DEL; no CNI → Waiting) before the
+       deposit window; `release_pod_network` (responders, DEL, sandbox_release, ESTALE ok, record).
+2. [x] `resolve_nics(.., pod)` realises pod NICs in the netns, starts `serve_dhcp` per bridged NIC;
+       `launch` spawns with the sandbox handle (`inline_a`).
+3. [x] Status: `made.binding` (`binding_of` removed); pod NICs report the pod IP from the start, and
+       `absorb_ends` does not replace it.
+4. [x] Released at machine end, failed start, deletion; `adopt_registered` → `restore_pod_networks`.
+       `Kubelet::with_engine(ring, cni)`; main passes an invoker on the same dirs.
+5. [x] Tests (7 new), README, status.md, CHANGELOG (b177a89, the brace fix, 7558936). sc-build of the
+       fix commit `cargo build --locked && cargo test --locked`: 317 kubelet unit pass. Not run on a node.
+6. [x] **Owner (2026-10-05): B**, rustkube's VM controller creates a virt-launcher Pod, the kubelet adopts it;
+       "can we have multiple vm in a namespace" (yes: a sandbox and a Pod each). Filed rustkube#203 (contract:
+       labels `kubevirt.io: virt-launcher`, `kubevirt.io/created-by: <vmi uid>`, owner ref, nodeName set).
+7. [x] Kubelet adopts it (3d9d26e, test 1 more, docs 523e978): launcher Pods kept out of the pod manager (and their VMI woken when one appears);
+       the pod-network VMI waits for its launcher Pod; CNI ADD with the Pod's ns/name/uid (recorded); the Pod's
+       status written (Running + podIP + Ready at start, Succeeded/Failed at end); a terminating launcher Pod
+       with no machine here is confirmed deleted (grace 0, uid precondition).
+8. [x] Tests (4 new), docs, CHANGELOG. sc-build `cargo build --locked && cargo test --locked`: 326 kubelet unit pass.
+9. [x] rustkube#203 done (golden-rustkube-3397b0cb2d2d). #152 fixed (a318daf: launcher on this node; migration
+       target launchers), golden-rustkube-node-cce2c30dd5c8. Kubelet side complete.
+10. [ ] Live done-when = stormcos_qa#18 (5 pod-network VMs, same-namespace NetworkPolicy), behind
+       stormcentral#55, the Fedora golden, stormcentral#376. `virtctl ssh` via port-forward needs #56. #88 proposed
+       after stormcos_qa#18.
+
+### Done from this side: #67 (P1), PVC ladder to PiB, raw block volumes, per-class filesystem
+
+2026-10-05. Owner (#67, 09-25): large classes stay **ext4** unless stormcos#91 says otherwise; Block for single
+objects past 16 TiB. stormcos#91's table: nothing forces XFS. Found:
+- stormblock main pins mkfs-ext4 **v3.0.0**: format RAM ~8 KiB/group (16 TiB 1.3 GiB, 64 TiB 5.1 GiB, 256 TiB
+  17.6 GiB, 1 PiB OOM; the fix, mkfs.ext4.rs#10, is untagged), and the default inode count wraps at 256 TiB
+  (mkfs.ext4.rs#9, open: the filesystem is not clean). The fstemplate API exposes no inode ratio.
+- stormblock `size` strings parse K/M/G/T only (no P): sizes are sent as `<MiB>M`.
+- stormpump binds a non-directory source onto a file placeholder, so a raw device can be bound at a
+  `volumeDevices[].devicePath` with no stormpump change (`fstype: None`, source = the device).
+- rustkube's provisioner (`stormblock.rs`) writes the PV without `volumeMode` (admission → Filesystem), so a
+  Block claim's control-plane PV mismatches: rustkube issue.
+1. [x] storage.rs: `SIZE_CLASSES` (name, bytes, `ClassFs`); 4T, 16T ext4; 64T, 256T, 1P `BlockOnly` (reason
+       names mkfs.ext4.rs#10/#9 and volumeMode: Block). Mint `fs` from the class, `size: <MiB>M`. d917f26.
+2. [x] Block claims: raw volume (`POST /api/v1/volumes`, role data, class size), `ResolvedVolume.block`,
+       `volumeDevices` bound at devicePath, `volume_mode_misuse` wait, PV `volumeMode` from the claim, `Pi`
+       quantities. Third-party CSI Block was already refused (csi_volumes.rs).
+3. [x] Tests: 9 new unit (ladder, fs per class, MiB sizes, raw volume end to end against one fake
+       apiserver+stormblock, 20Ti filesystem refused, mode misuse, device mounts, Block PV, Pi). `test/` medium:
+       4Ti/16Ti, Block 1Mi/20Ti/1Pi via volumeDevices, 20Ti filesystem refused, above-ladder 2Pi (312e9ff).
+       Docs README, csi.md, status.md, CHANGELOG (04a6fdc).
+4. [x] Filed rustkube#201 (provisioner volumeMode), stormblock#289 (carry mkfs.ext4.rs#9/#10).
+5. [x] sc-build 1e65251 `cargo build --locked && cargo test --locked`: 310 kubelet unit pass, exit 0 in 150 s;
+       `cd test && cargo test --locked` at 04a6fdc: 15 pass. Stage golden golden-rustkube-node-a0b9cebe68a0,
+       release request stormcos#164; #67 closed, shipped. Follow-up #149 (flip 64T+ to ext4) proposed after
+       stormblock#289. Not run on a node: medium Job waits on the test pipeline (#64), stormcos#92.
+
+### Done: #119 (P3), metadata at scale (stormcos#54)
+
+2026-10-05. Found: `instance_at` scans every VM and NIC under the `vms` lock and answers from the local record
+even when the cached VMI is missing or places the machine elsewhere. Per-machine reconciliation is already the
+UID executor's (`replace_source` enqueues only UIDs whose intent changed); `desired` is still replaced only by
+the full LIST, and a cluster without the VMI CRD never leaves "cold".
+1. [x] `Machines`: `vms` keeps an address → uids index, updated on insert/remove/update (only non-terminal
+       machines; no `DerefMut`); `instance_at` answers from it, and refuses an address two machines here claim.
+2. [x] `reconcile_one` refreshes that UID's cached object (removes it when gone); CRD 404 marks synced.
+3. [x] `placed_here`: cached object exists, not terminating, uid matches, `status.nodeName` is this node, no
+       completed (not failed) `migrationState` to another node. Covers address reuse. Not covered: a node
+       partitioned from the apiserver answers from its last cache (no lease; noted in status.md). Bounded by #156.
+4. [x] Tests (5 new), docs (README, api.md, status.md), CHANGELOG (3fe7496). sc-build 3fe7496 `cargo build
+       --locked && cargo test --locked`: 301 kubelet unit, 30 proxy, 25 CNI, 1 doc-test pass; exit 0 in 147 s.
+       Not run on a node.
+5. [x] Stage golden golden-rustkube-node-f254f18e7c47 (ed55857), release request stormcos#164; #119 closed, shipped.
+
+### Done: #148 (P1), pods wait for the CNI instead of retrying into backoff
+
+2026-10-05. Dell 11.79: cilium agent `attempts=10` over 10.5 s, coredns 16 over 27 s; CNI → all pods ~20–27 s.
+Found: the cilium agent is hostNetwork and never meets the CNI check; its attempts are its staged init containers
+(each a Pending pass woken by the exit, no backoff). A network pod with no CNI config acquires a stormpump
+sandbox, finds no conflist, releases it and retries on `wait_backoff` (a quarter of the wait, 1–10 s), so once
+the config appears it starts up to 10 s later. A CNI ADD that fails (agent not serving yet) has the same backoff.
+The executor's queue is apimachinery's FIFO with ≥32 workers: a network pod no longer holds a worker long
+enough to delay the agent, so no reorder.
+1. [x] stormpump runtime: no conflist → `CriError::NetworkNotConfigured`, checked before the sandbox is acquired.
+2. [x] Pod manager: a pod waiting on the config is woken by the config (event wait, 10 s fallback); an ADD failure
+       retries on a backoff from its first ADD failure, not from when the pod was seen.
+3. [x] Kubelet: `--cni-conf-dir` watched (inotify, fs_watch); a change wakes only the pods waiting on the network.
+4. [x] Tests, docs (README, configuration.md, status.md), CHANGELOG. f1a0c38; sc-build f1a0c38 `cargo build --locked &&
+       cargo test --locked`: 296 kubelet unit (3 new), 4 integration, 25 CNI, 30 proxy pass. Not run on a node.
+5. [x] Stage golden golden-rustkube-node-61af4712bf0d (409a838), release request stormcos#164; #148 closed,
+       `stormcentral shipped`. Live check: coredns's start-timing `wait` ends ~1 s after Cilium's conflist.
+
+### Done: #145 (P0), kube-proxy to a TLS apiserver with a token (stormcos#265, flowsdn edition)
+
+2026-10-05. Found: kube-proxy builds `reqwest::Client::new()` (no CA, no token) and parses any answer as a list,
+so a 401 reads as "no Services" and wipes every rule. Its rules are never entered: nothing jumps from
+PREROUTING/OUTPUT to `KUBE-SERVICES` or from POSTROUTING to `KUBE-POSTROUTING`. A change is detected only by
+counts, so a pod replaced at a new IP keeps the old DNAT.
+1. [x] `--ca-file`/`--token-file` (`KUBE_PROXY_CA_FILE`/`KUBE_PROXY_TOKEN_FILE`), defaulting to the in-cluster
+       ServiceAccount paths when present; token re-read each pass (projected tokens rotate). Non-2xx is an error.
+2. [x] Jumps ensured (`-C`, else `-I`) for PREROUTING, OUTPUT → KUBE-SERVICES, POSTROUTING → KUBE-POSTROUTING.
+3. [x] Apply when the generated rules differ from the last applied set, or 60 s after it (resync).
+4. [x] `--cluster-cidr` (optional): ClusterIP traffic from outside it is marked for masquerade. Also found and
+       fixed: service ports keyed without protocol (kube-dns 53/UDP vs 53/TCP collided), Endpoints matched by
+       number not name, stale backends never cleared. 3243b77; sc-build eb0afdb: 30 proxy tests (13 new) pass.
+5. [x] Tests, docs (configuration.md, README, status.md), CHANGELOG (cbfaec0). sc-build cbfaec0 `cargo build --locked
+       && cargo test --locked`: 293 kubelet unit, 4 integration, 25 CNI, 30 proxy pass. Stage golden
+       golden-rustkube-node-ed553922ee44, release request stormcos#164; node requirements answered on #145; closed,
+       `stormcentral shipped`. Follow-up #147 (UDP conntrack cleanup). Not run on a node: live check is stormcos#265.
+
+### Done from this side: #140 (P0), every new claim on the Dell (11.76): "stormblock would not clone pvc-ext4j-64m"
+
+2026-10-03. C2NR0Q2 (Dell R230, 11.76: this repo at ac07686, stormblock v20.0.0); pvetest1 fine with the same
+release. The node's stormblock needs its token, so the refusal cannot be read from here. Found: `storage_post`
+answers `None` for a transport error (60 s request bound, no log at all) and for a 2xx that is not JSON, and the
+claim message never carries stormblock's answer. stormblock refuses a clone of a `ready` template whose sealed
+volume is missing (404 "volume … not found"), not sealed (409) or absent (500 "has no sealed snapshot"); nothing
+here rebuilds such a template, so every retry meets the same refusal.
+1. [x] Engine POSTs (template clone, attach, snapshot clone) answer `Result` with stormblock's status and body, or
+       the transport error (timeout named); the claim's waiting message and FailedMount carry it.
+2. [x] A clone refused because the template itself is broken: DELETE the template and mint it again (one mkfs);
+       the claim waits on the mint. A template still formatting, or a refusal about the clone, is not "broken".
+3. [x] Tests (fake stormblock), docs (README, status.md), CHANGELOG (e3ca68d, de10176). sc-build de10176
+       `cargo build --locked && cargo test --locked`: 293 kubelet unit (4 new) and the other suites pass; exit 0
+       in 82 s. Not run on a node.
+4. [x] Stage golden golden-rustkube-node-945e83c78007 (c248063), release request stormcos#164; `stormcentral
+       shipped`. Live check after the release: the Dell's claim heals (broken template) or its FailedMount names
+       stormblock's refusal; a refusal that is stormblock's goes to stormblock as its own issue.
+
+### Done: #138, starts queue under a burst (wait p50 2.4 s, max 9.3 s over 173 pods)
+
+2026-10-03. pvetest1 (11.72), stormcos_qa turbomode. Found: every Pod/VMI pass runs on one executor with a
+fixed 8 workers (`workloads.run(self, 8)`). A start pass holds its worker through the sandbox (~200 ms), the
+status PUT and the start-timing annotation PATCH; each pod also gets a second pass 1 s later (its probes), with
+another status PUT. 173 pods in ~9.3 s is ~18/s, i.e. ~430 ms per pass across 8 workers: the pool is the
+queue. The ring (non-payload requests pipelined), CNI (no lock) and image pool are not.
+1. [x] Worker pool: `--pod-workers` / `POD_WORKERS`, default 16 × CPUs clamped to [32, 256].
+2. [x] The start-timing annotation PATCH off the worker (spawned, like the queued Events).
+3. [x] Annotation: `workers=<busy>/<limit>` and `pending=<pods seen here, not yet started>` at the attempt's begin.
+4. [x] The pass's "any adopted pod without its spec" guard reads under the lock instead of cloning every PodState.
+5. [x] Tests, docs (README, configuration.md, status.md), CHANGELOG (20e95fc, b5f21c5). sc-build 20e95fc
+       `cargo build --locked && cargo test --locked`: 289 kubelet unit (2 new), 4 integration, 25 CNI, 17 proxy,
+       1 doc-test pass (1 ignored); exit 0 in 122 s. Not run on a node.
+6. [x] Stage golden golden-rustkube-node-317e2624c20e (ac07686), release request stormcos#164; #138 closed.
+       Live check after the release: turbomode on pvetest1, 50 pods,
+       wait p90 < 100 ms, total p90 < 500 ms; `workers=` says whether the pool is still the limit.
+
+### Done: #137 (P1), a finished Pod keeps its pod IP (Cilium range full at ~250)
+
+2026-10-03. pvetest1 (11.72): 1,000 `restartPolicy: Never` sleep pods, 250 reach Succeeded, the rest wait on
+`range is full`. Found: nothing stops a terminal Pod's sandbox until the Pod object is deleted (the sync skips
+Succeeded/Failed pods), and the stormpump runtime's `stop_pod_sandbox` only flipped a state: CNI DEL ran in
+`remove_pod_sandbox`, which waits for every container record to go.
+1. [x] stormpump `stop_pod_sandbox`: CNI DEL (an error keeps it Ready, retried) and the netns holder released,
+       idempotent; `remove_pod_sandbox` does not DEL again.
+2. [x] Pod manager: the pass that makes a pod Succeeded/Failed stops its sandbox (containers, status, logs kept);
+       a failed stop is retried on RECHECK from the terminal-skip branch (`PodState.sandbox_stopped`).
+3. [x] Tests, docs (README, status.md), CHANGELOG (227fbfe, e9bbcb9). sc-build 227fbfe `cargo build --locked &&
+       cargo test --locked`: 287 kubelet unit (2 new), 4 integration, 25 CNI, 17 proxy, 1 doc-test pass (1 ignored);
+       exit 0 in 123 s. Not run on a node.
+4. [x] Stage golden golden-rustkube-node-9c5a14b04400 (3e4446b), release request stormcos#164; #137 closed.
+       Live check after the release: stormcos_qa turbomode on pvetest1 reaches 1,000 Succeeded.
+
+### Done: #134 (P1), every start attempts=2; report outlier; serial work in sandbox/containers
+
+2026-10-02. pvetest1 (11.71): five busybox pods, all `attempts=2`, one `report=729ms`.
+Found: `prepare_images` spawns the image resolution and reads its result in the same call, before the
+task has run, so attempt 1 always returns `Pending("waiting for image …")` (a golden resolves in 0.1 ms) and
+the pod writes a ContainerCreating status PUT before the real one. `report` is exactly one status PUT (no GET,
+no tick): 729 ms is the apiserver's write. In `containers`, each container awaits three Event POSTs
+(Pulled, Created, Started) to the apiserver, serially, inside the timed step.
+1. [x] Image grace: a just-asked image is waited for up to 100 ms (subscribed before the spawn), so a local
+       image starts on attempt 1 with no Pending write; a real pull still yields the worker.
+2. [x] Events: Normal lifecycle Events on the start path go through one ordered background sender
+       (timestamps taken when recorded); Warnings stay inline.
+3. [x] Tests, docs (README, status.md), CHANGELOG (5f6af4f, 23d33f3). sc-build 5f6af4f `cargo build --locked &&
+       cargo test --locked`: 285 kubelet unit (2 new), 25 CNI, 17 proxy, 1 doc-test pass (1 ignored); exit 0.
+       Not run on a node. PUT outlier filed as rustkube#191. Remaining sandbox/containers time is stormpump work.
+4. [x] Stage golden golden-rustkube-node-31c042c9e59a (1d2d711), release request stormcos#164; #134 closed.
+       Live check after the release: five busybox pods on pvetest1 read `attempts=1`.
+
+### Done: #132 (P1), per-pod start timing (annotation, Event, histograms, one INFO line)
+
+2026-10-02. Owner: "Why 1 second? What's holding us up?" Nothing times the phases (#95 item 1).
+One `StartTiming` per pod UID, kept across Pending retries, published once the apiserver acknowledges Running.
+Phases: `scheduled` (PodScheduled/creation → seen, wall clock), `wait` (seen → the attempt that started it),
+`image` (images asked for → resolved; a pull is the registry clone + attach + mount), `volumes` (+ each volume),
+`sandbox` (incl. CNI), `init`, `containers` (+ each create+start), `report` (status PUT sent → acknowledged), `total`.
+1. [x] `start_timing.rs`; seen noted when the pod list/watch delivers it; start_pod times its steps.
+2. [x] Publish (8009bd4): `storm.io/start-timing` annotation (merge patch), `StartTiming` Event, histogram
+       `kubelet_pod_start_phase_duration_seconds{phase}`, one INFO log line.
+3. [x] Tests, docs (README, metrics.md, status.md), CHANGELOG. sc-build f10e8f3 `cargo build --locked && cargo test --locked`:
+       283 kubelet unit (6 new), 4 integration, 25 CNI, 17 proxy, 1 doc-test pass (1 ignored); exit 0 in 106 s. Not run on a node.
+4. [x] Stage golden golden-rustkube-node-70fe65e86c27 (59f0a05), release request stormcos#164; #132 closed.
+       Live check after the release: a pod on a blade shows the annotation; stormconsole#69 and stormcentral#301 read it.
+
+### Done: #129 (P0), after a reboot every new pod fails: its own dirs "do not exist"
+
+2026-10-02. Found on server3 (11.65, storm-8486f0) from the live kubelet log: not a namespace mismatch. The
+filesystem under `/var/lib/kubelet` and `/var/log/pods` is full after the reboot (ephemeral-storage capacity
+61396Ki, DiskPressure True since 22:52:35, `could not create container log dir …: No space left on device`).
+The kubelet discarded the emptyDir/projected/SA `create_dir_all` errors (so ENOSPC read as "does not exist") and
+the log-dir ENOSPC was a generic start error, so the pod went `Failed` and the DaemonSet burned its backoff.
+1. [x] Per-pod dirs (emptyDir, configMap, secret, projected, SA token, resolv.conf) and the container log dirs
+       created before the sandbox; a failure is a wait (Pending, FailedMount / Failed Event naming the errno),
+       retried, never `Failed`. a72d4a1.
+2. [x] Tests, docs (README, status.md), CHANGELOG. sc-build a72d4a1 `cargo build --locked && cargo test --locked`:
+       277 kubelet unit, 4 integration, 25 CNI, 17 proxy, 1 doc-test pass (1 ignored); exit 0 in 97 s. Not run on a node.
+3. [x] Full filesystem filed as stormcos#231 (P0): server3 runs no new pod until the host has room.
+4. [x] Stage golden golden-rustkube-node-cb302b196e29 (644d4ca), release request stormcos#164; #129 closed.
+       Live check after stormcos#231 and the release: the issue's SNO hard-power-off test on server3.
+
+### Done: #103 (P0), a pulled non-golden image cannot be resolved by create_container
+
+2026-10-02. The pod manager passes `create_container` the reference `pull_image` returned: for a pull that is the
+mount `/run/stormpump/images/<volume>`. `create_container` and `spec_for` resolved it with `local_path`, which maps
+the last path component to `/pallets/<name>`, so every pulled image failed at start "was never pulled" (C2NR0Q2,
+11.56, stormcos_qa test Jobs).
+1. [x] `image_root`: a path one volume below `/run/stormpump/images/` (what a pull returns) is the root as given
+       (not checked from here: PID 1 mounted it in the node's namespace); otherwise `local_path` as before. Used by
+       `create_container` and `spec_for`. 7d28509.
+2. [x] Tests: the live repro's volume resolves to its mount, repeatably; malformed paths refused; goldens by ref and
+       by pallet path. create/start themselves need an engine (not unit-testable here).
+3. [x] Docs (configuration.md, status.md), CHANGELOG. sc-build 4263d80 `cargo build --locked && cargo test --locked`:
+       274 kubelet unit, 4 integration, 25 CNI, 17 proxy, 1 doc-test pass (1 ignored); exit 0 in 94 s. The first run
+       hit an ETXTBSY CNI test race, filed by sc-build as #128 and fixed in 4263d80 (retry, as libcni).
+4. [x] Stage golden golden-rustkube-node-b064bfdcc9fb (4263d80), release request stormcos#164. Live check after the
+       release: `stormcentral test run stormcos_qa short` reaches the pod log.
+
+### Done: #124, `logs` on a stormpump:// mirror pod answers "not found on this node"
+
+2026-10-02. Found: 11.61 (server1, stormcos#217) carries rustkube-node d5c0d2c (v0.12.0, base 11.50), which
+predates #72's stormd-volume path, so every mirror pod answered "not found". On main, #72 serves the stormd
+volume, but a service that dies before stormd writes it (stormcluster, stormrdp on 11.61), `--previous` with no
+`.failed.log`, and a service not run by stormd still had nothing. stormpump (#51, in 11.61's 95dbea4) records
+the dead incarnation's last 20 lines of its `w<id>.log` as `last_output` in assets.json.
+1. [x] `node_logs::Record` from assets.json (`last_output`, `last_exit`, `last_error`); the mirror path resolves
+       the asset when assets.json lists it or a boot unit gives it a stormd volume.
+2. [x] Current: stormd volume; else, asset not running, stormpump's `last_output`. Previous: newest `.failed.log`,
+       else `last_output`. Nothing: 404/400 naming what was looked at (and the exit/refusal), never "not found".
+3. [x] Tests, docs (README, api.md, status.md), CHANGELOG. fc867c1; sc-build `cargo build --locked && cargo test --locked`:
+       272 kubelet unit, 4 integration, 25 CNI, 17 proxy, 1 doc-test pass (1 ignored); exit 0 in 89 s. Not run on a node.
+4. [x] Stage golden golden-rustkube-node-58e64be5aba3 (46ee39f), release request stormcos#164; #124 closed.
+       The live check is the next release on server1 (stormcos#217).
+
+### Done: documentation refresh from code since 2026-09-25 (#54, #120, #121)
+
+2026-10-02, on main at fecb331.
+1. [x] Audit README, docs/, CLAUDE.md against code and `git log --since=2026-09-25`.
+2. [x] status.md: changes since 09-25, decided-not-implemented table (#106–#110), new gap rows
+   (#115, #116, #118, #119, #122, stormimds#12). README, api.md, configuration.md, BUILD.md,
+   csi.md (inotify registry, 1 s retry), node-volumes.md updated. :5100 is sbregistry (#120).
+3. [x] Module comments (#54): cmd/kubelet main.rs, storage.rs (PID 1 mounts, container binds),
+   server.rs `/vmInstance` (stormimds#12 undecided).
+4. [x] CHANGELOG; pushed 13517fb; sc-build `cargo build --locked && cargo test --locked` exit 0 in 91 s
+   (270 kubelet unit pass). Comments on #54/#120/#121; #106–#109 closed with pointers. Docs/comments only: no golden.
+
+### Done: #117, a golden still importing (409 not sealed) waits, not a failed start
+
+2026-09-30, on main. `resolve_disks` treated only a 404 from `POST /volumes/{g}/clone` as Waiting;
+stormblock's `409 … is not sealed` (vmimages still importing) counted as failed starts with backoff.
+1. [x] `golden_wait(e)`: 404 → "waiting for golden {g}", 409 + "not sealed" → "… (importing)"; unit test. c74b589.
+2. [x] README, CHANGELOG. sc-build c74b589 `cargo build --locked && cargo test --locked`: 270 kubelet unit,
+   4 integration, 25 CNI, 17 proxy, 1 doc-test pass (1 ignored); exit 0 in 106 s. Not run on a node.
+3. [x] #117 closed with evidence. Stage golden golden-rustkube-node-e5db6ac32831 (9c2f738), release request stormcos#164.
+
+### Done: #114, turbomode merged into main
+
+2026-09-29: owner instruction in #114 supersedes the earlier no-merge hold.
+Preserve main's #91 address pump, #35 failed-list protection, #53 snapshots
+and #75 VM disk ownership in the UID worker design. Open #100/#101/#102
+work continues on main afterwards; no golden or release is requested here.
+
+1. [x] Read #114, #100, project rules and open issues; checkout is clean.
+2. [x] Merge origin/main into turbomode; preserve address pump, failed-list
+   protection, snapshot maintenance, durable disks, retry policy and credentials.
+3. [x] ec39c2a pushed; full sc-build `cargo build --locked && cargo test --locked`
+   passed: 251 kubelet unit, four integration, 24 CNI, 17 proxy and one doc-test;
+   one doc-test ignored. Remote exit 0 in 107s; drive deleted. Local statistics
+   append was read-only (remote result unaffected).
+4. [x] Main merge 600b58a pushed (--no-ff); full sc-build with the same command
+   passed in 79s, remote exit 0, identical test counts, drive deleted. The local
+   statistics append again reported read-only; no remote build/test failure.
+5. [x] Posted merge/test evidence and remaining #100/#101/#102 work on #114;
+   issue closed. No golden, release or live deployment requested. Continue
+   unfinished work on main; live target remains #110. This final checkpoint
+   changes documentation only after the verified main merge.
+
+
+### Parked on #102: #99, event-driven node and subsecond warm startup
+
+2026-09-29, on main. #99 is the umbrella; #100/#101 are done, rustkube#143,
+#145, #146 and #148 are closed, and rustkube#144/#147/#149 are open there.
+Its acceptance measures real nodes (C2NR0Q2, owner's choice on #110), which
+waits on the master installing the release (stormcos#164) = #102.
+1. [x] Ring: `DEADLINE` from enqueue; abandoned requests keep the arena until
+   they complete; a late success is undone. db9b783.
+2. [x] CNI: plugin exec bounded (60 s), killed and reaped on timeout. db9b783.
+3. [x] EngineClient: 5 s connect, 60 s request, 1 h mint, unbounded watch.
+   A timed-out mint is found again by name (stormblock refuses duplicates).
+4. [x] sc-build db9b783: 269 kubelet unit, 4 integration, 25 CNI, 17 proxy,
+   1 doc-test pass (1 ignored). Acceptance table in docs/event-driven-design.md.
+5. [ ] Real-node measurements = #102; proposed #99 after it (moved behind #102).
+       #102 (2026-10-05): pvetest1 day turbomode run 7277704177: sleep request→running p50 4.05 s, p95 61.1 s,
+       of which scheduling p95 60.86 s (filed rustkube#205); PVC p95 10.85 s. C2NR0Q2 blocked by registry 507
+       (stormcentral#376). Owner (#158): **C**, the day suite on the Dell is the acceptance; full scale scheduled
+       separately at night on a pve VM (reported, not gating). #102 proposed after stormcentral#376.
+       2026-10-07: #376 closed, 11.88 has the 4 GiB registry; the Dell is down (stormcos#337), pve VMs missing.
+       #102 proposed after stormcos#337; then `stormcentral test run stormcos_qa turbomode --tag C2NR0Q2`.
+       2026-10-08: stormcos#337 closed (11.89). Queued turbomode 630379c31b (stormcos_qa b9ec446519df, C2NR0Q2),
+       behind short 7f911d561b (at "wait for the node to settle", media import: stormblock-registry#95 may hold it).
+       vm-waves 845557b202 queued too (#91/#92's check). Read with `stormcentral test show <id>`; compare with the
+       11.50/11.51 baseline (container start 20.8/21.2 s, claim 75.5/67.2 s) and post on #102.
+       630379c31b: error at the test-image build on dev.g8.lo (retired; stormcentral#521), after the node settled.
+       #102 proposed after stormcentral#521; rerun then. #521 closed before the build-VM stormcentral installed (plain
+       sc-build still went to dev at ~13:45Z): #102 and #97 re-proposed after stormcentral#526 (test-image builds),
+       #165 after stormcentral#527 (component stage).
+       2026-10-13: #526 closed, but the owner closed C2NR0Q2's `tests` valve on 10-10 ("tests on pvetest machines
+       only", shelf formats); pvetest1/2 refuse runs (12.16 installs failed). Asked on #102: A wait for the Dell's
+       valve (recommended), B pve VM absolute check, C open the valve for one run. `wait-owner` run.
+   Stage golden golden-rustkube-node-e8bca700a793 (bba7d54), release request stormcos#164.
+
+### Done: #101, events and explicit deadlines instead of sync ticks
+
+2026-09-29, on main. Heartbeat is the only fixed schedule left.
+1. [x] Pod adapter deadlines (probe periods, CrashLoopBackOff, waiting retry,
+   init limit); AwaitEvent otherwise; CRI runtime without exits keeps
+   `sync_interval`, counted (`kubelet_timed_reconciles_total`). 4320c20.
+2. [x] VMI deadlines: start backoff, waiting retry, guest-agent poll. 4320c20.
+3. [x] Service mirror: inotify on /run/stormpump gated on the parsed table
+   (≤1 read/s while PID 1 rewrites every pass: filed stormpump#67) + mirror-pod
+   watch; skip-when-current writes. 08fc437.
+4. [x] stormblock volume watch (`follow_volumes`, 30 s counted poll without it)
+   → system claims + disk-owner sweep; PV/PVC and VM/VMI watches. 82f00c3.
+5. [x] Reclaim on PV watch (5 s pending retry); CSI sweep on node Pod watch
+   (10 s pending retry); snapshot take completions notify. 82f00c3.
+6. [x] Tests, docs, CHANGELOG. sc-build fbb9676 `cargo build --locked && cargo
+   test --locked`: 266 kubelet unit, 4 integration, 24 CNI, 17 proxy, 1 doc-test
+   pass (1 ignored). Not measured on a node (#102). Follow-up: #115 (route an
+   exit to its own UID instead of waking every workload).
+7. [x] Stage golden golden-rustkube-node-2f39a07e3c07 (4b648f4), release request stormcos#164.
+
+### Done: #100 on main, VM partial-start unwind (stormpump#63 closed)
+
+2026-09-29: master moved #100 to main after the #114 merge; stormpump#63's
+`DEPOSIT_WITHDRAW` (op 9) is on stormpump main. The lock's stormpump (30a76d3)
+predates the enum variant and cannot move until stormvm#65, so the op is sent by
+number (`stormpump_ring::OP_DEPOSIT_WITHDRAW`).
+1. [x] `RingClient::deposit_withdraw` (op 9) and `spec_release`.
+2. [x] VmManager ledger by uid (deposit noted before sending, handles as
+   registered, cleared inside the spawn closure on success). Unwound in
+   `launch`'s window after a failure, before the next start (Waiting while a
+   deposit is held) and before a deletion is acknowledged. Found: stormvm names
+   deposits `tap-<nic>` per client, so concurrent starts could swap taps; one
+   kubelet-wide deposit window now covers deposit→spawn and every withdraw.
+3. [x] Tests (injected undo), docs, CHANGELOG. sc-build 6c49fbc: 255 kubelet unit pass.
+4. [x] CNI: DEL after a failed ADD before the sandbox is released, retained and
+   retried if DEL fails. Reclaim handler runs the release in its own task.
+   sc-build 077ad5c `cargo build --locked && cargo test --locked`: 257 kubelet
+   unit, 4 integration, 24 CNI, 17 proxy, 1 doc-test pass (1 ignored). Not run
+   on a node (live validation is #102/#110).
+5. [x] Issue closed. Stage golden golden-rustkube-node-2fb5a1e7ab0d (ac738df),
+   release request stormcos#164.
+
+### Done (history): #100, common bounded per-UID Pod/VMI workers
+
+Earlier checkpoint: #100 continued at turbomode 9b46886 (211 tests passed).
+#114 now authorizes merging; unfinished cancellation work continues on main.
+
+1. [x] Wire Pod/VMI adapters to one eight-worker executor with name/claim
+   reservations; seed adopted workloads before admission. Static manifests have
+   an independent desired source, so unavailable API reads do not remove them.
+2. [x] Stage image pulls (four-slot shared pull pool), init waits and VM shutdown
+   grace periods. Retain partial Pod starts, refused runtime releases and CSI
+   teardown records. Serialize CSI mutations by driver/handle. Reject unknown
+   runtime recovery and VM exit as proof that cleanup is safe.
+3. [x] Add inverse claim/image/driver indexes and PV/attachment-to-claim routing;
+   UID guards on Pod deletion, VM status/finalizers, migration writes and PV deletion.
+4. [x] Push incremental checkpoints and run sc-build. af1704b passed 223 unit +
+   four integration tests. e504f58 full workspace build passed; test compilation
+   found a missing json macro import. Fixed in 55d458c: full sc-build
+   `cargo build --locked && cargo test --locked` passed (224 kubelet unit,
+   four integration, 24 CNI, 17 proxy; one doc-test passed, one ignored).
+5. [ ] Finish cancellation at every side-effect boundary. External blocker:
+   stormpump#63 has no acknowledged withdrawal for deposited VM tap FDs before
+   spawn. Partial NIC/plan/registration failures can keep a tap alive in the
+   shared engine connection and block same-name recreation. #100 moved behind
+   that issue with stormcentral propose; do not close or release it yet.
+   Resume: wire deposit withdrawal and retain VM partial-start ownership (disk,
+   volume/spec handles, registration, NIC deposits) until each cleanup succeeds;
+   add real adapter cancellation/failure-injection coverage. Audit CNI partial
+   sandbox failures and cancellation of the claim-reclaim HTTP handler too.
+   Existing tests cover shared admission, slow-image/fast-start, staged init
+   resume/delete, failed teardown, same-name replacement and dirty work during
+   an active operation; they do not establish every-boundary cancellation yet.
+6. [x] Main's #91/#35/#53/#75 behavior is integrated under #114. Live target
+   remains the owner's decision under #102/#110. Version stays 0.13.0: this
+   merges unfinished work, without cutting a feature release or golden.
+
+
+### Done: documentation refresh from code (#54), 2026-09-29
+
+Scope: current main at 5bb1a38 and `git log --since=2026-09-18`.
+Work on docs/code-refresh-20260929; preserve turbomode separately, with no merge
+or golden from that experimental branch.
+
+1. [x] Audit README, docs and current configuration/API/runtime code; distinguish
+   implementation from plans and live acceptance.
+2. [x] Correct shipping instructions, add complete CLI/default/port references,
+   and link every unsupported promise to its owning issue (file missing ones).
+3. [x] Update CHANGELOG; review for secrets; commit and push the documentation.
+   New P2 follow-ups: #111 restartable init sidecars, #112 backoff persistence,
+   #113 explicit default-valued apiserver precedence. Existing gaps are linked
+   in docs/status.md; #3 now records the no-cni help/behavior mismatch.
+4. [x] ad43ee9 passed remote sc-build `cargo build --locked && cargo test --locked`:
+   227 kubelet unit tests, four integration tests and the CNI/proxy suites passed;
+   one doc-test ignored. Remote exit 0 in 74 seconds; scratch drive deleted.
+   The local runs.jsonl append failed (read-only filesystem); remote verification
+   completed. All 26 CLI flags, 11 routes and local doc links were checked.
+5. [x] Documentation only: no version bump or runtime change. Fast-forwarded
+   onto main at 9c1fe94; turbomode preserved. Requested the standard stage once.
+6. [ ] Artifact follow-up only: stage 131edf1ad026 failed before compilation
+   fetching private stormcos be718e09b5f2 (GitHub username unavailable).
+   Added evidence to stormcentral#161 and proposed #54 after it (proposal
+   663d4471d6a0 awaits approval). No golden or
+   release request was produced. Documentation itself is published and verified;
+   resume the stage request after the platform authentication fix.
+
+
+
+### Done: #35, VMs reconciled against VMIs: deletion stops them, orphans found
+
+Found, 2026-09-27 (test2's QEMU outlived its VMI on C2NR0Q2): a VM outlives a kubelet restart (the engine
+supervises it; the token reclaims ownership), but its handle lived only in `vms`, in memory. A restarted
+kubelet knew nothing of it, so deleting its VMI stopped nothing. Also: a failed VMI list read as "no VMIs" and
+stopped every VM (and deleted its root); a terminating VMI (deletionTimestamp) was still desired.
+test1 not restarted is the VM controller's: rustkube#104.
+
+Steps:
+1. [x] A failed list is not an empty one: `list_for_node` → Option, the watch's LIST checks status; no sync on failure.
+2. [x] The registration (`/run/stormvm/<ns>/<name>/vm.json`) is the record: after the spawn it is rewritten with
+       `running_as(handle)` and the disks (volume ids, owned).
+3. [x] `reconcile_registered` each sync: running+wanted → adopt; running+unwanted → stop; gone+wanted → Failed
+       record (not restarted behind the VM controller); gone+unwanted → leftovers released. Handle-less:
+       liveness is a connect to the control socket; stop is ACPI, 30 s, then QMP `quit` / chv `vmm.shutdown`.
+4. [x] A terminating VMI is not desired. Finalizer `storm.io/vm` ensured each sync while running (rv-guarded),
+       removed once stopped.
+5. [x] Tests, docs (README), CHANGELOG. sc-build at 2331af9: all pass (kubelet 189). Not run on a node.
+6. [x] Released v0.13.0 (e8211b6). Release sc-build at cf6aee2 (`--release --locked --target
+       x86_64-unknown-linux-musl`, then `cargo test --locked`): passed (kubelet 189). Stage golden
+       golden-rustkube-node-d9a108728be0 (at ccb7bfc; the first stage try died on dev: no NVMe device). No
+       release request was filed by stage: stormcentral#117. #35 closed (sc-build only, not on a node).
+
+### Done: #75, a VM's disks outlive its VMI: restart does not re-clone
+
+Found, 2026-09-29: `stop` → `destroy_owned` deleted every golden clone, seed and emptyDisk, and the golden clone was
+unconditional, so each VirtualMachine restart (a new VMI) re-cloned root. stormblock#115 (closed) gives a volume an
+`owner {kind, namespace, name, uid}`, set on create/clone or `PUT /volumes/{id}/owner`, returned by the listing.
+The VMI's ownerReferences carry its VirtualMachine's uid (rustkube virtualmachine.rs).
+
+Steps:
+1. [x] Find before create: a golden disk or emptyDisk named `volume_name(vm, disk)` is reused, cloned/created only
+       when missing (a failed listing is a failed start, never "make a new one"). Owner on each: the VMI's
+       VirtualMachine (kind, ns, name, uid), else the VMI itself. A found disk owned by an earlier object of the
+       same name (other uid) waits for the sweep. Seed: namespaced name, the old one replaced each start.
+2. [x] Stop detaches only. `destroy_owned` gone.
+3. [x] Orphan sweep (≤ once a minute): engine volumes owned by a VirtualMachine/VMI, not in use and not held by a
+       machine here, whose owner is 404 / another uid / being deleted → deleted. Any other answer keeps them.
+4. [x] `storm.io/retain-disks: "true"` (VMI or VM annotation): disks get no owner, never swept. Owners set on the
+       disks of adopted machines too.
+5. [x] Tests, docs (README), CHANGELOG. sc-build at 9149ea1: all pass (kubelet 227). Not run on a node
+       (C2NR0Q2). Unreleased. Closed.
+
+### Historical checkpoint: #100 before #114 superseded the merge hold
+
+At this checkpoint work was on `turbomode`; #114 supersedes that hold. Read rustkube's `docs/turbomode-handoff.md` (turbomode branch).
+2026-09-29: handoff step 2 done, `sc-build 'cargo test --locked -p kubelet'` at turbomode 9b46886: 211 pass.
+Merging origin/main conflicts in `kubelet.rs` (turbomode's `pod_loop`/`vm_loop` vs main's #91 address pump,
+#35 `watch_for_node`/`list_for_node`, #53 `snapshots.sync()`): aborted, owner asked on #100 (resolve, or leave).
+
+### Done from this side: #53 snapshot + restore (option A, #109), VirtualMachineSnapshot / VirtualMachineRestore
+
+2026-09-30: owner chose A (a restore rewrites the VirtualMachine's disks to the restored PVCs).
+The text below predates the answer.
+
+2026-09-29 recheck: read #53 and #109, including comments. Snapshot support is
+already on main; #109 remains unanswered and labeled needs-owner. Stop restore
+implementation until the owner chooses disk references and node placement.
+Propose #53 after #109; then resume step 3 below, update docs/tests, push and
+verify with sc-build before completion. This recheck changes documentation only;
+no new build, live validation, release or issue closure is claimed.
+
+stormvm (in the dc1b7ea lock): `stormvm_spec::snapshot::{snapshot_request, restore_request, snapshot_status,
+restore_status}`, `stormvm_console::snapshot::take(reg, stormblock, name, Options)` (freeze → pause → one /v1
+group snapshot, named `<ns>.<vm>.<snap>`, idempotent by name → unpause → thaw). stormblock#130 is closed.
+The CRDs are stormcos#170 (open): until they are installed the LIST 404s and the kubelet does nothing.
+Found: stormblock on stormcos is single-node (no cluster), so a group snapshot and any volume restored from it
+live only in the engine of the node that took it. The VMI shape has no raw-volume disk (only dataVolume,
+containerDisk → golden, PVC, cloudInit, emptyDisk), so "rewire the disks" needs a decision: owner.
+
+Steps:
+1. [x] `vm_snapshot.rs`, each tick after the VMIs: list snapshots (404 → CRD absent, nothing). One whose source
+       is registered here (`/run/stormvm/<ns>/<vm>`) and has no phase: claim it (annotation
+       `storm.io/snapshot-node`, rv-guarded), InProgress, `take` in the background, then Succeeded/Failed +
+       group id, sourceUID, indications, Event. failureDeadline (default 5 min) from creationTimestamp. An
+       InProgress one of ours not in flight (kubelet restart) is taken again: idempotent by name.
+2. [x] Tests (fake apiserver, injected take), docs (README), CHANGELOG. sc-build at 2b88465: all pass (kubelet 221).
+       Not run on a node (CRDs: stormcos#170; needs a running VM). Unreleased.
+3. [x] Restore: owner chose **A** (#109): the restore rewrites the VirtualMachine's disks to restored PVCs; the
+       whole disk set together; seed regenerated only when the VM has cloud-init (it is, each start, #75);
+       placement follows the PVs' nodeAffinity.
+4. [x] (2026-10-05) The claim records `storm.io/snapshot-disks` (disk → volume id, `disk_map(reg)`).
+5. [x] `vm_restore.rs`: by the snapshot's node; waits (snapshot Succeeded, VM stopped); per non-cloud-init disk
+       `from_snapshot` + bound Block PVC/PV (Delete, this node); VM template volume → PVC; status + Events;
+       errors said once. `RestoreEngine` seam (`Stormblock` = stormvm_block::Client). 5c4edf2 (+ fix for #153).
+6. [x] Tests (5 new), docs (README "Restores", api.md, status.md), CHANGELOG. sc-build `cargo build --locked
+       && cargo test --locked`: 331 kubelet unit pass. Not run on a node: the CRDs are stormcos#170.
+
+### Done: #83, the console router is told where stormblock is (the snapshot verb)
+
+stormvm's `Config.stormblock` was left `None` in both mounts of `stormvm_console::router`, so its `snapshot`
+verb answered 409 on every node. stormvm_block::Client reads the engine token itself (`Token::from_env`, same
+order as engine.rs). The verbs are not routed onto :10250 yet: that is #94 (snapshot may now go with them).
+
+Steps:
+1. [x] `server.rs`: one `console(run_dir, stormblock)` builder; `ServerConfig.stormblock_url` from the kubelet's
+       engine URL (`--stormblock`); `router()` (tests) uses `engine::DEFAULT_URL`. Test: snapshot gets past the
+       409 to the hypervisor.
+2. [x] Docs (README), CHANGELOG. sc-build at 09cc138: all pass (kubelet 211). Closed. Not run on a node. Unreleased.
+
+### Done: #76, a failed VM start is retried with backoff, not recorded Failed for good
+
+Owner: "Nothing should be perm." rustkube#104 (v0.16.0) makes the VM controller recreate a *Failed* VMI under
+Always / RerunOnFailure / running:true and leave it under Once / Manual.
+
+Found, 2026-09-28: every start clones a new root from its golden and makes a new seed, and a failed start
+only detaches (`release`), so each retry would leak two volumes.
+
+Steps:
+1. [x] A failed start deletes the volumes it created in that attempt (golden clones, seeds; never a reused
+       emptyDisk), in `resolve_disks` and after it.
+2. [x] `StartFail::Failed`: retry with backoff 10 s doubling to 5 min, keyed on uid + generation (a spec change
+       retries at once). Pending with the reason + attempt + next try, Warning Event each attempt.
+       Failed for good only when the owning VM's runStrategy is Once or Manual. Standalone VMI: retried.
+3. [x] Tests, docs (README), CHANGELOG. sc-build at 20036bf: all pass (kubelet 210). Not run on a node. Unreleased.
+
+### Waiting on stormcos_qa#52 (its agent-keys step, behind stormcos#271): #92, a VMI's accessCredentials (keys into the seed and through the agent)
+
+stormvm e5b4d16 (in the dc1b7ea lock): `VmSpec.access_credentials`, `access::keys_in_secret`, `Seed.public_keys`,
+`qga::set_authorized_keys` (reset: true), `access::condition`.
+
+Steps:
+1. [x] Start: `noCloud` Secrets read before the disks, keys into the seed's meta-data `public-keys`. A missing
+       Secret, an empty one, or no cloudInitNoCloud volume: start anyway, reason in the condition.
+2. [x] Each sync, from the VMI as it is now: agent credentials applied once the agent answers, re-sent only
+       when the Secret's keys differ from what the agent last accepted. A missing/empty Secret leaves the
+       guest's keys alone (no lock-out). `Vm.access` holds it.
+3. [x] `AccessCredentialsSynchronized` merged into the VMI's existing conditions; transition time held while
+       the status holds.
+4. [x] Tests, docs (README), CHANGELOG. sc-build at 1f5409a: build clean, all pass (kubelet 207).
+5. [ ] The issue's done-when on the test host: console-created VM, ssh in with the key; "Add my keys" live.
+       2026-10-05: half 1 is stormcos_qa `vm-waves` (noCloud key, ssh); half 2 filed as stormcos_qa#52. Runs on
+       C2NR0Q2 get 507 on the image push (stormcentral#376); #92 proposed after it. Then run vm-waves, close.
+       2026-10-07: #376 closed; vm-waves 18d8dc0653 died on the Dell's apiserver (stormcos#337). #92 proposed after
+       stormcos#337; half 2 still needs stormcos_qa#52.
+       2026-10-08: stormcos#337 closed; vm-waves still can't run (test images: stormcentral#521; fresh-node media
+       import: stormblock-registry#95). Tests pass on a build VM (fb94c9a). #92 proposed after stormblock-registry#95.
+       2026-10-28: half 1 verified live: vm-waves 572366a0a2 (pvetest2, 12.21, `--seed-key` off) logged in with the
+       `noCloud` key on 6 VMs and every restart. Half 2 = stormcos_qa d85d0d3's `agent-keys` step (after that run's
+       e22a837), never run: every test run dies at the node's fetch (stormcos#271), and vm-waves is stormcos_qa's to queue.
+       #92 proposed after stormcos_qa#52. Resume: read the first vm-waves run with `agent-keys` lines, close or fix.
+
+### Done: #55, a presentation of rustkube-node (`docs/presentation.md`, Marp)
+
+2026-10-05. 8–15 slides from current code/docs: purpose; place in stormcos (stormcentral: depends on rustkube,
+stormpump, stormvm; depended on by stormcos, flowsdn); moving parts (diagram); features today (Pods, storage,
+VMs, node services); interfaces; shipping; planned (own slide); status and open issues. Check claims by grep;
+render with marp-cli via sc-build if dev can.
+Done: docs/presentation.md, 12 slides, ASCII diagrams (Marp shows Mermaid as source). sc-build `npx
+@marp-team/marp-cli docs/presentation.md -o …html`: renders, 12 sections. PDF needs a browser dev lacks (#154).
+
+### Done: #122, host-network metadata by ServiceAccount token; pod-bound tokens
+
+2026-10-05. rustkube#182 (in golden-rustkube-152acbd2a1f0): TokenRequest honours `expirationSeconds` and
+`boundObjectRef` (Pod name + uid); TokenReview returns `authentication.kubernetes.io/pod-name`/`pod-uid`/
+`node-name` in `status.user.extra`. The kubelet's `Authorization` header on :10250 is the caller's own credential
+(auth_mw), so the workload's token comes in `X-Storm-Workload-Token`.
+1. [x] Tokens (d25f05c): kube-api-access asks `expirationSeconds: 3607` + `boundObjectRef` (the Pod); a projected
+       `serviceAccountToken` passes its own `expirationSeconds` (default 3600) + the Pod. Each file recorded;
+       a refresher rewrites it (tmp + rename) at 80% of its life (`status.expirationTimestamp`); dropped with the pod.
+2. [x] (0cdc142) `/vmInstance/{address}` from a node address with `X-Storm-Workload-Token`: TokenReview; the pod in
+       `status.user.extra` must be on this node (node-name), and its object (GET) must match uid, nodeName,
+       not terminating, not terminal; the answer is that pod's metadata (`storm.io/kind: Pod`). Anything else:
+       today's refusal (404).
+3. [x] Tests (5 new), docs (c79e92c), CHANGELOG. sc-build `cargo build --locked && cargo test --locked`: 336
+       kubelet unit pass. Golden, stormimds#12 note, close.
+
+### Waiting on stormstorage#44: #40, live migration of stormvm-started VMIs
+
+2026-10-05. Both halves exist: stormvm dc1b7ea `plan::build_receiving`, `Machine::{migrate, receive_migration,
+migration}`; rustkube#184 drives VMI `status.migrationState` (controller: migrationUid/sourceNode; scheduler:
+targetNode; target kubelet: receiving start + `targetNodeAddress`; source kubelet: send + completed/failed).
+CRD stormcos#288 (open). **Blocker: the disks.** Migration moves memory only; every VM disk is a volume in the
+source node's stormblock, the target cannot attach it (#142, no NVMe/TCP connect) and stormvm copies no disks.
+A target started normally would clone a fresh root: guest RAM and disk would disagree. Asked on #40: A shared over
+NVMe/TCP (#142; recommended), B copy during migration (blockdev-mirror), C replicas only (#68). No code yet.
+**Owner (#159, 2026-10-05): add a RAID leg on the destination, let it catch up, then move memory.** Needs a storage
+primitive for in-use local volumes (migrate → synced → cut over / abort): filed stormstorage#44; #40 proposed after
+it. Kubelet side then: target waits all disks synced → receiving start on its copies → targetNodeAddress; source
+sends → completed/failed; cut over or abort each disk.
+
+### Done: #91, a bridged VM's IP from its tap (stormvm_net::snoop_tap)
+
+2026-10-28: closed on the live check. stormcos_qa vm-waves 572366a0a2 (pvetest2, 12.21-flowsdn, 2026-10-14): every
+bridged VM (`storm.io/bridge`, Fedora 44) reached Running with its g16 lease in `status.interfaces[].ipAddress`, and ssh
+took the run's key, in 12.3–13.4 s (wave-1 ×2, wave-2 ×3, every restart too). The run's 3 failures are the failed-start
+case: filed #298 (an SR-IOV NIC on a missing NAD reaches Running).
+
+stormvm 2be5900 (lock moves 1b0d941 → dc1b7ea, `cargo update -p stormvm-net` on dev with
+`CARGO_NET_GIT_FETCH_WITH_CLI=true`; the lock diff applied here). `snoop_tap(tap, mac, changed)` → `Snooper`
+(`addresses()`, drop joins its thread, ≤1 s RCVTIMEO). `Made.binding == "host-bridge"` marks a tap on a node bridge.
+
+Steps:
+1. [x] Lock bump; `resolve_nics` takes the uid and starts a snooper per host-bridge NIC before the spawn (a failure
+       to open it is a warning, not a failed start); `start` keeps them, into `snoopers[uid]` once running.
+2. [x] Callback → unbounded channel → pump task (spawned in `run`): that NIC's addresses + `patch_status` at once.
+3. [x] `absorb_ends`: snooper per NIC first, then guest agent, then neighbour table. Snoopers dropped (in
+       spawn_blocking) when the VM stops or ends.
+4. [x] Tests, docs (README), CHANGELOG. sc-build at 3ad9ea8: build clean, all pass (kubelet 205).
+       The bump had also moved stormpump (30a76d3 → e8ccef9) and stormcast; pinned back with `--precise`, because
+       stormvm-node doesn't build against stormpump's `Mount.propagation` (filed stormvm#65, which also blocks #81).
+5. [ ] On the test host (the issue's done-when): a new bridged VM shows its lease in `status.interfaces[].ipAddress`
+       within seconds. 2026-10-05: C2NR0Q2 is up on 11.80 (carries 3ad9ea8). stormcos_qa's `vm-waves` suite is
+       exactly this (bridged `storm.io/bridge: stormbr0` Fedora VMs, "Running with an address in
+       status.interfaces[]"); running it there. Found on the way: stormcentral builds the Job itself (no
+       `test/rustkube-node-test.yaml`, no `RUSTKUBE_NODE_TEST_IMAGE` = #97), grants cluster reads only through
+       `test/requires.toml` (none here), and `STORM_NODE` is an address: the #59/#62 medium cases need fixing.
+       Run a844d807fe: C2NR0Q2's sbregistry answers 507 on the push (stormcentral#376, commented). #91 proposed
+       after stormcentral#376; rerun `stormcentral test run stormcos_qa vm-waves --tag C2NR0Q2` then.
+       Test container fixed for the real runner (fb7fc66, 8d65920: own image #97, node name, requires.toml,
+       node-volumes restore → skip); sc-build `cd test && cargo test --locked && cargo build --release
+       --locked`: 19 pass. #97 also proposed after stormcentral#376 for its live run.
+       2026-10-07: stormcentral#376 closed; vm-waves 18d8dc0653 died on the Dell's apiserver (stormcos#337, down since
+       20:55Z, reinstall queued). #91 proposed after stormcos#337.
+       2026-10-08: stormcos#337 closed (C2NR0Q2 on 11.89). Still no live run: test images are built on the retired
+       dev.g8.lo (stormcentral#521) and a fresh node's media import fails (stormblock-registry#95, P0), which the
+       Fedora VMs need. Unit tests pass on a build VM (fb94c9a). #91 proposed after stormblock-registry#95.
+       2026-10-06: 11.88 on C2NR0Q2 has the 4 GiB registry (stormcos#122, no more 507). Queued: vm-waves
+       18d8dc0653 (#91, #92 half 1), rustkube-node medium fff1f4d9d9 (#64, #59, #62, #67) and short c7e24520ec,
+       at 65e3c3c. Read with `stormcentral test show <id>`; close what passes.
+
+### Done: #87, static (mirror) pods: logs and stale status
+
+Logs: stormd services answered by #72. registry/stormblock/timesync wait on stormpump#55 (assets.json names no log).
+Stale status, found 2026-09-28: stormpump lists every asset it tried to start (refused ones too, with
+last_error), but one not started on this boot is not in the table, and the mirror writes only pods for listed
+assets, so its pod keeps the last boot's Running and startTime (registry, stormstorage on C2NR0Q2 at 17:32).
+
+Steps:
+1. [x] Each pass: list this node's mirror pods (`storm.io/component=node-service`, spec.nodeName); one whose asset
+       is not in the table gets status "not started on this boot" (phase Pending, waiting NotStarted, not
+       Ready), written once (skipped when already so), with a Warning Event. Never deleted.
+2. [x] Tests, docs (README), CHANGELOG. sc-build at 7f4f3d1: all pass (kubelet 203). Not run on a node.
+3. [x] registry/stormblock/timesync logs: after stormpump#55 names each asset's `w<id>.log`, serve it (and the
+       previous incarnation's for `--previous`) from `/hostrun/stormpump/logs`. Then close #87.
+       2026-10-08: landed as stormpump#90 (17407fc, #55 left open): assets.json `runs` (last 5, oldest first, the
+       running one last), each with `log` (`w<id>.log`) and `log_rotated`, or `stdout`/`stderr`. Doing: `Record.runs`;
+       current = the running run's files (rotated first), `-f` follows the live one; `--previous` = stormd's
+       `.failed.log`, else the newest ended run's files, else `last_output`. Tests, README/api.md, CHANGELOG.
+       Done: 99c34e2 (2 tests). NOT yet built: the SC_BUILD_VM job was cancelled while queued. Rerun, close.
+
+### Done: #72, `kubectl logs` on a node service's mirror pod reads its stormd log volume
+
+Found, 2026-09-28: a mirror pod (`kube-system/<asset>-<node>`) is not in the pod manager, so `containerLogs`
+answers "not found on this node" (#87 is the same miss). stormd writes `<proc>.log` (current),
+`<proc>.N.log` (rotations, 1 newest) and `<proc>.<YYYYMMDDTHHMMSS>.{failed,exited}.log` into its
+`/var/log/stormd`, which boot.d mounts from a host path (`volume felogs /logs/fastetcd` +
+`mount felogs /var/log/stormd`). The kubelet sees the host at `/hostroot`. Lines are
+`<rfc3339> <stream> <severity> <msg>`. Assets not run by stormd (stormblock, registry, timesync) write only to
+stormpump's `/run/stormpump/logs/w<id>.log`, and assets.json does not name the id: stormpump issue, not here.
+
+Steps:
+1. [x] `node_logs.rs`: boot.d parse (spec → host path of its /var/log/stormd), current run (rotations + live, every
+       process, merged by time, `[proc]` prefix when more than one), `--previous` = newest `.failed.log`.
+2. [x] `containerLogs`: a pod this node does not run, in kube-system, named `<asset>-<node>`, container `<asset>` →
+       node logs. tailLines, sinceSeconds/sinceTime, timestamps, limitBytes, follow (polls the live files).
+3. [x] Tests, docs (README), CHANGELOG. sc-build at ec32b92: all pass (kubelet 202). Filed stormpump#55 (log id in
+       assets.json) for stormblock/registry/timesync; #87 keeps those and the stale-status half. Not run on a node:
+       whether `/hostroot/logs/<svc>` shows the mounted volume is unchecked (C2NR0Q2 down). Unreleased.
+
+### Done: #64, PVC size test (the medium suite's first test)
+
+2026-11-06. stormcos#271 closed, but no run reaches a test: the fetched image's tag answers 404 on the node (stormblock-registry#150; #61's 023f853fba, stormcos-cilium 8036d8a602 on pvetest1, 12.61). No medium queued while it stands. #64 proposed after it. Resume as below.
+2026-11-06 (later). #150 closed (v0.55.1, 9912c98). Registry image golden-registry-e7abc9eefceb (f2f13ad) has the fix; no release carries it yet (newest 12.61). No run queued. #64 proposed `--after-release registry>=9912c98`. Resume as below.
+2026-11-06 (17:40Z): 12.62 carried it but was tombstoned (stormcos#814, see #52). #64 proposed after stormcos#812. Resume as below once #812 closes.
+2026-11-06 (22:10Z): medium on pvetest2 (5d70bf4679, 12.63-flowsdn): classes 1Mi-16Gi and sizes 1, 1Mi+1, 17Mi, 1500M, 3.5Gi pass (df in range, claim capacity, reclaim); 2Pi refused by the kubelet; overcommit refused by the scheduler. 64Gi, 256Gi, 600Gi, 1Ti only refused (16Gi maximum), so no 1Ti mint yet. C2NR0Q2 run 167642695f skipped by #791; `--force-hardware` refused by this session's permissions. Waiting on the owner (question on #64: A force it, recommended; B wait for stormpump#222 + a pve machine; C close). Resume from the answer: medium on C2NR0Q2, close on the size cases or file each failure.
+2026-11-07 (00:58Z): owner chose the Dell. Medium e129544315 (a1ea812, C2NR0Q2, 12.64): 34 pass, 0 fail, 1 skip. Real claims 1Mi to 1Ti, 600Gi, odd sizes, block /dev/xvda; 4Ti+ refused on capacity (1Ti maximum), 2Pi refused by the kubelet. 1Ti case 15.9 s against the 20 min budget; no log says whether that run minted the blank. Closed.
+
+2026-10-21. stormblock#331 closed. Every test run since stormcentral#697 that finds its image on forge dies at the node's
+fetch (`forge.g16.lo:5100 is not a peer of this registry`, stormcos#271); pvetest1/2 are refused ("sbregistry failing"),
+the Dell needs a pve pass (#791). Suite ready at main (ladder to 1Pi with #149, 20ti case, 3 at a time, #209 refusals,
+overcommit). Resume: `stormcentral test run rustkube-node medium --tag pvetest1` once a release carries the peer; close
+on the size cases, file what fails.
+
+(earlier) 
+2026-10-08: medium ran at c8256ac on server3 (63a3c5201b, 19:08–19:43Z): image built and pushed, the Job ran, and 90 s
+into the size cases the node's apiserver stopped answering (delete of sz-class-1mi, then cleanup, timed out): the
+second time after the Dell's fff1f4d9d9. The Dell's 4d4721131e: the Job never got a pod. All twenty size cases ran at
+once (every class blank a format, up to 16Ti and 1Pi). Doing: `SIZE_CASES_AT_ONCE = 3`, largest first (the test is
+not a stress test); file stormcos (the control plane starved by storage load) with the two runs; rerun medium.
+2acfe02 done (28 pass); stormcos#400 filed. Rerun bfec2f964b (pvetest1): node never settled (flow-over, stormblock#331).
+Blades off 19:00–06:00 Chicago. #64 proposed after stormblock#331; else run on server3 in the morning.
+
+Started 2026-09-27. No `test/` existed (that is #61), so this adds the container, modelled on
+stormblock-csi's `test/` (own workspace, static musl binary, scratch image, the image doubles as
+the workload pods' program). Short and long report one skip pointing at #61.
+
+Steps:
+1. [x] Kubelet: `parse_quantity` reads fractions (`3.5Gi` parsed as nothing, and the claim got 1 MiB).
+2. [x] `test/`: Cargo.toml (lock seeded from stormblock-csi/test, same deps), env, api, report, workload
+       (`sized <path> <seed> <bytes> <lo> <hi>`: write, read back, statvfs total in (lo, hi]).
+3. [x] medium `pvc-size-*`: every ladder class + 1, 1Mi+1, 17Mi, 1500M, 3.5Gi, 600Gi, in parallel; each bound,
+       status capacity = its class, df in (previous class, class], deleted, PV gone. 2Ti: FailedMount /
+       waiting reason "larger than the largest size class", never bound. 1Ti timed against a budget
+       (`RUSTKUBE_NODE_TEST_MINT_BUDGET`, default 20 min). Overcommit: skip until #62 decides.
+4. [x] Containerfile (repo root context), Job yaml, docs, CHANGELOG. Also found and fixed: a request-sized PV
+       (control plane first) never got the class's capacity (30ce985). sc-build: root at 30ce985 all pass
+       (kubelet 195); `cd test` at f63d8c2: 15 tests pass `--locked`, release binary runs (sized, short skip).
+5. [ ] On a machine: run 831e049d94 (medium, e2ae178, C2NR0Q2) sat at "podman build" > 60 min while every
+       other run there failed at push / sbregistry :5100 refused. Rerun when the test pipeline is healthy; the
+       machine's kubelet predates c5187a6/30ce985, so 3.5gi and capacity cases should fail until a release.
+       2026-09-28: 831e049d94 still at "podman build" (>1 day, no timeout; the queue behind it waits). :5100
+       answers again (stormcentral#71). Doing: `test/build.sh` builds the static binary on dev, the
+       Containerfile is `FROM scratch` + COPY (no rust:1-alpine pull, no compile in podman), as cadvisor's;
+       file the hung run on stormcentral; rerun.
+       Done: 38dba5a (build.sh verified on dev: static-pie, `/test short` exits 2 with no runner env). Hung run
+       filed as stormcentral#139. Rerun 20d0bf509c (38dba5a) sat at "power" 15:56–16:51 UTC; C2NR0Q2 then
+       unreachable (no ping, no route). **Waiting on the test machine**; rerun
+       `stormcentral test run rustkube-node medium --commit <head>` when it answers. Overcommit case still
+       waits on #62 (owner decision).
+
+### Done: #63, a pod waiting on its claim stays visible (ContainerCreating + reason)
+
+Found, 2026-09-27: two causes. (1) A pod whose volumes are not ready gets a Pending status and is never
+recorded, so `pod_uid` misses it: `logs` says "not found on this node", no container statuses. (2) The
+engine client has no timeout and `mint_template` is one synchronous POST, so a 1 TiB blank's format holds
+the whole sync loop (stormblock#141 keeps formatting after a client leaves).
+
+Steps:
+1. [x] Mint in the background (one in flight per blank); a template not `ready` is a wait naming its state
+       ("template pvc-ext4j-1048576m awaiting_format"), not a clone attempt.
+2. [x] Waiting pods recorded (uid, reason, since): statuses report every container `waiting: ContainerCreating`
+       with the reason; `logs` answers 400 "waiting to start: ContainerCreating" instead of 404.
+3. [x] FailedMount Event on the pod; past 5 min the message says "timed out after Nm waiting for …" and the
+       pod keeps retrying, Pending (upstream's behaviour: a mount timeout does not fail the pod).
+4. [x] Tests, docs (README), CHANGELOG. sc-build at c78baf0: all pass (kubelet 193). Closed; noted on #70
+       (wait-for-ready done here, Event on the claim still open). Not run on a node. Unreleased.
+
+### Decided, not started: #62, CSIStorageCapacity for the built-in class
+
+Recorded 2026-10-02: the owner answered on #108 ("take the recommendation"): the class size counts
+at bind, overcommit ratio 1.0, clones sized to the class. Resume from the findings below.
+2026-09-28: stopped before code. What a node publishes, and when the kubelet refuses a claim, both depend on
+how a claim counts against the slab, and the issue leaves that open. Questions posted on #62; resume from the answer.
+
+Found, 2026-09-27:
+- Engine: `GET /api/v1/slabs` items have `role` (system|data), `total_bytes`, `free_bytes`. Claims live in
+  the data half (blanks minted `role: data`). `/api/v1/volumes`: `virtual_size_bytes`, `allocated_bytes`.
+  No overcommit guard in stormblock (clone never checks space; writes get NoSpace). Pool pressure gauges
+  only, pool-wide, only with growth enabled; no Event.
+- rustkube scheduler (`pkg/scheduler/src/volumebinding.rs` `capacity_fits`): applies to unbound claims whose
+  class provisioner is a CSIDriver with `storageCapacity: true`; matches `storageClassName` + `nodeTopology`
+  selector on node labels; compares `maximumVolumeSize` (else `capacity`) against the raw request (not the
+  class). No object for a node → node rejected.
+- stormcos `46-csidriver.yaml` (`stormblock.storm.io`) lacks `storageCapacity: true`: publishing does nothing
+  until stormcos flips it, and it must flip only after every node publishes. Provisioner `stormblock.storm.io`, WFFC.
+- Open for the owner: overcommit ratio default (class size counted at bind vs written bytes), and whether
+  to size clones to the exact request.
+
+### Done: #59, every node volume a complete, current PV + PVC set
+
+Found, 2026-09-27: `system_claims.rs` creates once and never updates, skips `*-logs`, and leaves
+`claimRef` without uid and the binding annotations off. rustkube's binder (persistentvolume.rs) owns PV
+phases (Bound if the claim exists, Released if not) and the protection finalizers, so the mirror writes
+objects and bindings, not phases. The engine marks nothing as logs: kind comes from the name suffix
+(`-data`, `-state`, `-logs`), and `role` is only the slab half (system|data), recorded as an annotation.
+
+Steps:
+1. [x] Shared builder (`stormblock_pv`, `bind_pvc`, `objects`): labels `storm.io/volume-kind`, `storm.io/component`;
+       PVC bind-completed, bound-by-controller, storage-provisioner (+beta), selected-node; PV provisioned-by,
+       `claimRef` with uid+resourceVersion, `csi.fsType`, `volumeAttributes`, health/access/role annotations.
+2. [x] Reconciler: two lists a pass; PVC first, then PV with its uid; size only grows; labels/annotations merged;
+       claimRef follows the claim's uid. Only objects annotated with this node. Nothing written when current.
+3. [x] `bind_claim` (built-in driver claims) uses the same builder.
+4. [x] (b) A vanished volume: the mirror deletes its claim, the binder makes the PV Released, the PV is never
+       deleted (the issue's stated outcome). Not on a listing with none of the node's volumes.
+5. [x] **#107: `<volume>-<node>`, no migration** (5855ff8). PVC `kube-system/<volume>-<node>`, PV
+       `storm-<volume>-<node>`; the vanished-volume branch keys on the claim's `storm.io/volume`, so old
+       unqualified pairs are left as they are. E2E test: two nodes each get their pair, an old pair untouched.
+       sc-build 5855ff8: 310 kubelet unit pass. `test/` medium `node-volumes-pairs` / `-restored` (82bc3ce;
+       sc-build `cd test && cargo test --locked && cargo build --release --locked`: 17 pass). Live run waits on
+       the release (the test machine's kubelet writes the old names) and the test pipeline (#64).
+6. [x] Tests (fake apiserver + engine end to end), docs (`docs/node-volumes.md`), CHANGELOG. sc-build at 30bb887: all pass (kubelet 185).
+
+### Done: #57, pod limits onto stormpump `Spec.limits`, container stats from `QUERY`
+
+Steps:
+1. [x] `spec_for`: `memory_limit_bytes` → `memory_max` (+ `swap_max = 0`), `cpu_quota`/`cpu_period` → `cpu_max`.
+       Nothing sets `unified`/pids here, so those have no source yet.
+2. [x] Ring client: one request owns the arena at a time (payloads all go at offset 0), and a request can
+       have its region copied back after completion. `query_stats`.
+3. [x] `list_container_stats`: `QUERY` stats → CPU (exact) and memory (`memory_current`, includes page cache).
+4. [x] **Decided (#106): Pods under one parent cgroup (OpenShift), engine side stormpump#68 (done 2026-10-08, see above).** `cpu_shares` → `cpu_weight`. stormpump workloads are flat siblings, node services
+       included (default weight 100). Upstream's conversion puts every pod below them (1 CPU → 39, no request → 1).
+5. [x] Tests, docs, CHANGELOG. sc-build at 4245b8f: all pass (kubelet 177). Issue stays open on step 4.
+
+### Done: #36, kubelet metrics under upstream's names
+
+Found, 2026-09-27: `/metrics` and `/metrics/cadvisor` exist, but hand-written. `/metrics` has two gauges,
+`kubelet_running_containers` has no `container_state`, there is no `process_*`, and the cadvisor side has
+CPU and memory only, from CRI. The stormpump runtime reports no container stats at all: `QUERY` has a stats
+block, but the ring client never reads a reply arena back. That is #57 (step 3), not this issue.
+
+Steps:
+1. [x] `metrics.rs`: the recorder (`kubernetes_build_info` with the kubelet's version), apimachinery's `process_*`
+       collector, `kubelet_running_pods`, `kubelet_running_containers{container_state}`, and histograms
+       `kubelet_pod_start_duration_seconds` (first seen → started) and `kubelet_pleg_relist_duration_seconds`
+       (the sync pass over known pods; there is no separate PLEG). Upstream's buckets.
+2. [x] cadvisor: `ContainerStatsInfo` fields optional (absent ≠ 0), plus `fs_usage_bytes` (CRI writable layer).
+       Pod network from a new `list_pod_network_stats`. stormpump reads `/proc/<holder>/net/dev` of the sandbox.
+       Series labelled `{container,id,namespace,pod}`, and network also `{interface}`, per pod.
+3. [x] Tests, docs (`docs/metrics.md`), CHANGELOG. sc-build at f239350: all pass (kubelet 171). Closed.
+   stormpump CPU/memory series wait on #57 (ring client must read QUERY's reply arena; noted there).
+
+### Done: #73 + #74, stormvm v0.10.0's DiskSource (Empty, Claim)
+
+stormvm v0.10.0 (1b0d941) adds `DiskSource::Empty` (emptyDisk) and `DiskSource::Claim`
+(a PVC, which used to arrive as `Volume(<claim name>)` and fail with "invalid UUID").
+`vm_manager::resolve_disks` matches exhaustively, so the lock bump and both arms land together.
+
+Steps:
+1. [x] Lock: `cargo update -p stormvm-spec` on dev (all stormvm crates move to 1b0d941).
+2. [x] Empty (#73): find `<vm>-<disk>` by name, else create it blank with the disk's size (no redundancy), label `storm.io/vm`; owned by the VM.
+3. [x] Claim (#74): the pod manager resolves it (`provision_claim`, shared): bound → its volume, unbound stormblock-class → provisioned,
+       other class → Waiting. A pod on this node holding the claim → Waiting with its name. Not owned: deleting the VM keeps the volume.
+4. [x] Ownership is an explicit list (Golden, CloudInit, Empty), so a new source is not owned by default.
+5. [x] Tests, docs, CHANGELOG. sc-build at 6e4b48f: all pass (kubelet 166). Release v0.12.0, golden, close both.
+   Follow-up filed: #80 (a pod can mount a claim a VM here is using).
+
+### Done: #66 (P0, stormcos#104), the kubelet presents no stormblock engine token
+
+The engine (stormblock ≥ 17) requires `Authorization: Bearer <token>` on its API.
+Every engine call from the kubelet got 401, so claims and VM disks did not attach.
+
+Steps:
+1. [x] `engine.rs`: one engine client. The token comes from `$STORMBLOCK_API_TOKEN`, then the
+       file at `$STORMBLOCK_TOKEN_FILE` (default `/run/stormblock/engine/api_token`), then
+       `/etc/stormblock/api_token`, then `/var/lib/stormblock/api_token`. It is re-read on a 401, and on
+       every call while none is found (the engine mints it at start). Tests.
+2. [x] pod_manager, system_claims, vm_manager and stormpump_runtime use it instead of the apiserver client or a bare client.
+3. [x] `scripts/build-golden.sh`: curl carries the token.
+4. [x] Docs, CHANGELOG. sc-build at ca6dd06: build clean, all tests pass (kubelet 161, including engine::tests).
+5. [x] Released v0.11.0 (036b976), golden-rustkube-node-fdc1c7497472, #66 closed.
+
+### Done: #58, the golden build cannot load the workspace
+
+The golden build fetches this repo alone, at one commit, and runs
+`cargo build --release --locked`. `apimachinery` was `path = "../rustkube/..."`,
+so there is no sibling there and the manifest does not load.
+
+Steps:
+1. [x] `apimachinery` becomes a git dependency on rustkube, pinned by `rev`
+       (v0.15.2, e7f4fdb). A rustkube bump is an explicit change here.
+2. [x] Regenerate `Cargo.lock` for it on dev (no cargo on this VM). `cargo update -p apimachinery` cannot
+       match the old path entry, so use `cargo metadata`, which rewrites the lock minimally.
+3. [x] Remove `scripts/sc-build.sh` and `.deps/`; docs (README, BUILD.md), CHANGELOG.
+4. [x] `sc-build 'cargo build --release --locked --target x86_64-unknown-linux-musl'`, then `cargo test --locked`: passed at 6741e93.
+5. [x] Close #58, request the golden.
+
+### Done: #233, multi-NIC by the Multus standard (verified live: multus 131ea41fe0, pvetest1, 12.74)
+
+2026-10-09. `k8s.v1.cni.cncf.io/networks` (names, ns/name, name@if, or the JSON list with interface/ips/mac) and
+`v1.multus-cni.io/default-network`; NADs `k8s.cni.cncf.io/v1` `spec.config`.
+1. [x] cni: `NetworkConfigList::from_json` (conflist or one plugin), `add_network`/`del_network` with an explicit
+       config, ifname and `runtimeConfig` (ips/mac for plugins whose `capabilities` say so).
+2. [x] kubelet `multus.rs`: parse the annotations, resolve each NAD (GET, the pod's namespace unless named), ifnames
+       net1.. unless given; onto `PodSandboxConfig.networks` / `default_network`. Missing NAD = NetworkNotReady (wait,
+       FailedCreatePodSandBox naming it).
+3. [x] stormpump runtime: default (or its override), then one ADD per attachment; a failure DELs what was added
+       (reverse) and fails the sandbox naming it; stop DELs attachments in reverse, then the default.
+       network-status: default first, then each attachment (`name` ns/name, `default: false`).
+4. [x] Tests (6 new), docs/networking.md, CHANGELOG (993efb9, 7fef.., a91dd58). SC_BUILD_VM sc-build: 482 kubelet
+       unit, 26 cni pass. Stage golden golden-rustkube-node-08db97981bb2 (stormcos#424). Follow-up #235 (attachments
+       across a kubelet restart).
+5. [ ] Live: stormcos's cni-bin carries only Cilium's binaries; asked in stormcos#495 for containernetworking/plugins.
+       Then: a bridge + a macvlan NAD on a test node (test-container case: NADs are namespaced), close.
+       2026-10-28: 12.58 (pvetest1/2) carries cni-bin f77591d (has stormcos 3ca1af8: plugins v1.9.1 in cni-bin) and
+       this code; stormcos ships the NAD CRD (97-network-attachment-crd.yaml); the run's Role is `*`. Every test run still
+       dies at the node's image fetch (stormcos#271). Doing: `test/` suite `multus` (`multus.rs`, workload
+       `expect-nics`): bridge + macvlan NADs → net1/net2 with IPv4 in the pod and in network-status; a missing NAD →
+       FailedCreatePodSandBox naming it; a one-address host-local NAD used by two pods in turn (DEL released it).
+       requires.toml `[multus]`; sc-build `cd test`; propose #233 after stormcos#271; resume: `stormcentral test run
+       rustkube-node multus --tag pvetest1`, close on a pass.
+       Done: c10fa21 (suite), 935f2c9 (docs). SC_BUILD_VM sc-build: clippy -D warnings clean, 45 test-crate tests (4 new),
+       release build. Commented on #233; proposed after stormcos#271.
+       2026-11-06: stormcos#271 closed; every run now stops at the fetched image's tag, 404 on the node (stormblock-registry#150). No multus run
+       queued while it stands. #233 proposed after it. Resume: `stormcentral test run rustkube-node multus --tag pvetest1`, close on a pass.
+       2026-11-06 (later): #150 closed (v0.55.1, 9912c98); registry image e7abc9eefceb (f2f13ad) has it, no release carries it (newest 12.61; rustkube rigs 5e9f2f7a9c, pvetest1,
+       same 404). No run queued. #233 proposed `--after-release registry>=9912c98`. Resume as above; the prerequisites were checked on 12.58, not rechecked since.
+       2026-11-06 (17:40Z): 12.62 carried it but was tombstoned (stormcos#814, see #52). #233 proposed after stormcos#812. Resume as above once #812 closes.
+       2026-11-06 (22:08Z): stormcos#812 closed, but no machine can take the run. pvetest2 (12.63-flowsdn, has the registry fix) is down (#52). pvetest1 (12.58.5) is refused: its sbregistry refuses forge's test images (stormcos#271's peer, not on this release). C2NR0Q2 and server7 have 12.63, but #791 wants a pve run first. No run queued, no code changed. Resume when pvetest2's apiserver answers, or pvetest1 runs >= 12.63: `stormcentral test run rustkube-node multus --tag <that machine>`; close on a pass, or fix what fails.
+       2026-11-07 (01:35Z): pvetest1 and pvetest2 got 12.64 at about 00:52Z, then multus 87bbed77d9 (55484ca, pvetest1) errored at `power`: `no VM 3101 on pve node pve`. Both VMs are being destroyed and remade from pve (qmdestroy 3101, 3102 at 01:31Z; stormcentral#360's multi-node install is dispatched, not confirmed as the cause). The suite still hasn't run. Held by `wait-owner --probe tcp://192.168.31.172:6443`. Resume: `stormcentral test run rustkube-node multus --tag pvetest1`; close on a pass, or fix what fails. A pvetest1 in a two-node cluster may need another look at the suite's single-node assumption.
+       2026-11-07 (03:55Z): pvetest1 and pvetest2 passed 12.65. multus 27cb670ba3 (94f0fc0, pvetest1) is queued, first in line behind cluster test c9aafb939f (#360, lease until 12:44Z, at `release the worker`). Read with `stormcentral test show 27cb670ba3`; close on a pass, or fix what fails.
+       2026-11-07 (07:05Z): 27cb670ba3 errored `no VM 3101` (the cluster test's end removes the VMs). adf8a72317 (87e2f2d, pvetest1) is queued behind repeated 12.66 installs (filed on stormcentral); a second multus is queued on pvetest2, whose line is empty. Read whichever finishes first (`stormcentral test list rustkube-node`); close on a pass, or fix what fails.
+       2026-11-07 (09:45Z): adf8a72317 errored `no VM 3101` too. 6eaa04e0e7 (pvetest2) waited from 07:43Z while pvetest2 installed and passed 12.67 eight times, and it was never dispatched (stormcentral#1266, evidence added). Queued fc7746d676 (b874e96, pvetest1, idle at 12.67 passed). #233 proposed after stormcentral#1266. Resume: `stormcentral test list rustkube-node`, read whichever multus run finished (`test show <id>`); close on a pass, or fix what fails; on another machine error, queue on a pve machine that has passed a release.
+       2026-11-10: fc7746d676 errored `no VM 3101` too. pvetest1/2/3 have all passed 12.74. Queued multus 131ea41fe0 (8b8ebef, pvetest1). Resume: `stormcentral test show 131ea41fe0`; close on a pass, or fix what fails.
+       2026-11-10: 131ea41fe0 passed 3/0/0: bridge on net1 + macvlan on net2 with IPv4, network-status default first; a missing NAD = Pending with FailedCreatePodSandBox naming it; a one-address host-local range released by DEL and reused. Closed.
+
+### Done: #231 + #232 (P0, stormcos#488): verified live on the Dell, 12.07
+
+2026-10-09. stormcos#259 moved the mount list off the command line (`/etc/stormblock/mounts`), so golden_of
+assumed volume == path: cilium-operator's pallet `operator-generic` is volume `cilium-operator` → "no golden". The
+engine's listing says it (`mounted_at: /p/operator-generic`). Fix: `pallet_volume(listing, path)` (volume-level
+or attachments[] `mounted_at` `/p/<path>` or `/pallets/<path>`), then the cmdline list, then name == path; Roots
+caches path → volume for provenance_for; also the root volume's /etc/stormblock/mounts (behind the engine, before the
+cmdline's absence). #232 (my #71 regression): kind: clone / fsType: ext4 accepted. ca44386 (+ docs a1974fb); P0
+sc-build ca44386: 475 kubelet unit pass. Golden golden-rustkube-node-9b876df216c9 (stormcos#424), master told; close
+both when the Dell runs cilium-operator and a new claim. #21 paused on branch wip/21-rebased.
+
+### Done: #52, external StorageClasses: the end-to-end with the test container's own CSI driver (master: A)
+
+2026-10-21. Master's decision on #52: **A**, the suite brings its own driver. Host `/var/lib/kubelet` is the
+kubelet's (stormcos `volume kubeletdir`), so a driver pod's hostPath reaches what the kubelet watches. Doing:
+1. [x] `test/`: tonic/prost + build.rs on the vendored protos (`../pkg/kubelet/proto`, server + client for tests);
+       `csi_driver.rs`: mode `csi-driver <name> <node>` (Identity, Node without stage: NodePublish = bind of
+       `/var/lib/kubelet/plugins/<name>/data/<handle>` at the target, NodeUnpublish = umount + rmdir, each call one
+       stdout line; Registration on `plugins_registry/<name>-reg.sock`; SIGTERM removes sockets and data); mode
+       `restart-kubelet` (hostPID: SIGTERM the `kubelet` process, wait for a new pid).
+2. [x] `csi.rs` suite `csi` (requires.toml `[csi]`, budget 900, cluster_write csidrivers + persistentvolumes, reads
+       nodes/csinodes/PVs): CSIDriver (no attach), privileged driver pod (Bidirectional /var/lib/kubelet), static PV
+       pre-bound to a claim; cases: registered (CSINode), publish (writer pod; NodePublish in the driver's log),
+       unpublish (writer deleted → NodeUnpublish; reader reads the data back), kubelet-restart (holder stays Running,
+       a new reader reads, holder's delete unpublishes), deregistered (driver deleted → CSINode drops it).
+3. [x] Lock from a build VM (`cargo metadata`, SC_BUILD_OUT); sc-build `cd test && cargo test --locked && cargo build
+       --release --locked`; docs (csi.md "Not yet", README test section), CHANGELOG.
+       Done: f0489cd, 9fc4801 (lock sha 56bf0777…, job c0ebe2c2b1), docs. sc-build 9fc4801 (job 624672bcac): 41 test-crate
+       tests (9 new), clippy -D warnings clean, release builds; `restart-kubelet` off-node says no kubelet, exit 1.
+4. [ ] Live: `stormcentral test run rustkube-node csi --tag <machine>`; close on its result (or move it behind what
+       blocks the run: stormcos#271 for test images on nodes).
+       2026-10-21: run 9deb7dc500 (pvetest1, 12.38, e05e237): the test image built on stormcentral's build VM and was
+       pushed to forge (sha256:2128789e…); the node's fetch failed: `forge.g16.lo:5100 is not a peer of this registry`
+       = stormcos#271. #52 proposed after it. Resume: `stormcentral test run rustkube-node csi --tag pvetest1`, read
+       with `test show`, fix what fails, close on a pass.
+       2026-11-06: stormcos#271 closed, but no run got past the image: a tag fetched from forge by digest answers 404 on the node
+       (stormblock-registry#150; #61's 023f853fba on pvetest1, 12.61). No csi run queued while it stands. #52 proposed after it. Resume as above.
+       2026-11-06 (later): #150 closed (v0.55.1, 9912c98), not on a node: the newest registry image is da53e0e, behind it, and 12.61 predates it. No run queued.
+       #52 proposed `--after-release registry>=9912c98`. Resume as above.
+       2026-11-06 (17:40Z): the hold cleared on 12.62 (registry f2f13ad), but 12.62 was tombstoned: pvetest1's install failed at `local boot: the apiserver answers` (stormcos#814,
+       P0: stormcert and rustkube-node `failed while attaching mounts`, errno 11, the boot unit's mounts, no kubelet code ran). So still no machine has the fix; no run queued.
+       #52 proposed after stormcos#812 (install a release carrying registry>=9912c98 on a pve machine). Resume as above.
+       2026-11-06 (21:43Z): stormcos#812 closed; pvetest2 passed 12.63-flowsdn and medium ran there (#61). Queued csi 562ae87cdb (pvetest2, 84c7223). Read with `stormcentral test show 562ae87cdb`, fix what fails, close on a pass.
+       2026-11-06 (22:03Z): 562ae87cdb: `csi-setup` 409 on the run's own CSIDriver name (unexplained). 045726d654: no results; pvetest2's apiserver gone during the Job, wedged 13+ min (6443/9094 refused; stormd APIs and :10250 accept, no answer). Cause unknown; may be the suite (privileged Bidirectional driver pod, hostPID kubelet restart). Don't run csi on another machine until the console says. Master asked to read the console. Resume: its answer, then rerun on a fresh install. Consider: csi suite writes results as it goes, so a lost node still says which case it reached.
+       2026-11-07 (00:40Z): 3265d7a21a (befb0da, pvetest2) with ports and logs sampled: 9 `Kubelet starting` in 2 min. The first attempt got to `csi-restart-kubelet`; the new kubelet adopts nothing on stormpump (`list_pod_sandbox` is in memory), starts every pod again, the restart pod signals again: a loop. The runner re-ran too, so the 409s were its own objects (562ae87cdb the same). Probably 045726d654's wedge, logs lost. Filed #334 (P1). `csi-kubelet-restart` skipped until it's fixed (`KUBELET_RESTART_ADOPTS`). pvetest2 now has duplicate unsupervised pods: it needs a fresh install, master asked. Doing: rerun csi on pvetest1 (12.64), close on a pass; the restart check moves to #334.
+       2026-11-07 (00:46Z): csi 876bbe55ab (ea2692a, pvetest1, 12.64): 5 pass, 1 skip (`csi-kubelet-restart`, #334). Closed. On a node: registration, publish, unpublish, read back, deregistration. Unit tests only: NodeStage, attachRequired. Not run: a third-party driver, a kubelet restart (#334).
+
+(earlier) 2026-10-21. stormcentral#479 landed (`cluster_write`, `service_account_cluster_rules`). Blocker found: no stormcos node
+can run csi-driver-host-path's `hostpathplugin` (upstream images only as pinned imports; `pinned-images.txt` has the
+registrar v2.13.0 and provisioner v5.1.0 as optional goldens, no hostpath plugin; stormblock-csi is not deployed), and
+copying images over /v2/ by hand is not a test-standard run. Asked on #52 (wait-owner): A the test container's own
+CSI driver (recommended: Identity+Node from the vendored csi.proto, self-registration, bind-mount NodePublish, static
+PV via `cluster_write` csidrivers+persistentvolumes, privileged pod with /var/lib/kubelet Bidirectional), B pin
+hostpathplugin in stormcos, C unit tests only. Resume from the answer.
+
+(earlier) 
+2026-10-09. stormblock-registry#99 is fixed (v0.40.1; pushed goldens build). The e2e has to be a test-container
+suite (test standard; no kubectl/credentials here), and it must create a CSIDriver and a StorageClass and give the
+external-provisioner's SA cluster rules (PVs): the runner grants only cluster reads (#55); #479 proposes
+cluster_write but refuses RBAC. Commented the exact needs on #479; #52 proposed after it. Then: a `[csi]` suite
+(budget_secs) using tmp/csi52's manifests, driver images copied into the node registry over /v2/ (tmp/regcopy.py),
+the five checks.
+
+### (history) Waiting on stormblock-registry#99 (pushed images): #52, external StorageClasses (the CSI node side)
+
+2026-09-29: stormpump#35's engine side is on stormpump main (a06ce4c..), and `/` is rshared on C2NR0Q2 (11.51).
+What is left here is step 6 = #81 (`Mount.propagation` into `spec_for`), which needs stormpump ≥ a06ce4c in the
+lock. The lock has one stormpump, shared with stormvm-node, and stormvm main (cf343c7) still builds
+`stormpump::spec::Mount` without `propagation` (plan.rs:347): stormvm#65, open. Proposed #52 and #81 after it.
+Then: bump stormpump, map propagation (#81), end to end with csi-driver-host-path on a node (step 9).
+
+(Was: parked on stormpump#35 (P1).)
+
+Findings, 2026-09-24:
+- `csi.rs` was a stub. It logged calls and created directories, and it never
+  spoke gRPC. The issue called it complete, and it was not.
+- **Blocked outside this repo:** stormpump makes every container's mount namespace
+  `MS_PRIVATE`, and its spec has no propagation field. So a CSI driver's
+  NodePublish mount cannot reach PID 1's namespace, and the application
+  container's bind would find an empty directory. It needs a stormpump issue
+  for per-mount propagation, and possibly stormcos for `/var/lib/kubelet` as a
+  shared mount on the host.
+
+Steps:
+1. [x] Vendor `csi.proto` and the plugin-registration proto; build.rs generates clients (and servers, for tests).
+2. [x] `csi.rs`: a real gRPC client over the driver's Unix socket (Identity + Node).
+3. [x] `csi_plugins.rs`: watch `/var/lib/kubelet/plugins_registry`, GetInfo, NodeGetInfo,
+       write `CSINode` and the topology labels, NotifyRegistrationStatus, and deregister when the socket goes.
+4. [x] Mount: a claim bound to a PV of another driver waits for its VolumeAttachment
+       (when the CSIDriver has `attachRequired`), then NodeStage and NodePublish, and the published directory is bound in.
+       Write `vol_data.json` beside the mount so teardown survives a kubelet restart.
+5. [x] Unmount: NodeUnpublish when the pod goes, NodeUnstage when it is the last pod on the node.
+6. [x] Pass `mountPropagation` through to stormpump (#81, 599a86e). Was stormpump#35. Until then the mountinfo check keeps pods waiting instead of giving them an empty directory.
+7. [x] Tests: a mock driver and registrar on a real Unix socket, the full round trip.
+8. [x] Docs (`docs/csi.md`), CHANGELOG.
+9. [ ] End to end with csi-driver-host-path on a node (step 6 done by #81). 2026-10-08: no node runs #81 yet (goldens
+       in the open release request stormcos#366; test machines on 11.91); the driver's images must be in the node's
+       registry. #52 proposed after stormcos#366. Then: lease a machine, deploy the driver, pod on its claim, write/read,
+       kubelet restart, delete → NodeUnpublish.
+       2026-10-08: 11.93 (pvetest1) carries #81. Images copied there over /v2/ (tmp/regcopy.py: registry.k8s.io →
+       :5100, podman is not usable here); every golden build fails at the seal (stormblock-registry#99, filed). Manifests
+       in tmp/csi52/ (CSIDriver no-attach, one pinned plugin+registrar+provisioner pod, Immediate SC, 16Mi PVC, busybox).
+       #52 proposed after stormblock-registry#99; lease released, nothing created on the node.
+10. [x] Build verified: `sc-build scripts/sc-build.sh` at 004b2e7, build clean, all kubelet tests pass.
+
+Related, filed elsewhere: rustkube#94 (no ephemeral-volume controller).
