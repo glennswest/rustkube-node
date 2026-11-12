@@ -84,7 +84,17 @@ pvetest1 (installing 12.78). Resume: that run passes both own-token cases → cl
 metadata ccb750ba4b (bd7097d, pvetest1, 12.78 = 8b8ebef): 3/0/0, own token at 127.0.0.1 and 192.168.31.172 → 200 with its own Pod; no token → 404
 "is this node's own address". Closed; stormimds#19 asked to rerun `node` on a release >= 12.74.7.
 
-### Waiting on stormcentral#1274 (the cluster test's pod timing): #340 (P1), first pod on a cluster worker 2.1 s (flowsdn) / 4.1 s (cilium) vs 160 ms on one node
+### In progress: #340 (P1), the worker's first pod: what the cluster test with stormcentral#1274 shows
+
+2026-11-12. stormcentral#1274 closed (watch-based pod steps, kubelet phases on every pod step). Runs since: 35a9f71937 (12.74.7 cilium):
+first pod 14500 ms = sandbox/cni 12975 ms (cilium agent just started, then crash-loops on bound ports: stormcos-cilium#52), volumes 328 ms
+(kube-api-access: TokenRequest then kube-root-ca.crt, one after the other through the VIP; 5 ms on one node), containers 430 ms (node busy
+compiling BPF). 1439e5f1ee (12.74.7-flowsdn) never joined (flowsdn#404, closed). bad8762295 (12.74.6 cilium): first pod CNI, 600 s.
+The pod's own timestamps read "scheduled not set, Ready not set": the kubelet writes conditions with no `lastTransitionTime` and drops the
+scheduler's. Doing: (1) conditions carry `lastTransitionTime` (kept while unchanged, now on a flip, PodScheduled's from the scheduler);
+(2) a projected volume's sources fetched concurrently. Then sc-build, stage, and the next cluster test on both flavours decides close.
+
+### Earlier: waiting on stormcentral#1274 (the cluster test's pod timing): #340 (P1), first pod on a cluster worker 2.1 s (flowsdn) / 4.1 s (cilium) vs 160 ms on one node
 
 2026-11-07. Found, no kubelet change: the cluster test's `pinned_pod` GETs once, then sleeps `poll()` = 2000 ms, so every pod step is a
 2 s tick. First pod across six runs: 2.0, 2.1, 4.1, 2.1, 4.1, 2.0 s; the new pod after the reboot reads 2.0 or 8.0 s. The worker kubelet's own `storm.io/start-timing` in the same runs
