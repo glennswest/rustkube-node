@@ -94,6 +94,8 @@ The pod's own timestamps read "scheduled not set, Ready not set": the kubelet wr
 scheduler's. Doing: (1) conditions carry `lastTransitionTime` (kept while unchanged, now on a flip, PodScheduled's from the scheduler);
 (2) a projected volume's sources fetched concurrently. Then sc-build, stage, and the next cluster test on both flavours decides close.
 Done in code: `stamp_condition_transitions` (kubelet.rs, test `conditions_carry_their_transition_times`), `materialize_projected` → `try_join_all`.
+a8f0511: sc-build passed (632 kubelet unit tests, no new warnings), stage build d753d5d3a625, comment on #340. Held `--after-install rustkube-node>=a8f0511`.
+Resume: run the cluster test on both flavours. Cilium also needs stormcos-cilium#52; flowsdn needs a release with flowsdn#404. Close if the first pod is within ~300 ms of one node.
 
 ### Earlier: waiting on stormcentral#1274 (the cluster test's pod timing): #340 (P1), first pod on a cluster worker 2.1 s (flowsdn) / 4.1 s (cilium) vs 160 ms on one node
 
