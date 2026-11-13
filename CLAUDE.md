@@ -11,9 +11,9 @@ stage golden through `stormcentral component stage rustkube-node`, not a package
 `0.13.0`. There is one version location: `[workspace.package] version` in
 `Cargo.toml` (every crate uses `version.workspace = true`).
 
-## Current implementation reference (2026-11-06)
+## Current implementation reference (2026-11-13)
 
-Main baseline: 36149de (#312 the engine client over https with `--stormblock-ca`, 55eb751; #311 `container/<name>` steps, 6a3b27a; #310 diagnosed, no code: Cilium's `endpoint-create` limiter; #303 VMI Running once its control socket answers; stormvm 0225218, #304 bridge keeps multus/SR-IOV NICs; #302 disk moves off the node; #301; #40 live migration kubelet half, #160 parked startup admission, #292 ring arena per request; every git dependency by rev, #210; stage builds are listed per issue in the work plan). See
+Main baseline: 0c4a931 (#340 pod condition times, a8f0511; #344 golden from a running VM; #348 RDMA verbs; #338/#339 claim and stopped-VM moves to another node; #342 vmInstance refusals; #312 the engine client over https with `--stormblock-ca`, 55eb751; #311 `container/<name>` steps, 6a3b27a; #310 diagnosed, no code: Cilium's `endpoint-create` limiter; #303 VMI Running once its control socket answers; stormvm 0225218, #304 bridge keeps multus/SR-IOV NICs; #302 disk moves off the node; #301; #40 live migration kubelet half, #160 parked startup admission, #292 ring arena per request; every git dependency by rev, #210; stage builds are listed per issue in the work plan). See
 `docs/status.md` for changes since October 2, the owner's recorded decisions and issue-backed limitations,
 `docs/configuration.md` for every CLI/env/default, `docs/api.md` for ports and actual routes, `docs/retries.md`
 for every remote call's retry policy. CLI runtime defaults to native; stormcos explicitly chooses stormpump.
@@ -29,7 +29,7 @@ current deployment guarantees. Owner decisions answered: #106 (Pods under one pa
 (`<volume>-<node>`, done), #108 (class size at bind, done), #109 (option A, done), #110/#158 (C2NR0Q2's day
 suite is the acceptance, #102), #104 (A), #3 (no NotReady gating; #201), #68 (stormblock-csi owns replicas),
 #159 (RAID leg on the destination, #40 after stormstorage#44), stormimds#12 (stormimds asks `/vmInstance`).
-Open: #334 (a kubelet restart adopts no pods on stormpump). Waiting on the owner: #102 (acceptance machine: the Dell's tests valve is closed).
+Open: #334 (a kubelet restart adopts no pods on stormpump), #327-#330 (downward API, token automount, service env). Waiting on the owner: #102 (acceptance machine: the Dell's tests valve is closed).
 
 ## Build and test
 

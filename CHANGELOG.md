@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-13
+
+- **docs:** Audit against main 0c4a931 (`git log --since=2026-11-06`): status.md gains the golden-from-VM (#344) and `/vmInstance` refusal (#342) rows and lists the open issues whose gaps the code still has (#327-#330, #334, #320, #351, #324, #336, #346, #347, and others) under "Promises the current code does not fulfill"; CLAUDE.md's baseline and open list, api.md's audit date. No code change.
+
 ## 2026-11-12
 
 - **fix:** Pod conditions carry `lastTransitionTime` (#340). The kubelet wrote PodScheduled, Initialized, ContainersReady and Ready with no transition time, and overwrote the scheduler's, so a reader of the pod (the cluster test's "pod's own timestamps", stormcentral#1274) saw "scheduled not set, Ready not set". Each condition now keeps its time from the last status while its value holds, and takes the write's time when it flips or is new. PodScheduled takes the bind's (`storm.io/scheduled-at`, else creation). An unchanged status still compares equal to the last one, so it is still not written again.

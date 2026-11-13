@@ -1,6 +1,6 @@
 # Ports and kubelet API
 
-Audited from `pkg/kubelet/src/server.rs` and the CLI at main 06b91b5 (2026-10-09).
+Audited from `pkg/kubelet/src/server.rs` and the CLI at main 0c4a931 (2026-11-13).
 
 | Endpoint | Ownership / default |
 |---|---|
