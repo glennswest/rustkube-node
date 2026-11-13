@@ -204,7 +204,7 @@ impl Suite {
         let within = self.env.budget(BOOT, MARGIN);
         let end = Instant::now() + within;
         k8s::until(within, || async move {
-            let v = self.api.get(&path).await?.ok_or_else(|| format!("VMI {name} is gone"))?;
+            let v = self.api.get(path).await?.ok_or_else(|| format!("VMI {name} is gone"))?;
             match s(&v, "/status/phase") {
                 "Running" => Ok(()),
                 "Failed" | "Succeeded" => Err(format!("VMI {name} ended {}", short(&v["status"]))),
@@ -232,7 +232,7 @@ impl Suite {
         let path = path.as_str();
         let within = self.env.budget(REQUEST, MARGIN);
         k8s::until(within, || async move {
-            let v = self.api.get(&path).await?.ok_or_else(|| format!("request {name} is gone"))?;
+            let v = self.api.get(path).await?.ok_or_else(|| format!("request {name} is gone"))?;
             match s(&v, "/status/phase") {
                 "Sealed" | "Failed" => Ok(v),
                 p => Err(format!("request {name} still {p:?} after {} s: {}", within.as_secs(), s(&v, "/status/message"))),
