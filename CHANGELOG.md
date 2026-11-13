@@ -2,6 +2,8 @@
 
 ## 2026-11-13
 
+- **fix(test):** long's waves stop at a memory floor (#61). Its second night run (ef37856d6b, pvetest3) lost the node's apiserver as the first wave started: 80% of 110 slots is ~88 BestEffort pods, and pve shows the VM at a 15.9G memory peak (idle 9.6-12.4G) with no power cycle. A wave now goes in steps of ten, each waited on, and stops adding pods when the node's `MemAvailable` (the runner's `/proc/meminfo`, used only when its `MemTotal` is the Node's `capacity.memory`) is under 20% of `MemTotal`, at least 1 GiB (`RUSTKUBE_NODE_TEST_MEM_FLOOR_PCT`). Later waves take the first wave's size. Each wave's fields carry `mem_before_mib`, `mem_low_mib` and `mem_stopped`; a wave that could add no pod fails.
+
 - **docs:** Audit against main 0c4a931 (`git log --since=2026-11-06`): status.md gains the golden-from-VM (#344) and `/vmInstance` refusal (#342) rows and lists the open issues whose gaps the code still has (#327-#330, #334, #320, #351, #324, #336, #346, #347, and others) under "Promises the current code does not fulfill"; CLAUDE.md's baseline and open list, api.md's audit date. No code change.
 
 ## 2026-11-12

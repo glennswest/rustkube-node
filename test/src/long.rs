@@ -10,6 +10,15 @@
 //!    `RUSTKUBE_NODE_TEST_WAVE_MAX` (default 500). Every pod is pinned to the
 //!    node and holds (`sleep`). Every fourth also gets a 16Mi claim of the
 //!    built-in class, written by an init container, when the class is here.
+//!    The pods go in steps of ten, each step waited on, and the ramp stops
+//!    adding pods when the node's `MemAvailable` (its `/proc/meminfo`: the
+//!    runner is on the node, and the file is not namespaced) is under a floor,
+//!    20% of `MemTotal` and at least 1 GiB (`RUSTKUBE_NODE_TEST_MEM_FLOOR_PCT`).
+//!    A wave of BestEffort pods at 80% of 110 slots ran a 16 GiB node out of
+//!    memory and took its apiserver with it (ef37856d6b): the slots are not
+//!    the node's capacity, its memory is. Later waves take the first wave's
+//!    size, so they compare. When the Node's `capacity.memory` is not this
+//!    `MemTotal` (the runner on another node), the floor is not used.
 //! 2. **Measure** each pod's start: from its create to the first time the API
 //!    shows it Running (polled every second, so the resolution is a second).
 //! 3. **Hold** 30 s, and read one pod's log back.
@@ -40,6 +49,38 @@ const MARGIN: Duration = Duration::from_secs(600);
 const HOLD: Duration = Duration::from_secs(30);
 /// One pod in this many carries a claim.
 const CLAIM_EVERY: usize = 4;
+/// Pods created between two memory reads.
+const STEP: usize = 10;
+/// How long one step's pods are waited on before the next memory read.
+const STEP_WAIT: Duration = Duration::from_secs(120);
+const GIB: u64 = 1 << 30;
+
+/// `MemTotal` and `MemAvailable` of a `/proc/meminfo`, in bytes.
+pub fn meminfo(text: &str) -> Option<(u64, u64)> {
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(name)?.strip_prefix(':'))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            .map(|kib| kib * 1024)
+    };
+    Some((field("MemTotal")?, field("MemAvailable")?))
+}
+
+/// The memory a wave leaves the node: `pct`% of its total, at least 1 GiB.
+pub fn mem_floor(total: u64, pct: u64) -> u64 {
+    (total / 100 * pct.min(90)).max(GIB)
+}
+
+/// Whether this `MemTotal` is the Node's `capacity.memory` (within 5%):
+/// the runner reads the meminfo of the node it is on.
+pub fn same_node_memory(capacity: u64, total: u64) -> bool {
+    capacity > 0 && capacity.abs_diff(total) <= capacity / 20
+}
+
+/// The node's memory as the runner sees it: (total, available).
+fn node_memory() -> Option<(u64, u64)> {
+    meminfo(&std::fs::read_to_string("/proc/meminfo").ok()?)
+}
 
 /// The wave size for a node: 80% of its free pod slots, at least 1, at most
 /// `max`.
@@ -62,6 +103,11 @@ pub struct Wave {
     pub max_ms: u128,
     pub ramp_ms: u128,
     pub drain_ms: u128,
+    /// The node's `MemAvailable` before the wave and at its fullest, MiB.
+    pub mem_before_mib: u64,
+    pub mem_low_mib: u64,
+    /// Whether the ramp stopped at the memory floor short of its size.
+    pub mem_stopped: bool,
     /// What its drain left: pods, claims, PVs, by name.
     pub left: Vec<String>,
     /// Pods that never ran, with why.
@@ -71,8 +117,9 @@ pub struct Wave {
 impl Wave {
     pub fn fields(&self) -> String {
         format!(
-            "\"wave\": {}, \"pods\": {}, \"claims\": {}, \"p50_ms\": {}, \"p95_ms\": {}, \"max_ms\": {}, \"ramp_ms\": {}, \"drain_ms\": {}, \"left\": {}",
-            self.n, self.pods, self.claims, self.p50_ms, self.p95_ms, self.max_ms, self.ramp_ms, self.drain_ms, self.left.len()
+            "\"wave\": {}, \"pods\": {}, \"claims\": {}, \"p50_ms\": {}, \"p95_ms\": {}, \"max_ms\": {}, \"ramp_ms\": {}, \"drain_ms\": {}, \"left\": {}, \"mem_before_mib\": {}, \"mem_low_mib\": {}, \"mem_stopped\": {}",
+            self.n, self.pods, self.claims, self.p50_ms, self.p95_ms, self.max_ms, self.ramp_ms, self.drain_ms, self.left.len(),
+            self.mem_before_mib, self.mem_low_mib, self.mem_stopped
         )
     }
 
@@ -82,6 +129,9 @@ impl Wave {
         if !self.never_ran.is_empty() {
             wrong.push(format!("{} pods never ran ({})", self.never_ran.len(), self.never_ran.iter().take(3).cloned().collect::<Vec<_>>().join("; ")));
         }
+        if self.pods == 0 && self.mem_stopped {
+            wrong.push(format!("the node was under the memory floor before the wave ({} MiB available)", self.mem_low_mib));
+        }
         if !self.left.is_empty() {
             wrong.push(format!("left after the drain: {}", self.left.iter().take(5).cloned().collect::<Vec<_>>().join(", ")));
         }
@@ -89,8 +139,9 @@ impl Wave {
             wrong.push(format!("p95 start {} ms against the first wave's {f} ms", self.p95_ms));
         }
         let summary = format!(
-            "{} pods ({} with claims): start p50 {} ms, p95 {} ms; drained in {} ms",
-            self.pods, self.claims, self.p50_ms, self.p95_ms, self.drain_ms
+            "{} pods ({} with claims): start p50 {} ms, p95 {} ms; drained in {} ms{}",
+            self.pods, self.claims, self.p50_ms, self.p95_ms, self.drain_ms,
+            if self.mem_stopped { format!("; stopped at the memory floor ({} MiB available)", self.mem_low_mib) } else { String::new() }
         );
         if wrong.is_empty() { Outcome::Pass(summary) } else { Outcome::Fail(format!("{summary}; {}", wrong.join("; "))) }
     }
@@ -126,11 +177,23 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
         r.record("capacity", Outcome::Fail(format!("Node {} reports no allocatable pods", env.node_name)), 0, None);
         return;
     }
-    let size = wave_size(allocatable, on_node, knob("RUSTKUBE_NODE_TEST_WAVE_MAX").unwrap_or(500)) as usize;
+    let mut size = wave_size(allocatable, on_node, knob("RUSTKUBE_NODE_TEST_WAVE_MAX").unwrap_or(500)) as usize;
     let claims = matches!(k8s::no_builtin_class(&api).await, Ok(None));
+    let capacity = crate::api::quantity_bytes(s(&node, "/status/capacity/memory")).unwrap_or(0);
+    let floor = match node_memory() {
+        Some((total, _)) if same_node_memory(capacity, total) => Some(mem_floor(total, knob("RUSTKUBE_NODE_TEST_MEM_FLOOR_PCT").unwrap_or(20))),
+        _ => None,
+    };
     r.record(
         "capacity",
-        Outcome::Pass(format!("{allocatable} pod slots, {on_node} in use: waves of {size}{}", if claims { "" } else { " (no built-in class: no claims)" })),
+        Outcome::Pass(format!(
+            "{allocatable} pod slots, {on_node} in use: waves of up to {size}{}; {}",
+            if claims { "" } else { " (no built-in class: no claims)" },
+            match floor {
+                Some(f) => format!("ramp stops under {} MiB available", f >> 20),
+                None => "no memory floor (this meminfo is not the Node's)".to_string(),
+            }
+        )),
         0,
         None,
     );
@@ -143,8 +206,11 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
             break;
         }
         let t = Instant::now();
-        let w = wave(&env, &api, n, size, claims).await;
+        let w = wave(&env, &api, n, size, claims, floor).await;
         last = t.elapsed();
+        if n == 1 && w.mem_stopped {
+            size = w.pods.max(1);
+        }
         let fields = w.fields();
         r.record(&format!("wave-{n}"), w.outcome(first_p95), last.as_millis(), Some(&fields));
         if first_p95.is_none() && w.never_ran.is_empty() {
@@ -175,43 +241,13 @@ pub fn wave_objects(env: &Env, n: usize, i: usize, claims: bool) -> (Value, Opti
     (p, Some(c))
 }
 
-async fn wave(env: &Env, api: &Api, n: usize, size: usize, claims: bool) -> Wave {
-    let mut w = Wave {
-        n, pods: size, claims: 0, p50_ms: 0, p95_ms: 0, max_ms: 0, ramp_ms: 0, drain_ms: 0,
-        left: Vec::new(), never_ran: Vec::new(),
-    };
-    let ramp = Instant::now();
-    let mut created: HashMap<String, Instant> = HashMap::new();
-    let mut claim_names = Vec::new();
-    for i in 0..size {
-        let (p, c) = wave_objects(env, n, i, claims);
-        let name = s(&p, "/metadata/name").to_string();
-        if let Some(c) = c {
-            match api.create(&k8s::pvcs(env), &c).await {
-                Ok(_) => claim_names.push(name.clone()),
-                Err(e) => {
-                    w.never_ran.push(format!("{name}: claim: {e}"));
-                    continue;
-                }
-            }
-        }
-        match api.create(&k8s::pods(env), &p).await {
-            Ok(_) => {
-                created.insert(name, Instant::now());
-            }
-            Err(e) => w.never_ran.push(format!("{name}: {e}")),
-        }
-    }
-    w.claims = claim_names.len();
-
-    // Poll the wave's pods until each has been seen Running, or the ramp's
-    // time is up (10 minutes, or what the suite has left).
-    let sel = format!("{}?labelSelector=storm.io%2Fwave%3D{n},storm.io%2Ftest-run%3D{}", k8s::pods(env), env.run_id);
-    let mut started: HashMap<String, u128> = HashMap::new();
-    let mut last_seen: HashMap<String, String> = HashMap::new();
-    let end = Instant::now() + env.budget(Duration::from_secs(600), Duration::from_secs(120));
+/// Poll a wave's pods until each created one has been seen Running, or `end`.
+async fn poll(
+    api: &Api, sel: &str, created: &HashMap<String, Instant>, started: &mut HashMap<String, u128>,
+    last_seen: &mut HashMap<String, String>, end: Instant,
+) {
     while started.len() < created.len() && Instant::now() < end {
-        if let Ok(Some(items)) = api.list(&sel).await {
+        if let Ok(Some(items)) = api.list(sel).await {
             for p in &items {
                 let name = s(p, "/metadata/name").to_string();
                 if started.contains_key(&name) {
@@ -226,8 +262,69 @@ async fn wave(env: &Env, api: &Api, n: usize, size: usize, claims: bool) -> Wave
                 }
             }
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        if started.len() < created.len() {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
     }
+}
+
+async fn wave(env: &Env, api: &Api, n: usize, size: usize, claims: bool, floor: Option<u64>) -> Wave {
+    let mut w = Wave {
+        n, pods: 0, claims: 0, p50_ms: 0, p95_ms: 0, max_ms: 0, ramp_ms: 0, drain_ms: 0,
+        mem_before_mib: 0, mem_low_mib: 0, mem_stopped: false, left: Vec::new(), never_ran: Vec::new(),
+    };
+    let ramp = Instant::now();
+    let sel = format!("{}?labelSelector=storm.io%2Fwave%3D{n},storm.io%2Ftest-run%3D{}", k8s::pods(env), env.run_id);
+    let mut created: HashMap<String, Instant> = HashMap::new();
+    let mut started: HashMap<String, u128> = HashMap::new();
+    let mut last_seen: HashMap<String, String> = HashMap::new();
+    let mut claim_names = Vec::new();
+    // The ramp's time: 10 minutes, or what the suite has left.
+    let end = Instant::now() + env.budget(Duration::from_secs(600), Duration::from_secs(120));
+    let mut low = u64::MAX;
+    let mut i = 0;
+    while i < size && Instant::now() < end {
+        if let Some((_, avail)) = node_memory() {
+            if i == 0 {
+                w.mem_before_mib = avail >> 20;
+            }
+            low = low.min(avail);
+            if floor.is_some_and(|f| avail < f) {
+                w.mem_stopped = true;
+                break;
+            }
+        }
+        for j in i..(i + STEP).min(size) {
+            let (p, c) = wave_objects(env, n, j, claims);
+            let name = s(&p, "/metadata/name").to_string();
+            if let Some(c) = c {
+                match api.create(&k8s::pvcs(env), &c).await {
+                    Ok(_) => claim_names.push(name.clone()),
+                    Err(e) => {
+                        w.never_ran.push(format!("{name}: claim: {e}"));
+                        continue;
+                    }
+                }
+            }
+            match api.create(&k8s::pods(env), &p).await {
+                Ok(_) => {
+                    created.insert(name, Instant::now());
+                }
+                Err(e) => w.never_ran.push(format!("{name}: {e}")),
+            }
+        }
+        i = (i + STEP).min(size);
+        // Wait on this step before reading the memory again: a pod takes its
+        // memory as it starts, not when it is made.
+        poll(api, &sel, &created, &mut started, &mut last_seen, end.min(Instant::now() + STEP_WAIT)).await;
+    }
+    poll(api, &sel, &created, &mut started, &mut last_seen, end).await;
+    if let Some((_, avail)) = node_memory() {
+        low = low.min(avail);
+    }
+    w.mem_low_mib = if low == u64::MAX { 0 } else { low >> 20 };
+    w.pods = created.len() + w.never_ran.len();
+    w.claims = claim_names.len();
     w.ramp_ms = ramp.elapsed().as_millis();
     for name in created.keys().filter(|n| !started.contains_key(*n)) {
         w.never_ran.push(format!("{name}: {}", last_seen.get(name).map(String::as_str).unwrap_or("never listed")));
@@ -323,11 +420,40 @@ mod tests {
     #[test]
     fn a_wave_fails_on_residue_or_slowdown() {
         let w = |p95, left: Vec<String>| Wave {
-            n: 2, pods: 10, claims: 2, p50_ms: 100, p95_ms: p95, max_ms: p95, ramp_ms: 0, drain_ms: 0, left, never_ran: vec![],
+            n: 2, pods: 10, claims: 2, p50_ms: 100, p95_ms: p95, max_ms: p95, ramp_ms: 0, drain_ms: 0,
+            mem_before_mib: 4000, mem_low_mib: 3000, mem_stopped: false, left, never_ran: vec![],
         };
         assert!(matches!(w(500, vec![]).outcome(Some(400)), Outcome::Pass(_)));
         assert!(matches!(w(5000, vec![]).outcome(Some(400)), Outcome::Fail(_)));
         assert!(matches!(w(500, vec!["PV x".into()]).outcome(Some(400)), Outcome::Fail(_)));
         assert!(w(500, vec![]).fields().contains("\"p95_ms\": 500"));
+        assert!(w(500, vec![]).fields().contains("\"mem_low_mib\": 3000"));
+        let mut full = w(500, vec![]);
+        full.mem_stopped = true;
+        assert!(matches!(full.outcome(Some(400)), Outcome::Pass(s) if s.contains("memory floor")));
+        full.pods = 0;
+        assert!(matches!(full.outcome(Some(400)), Outcome::Fail(_)));
+    }
+
+    #[test]
+    fn meminfo_reads_total_and_available() {
+        let text = "MemTotal:       16384000 kB\nMemFree:         1000 kB\nMemAvailable:    4096000 kB\n";
+        assert_eq!(meminfo(text), Some((16384000 * 1024, 4096000 * 1024)));
+        assert_eq!(meminfo("MemTotal: 10 kB\n"), None);
+        assert_eq!(meminfo(""), None);
+    }
+
+    #[test]
+    fn the_floor_is_a_share_of_the_node_and_at_least_a_gib() {
+        assert_eq!(mem_floor(16 * GIB, 20), 16 * GIB / 100 * 20);
+        assert_eq!(mem_floor(2 * GIB, 20), GIB);
+        assert_eq!(mem_floor(100 * GIB, 500), 100 * GIB / 100 * 90);
+    }
+
+    #[test]
+    fn the_floor_is_used_only_on_the_nodes_own_meminfo() {
+        assert!(same_node_memory(16 * GIB, 16 * GIB - GIB / 2));
+        assert!(!same_node_memory(16 * GIB, 64 * GIB));
+        assert!(!same_node_memory(0, 16 * GIB));
     }
 }

@@ -1318,8 +1318,13 @@ kubelet is under test, not the scheduler.
     claim is deleted and must come back with its PV naming the new uid.
 - **long** (the night window, on a pve VM): waves of pods, each 80% of the
   node's free pod slots (`RUSTKUBE_NODE_TEST_WAVE_MAX`, default 500), every
-  fourth with a 16Mi built-in claim written by an init container. Per wave
-  (`wave-<n>`, with `pods`, `p50_ms`, `p95_ms`, `drain_ms`, `left` as fields):
+  fourth with a 16Mi built-in claim written by an init container. The pods
+  go in steps of ten, and the ramp stops adding them when the node's
+  `MemAvailable` (`/proc/meminfo`, read by the runner on the node) is under
+  20% of `MemTotal`, at least 1 GiB (`RUSTKUBE_NODE_TEST_MEM_FLOOR_PCT`);
+  later waves take the first wave's size. Per wave (`wave-<n>`, with `pods`,
+  `p50_ms`, `p95_ms`, `drain_ms`, `left`, `mem_before_mib`, `mem_low_mib`,
+  `mem_stopped` as fields):
   each pod's start (create → seen Running, 1 s resolution), a 30 s hold and a
   log read, then the drain. A wave fails on anything left after its drain
   (pods, claims, PVs) or a p95 start over twice the first wave's plus 2 s.

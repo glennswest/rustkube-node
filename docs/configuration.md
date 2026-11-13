@@ -282,6 +282,7 @@ medium, long or csi (#52, declared in `test/requires.toml`). The process passes 
 | `STORM_NODE` | The test node's address (or name), resolved to its Node at the start of a run; the suites' pods are pinned to it |
 | `RUSTKUBE_NODE_TEST_IMAGE` | The workload pods' image; empty: the Job's own pod's image, else `test-rustkube-node-<suite>:<commit12>` (#97) |
 | `RUSTKUBE_NODE_TEST_WAVE_MAX` | long: the largest wave, default 500 pods (a wave is otherwise 80% of the node's free pod slots) |
+| `RUSTKUBE_NODE_TEST_MEM_FLOOR_PCT` | long: a wave's ramp stops adding pods when the node's `MemAvailable` is under this share of `MemTotal` (default 20, at least 1 GiB, at most 90); not used when the runner's meminfo is not the Node's `capacity.memory` |
 | `RUSTKUBE_NODE_TEST_WAVES` | long: stop after this many waves (default: until the suite's time is nearly out) |
 | `STORM_TIMEOUT` | Seconds: short 120, medium 1800, long 28800, csi 900 |
 | `RUSTKUBE_NODE_TEST_MINT_BUDGET` | 1200 seconds per PVC case, bounded by remaining suite time |
