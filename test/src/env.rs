@@ -59,6 +59,7 @@ impl Env {
             "medium" => 1800,
             "long" => 8 * 3600,
             "csi" => 900,
+            "golden" => 1800,
             _ => 120,
         };
         let secs = |k: &str, d: u64| Duration::from_secs(var(k).and_then(|v| v.parse().ok()).unwrap_or(d));

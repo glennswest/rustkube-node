@@ -69,3 +69,19 @@ host_network = true
 cluster_read = [
   { apiGroup = "", resource = "nodes" },
 ]
+
+[golden]
+# The kubelet makes a sealed, de-identified golden from a running VM (#344,
+# vmcloud-image-operator#50): VMIs and VirtualMachineGolden requests in the
+# run's namespace (its Role), booted from the release's golden
+# (RUSTKUBE_NODE_TEST_VM_GOLDEN, default fedora-44-x86_64) on this node. The
+# requests need vmimages' CRD (vmimages 60119d9+, it installs it). Which Node
+# STORM_NODE is. The sealed golden stays on the node's engine: the kubelet
+# made it and a test's storage user may not delete it, so `cleanup` names it
+# as a skip. Not in `required`, and 30 min so no night lane picks it up: it
+# runs on request (`stormcentral test run rustkube-node golden`).
+budget_secs = 1800
+requires = ["kvm"]
+cluster_read = [
+  { apiGroup = "", resource = "nodes" },
+]

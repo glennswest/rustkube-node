@@ -15,6 +15,11 @@
 #             image's own driver; its driver pod is privileged with
 #             /var/lib/kubelet Bidirectional, its restart-kubelet pod
 #             privileged and hostPID (#52).
+#             golden (< 30 min, on request, requires kvm): VMIs and
+#             VirtualMachineGolden requests in the run's namespace; a
+#             no-agent guest's request Fails, a good one Seals, its clone
+#             has a new machine-id; the sealed golden is left on the node's
+#             engine, named by `cleanup` (#344).
 #   requires: []            (storage comes from the node's stormblock engine
 #                            through the kubelet. Where the class is not
 #                            offered — no StorageClass stormblock of

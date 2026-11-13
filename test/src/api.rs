@@ -89,6 +89,87 @@ impl Api {
             (c, v) => Err(Self::fail("DELETE", path, c, &v)),
         }
     }
+
+    /// What a VMI's serial console says, the way `virtctl console` reaches
+    /// it: the apiserver's `subresources.kubevirt.io` door, a WebSocket
+    /// proxied to the kubelet, which replays the tail of the console log
+    /// and then streams it. Read for up to `window`, or until `enough` says
+    /// it has what it wants; the door is closed after. An error is a door
+    /// that would not open (the VM not yet running, the route not served).
+    ///
+    /// The frames are read by [`ws_frame`]: this crate has no WebSocket
+    /// library, and a reader of a server's unmasked frames is all it needs.
+    pub async fn console(&self, ns: &str, vmi: &str, window: Duration, enough: impl Fn(&str) -> bool) -> Result<String, String> {
+        use tokio::io::AsyncReadExt;
+
+        let path = format!("/apis/subresources.kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{vmi}/console");
+        let mut req = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .header("connection", "Upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            // Any sixteen bytes, base64'd; the answer's accept is not checked.
+            .header("sec-websocket-key", "c3Rvcm12bS10ZXN0LWtleQ==");
+        if let Some(t) = &self.token {
+            req = req.bearer_auth(t);
+        }
+        let resp = req.send().await.map_err(|e| format!("GET {path}: {e}"))?;
+        if resp.status().as_u16() != 101 {
+            let code = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("the console door of {ns}/{vmi} answered {code}, not a WebSocket: {}", short(&Value::String(body))));
+        }
+        let mut io = resp.upgrade().await.map_err(|e| format!("upgrading {path}: {e}"))?;
+        let deadline = tokio::time::Instant::now() + window;
+        let (mut buf, mut seen, mut chunk) = (Vec::new(), String::new(), vec![0u8; 16 * 1024]);
+        'read: while !enough(&seen) {
+            let n = match tokio::time::timeout_at(deadline, io.read(&mut chunk)).await {
+                Err(_) | Ok(Ok(0)) | Ok(Err(_)) => break,
+                Ok(Ok(n)) => n,
+            };
+            buf.extend_from_slice(&chunk[..n]);
+            while let Some((op, payload, used)) = ws_frame(&buf) {
+                buf.drain(..used);
+                match op {
+                    // Continuation, text, binary.
+                    0..=2 => seen.push_str(&String::from_utf8_lossy(&payload)),
+                    // Close.
+                    8 => break 'read,
+                    _ => {}
+                }
+            }
+        }
+        Ok(seen)
+    }
+}
+
+/// One WebSocket frame from the front of `buf` (RFC 6455 §5.2): its opcode,
+/// its payload (unmasked) and how many bytes it took; `None` while `buf`
+/// does not yet hold a whole frame.
+pub fn ws_frame(buf: &[u8]) -> Option<(u8, Vec<u8>, usize)> {
+    if buf.len() < 2 {
+        return None;
+    }
+    let op = buf[0] & 0x0f;
+    let masked = buf[1] & 0x80 != 0;
+    let (len, mut at) = match buf[1] & 0x7f {
+        126 => (u16::from_be_bytes(buf.get(2..4)?.try_into().ok()?) as usize, 4),
+        127 => (u64::from_be_bytes(buf.get(2..10)?.try_into().ok()?) as usize, 10),
+        n => (n as usize, 2),
+    };
+    let mask = if masked {
+        let m: [u8; 4] = buf.get(at..at + 4)?.try_into().ok()?;
+        at += 4;
+        Some(m)
+    } else {
+        None
+    };
+    let mut payload = buf.get(at..at.checked_add(len)?)?.to_vec();
+    if let Some(m) = mask {
+        payload.iter_mut().enumerate().for_each(|(i, b)| *b ^= m[i % 4]);
+    }
+    Some((op, payload, at + len))
 }
 
 /// A value for an error message, cut short.
@@ -185,6 +266,23 @@ mod tests {
         assert_eq!(rfc3339_secs("2026-09-26T07:18:29.123456Z"), Some(1_790_407_109));
         assert_eq!(rfc3339_secs("2000-03-01T00:00:00Z"), Some(951_868_800));
         assert_eq!(rfc3339_secs("garbage"), None);
+    }
+
+    #[test]
+    fn websocket_frames_are_read_whole() {
+        assert_eq!(ws_frame(&[0x81]), None);
+        assert_eq!(ws_frame(&[0x82, 3, b'a', b'b']), None);
+        assert_eq!(ws_frame(&[0x82, 3, b'a', b'b', b'c', 0x81]), Some((2, b"abc".to_vec(), 5)));
+        let mut long = vec![0x81, 126, 1, 0];
+        long.extend([b'x'; 256]);
+        let (op, p, used) = ws_frame(&long).unwrap();
+        assert_eq!((op, p.len(), used), (1, 256, 260));
+        // A masked frame is unmasked.
+        let m = [1u8, 2, 3, 4];
+        let mut f = vec![0x81, 0x80 | 2, 1, 2, 3, 4];
+        f.extend([b'h' ^ m[0], b'i' ^ m[1]]);
+        assert_eq!(ws_frame(&f), Some((1, b"hi".to_vec(), 8)));
+        assert_eq!(ws_frame(&[0x88, 0]), Some((8, vec![], 2)));
     }
 
     #[test]

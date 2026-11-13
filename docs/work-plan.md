@@ -67,6 +67,10 @@ by this node and not in flight (a kubelet restart) is Failed and cleaned up (onc
        Resume: on a release with #345 + this, a vmimages golden-from-VM request (or a hand-made `VirtualMachineGolden`) on a VM with
        qemu-guest-agent: `Sealed` with volumeId/sha256, the golden clones and boots with a new machine-id; a no-agent guest `Failed`, nothing left.
        2026-11-10: #345 done (7c37659, has 613dbed). No release carries it: 12.74.7 has 8b8ebef, 12.75 has 78bf751. Proposed `--after-release rustkube-node>=7c37659`.
+       2026-11-13: 12.79 carries both (rustkube-node 0c4a931, vmimages 60119d9 with the CRD) but is on no pve test machine (pvetest1/3 run
+       12.78.14). The live run is a test suite, `golden` (test/src/golden.rs): no-agent → Failed, good → Sealed, clone → new machine-id;
+       leaves the golden (no admin token in tests). Doing: commit, sc-build the test crate, propose `--after-install rustkube-node>=0c4a931@any:pve`,
+       then `stormcentral test run rustkube-node golden` and close on a pass.
 
 ### Done: #342 (P2), /vmInstance: a host-network pod's bound token answered 404 (stormimds#19, pvetest2)
 

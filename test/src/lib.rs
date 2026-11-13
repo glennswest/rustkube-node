@@ -15,6 +15,10 @@
 //!   standard, with the standard CNI plugins (`multus.rs`).
 //! - `metadata` (< 5 min, #342): a host-network pod's own instance metadata
 //!   from its node's kubelet by its bound ServiceAccount token (`metadata.rs`).
+//! - `golden` (< 30 min, #344, on request only): the kubelet makes a sealed,
+//!   de-identified golden from a running VM when a `VirtualMachineGolden`
+//!   asks; a clone of it has a new machine-id (`golden.rs`). Leaves the
+//!   golden on the node's engine (a test may not delete it).
 //! - `long` (the night): waves of pods sized from the node's capacity,
 //!   measuring start latency and what each wave leaves behind (`long.rs`).
 //!
@@ -27,6 +31,7 @@ pub mod api;
 pub mod csi;
 pub mod csi_driver;
 pub mod env;
+pub mod golden;
 pub mod k8s;
 pub mod long;
 pub mod medium;
@@ -90,8 +95,9 @@ pub async fn run(env: Arc<Env>, r: &mut Report) {
         "csi" => Box::pin(csi::run(env, api, r)).await,
         "multus" => Box::pin(multus::run(env, api, r)).await,
         "metadata" => Box::pin(metadata::run(env, api, r)).await,
+        "golden" => Box::pin(golden::run(env, api, r)).await,
         other => {
-            r.record("suite", Outcome::Infra(format!("STORM_SUITE {other:?} is not short, medium, long, csi, multus or metadata")), 0, None);
+            r.record("suite", Outcome::Infra(format!("STORM_SUITE {other:?} is not short, medium, long, csi, multus, metadata or golden")), 0, None);
         }
     }
 }
