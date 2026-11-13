@@ -71,6 +71,9 @@ by this node and not in flight (a kubelet restart) is Failed and cleaned up (onc
        12.78.14). The live run is a test suite, `golden` (test/src/golden.rs): no-agent → Failed, good → Sealed, clone → new machine-id;
        leaves the golden (no admin token in tests). Doing: commit, sc-build the test crate, propose `--after-install rustkube-node>=0c4a931@any:pve`,
        then `stormcentral test run rustkube-node golden` and close on a pass.
+       Done: ee3a3e1 + 8fddad6, 2cefcf6 (compile/clippy fixes, #364/#365 closed by the passing build). SC_BUILD_VM sc-build of the test crate
+       (clippy -D warnings, cargo test): 59 pass, 5 new. 12.78.14 already has the kubelet half (5d5542f ⊇ 7c37659); the gate is vmimages'
+       CRD. Proposed `--after-install vmimages>=60119d9@any:pve`; comment issuecomment-6866656867. Resume: `stormcentral test run rustkube-node golden`.
 
 ### Done: #342 (P2), /vmInstance: a host-network pod's bound token answered 404 (stormimds#19, pvetest2)
 
