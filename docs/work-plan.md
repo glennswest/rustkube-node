@@ -27,6 +27,9 @@ Done: e8242e9 (code, 7 tests), 9581611/482bddd (docs), 5d5542f (medium `pod-rdma
 Stage build dfc286e1e525. Filed stormpump#230 (Spec rlimits, MEMLOCK), rustkube#315 (scheduler: extended resources). Proposed `--after-release rustkube-node>=e8242e9`.
 Resume: an X9 blade (ConnectX-3, stormcos#914's modules) on a release with it: Node shows `rdma.storm.io/hca`; `stormcentral test run rustkube-node medium --tag
 server8` (after a pve pass, #791): `pod-rdma` passes (not skipped); close. If the blade shows no resource: `/sys/class/infiniband_verbs` on it (stormcos#914).
+2026-11-13: 12.74 carries rustkube-node 78bf751 and modules 32f2dfa, both behind e8242e9 / stormcos 7882c46. Re-proposed
+`--after-install rustkube-node>=e8242e9@any:hardware` (item b1a6ccabec1b); `modules` is not a registry component, so it cannot be named, but
+its verbs image (0818ddcdd110) was staged before this golden and releases compose forward. stormpump#230 still open (CAP_IPC_LOCK covers it).
 
 ### Done: #352 (P2), stormvm → 71bf5b5: machine.type (pc/i440fx) and the ide bus (stormvm#117)
 
