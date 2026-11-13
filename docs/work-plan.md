@@ -1780,7 +1780,7 @@ is live GETs already.
 2026-10-07. de51950: README, BUILD.md, status.md, presentation, CLAUDE.md (flowsdn owns Services in its edition,
 #145; checked against stormcos main). sc-build: deck renders (12 slides), `cargo build --locked` ok. Closed.
 
-### Waiting on the night's long run f47d49df0d: #61, short, medium and long test suites (stormcentral docs/test-standard.md)
+### Doing: #61 long sized by memory (ef37856d6b lost the node); #61, short, medium and long test suites (stormcentral docs/test-standard.md)
 
 2026-10-06. `test/` has medium's storage cases (#64, #59, #62, #67); short and long are one skip each. The
 runner's namespace Role is `*`; cluster reads come from `test/requires.toml` (only [medium] declares `nodes`, which
@@ -1844,6 +1844,13 @@ every suite needs to resolve STORM_NODE). Pods are pinned with `spec.nodeName` (
        results). Not the suite: pve shut VM 3102 down at 04:14:13Z (`pvesh qmshutdown:3102`, timeout, then off, started again 04:16:11Z) while the run held the
        machine; the node's syslog has nothing before that boot. Master told (stormcentral note). Queued long ef37856d6b (3dc1ddf, pvetest3, window 04:00Z). #61 proposed
        `--after-release rustkube-node>=3dc1ddf`. Resume: `stormcentral test show ef37856d6b`; fix or file what fails; close on a pass. (#350 is medium's own flake on a 4Gi node.)
+       2026-11-13: ef37856d6b (3dc1ddf, pvetest3) error the same way: Job `running`, then every apiserver call `error sending request`. No power
+       cycle this time: pve shows VM 3103 untouched 04:00:40Z-05:11:09Z, and its scope `15.9G memory peak` (idle boots 9.6-12.4G). The wave
+       (80% of 110 slots, ~88 BestEffort pods) ran the node out of memory and took its apiserver with it; the kubelet reports MemoryPressure
+       but neither refuses nor evicts (filed separately). `nodes/proxy` (stats/summary) is refused to suites (stormcentral testruns.rs), so
+       Doing: long ramps each wave in steps of 10, reading the node's /proc/meminfo (global, the runner is on the node); it stops adding pods
+       when MemAvailable falls under a floor (20% of MemTotal, at least 1 GiB; `RUSTKUBE_NODE_TEST_MEM_FLOOR_PCT`), and later waves take the
+       first wave's size. The wave's fields carry the memory it saw. Tests, CHANGELOG, docs; sc-build test crate; long on pvetest3 at night.
 
 ### Done: #171 (P2), fsGroup / supplementalGroups onto the engine
 
