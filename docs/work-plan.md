@@ -1780,7 +1780,7 @@ is live GETs already.
 2026-10-07. de51950: README, BUILD.md, status.md, presentation, CLAUDE.md (flowsdn owns Services in its edition,
 #145; checked against stormcos main). sc-build: deck renders (12 slides), `cargo build --locked` ok. Closed.
 
-### Doing: #61 long sized by memory (ef37856d6b lost the node); #61, short, medium and long test suites (stormcentral docs/test-standard.md)
+### Waiting on long fd087d88ec: #61, short, medium and long test suites (stormcentral docs/test-standard.md)
 
 2026-10-06. `test/` has medium's storage cases (#64, #59, #62, #67); short and long are one skip each. The
 runner's namespace Role is `*`; cluster reads come from `test/requires.toml` (only [medium] declares `nodes`, which
@@ -1851,6 +1851,9 @@ every suite needs to resolve STORM_NODE). Pods are pinned with `spec.nodeName` (
        Doing: long ramps each wave in steps of 10, reading the node's /proc/meminfo (global, the runner is on the node); it stops adding pods
        when MemAvailable falls under a floor (20% of MemTotal, at least 1 GiB; `RUSTKUBE_NODE_TEST_MEM_FLOOR_PCT`), and later waves take the
        first wave's size. The wave's fields carry the memory it saw. Tests, CHANGELOG, docs; sc-build test crate; long on pvetest3 at night.
+       Done: e73b4bc (README, configuration.md, CHANGELOG). sc-build test crate (VM sc-build-def6ca7013): clippy -D warnings 0, 53 tests. Filed #363
+       (kubelet: MemoryPressure not acted on; with #205). Long fd087d88ec queued on pvetest3 (window 04:00Z). #61 proposed `--after-run fd087d88ec`.
+       Resume: `stormcentral test show fd087d88ec`; waves' `mem_stopped`/`mem_low_mib`; close #61 on a pass, else fix or file what fails.
 
 ### Done: #171 (P2), fsGroup / supplementalGroups onto the engine
 
