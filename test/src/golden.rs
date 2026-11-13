@@ -135,8 +135,7 @@ pub fn request(env: &Env, name: &str, vm: &str, golden: &str) -> Value {
 /// The last machine-id the console printed after [`ID_MARKER`].
 pub fn machine_id(console: &str) -> Option<String> {
     console
-        .match_indices(ID_MARKER)
-        .rev()
+        .rmatch_indices(ID_MARKER)
         .find_map(|(i, m)| {
             let id: String = console[i + m.len()..].chars().take_while(char::is_ascii_hexdigit).collect();
             (id.len() == 32).then_some(id)
@@ -275,9 +274,10 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
         }
     }
 
+    let (says_id, no_agent) = (says_its_id(), has_no_agent());
     let (src, noagent) = tokio::join!(
-        suite.boot(SOURCE, &root, &says_its_id(), |c| machine_id(c).is_some()),
-        suite.boot(NO_AGENT, &root, &has_no_agent(), |c| c.contains(NO_AGENT_MARKER)),
+        suite.boot(SOURCE, &root, &says_id, |c| machine_id(c).is_some()),
+        suite.boot(NO_AGENT, &root, &no_agent, |c| c.contains(NO_AGENT_MARKER)),
     );
     let source_id = src.as_deref().ok().and_then(machine_id);
     r.record(
@@ -314,7 +314,7 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
         let o = if !sealed {
             Outcome::Skip(format!("no golden {golden} was sealed to boot"))
         } else {
-            match suite.boot(CLONE, &golden, &says_its_id(), |c| machine_id(c).is_some()).await {
+            match suite.boot(CLONE, &golden, &says_id, |c| machine_id(c).is_some()).await {
                 Ok(c) => judge_identity(src_id, machine_id(&c).as_deref()),
                 Err(e) => Outcome::Fail(e),
             }
