@@ -11,6 +11,8 @@ no manifest change. Rev-only bump of the 9 lock entries + pkg/kubelet/Cargo.toml
 (stormvm#37 closes on medium's `memsnap-resumed` on a release carrying it).
 Done: d933287. sc-build (VM sc-build-cc60422d2b): `--locked` build/test, 632 kubelet unit, all suites; 9 stormvm lock entries at c9cd494;
 warnings unchanged (#227's, none in stormvm or new). Stage build 83ae4197e8a9. Closed. Live: stormvm medium `memsnap-resumed` on a release carrying it.
+Item fdebb372361d came back (closing the issue does not end it): `shipped` with proof `log:` the kubelet's first static pod running on a
+release carrying d933287 (the bump's on-node regression check); the memory-snapshot proof stays stormvm#37's `memsnap-resumed`.
 
 ### Done: #355 (P3), stormvm → 13a0781: passt as 65534 by number (stormvm#7)
 
