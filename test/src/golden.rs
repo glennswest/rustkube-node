@@ -124,11 +124,16 @@ pub fn vmi(env: &Env, name: &str, root: &str, user_data: &str) -> Value {
 }
 
 /// The request vmimages would write: golden `golden` from VMI `vm`.
+///
+/// The CRD requires `spec.image` (the `CloudImage` that asked; d74a5827f5
+/// was refused 422 without it). The kubelet never reads it, and vmimages
+/// reads a request only from its `CloudImage`'s side, so naming one that
+/// does not exist (the golden's own name) leaves the request to the kubelet.
 pub fn request(env: &Env, name: &str, vm: &str, golden: &str) -> Value {
     json!({
         "apiVersion": API, "kind": KIND,
         "metadata": { "name": name, "namespace": env.namespace, "labels": k8s::labels(env) },
-        "spec": { "vm": vm, "golden": golden },
+        "spec": { "vm": vm, "golden": golden, "image": golden },
     })
 }
 
@@ -354,7 +359,7 @@ mod tests {
         assert_eq!(v["spec"]["volumes"][0]["dataVolume"]["name"], "fedora-44-x86_64");
         assert_eq!(v["metadata"]["labels"]["storm.io/test-run"], json!(env.run_id));
         let q = request(&env, ASK_SEAL, SOURCE, "rkn-golden-x");
-        assert_eq!(q["spec"], json!({"vm": SOURCE, "golden": "rkn-golden-x"}));
+        assert_eq!(q["spec"], json!({"vm": SOURCE, "golden": "rkn-golden-x", "image": "rkn-golden-x"}));
         assert_eq!(q["apiVersion"], API);
     }
 
