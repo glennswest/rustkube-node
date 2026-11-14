@@ -107,7 +107,8 @@ Done in code: `stamp_condition_transitions` (kubelet.rs, test `conditions_carry_
 a8f0511: sc-build passed (632 kubelet unit tests, no new warnings), stage build d753d5d3a625, comment on #340. Held `--after-install rustkube-node>=a8f0511`.
 Resume: run the cluster test on both flavours. Cilium also needs stormcos-cilium#52; flowsdn needs a release with flowsdn#404. Close if the first pod is within ~300 ms of one node.
 2026-11-13: 12.81 / 12.81-flowsdn carry rustkube-node 0c4a931 (has a8f0511). Running `testhost cluster-test pvetest1 pvetest2 12.81-flowsdn`
-(output tmp/ct-flowsdn.log). Cilium waits on stormcos-cilium#52 (open).
+(output tmp/ct-flowsdn.log): 403, the paired test is the master's. Noted the master to run it on 12.81-flowsdn (and 12.81 cilium after
+stormcos-cilium#52); held `--after stormcos-cilium#52`. Resume: read `testhost cluster-tests` for a 12.81+ run; close on ~300 ms.
 
 ### Earlier: waiting on stormcentral#1274 (the cluster test's pod timing): #340 (P1), first pod on a cluster worker 2.1 s (flowsdn) / 4.1 s (cilium) vs 160 ms on one node
 
