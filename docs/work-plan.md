@@ -1807,7 +1807,13 @@ is live GETs already.
 2026-10-07. de51950: README, BUILD.md, status.md, presentation, CLAUDE.md (flowsdn owns Services in its edition,
 #145; checked against stormcos main). sc-build: deck renders (12 slides), `cargo build --locked` ok. Closed.
 
-### Waiting on long fd087d88ec: #61, short, medium and long test suites (stormcentral docs/test-standard.md)
+### Waiting on long 7dae7cfca6 / 0e99f2d197: #61, short, medium and long test suites (stormcentral docs/test-standard.md)
+
+2026-11-14: fd087d88ec (e73b4bc, pvetest3) never reached the suite: `apiserver did not answer /readyz within 10 minutes` after `power`.
+pvetest3's 12.81 install had been cancelled at 'checks' (node in the initramfs shell after the power-cut reboot: storage refused its own
+system drive, FATAL diskless; stormblock bug, filed by stormcos). Not the suite. Requeued long at 7406719 (long unchanged since e73b4bc):
+7dae7cfca6 on pvetest1 (12.81), 0e99f2d197 on pvetest2 (12.81-flowsdn), night window. Held `--after-run 7dae7cfca6`.
+Resume: `stormcentral test show 7dae7cfca6` and `0e99f2d197`; fix or file what fails; close on a pass.
 
 2026-10-06. `test/` has medium's storage cases (#64, #59, #62, #67); short and long are one skip each. The
 runner's namespace Role is `*`; cluster reads come from `test/requires.toml` (only [medium] declares `nodes`, which
