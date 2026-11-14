@@ -1810,7 +1810,7 @@ is live GETs already.
 2026-10-07. de51950: README, BUILD.md, status.md, presentation, CLAUDE.md (flowsdn owns Services in its edition,
 #145; checked against stormcos main). sc-build: deck renders (12 slides), `cargo build --locked` ok. Closed.
 
-### Doing: #61 long ran the night; one ~30 s stall each: #61, short, medium and long test suites (stormcentral docs/test-standard.md)
+### Waiting on long ccfea13ac4 / 9c755fea1c: #61 long ran the night; one ~30 s stall each: #61, short, medium and long test suites (stormcentral docs/test-standard.md)
 
 2026-11-14 (14:30Z): both runs went the whole window: 7dae7cfca6 (pvetest1) 664 pass / 1 fail, 0e99f2d197
 (pvetest2, flowsdn) 658 / 1. Each failed one wave on p95 start ~31 s (wave-426, wave-131); max ~31.6-32.1 s, every other
@@ -1820,6 +1820,10 @@ blinds the runner for 30 s and every pod of that step reads 30 s late. Doing: a 
 saw and its own `startedAt - creationTimestamp` + 1 s (both second-resolution; still an upper bound); each wave records
 `api_slowest_ms` / `api_errors` and names its slowest pods. Then: sc-build, close #61 (the suite works on two nodes),
 rerun long to read the new fields; a real kubelet or apiserver stall is filed on its own.
+Done: 165093b; sc-build (sc-build-3eb267c1a0, `test/`: clippy -D warnings clean, 61 tests). Queued long at 165093b:
+ccfea13ac4 (pvetest1), 9c755fea1c (pvetest2), night window; held `--after-run ccfea13ac4`. Resume: `stormcentral test
+show` both; a wave still slow with a small `api_slowest_ms` is the kubelet's (file it, with the slowest pods); a big
+`api_slowest_ms` with passing waves is the apiserver's/runner's (file on rustkube if it repeats); close #61 on a pass.
 
 2026-11-14: fd087d88ec (e73b4bc, pvetest3) never reached the suite: `apiserver did not answer /readyz within 10 minutes` after `power`.
 pvetest3's 12.81 install had been cancelled at 'checks' (node in the initramfs shell after the power-cut reboot: storage refused its own
