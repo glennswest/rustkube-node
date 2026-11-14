@@ -1810,7 +1810,16 @@ is live GETs already.
 2026-10-07. de51950: README, BUILD.md, status.md, presentation, CLAUDE.md (flowsdn owns Services in its edition,
 #145; checked against stormcos main). sc-build: deck renders (12 slides), `cargo build --locked` ok. Closed.
 
-### Waiting on long 7dae7cfca6 / 0e99f2d197: #61, short, medium and long test suites (stormcentral docs/test-standard.md)
+### Doing: #61 long ran the night; one ~30 s stall each: #61, short, medium and long test suites (stormcentral docs/test-standard.md)
+
+2026-11-14 (14:30Z): both runs went the whole window: 7dae7cfca6 (pvetest1) 664 pass / 1 fail, 0e99f2d197
+(pvetest2, flowsdn) 658 / 1. Each failed one wave on p95 start ~31 s (wave-426, wave-131); max ~31.6-32.1 s, every other
+wave's p95 under 4.6 s, nothing left after any drain, the memory floor held. The node's syslog stops at 03:50Z, so no node
+log. ~30 s is the runner's own reqwest timeout (`test/src/api.rs`), and `poll` drops failed lists, so one hung API call
+blinds the runner for 30 s and every pod of that step reads 30 s late. Doing: a pod's start is the lesser of what the runner
+saw and its own `startedAt - creationTimestamp` + 1 s (both second-resolution; still an upper bound); each wave records
+`api_slowest_ms` / `api_errors` and names its slowest pods. Then: sc-build, close #61 (the suite works on two nodes),
+rerun long to read the new fields; a real kubelet or apiserver stall is filed on its own.
 
 2026-11-14: fd087d88ec (e73b4bc, pvetest3) never reached the suite: `apiserver did not answer /readyz within 10 minutes` after `power`.
 pvetest3's 12.81 install had been cancelled at 'checks' (node in the initramfs shell after the power-cut reboot: storage refused its own
