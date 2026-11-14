@@ -73,6 +73,9 @@ vol-3b05… for disk root: 404`, and golden-sealed found the name taken by ed227
 done, so the copy stayed. Doing: after the restore, the copy's engine id by name (volume_named); not listed → Failed with "not removed".
 Test: judge_failed needs the message to name the agent (9f184d6390 passed it on an attach 404). sc-build; stage; rerun golden on pvetest2.
 The rkn-golden-9f184d6390 copy (ed22779b-…) stays on pvetest2's engine: tests have no admin token; named on the issue.
+Done: 6b36f19. sc-build (VM sc-build-646357b46b): --locked build/test (633 kubelet unit), test crate clippy -D warnings + 61 tests.
+(An earlier run with kubelet clippy filed #369: a pre-existing never_loop in pod_manager.rs:3781; closed as part of #227.) Stage 573ea87ea979.
+Held `--after-install rustkube-node>=6b36f19@any:pve`. Resume: `stormcentral test run rustkube-node golden` on that machine; close on a pass.
 
 2026-11-10. stormvm 6e188a6 (the lock) has `stormvm_node::golden` (root_disk, sealer_spec, DEIDENTIFY/DEIDENTIFIED, provenance) and the
 flow in its CLI (`make_golden`). Not in a library, so the kubelet runs the steps itself. Chosen: no owner on the golden (#75's sweep deletes
