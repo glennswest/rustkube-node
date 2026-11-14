@@ -52,7 +52,8 @@ Stage build 1e5aa3c76f78. Closed. Live: stormvm medium `snapshot-restore` / `mem
 ### Waiting on a release with 7c37659 for the live run: #344 (P3), the golden-from-VM sealer: reconcile storm.io VirtualMachineGolden (vmcloud-image-operator#50)
 
 2026-11-13: 12.81 carries rustkube-node 0c4a931 and vmimages 06bcff6 (after 60119d9: the CRD). Running `stormcentral test run rustkube-node golden`
-(tmp/golden-run.log). Pass → close; fail → fix what it names.
+(tmp/golden-run.log). Pass → close; fail → fix what it names. e9150c9ade (pvetest1, 12.78.14): skip golden-crd (no CRD there).
+d74a5827f5 (pvetest2, 12.81-flowsdn) queued; held `--after-run d74a5827f5`. Resume: `stormcentral test show d74a5827f5`.
 
 2026-11-10. stormvm 6e188a6 (the lock) has `stormvm_node::golden` (root_disk, sealer_spec, DEIDENTIFY/DEIDENTIFIED, provenance) and the
 flow in its CLI (`make_golden`). Not in a library, so the kubelet runs the steps itself. Chosen: no owner on the golden (#75's sweep deletes
