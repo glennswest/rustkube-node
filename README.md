@@ -944,7 +944,10 @@ with `CAP_IPC_LOCK` effective. A pod that doesn't ask must see neither.
     VirtualMachineSnapshot annotated `storm.io/memory: "true"` also saves the
     guest's memory and device state, into a thin volume
     `<ns>.<vm>.<snapshot>.state` that joins the same group (the guest paused
-    while its RAM is written). Its status then says `storm.io/memory: true`,
+    while its RAM is written). The kubelet opens the state volume's device
+    itself (write-only, no truncate) and hands qemu the descriptor (`fd:`,
+    stormvm c9cd494, #367): qemu's `file:` target truncates, and a ublk device
+    cannot be. Its status then says `storm.io/memory: true`,
     `storm.io/stateVolume` and `storm.io/memoryBytes`. A VM with a disk on
     another driver's claim is refused (the state and that disk would not be of
     one instant).
@@ -1159,7 +1162,7 @@ VM manager's orphan and adoption passes leave to its request.
 
 Limits: the engine calls go through stormvm's client, so an `https://` engine
 URL needs #318 (as snapshots do). On one node, `volume_from_snapshot` relies on
-stormvm 893b2e8 or later (#345: no slave replicas on a restore); the kubelet pins 13a0781 (#352, #355). The kubelet's
+stormvm 893b2e8 or later (#345: no slave replicas on a restore); the kubelet pins c9cd494 (#352, #355, #367). The kubelet's
 identity (`system:nodes`) is bound to cluster-admin by rustkube's bootstrap, so
 no RBAC is added; a tightened node role needs `get/list/watch` on
 `virtualmachinegoldens` and `patch` on `virtualmachinegoldens/status`.
