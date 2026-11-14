@@ -4,11 +4,13 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #367 (P3), stormvm → c9cd494: a memory snapshot's state through fd:, not file: (stormvm#37)
+### Done: #367 (P3), stormvm → c9cd494: a memory snapshot's state through fd:, not file: (stormvm#37)
 
 2026-11-13. 16 commits fast-forward on 13a0781, code only in stormvm-control snapshot.rs (#37) and stormvm-vmm qemu.rs (#76 usb-tablet);
 no manifest change. Rev-only bump of the 9 lock entries + pkg/kubelet/Cargo.toml; README/status.md, CHANGELOG; sc-build; stage; close
 (stormvm#37 closes on medium's `memsnap-resumed` on a release carrying it).
+Done: d933287. sc-build (VM sc-build-cc60422d2b): `--locked` build/test, 632 kubelet unit, all suites; 9 stormvm lock entries at c9cd494;
+warnings unchanged (#227's, none in stormvm or new). Stage build 83ae4197e8a9. Closed. Live: stormvm medium `memsnap-resumed` on a release carrying it.
 
 ### Done: #355 (P3), stormvm → 13a0781: passt as 65534 by number (stormvm#7)
 
