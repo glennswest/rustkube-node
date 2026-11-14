@@ -132,7 +132,9 @@ pub fn decide(obj: &Value, node: &str, source_here: bool, in_flight: bool) -> Ac
 pub trait Engine: Send + Sync {
     /// The id of the volume named `name`, if there is one.
     async fn volume_named(&self, name: &str) -> Result<Option<String>, String>;
-    /// A new volume named `name` holding `snapshot`; its id.
+    /// A new volume named `name` holding `snapshot`. What it answers is the
+    /// `/v1` contract's id (`vol-<hex>`), which no `/api/v1` call knows:
+    /// the copy's engine id is looked up by name ([`Engine::volume_named`]).
     async fn volume_from_snapshot(&self, name: &str, snapshot: &stormvm_block::Snapshot) -> Result<String, String>;
     async fn seal(&self, id: &str) -> Result<(), String>;
     /// The sealed volume's sha256, when the engine has it.
@@ -325,9 +327,24 @@ impl Goldens {
         let snap = group.of(&root_id).cloned()
             .ok_or_else(|| format!("the snapshot {} has no member for {root_id}", group.id))?;
 
-        // 2. The copy, under the golden's name.
-        let copy = self.engine.volume_from_snapshot(&golden, &snap).await
+        // 2. The copy, under the golden's name. stormblock's `/v1` restore
+        // answers its own id (`vol-<hex>`); attach, seal, digest and delete
+        // are `/api/v1` calls and take the engine's id, found by name. Run
+        // 9f184d6390 attached the `/v1` id (404), and its cleanup's delete
+        // of that id was a 404 too, taken as done: the copy stayed.
+        let v1 = self.engine.volume_from_snapshot(&golden, &snap).await
             .map_err(|e| format!("copying {}'s root disk as {golden}: {e}", vm.name))?;
+        let copy = match self.engine.volume_named(&golden).await {
+            Ok(Some(id)) => id,
+            Ok(None) => return Err(format!(
+                "copying {}'s root disk as {golden}: the engine made {v1} but lists no volume named {golden}; not removed: the copy {v1}",
+                vm.name
+            )),
+            Err(e) => return Err(format!(
+                "copying {}'s root disk as {golden}: finding the copy {v1} by name: {e}; not removed: the copy {v1}",
+                vm.name
+            )),
+        };
         made.copy = Some(copy.clone());
         self.patch_status(obj, json!({
             "phase": SEALING,
@@ -675,17 +692,27 @@ mod tests {
         log: Log,
         existing: Option<String>,
         fail_seal: bool,
+        /// The names volume_from_snapshot made, listed by volume_named
+        /// under the engine id `v-copy`.
+        made: StdMutex<Vec<String>>,
+        /// The made copy is not listed by name.
+        unlisted: bool,
     }
 
     #[async_trait]
     impl Engine for FakeEngine {
         async fn volume_named(&self, name: &str) -> Result<Option<String>, String> {
             self.log.lock().unwrap().push(format!("named {name}"));
+            if !self.unlisted && self.made.lock().unwrap().iter().any(|n| n == name) {
+                return Ok(Some("v-copy".into()));
+            }
             Ok(self.existing.clone())
         }
         async fn volume_from_snapshot(&self, name: &str, s: &stormvm_block::Snapshot) -> Result<String, String> {
             self.log.lock().unwrap().push(format!("copy {name} from {}", s.id));
-            Ok("v-copy".into())
+            self.made.lock().unwrap().push(name.to_string());
+            // The /v1 id, which is not the engine's (run 9f184d6390).
+            Ok("vol-v1copy".into())
         }
         async fn seal(&self, id: &str) -> Result<(), String> {
             self.log.lock().unwrap().push(format!("seal {id}"));
@@ -791,6 +818,7 @@ mod tests {
             "named company-base",
             "snapshot v-root as ci.base.golden-company-base",
             "copy company-base from s-1",
+            "named company-base",
             "start base-sealer as vmgolden-r-1 on Volume(\"v-copy\")",
             "deidentify base-sealer",
             "stop base-sealer",
@@ -827,6 +855,23 @@ mod tests {
         log.lock().unwrap().clear();
         assert!(gs.remove(&made).await.is_empty());
         assert_eq!(*log.lock().unwrap(), vec!["stop base-sealer", "delete volume v-copy", "delete group g-1"]);
+    }
+
+    /// The copy is attached, sealed and deleted by the engine's id, never
+    /// by the `/v1` id its restore answered; one the engine does not list
+    /// by name is said as left behind, not taken as removed.
+    #[tokio::test]
+    async fn the_copy_is_known_by_its_engine_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().to_str().unwrap();
+        let log: Log = Default::default();
+        let gs = goldens(FakeEngine { log: log.clone(), unlisted: true, ..Default::default() },
+                         FakeMachines { log: log.clone(), run_dir: run.into(), ..Default::default() }, run);
+        let mut made = Made::default();
+        let err = gs.make(&request(None, None), &vmi(), &source(run), &mut made).await.unwrap_err();
+        assert!(err.contains("not removed: the copy vol-v1copy"), "{err}");
+        assert_eq!(made.copy, None, "the /v1 id is never handed to an /api/v1 call");
+        assert!(!log.lock().unwrap().iter().any(|l| l.starts_with("start ")), "no sealer on an unknown copy");
     }
 
     /// A seal refused: the stopped copy and the group are removed.

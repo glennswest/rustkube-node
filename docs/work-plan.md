@@ -67,6 +67,12 @@ d74a5827f5 (pvetest2, 12.81-flowsdn) queued; held `--after-run d74a5827f5`. Resu
 d74a5827f5: failed, both requests 422 `spec.image: Required value` (the CRD requires it; the test sent vm+golden only). Fixed in the test
 (`image` = the golden's name), 7a0d963; sc-build of test/ (clippy -D warnings, cargo test) passed (VM sc-build-f02e649987).
 Rerun at 7a0d963: 9f184d6390 (pvetest2, decides), cde82c6604 (pvetest1, 12.78.14: will skip). Held `--after-run 9f184d6390`.
+2026-11-14: 9f184d6390 failed (3 pass, 1 fail, 1 skip). A kubelet bug: no-agent ended `Failed: starting the sealer: attaching
+vol-3b05… for disk root: 404`, and golden-sealed found the name taken by ed22779b-… . stormblock's `/v1` restore answers its own id
+(`vol-<hex>`); attach/seal/digest/delete are `/api/v1` and take the engine's uuid. The cleanup's delete of the /v1 id was a 404, taken as
+done, so the copy stayed. Doing: after the restore, the copy's engine id by name (volume_named); not listed → Failed with "not removed".
+Test: judge_failed needs the message to name the agent (9f184d6390 passed it on an attach 404). sc-build; stage; rerun golden on pvetest2.
+The rkn-golden-9f184d6390 copy (ed22779b-…) stays on pvetest2's engine: tests have no admin token; named on the issue.
 
 2026-11-10. stormvm 6e188a6 (the lock) has `stormvm_node::golden` (root_disk, sealer_spec, DEIDENTIFY/DEIDENTIFIED, provenance) and the
 flow in its CLI (`make_golden`). Not in a library, so the kubelet runs the steps itself. Chosen: no owner on the golden (#75's sweep deletes

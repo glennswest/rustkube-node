@@ -156,6 +156,11 @@ pub fn judge_failed(obj: &Value) -> Outcome {
     if msg.contains("not removed") {
         return Outcome::Fail(format!("Failed, but left something behind: {msg}"));
     }
+    // Failed for its missing agent, not for anything before it: run
+    // 9f184d6390 passed here on a sealer that never started (an attach 404).
+    if !msg.contains("agent") {
+        return Outcome::Fail(format!("Failed, but not for the missing agent: {msg}"));
+    }
     Outcome::Pass(format!("Failed: {msg}"))
 }
 
@@ -384,6 +389,8 @@ mod tests {
         assert!(matches!(judge_failed(&failed), Outcome::Pass(_)));
         let left = json!({"status": {"phase": "Failed", "message": "x; not removed: volume rkn-golden-a"}});
         assert!(matches!(judge_failed(&left), Outcome::Fail(_)));
+        let early = json!({"status": {"phase": "Failed", "message": "starting the sealer: attaching vol-3b05 for disk root: 404 Not Found"}});
+        assert!(matches!(judge_failed(&early), Outcome::Fail(_)));
         assert!(matches!(judge_failed(&json!({"status": {"phase": "Sealed"}})), Outcome::Fail(_)));
 
         let sha = "a".repeat(64);

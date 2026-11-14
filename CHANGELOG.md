@@ -2,6 +2,8 @@
 
 ## 2026-11-14
 
+- **fix:** A golden-from-VM request knows its copy by the engine's id (#344). stormblock's `/v1` restore (`volume_from_snapshot`) answers the `/v1` contract's id (`vol-<hex>`), and the kubelet handed it to `/api/v1` calls, which take the engine's uuid. Run 9f184d6390 on pvetest2: the sealer's attach was a 404, and the cleanup's delete of that id was a 404 too, which counts as done, so the copy stayed under the golden's name and the next request was refused "already on this node's engine". After the restore, the copy's id is now looked up by name. If the engine lists no volume of that name, the request is `Failed` and says the copy was not removed. `golden-no-agent-fails` now passes only when the request failed for its missing agent, not for an earlier step.
+
 - **fix(test):** long measures a pod's start from the pod as well as the runner (#61). Both night runs at 7406719 went the whole window (7dae7cfca6 on pvetest1: 664 pass, 1 fail; 0e99f2d197 on pvetest2, flowsdn: 658 pass, 1 fail). Each failed one wave on a p95 start of ~31 s while every other wave's p95 stayed under 4.6 s. ~30 s is the runner's own client timeout, and the poll dropped a failed list, so one hung API call blinded the runner for 30 s and every pod of that step read 30 s late. A pod's start is now the lesser of what the runner saw and its own `startedAt - creationTimestamp` + 1 s (both are second-resolution timestamps, so it is still an upper bound). Each wave records `api_slowest_ms` and `api_errors`, names a call over 5 s, and a slow wave names its three slowest pods with both times.
 
 ## 2026-11-13
