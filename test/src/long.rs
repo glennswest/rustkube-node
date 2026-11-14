@@ -20,7 +20,14 @@
 //!    size, so they compare. When the Node's `capacity.memory` is not this
 //!    `MemTotal` (the runner on another node), the floor is not used.
 //! 2. **Measure** each pod's start: from its create to the first time the API
-//!    shows it Running (polled every second, so the resolution is a second).
+//!    shows it Running (polled every second, so the resolution is a second),
+//!    or the pod's own `startedAt - creationTimestamp` plus a second, when
+//!    that is less. Both upper-bound the start; the pod's own does not depend
+//!    on the runner watching. The runner's client waits 30 s on a request, so
+//!    one hung call made every pod of its step read 30 s late (7dae7cfca6,
+//!    0e99f2d197: one wave each in a night, p95 ~31 s). Each wave also
+//!    records its slowest API call and its failed ones, and a slow wave names
+//!    its slowest pods.
 //! 3. **Hold** 30 s, and read one pod's log back.
 //! 4. **Drain**: delete every pod and claim of the wave, and check they are
 //!    gone, and the claims' PVs reclaimed.
@@ -54,6 +61,73 @@ const STEP: usize = 10;
 /// How long one step's pods are waited on before the next memory read.
 const STEP_WAIT: Duration = Duration::from_secs(120);
 const GIB: u64 = 1 << 30;
+/// An API call this slow is named in the wave's line.
+const SLOW_CALL: u128 = 5_000;
+/// The slowest pods a slow wave names.
+const SLOWEST: usize = 3;
+
+/// Seconds since the epoch of an RFC 3339 UTC time (`2026-11-14T11:26:00Z`,
+/// with or without a fraction); `None` for anything else.
+pub fn epoch_secs(t: &str) -> Option<i64> {
+    let t = t.strip_suffix('Z')?;
+    let t = t.split('.').next()?;
+    let (date, time) = t.split_once('T')?;
+    let num = |s: &str| s.parse::<i64>().ok();
+    let mut d = date.splitn(3, '-').map(num);
+    let (y, m, day) = (d.next()??, d.next()??, d.next()??);
+    let mut c = time.splitn(3, ':').map(num);
+    let (h, min, sec) = (c.next()??, c.next()??, c.next()??);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&day) || h > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + h * 3600 + min * 60 + sec)
+}
+
+/// A Running pod's own start, ms: its container's `startedAt` less its
+/// `creationTimestamp`, plus the second both are truncated to, so it is an
+/// upper bound like the runner's.
+pub fn own_start_ms(p: &Value) -> Option<u128> {
+    let created = epoch_secs(s(p, "/metadata/creationTimestamp"))?;
+    let started = epoch_secs(s(p, "/status/containerStatuses/0/state/running/startedAt"))?;
+    u128::try_from(started.checked_sub(created)?).ok().map(|d| d * 1000 + 1000)
+}
+
+/// The start a pod is measured at: what the runner saw, or its own, if less.
+pub fn start_ms(seen: u128, own: Option<u128>) -> u128 {
+    own.map_or(seen, |o| o.min(seen))
+}
+
+/// A wave's API calls: the slowest, and how many failed.
+#[derive(Default)]
+pub struct Calls {
+    pub slowest_ms: u128,
+    pub slowest: String,
+    pub errors: usize,
+}
+
+impl Calls {
+    async fn time<T>(&mut self, what: &str, f: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
+        let t = Instant::now();
+        let r = f.await;
+        let ms = t.elapsed().as_millis();
+        if ms > self.slowest_ms {
+            self.slowest_ms = ms;
+            self.slowest = what.to_string();
+        }
+        if r.is_err() {
+            self.errors += 1;
+        }
+        r
+    }
+}
 
 /// `MemTotal` and `MemAvailable` of a `/proc/meminfo`, in bytes.
 pub fn meminfo(text: &str) -> Option<(u64, u64)> {
@@ -112,14 +186,18 @@ pub struct Wave {
     pub left: Vec<String>,
     /// Pods that never ran, with why.
     pub never_ran: Vec<String>,
+    /// The slowest pods: name, measured start, and what the runner saw, ms.
+    pub slowest: Vec<(String, u128, u128)>,
+    /// The ramp's API calls.
+    pub calls: Calls,
 }
 
 impl Wave {
     pub fn fields(&self) -> String {
         format!(
-            "\"wave\": {}, \"pods\": {}, \"claims\": {}, \"p50_ms\": {}, \"p95_ms\": {}, \"max_ms\": {}, \"ramp_ms\": {}, \"drain_ms\": {}, \"left\": {}, \"mem_before_mib\": {}, \"mem_low_mib\": {}, \"mem_stopped\": {}",
+            "\"wave\": {}, \"pods\": {}, \"claims\": {}, \"p50_ms\": {}, \"p95_ms\": {}, \"max_ms\": {}, \"ramp_ms\": {}, \"drain_ms\": {}, \"left\": {}, \"mem_before_mib\": {}, \"mem_low_mib\": {}, \"mem_stopped\": {}, \"api_slowest_ms\": {}, \"api_errors\": {}",
             self.n, self.pods, self.claims, self.p50_ms, self.p95_ms, self.max_ms, self.ramp_ms, self.drain_ms, self.left.len(),
-            self.mem_before_mib, self.mem_low_mib, self.mem_stopped
+            self.mem_before_mib, self.mem_low_mib, self.mem_stopped, self.calls.slowest_ms, self.calls.errors
         )
     }
 
@@ -136,13 +214,20 @@ impl Wave {
             wrong.push(format!("left after the drain: {}", self.left.iter().take(5).cloned().collect::<Vec<_>>().join(", ")));
         }
         if let Some(f) = first_p95.filter(|f| slowed(*f, self.p95_ms)) {
-            wrong.push(format!("p95 start {} ms against the first wave's {f} ms", self.p95_ms));
+            let names: Vec<String> = self.slowest.iter().map(|(n, ms, seen)| format!("{n} {ms} ms (seen at {seen} ms)")).collect();
+            wrong.push(format!("p95 start {} ms against the first wave's {f} ms (slowest: {})", self.p95_ms, names.join(", ")));
         }
-        let summary = format!(
+        let mut summary = format!(
             "{} pods ({} with claims): start p50 {} ms, p95 {} ms; drained in {} ms{}",
             self.pods, self.claims, self.p50_ms, self.p95_ms, self.drain_ms,
             if self.mem_stopped { format!("; stopped at the memory floor ({} MiB available)", self.mem_low_mib) } else { String::new() }
         );
+        if self.calls.slowest_ms >= SLOW_CALL {
+            summary.push_str(&format!("; slowest API call {} ms ({})", self.calls.slowest_ms, self.calls.slowest));
+        }
+        if self.calls.errors > 0 {
+            summary.push_str(&format!("; {} API call(s) failed", self.calls.errors));
+        }
         if wrong.is_empty() { Outcome::Pass(summary) } else { Outcome::Fail(format!("{summary}; {}", wrong.join("; "))) }
     }
 }
@@ -242,12 +327,13 @@ pub fn wave_objects(env: &Env, n: usize, i: usize, claims: bool) -> (Value, Opti
 }
 
 /// Poll a wave's pods until each created one has been seen Running, or `end`.
+/// `started` holds each pod's (measured, seen) start.
 async fn poll(
-    api: &Api, sel: &str, created: &HashMap<String, Instant>, started: &mut HashMap<String, u128>,
-    last_seen: &mut HashMap<String, String>, end: Instant,
+    api: &Api, sel: &str, created: &HashMap<String, Instant>, started: &mut HashMap<String, (u128, u128)>,
+    last_seen: &mut HashMap<String, String>, calls: &mut Calls, end: Instant,
 ) {
     while started.len() < created.len() && Instant::now() < end {
-        if let Ok(Some(items)) = api.list(sel).await {
+        if let Ok(Some(items)) = calls.time("list the wave", api.list(sel)).await {
             for p in &items {
                 let name = s(p, "/metadata/name").to_string();
                 if started.contains_key(&name) {
@@ -255,7 +341,8 @@ async fn poll(
                 }
                 if s(p, "/status/phase") == "Running" && p.pointer("/status/containerStatuses/0/state/running").is_some() {
                     if let Some(t) = created.get(&name) {
-                        started.insert(name, t.elapsed().as_millis());
+                        let seen = t.elapsed().as_millis();
+                        started.insert(name, (start_ms(seen, own_start_ms(p)), seen));
                     }
                 } else {
                     last_seen.insert(name, format!("{}{}", s(p, "/status/phase"), k8s::waiting(p)));
@@ -272,11 +359,12 @@ async fn wave(env: &Env, api: &Api, n: usize, size: usize, claims: bool, floor: 
     let mut w = Wave {
         n, pods: 0, claims: 0, p50_ms: 0, p95_ms: 0, max_ms: 0, ramp_ms: 0, drain_ms: 0,
         mem_before_mib: 0, mem_low_mib: 0, mem_stopped: false, left: Vec::new(), never_ran: Vec::new(),
+        slowest: Vec::new(), calls: Calls::default(),
     };
     let ramp = Instant::now();
     let sel = format!("{}?labelSelector=storm.io%2Fwave%3D{n},storm.io%2Ftest-run%3D{}", k8s::pods(env), env.run_id);
     let mut created: HashMap<String, Instant> = HashMap::new();
-    let mut started: HashMap<String, u128> = HashMap::new();
+    let mut started: HashMap<String, (u128, u128)> = HashMap::new();
     let mut last_seen: HashMap<String, String> = HashMap::new();
     let mut claim_names = Vec::new();
     // The ramp's time: 10 minutes, or what the suite has left.
@@ -298,7 +386,7 @@ async fn wave(env: &Env, api: &Api, n: usize, size: usize, claims: bool, floor: 
             let (p, c) = wave_objects(env, n, j, claims);
             let name = s(&p, "/metadata/name").to_string();
             if let Some(c) = c {
-                match api.create(&k8s::pvcs(env), &c).await {
+                match w.calls.time(&format!("create claim {name}"), api.create(&k8s::pvcs(env), &c)).await {
                     Ok(_) => claim_names.push(name.clone()),
                     Err(e) => {
                         w.never_ran.push(format!("{name}: claim: {e}"));
@@ -306,7 +394,7 @@ async fn wave(env: &Env, api: &Api, n: usize, size: usize, claims: bool, floor: 
                     }
                 }
             }
-            match api.create(&k8s::pods(env), &p).await {
+            match w.calls.time(&format!("create pod {name}"), api.create(&k8s::pods(env), &p)).await {
                 Ok(_) => {
                     created.insert(name, Instant::now());
                 }
@@ -316,9 +404,9 @@ async fn wave(env: &Env, api: &Api, n: usize, size: usize, claims: bool, floor: 
         i = (i + STEP).min(size);
         // Wait on this step before reading the memory again: a pod takes its
         // memory as it starts, not when it is made.
-        poll(api, &sel, &created, &mut started, &mut last_seen, end.min(Instant::now() + STEP_WAIT)).await;
+        poll(api, &sel, &created, &mut started, &mut last_seen, &mut w.calls, end.min(Instant::now() + STEP_WAIT)).await;
     }
-    poll(api, &sel, &created, &mut started, &mut last_seen, end).await;
+    poll(api, &sel, &created, &mut started, &mut last_seen, &mut w.calls, end).await;
     if let Some((_, avail)) = node_memory() {
         low = low.min(avail);
     }
@@ -329,10 +417,14 @@ async fn wave(env: &Env, api: &Api, n: usize, size: usize, claims: bool, floor: 
     for name in created.keys().filter(|n| !started.contains_key(*n)) {
         w.never_ran.push(format!("{name}: {}", last_seen.get(name).map(String::as_str).unwrap_or("never listed")));
     }
-    let times: Vec<u128> = started.values().copied().collect();
+    let times: Vec<u128> = started.values().map(|(ms, _)| *ms).collect();
     w.p50_ms = percentile(&times, 50);
     w.p95_ms = percentile(&times, 95);
     w.max_ms = times.iter().copied().max().unwrap_or(0);
+    let mut slowest: Vec<(String, u128, u128)> = started.iter().map(|(n, (ms, seen))| (n.clone(), *ms, *seen)).collect();
+    slowest.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+    slowest.truncate(SLOWEST);
+    w.slowest = slowest;
 
     // Hold, and read one pod's log back: the kubelet still serves while full.
     tokio::time::sleep(HOLD.min(env.remaining().saturating_sub(MARGIN))).await;
@@ -422,12 +514,18 @@ mod tests {
         let w = |p95, left: Vec<String>| Wave {
             n: 2, pods: 10, claims: 2, p50_ms: 100, p95_ms: p95, max_ms: p95, ramp_ms: 0, drain_ms: 0,
             mem_before_mib: 4000, mem_low_mib: 3000, mem_stopped: false, left, never_ran: vec![],
+            slowest: vec![("w2-3".into(), p95, p95 + 100)], calls: Calls::default(),
         };
         assert!(matches!(w(500, vec![]).outcome(Some(400)), Outcome::Pass(_)));
         assert!(matches!(w(5000, vec![]).outcome(Some(400)), Outcome::Fail(_)));
         assert!(matches!(w(500, vec!["PV x".into()]).outcome(Some(400)), Outcome::Fail(_)));
         assert!(w(500, vec![]).fields().contains("\"p95_ms\": 500"));
         assert!(w(500, vec![]).fields().contains("\"mem_low_mib\": 3000"));
+        assert!(w(500, vec![]).fields().contains("\"api_slowest_ms\": 0, \"api_errors\": 0"));
+        assert!(matches!(w(5000, vec![]).outcome(Some(400)), Outcome::Fail(s) if s.contains("slowest: w2-3 5000 ms (seen at 5100 ms)")));
+        let mut hung = w(500, vec![]);
+        hung.calls = Calls { slowest_ms: 30_012, slowest: "list the wave".into(), errors: 1 };
+        assert!(matches!(hung.outcome(Some(400)), Outcome::Pass(s) if s.contains("slowest API call 30012 ms (list the wave)") && s.contains("1 API call(s) failed")));
         let mut full = w(500, vec![]);
         full.mem_stopped = true;
         assert!(matches!(full.outcome(Some(400)), Outcome::Pass(s) if s.contains("memory floor")));
@@ -455,5 +553,31 @@ mod tests {
         assert!(same_node_memory(16 * GIB, 16 * GIB - GIB / 2));
         assert!(!same_node_memory(16 * GIB, 64 * GIB));
         assert!(!same_node_memory(0, 16 * GIB));
+    }
+
+    #[test]
+    fn rfc3339_times_read_as_epoch_seconds() {
+        assert_eq!(epoch_secs("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(epoch_secs("2026-11-14T11:26:00Z"), Some(1_794_655_560));
+        assert_eq!(epoch_secs("2000-03-01T00:00:01.250Z"), Some(951_868_801));
+        assert_eq!(epoch_secs("2026-11-14T11:26:00+01:00"), None);
+        assert_eq!(epoch_secs(""), None);
+        assert_eq!(epoch_secs("2026-13-01T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn a_pods_own_start_bounds_what_the_runner_saw() {
+        let p = json!({
+            "metadata": { "creationTimestamp": "2026-11-14T11:26:00Z" },
+            "status": { "containerStatuses": [{ "state": { "running": { "startedAt": "2026-11-14T11:26:01Z" } } }] }
+        });
+        assert_eq!(own_start_ms(&p), Some(2000));
+        // The runner blind for 30 s behind a hung call: the pod's own wins.
+        assert_eq!(start_ms(31_288, own_start_ms(&p)), 2000);
+        // The runner saw it sooner than a second's truncation allows.
+        assert_eq!(start_ms(1_380, own_start_ms(&p)), 1_380);
+        assert_eq!(start_ms(1_380, None), 1_380);
+        assert_eq!(own_start_ms(&json!({ "metadata": { "creationTimestamp": "2026-11-14T11:26:05Z" },
+            "status": { "containerStatuses": [{ "state": { "running": { "startedAt": "2026-11-14T11:26:01Z" } } }] } })), None);
     }
 }

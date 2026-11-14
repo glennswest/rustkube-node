@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-14
+
+- **fix(test):** long measures a pod's start from the pod as well as the runner (#61). Both night runs at 7406719 went the whole window (7dae7cfca6 on pvetest1: 664 pass, 1 fail; 0e99f2d197 on pvetest2, flowsdn: 658 pass, 1 fail). Each failed one wave on a p95 start of ~31 s while every other wave's p95 stayed under 4.6 s. ~30 s is the runner's own client timeout, and the poll dropped a failed list, so one hung API call blinded the runner for 30 s and every pod of that step read 30 s late. A pod's start is now the lesser of what the runner saw and its own `startedAt - creationTimestamp` + 1 s (both are second-resolution timestamps, so it is still an upper bound). Each wave records `api_slowest_ms` and `api_errors`, names a call over 5 s, and a slow wave names its three slowest pods with both times.
+
 ## 2026-11-13
 
 - **fix(test):** `golden`'s requests carry `spec.image` (#344). The `VirtualMachineGolden` CRD (vmimages 06bcff6) requires it, and run d74a5827f5 on pvetest2 (12.81-flowsdn) had both requests refused `422 spec.image: Required value`. The kubelet does not read it; the suite names the golden itself, a CloudImage that does not exist, so vmimages leaves the request alone.

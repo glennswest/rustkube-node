@@ -1327,10 +1327,14 @@ kubelet is under test, not the scheduler.
   20% of `MemTotal`, at least 1 GiB (`RUSTKUBE_NODE_TEST_MEM_FLOOR_PCT`);
   later waves take the first wave's size. Per wave (`wave-<n>`, with `pods`,
   `p50_ms`, `p95_ms`, `drain_ms`, `left`, `mem_before_mib`, `mem_low_mib`,
-  `mem_stopped` as fields):
-  each pod's start (create → seen Running, 1 s resolution), a 30 s hold and a
+  `mem_stopped`, `api_slowest_ms`, `api_errors` as fields):
+  each pod's start (create → seen Running, 1 s resolution, or the pod's own
+  `startedAt − creationTimestamp` + 1 s when that is less, so a hung API call
+  of the runner's does not read as a slow start), a 30 s hold and a
   log read, then the drain. A wave fails on anything left after its drain
-  (pods, claims, PVs) or a p95 start over twice the first wave's plus 2 s.
+  (pods, claims, PVs) or a p95 start over twice the first wave's plus 2 s,
+  and then names its three slowest pods; an API call over 5 s or a failed
+  one is named in the wave's line.
   Waves repeat until the suite's time is nearly out (`RUSTKUBE_NODE_TEST_WAVES`
   caps them for a hand run). VM waves are stormcos_qa's `vm-waves`.
 - **csi** (< 15 min, declared in `test/requires.toml`, run on request, #52): the
