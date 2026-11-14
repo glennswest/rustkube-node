@@ -65,7 +65,8 @@ Stage build 1e5aa3c76f78. Closed. Live: stormvm medium `snapshot-restore` / `mem
 (tmp/golden-run.log). Pass → close; fail → fix what it names. e9150c9ade (pvetest1, 12.78.14): skip golden-crd (no CRD there).
 d74a5827f5 (pvetest2, 12.81-flowsdn) queued; held `--after-run d74a5827f5`. Resume: `stormcentral test show d74a5827f5`.
 d74a5827f5: failed, both requests 422 `spec.image: Required value` (the CRD requires it; the test sent vm+golden only). Fixed in the test
-(`image` = the golden's name); rerunning `golden` on pvetest2.
+(`image` = the golden's name), 7a0d963; sc-build of test/ (clippy -D warnings, cargo test) passed (VM sc-build-f02e649987).
+Rerun at 7a0d963: 9f184d6390 (pvetest2, decides), cde82c6604 (pvetest1, 12.78.14: will skip). Held `--after-run 9f184d6390`.
 
 2026-11-10. stormvm 6e188a6 (the lock) has `stormvm_node::golden` (root_disk, sealer_spec, DEIDENTIFY/DEIDENTIFIED, provenance) and the
 flow in its CLI (`make_golden`). Not in a library, so the kubelet runs the steps itself. Chosen: no owner on the golden (#75's sweep deletes
