@@ -22,7 +22,7 @@ closes on medium's `passt-reached` on a pve machine with a release carrying it).
 Done: 1a8b492. SC_BUILD_VM sc-build (VM sc-build-888bde7fc4): `--locked` metadata/build/test, 631 kubelet unit, all suites; 9 stormvm lock entries at 13a0781;
 warnings unchanged (#227's). Stage build 795af1305809. Closed. Live: stormvm medium `passt-reached` on a pve machine with a release carrying it.
 
-### Waiting on a release with e8242e9 on an X9 blade: #348 (P3), RDMA verbs for a pod that asks (stormcos#914)
+### Waiting on server8 (X9 blade) installing a release with e8242e9: #348 (P3), RDMA verbs for a pod that asks (stormcos#914)
 
 2026-11-10. Found: stormpump (9877a97 and main) has no device list and no rlimit in `Spec`; its container /dev is a tmpfs without
 nodev, binds under /dev land since stormpump#222, and it attaches no cgroup device filter (every device usable once its node is there).
@@ -45,6 +45,10 @@ held `--after-run 8737853772`. Resume: on its pass, `stormcentral test run rustk
 skipped → forge1 has no verbs devices, re-hold `--after-install …@any:hardware` for an X9 blade (server8).
 8737853772 (pvetest2) passed 36/0/2 (`pod-rdma` skipped: no verbs there, as expected). Queued medium on forge1: 8d39c5d794 at 6d99ff2;
 held `--after-run 8d39c5d794`. Resume: `stormcentral test show 8d39c5d794 | grep pod-rdma`.
+8d39c5d794 (forge1) error, nothing ran: the test pod's `GET /api/v1/nodes` to 192.168.31.203:6443 failed TLS. forge1's serving certs name only
+p2's .204 (`${NODE_IP}`), not forge1.g16.lo's .203 (stormipmi 9cefbcd575 and stormcluster 1fbd9ac163 the same); filed stormcos#967. Not ours. And forge1's
+Node has no `rdma.storm.io/hca` (no verbs there), so `pod-rdma` would skip on it anyway. Re-held `--after-install rustkube-node>=e8242e9@server8`.
+Resume: server8's Node shows `rdma.storm.io/hca`; `stormcentral test run rustkube-node medium --tag server8`; `pod-rdma` passed → close.
 
 ### Done: #352 (P2), stormvm → 71bf5b5: machine.type (pc/i440fx) and the ide bus (stormvm#117)
 
