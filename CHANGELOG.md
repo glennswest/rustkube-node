@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-15
+
+- **docs:** The long suite runs a whole night and catches a real kubelet stall (#61, closed). ccfea13ac4 (165093b, pvetest1, 12.81): 632 pass, 2 fail. wave-40's slowest pods took 31-32 s by their own timestamps, while the runner's slowest API call took 39 ms. The 2026-11-14 entry's cause, the runner's 30 s client timeout, was wrong: the kubelet held a step of pods for ~30 s. Filed as #370.
+
 ## 2026-11-14
 
 - **fix:** A golden-from-VM request knows its copy by the engine's id (#344). stormblock's `/v1` restore (`volume_from_snapshot`) answers the `/v1` contract's id (`vol-<hex>`), and the kubelet handed it to `/api/v1` calls, which take the engine's uuid. Run 9f184d6390 on pvetest2: the sealer's attach was a 404, and the cleanup's delete of that id was a 404 too, which counts as done, so the copy stayed under the golden's name and the next request was refused "already on this node's engine". After the restore, the copy's id is now looked up by name. If the engine lists no volume of that name, the request is `Failed` and says the copy was not removed. `golden-no-agent-fails` now passes only when the request failed for its missing agent, not for an earlier step.

@@ -1819,7 +1819,16 @@ is live GETs already.
 2026-10-07. de51950: README, BUILD.md, status.md, presentation, CLAUDE.md (flowsdn owns Services in its edition,
 #145; checked against stormcos main). sc-build: deck renders (12 slides), `cargo build --locked` ok. Closed.
 
-### Waiting on long ccfea13ac4 / 9c755fea1c: #61 long ran the night; one ~30 s stall each: #61, short, medium and long test suites (stormcentral docs/test-standard.md)
+### Done: #61, short, medium and long test suites (stormcentral docs/test-standard.md); long's stall is #370
+
+2026-11-15: ccfea13ac4 (165093b, pvetest1, 12.81) ran the whole window, 04:01-11:50Z: 632 pass, 2 fail. wave-40: p95 31285 ms,
+the slowest pods 31.3-32.0 s by their own `startedAt - creationTimestamp`, `api_slowest_ms` 39. wave-83: p95 7011 ms,
+`api_slowest_ms` 757. The runner was not blind: the kubelet stalled a step of pods for ~30 s (the 2026-11-14 guess, the
+runner's timeout, was wrong). Filed #370 (P2) with leads: `stormpump_ring::DEADLINE` and the kubelet's 30 s API client
+timeout, and #358. No node syslog (pvetest1's stops 2026-11-14 15:21Z). Closed #61: all three suites run on nodes (short and medium
+pass, long runs a night and reports per-wave numbers that catch a stall). 9c755fea1c (pvetest2) is still queued; its result goes to #370.
+
+### (earlier) Waiting on long ccfea13ac4 / 9c755fea1c: #61
 
 2026-11-14 (14:30Z): both runs went the whole window: 7dae7cfca6 (pvetest1) 664 pass / 1 fail, 0e99f2d197
 (pvetest2, flowsdn) 658 / 1. Each failed one wave on p95 start ~31 s (wave-426, wave-131); max ~31.6-32.1 s, every other
