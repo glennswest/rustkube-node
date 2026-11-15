@@ -40,9 +40,9 @@ server8` (after a pve pass, #791): `pod-rdma` passes (not skipped); close. If th
 2026-11-13: 12.74 carries rustkube-node 78bf751 and modules 32f2dfa, both behind e8242e9 / stormcos 7882c46. Re-proposed
 `--after-install rustkube-node>=e8242e9@any:hardware` (item b1a6ccabec1b); `modules` is not a registry component, so it cannot be named, but
 its verbs image (0818ddcdd110) was staged before this golden and releases compose forward. stormpump#230 still open (CAP_IPC_LOCK covers it).
-2026-11-15: back in line: forge1 (hardware) runs a passed install of 12.86, which carries e8242e9. Ran medium there (run 43b07aa8d7 at 1d4d7f3);
-proposed `--after-run 43b07aa8d7`. Resume: `stormcentral test show 43b07aa8d7`: `pod-rdma` passed → close; skipped → forge1 has no verbs
-devices (no ConnectX/modules), re-hold `--after-install …@any:hardware` for an X9 blade (server8).
+2026-11-15: back in line: forge1 (hardware) runs a passed install of 12.86, which carries e8242e9. Medium on forge1 (43b07aa8d7) was skipped: #791 wants a pve pass at the commit first. Queued medium on pvetest2 (8737853772 at 6d99ff2),
+held `--after-run 8737853772`. Resume: on its pass, `stormcentral test run rustkube-node medium --tag forge1`; `pod-rdma` passed → close;
+skipped → forge1 has no verbs devices, re-hold `--after-install …@any:hardware` for an X9 blade (server8).
 
 ### Done: #352 (P2), stormvm → 71bf5b5: machine.type (pc/i440fx) and the ide bus (stormvm#117)
 
