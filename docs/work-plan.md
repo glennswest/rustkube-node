@@ -43,6 +43,8 @@ its verbs image (0818ddcdd110) was staged before this golden and releases compos
 2026-11-15: back in line: forge1 (hardware) runs a passed install of 12.86, which carries e8242e9. Medium on forge1 (43b07aa8d7) was skipped: #791 wants a pve pass at the commit first. Queued medium on pvetest2 (8737853772 at 6d99ff2),
 held `--after-run 8737853772`. Resume: on its pass, `stormcentral test run rustkube-node medium --tag forge1`; `pod-rdma` passed → close;
 skipped → forge1 has no verbs devices, re-hold `--after-install …@any:hardware` for an X9 blade (server8).
+8737853772 (pvetest2) passed 36/0/2 (`pod-rdma` skipped: no verbs there, as expected). Queued medium on forge1: 8d39c5d794 at 6d99ff2;
+held `--after-run 8d39c5d794`. Resume: `stormcentral test show 8d39c5d794 | grep pod-rdma`.
 
 ### Done: #352 (P2), stormvm → 71bf5b5: machine.type (pc/i440fx) and the ide bus (stormvm#117)
 
