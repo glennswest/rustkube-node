@@ -1392,7 +1392,8 @@ plugin-registration protos the kubelet vendors, so it needs `protoc` too. Check 
 Required test inputs are listed in [configuration](docs/configuration.md#test-container).
 The image the workload pods run is the Job's own (#97), and `STORM_NODE` (an
 address) is resolved to its Node. Live: short passed on C2NR0Q2 (#97); medium on pvetest2 and C2NR0Q2 (12.64); csi
-on pvetest1 (#52). Long has no complete live pass yet (#61).
+on pvetest1 (#52). Long runs the whole night window (ccfea13ac4, pvetest1, 12.81: 632 pass, 2 fail);
+its failures are a ~30 s kubelet start stall, #370.
 
 ## Relationship to rustkube
 
