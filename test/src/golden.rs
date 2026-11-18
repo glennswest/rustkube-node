@@ -13,6 +13,8 @@
 //!
 //! Then, with one golden name `G` for the run (`rkn-golden-<run>`):
 //!
+//! - `vmi-status-volumes` (#373): the source VMI's `status.volumes[]` names
+//!   its root disk: role `root`, its golden, its engine volume, `owned`.
 //! - `golden-no-agent-fails`: a request for `G` from the agentless VM ends
 //!   `Failed` (the copy's agent never answers, and an undeidentified golden
 //!   is worse than none), and its message names nothing left behind.
@@ -301,6 +303,18 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
         None,
     );
 
+    // The machine names its volumes (#373, stormvm#129): the source's
+    // `status.volumes[]`, as the kubelet writes it from stormvm's list.
+    if source_id.is_some() {
+        let t = Instant::now();
+        let o = match api.get(&format!("{}/{SOURCE}", vmis(&env))).await {
+            Ok(Some(v)) => judge_status_volumes(&v, &root),
+            Ok(None) => Outcome::Fail(format!("VMI {SOURCE} is gone")),
+            Err(e) => Outcome::Infra(e),
+        };
+        r.record("vmi-status-volumes", o, t.elapsed().as_millis(), None);
+    }
+
     if noagent.is_ok() {
         let t = Instant::now();
         let o = match suite.ask(ASK_FAIL, NO_AGENT, &golden).await {
@@ -344,9 +358,38 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
     r.record("cleanup", o, t.elapsed().as_millis(), None);
 }
 
+/// A VMI's `status.volumes[]` (#373): its root disk is there with role
+/// `root`, the golden it was cloned from, its engine volume and whether the
+/// machine owns it.
+pub fn judge_status_volumes(vmi: &Value, golden: &str) -> Outcome {
+    let Some(vols) = vmi["status"]["volumes"].as_array() else {
+        return Outcome::Fail(format!("no status.volumes; status keys: {:?}",
+            vmi["status"].as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default()));
+    };
+    let Some(root) = vols.iter().find(|v| v["role"] == "root") else {
+        return Outcome::Fail(format!("status.volumes has no role root: {}", Value::Array(vols.clone())));
+    };
+    let id = root["volumeID"].as_str().unwrap_or("");
+    if id.is_empty() || root["golden"].as_str() != Some(golden) || !root["owned"].is_boolean() {
+        return Outcome::Fail(format!("the root entry is not complete (volumeID, golden {golden}, owned): {root}"));
+    }
+    Outcome::Pass(format!("{} volume(s); root: {root}", vols.len()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_volumes_are_judged() {
+        let ok = serde_json::json!({"status": {"volumes": [
+            {"golden": "fedora-44-x86_64", "name": "root", "owned": true, "role": "root", "source": "golden:fedora-44-x86_64", "volumeID": "u-1"},
+            {"name": "seed", "owned": true, "role": "seed", "source": "seed"},
+        ]}});
+        assert!(matches!(judge_status_volumes(&ok, "fedora-44-x86_64"), Outcome::Pass(_)));
+        assert!(matches!(judge_status_volumes(&ok, "other"), Outcome::Fail(_)));
+        assert!(matches!(judge_status_volumes(&serde_json::json!({"status": {"phase": "Running"}}), "x"), Outcome::Fail(_)));
+    }
 
     #[test]
     fn the_golden_name_is_a_dns_label_of_the_run() {
