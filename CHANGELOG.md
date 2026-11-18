@@ -2,6 +2,7 @@
 
 ## 2026-11-18
 
+- **docs:** The golden-from-VM sealer's live run 7d1775d365 (pvetest1, 12.94) reached the de-identify step: the guest's SELinux denied it (qemu-ga's `guest-exec` runs confined as `virt_qemu_ga_t`), so a Fedora golden's request ends `Failed`. Filed as stormvm#135; status.md lists it as a limitation (#344). `vmi-status-volumes` passed in the same run (#373).
 - **test:** RDMA verbs seen live (#348): medium on server8 (X9 blade, ConnectX-3; release 12.94) ran `pod-rdma` and passed it (run 0c4dfc15fb): the Node advertises `rdma.storm.io/hca`, the asking pod sees `rdma_cm` and `uverbs0` with `CAP_IPC_LOCK`, and the plain pod sees neither.
 - **feat:** Live migration takes up post-copy when it is allowed (#397, stormvm#132). The target resolves the migration's configuration as upstream does: the `KubeVirt` CR's `migrations`, then the best-matching `MigrationPolicy`. It records it as `migrationState.migrationConfiguration`, and both ends set `postcopy-ram` from it. The source switches with `migrate-start-postcopy` when pre-copy sets no new low for ten polls, or passes `completionTimeoutPerGiB` × the guest's GiB. It records `mode: PostCopy` and an Event `PostCopy`, and refuses an abort from then on. `postcopy-paused` fails the migration. Without either object (stormcos serves neither yet) nothing changes: no post-copy.
 - **chore:** stormvm → 1632135 (#397): post-copy migration (`Tuning.post_copy`, `Convergence`, `start_post_copy`). A rev-only bump in the lock.
