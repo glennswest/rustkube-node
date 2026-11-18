@@ -591,9 +591,45 @@ class's blank is minted or formats, a Warning `ProvisioningFailed` with stormblo
 clone is refused, and a Normal `ProvisioningSucceeded` once it is cloned (`kubectl describe pvc`; repeats
 aggregate).
 
+**Growing a claim** (#379): a Bound claim of the class whose request is raised (`kubectl patch pvc … -p
+'{"spec":{"resources":{"requests":{"storage":"8Gi"}}}}'`) is grown online by the node that holds its volume
+(`pvc_resize.rs`), in upstream's two halves and with their words. First the resizer: `Resizing`,
+`allocatedResources` and `allocatedResourceStatuses.storage: ControllerResizeInProgress` with a `Resizing` event, then
+the engine grows the volume (stormblock#655: `PATCH /apis/storage.storm.io/v1/volumes/{id}` `spec.sizeBytes`, the
+request rounded up to a MiB, thin, the ublk device told), then the PV's capacity. A Block claim is done there
+(`VolumeResizeSuccessful`). A filesystem claim is `FileSystemResizePending` / `NodeResizePending`
+(`FileSystemResizeRequired`) until its device is mounted on this node. Then its ext4 (`EXT4_IOC_RESIZE_FS`) or XFS
+(`XFS_IOC_FSGROWFSDATA`) is grown online to the device, the claim's `status.capacity` follows, and the event is
+`FileSystemResizeSuccessful`. A claim no pod mounts stays pending until one does, as upstream's does. The engine's
+refusal (a mirrored or exported volume: 409; a sealed one) is a `VolumeResizeFailed` Warning with its words, and
+`ControllerResizeInfeasible` until the request changes. The apiserver refuses a shrink, and refuses any grow unless
+the class says `allowVolumeExpansion: true` (stormcos#1032). The node's own service volumes are not grown here: they
+grow through their stormblock Volume object, and the claim mirror follows. A claim's size class is where it starts;
+it is no longer its ceiling.
+
+**Snapshots and restores** (#379, `pvc_snapshot.rs`): with a `VolumeSnapshotClass` of driver `stormblock.storm.io`
+(stormcos#1032), the snapshot-controller turns a `VolumeSnapshot` of a claim into a `VolumeSnapshotContent`. The node
+whose engine holds the volume does the csi-snapshotter's part. It flushes (`sync(2)`), cuts a one-volume stormblock
+group snapshot named after the content (found again by name after a restart, never cut twice), marks the content
+`storm.io/snapshot-node`, and writes `status.snapshotHandle` (the group id), `creationTime`, `restoreSize` and
+`readyToUse`, with a `SnapshotCreated` event. A refusal is `status.error` (which the controller copies to the
+snapshot) and `SnapshotCreationFailed`. While it is cut the content carries upstream's `volumesnapshot-being-created`
+annotation. Deleting it follows the controller: once it marks the content `volumesnapshot-being-deleted`, a
+`deletionPolicy: Delete` content's group is deleted, a `Retain` one's is kept, and then the controller's
+`volumesnapshotcontent-bound-protection` finalizer comes off. A claim with `dataSource` (or `dataSourceRef`)
+`{apiGroup: snapshot.storage.k8s.io, kind: VolumeSnapshot, name: …}` is restored as a new volume from the group, at
+the snapshot's size, and grown to its request once bound. A request below `restoreSize` is refused with upstream's
+words. The snapshot must be ready, and its pod must run on the node that holds it (a snapshot is in one node's
+storage, like the claim it was cut from). A `dataSource` of kind `PersistentVolumeClaim` clones a claim, as before.
+
+**`describe pvc`**: a built-in claim's PV names the engine's volume id in its CSI source
+(`volumeAttributes["storm.io/volume-id"]`, beside the handle, the volume's name; stormblock#649). The claim's events
+are provisioning (above), `Restored`, the resize events and the snapshot events (on the content). `Used By` is
+kubectl's own, from the pods.
+
 The ladder is **1Mi, 16Mi, 64Mi, 256Mi, 1Gi, 4Gi, 16Gi, 64Gi, 256Gi, 1Ti,
 4Ti, 16Ti, 64Ti, 256Ti, 1Pi** (#67); requests round up, and requests above 1Pi
-are refused. The rounded class is the volume ceiling. Each class names its
+are refused. The rounded class is the volume's starting size (a claim grows past it, above). Each class names its
 filesystem (`storage.rs` `SIZE_CLASSES`); all are ext4 (owner, #67; stormcos#91
 found nothing that forces XFS), **1Pi included** (#149): stormblock carries mkfs-ext4 v4.1.1 since
 golden-stormblock-12891c0025b2 (stormblock#289: the streaming format of mkfs.ext4.rs#10 and the inode count of #9),
