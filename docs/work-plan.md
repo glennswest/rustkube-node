@@ -4,10 +4,12 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #390 (P1), bump stormvm to f11ac55 (stormvm#37: memory snapshot state device through qemu's root)
+### Done: #390 (P1), bump stormvm to f11ac55 (stormvm#37: memory snapshot state device through qemu's root)
 
 2026-11-18. Rev-only (a302b3e → f11ac55: no manifest change upstream; fd97183 dropped NIC `vlan`/`rate_mbytes`, unused here). sc-build;
 stage; shipped with proof on stormvm's medium `memsnap-resumed` (stormvm#37 closes on it).
+Done: 14499b0. sc-build passed (VM sc-build-90dd51c910, `--locked` build + 672 kubelet unit). Stage build 0d84e3da70a2. Closed:
+the live check is stormvm#37's (its medium `memsnap-resumed` on a release with 14499b0); holding here would be circular, as #381.
 
 ### In progress: #379 (P0), PVC management on the default class: expansion, VolumeSnapshot + restore, describe pvc
 
