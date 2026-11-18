@@ -203,7 +203,7 @@ closes on medium's `passt-reached` on a pve machine with a release carrying it).
 Done: 1a8b492. SC_BUILD_VM sc-build (VM sc-build-888bde7fc4): `--locked` metadata/build/test, 631 kubelet unit, all suites; 9 stormvm lock entries at 13a0781;
 warnings unchanged (#227's). Stage build 795af1305809. Closed. Live: stormvm medium `passt-reached` on a pve machine with a release carrying it.
 
-### Waiting on server8 (X9 blade) installing a release with e8242e9: #348 (P3), RDMA verbs for a pod that asks (stormcos#914)
+### Done: #348 (P3), RDMA verbs for a pod that asks (stormcos#914)
 
 2026-11-10. Found: stormpump (9877a97 and main) has no device list and no rlimit in `Spec`; its container /dev is a tmpfs without
 nodev, binds under /dev land since stormpump#222, and it attaches no cgroup device filter (every device usable once its node is there).
@@ -233,6 +233,8 @@ Resume: server8's Node shows `rdma.storm.io/hca`; `stormcentral test run rustkub
 2026-11-18: back in line: server8 runs a passed install of 12.94 (carries e8242e9). Queued medium on server8: 0c4dfc15fb at 6d99ff2
 (pvetest2 passed that commit, #791), held `--after-run 0c4dfc15fb`. Resume: `stormcentral test show 0c4dfc15fb | grep -i rdma`; passed → close;
 skipped → server8 has no verbs devices: check `/sys/class/infiniband_verbs` via its console logs, stormcos#914.
+0c4dfc15fb (server8, 12.94) passed 37/0/1: `pod-rdma` pass, "asked: devices=rdma_cm,uverbs0 ipc_lock=yes; plain: devices=none ipc_lock=no"
+(the test needs the Node's allocatable `rdma.storm.io/hca` >= 1 first). Closed #348. stormpump#230 (MEMLOCK rlimit) and rustkube#315 (scheduler) stay open there.
 
 ### Done: #352 (P2), stormvm → 71bf5b5: machine.type (pc/i440fx) and the ide bus (stormvm#117)
 
