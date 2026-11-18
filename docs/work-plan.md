@@ -4,6 +4,14 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #399 (P3), golden sealer de-identifies from a systemd unit (stormvm#135)
+
+2026-11-18. stormvm 1632135 → 2a60a3c (sealer_spec hands the copy `stormvm-seal.service` via SMBIOS type 11 credentials; also
+closes #394's lag). `Machines::deidentify` gains the copy's volume id (nonce). Order, as `stormvm golden` (make_golden): up = the
+agent answers or `SealLog::read(reg.serial_log, copy)` is not Silent; give the unit `UNIT_GRACE`; if it spoke, wait ≤300 s for
+Done (deidentified → it powers itself off; else fail with exit/output); if Silent, the agent runs DEIDENTIFY as before, a failure
+adds `id -Z; getenforce`. Unit tests on the decision with a fake log. Then sc-build, stage, and #344's golden run decides it.
+
 ### In progress: #397 (P3), live migration post-copy (stormvm#132)
 
 2026-11-18. stormvm → 1632135. vm_migration: MigrationConfiguration (resolve: KubeVirt CR migrations, then policy_for over
