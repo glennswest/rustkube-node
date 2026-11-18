@@ -4,7 +4,7 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #372 (P0), traceability: root clones owned by their Pod, pods carry instance/golden/digest/volume ids, mirror pods declare the service's volumes
+### Shipped (waits for the proof on a node): #372 (P0), traceability: root clones owned by their Pod, pods carry instance/golden/digest/volume ids, mirror pods declare the service's volumes
 
 2026-11-18. Found: the kubelet *does* pass `owner {kind: Pod, …}` to `Roots::make`, but a pulled image's root (fstemplate clone, which takes
 no owner) sets it after with `PUT /volumes/{id}/owner` and the bare owner as the body. stormblock reads `{"owner": …}` (`OwnerRequest`), so
@@ -19,7 +19,9 @@ each service gets `spec.volumes` (root as hostPath of its mount, data/state/logs
 Then tests, docs (api.md, status.md), CHANGELOG; sc-build; stage; shipped with proof `api:/api/v1/pods ~ "storm.io/instance\.`.
 Done (code): ce19869, all five, with tests (container_roots owner body, claim owner, annotations, volume_stats, mirror
 service_volumes). Filed stormblock#651 (Owner keeps `container`). Service volumes' own owner (`Service`) is stormd#75's.
-Next: sc-build result; stage; shipped with proof.
+sc-build ce19869: build+test passed (637 kubelet unit); clippy hit a July `never_loop` (#375, filed by sc-build), fixed in 60854ba.
+sc-build 60854ba (VM sc-build-4ea5a1db11): build, test (637), clippy all pass; no warning on a changed line (#227's remain). #375 closed by it.
+Stage build b41b2d1a2cf1. `shipped` with proof `api:/api/v1/pods ~ "storm.io/instance\.`; the Volume object's `status.owner` is stormblock#649.
 
 ### Done: #367 (P3), stormvm → c9cd494: a memory snapshot's state through fd:, not file: (stormvm#37)
 
