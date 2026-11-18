@@ -4,13 +4,16 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #383 (P0), a template listed `broken` is waited on forever (server8 12.92, pvc-ext4j-64m)
+### Shipped (proof pending): #383 (P0), a template listed `broken` is waited on forever (server8 12.92, pvc-ext4j-64m)
 
 - Kubelet: `TemplateStatus::of` sorts the engine's template (ready / making / broken with reason / unknown);
   `clone_blank` deletes and re-mints a broken one (`remint`, shared with #140's refusal path), with the reason
   in the claim's event; an unknown state is a ProvisioningFailed, never a wait. Unit tests with a fake engine:
   listed-broken → deleted, minted, cloned on the next pass; unknown → failure; formatting → wait.
-- Item 3 (a warm-probe case on a real node) needs the engine to mark a template broken on request: see the issue.
+- Item 3 (a warm-probe case on a real node) needs the engine to mark a template broken on request: filed
+  stormblock#664; the case is #387, proposed `--after` it.
+- Built 38e17aa (+ rust-version 1.83, #384): sc-build passed, 655 kubelet tests. Stage build fadb1ad3c0e7.
+  The workspace's clippy backlog (#384-#386, filed by sc-build when clippy was run) is pre-existing, not #383's.
 - Proof: `console:template pvc-ext4j-64m is broken .* minted again` on an install with a kept broken template.
 
 ### In progress: #381 (P1), VirtualMachineRestore waits up to 60 s: vm_maintenance_loop does not watch restores (stormvm#127)
