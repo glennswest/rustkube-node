@@ -927,6 +927,14 @@ with `CAP_IPC_LOCK` effective. A pod that doesn't ask must see neither.
     `Pending` with why. Events `DiskAdded`, `DiskRemoved`.
   - A VirtualMachine edit reaches the VMI through rustkube's VM controller
     (rustkube#269).
+- **`status.volumes[]`** (#373, stormvm#129): on the VMI, and on its VirtualMachine (written only when it
+  changes), one entry per disk from `stormvm_spec::volumes::status`: `name`, `role` (`root`, `data`,
+  `cloud-init`), `volumeID` (stormblock's id, once resolved; none for another driver's claim), `golden`,
+  `source` and `owned` (whether the volume goes with the machine). A hot-added disk is there on the next
+  status write. This is the way from a machine to its volumes; each Volume's `owner` is the way back.
+  A restore's volumes get their owner as soon as they are made: a restored disk its PVC (it is a claim and
+  outlives the machine; the VM as owner would let the orphan sweep delete it under the claim), the restored
+  memory state the VirtualMachine (none with `storm.io/retain-disks`).
 - **Snapshots: `VirtualMachineSnapshot`** (`snapshot.kubevirt.io/v1beta1`).
   - **Whose:** the node whose stormblock holds the VM's volumes, the one it
     runs on (`spec.source` is a `VirtualMachine` or a `VirtualMachineInstance`).
@@ -1176,7 +1184,7 @@ VM manager's orphan and adoption passes leave to its request.
 
 Limits: the engine calls go through stormvm's client, so an `https://` engine
 URL needs #318 (as snapshots do). On one node, `volume_from_snapshot` relies on
-stormvm 893b2e8 or later (#345: no slave replicas on a restore); the kubelet pins c9cd494 (#352, #355, #367). The kubelet's
+stormvm 893b2e8 or later (#345: no slave replicas on a restore); the kubelet pins d952a0c (#352, #355, #367, #373). The kubelet's
 identity (`system:nodes`) is bound to cluster-admin by rustkube's bootstrap, so
 no RBAC is added; a tightened node role needs `get/list/watch` on
 `virtualmachinegoldens` and `patch` on `virtualmachinegoldens/status`.

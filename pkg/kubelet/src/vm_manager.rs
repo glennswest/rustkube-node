@@ -1061,6 +1061,9 @@ pub struct VmManager {
     retries: std::sync::Mutex<HashMap<String, Retry>>,
     /// When the orphan sweep last ran (#75).
     swept: std::sync::Mutex<Option<std::time::Instant>>,
+    /// What each VirtualMachine's `status.volumes` was last written as
+    /// (#373), by VM `<ns>/<name>`: written only when it changes.
+    vm_volumes: std::sync::Mutex<HashMap<String, Value>>,
     /// What unfinished starts left in the engine, by uid (#100).
     partial: Ledger,
     /// Undoes it. The ring, when there is one.
@@ -1300,6 +1303,17 @@ fn gives_up(vm: Option<&Value>) -> bool {
 }
 
 /// The VirtualMachine that owns this VMI, by name, if any.
+/// A machine's `status.volumes` (#373, stormvm#129): each disk of `obj`'s
+/// spec with its role, source, whether it goes with the machine, and the
+/// volume it resolved to (`disks`), by stormvm's own definition
+/// (`stormvm_spec::volumes::status`). `None` when the object is not a
+/// machine stormvm can read.
+pub fn status_volumes(obj: &Value, disks: &[ResolvedDisk]) -> Option<Value> {
+    let spec: VmSpec = stormvm_spec::kube::from_kube(obj).ok()?;
+    let resolved: Vec<(String, Option<String>)> = disks.iter().map(|d| (d.name.clone(), d.volume_id.clone())).collect();
+    Some(stormvm_spec::volumes::status(&spec, &resolved))
+}
+
 fn owner_vm(obj: &Value) -> Option<&str> {
     obj["metadata"]["ownerReferences"]
         .as_array()?
@@ -1378,6 +1392,7 @@ impl VmManager {
             snoop_rx: std::sync::Mutex::new(Some(snoop_rx)),
             retries: std::sync::Mutex::new(HashMap::new()),
             swept: std::sync::Mutex::new(None),
+            vm_volumes: Default::default(),
             partial: Arc::default(),
             unwinder,
             deposit_window: Mutex::new(()),
@@ -5243,6 +5258,14 @@ impl VmManager {
             let names: Vec<String> = vm.disks.iter().map(|d| d.name.clone()).collect();
             status["volumeStatus"] = crate::vm_hotplug::volume_status(&names, &vm.hot);
         }
+        // Its volumes (#373, stormvm#129): from the VMI to each disk's
+        // volume (the Volume's `owner` is the way back). A hot-added disk is
+        // in the spec and in `vm.disks`, so the next write has it.
+        let desired = self.desired.lock().await.get(&vm.uid).cloned();
+        let volumes = desired.as_ref().and_then(|o| status_volumes(o, &vm.disks));
+        if let Some(v) = &volumes {
+            status["volumes"] = v.clone();
+        }
         // `AccessCredentialsSynchronized` (#92) and `HotplugSynchronized`
         // (#246), with whatever conditions the object already carries: a
         // merge patch replaces the list whole.
@@ -5270,6 +5293,35 @@ impl VmManager {
             .await
         {
             warn!("could not report {}/{}: {e}", vm.namespace, vm.name);
+        }
+        // The same on its VirtualMachine (#373), which outlives the VMI.
+        if let (Some(v), Some(owner)) = (volumes, desired.as_ref().and_then(|o| owner_vm(o).map(str::to_string))) {
+            self.patch_vm_volumes(&vm.namespace, &owner, v).await;
+        }
+    }
+
+    /// Write a VirtualMachine's `status.volumes` (#373), only when it
+    /// differs from what this kubelet last wrote there.
+    async fn patch_vm_volumes(&self, ns: &str, name: &str, volumes: Value) {
+        let key = format!("{ns}/{name}");
+        if self.vm_volumes.lock().unwrap_or_else(|e| e.into_inner()).get(&key) == Some(&volumes) {
+            return;
+        }
+        let url = format!("{}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}/status", self.api_url);
+        let body = json!({ "status": { "volumes": volumes } });
+        match self
+            .api
+            .patch(&url)
+            .header("content-type", "application/merge-patch+json")
+            .json(&body)
+            .send_retrying(retry::Policy::API)
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                self.vm_volumes.lock().unwrap_or_else(|e| e.into_inner()).insert(key, volumes);
+            }
+            Ok(r) => warn!("VirtualMachine {key}: status.volumes not written: {}", r.status()),
+            Err(e) => warn!("VirtualMachine {key}: status.volumes not written: {e}"),
         }
     }
 
@@ -10187,6 +10239,64 @@ mod tests {
             {"name": "cloudinit", "cloudInitNoCloud": {"userData": "#cloud-config\n"}},
         ]);
         obj
+    }
+
+    /// #373: a machine's `status.volumes` names each disk's volume, its role
+    /// and whether it goes with the machine, by stormvm's definition.
+    #[test]
+    fn status_volumes_name_each_disks_volume() {
+        let obj = vm_owned_vmi("vmi-1");
+        let disk = |n: &str, v: Option<&str>| ResolvedDisk {
+            name: n.into(), device: String::new(), volume_id: v.map(String::from), readonly: false, bus: Default::default(),
+        };
+        let v = status_volumes(&obj, &[disk("root", Some("v-root")), disk("cloudinit", Some("v-seed"))]).unwrap();
+        assert_eq!(v[0]["name"], "root");
+        assert_eq!(v[0]["role"], "root");
+        assert_eq!(v[0]["volumeID"], "v-root");
+        assert_eq!(v[0]["owned"], true);
+        assert_eq!(v[1]["role"], "cloud-init");
+        assert_eq!(v[1]["volumeID"], "v-seed");
+        // Not resolved yet: listed, with no volume.
+        let v = status_volumes(&obj, &[]).unwrap();
+        assert!(v[0].get("volumeID").is_none());
+    }
+
+    /// #373: the VMI's status carries `volumes`, and its VirtualMachine gets
+    /// the same, written once while it does not change.
+    #[tokio::test]
+    async fn the_vmi_and_its_vm_carry_status_volumes() {
+        type S = Arc<std::sync::Mutex<Vec<(String, Value)>>>;
+        let seen: S = Default::default();
+        let app = axum::Router::new()
+            .route(
+                "/apis/kubevirt.io/v1/namespaces/{ns}/{kind}/{name}/status",
+                axum::routing::patch(|axum::extract::State(s): axum::extract::State<S>,
+                                      axum::extract::Path((_, k, n)): axum::extract::Path<(String, String, String)>,
+                                      axum::Json(b): axum::Json<Value>| async move {
+                    s.lock().unwrap().push((format!("{k}/{n}"), b));
+                    axum::Json(json!({}))
+                }),
+            )
+            .with_state(seen.clone());
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), &url);
+        let obj = vm_owned_vmi("vmi-1");
+        m.desired.lock().await.insert("vmi-1".into(), obj);
+        let mut vm = vm_at("vmi-1", &[], Phase::Running);
+        vm.name = "web-1".into();
+        vm.disks = vec![ResolvedDisk { name: "root".into(), device: "/dev/ublkb1".into(), volume_id: Some("v-root".into()),
+                                       readonly: false, bus: Default::default() }];
+        m.patch_status(&vm).await;
+        m.patch_status(&vm).await;
+        let got = seen.lock().unwrap().clone();
+        let vmi: Vec<_> = got.iter().filter(|(p, _)| p == "virtualmachineinstances/web-1").collect();
+        assert_eq!(vmi.len(), 2);
+        assert_eq!(vmi[0].1["status"]["volumes"][0]["volumeID"], "v-root");
+        let vms: Vec<_> = got.iter().filter(|(p, _)| p == "virtualmachines/web").collect();
+        assert_eq!(vms.len(), 1, "the VM's is written once while it is the same: {got:?}");
+        assert_eq!(vms[0].1["status"]["volumes"], vmi[0].1["status"]["volumes"]);
     }
 
     /// **The issue.** A VirtualMachine restart is a new VMI: its root is the

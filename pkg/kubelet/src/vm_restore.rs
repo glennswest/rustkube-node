@@ -84,6 +84,29 @@ pub trait RestoreEngine: Send + Sync {
     /// Delete a volume (a memory snapshot's state volume). Gone already is
     /// done.
     fn delete_volume(&self, id: &str) -> Result<(), String>;
+    /// Say what a volume (by id or name) belongs to (#373, stormblock#115):
+    /// a `/v1` volume from a snapshot takes no owner when it is made.
+    fn set_owner(&self, volume: &str, owner: &stormvm_block::Owner) -> Result<(), String>;
+}
+
+/// The owner a restore gives what it makes (#373): a restored disk is its
+/// claim's (it is bound to a PVC and outlives the machine as any claim does,
+/// `owned: false` in `status.volumes`; the VirtualMachine as its owner would
+/// have the kubelet's sweep delete it under the claim once the VM went), the
+/// memory state is the machine's own. `None` for a VirtualMachine that keeps
+/// its disks ([`crate::vm_manager::RETAIN_ANNOTATION`]).
+pub fn restored_owner(kind: &str, ns: &str, name: &str, uid: &str) -> stormvm_block::Owner {
+    stormvm_block::Owner::new(kind, ns, name, Some(uid))
+}
+
+/// The VirtualMachine as the owner of its restored memory state, or `None`
+/// when it keeps its disks.
+pub fn state_owner(vm: &Value) -> Option<stormvm_block::Owner> {
+    if vm["metadata"]["annotations"][crate::vm_manager::RETAIN_ANNOTATION].as_str() == Some("true") {
+        return None;
+    }
+    let s = |k: &str| vm["metadata"][k].as_str().unwrap_or("");
+    Some(restored_owner("VirtualMachine", s("namespace"), s("name"), s("uid")))
 }
 
 /// stormvm's client against this node's stormblock, with the engine's token.
@@ -113,6 +136,11 @@ impl RestoreEngine for Stormblock {
     fn delete_volume(&self, id: &str) -> Result<(), String> {
         retry::blocking(retry::Policy::ENGINE, &format!("delete volume {id}"), |e: &String| retry::class_of_message(e), || {
             stormvm_block::Client::new(&self.0).delete_volume(id).map_err(|e| e.to_string())
+        })
+    }
+    fn set_owner(&self, volume: &str, owner: &stormvm_block::Owner) -> Result<(), String> {
+        retry::blocking(retry::Policy::ENGINE, &format!("owner of volume {volume}"), |e: &String| retry::class_of_message(e), || {
+            stormvm_block::Client::new(&self.0).set_owner(volume, owner).map_err(|e| e.to_string())
         })
     }
 }
@@ -349,7 +377,11 @@ impl Snapshots {
             let made = engine
                 .from_snapshot(&volume, member)
                 .map_err(|e| Step::Wait(format!("stormblock would not restore disk {disk}: {e}")))?;
-            self.bind_restored(ns, &claim, &made, member.size_bytes, obj).await.map_err(Step::Wait)?;
+            let claim_uid = self.bind_restored(ns, &claim, &made, member.size_bytes, obj).await.map_err(Step::Wait)?;
+            // Its owner, right after it is made (#373): its claim.
+            engine
+                .set_owner(&made, &restored_owner("PersistentVolumeClaim", ns, &claim, &claim_uid))
+                .map_err(|e| Step::Wait(format!("disk {disk}'s restored volume has no owner yet: {e}")))?;
             restores.push(Restored { disk: disk.clone(), snapshot: req.snapshot.clone(), volume: claim.clone() });
             claims.push((disk.clone(), claim));
         }
@@ -372,6 +404,12 @@ impl Snapshots {
             let made = engine
                 .from_snapshot(&state_name(ns, &req.vm, &req.name), member)
                 .map_err(|e| Step::Wait(format!("stormblock would not restore the memory state: {e}")))?;
+            // The machine's own (#373).
+            if let Some(owner) = state_owner(&vm) {
+                engine
+                    .set_owner(&made, &owner)
+                    .map_err(|e| Step::Wait(format!("the restored memory state has no owner yet: {e}")))?;
+            }
             state = Some(made);
         }
         let mut updated = rewired(&vm, &claims).unwrap_or_else(|| vm.clone());
@@ -453,8 +491,9 @@ impl Snapshots {
         Ok(())
     }
 
-    /// The bound PVC and PV for a restored volume, made when missing.
-    async fn bind_restored(&self, ns: &str, claim: &str, volume: &str, bytes: u64, restore: &Value) -> Result<(), String> {
+    /// The bound PVC and PV for a restored volume, made when missing. The
+    /// claim's uid, for the volume's owner (#373).
+    async fn bind_restored(&self, ns: &str, claim: &str, volume: &str, bytes: u64, restore: &Value) -> Result<String, String> {
         let (api, url, node) = self.api();
         let pvc_path = format!("/api/v1/namespaces/{ns}/persistentvolumeclaims/{claim}");
         let pvc = match self.api_object(&pvc_path).await {
@@ -500,7 +539,7 @@ impl Snapshots {
                 return Err(format!("PV {volume} not made: {}", r.status()));
             }
         }
-        Ok(())
+        Ok(pvc["metadata"]["uid"].as_str().unwrap_or("").to_string())
     }
 
     async fn api_object(&self, path: &str) -> Option<Value> {
@@ -627,6 +666,8 @@ mod tests {
         pub(crate) deleted: Mutex<Vec<String>>,
         /// A group with a memory state member (`v-state`) too (#251).
         pub(crate) with_state: bool,
+        /// Every owner set (#373): `<volume> <kind>/<name>`.
+        pub(crate) owners: Mutex<Vec<String>>,
     }
 
     impl RestoreEngine for Engine {
@@ -664,6 +705,10 @@ mod tests {
             self.deleted.lock().unwrap().push(format!("volume {id}"));
             Ok(())
         }
+        fn set_owner(&self, volume: &str, owner: &stormvm_block::Owner) -> Result<(), String> {
+            self.owners.lock().unwrap().push(format!("{volume} {}/{}", owner.kind, owner.name));
+            Ok(())
+        }
     }
 
     const SNAP: &str = "/apis/snapshot.kubevirt.io/v1beta1/namespaces/web/virtualmachinesnapshots/snap";
@@ -698,6 +743,17 @@ mod tests {
 
     const DISKS: &str = r#"{"rootdisk":"v-root","data":"v-data","cloudinitdisk":"v-seed"}"#;
 
+    /// #373: a VirtualMachine that keeps its disks owns no restored state.
+    #[test]
+    fn a_retained_vm_owns_no_restored_state() {
+        let mut v = vm();
+        v["metadata"]["uid"] = json!("vm-u");
+        let o = state_owner(&v).unwrap();
+        assert_eq!((o.kind.as_str(), o.name.as_str(), o.uid.as_deref()), ("VirtualMachine", "web-1", Some("vm-u")));
+        v["metadata"]["annotations"] = json!({ crate::vm_manager::RETAIN_ANNOTATION: "true" });
+        assert!(state_owner(&v).is_none());
+    }
+
     fn snapshots(url: &str, engine: Arc<Engine>) -> Snapshots {
         let take: crate::vm_snapshot::TakeFn =
             Arc::new(|_, _, _, _, _| Box::pin(async { crate::vm_snapshot::Taken::default() }));
@@ -723,6 +779,11 @@ mod tests {
         assert_eq!(resume, json!({ "volume": "web.web-1-state-restore-r1", "restore": "web/r1" }));
         assert_eq!(s[RESTORE]["status"]["complete"], true);
         assert_eq!(s[RESTORE]["status"][MEMORY_STATUS], "pending");
+        // #373: each restored disk is its claim's, the memory state the machine's.
+        let owners = engine.owners.lock().unwrap().clone();
+        assert!(owners.contains(&"web.web-1-rootdisk-restore-r1 PersistentVolumeClaim/web-1-rootdisk-restore-r1".to_string()), "{owners:?}");
+        assert!(owners.contains(&"web.web-1-state-restore-r1 VirtualMachine/web-1".to_string()), "{owners:?}");
+        assert!(!owners.iter().any(|o| o.starts_with("web.web-1-rootdisk") && o.contains("VirtualMachine")), "a claim's disk is never the VM's");
     }
 
     /// #251: a snapshot this node took and holds is deleted with its content
