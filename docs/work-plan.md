@@ -18,6 +18,10 @@ SIGTERM); an exec client (`pods/exec` WebSocket, v5.channel.k8s.io); medium case
 shared netns, IPC, a restart of a alone, stop order (sidecar last, from stop times on the claim). (3) docs, CHANGELOG; sc-build both;
 medium on pvetest1/2. (4) The proof pod `default/multi-<node>` must outlive a run; the suites cannot write `default` and drain what
 they make: owner's question if no better proof. Part 3 (node services' helpers) waits on stormd#75: own issue, `--after`.
+Done: caa7d29 (hooks, 2 unit tests; sc-build: 639 kubelet unit, clippy, no warning on a changed line), d23c631 (test: `multi.rs`,
+`member`, exec client; `cd test` sc-build: 65 tests, clippy -D warnings clean). Stage build 9842594f16e9 (caa7d29+).
+Medium on pvetest2 at d23c631 queued (before a release carries the hooks: the hook halves of `pod-multi-exec` and
+`pod-multi-stop-order` are expected to fail there; the rest names the runtime's gaps). Resume: `stormcentral test list` → show it.
 
 ### Shipped (waits for the proof on a node): #372 (P0), traceability: root clones owned by their Pod, pods carry instance/golden/digest/volume ids, mirror pods declare the service's volumes
 
