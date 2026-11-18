@@ -4,13 +4,16 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #399 (P3), golden sealer de-identifies from a systemd unit (stormvm#135)
+### Waiting on an install with b515348: #399 (P3), golden sealer de-identifies from a systemd unit (stormvm#135)
 
 2026-11-18. stormvm 1632135 → 2a60a3c (sealer_spec hands the copy `stormvm-seal.service` via SMBIOS type 11 credentials; also
 closes #394's lag). `Machines::deidentify` gains the copy's volume id (nonce). Order, as `stormvm golden` (make_golden): up = the
 agent answers or `SealLog::read(reg.serial_log, copy)` is not Silent; give the unit `UNIT_GRACE`; if it spoke, wait ≤300 s for
 Done (deidentified → it powers itself off; else fail with exit/output); if Silent, the agent runs DEIDENTIFY as before, a failure
 adds `id -Z; getenforce`. Unit tests on the decision with a fake log. Then sc-build, stage, and #344's golden run decides it.
+Done: b515348 (vm_golden::await_seal + unit_said, 7 seal_tests). sc-build passed (build + 684 kubelet unit); no clippy findings in
+the changed code (crate-wide ones are #385/#386). Stage build 015557193cf1. Closed #394 (fixes in the pin). #399 and #344 held
+`--after-install rustkube-node>=b515348@any:pve`. Resume: run #344's golden suite; pass → close #399, #344 (and #373); fail → fix it.
 
 ### In progress: #397 (P3), live migration post-copy (stormvm#132)
 
