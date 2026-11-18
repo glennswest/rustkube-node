@@ -284,14 +284,16 @@ pub enum ClaimSource {
     Claim(Option<String>, String),
     /// A golden, by name (`apiGroup: storm.io, kind: Golden`).
     Golden(String),
+    /// A `VolumeSnapshot` of the built-in class, in the claim's namespace
+    /// (#379): a new volume from its group snapshot.
+    Snapshot(String),
 }
 
 /// The source a claim asks to be cloned from, if any.
 ///
 /// `dataSourceRef` wins over `dataSource`, as upstream defines it. A source
-/// this node cannot clone (a VolumeSnapshot, some other API group) is `None`,
-/// so the claim gets a blank rather than a failure; snapshots are
-/// stormblock#111.
+/// this node cannot clone (some other API group) is `None`, so the claim gets
+/// a blank rather than a failure. A `VolumeSnapshot` is restored (#379).
 pub fn claim_source(pvc: &Value) -> Option<ClaimSource> {
     let r = if pvc["spec"]["dataSourceRef"].is_object() {
         &pvc["spec"]["dataSourceRef"]
@@ -304,6 +306,7 @@ pub fn claim_source(pvc: &Value) -> Option<ClaimSource> {
     match (group, r["kind"].as_str()?) {
         ("", "PersistentVolumeClaim") => Some(ClaimSource::Claim(ns, name)),
         ("storm.io", "Golden") => Some(ClaimSource::Golden(name)),
+        ("snapshot.storage.k8s.io", "VolumeSnapshot") => Some(ClaimSource::Snapshot(name)),
         _ => None,
     }
 }
@@ -651,11 +654,13 @@ mod tests {
             claim_source(&pvc(json!({"apiGroup": "storm.io", "kind": "Golden", "name": "fedora"}))),
             Some(ClaimSource::Golden("fedora".into()))
         );
-        // Not ours to clone: a blank instead.
+        // A VolumeSnapshot is restored (#379); another group's kind is not
+        // ours to clone: a blank instead.
         assert_eq!(
             claim_source(&pvc(json!({"apiGroup": "snapshot.storage.k8s.io", "kind": "VolumeSnapshot", "name": "s"}))),
-            None
+            Some(ClaimSource::Snapshot("s".into()))
         );
+        assert_eq!(claim_source(&pvc(json!({"apiGroup": "example.com", "kind": "Backup", "name": "s"}))), None);
         assert_eq!(claim_source(&json!({"spec": {}})), None);
         // dataSourceRef wins.
         assert_eq!(

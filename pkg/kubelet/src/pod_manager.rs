@@ -3006,6 +3006,9 @@ impl PodManager {
         name: &str,
     ) -> Result<String, ClaimError> {
         let source = crate::storage::claim_source(pvc).expect("checked by the caller");
+        if let crate::storage::ClaimSource::Snapshot(snapshot) = &source {
+            return self.restore_claim_snapshot(namespace, pvc, name, snapshot).await;
+        }
         let candidates: Vec<String> = match &source {
             crate::storage::ClaimSource::Claim(src_ns, src) => {
                 let src_ns = src_ns.as_deref().unwrap_or(namespace);
@@ -3030,6 +3033,7 @@ impl PodManager {
                 c
             }
             crate::storage::ClaimSource::Golden(g) => vec![format!("{g}.golden"), g.clone()],
+            crate::storage::ClaimSource::Snapshot(_) => unreachable!("restored above"),
         };
         let mut src_id = None;
         for cand in &candidates {
@@ -3069,6 +3073,51 @@ impl PodManager {
         made["id"].as_str().map(String::from).ok_or_else(|| {
             ClaimError::Failed(format!("clone of {src_name} returned no id: {made}"))
         })
+    }
+
+    /// A claim whose `dataSource` is a `VolumeSnapshot` of this class (#379):
+    /// a new volume from the snapshot's group in this node's engine, at the
+    /// snapshot's size (`pvc_resize` grows it to the claim's request once it
+    /// is bound). A claim asking for less than the snapshot is refused, as
+    /// upstream's provisioner refuses it.
+    async fn restore_claim_snapshot(
+        &self,
+        namespace: &str,
+        pvc: &Value,
+        name: &str,
+        snapshot: &str,
+    ) -> Result<String, ClaimError> {
+        let claim = pvc["metadata"]["name"].as_str().unwrap_or_default();
+        let groups = crate::pvc_snapshot::Groups::new(&self.engine);
+        let found = crate::pvc_snapshot::source(&self.api_client, &self.api_url, &groups, namespace, snapshot, &self.node_name)
+            .await
+            .map_err(ClaimError::Failed)?;
+        let size: u64 = found.group.snapshots.iter().map(|s| s.size_bytes).sum();
+        let want = crate::storage::claim_bytes(pvc);
+        if want < size {
+            let why = format!(
+                "requested volume size {want} is less than the size {size} for the source snapshot {snapshot}"
+            );
+            self.claim_event(pvc, "Warning", "ProvisioningFailed", &why).await;
+            return Err(ClaimError::Failed(why));
+        }
+        // An earlier pass that restored and then failed: the volume by name.
+        if let Some(id) = self.storage_volume_id(name).await {
+            return Ok(id);
+        }
+        groups.restore(name, &found.group).await.map_err(|e| {
+            ClaimError::Failed(format!("restoring VolumeSnapshot {namespace}/{snapshot} into {name}: {e}"))
+        })?;
+        // The restore answers `/v1`'s id; attach, owner and every later call
+        // take the engine's (the #344 lesson): the volume by name.
+        let id = self.storage_volume_id(name).await.ok_or_else(|| {
+            ClaimError::Failed(format!("restored {name} from {snapshot}, but the engine does not list it by name"))
+        })?;
+        info!("claim {namespace}/{claim}: restored from VolumeSnapshot {snapshot} (content {}, group {})", found.content, found.group.id);
+        self.claim_event(pvc, "Normal", "Restored", &format!(
+            "restored from VolumeSnapshot {snapshot} ({size} bytes; grown to the request once bound)"
+        )).await;
+        Ok(id)
     }
 
     /// A filesystem template by name, sorted into what a claim does with it

@@ -586,6 +586,10 @@ impl Kubelet {
         // events (#101).
         tokio::spawn(self.clone().reclaim_loop());
 
+        // VolumeSnapshots of the built-in class's claims (#379): the
+        // csi-snapshotter's part, on content events.
+        tokio::spawn(self.clone().snapshot_loop());
+
         // External CSI drivers (#52): register what appears in
         // plugins_registry, and undo the volumes of pods that are gone
         // (deleted while the kubelet was down, or a teardown due a retry),
@@ -901,6 +905,28 @@ impl Kubelet {
                 self.watches.observe(&self.api_client, format!("{api}/api/v1/persistentvolumes"));
                 if self.pod_manager.reclaim_released().await {
                     crate::metrics::observe_timed("reclaim", "deadline");
+                    apimachinery::reactor::requeue_after(RECLAIM_PENDING);
+                }
+            }).await;
+            drop(work);
+        }
+    }
+
+    /// The built-in driver's VolumeSnapshotContents (#379): cut, made
+    /// ready, deleted, on content events; one being cut is looked at again
+    /// shortly (the engine's readiness is not an API change).
+    async fn snapshot_loop(self: Arc<Self>) {
+        let worker = self.watches.worker("kubelet-snapshots");
+        let api = self.config.api_server_url.clone();
+        let events = (!api.is_empty())
+            .then(|| crate::events::EventRecorder::new(self.api_client.clone(), &api, &self.config.node_name));
+        loop {
+            let work = worker.next().await;
+            worker.run(async {
+                if api.is_empty() { return; }
+                self.watches.observe(&self.api_client, format!("{api}/apis/snapshot.storage.k8s.io/v1/volumesnapshotcontents"));
+                if crate::pvc_snapshot::pass(&self.api_client, &api, &self.config.engine, &self.config.node_name, events.as_ref()).await {
+                    crate::metrics::observe_timed("snapshots", "deadline");
                     apimachinery::reactor::requeue_after(RECLAIM_PENDING);
                 }
             }).await;
