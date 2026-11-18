@@ -4,6 +4,26 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #379 (P0), PVC management on the default class: expansion, VolumeSnapshot + restore, describe pvc
+
+2026-11-18. Found: rustkube's apiserver already admits a grow only with `allowVolumeExpansion: true` and refuses a shrink below
+`status.capacity` (upstream's words); its binder leaves a Bound claim's capacity to the resizer. The StorageClass and a
+VolumeSnapshotClass are stormcos manifests (45-storageclass.yaml says `allowVolumeExpansion: false`; no class for snapshots):
+filed on stormcos. The upstream snapshot-controller runs (93-snapshot-controller.yaml) and waits for a driver's csi-snapshotter.
+stormblock v24.26.0 grows a volume: `PATCH /apis/storage.storm.io/v1/volumes/{id}` `{"spec":{"sizeBytes":N}}` (refuses smaller, sealed,
+mirrored). A claim's ext4 is mounted by stormpump's PID 1 at /run/stormpump/pvc/<dev>, which the kubelet sees.
+Doing:
+1. [ ] `pvc_resize.rs`: for claims of this node's built-in class whose request exceeds the PV: the resizer half (Resizing condition,
+       `allocatedResources`, `allocatedResourceStatuses`, the engine PATCH, PV capacity, `FileSystemResizePending`, events
+       `Resizing`/`VolumeResizeFailed`/`FileSystemResizeRequired`) and the node half (EXT4_IOC_RESIZE_FS / XFS growfs on the mount,
+       `status.capacity`, `FileSystemResizeSuccessful`). Block claims finish at the engine. bind() takes the engine's size, not the class's.
+2. [ ] `pvc_snapshot.rs`: the csi-snapshotter's part for driver stormblock.storm.io: a VolumeSnapshotContent whose source volume is in
+       this node's engine → a one-volume group snapshot (named after the content); status snapshotHandle (group id), creationTime,
+       restoreSize, readyToUse; deletion per deletionPolicy, then the finalizer off. A claim with dataSource VolumeSnapshot restores it
+       (`volume_from_snapshot`, the engine id by name; grown to the request by 1).
+3. [ ] describe pvc: the PV's csi.volumeAttributes carry `storm.io/volume-id`; events on the claim for resize and restore.
+4. [ ] docs (docs/csi.md / node-volumes.md, README), CHANGELOG; sc-build; stage; proof on a pvetest after stormcos ships the classes.
+
 ### Shipped (proof pending): #383 (P0), a template listed `broken` is waited on forever (server8 12.92, pvc-ext4j-64m)
 
 - Kubelet: `TemplateStatus::of` sorts the engine's template (ready / making / broken with reason / unknown);
