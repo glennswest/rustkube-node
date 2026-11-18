@@ -47,6 +47,9 @@ pass → `shipped` with proof (a VolumeSnapshot readyToUse, a grown claim) / clo
   Scope narrowed by the master (stormblock#663: the engine keeps no `broken` state): an unknown state fails (done); a clone refused
   because the template vanished between the listing and the clone (404 `fstemplate … not found`) mints it at once and clones
   on the wake, once. Doing that now (`template_gone`), with a unit test; the proof becomes the warm claim probes on an install.
+  Done: 25a5ccd. sc-build passed (VM sc-build-aea9558182, 672 kubelet unit incl. a_template_gone_before_its_clone_is_minted_once_and_cloned).
+  Stage build b3e26b8573c7. Shipped with proof `log:warm probes: container \(3 times\), claim and VM` (a passed install
+  gates on the warm claim probe, stormcentral testhosts.rs warm_verdict). #387 (a real broken-template case) waits on stormblock#664.
 
 ### In progress: #381 (P1), VirtualMachineRestore waits up to 60 s: vm_maintenance_loop does not watch restores (stormvm#127)
 
