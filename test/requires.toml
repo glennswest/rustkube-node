@@ -85,3 +85,19 @@ requires = ["kvm"]
 cluster_read = [
   { apiGroup = "", resource = "nodes" },
 ]
+
+[pvc]
+# PVC management on the built-in class (#379): a claim grown online under its
+# pod, a VolumeSnapshot of it, the snapshot restored into a larger claim, and
+# its content deleted with it. Claims, pods and VolumeSnapshots are made in
+# the run's namespace (its Role). Reads the StorageClass and the
+# VolumeSnapshotClasses (stormcos#1032 ships them) and the content a snapshot
+# is bound to. On request (`stormcentral test run rustkube-node pvc`).
+budget_secs = 900
+cluster_read = [
+  { apiGroup = "", resource = "nodes" },
+  { apiGroup = "", resource = "persistentvolumes" },
+  { apiGroup = "storage.k8s.io", resource = "storageclasses" },
+  { apiGroup = "snapshot.storage.k8s.io", resource = "volumesnapshotclasses" },
+  { apiGroup = "snapshot.storage.k8s.io", resource = "volumesnapshotcontents" },
+]

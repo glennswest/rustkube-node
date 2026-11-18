@@ -67,7 +67,7 @@ pub fn is_workload(args: &[String]) -> bool {
         Some(
             "fill" | "verify" | "size-at-least" | "sized" | "echo" | "exit" | "sleep" | "fail-once"
                 | "write-file" | "expect-file" | "expect-env" | "expect-nics" | "read-file" | "vm-instance" | "rdma-view"
-                | "member"
+                | "member" | "grows"
         )
     )
 }
@@ -309,6 +309,36 @@ fn run(args: &[String]) -> Result<String, String> {
                 Ok(format!("wrote and read back {n} bytes; {} is {have} bytes, in ({lo}, {hi}]", dir.display()))
             } else {
                 Err(format!("{} is {have} bytes, not in ({lo}, {hi}]", dir.display()))
+            }
+        }
+        // A claim grown while this holds it (#379): write the pattern (or,
+        // on a restored claim that has it, read it back), then wait for the
+        // mounted filesystem to reach `want` bytes, as `df` would see it.
+        "grows" => {
+            let (dir, seed, n, want) = (PathBuf::from(arg(1, "path")?), num(2, "seed")?, num(3, "bytes")?, num(4, "want")?);
+            let wait = args.get(5).and_then(|w| w.parse().ok()).unwrap_or(600u64);
+            let p = target(&arg(1, "path")?);
+            let how = if p.exists() {
+                verify(&p, seed, n)?;
+                "read back"
+            } else {
+                fill(&p, seed, n)?;
+                verify(&p, seed, n)?;
+                "wrote and read back"
+            };
+            let first = size(&dir)?;
+            println!("grows: {how} {n} bytes; {} is {first} bytes, waiting for {want}", dir.display());
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+            loop {
+                let have = size(&dir)?;
+                if have >= want {
+                    verify(&p, seed, n)?;
+                    return Ok(format!("{how} {n} bytes; {} grew from {first} to {have} bytes (>= {want}) while mounted", dir.display()));
+                }
+                if std::time::Instant::now() >= end {
+                    return Err(format!("{} is {have} bytes after {wait} s, wanted >= {want}", dir.display()));
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
             }
         }
         "echo" => Ok(args[1..].join(" ")),

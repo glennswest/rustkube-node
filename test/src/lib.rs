@@ -22,6 +22,9 @@
 //!   de-identified golden from a running VM when a `VirtualMachineGolden`
 //!   asks; a clone of it has a new machine-id (`golden.rs`). Leaves the
 //!   golden on the node's engine (a test may not delete it).
+//! - `pvc` (< 15 min, #379, on request only): a claim of the built-in class
+//!   grown online under its pod, a `VolumeSnapshot` of it, and that snapshot
+//!   restored into a larger claim (`pvc.rs`). Needs stormcos#1032's classes.
 //! - `long` (the night): waves of pods sized from the node's capacity,
 //!   measuring start latency and what each wave leaves behind (`long.rs`).
 //!
@@ -43,6 +46,7 @@ pub mod multi;
 pub mod multus;
 pub mod node_volumes;
 pub mod pods;
+pub mod pvc;
 pub mod report;
 pub mod short;
 pub mod workload;
@@ -100,8 +104,9 @@ pub async fn run(env: Arc<Env>, r: &mut Report) {
         "multus" => Box::pin(multus::run(env, api, r)).await,
         "metadata" => Box::pin(metadata::run(env, api, r)).await,
         "golden" => Box::pin(golden::run(env, api, r)).await,
+        "pvc" => Box::pin(pvc::run(env, api, r)).await,
         other => {
-            r.record("suite", Outcome::Infra(format!("STORM_SUITE {other:?} is not short, medium, long, csi, multus, metadata or golden")), 0, None);
+            r.record("suite", Outcome::Infra(format!("STORM_SUITE {other:?} is not short, medium, long, csi, multus, metadata, golden or pvc")), 0, None);
         }
     }
 }

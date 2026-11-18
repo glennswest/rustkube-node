@@ -1,0 +1,341 @@
+//! The `pvc` suite (#379): PVC management on the built-in class, as `oc`
+//! does it — a claim grown online while a pod holds it, a `VolumeSnapshot` of
+//! it, and that snapshot restored into a larger claim.
+//!
+//! - `pvc-classes`: StorageClass `stormblock` says `allowVolumeExpansion:
+//!   true` and a `VolumeSnapshotClass` of driver `stormblock.storm.io` exists
+//!   (stormcos#1032). Without them the rest is a skip, naming what is missing.
+//! - `pvc-grow`: a 64Mi claim held by a pod that wrote a pattern to it is
+//!   patched to 256Mi. The claim ends with `status.capacity.storage` 256Mi and
+//!   no resize condition; the pod sees its mounted filesystem past 200 MiB
+//!   (statvfs, as `df` reads it) and its pattern intact; the claim carries the
+//!   `Resizing` and `FileSystemResizeSuccessful` events.
+//! - `pvc-shrink-refused`: patching it back to 64Mi is refused by the
+//!   apiserver.
+//! - `pvc-snapshot`: a `VolumeSnapshot` of the grown claim is `readyToUse`
+//!   with a `restoreSize` of at least 256Mi.
+//! - `pvc-restore`: a 512Mi claim with that snapshot as its `dataSource` is
+//!   restored: a pod reads the pattern back and sees its filesystem grow past
+//!   400 MiB.
+//! - `pvc-snapshot-deleted`: deleting the snapshot deletes its content
+//!   (`deletionPolicy: Delete`).
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
+
+use crate::api::{s, Api};
+use crate::env::{Env, CLASS, PROVISIONER};
+use crate::k8s::{self, MIB};
+use crate::report::{Outcome, Report};
+
+const MARGIN: Duration = Duration::from_secs(20);
+const SNAP_API: &str = "/apis/snapshot.storage.k8s.io/v1";
+const SEED: u64 = 379;
+const BYTES: u64 = 8 * MIB;
+
+fn snapshots(env: &Env) -> String {
+    format!("{SNAP_API}/namespaces/{}/volumesnapshots", env.namespace)
+}
+
+/// A `VolumeSnapshot` of claim `claim` in class `class`.
+pub fn snapshot(env: &Env, name: &str, claim: &str, class: &str) -> Value {
+    json!({
+        "apiVersion": "snapshot.storage.k8s.io/v1", "kind": "VolumeSnapshot",
+        "metadata": { "name": name, "namespace": env.namespace, "labels": k8s::labels(env) },
+        "spec": { "volumeSnapshotClassName": class, "source": { "persistentVolumeClaimName": claim } },
+    })
+}
+
+/// A claim restored from snapshot `snap`.
+pub fn restored_claim(env: &Env, name: &str, request: &str, snap: &str) -> Value {
+    let mut c = k8s::claim(env, name, request);
+    c["spec"]["dataSource"] = json!({ "apiGroup": "snapshot.storage.k8s.io", "kind": "VolumeSnapshot", "name": snap });
+    c
+}
+
+/// A pod pinned to the node holding `claim`, running `grows` on it: the
+/// pattern written (or read back), then its filesystem waited on until it
+/// holds `want` bytes.
+pub fn grows_pod(env: &Env, name: &str, claim: &str, want: u64) -> Value {
+    let args = [SEED.to_string(), BYTES.to_string(), want.to_string(), "600".to_string()];
+    let mut p = k8s::work(env, name, claim, "grows", &args);
+    p["spec"]["nodeName"] = json!(env.node_name);
+    p
+}
+
+/// Whether the classes #379 needs are here: `None` when they are, else why not.
+pub fn classes_missing(sc: Option<&Value>, vscs: &[Value]) -> Option<String> {
+    let mut why = Vec::new();
+    match sc {
+        None => why.push(format!("no StorageClass {CLASS}")),
+        Some(c) if s(c, "/provisioner") != PROVISIONER => why.push(format!("StorageClass {CLASS} is {:?}'s", s(c, "/provisioner"))),
+        Some(c) if c["allowVolumeExpansion"] != json!(true) => {
+            why.push(format!("StorageClass {CLASS} does not allow volume expansion (stormcos#1032)"))
+        }
+        Some(_) => {}
+    }
+    if !vscs.iter().any(|v| s(v, "/driver") == PROVISIONER) {
+        why.push(format!("no VolumeSnapshotClass of driver {PROVISIONER} (stormcos#1032)"));
+    }
+    (!why.is_empty()).then(|| why.join("; "))
+}
+
+struct Suite {
+    env: Arc<Env>,
+    api: Api,
+}
+
+impl Suite {
+    fn claim_path(&self, name: &str) -> String {
+        format!("{}/{name}", k8s::pvcs(&self.env))
+    }
+
+    /// Set a claim's request (a read-modify-write: the test's Api has no patch).
+    async fn request(&self, name: &str, request: &str) -> Result<(), String> {
+        let path = self.claim_path(name);
+        let mut c = self.api.get(&path).await?.ok_or_else(|| format!("claim {name} is gone"))?;
+        c["spec"]["resources"]["requests"]["storage"] = json!(request);
+        self.api.put(&path, &c).await.map(|_| ())
+    }
+
+    /// Wait for a claim's capacity to reach `bytes` with no resize pending.
+    async fn grown(&self, name: &str, bytes: u64, within: Duration) -> Result<Value, String> {
+        let path = self.claim_path(name);
+        k8s::until(within, || {
+            let path = path.clone();
+            async move {
+                let c = self.api.get(&path).await?.ok_or_else(|| format!("claim {name} is gone"))?;
+                let have = crate::api::quantity_bytes(s(&c, "/status/capacity/storage")).unwrap_or(0);
+                let pending: Vec<String> = c["status"]["conditions"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|x| x["status"] == "True")
+                    .map(|x| format!("{} {}", s(x, "/type"), s(x, "/message")))
+                    .collect();
+                if have >= bytes && pending.is_empty() {
+                    Ok(c)
+                } else {
+                    Err(format!(
+                        "claim {name}: capacity {:?}, conditions {pending:?}, allocatedResourceStatuses {}",
+                        s(&c, "/status/capacity/storage"),
+                        c["status"]["allocatedResourceStatuses"]
+                    ))
+                }
+            }
+        })
+        .await
+    }
+
+    /// The pod's result line: `grows`'s detail, or why it failed.
+    async fn finished(&self, pod: &str, within: Duration) -> Result<String, String> {
+        let done = k8s::pod_done(&self.env, &self.api, pod, within).await?;
+        let message = if done.message.is_empty() {
+            k8s::log(&self.env, &self.api, pod, false).await.unwrap_or_default()
+        } else {
+            done.message
+        };
+        let line: Value = serde_json::from_str(message.trim().lines().last().unwrap_or("")).unwrap_or(Value::Null);
+        match (done.phase.as_str(), line["ok"].as_bool()) {
+            ("Succeeded", Some(true)) => Ok(s(&line, "/detail").to_string()),
+            _ => Err(format!("pod {pod} {}: {}", done.phase, message.trim())),
+        }
+    }
+
+    async fn grow(&self) -> Outcome {
+        let within = self.env.budget(Duration::from_secs(300), MARGIN);
+        if let Err(e) = self.api.create(&k8s::pvcs(&self.env), &k8s::claim(&self.env, "grow", "64Mi")).await {
+            return Outcome::Infra(e);
+        }
+        if let Err(e) = self.api.create(&k8s::pods(&self.env), &grows_pod(&self.env, "grow-pod", "grow", 200 * MIB)).await {
+            return Outcome::Infra(e);
+        }
+        if let Err(e) = k8s::pod_running(&self.env, &self.api, "grow-pod", within).await {
+            return Outcome::Fail(format!("the pod holding the claim did not start: {e}"));
+        }
+        let t = Instant::now();
+        if let Err(e) = self.request("grow", "256Mi").await {
+            return Outcome::Fail(format!("growing the claim to 256Mi was refused: {e}"));
+        }
+        let claim = match self.grown("grow", 256 * MIB, within).await {
+            Ok(c) => c,
+            Err(e) => return Outcome::Fail(e),
+        };
+        let took = t.elapsed().as_secs();
+        let pod = match self.finished("grow-pod", within).await {
+            Ok(d) => d,
+            Err(e) => return Outcome::Fail(format!("the claim says 256Mi, but in the pod: {e}")),
+        };
+        let events = k8s::events_for(&self.env, &self.api, "PersistentVolumeClaim", "grow").await.unwrap_or_default();
+        for want in ["Resizing", "FileSystemResizeSuccessful"] {
+            if !events.iter().any(|e| e.starts_with(&format!("{want}:"))) {
+                return Outcome::Fail(format!("no {want} event on the claim: {events:?}"));
+            }
+        }
+        Outcome::Pass(format!(
+            "64Mi → {} in {took} s; pod: {pod}; events: {}",
+            s(&claim, "/status/capacity/storage"),
+            events.join(" | ")
+        ))
+    }
+
+    async fn shrink_refused(&self) -> Outcome {
+        match self.request("grow", "64Mi").await {
+            Ok(()) => Outcome::Fail("the apiserver took a shrink of claim grow to 64Mi".into()),
+            Err(e) if e.contains("403") || e.contains("422") || e.to_lowercase().contains("forbidden") => Outcome::Pass(e),
+            Err(e) => Outcome::Infra(e),
+        }
+    }
+
+    async fn snapshot(&self, class: &str) -> Outcome {
+        let within = self.env.budget(Duration::from_secs(180), MARGIN);
+        if let Err(e) = self.api.create(&snapshots(&self.env), &snapshot(&self.env, "grow-snap", "grow", class)).await {
+            return Outcome::Infra(e);
+        }
+        let path = format!("{}/grow-snap", snapshots(&self.env));
+        let got = k8s::until(within, || {
+            let path = path.clone();
+            async move {
+                let v = self.api.get(&path).await?.ok_or("VolumeSnapshot grow-snap is gone")?;
+                if let Some(e) = v.pointer("/status/error/message").and_then(Value::as_str) {
+                    return Ok(Err(e.to_string()));
+                }
+                if v["status"]["readyToUse"] == json!(true) {
+                    Ok(Ok(v))
+                } else {
+                    Err(format!("VolumeSnapshot grow-snap: status {}", v["status"]))
+                }
+            }
+        })
+        .await;
+        let v = match got {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return Outcome::Fail(format!("the snapshot was refused: {e}")),
+            Err(e) => return Outcome::Fail(e),
+        };
+        let size = match &v["status"]["restoreSize"] {
+            Value::String(q) => crate::api::quantity_bytes(q).unwrap_or(0),
+            Value::Number(n) => n.as_u64().unwrap_or(0),
+            _ => 0,
+        };
+        if size < 256 * MIB {
+            return Outcome::Fail(format!("readyToUse, but restoreSize is {} (< 256Mi)", v["status"]["restoreSize"]));
+        }
+        Outcome::Pass(format!(
+            "readyToUse, restoreSize {}, content {}",
+            v["status"]["restoreSize"],
+            s(&v, "/status/boundVolumeSnapshotContentName")
+        ))
+    }
+
+    async fn restore(&self) -> Outcome {
+        let within = self.env.budget(Duration::from_secs(300), MARGIN);
+        let c = restored_claim(&self.env, "restored", "512Mi", "grow-snap");
+        if let Err(e) = self.api.create(&k8s::pvcs(&self.env), &c).await {
+            return Outcome::Infra(e);
+        }
+        if let Err(e) = self.api.create(&k8s::pods(&self.env), &grows_pod(&self.env, "restored-pod", "restored", 400 * MIB)).await {
+            return Outcome::Infra(e);
+        }
+        let pod = match self.finished("restored-pod", within).await {
+            Ok(d) => d,
+            Err(e) => return Outcome::Fail(e),
+        };
+        if !pod.starts_with("read back") {
+            return Outcome::Fail(format!("the restored claim did not hold the snapshot's data: {pod}"));
+        }
+        match self.grown("restored", 512 * MIB, Duration::from_secs(30)).await {
+            Ok(c) => Outcome::Pass(format!("{}; claim {}", pod, s(&c, "/status/capacity/storage"))),
+            Err(e) => Outcome::Fail(format!("the pod saw it, but {e}")),
+        }
+    }
+
+    async fn snapshot_deleted(&self) -> Outcome {
+        let path = format!("{}/grow-snap", snapshots(&self.env));
+        let content = match self.api.get(&path).await {
+            Ok(Some(v)) => s(&v, "/status/boundVolumeSnapshotContentName").to_string(),
+            Ok(None) => return Outcome::Skip("no snapshot to delete".into()),
+            Err(e) => return Outcome::Infra(e),
+        };
+        if let Err(e) = self.api.delete(&path).await {
+            return Outcome::Infra(e);
+        }
+        let within = self.env.budget(Duration::from_secs(120), MARGIN);
+        if let Err(e) = k8s::gone(&self.api, &path, within).await {
+            return Outcome::Fail(e);
+        }
+        if content.is_empty() {
+            return Outcome::Pass("the snapshot is gone (it named no content)".into());
+        }
+        match k8s::gone(&self.api, &format!("{SNAP_API}/volumesnapshotcontents/{content}"), within).await {
+            Ok(()) => Outcome::Pass(format!("VolumeSnapshot and its content {content} gone")),
+            Err(e) => Outcome::Fail(e),
+        }
+    }
+}
+
+pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
+    let sc = match api.get(&format!("/apis/storage.k8s.io/v1/storageclasses/{CLASS}")).await {
+        Ok(sc) => sc,
+        Err(e) => {
+            r.record("pvc-classes", Outcome::Infra(e), 0, None);
+            return;
+        }
+    };
+    let vscs = api.list(&format!("{SNAP_API}/volumesnapshotclasses")).await.ok().flatten().unwrap_or_default();
+    if let Some(why) = classes_missing(sc.as_ref(), &vscs) {
+        r.record("pvc-classes", Outcome::Skip(why), 0, None);
+        return;
+    }
+    let class = vscs.iter().find(|v| s(v, "/driver") == PROVISIONER).map(|v| s(v, "/metadata/name").to_string()).unwrap_or_default();
+    r.record("pvc-classes", Outcome::Pass(format!("{CLASS} expands; VolumeSnapshotClass {class}")), 0, None);
+
+    let suite = Suite { env: env.clone(), api: api.clone() };
+    let grew = r.run("pvc-grow", suite.grow()).await;
+    if grew {
+        r.run("pvc-shrink-refused", suite.shrink_refused()).await;
+    }
+    let cut = grew && r.run("pvc-snapshot", suite.snapshot(&class)).await;
+    if cut {
+        r.run("pvc-restore", suite.restore()).await;
+    }
+    // Before the claims go: the snapshot's content is deleted from its claim's node.
+    r.run("pvc-snapshot-deleted", suite.snapshot_deleted()).await;
+    if let Err(e) = k8s::drain(&env, &api, Duration::from_secs(30)).await {
+        r.record("cleanup", Outcome::Infra(e), 0, None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_classes_are_judged() {
+        let sc = json!({ "provisioner": PROVISIONER, "allowVolumeExpansion": true });
+        let vsc = json!({ "metadata": { "name": "stormblock" }, "driver": PROVISIONER });
+        assert_eq!(classes_missing(Some(&sc), std::slice::from_ref(&vsc)), None);
+        let fixed = json!({ "provisioner": PROVISIONER, "allowVolumeExpansion": false });
+        let why = classes_missing(Some(&fixed), &[]).unwrap();
+        assert!(why.contains("does not allow volume expansion") && why.contains("no VolumeSnapshotClass"), "{why}");
+        assert!(classes_missing(None, &[vsc]).unwrap().contains("no StorageClass"));
+    }
+
+    #[test]
+    fn the_objects_name_what_they_restore() {
+        let env = k8s::tests::env();
+        let v = snapshot(&env, "grow-snap", "grow", "stormblock");
+        assert_eq!(v["spec"]["source"]["persistentVolumeClaimName"], "grow");
+        assert_eq!(v["spec"]["volumeSnapshotClassName"], "stormblock");
+        let c = restored_claim(&env, "restored", "512Mi", "grow-snap");
+        assert_eq!(c["spec"]["dataSource"]["kind"], "VolumeSnapshot");
+        assert_eq!(c["spec"]["resources"]["requests"]["storage"], "512Mi");
+        let p = grows_pod(&env, "grow-pod", "grow", 200 * MIB);
+        let args: Vec<&str> = p["spec"]["containers"][0]["args"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        assert_eq!(args[0], "grows");
+        assert_eq!(args[2], "379");
+        assert_eq!(p["spec"]["nodeName"], json!(env.node_name));
+    }
+}
