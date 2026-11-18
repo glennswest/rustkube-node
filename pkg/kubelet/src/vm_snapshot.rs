@@ -419,6 +419,8 @@ pub struct Snapshots {
     /// Restores already written complete or failing the same way, so an
     /// unchanged one is not written again.
     pub(crate) restore_said: Mutex<std::collections::HashMap<String, String>>,
+    /// Backups off the node (#380): `None`, none are taken.
+    pub(crate) backups: Option<Arc<crate::vm_backup::Backups>>,
 }
 
 impl Snapshots {
@@ -444,7 +446,15 @@ impl Snapshots {
             completed: Arc::new(tokio::sync::Notify::new()),
             restore_engine: None,
             restore_said: Mutex::new(Default::default()),
+            backups: None,
         }
+    }
+
+    /// Ship backups to their stores, schedule them and restore from them
+    /// (#380).
+    pub fn with_backups(mut self, backups: Arc<crate::vm_backup::Backups>) -> Snapshots {
+        self.backups = Some(backups);
+        self
     }
 
     /// Serve `VirtualMachineRestore` with this engine (#53).
@@ -478,6 +488,11 @@ impl Snapshots {
         // no snapshot CRD has no restores either.
         self.restores().await;
         let Some(items) = self.list().await else { return };
+        // Backups (#380): every one this node took is stepped, and the
+        // schedule asks for any that is due.
+        if let Some(b) = &self.backups {
+            b.pass(&items).await;
+        }
         let now = chrono::Utc::now();
         for obj in items {
             let ns = obj["metadata"]["namespace"].as_str().unwrap_or("default").to_string();

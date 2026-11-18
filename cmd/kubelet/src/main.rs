@@ -148,6 +148,14 @@ struct Cli {
     #[arg(long, env = "MIGRATION_PORT", default_value_t = kubelet::vm_migration::DEFAULT_PORT)]
     migration_port: u16,
 
+    /// A store VM backups go to (#380, stormvm#31): `name=url@node[,token=<file>]`,
+    /// the store engine's URL, the node its engine serves attaches on, and
+    /// its token file (none: the node's own, only right for this node's
+    /// engine). Repeatable; `BACKUP_STORES` is `;`-separated. `forge` is the
+    /// store a backup names when it names none.
+    #[arg(long = "backup-store", env = "BACKUP_STORES", value_delimiter = ';')]
+    backup_store: Vec<String>,
+
     /// Pods this node takes: its capacity and allocatable `pods`, which the
     /// scheduler holds it to (#165). Upstream's default; stormcos sets 250.
     #[arg(long, env = "MAX_PODS", default_value_t = kubelet::node_status::DEFAULT_MAX_PODS)]
@@ -660,6 +668,12 @@ async fn main() -> anyhow::Result<()> {
         parse("--system-reserved", &cli.system_reserved)?.plus(&parse("--kube-reserved", &cli.kube_reserved)?)
     };
     let container_log = container_log_rotation(&cli.container_log_max_size, cli.container_log_max_files)?;
+    let backup_stores = cli
+        .backup_store
+        .iter()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| kubelet::vm_backup::parse_store(s).map_err(|e| anyhow::anyhow!("--backup-store {e}")))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     if cli.runtime != "cri" {
         if let Some(d) = &cli.cgroup_driver {
             tracing::info!("--cgroup-driver={d} is not used by --runtime {} (only a CRI runtime takes a cgroup parent)", cli.runtime);
@@ -719,6 +733,7 @@ async fn main() -> anyhow::Result<()> {
             port: cli.migration_port,
             node_ip: String::new(),
         },
+        backup_stores,
         ..Default::default()
     };
     kubelet::startup::mark("credentials");

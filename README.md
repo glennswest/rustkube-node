@@ -935,6 +935,25 @@ with `CAP_IPC_LOCK` effective. A pod that doesn't ask must see neither.
   A restore's volumes get their owner as soon as they are made: a restored disk its PVC (it is a claim and
   outlives the machine; the VM as owner would let the orphan sweep delete it under the claim), the restored
   memory state the VirtualMachine (none with `storm.io/retain-disks`).
+- **Backups off the node** (#380, stormvm#31, the owner's decision A): a `VirtualMachineSnapshot` with
+  `storm.io/backup-to: <store>` is also a backup. Once it reads `Succeeded` on the node that took it, its
+  group's disks are shipped to the store (changed extents only, against the last backup's group still on
+  the node) by stormvm's `Transfer`, kept in `status["storm.io/backup-transfer"]` and stepped once per
+  pass. `status["storm.io/backup"]` says `phase` (`preparing`, `copying`, `sealing`, `done`,
+  `waitingEngine`, `failed`), `store`, `point`, `incremental` and the bytes. `waitingEngine` (an engine
+  without stormblock#399/#400, or a store this node is not given) is asked again, never failed. Once
+  done: the older backups' groups leave the node (`storm.io/backupBaseReleased`; only the newest stays,
+  as the next base), the store keeps the VM's `storm.io/backup-keep` newest points, and a scheduled
+  snapshot whose point was pruned is deleted (`storm.io/backupSettled` when all of it went through).
+  - **Schedule:** a VirtualMachine running here with `storm.io/backup-every: 6h` (1h at least;
+    `storm.io/backup-keep`, `storm.io/backup-to`) gets `<vm>-backup-<ms>` snapshots, labelled
+    `storm.io/backup-of=<vm>`, when one is due. A bad annotation is a `BackupScheduleInvalid` Event on the VM.
+  - **Restore from a store:** a `VirtualMachineRestore` of a snapshot whose group has left the node
+    copies its point back from the store (`status["storm.io/restore-transfer"]` on the restore), into
+    `<ns>.<vm>.<disk>.restored.<restore>` volumes, bound and owned by claims and made the VM's disks
+    as any restore. The memory is not on the store: such a VM starts cold.
+  - **Stores:** `--backup-store` (configuration.md). The console's `GET /api/v1/vms/{ns}/{name}/backups`
+    lists the node's snapshots and every store's points.
 - **Snapshots: `VirtualMachineSnapshot`** (`snapshot.kubevirt.io/v1beta1`).
   - **Whose:** the node whose stormblock holds the VM's volumes, the one it
     runs on (`spec.source` is a `VirtualMachine` or a `VirtualMachineInstance`).
@@ -1184,7 +1203,7 @@ VM manager's orphan and adoption passes leave to its request.
 
 Limits: the engine calls go through stormvm's client, so an `https://` engine
 URL needs #318 (as snapshots do). On one node, `volume_from_snapshot` relies on
-stormvm 893b2e8 or later (#345: no slave replicas on a restore); the kubelet pins d952a0c (#352, #355, #367, #373). The kubelet's
+stormvm 893b2e8 or later (#345: no slave replicas on a restore); the kubelet pins a302b3e (#352, #355, #367, #373, #380). The kubelet's
 identity (`system:nodes`) is bound to cluster-admin by rustkube's bootstrap, so
 no RBAC is added; a tightened node role needs `get/list/watch` on
 `virtualmachinegoldens` and `patch` on `virtualmachinegoldens/status`.

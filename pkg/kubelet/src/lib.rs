@@ -54,6 +54,7 @@ pub mod vm_golden;
 pub mod vm_hotplug;
 pub mod volume_ownership;
 pub mod vm_start_timing;
+pub mod vm_backup;
 pub mod vm_manager;
 pub mod vm_network;
 pub mod vm_restore;

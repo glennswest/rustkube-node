@@ -57,6 +57,9 @@ pub struct ServerConfig {
     /// `snapshot` verb (#83). The console finds the engine token itself, in
     /// the same places `engine.rs` looks.
     pub stormblock_url: String,
+    /// The backup stores (#380), name → engine URL, so the console's
+    /// `GET …/backups` lists their points too.
+    pub backup_stores: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -144,7 +147,7 @@ pub fn router(pod_manager: Arc<PodManager>) -> Router {
     router_with_console(
         pod_manager,
         None,
-        console(crate::vm_manager::RUN_ROOT, crate::engine::DEFAULT_URL),
+        console(crate::vm_manager::RUN_ROOT, crate::engine::DEFAULT_URL, Vec::new()),
     )
 }
 
@@ -154,10 +157,11 @@ pub fn router(pod_manager: Arc<PodManager>) -> Router {
 /// Without `stormblock` the router still serves the doors and every other
 /// verb, but `snapshot` answers 409 "this service was not told where
 /// stormblock is" (#83) — so both mounts go through here.
-fn console(run_dir: &str, stormblock: &str) -> Router {
+fn console(run_dir: &str, stormblock: &str, backup_stores: Vec<(String, String)>) -> Router {
     stormvm_console::router(stormvm_console::Config {
         run_dir: run_dir.to_string(),
         stormblock: Some(stormblock.to_string()),
+        backup_stores,
         ..Default::default()
     })
 }
@@ -233,7 +237,7 @@ pub async fn serve(
     let app = router_with_console(
         pod_manager,
         vms,
-        console(crate::vm_manager::RUN_ROOT, &config.stormblock_url),
+        console(crate::vm_manager::RUN_ROOT, &config.stormblock_url, config.backup_stores.clone()),
     )
     .layer(middleware::from_fn_with_state(auth, auth_mw));
 

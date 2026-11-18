@@ -358,16 +358,32 @@ impl Snapshots {
         let group = if engine_disks.is_empty() && state_member.is_none() {
             None
         } else {
-            Some(
-                engine
-                    .group(group_id)
-                    .map_err(|e| Step::Wait(format!("stormblock: {e}")))?
-                    .ok_or_else(|| Step::Error(format!("group snapshot {group_id} is gone from this node")))?,
-            )
+            engine.group(group_id).map_err(|e| Step::Wait(format!("stormblock: {e}")))?
         };
 
         let mut restores = Vec::new();
         let mut claims = Vec::new();
+        // The group is gone from the node (a backup's, released once a newer
+        // one was done, #380): its disks come back from the store's point.
+        // The memory is not on the store: the VM starts cold.
+        let state_member = if group.is_none() && !engine_disks.is_empty() {
+            for (disk, made, bytes) in self.from_store(obj, req, snap, group_id).await? {
+                let (_, claim) = names(ns, &req.vm, &disk, &req.name);
+                let claim_uid = self.bind_restored(ns, &claim, &made, bytes, obj).await.map_err(Step::Wait)?;
+                engine
+                    .set_owner(&made, &restored_owner("PersistentVolumeClaim", ns, &claim, &claim_uid))
+                    .map_err(|e| Step::Wait(format!("disk {disk}'s restored volume has no owner yet: {e}")))?;
+                restores.push(Restored { disk: disk.clone(), snapshot: req.snapshot.clone(), volume: claim.clone() });
+                claims.push((disk, claim));
+            }
+            None
+        } else {
+            if group.is_none() && state_member.is_some() {
+                return Err(Step::Error(format!("group snapshot {group_id} is gone from this node")));
+            }
+            state_member
+        };
+        let engine_disks = if group.is_none() { Vec::new() } else { engine_disks };
         for (disk, vol) in engine_disks {
             let group = group.as_ref().expect("a group for the engine's disks");
             let member = group
@@ -491,6 +507,73 @@ impl Snapshots {
         Ok(())
     }
 
+    /// A restore whose snapshot's group is gone from the node, from the
+    /// point its backup left on a store (#380): stormvm's `Transfer`
+    /// (store → node), kept in the restore's status and stepped one round a
+    /// pass. Done: each disk with the volume it landed in and its size.
+    async fn from_store(
+        &self,
+        obj: &Value,
+        req: &spec::RestoreRequest,
+        snap: &Value,
+        group_id: &str,
+    ) -> Result<Vec<(String, String, u64)>, Step> {
+        use crate::vm_backup::{BACKUP_STATUS, RESTORE_TRANSFER, TRANSFER_STATUS};
+        use stormvm_block::backup::{Phase, Transfer};
+        let gone = format!("group snapshot {group_id} is gone from this node");
+        let backup = &snap["status"][BACKUP_STATUS];
+        let (Some(store_name), Some(point)) = (backup["store"].as_str(), backup["point"].as_str()) else {
+            return Err(Step::Error(format!("{gone}, and the snapshot was not backed up to a store")));
+        };
+        if backup["phase"].as_str() != Some("done") {
+            return Err(Step::Error(format!("{gone}, and its backup to {store_name} is not done")));
+        }
+        let Some(b) = self.backups.clone() else {
+            return Err(Step::Error(format!("{gone}; its point is on {store_name}, and this kubelet has no backup stores")));
+        };
+        let Some(store) = b.store(store_name).cloned() else {
+            return Err(Step::Wait(format!("{gone}; its point is on {store_name}, a store this node does not know (--backup-store)")));
+        };
+        let kept: Option<Transfer> = serde_json::from_value(obj["status"][RESTORE_TRANSFER].clone()).ok();
+        let t = match kept {
+            Some(t) => t,
+            None => {
+                let points = b.points(&store, &req.namespace, &req.vm).await.map_err(|e| Step::Wait(format!("store {store_name}: {e}")))?;
+                let g = points
+                    .iter()
+                    .find(|g| g.name == point)
+                    .ok_or_else(|| Step::Error(format!("{gone}, and point {point} is gone from {store_name}")))?;
+                // Which store volume held which disk: the backup's own copy says.
+                let shipped: Option<Transfer> = serde_json::from_value(snap["status"][TRANSFER_STATUS].clone()).ok();
+                let disks: Vec<(String, String)> = shipped
+                    .map(|t| t.members.into_iter().filter_map(|m| m.target_id.map(|id| (m.disk, id))).collect())
+                    .unwrap_or_default();
+                if disks.is_empty() {
+                    return Err(Step::Error(format!("{gone}, and its backup records no store volume per disk")));
+                }
+                Transfer::restore(&req.namespace, &req.vm, &req.name, g, &disks, &store.node, b.node()).map_err(Step::Error)?
+            }
+        };
+        let (t, r) = b.step_restore(t, &store).await;
+        self.write_restore_status(obj, json!({ RESTORE_TRANSFER: serde_json::to_value(&t).unwrap_or(Value::Null) })).await;
+        let (total, done) = t.progress();
+        match (t.phase, r) {
+            (Phase::Done, _) => Ok(t.members.iter().map(|m| (m.disk.clone(), m.target_name.clone(), m.size_bytes)).collect()),
+            (Phase::Failed, _) => Err(Step::Error(format!(
+                "the copy from {store_name} failed: {}",
+                t.message.as_deref().unwrap_or("no reason given")
+            ))),
+            (phase, r) => {
+                apimachinery::reactor::requeue_after(crate::vm_backup::STEP_EVERY);
+                let why = r.err().map(|e| format!(" ({e})")).unwrap_or_default();
+                Err(Step::Wait(format!(
+                    "copying {point} back from {store_name}: {} {done}/{total} bytes{why}",
+                    crate::vm_backup::phase_name(phase)
+                )))
+            }
+        }
+    }
+
     /// The bound PVC and PV for a restored volume, made when missing. The
     /// claim's uid, for the volume's owner (#373).
     async fn bind_restored(&self, ns: &str, claim: &str, volume: &str, bytes: u64, restore: &Value) -> Result<String, String> {
@@ -580,16 +663,16 @@ fn now() -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
-    type Store = Arc<Mutex<HashMap<String, Value>>>;
+    pub(crate) type Store = Arc<Mutex<HashMap<String, Value>>>;
 
     /// An in-memory apiserver: objects by path; the cluster-wide restore list;
     /// POST adds (uid assigned), PUT replaces, a status PATCH merges `status`.
-    async fn api(objects: Vec<(&str, Value)>) -> (String, Store, Arc<Mutex<Vec<String>>>) {
+    pub(crate) async fn api(objects: Vec<(&str, Value)>) -> (String, Store, Arc<Mutex<Vec<String>>>) {
         let store: Store = Arc::new(Mutex::new(objects.into_iter().map(|(k, v)| (k.to_string(), v)).collect()));
         let writes: Arc<Mutex<Vec<String>>> = Arc::default();
         let (s, w) = (store.clone(), writes.clone());
@@ -630,8 +713,11 @@ mod tests {
                         "PATCH" if path.ends_with("/status") => {
                             w.lock().unwrap().push(format!("STATUS {path}"));
                             let key = path.trim_end_matches("/status").to_string();
+                            // A merge patch: each top-level key of `status`.
                             if let Some(o) = s.get_mut(&key) {
-                                o["status"] = body["status"].clone();
+                                for (k, v) in body["status"].as_object().into_iter().flatten() {
+                                    o["status"][k] = v.clone();
+                                }
                             }
                             (StatusCode::OK, axum::Json(json!({})))
                         }
@@ -758,6 +844,60 @@ mod tests {
         let take: crate::vm_snapshot::TakeFn =
             Arc::new(|_, _, _, _, _| Box::pin(async { crate::vm_snapshot::Taken::default() }));
         Snapshots::new(reqwest::Client::new(), url, "n1", "/nonexistent", take).with_restore_engine(engine)
+    }
+
+    /// #380: a snapshot whose group is gone from the node, backed up to a
+    /// store, is restored from the store's point: copied back into new
+    /// volumes, which become the VM's disks, each owned by its claim.
+    #[tokio::test]
+    async fn a_backup_whose_group_left_the_node_is_restored_from_the_store() {
+        use crate::vm_backup::{tests as b, BACKUP_STATUS, RESTORE_TRANSFER, TRANSFER_STATUS};
+        let mut snap = snapshot("n1", Some(r#"{"rootdisk":"v-root","data":"v-data","cloudinitdisk":"v-seed"}"#));
+        snap["status"]["virtualMachineSnapshotContentName"] = json!("released-1");
+        let mut shipped = stormvm_block::backup::Transfer::backup(
+            "web", "web-1", "snap", &b::group("g-1", &["v-root", "v-data"]),
+            &[("rootdisk".into(), "v-root".into()), ("data".into(), "v-data".into())], None, "n1", "forge1",
+        ).unwrap();
+        for m in &mut shipped.members {
+            m.target_id = Some(format!("t-{}", m.disk));
+        }
+        snap["status"][TRANSFER_STATUS] = serde_json::to_value(&shipped).unwrap();
+        snap["status"][BACKUP_STATUS] = json!({"phase": "done", "store": "forge", "point": "web.web-1.backup.snap"});
+        let (url, store, _) = api(vec![(SNAP, snap), (RESTORE, restore()), (VM, vm())]).await;
+        let fake = Arc::new(b::Fake::default());
+        let mut point = b::group("p-1", &["t-rootdisk", "t-data"]);
+        point.name = "web.web-1.backup.snap".into();
+        fake.points.lock().unwrap().push(point);
+        let backups = crate::vm_backup::Backups::new(
+            reqwest::Client::new(), &url, "n1", "/nonexistent",
+            crate::vm_backup::Endpoint { url: "http://node".into(), token_file: None }, vec![b::forge()],
+        )
+        .with_engine(fake.clone());
+        let engine = Arc::new(Engine::default());
+        snapshots(&url, engine.clone()).with_backups(Arc::new(backups)).restores().await;
+
+        let calls = fake.calls.lock().unwrap().clone();
+        assert!(calls.iter().any(|c| c.starts_with("step https://forge1.g16.lo:9090->http://node")), "store → node: {calls:?}");
+        let s = store.lock().unwrap().clone();
+        assert_eq!(s[RESTORE]["status"]["complete"], true, "{}", s[RESTORE]["status"]);
+        assert_eq!(s[RESTORE]["status"][RESTORE_TRANSFER]["phase"], "done");
+        let vols = s[VM]["spec"]["template"]["spec"]["volumes"].clone();
+        assert!(vols.as_array().unwrap().iter().any(|v| v["persistentVolumeClaim"]["claimName"] == "web-1-rootdisk-restore-r1"), "{vols}");
+        let owners = engine.owners.lock().unwrap().clone();
+        assert!(owners.contains(&"web.web-1.rootdisk.restored.r1 PersistentVolumeClaim/web-1-rootdisk-restore-r1".to_string()), "{owners:?}");
+        assert!(engine.made.lock().unwrap().is_empty(), "nothing cloned from a node group that is gone");
+    }
+
+    /// #380: a group gone from the node with no backup is still an error.
+    #[tokio::test]
+    async fn a_gone_group_with_no_backup_is_an_error() {
+        let mut snap = snapshot("n1", Some(DISKS));
+        snap["status"]["virtualMachineSnapshotContentName"] = json!("released-1");
+        let (url, store, _) = api(vec![(SNAP, snap), (RESTORE, restore()), (VM, vm())]).await;
+        snapshots(&url, Arc::new(Engine::default())).restores().await;
+        let s = store.lock().unwrap().clone();
+        assert_ne!(s[RESTORE]["status"]["complete"], true);
+        assert!(s[RESTORE]["status"].to_string().contains("not backed up to a store"), "{}", s[RESTORE]["status"]);
     }
 
     /// #251: a memory snapshot's restore makes a volume from its state

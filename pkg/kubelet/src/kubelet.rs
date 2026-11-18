@@ -95,6 +95,8 @@ pub struct KubeletConfig {
     /// stormstorage and the node's certificate, for live migrations (#40).
     /// The node's address is filled in by the kubelet.
     pub migration: crate::vm_migration::Config,
+    /// Backup stores (#380, `--backup-store`).
+    pub backup_stores: Vec<crate::vm_backup::Store>,
 }
 
 impl Default for KubeletConfig {
@@ -134,6 +136,7 @@ impl Default for KubeletConfig {
             metadata_max_staleness: crate::vm_manager::METADATA_MAX_STALENESS,
             container_log: Default::default(),
             migration: Default::default(),
+            backup_stores: Vec::new(),
         }
     }
 }
@@ -318,7 +321,16 @@ impl Kubelet {
             crate::vm_manager::RUN_ROOT,
             crate::vm_snapshot::stormvm_take(self.config.engine.url().to_string(), self.api_client.clone(), self.config.api_server_url.clone()),
         )
-        .with_restore_engine(Arc::new(crate::vm_restore::Stormblock(self.config.engine.url().to_string())))));
+        .with_restore_engine(Arc::new(crate::vm_restore::Stormblock(self.config.engine.url().to_string())))
+        // Backups off the node (#380): to the stores `--backup-store` names.
+        .with_backups(Arc::new(crate::vm_backup::Backups::new(
+            self.api_client.clone(),
+            &self.config.api_server_url,
+            &self.config.node_name,
+            crate::vm_manager::RUN_ROOT,
+            crate::vm_backup::Endpoint { url: self.config.engine.url().to_string(), token_file: None },
+            self.config.backup_stores.clone(),
+        )))));
         if let Some(vms) = &self.vms {
             self.goldens = Some(Arc::new(crate::vm_golden::Goldens::new(
                 self.api_client.clone(),
@@ -443,6 +455,7 @@ impl Kubelet {
                 api_url: self.config.api_server_url.clone(),
                 anonymous: self.config.anonymous_auth,
                 stormblock_url: self.config.engine.url().to_string(),
+                backup_stores: crate::vm_backup::Backups::console_stores(&self.config.backup_stores),
             };
             let vms = self.vms.clone();
             let later = self.config.serving_pair_later.clone();
