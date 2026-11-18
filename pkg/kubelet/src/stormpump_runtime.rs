@@ -146,6 +146,12 @@ struct Container {
     /// handle is a resource the engine holds, and holding one for a container
     /// that may never start is a leak for as long as the pod is pending.
     root_path: Option<String>,
+    /// Where create read the image (argv[0], user names): a pallet's path, or
+    /// `root_path` for a pulled image. An exec resolves its command the same
+    /// way, from here first (#393: cilium's postStart `bash` was looked for in
+    /// `root_path` alone and not found, where create had found `cilium-agent`
+    /// in the pallet).
+    read_root: Option<String>,
     state: ContainerState,
     created_at: i64,
     started_at: i64,
@@ -1703,6 +1709,7 @@ impl RuntimeService for StormpumpRuntime {
             }.with_kubernetes_labels()),
             identity_file: None,
             root_path: Some(mount.clone()),
+            read_root: Some(read_root.to_string_lossy().into_owned()),
             state: ContainerState::Created,
             created_at: now_nanos(),
             started_at: 0,
@@ -2160,7 +2167,7 @@ impl RuntimeService for StormpumpRuntime {
         cmd: &[String],
         io: crate::exec::ExecIo,
     ) -> Result<crate::cri::ExecSession, CriError> {
-        let (target, base, root, qualified) = {
+        let (target, base, roots, qualified) = {
             let containers = self.containers.lock().await;
             let c = containers
                 .get(container_id)
@@ -2174,7 +2181,18 @@ impl RuntimeService for StormpumpRuntime {
             let base = c.exec_base.clone().ok_or_else(|| {
                 CriError::Runtime(format!("container {qualified} was not created by this kubelet"))
             })?;
-            (target, base, c.root_path.clone(), qualified)
+            // As create read the image, then the container's own root as
+            // the kubelet sees it, then as PID 1 does.
+            let mut roots: Vec<String> = Vec::new();
+            for r in [c.read_root.clone(), c.root_path.clone(), c.root_path.as_ref().map(|p| format!("/proc/1/root{p}"))]
+                .into_iter()
+                .flatten()
+            {
+                if !roots.contains(&r) {
+                    roots.push(r);
+                }
+            }
+            (target, base, roots, qualified)
         };
         let mut argv = cmd.to_vec();
         let Some(first) = argv.first().cloned() else {
@@ -2183,11 +2201,13 @@ impl RuntimeService for StormpumpRuntime {
         // The engine takes an absolute argv[0], as at create (`spec_for`).
         if !first.starts_with('/') {
             let path = crate::image_config::path_of(&base.env);
-            match root.as_deref().and_then(|r| resolve_in_image(std::path::Path::new(r), &first, &path)) {
+            match roots.iter().find_map(|r| resolve_in_image(std::path::Path::new(r), &first, &path)) {
                 Some(abs) => argv[0] = abs,
                 None => {
                     return Err(CriError::Runtime(format!(
-                        "exec in {qualified}: {first:?}: executable file not found in $PATH"
+                        "exec in {qualified}: {first:?}: executable file not found in $PATH ({}) in the image at {}",
+                        path.join(":"),
+                        if roots.is_empty() { "nothing: no root recorded".to_string() } else { roots.join(", ") }
                     )))
                 }
             }
@@ -2477,12 +2497,60 @@ fn resolve_in_image(root: &std::path::Path, argv0: &str, path: &[String]) -> Opt
         return None;
     }
     for dir in path {
-        let candidate = root.join(dir.trim_start_matches('/')).join(argv0);
-        if candidate.is_file() {
-            return Some(format!("{dir}/{argv0}"));
+        let inside = format!("{}/{argv0}", dir.trim_end_matches('/'));
+        if file_in_root(root, &inside) {
+            return Some(inside);
         }
     }
     None
+}
+
+/// Whether `path` (absolute, as the container sees it) is a regular file in
+/// the image at `root`, following the image's symlinks inside it (#393): an
+/// absolute link (`/bin -> /usr/bin`, `/usr/bin/sh -> /bin/bash`) is the
+/// image's, re-rooted at `root`, never the node's. `Path::is_file` followed
+/// such a link onto the node's own filesystem.
+fn file_in_root(root: &std::path::Path, path: &str) -> bool {
+    use std::collections::VecDeque;
+    let split = |p: &str| -> VecDeque<String> { p.split('/').filter(|c| !c.is_empty()).map(String::from).collect() };
+    let mut todo = split(path);
+    let mut at: Vec<String> = Vec::new();
+    let mut hops = 0;
+    while let Some(part) = todo.pop_front() {
+        match part.as_str() {
+            "." => continue,
+            ".." => {
+                at.pop();
+                continue;
+            }
+            _ => {}
+        }
+        let mut here = root.to_path_buf();
+        here.extend(&at);
+        here.push(&part);
+        let Ok(meta) = std::fs::symlink_metadata(&here) else { return false };
+        if meta.file_type().is_symlink() {
+            hops += 1;
+            let Ok(target) = std::fs::read_link(&here) else { return false };
+            if hops > 40 {
+                return false;
+            }
+            let target = target.to_string_lossy().into_owned();
+            if target.starts_with('/') {
+                at.clear();
+            }
+            let mut next = split(&target);
+            next.extend(todo.drain(..));
+            todo = next;
+        } else if todo.is_empty() {
+            return meta.is_file();
+        } else if meta.is_dir() {
+            at.push(part);
+        } else {
+            return false;
+        }
+    }
+    false
 }
 
 /// How long the registry is given to answer for an image's config (#98).
@@ -3348,6 +3416,7 @@ mod tests {
                     identity: None,
                     identity_file: None,
                     root_path: None,
+                    read_root: None,
                     state: ContainerState::Created,
                     created_at: 0,
                     started_at: 0,
@@ -3554,6 +3623,7 @@ mod tests {
                     identity: None,
                     identity_file: None,
                     root_path: None,
+                    read_root: None,
                     state: ContainerState::Created,
                     created_at: 0,
                     started_at: 0,
@@ -3734,6 +3804,21 @@ mod tests {
         // A directory of the right name is not a command.
         std::fs::create_dir_all(root.join("usr/bin/adir")).unwrap();
         assert_eq!(resolve_in_image(&root, "adir", &std_path()), None);
+
+        // #393: links are the image's. `/bin` an absolute link to `/usr/bin`
+        // and `bash` reached only through it; `sh` an absolute link to
+        // `/bin/bash`; a link that leaves the image (`/etc/x` on the node)
+        // is not followed onto the node.
+        std::fs::write(bin.join("bash"), b"x").unwrap();
+        std::os::unix::fs::symlink("/usr/bin", root.join("bin")).unwrap();
+        let only_bin = vec!["/bin".to_string()];
+        assert_eq!(resolve_in_image(&root, "bash", &only_bin), Some("/bin/bash".to_string()));
+        std::os::unix::fs::symlink("/bin/bash", bin.join("sh")).unwrap();
+        assert_eq!(resolve_in_image(&root, "sh", &std_path()), Some("/usr/bin/sh".to_string()));
+        std::os::unix::fs::symlink("../../../../../../../../etc/hostname", bin.join("escape")).unwrap();
+        assert_eq!(resolve_in_image(&root, "escape", &std_path()), None, "a link never leaves the image");
+        std::os::unix::fs::symlink("loop", bin.join("loop")).unwrap();
+        assert_eq!(resolve_in_image(&root, "loop", &std_path()), None);
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -4120,6 +4205,7 @@ mod tests {
             log_dir: String::new(),
             mount_sources: Vec::new(),
             root_path: None,
+            read_root: None,
             state: ContainerState::Exited,
             created_at: 0,
             started_at: 0,

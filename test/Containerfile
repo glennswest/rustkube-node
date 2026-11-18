@@ -17,4 +17,10 @@ FROM scratch
 ARG COMMIT=unknown
 LABEL storm.io/test-of="rustkube-node" storm.io/test-commit="${COMMIT}"
 COPY test/.stage/test /test
+# A second copy, reachable only through the image's own PATH (#393): the
+# multi-container pod's postStart hook calls it by the bare name `rkn-test`,
+# which no default PATH holds, so the hook runs only if exec resolves its
+# command with the image's environment.
+COPY test/.stage/test /opt/rkn/bin/rkn-test
+ENV PATH=/opt/rkn/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ENTRYPOINT ["/test"]

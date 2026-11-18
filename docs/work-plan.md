@@ -4,6 +4,14 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #393 (P0), exec cannot find cilium's postStart `bash` (12.93 tombstoned)
+
+2026-11-18. caa7d29 (#374) started running hooks; exec resolved argv[0] only in `root_path` (the container's root mount), while
+create resolves in `read_root` (a pallet's path for pallet images like cilium). Fix: Container.read_root, tried first, then root_path,
+then /proc/1/root+root_path; symlinks followed inside the image (`file_in_root`); the miss names PATH and roots. Test: the test
+image gets /opt/rkn/bin/rkn-test + ENV PATH; multi's postStart calls `rkn-test`. Then sc-build, stage, shipped with
+`console:cilium-agent .* Running`-style proof on the next 12.9x pvetest3 install.
+
 ### Reopened: #373 (P?), VMI status.volumes[]: the shipped proof could not hold
 
 2026-11-18. The proof ran on pvetest2 (12.93-flowsdn) and saw a golden-suite VMI. The regex `"volumes":\[\{"name"` cannot

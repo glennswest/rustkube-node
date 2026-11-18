@@ -10,7 +10,7 @@
 //! |---|---|---|---|
 //! | `init` | | | writes `/scratch/from-init` |
 //! | `sidecar` | 8081 | | startup tcpSocket; preStop writes `/data/prestop-sidecar` |
-//! | `a` | 8080 | sidecar | readiness httpGet; postStart writes `/scratch/poststart-a`, preStop `/data/prestop-a`; 16Mi/64Mi |
+//! | `a` | 8080 | sidecar | readiness httpGet; postStart (`rkn-test`, by the image's PATH alone, #393) writes `/scratch/poststart-a`, preStop `/data/prestop-a`; 16Mi/64Mi |
 //! | `b` | 8082 | a, sidecar | readiness and liveness tcpSocket; 32Mi/96Mi |
 //!
 //! The cases, read back through the apiserver:
@@ -55,6 +55,16 @@ fn hook(path: &str, text: &str) -> Value {
     json!({ "exec": { "command": [BIN, "write-file", path, text] } })
 }
 
+/// The image's copy of this binary that only its own `PATH` reaches
+/// (`/opt/rkn/bin`, test/Containerfile), by bare name (#393).
+pub const PATH_ONLY_BIN: &str = "rkn-test";
+
+/// [`hook`], calling [`PATH_ONLY_BIN`]: it runs only if exec resolves the
+/// command with the image's environment, as cilium's `bash` hook needs.
+fn path_hook(path: &str, text: &str) -> Value {
+    json!({ "exec": { "command": [PATH_ONLY_BIN, "write-file", path, text] } })
+}
+
 /// The pod. `claim`: the data volume is [`CLAIM`] (else an emptyDir, and the
 /// stop order cannot be read after the pod).
 pub fn pod(env: &Env, claim: bool) -> Value {
@@ -77,7 +87,7 @@ pub fn pod(env: &Env, claim: bool) -> Value {
     a["ports"] = json!([{ "name": "http", "containerPort": 8080 }]);
     a["readinessProbe"] = json!({ "httpGet": { "port": "http", "path": "/" }, "periodSeconds": 2 });
     a["lifecycle"] = json!({
-        "postStart": hook("/scratch/poststart-a", "a"),
+        "postStart": path_hook("/scratch/poststart-a", "a"),
         "preStop": hook("/data/prestop-a", "a"),
     });
     a["resources"] = json!({ "requests": { "cpu": "10m", "memory": "16Mi" }, "limits": { "memory": "64Mi" } });
@@ -483,5 +493,9 @@ mod tests {
         assert_eq!(p["spec"]["volumes"][1]["persistentVolumeClaim"]["claimName"], CLAIM);
         assert_eq!(pod(&env, false)["spec"]["volumes"][1]["emptyDir"], json!({}));
         assert_eq!(reader(&env)["spec"]["containers"].as_array().map(Vec::len), Some(READ.len()));
+        // #393: a's postStart names its command bare, for the image's PATH to find.
+        let post = &p["spec"]["containers"][0]["lifecycle"]["postStart"]["exec"]["command"];
+        assert_eq!(post[0], PATH_ONLY_BIN);
+        assert!(!PATH_ONLY_BIN.contains('/'));
     }
 }
