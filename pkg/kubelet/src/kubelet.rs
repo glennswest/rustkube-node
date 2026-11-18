@@ -1579,7 +1579,7 @@ impl Kubelet {
             source
         };
 
-        let container_statuses: Vec<Value> = update
+        let mut container_statuses: Vec<Value> = update
             .container_statuses
             .iter()
             .map(|cs| {
@@ -1650,6 +1650,10 @@ impl Kubelet {
                 status
             })
             .collect();
+        // By name, as upstream's kubelet sorts them (#374): they came in the
+        // order of a HashMap, so `b` was listed before `a`, and differently
+        // from one write to the next.
+        sort_by_name(&mut container_statuses);
 
         // Init containers, reported as Kubernetes reports them.
         //
@@ -2435,6 +2439,11 @@ async fn notified(notify: &Option<Arc<tokio::sync::Notify>>) {
         Some(n) => n.notified().await,
         None => std::future::pending().await,
     }
+}
+
+/// Container statuses by name, as upstream's kubelet reports them (#374).
+pub fn sort_by_name(statuses: &mut [Value]) {
+    statuses.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
 }
 
 async fn runtime_changed(receiver: &mut Option<tokio::sync::watch::Receiver<u64>>) {
@@ -3527,5 +3536,14 @@ mod status_conflict_tests {
             .unwrap();
         assert!(r.is_none(), "already Succeeded");
         assert_eq!(puts.lock().unwrap().len(), 1);
+    }
+
+    /// #374: container statuses are listed by name, whatever order they came in.
+    #[test]
+    fn container_statuses_are_listed_by_name() {
+        let mut v = vec![serde_json::json!({"name": "b"}), serde_json::json!({"name": "sidecar"}), serde_json::json!({"name": "a"})];
+        super::sort_by_name(&mut v);
+        let names: Vec<&str> = v.iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["a", "b", "sidecar"]);
     }
 }

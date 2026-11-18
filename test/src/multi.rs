@@ -295,7 +295,11 @@ pub async fn run(env: &Env, api: &Api) -> Vec<(String, Outcome, u128)> {
         }
         Err(e) => {
             put(&mut out, "pod-multi-ready", Outcome::Fail(e), &mut t);
-            return out;
+            // Running all the same: the other cases still say what they can.
+            match api.get(&path).await {
+                Ok(Some(p)) if s(&p, "/status/phase") == "Running" => p,
+                _ => return out,
+            }
         }
     };
 
