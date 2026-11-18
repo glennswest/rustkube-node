@@ -17,6 +17,9 @@ each service gets `spec.volumes` (root as hostPath of its mount, data/state/logs
 `storm.io/instance.<svc>` / `storm.io/golden.<svc>` / `storm.io/volume.<name>`; an existing mirror is patched when they differ.
 (5) `/stats/summary`: each pod's `volume[]` (name, pvcRef, capacity/used from the engine) with `storm.io/volume-id`.
 Then tests, docs (api.md, status.md), CHANGELOG; sc-build; stage; shipped with proof `api:/api/v1/pods ~ "storm.io/instance\.`.
+Done (code): ce19869, all five, with tests (container_roots owner body, claim owner, annotations, volume_stats, mirror
+service_volumes). Filed stormblock#651 (Owner keeps `container`). Service volumes' own owner (`Service`) is stormd#75's.
+Next: sc-build result; stage; shipped with proof.
 
 ### Done: #367 (P3), stormvm → c9cd494: a memory snapshot's state through fd:, not file: (stormvm#37)
 
