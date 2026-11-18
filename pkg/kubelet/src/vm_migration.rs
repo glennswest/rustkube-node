@@ -704,7 +704,7 @@ mod tests {
         let m = DiskMigration::of(&json!({"id": "vm-1-0", "state": "synced",
             "target": {"node": "b", "name": "default.web-1-root", "id": "e7"}}));
         assert_eq!((m.state.as_str(), m.target_id.as_deref()), ("synced", Some("e7")));
-        let config = MigrationConfiguration::default();
+        let config = Config::default();
         assert!(config.missing().unwrap().contains("stormstorage"));
         assert_eq!(config.port(), DEFAULT_PORT);
     }
