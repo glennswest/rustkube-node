@@ -777,12 +777,7 @@ impl Kubelet {
             };
             worker.run(async {
                 if !api.is_empty() {
-                    for path in [
-                        "/apis/snapshot.kubevirt.io/v1beta1/virtualmachinesnapshots",
-                        "/apis/storm.io/v1alpha1/virtualmachinegoldens",
-                        "/apis/kubevirt.io/v1/virtualmachines",
-                        "/apis/kubevirt.io/v1/virtualmachineinstances",
-                    ] {
+                    for path in VM_MAINTENANCE_WATCHES {
                         self.watches.observe(&self.api_client, format!("{api}{path}"));
                     }
                 }
@@ -2459,6 +2454,17 @@ pub fn sort_by_name(statuses: &mut [Value]) {
     statuses.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
 }
 
+/// Every kind `vm_maintenance_loop` acts on, watched so that a change to
+/// one is a pass (#101). A kind missing here waits for an unrelated event or
+/// the sweep's requeue (up to 60 s): restores did (#381, stormvm#127).
+pub const VM_MAINTENANCE_WATCHES: [&str; 5] = [
+    "/apis/snapshot.kubevirt.io/v1beta1/virtualmachinesnapshots",
+    "/apis/snapshot.kubevirt.io/v1beta1/virtualmachinerestores",
+    "/apis/storm.io/v1alpha1/virtualmachinegoldens",
+    "/apis/kubevirt.io/v1/virtualmachines",
+    "/apis/kubevirt.io/v1/virtualmachineinstances",
+];
+
 async fn runtime_changed(receiver: &mut Option<tokio::sync::watch::Receiver<u64>>) {
     if let Some(rx) = receiver {
         if rx.changed().await.is_ok() {
@@ -3558,5 +3564,14 @@ mod status_conflict_tests {
         super::sort_by_name(&mut v);
         let names: Vec<&str> = v.iter().map(|c| c["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["a", "b", "sidecar"]);
+    }
+
+    /// #381: the VM maintenance loop watches every kind it acts on, the
+    /// restores included, so a new VirtualMachineRestore is a pass at once.
+    #[test]
+    fn the_vm_maintenance_loop_watches_restores() {
+        for kind in ["virtualmachinesnapshots", "virtualmachinerestores", "virtualmachinegoldens", "virtualmachines", "virtualmachineinstances"] {
+            assert!(super::VM_MAINTENANCE_WATCHES.iter().any(|p| p.ends_with(&format!("/{kind}"))), "{kind} is not watched");
+        }
     }
 }

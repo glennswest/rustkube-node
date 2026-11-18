@@ -4,6 +4,13 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #381 (P1), VirtualMachineRestore waits up to 60 s: vm_maintenance_loop does not watch restores (stormvm#127)
+
+2026-11-18. Confirmed: the loop observes snapshots, goldens, VMs, VMIs, not `virtualmachinerestores`; a new restore waits for an unrelated
+event or the sweep's requeue (≤ `SWEEP_EVERY`, 60 s). Fix: the watched paths as one constant `VM_MAINTENANCE_WATCHES` with restores in
+it, a unit test that it holds every kind the loop acts on. CHANGELOG; sc-build; stage; shipped with proof on stormvm's medium
+`snapshot-restore` (claim within ~2 s).
+
 ### In progress: #380 (P0), VM backups off the node: the kubelet's half of stormvm#31 (decision A)
 
 2026-11-18. stormvm → a302b3e (main: 47fb0d3 backup Transfer/spec/console route; no manifest change). Plan, in `vm_backup.rs` (new) beside
