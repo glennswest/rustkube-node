@@ -3869,7 +3869,7 @@ impl PodManager {
 
             // It runs until it exits (#126): no fixed bound, as upstream. The
             // pod's activeDeadlineSeconds, when set, is the only deadline.
-            loop {
+            // Read once (#375, clippy never_loop): exited goes on to the next init container, anything else is pending.
                 let status = self.runtime.container_status(&cid).await?;
                 match status.state {
                     ContainerState::Exited => {
@@ -3923,7 +3923,6 @@ impl PodManager {
                         } else {
                             self.kept_inits.lock().unwrap_or_else(|e| e.into_inner()).entry(uid.to_string()).or_default().push(cid.clone());
                         }
-                        break;
                     }
                     _ => {
                         let seen = self.first_seen.lock().unwrap_or_else(|e| e.into_inner()).get(uid).copied();
@@ -3968,7 +3967,6 @@ impl PodManager {
                         return Err(CriError::Pending(format!("init container {cname} is running")));
                     }
                 }
-            }
         }
         Ok(())
     }
