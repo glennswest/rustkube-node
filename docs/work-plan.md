@@ -4,6 +4,17 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #373, VMI/VM status.volumes[] (stormvm#129); restored disks owned; stormvm → d952a0c
+
+2026-11-18. stormvm c9cd494..d952a0c: no manifest change; the kubelet calls none of the changed `stormvm_block` signatures. Pinned at
+d952a0c, not main: main's 47fb0d3 adds a backups route whose kubelet half is #380. Plan: (1) rev-only bump (pkg/kubelet/Cargo.toml + lock).
+(2) `patch_status` writes `status.volumes` = `stormvm_spec::volumes::status(spec of the desired object, vm.disks (name, volume_id))`, so a
+hot-added disk is there on the next status write; the VirtualMachine (VMI's owner ref) gets the same in its status, patched only when it
+changes. (3) restore: `RestoreEngine::set_owner`; a restored **disk** is owned by its restored PVC, not the VirtualMachine: the VM sweep
+deletes an owned, unused volume once its VM is gone, and a claim-bound disk is lent (`owned: false` in volumes::status), so a VM owner
+would let the sweep delete what a PVC still binds. The restored **memory state** volume is the machine's: owner VirtualMachine (or none
+when retained). Tests; docs; CHANGELOG; sc-build; stage; shipped with the VMI proof.
+
 ### In progress: #374 (P0), multi-container pods proven on every test machine
 
 2026-11-18. Found: the kubelet runs init containers, sidecars (#111: stopped last, last declared first), per-container probes,
