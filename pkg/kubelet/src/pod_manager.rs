@@ -16,7 +16,7 @@ use crate::health::{run_probe, ProbeResult};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -26,6 +26,10 @@ mod deadlines;
 /// An image's resolution and when it finished (#132).
 type ImageResult = Arc<std::sync::Mutex<Option<(Result<String, String>, Instant)>>>;
 type ImageKey = (String, String);
+
+/// How long a `postStart` hook may take (#374). Upstream sets none; a hook
+/// that never ends would hold the pod's start for ever, so one is set.
+pub const POST_START_LIMIT: Duration = Duration::from_secs(120);
 
 /// A built-in claim volume's owner in the engine (#372): its claim.
 pub fn claim_owner(namespace: &str, claim: &str, uid: &str) -> Value {
@@ -1035,6 +1039,99 @@ impl PodManager {
     /// failures somebody opens it for. A helper rather than `if let` at every
     /// site, because the sites are what was missing and they should be one
     /// line each.
+    /// Run one lifecycle handler of a container (#374): `exec` in the
+    /// container, `httpGet` or `tcpSocket` from the pod's network namespace
+    /// (the probe paths, `health.rs`), or `sleep`. Bounded by `within`.
+    async fn run_hook(
+        &self,
+        handler: &Value,
+        spec: &Value,
+        cid: &str,
+        sandbox_id: &str,
+        pod_ip: &str,
+        within: Duration,
+    ) -> Result<(), String> {
+        if let Some(secs) = handler["sleep"]["seconds"].as_u64() {
+            tokio::time::sleep(Duration::from_secs(secs).min(within)).await;
+            return Ok(());
+        }
+        let mut probe = handler.clone();
+        probe["timeoutSeconds"] = serde_json::json!(within.as_secs().max(1));
+        let netns = match handler["exec"].is_null() {
+            true => self.runtime.pod_sandbox_status(sandbox_id).await.ok().and_then(|s| s.netns_path),
+            false => None,
+        };
+        match crate::health::run_probe(&probe, spec, cid, pod_ip, netns.as_deref(), &self.runtime).await {
+            crate::health::ProbeResult::Success => Ok(()),
+            crate::health::ProbeResult::Failure(why) => Err(why),
+            crate::health::ProbeResult::Unknown => Err("the handler's result is unknown".into()),
+        }
+    }
+
+    /// A container's `lifecycle.postStart` (#374), run once it has started.
+    /// As upstream: it fails the container, which is killed with a
+    /// `FailedPostStartHook` event and restarted (or not) by its policy.
+    /// Bounded by [`POST_START_LIMIT`].
+    async fn post_start(&self, pod: &Value, spec: &Value, cid: &str, sandbox_id: &str, pod_ip: &str) {
+        let handler = &spec["lifecycle"]["postStart"];
+        if handler.is_null() {
+            return;
+        }
+        let name = spec["name"].as_str().unwrap_or("");
+        if let Err(why) = self.run_hook(handler, spec, cid, sandbox_id, pod_ip, POST_START_LIMIT).await {
+            let msg = format!("PostStartHook failed for container {name}: {why}");
+            warn!("{msg}");
+            self.event(pod, "Warning", "FailedPostStartHook", &msg).await;
+            if let Err(e) = self.runtime.stop_container(cid, 0).await {
+                warn!("container {name}: not killed after its postStart hook failed: {e}");
+            }
+        }
+    }
+
+    /// A container's `lifecycle.preStop` (#374), run before its stop's
+    /// SIGTERM, inside the grace; what it took is taken from the grace the
+    /// stop has left, as upstream. A failure is a `FailedPreStopHook` event,
+    /// and the stop goes on.
+    async fn pre_stop(&self, pod: &Value, name: &str, cid: &str, grace: i64) -> i64 {
+        let Some(spec) = ["containers", "initContainers"]
+            .iter()
+            .filter_map(|k| pod["spec"][k].as_array())
+            .flatten()
+            .find(|c| c["name"].as_str() == Some(name))
+            .cloned()
+        else {
+            return grace;
+        };
+        let handler = &spec["lifecycle"]["preStop"];
+        if handler.is_null() || grace <= 0 {
+            return grace;
+        }
+        let (sandbox_id, pod_ip) = self
+            .pods
+            .read()
+            .await
+            .get(pod["metadata"]["uid"].as_str().unwrap_or(""))
+            .map(|p| (p.sandbox_id.clone(), p.pod_ip.clone().unwrap_or_default()))
+            .unwrap_or_default();
+        let t = Instant::now();
+        let within = Duration::from_secs(grace as u64);
+        let done = self.run_hook(handler, &spec, cid, sandbox_id.as_deref().unwrap_or(""), &pod_ip, within);
+        match tokio::time::timeout(within, done).await {
+            Ok(Ok(())) => {}
+            Ok(Err(why)) => {
+                let msg = format!("PreStopHook failed for container {name}: {why}");
+                warn!("{msg}");
+                self.event(pod, "Warning", "FailedPreStopHook", &msg).await;
+            }
+            Err(_) => {
+                let msg = format!("PreStopHook for container {name} did not finish within the grace ({grace}s)");
+                warn!("{msg}");
+                self.event(pod, "Warning", "FailedPreStopHook", &msg).await;
+            }
+        }
+        (grace - t.elapsed().as_secs() as i64).max(0)
+    }
+
     async fn event(&self, pod: &Value, etype: &str, reason: &str, message: &str) {
         if let Some(r) = &self.events {
             r.pod_event(pod, etype, reason, message).await;
@@ -3858,6 +3955,7 @@ impl PodManager {
                 state.container_ids.insert(cname.into(),cid.clone());
             }
             self.runtime.start_container(&cid).await?;
+            self.post_start(pod, spec, &cid, sandbox_id, pod_ip.unwrap_or("")).await;
             if let Some(state)=self.pods.write().await.get_mut(uid) {state.started.insert(cname.into(),Instant::now());}
             cid
             };
@@ -4380,6 +4478,7 @@ impl PodManager {
                 &format!("Started container {container_name}"),
             )
             .await;
+            self.post_start(pod, container_spec, &container_id, &sandbox_id, pod_ip.as_deref().unwrap_or("")).await;
             info!("Started container {container_name} ({container_id}) in {namespace}/{name}");
             let took = step.elapsed();
             attempt.container(container_name, took, self.runtime.container_steps(&container_id).await);
@@ -5231,6 +5330,7 @@ impl PodManager {
         // Capture the pod's namespace-sharing flags before `state` is borrowed
         // by the async block below (which also mutably borrows `state` later).
         let pod_for_ns = state.pod.clone();
+        let pod_ip_for_hook = state.pod_ip.clone();
         let result = async move {
             let image_ref = self.ensure_image(image, spec).await?;
             let mut config = build_container_config(spec, &image_ref, envs, mounts);
@@ -5245,6 +5345,7 @@ impl PodManager {
                 .create_container(&sandbox_id, &config, sandbox_config)
                 .await?;
             self.runtime.start_container(&cid).await?;
+            self.post_start(&pod_for_ns, spec, &cid, &sandbox_id, pod_ip_for_hook.as_deref().unwrap_or("")).await;
             Ok::<(String, String), CriError>((cid, image_ref))
         }
         .await;
@@ -5906,7 +6007,10 @@ impl PodManager {
             let grace = grace.map(|g| g.max(0)).unwrap_or_else(|| termination_grace(&state.pod));
             let apps: Vec<(&String, &String)> =
                 state.container_ids.iter().filter(|(n, _)| !sidecars.contains(*n)).collect();
+            let pod = &state.pod;
             let stops = apps.iter().map(|(name, cid)| async move {
+                // Its preStop first, inside the grace (#374).
+                let grace = self.pre_stop(pod, name, cid, grace).await;
                 info!("Stopping container {name} ({cid}), grace {grace}s");
                 stopped(self.runtime.stop_container(cid, grace).await)
             });
@@ -5918,6 +6022,7 @@ impl PodManager {
             }
             for n in sidecars.iter().rev() {
                 if let Some((name, cid)) = state.container_ids.get_key_value(n) {
+                    let grace = self.pre_stop(&state.pod, name, cid, grace).await;
                     info!("Stopping sidecar {name} ({cid}), grace {grace}s");
                     stopped(self.runtime.stop_container(cid, grace).await)?;
                     stopped(self.runtime.remove_container(cid).await)?;
@@ -7271,6 +7376,10 @@ pub(crate) mod tests {
         fail_start: Mutex<std::collections::HashSet<String>>,
         /// Every stop_container: the container and its grace (#225).
         stop_graces: Mutex<Vec<(String, i64)>>,
+        /// Every exec_sync: the container and its command (#374), and the
+        /// stops among them, in order: `exec <cmd>` / `stop <cid>`.
+        execs: Mutex<Vec<(String, Vec<String>)>>,
+        order: Mutex<Vec<String>>,
     }
 
     impl FakeRuntime {
@@ -7469,6 +7578,7 @@ pub(crate) mod tests {
 
         async fn stop_container(&self, container_id: &str, timeout: i64) -> Result<(), CriError> {
             self.stop_graces.lock().unwrap().push((container_id.to_string(), timeout));
+            self.order.lock().unwrap().push(format!("stop {container_id}"));
             if self.fail_stop.load(Ordering::SeqCst) {
                 return Err(CriError::Connection("injected outage".into()));
             }
@@ -7519,10 +7629,12 @@ pub(crate) mod tests {
 
         async fn exec_sync(
             &self,
-            _container_id: &str,
-            _cmd: &[String],
+            container_id: &str,
+            cmd: &[String],
             _timeout: i64,
         ) -> Result<ExecSyncResult, CriError> {
+            self.execs.lock().unwrap().push((container_id.to_string(), cmd.to_vec()));
+            self.order.lock().unwrap().push(format!("exec {}", cmd.join(" ")));
             Ok(ExecSyncResult {
                 stdout: vec![],
                 stderr: vec![],
@@ -9836,6 +9948,64 @@ pub(crate) mod tests {
         mgr.sync_pods(&[pod("uid-2", "web", "Never", simple_container())]).await;
         mgr.stop_pod_within("uid-2", Some(1)).await.unwrap();
         assert_eq!(rt.stop_graces.lock().unwrap().iter().map(|(_, g)| *g).collect::<Vec<_>>(), [1]);
+    }
+
+    /// #374: a postStart hook runs once the container has started; one that
+    /// fails kills the container (grace 0), as upstream.
+    #[tokio::test]
+    async fn a_post_start_hook_runs_and_its_failure_kills_the_container() {
+        let mut c = simple_container();
+        c["lifecycle"] = json!({"postStart": {"exec": {"command": ["warm", "up"]}}});
+        let (rt, mgr) = manager();
+        mgr.sync_pods(&[pod("uid-ps", "web", "Always", c.clone())]).await;
+        let cid = mgr.pods.read().await["uid-ps"].container_ids["app"].clone();
+        assert_eq!(*rt.execs.lock().unwrap(), vec![(cid.clone(), vec!["warm".to_string(), "up".to_string()])]);
+        assert!(rt.stop_graces.lock().unwrap().is_empty(), "a hook that passed kills nothing");
+
+        let (rt, mgr) = manager();
+        rt.set_exec_exit_code(1);
+        mgr.sync_pods(&[pod("uid-ps2", "web", "Always", c)]).await;
+        let cid = mgr.pods.read().await["uid-ps2"].container_ids["app"].clone();
+        assert_eq!(*rt.stop_graces.lock().unwrap(), vec![(cid, 0)], "a failed hook kills its container at once");
+
+        // `sleep` needs no runtime.
+        let (rt, mgr) = manager();
+        let mut c = simple_container();
+        c["lifecycle"] = json!({"postStart": {"sleep": {"seconds": 0}}});
+        mgr.sync_pods(&[pod("uid-ps3", "web", "Always", c)]).await;
+        assert!(rt.execs.lock().unwrap().is_empty() && rt.stop_graces.lock().unwrap().is_empty());
+    }
+
+    /// #374: a preStop hook runs before the container's stop, in the grace;
+    /// a sidecar's runs after every app container has stopped.
+    #[tokio::test]
+    async fn a_pre_stop_hook_runs_before_the_stop_and_sidecars_last() {
+        let (rt, mgr) = manager();
+        let mut app = simple_container();
+        app["lifecycle"] = json!({"preStop": {"exec": {"command": ["drain-app"]}}});
+        let mut p = pod("uid-pre", "web", "Always", app);
+        p["spec"]["terminationGracePeriodSeconds"] = json!(5);
+        p["spec"]["initContainers"] = json!([{"name": "proxy", "image": "busybox:latest", "restartPolicy": "Always",
+            "lifecycle": {"preStop": {"exec": {"command": ["drain-proxy"]}}}}]);
+        mgr.sync_pods(&[p]).await;
+        let ids = mgr.pods.read().await["uid-pre"].container_ids.clone();
+        rt.order.lock().unwrap().clear();
+        mgr.stop_pod("uid-pre").await.unwrap();
+        let order = rt.order.lock().unwrap().clone();
+        assert_eq!(order, vec![
+            "exec drain-app".to_string(), format!("stop {}", ids["app"]),
+            "exec drain-proxy".to_string(), format!("stop {}", ids["proxy"]),
+        ]);
+        assert!(rt.stop_graces.lock().unwrap().iter().all(|(_, g)| (4..=5).contains(g)), "{:?}", rt.stop_graces.lock().unwrap());
+
+        // A failed hook: the stop goes on.
+        let (rt, mgr) = manager();
+        let mut app = simple_container();
+        app["lifecycle"] = json!({"preStop": {"exec": {"command": ["drain"]}}});
+        mgr.sync_pods(&[pod("uid-pre2", "web", "Always", app)]).await;
+        rt.set_exec_exit_code(1);
+        mgr.stop_pod("uid-pre2").await.unwrap();
+        assert_eq!(rt.stop_graces.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
