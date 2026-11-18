@@ -10,6 +10,9 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 MigrationPolicies; recorded by the target in target_ready as migrationConfiguration), tuning(config), Progress, POSTCOPY_PAUSED;
 Migrator gains start_post_copy. vm_manager: per-migration Convergence on the source, switch once, mode PostCopy, abort refused in
 post-copy, postcopy-paused fails. stormcos serves neither CRD: filed. Live: stormvm#132's two-node run (needs stormcos#354).
+Done: 4349a70 (+ a007e71 test fix, 3462483 clippy). sc-build passed (VM sc-build-873846f9a6, 677 kubelet unit: policy resolution,
+configuration recorded/read, a stalled pre-copy switches once, abort refused in post-copy, postcopy-paused fails). Stage 500bc7a9aabb.
+Filed stormcos#1038 (MigrationPolicy CRD). Held `--after stormcos#1038`; the live run is stormvm#132's (two test nodes).
 
 ### Shipped (proof pending): #393 (P0), exec cannot find cilium's postStart `bash` (12.93 tombstoned)
 
