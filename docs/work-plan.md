@@ -4,6 +4,11 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #390 (P1), bump stormvm to f11ac55 (stormvm#37: memory snapshot state device through qemu's root)
+
+2026-11-18. Rev-only (a302b3e → f11ac55: no manifest change upstream; fd97183 dropped NIC `vlan`/`rate_mbytes`, unused here). sc-build;
+stage; shipped with proof on stormvm's medium `memsnap-resumed` (stormvm#37 closes on it).
+
 ### In progress: #379 (P0), PVC management on the default class: expansion, VolumeSnapshot + restore, describe pvc
 
 2026-11-18. Found: rustkube's apiserver already admits a grow only with `allowVolumeExpansion: true` and refuses a shrink below
