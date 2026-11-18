@@ -230,6 +230,9 @@ held `--after-run 8d39c5d794`. Resume: `stormcentral test show 8d39c5d794 | grep
 p2's .204 (`${NODE_IP}`), not forge1.g16.lo's .203 (stormipmi 9cefbcd575 and stormcluster 1fbd9ac163 the same); filed stormcos#967. Not ours. And forge1's
 Node has no `rdma.storm.io/hca` (no verbs there), so `pod-rdma` would skip on it anyway. Re-held `--after-install rustkube-node>=e8242e9@server8`.
 Resume: server8's Node shows `rdma.storm.io/hca`; `stormcentral test run rustkube-node medium --tag server8`; `pod-rdma` passed → close.
+2026-11-18: back in line: server8 runs a passed install of 12.94 (carries e8242e9). Queued medium on server8: 0c4dfc15fb at 6d99ff2
+(pvetest2 passed that commit, #791), held `--after-run 0c4dfc15fb`. Resume: `stormcentral test show 0c4dfc15fb | grep -i rdma`; passed → close;
+skipped → server8 has no verbs devices: check `/sys/class/infiniband_verbs` via its console logs, stormcos#914.
 
 ### Done: #352 (P2), stormvm → 71bf5b5: machine.type (pc/i440fx) and the ide bus (stormvm#117)
 
