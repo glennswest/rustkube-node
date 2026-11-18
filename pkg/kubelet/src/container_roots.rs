@@ -212,6 +212,27 @@ pub fn orphans(listing: &Value, known: &HashSet<String>, own: &str) -> Vec<(Stri
         .collect()
 }
 
+/// What a container's root belongs to (#372): its Pod (namespace, name, uid),
+/// as stormblock#115's owner, with the container's name beside it. `Null`
+/// when the pod is not known: an owner without a kind and a name is refused,
+/// and a partial one reads as an answer.
+pub fn root_owner(namespace: &str, pod: &str, uid: &str, container: &str) -> Value {
+    if pod.is_empty() {
+        return Value::Null;
+    }
+    let mut o = json!({ "kind": "Pod", "namespace": namespace, "name": pod, "container": container });
+    if !uid.is_empty() {
+        o["uid"] = json!(uid);
+    }
+    o
+}
+
+/// The body of `PUT /api/v1/volumes/{id}/owner`: `{"owner": …}`, never the
+/// owner alone (stormblock's `OwnerRequest`; a bare owner reads as null).
+pub fn owner_body(owner: &Value) -> Value {
+    json!({ "owner": owner })
+}
+
 /// A container root made: its engine volume and the device it is attached at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Made {
@@ -336,9 +357,12 @@ impl Roots {
             .ok_or_else(|| format!("the clone {name} came back with no volume id: {created}"))?;
         if matches!(golden, Golden::Template(_)) && !owner.is_null() {
             // A template clone takes no owner; set it after (stormblock#115).
-            let r = self.engine.put(&format!("{}/api/v1/volumes/{volume_id}/owner", self.url), owner).await;
+            // The body is `{"owner": …}` (#372): the bare owner read as a
+            // null one, which *cleared* it, so every pulled container's root
+            // was unclaimed.
+            let r = self.engine.put(&format!("{}/api/v1/volumes/{volume_id}/owner", self.url), &owner_body(owner)).await;
             if let Err(e) = self.answer("owner", r).await {
-                tracing::debug!(volume = %name, "container root owner not set: {e}");
+                tracing::warn!(volume = %name, "container root owner not set: {e}");
             }
         }
         let clone = step.elapsed();
@@ -554,7 +578,8 @@ mod tests {
         use axum::{extract::Path, routing::{delete, get, post, put}, Json, Router};
         let calls = Arc::new(Mutex::new(Vec::<String>::new()));
         let n = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let (c1, c2, c3, c4, c5, c6) = (calls.clone(), calls.clone(), calls.clone(), calls.clone(), calls.clone(), calls.clone());
+        let (c1, c2, c3, c4, c5, c6, c7) =
+            (calls.clone(), calls.clone(), calls.clone(), calls.clone(), calls.clone(), calls.clone(), calls.clone());
         let (n1, n2) = (n.clone(), n.clone());
         let app = Router::new()
             .route("/api/v1/volumes", get(move || {
@@ -571,11 +596,15 @@ mod tests {
             }))
             .route("/api/v1/fstemplates/{t}/clone", post(move |Path(t): Path<String>, Json(b): Json<Value>| {
                 c2.lock().unwrap().push(format!("clone template {t} as {}", b["name"].as_str().unwrap()));
+                assert!(b.get("owner").is_none(), "a template clone takes no owner: {b}");
                 let id = n1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async move { Json(json!({"volume_id": format!("v{id}")})) }
             }))
             .route("/api/v1/volumes/{g}/clone", post(move |Path(g): Path<String>, Json(b): Json<Value>| {
                 c3.lock().unwrap().push(format!("clone volume {g} as {}", b["name"].as_str().unwrap()));
+                if !b["owner"].is_null() {
+                    c3.lock().unwrap().push(format!("owner of {} {}", b["name"].as_str().unwrap(), b["owner"]));
+                }
                 let id = n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async move { Json(json!({"id": format!("v{id}")})) }
             }))
@@ -590,7 +619,11 @@ mod tests {
                 c6.lock().unwrap().push(format!("delete {v}"));
                 async { Json(json!({})) }
             }))
-            .route("/api/v1/volumes/{v}/owner", put(|| async { Json(json!({})) }));
+            .route("/api/v1/volumes/{v}/owner", put(move |Path(v): Path<String>, Json(b): Json<Value>| {
+                // stormblock's `OwnerRequest`: `{"owner": …}` (#372).
+                c7.lock().unwrap().push(format!("owner of {v} {}", b["owner"]));
+                async { Json(json!({})) }
+            }));
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", l.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
@@ -618,6 +651,12 @@ mod tests {
             "clone volume g1 as ctr-ct-a", "clone volume g1 as ctr-ct-b", "clone template sbr-busybox-1 as ctr-ct-c",
         ], "one clone per container, each of the sealed golden (g1), never of the mounted pallet (c1)");
 
+        // #372: both roots name their Pod: the pallet's in its clone, the
+        // template's by the owner PUT, `{"owner": …}` (a bare owner cleared it).
+        let owned = format!("{owner}");
+        assert!(log.contains(&format!("owner of ctr-ct-a {owned}")), "{log:?}");
+        assert!(log.contains(&format!("owner of {} {owned}", p.volume_id)), "{log:?}");
+
         roots.destroy(&a.volume_id).await.unwrap();
         roots.destroy(&p.volume_id).await.unwrap();
         let log = calls.lock().unwrap().clone();
@@ -631,6 +670,17 @@ mod tests {
         assert!(calls.lock().unwrap().iter().any(|c| c == "clone volume g7 as ctr-ct-op"), "{:?}", calls.lock().unwrap());
         assert_eq!(bare.pallet_volume_of("operator-generic").as_deref(), Some("cilium-operator"));
 
+    }
+
+    #[test]
+    fn a_roots_owner_is_its_pod_and_container() {
+        assert_eq!(
+            root_owner("ns", "web", "u-1", "app"),
+            json!({"kind": "Pod", "namespace": "ns", "name": "web", "uid": "u-1", "container": "app"})
+        );
+        assert!(root_owner("ns", "web", "", "app").get("uid").is_none(), "no uid is absent, never empty");
+        assert_eq!(root_owner("", "", "", "app"), Value::Null, "no pod: no partial owner");
+        assert_eq!(owner_body(&json!({"kind": "Pod"})), json!({"owner": {"kind": "Pod"}}));
     }
 
     #[tokio::test]

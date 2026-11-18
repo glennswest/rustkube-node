@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-11-18
+
+- **fix:** A pulled container's root keeps its owner (#372). The kubelet sent the owner to `PUT /api/v1/volumes/{id}/owner` as a bare object. stormblock reads `{"owner": …}`, so it took the owner as null and cleared it: every `ctr-ct-*` root on forge1 read `owner: unclaimed`. The body is now `{"owner": …}`, and a refusal is a warning, not a debug line. The owner also names the container.
+- **feat:** Traceability for pods (#372). A built-in claim's volume is owned by its PVC (`PersistentVolumeClaim`, namespace, name, uid). This is written off the start path, and not written again once the engine says so. Pods carry `storm.io/image-digest.<c>` and `storm.io/volume.<name>` (the engine id behind each claim, or another driver's volume handle). A node service's mirror pod declares, from the engine's listing, its root clone (`root`, a hostPath of its mount) and its `<svc>-data`/`-state`/`-logs` node claims as `spec.volumes`, with `volumeMounts` and `storm.io/instance.<svc>`, `storm.io/golden.<svc>` and `storm.io/volume.<name>`. An existing mirror pod is patched when these differ, or made again if the apiserver will not patch its spec, and an engine volume change starts a mirror pass. `/stats/summary` gives each pod a `volume[]` with the same `volumeId`, `pvcRef` and the engine's sizes.
+
 ## 2026-11-15
 
 - **docs:** The long suite runs a whole night and catches a real kubelet stall (#61, closed). ccfea13ac4 (165093b, pvetest1, 12.81): 632 pass, 2 fail. wave-40's slowest pods took 31-32 s by their own timestamps, while the runner's slowest API call took 39 ms. The 2026-11-14 entry's cause, the runner's 30 s client timeout, was wrong: the kubelet held a step of pods for ~30 s. Filed as #370.

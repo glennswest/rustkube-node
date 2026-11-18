@@ -488,6 +488,100 @@ pub fn golden_annotations(g: &crate::image_config::Provenance) -> serde_json::Ma
     out
 }
 
+/// A node service's volumes, as its mirror pod declares them (#372).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ServiceVolumes {
+    /// `spec.volumes`: `root` (a hostPath of where its system clone is
+    /// mounted) and `data`, `state`, `logs` (its node claims, `system_claims`).
+    pub volumes: Vec<Value>,
+    /// The container's `volumeMounts`, where the node mounted each.
+    pub mounts: Vec<Value>,
+    /// `storm.io/instance.<service>` (its root clone's id), `storm.io/golden.<service>`
+    /// (what that was cloned from) and `storm.io/volume.<name>` (each volume's id).
+    pub annotations: serde_json::Map<String, Value>,
+}
+
+/// Where the engine says a volume is mounted: on the volume, or on one of its
+/// attachments.
+fn mounted_at(v: &Value) -> Option<&str> {
+    v["mounted_at"].as_str().filter(|m| !m.is_empty()).or_else(|| {
+        v["attachments"].as_array()?.iter().find_map(|a| a["mounted_at"].as_str().filter(|m| !m.is_empty()))
+    })
+}
+
+/// What the engine's volume listing (`items`) says service `asset` runs on
+/// (#372, stormd#75): the writable volume named after it is its root clone,
+/// and each `<asset>-data`, `-state` or `-logs` ([`crate::system_claims::kind_of`])
+/// is a node claim, declared by the claim the node keeps for it
+/// (`<volume>-<node>`). Nothing listed: nothing declared, never a guess.
+pub fn service_volumes(items: &[Value], asset: &str, node: &str) -> ServiceVolumes {
+    let mut out = ServiceVolumes::default();
+    let name_of = |id: &str| items.iter().find(|v| v["id"].as_str() == Some(id)).and_then(|v| v["name"].as_str());
+    let key_ok = |what: &str, name: &str| format!("{what}.{name}").len() <= 63;
+    if let Some(root) = items
+        .iter()
+        .find(|v| v["name"].as_str() == Some(asset) && v["sealed"].as_bool() != Some(true))
+    {
+        if let Some(id) = root["id"].as_str() {
+            if key_ok("instance", asset) {
+                out.annotations.insert(format!("storm.io/instance.{asset}"), json!(id));
+            }
+            if let Some(g) = root["parent"].as_str().and_then(name_of).filter(|_| key_ok("golden", asset)) {
+                out.annotations.insert(format!("storm.io/golden.{asset}"), json!(g));
+            }
+            out.annotations.insert("storm.io/volume.root".into(), json!(id));
+        }
+        if let Some(at) = mounted_at(root) {
+            out.volumes.push(json!({"name": "root", "hostPath": {"path": at}}));
+            out.mounts.push(json!({"name": "root", "mountPath": at, "readOnly": true}));
+        }
+    }
+    let mut owned: Vec<(&'static str, &Value)> = items
+        .iter()
+        .filter_map(|v| {
+            let (kind, component) = crate::system_claims::kind_of(v)?;
+            (component == asset).then_some((kind, v))
+        })
+        .collect();
+    owned.sort_by_key(|(kind, _)| *kind);
+    owned.dedup_by_key(|(kind, _)| *kind);
+    for (kind, v) in owned {
+        let (Some(name), Some(id)) = (v["name"].as_str(), v["id"].as_str()) else { continue };
+        out.volumes.push(json!({
+            "name": kind,
+            "persistentVolumeClaim": {"claimName": crate::system_claims::claim_name(name, node)},
+        }));
+        if let Some(at) = mounted_at(v) {
+            out.mounts.push(json!({"name": kind, "mountPath": at}));
+        }
+        out.annotations.insert(format!("storm.io/volume.{kind}"), json!(id));
+    }
+    out
+}
+
+/// Put [`ServiceVolumes`] on a mirror pod: its `spec.volumes`, its container's
+/// `volumeMounts` and the annotations.
+pub fn with_volumes(pod: &mut Value, sv: &ServiceVolumes) {
+    for (k, v) in &sv.annotations {
+        pod["metadata"]["annotations"][k] = v.clone();
+    }
+    if !sv.volumes.is_empty() {
+        pod["spec"]["volumes"] = json!(sv.volumes);
+    }
+    if !sv.mounts.is_empty() {
+        pod["spec"]["containers"][0]["volumeMounts"] = json!(sv.mounts);
+    }
+}
+
+/// Whether `existing` already declares what `want` does (#372): its volumes,
+/// its container's mounts and the volume annotations.
+pub fn volumes_current(existing: &Value, want: &Value) -> bool {
+    let none = Value::Array(vec![]);
+    let or_none = |v: &Value| if v.is_null() { none.clone() } else { v.clone() };
+    or_none(&existing["spec"]["volumes"]) == or_none(&want["spec"]["volumes"])
+        && or_none(&existing["spec"]["containers"][0]["volumeMounts"]) == or_none(&want["spec"]["containers"][0]["volumeMounts"])
+}
+
 /// The golden a mirror pod's service runs from (#130).
 pub const GOLDEN: &str = "storm.io/golden";
 /// Its provenance, as the release manifest records it (`stormlb@b8ba1a7`).
@@ -992,5 +1086,49 @@ mod tests {
         let t = &down["status"]["containerStatuses"][0]["state"]["terminated"];
         assert_eq!((t["exitCode"].clone(), t["reason"].clone()), (json!(0), json!("Completed")));
         assert_eq!(t["finishedAt"], "2026-10-08T21:13:20Z");
+    }
+
+    /// #372: a service's root clone and its node claims, from the engine's
+    /// listing, on its mirror pod; another service's are not its.
+    #[test]
+    fn a_mirror_pod_declares_its_services_volumes() {
+        let items = vec![
+            json!({"id": "g-1", "name": "fastetcd.golden", "sealed": true}),
+            json!({"id": "r-1", "name": "fastetcd", "parent": "g-1", "attachments": [{"mounted_at": "/p/fastetcd"}]}),
+            json!({"id": "d-1", "name": "fastetcd-data", "mounted_at": "/var/lib/fastetcd"}),
+            json!({"id": "l-1", "name": "fastetcd-logs"}),
+            json!({"id": "x-1", "name": "stormlb-logs", "mounted_at": "/var/log/stormlb"}),
+            json!({"id": "c-1", "name": "ctr-ct-1"}),
+        ];
+        let sv = service_volumes(&items, "fastetcd", "n1");
+        assert_eq!(sv.annotations["storm.io/instance.fastetcd"], "r-1");
+        assert_eq!(sv.annotations["storm.io/golden.fastetcd"], "fastetcd.golden");
+        assert_eq!(sv.annotations["storm.io/volume.root"], "r-1");
+        assert_eq!(sv.annotations["storm.io/volume.data"], "d-1");
+        assert_eq!(sv.annotations["storm.io/volume.logs"], "l-1");
+        assert!(!sv.annotations.values().any(|v| v == "x-1"), "stormlb's logs are not fastetcd's");
+        assert_eq!(sv.volumes, vec![
+            json!({"name": "root", "hostPath": {"path": "/p/fastetcd"}}),
+            json!({"name": "data", "persistentVolumeClaim": {"claimName": "fastetcd-data-n1"}}),
+            json!({"name": "logs", "persistentVolumeClaim": {"claimName": "fastetcd-logs-n1"}}),
+        ]);
+        assert_eq!(sv.mounts, vec![
+            json!({"name": "root", "mountPath": "/p/fastetcd", "readOnly": true}),
+            json!({"name": "data", "mountPath": "/var/lib/fastetcd"}),
+        ], "a volume the engine says is mounted nowhere has no mount");
+
+        let asset = Asset { name: "fastetcd".into(), running: true, ..Default::default() };
+        let mut pod = mirror_pod(&asset, "n1", "u", "2026-11-18T00:00:00Z");
+        let bare = pod.clone();
+        with_volumes(&mut pod, &sv);
+        assert_eq!(pod["spec"]["volumes"][1]["persistentVolumeClaim"]["claimName"], "fastetcd-data-n1");
+        assert_eq!(pod["spec"]["containers"][0]["volumeMounts"][1]["mountPath"], "/var/lib/fastetcd");
+        assert_eq!(pod["metadata"]["annotations"]["storm.io/mirror"], "true", "the mirror's own marks stay");
+        assert!(volumes_current(&pod, &pod.clone()));
+        assert!(!volumes_current(&bare, &pod), "a mirror written before #372 is patched");
+        assert!(volumes_current(&bare, &bare.clone()));
+
+        // Nothing listed for it: nothing declared.
+        assert_eq!(service_volumes(&items, "sshd", "n1"), ServiceVolumes::default());
     }
 }

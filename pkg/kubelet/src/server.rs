@@ -986,6 +986,13 @@ async fn stats_summary(State(pm): State<Arc<PodManager>>) -> impl IntoResponse {
         by_pod.entry((p.namespace.clone(), p.pod.clone())).or_default();
         networks.insert((p.namespace.clone(), p.pod.clone()), network_summary(&p.interfaces));
     }
+    // Each pod's volumes (#372): the same ids its `storm.io/volume.<name>`
+    // annotations name, with the engine's sizes.
+    let mut volumes: BTreeMap<(String, String), Vec<serde_json::Value>> = BTreeMap::new();
+    for (key, v) in pm.pod_volume_stats().await {
+        by_pod.entry(key.clone()).or_default();
+        volumes.insert(key, v);
+    }
     let pods: Vec<serde_json::Value> = by_pod
         .into_iter()
         .map(|(key, containers)| {
@@ -995,6 +1002,9 @@ async fn stats_summary(State(pm): State<Arc<PodManager>>) -> impl IntoResponse {
             });
             if let Some(net) = networks.remove(&key) {
                 pod["network"] = net;
+            }
+            if let Some(v) = volumes.remove(&key) {
+                pod["volume"] = serde_json::json!(v);
             }
             pod
         })

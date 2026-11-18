@@ -1988,6 +1988,18 @@ impl Kubelet {
                 }
             });
         }
+        // The engine's volumes changed: a mirror's declared volumes may have
+        // (#372).
+        {
+            let worker = worker.clone();
+            let mut volumes = Some(self.engine_volumes.subscribe());
+            tokio::spawn(async move {
+                loop {
+                    runtime_changed(&mut volumes).await;
+                    worker.enqueue();
+                }
+            });
+        }
         // Each running service's stormd (#215, stormd#48): its processes'
         // state, restarts and readiness for the mirror's container status, and
         // its Kubernetes events onto the mirror pod. A change is a mirror pass.
@@ -2081,7 +2093,7 @@ impl Kubelet {
                     }
                     let health = self.service_health.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     let procs = stormd.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    mirror_node_services(&self.api_client, &url, &node, &self.node_ip, &health, &procs).await;
+                    mirror_node_services(&self.api_client, &url, &node, &self.node_ip, &health, &procs, &self.config.engine).await;
                 })
                 .await;
             drop(work);
@@ -2497,6 +2509,7 @@ async fn mirror_node_services(
     host_ip: &str,
     health: &std::collections::HashMap<String, crate::node_health::ServiceHealth>,
     stormd: &std::collections::HashMap<String, Vec<crate::stormd_api::Process>>,
+    engine: &crate::engine::EngineClient,
 ) {
     // No cluster: nothing to mirror into, and nothing to retry.
     if api_url.is_empty() {
@@ -2616,6 +2629,14 @@ async fn mirror_node_services(
     let mut node_uid: Option<String> = None;
     let now = chrono::Utc::now();
     let uptime = crate::mirror::node_uptime();
+    // The engine's volumes, for each service's root clone and claims (#372).
+    // Unread: no volume is written or taken away this pass.
+    let engine_items: Option<Vec<Value>> = match engine.get(&format!("{}/api/v1/volumes", engine.url())).await {
+        Ok(r) if r.status().is_success() => {
+            r.json::<Value>().await.ok().and_then(|v| v["items"].as_array().cloned())
+        }
+        _ => None,
+    };
     // Each service's golden, from the release the node booted (#130).
     let release = crate::image_config::RELEASE_MANIFESTS
         .iter()
@@ -2623,6 +2644,7 @@ async fn mirror_node_services(
         .unwrap_or_default();
     for a in &assets {
         let golden = crate::image_config::release_golden_in(&release, &a.name);
+        let volumes = engine_items.as_deref().map(|items| crate::mirror::service_volumes(items, &a.name, node));
         // startTime from the service's age (#193): the node's uptime less PID
         // 1's `started_secs` (one clock, CLOCK_BOOTTIME), which stays right
         // between writes of assets.json; else the `age_secs` the file says.
@@ -2646,16 +2668,50 @@ async fn mirror_node_services(
                 let from_stormd = apply_stormd(&mut pod, a, stormd);
                 // The golden's annotations (#130) are metadata, which the
                 // status write below does not carry: patched when they differ.
-                let want = golden.as_ref().map(crate::mirror::golden_annotations).unwrap_or_default();
-                if want.iter().any(|(k, v)| existing["metadata"]["annotations"][k] != *v) {
+                let mut want = golden.as_ref().map(crate::mirror::golden_annotations).unwrap_or_default();
+                // The service's volumes (#372): spec and annotations, patched
+                // when they differ. Kept as they are when the engine did not
+                // answer.
+                let mut spec = None;
+                match &volumes {
+                    Some(sv) => {
+                        crate::mirror::with_volumes(&mut pod, sv);
+                        want.extend(sv.annotations.clone());
+                        if !crate::mirror::volumes_current(existing, &pod) {
+                            spec = Some(serde_json::json!({
+                                "volumes": pod["spec"]["volumes"].as_array().cloned().unwrap_or_default(),
+                                "containers": pod["spec"]["containers"],
+                            }));
+                        }
+                    }
+                    None => {
+                        pod["spec"]["volumes"] = existing["spec"]["volumes"].clone();
+                        pod["spec"]["containers"] = existing["spec"]["containers"].clone();
+                    }
+                }
+                if spec.is_some() || want.iter().any(|(k, v)| existing["metadata"]["annotations"][k] != *v) {
+                    let mut body = serde_json::json!({"metadata": {"annotations": want}});
+                    if let Some(spec) = spec {
+                        body["spec"] = spec;
+                    }
                     let patched = client
                         .patch(format!("{base}/{name}"))
                         .header("content-type", "application/merge-patch+json")
-                        .json(&serde_json::json!({"metadata": {"annotations": want}}))
+                        .json(&body)
                         .send_retrying(retry::Policy::API)
                         .await;
-                    if !matches!(patched, Ok(ref r) if r.status().is_success()) {
-                        apimachinery::reactor::failed();
+                    match patched {
+                        Ok(ref r) if r.status().is_success() => {}
+                        // An apiserver that holds a pod's spec immutable, as
+                        // upstream's does: the mirror is made again, with
+                        // them, on the next pass.
+                        Ok(ref r) if r.status() == 422 && body.get("spec").is_some() => {
+                            info!("mirror {name}: its volumes cannot be patched in; making it again");
+                            let _ = client.delete(format!("{base}/{name}")).send_retrying(retry::Policy::API).await;
+                            apimachinery::reactor::failed();
+                            continue;
+                        }
+                        _ => apimachinery::reactor::failed(),
                     }
                 }
                 if crate::mirror::status_current(existing, &pod) {
@@ -2696,6 +2752,9 @@ async fn mirror_node_services(
                 };
                 let mut pod = crate::mirror::mirror_pod_with(a, node, uid, &started, health.get(&a.name));
                 crate::mirror::with_provenance(&mut pod, golden.as_ref(), host_ip);
+                if let Some(sv) = &volumes {
+                    crate::mirror::with_volumes(&mut pod, sv);
+                }
                 apply_stormd(&mut pod, a, stormd);
                 let created = client.post(&base).json(&pod).send_repeatable(retry::Policy::API).await;
                 if !matches!(created, Ok(ref r) if r.status().is_success() || r.status() == 409) {

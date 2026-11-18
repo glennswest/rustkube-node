@@ -27,6 +27,52 @@ mod deadlines;
 type ImageResult = Arc<std::sync::Mutex<Option<(Result<String, String>, Instant)>>>;
 type ImageKey = (String, String);
 
+/// A built-in claim volume's owner in the engine (#372): its claim.
+pub fn claim_owner(namespace: &str, claim: &str, uid: &str) -> Value {
+    let mut o = serde_json::json!({ "kind": "PersistentVolumeClaim", "namespace": namespace, "name": claim });
+    if !uid.is_empty() {
+        o["uid"] = serde_json::json!(uid);
+    }
+    o
+}
+
+/// A pod's `VolumeStats` (#372): one per volume `ids` names (pod volume
+/// name → volume id), its claim from the pod's `spec.volumes`, its sizes from
+/// the engine's `listing` when it has the volume.
+pub fn volume_stats(
+    namespace: &str,
+    pod: &str,
+    spec_volumes: &Value,
+    ids: &std::collections::BTreeMap<String, String>,
+    listing: &Value,
+) -> Vec<Value> {
+    let items = listing["items"].as_array();
+    ids.iter()
+        .map(|(name, id)| {
+            let mut v = serde_json::json!({ "name": name, "volumeId": id });
+            let claim = spec_volumes.as_array().and_then(|vs| {
+                vs.iter().find(|v| v["name"].as_str() == Some(name.as_str()))
+            }).and_then(|v| match v["persistentVolumeClaim"]["claimName"].as_str() {
+                Some(c) => Some(c.to_string()),
+                // A generic ephemeral volume's claim is `<pod>-<volume>`.
+                None => v.get("ephemeral").map(|_| format!("{pod}-{name}")),
+            });
+            if let Some(c) = claim {
+                v["pvcRef"] = serde_json::json!({ "name": c, "namespace": namespace });
+            }
+            if let Some(e) = items.and_then(|i| i.iter().find(|e| e["id"].as_str() == Some(id.as_str()))) {
+                if let Some(b) = e["virtual_size_bytes"].as_u64() {
+                    v["capacityBytes"] = serde_json::json!(b);
+                }
+                if let Some(b) = e["allocated_bytes"].as_u64() {
+                    v["usedBytes"] = serde_json::json!(b);
+                }
+            }
+            v
+        })
+        .collect()
+}
+
 /// State of a managed pod on this node.
 #[derive(Debug, Clone)]
 pub struct PodState {
@@ -574,6 +620,11 @@ pub struct PodManager {
     /// Each container's previous run, by pod uid then container (#130): what
     /// `lastState.terminated` says once the next run has started.
     last_terminated: std::sync::Mutex<HashMap<String, HashMap<String, LastTerminated>>>,
+    /// The volume behind each of a pod's claims, by pod uid then the pod's
+    /// volume name (#372): the engine's id for a built-in claim, the driver's
+    /// handle for another's. `storm.io/volume.<name>` on the pod and the
+    /// summary's `volume[]` say the same.
+    pod_volumes: std::sync::Mutex<HashMap<String, std::collections::BTreeMap<String, String>>>,
 }
 
 /// A pod this node has admitted and not started, and why.
@@ -675,6 +726,7 @@ impl PodManager {
             event_waits: Default::default(),
             kept_inits: Default::default(),
             last_terminated: Default::default(),
+            pod_volumes: Default::default(),
             waiting: std::sync::Mutex::new(HashMap::new()),
             start_holdoff: std::sync::Mutex::new(HashMap::new()),
             create_refusals: std::sync::Mutex::new(HashMap::new()),
@@ -1075,6 +1127,26 @@ impl PodManager {
         }
     }
 
+    /// Say in the engine that a claim's volume is the claim's (#372):
+    /// stormblock#115's owner, `PersistentVolumeClaim` with its namespace,
+    /// name and uid, so the engine's listing and the console say whose it is
+    /// and its cleanup never takes it for an orphan. Off the start path: the
+    /// pod needs the device, not the record; a refusal is said and the next
+    /// start asks again.
+    fn own_claim_volume(&self, vol_id: &str, namespace: &str, claim: &str, uid: &str) {
+        let owner = claim_owner(namespace, claim, uid);
+        let url = format!("{}/api/v1/volumes/{vol_id}/owner", self.storage_url);
+        let engine = self.engine.clone();
+        let what = format!("{namespace}/{claim}");
+        tokio::spawn(async move {
+            match engine.put(&url, &crate::container_roots::owner_body(&owner)).await {
+                Ok(r) if r.status().is_success() => debug!("claim {what}: its volume's owner recorded"),
+                Ok(r) => warn!("claim {what}: its volume's owner not recorded: stormblock answered {}", r.status()),
+                Err(e) => warn!("claim {what}: its volume's owner not recorded: {e}"),
+            }
+        });
+    }
+
     /// POST to stormblock's management API on this node.
     ///
     /// Loopback by default: the storage engine runs on the node whose volumes
@@ -1342,6 +1414,9 @@ impl PodManager {
                                 .unwrap_or(false);
                             match self.mount_csi_claim(pod, &name, &pvc, &pv, readonly).await {
                                 Ok(dir) => {
+                                    if let Some(h) = pv["spec"]["csi"]["volumeHandle"].as_str() {
+                                        self.record_pod_volume(uid, &name, h);
+                                    }
                                     map.insert(
                                         name,
                                         ResolvedVolume {
@@ -1385,7 +1460,8 @@ impl PodManager {
                 let mut steps = crate::start_timing::ClaimSteps::default();
                 let provisioned = self.provision_claim_timed(namespace, claim, uid, &mut steps).await;
                 match provisioned {
-                    Ok((device, fstype)) => {
+                    Ok((vol_id, device, fstype)) => {
+                        self.record_pod_volume(uid, &name, &vol_id);
                         claims.push((name.clone(), steps));
                         map.insert(
                             name,
@@ -2123,10 +2199,8 @@ impl PodManager {
         claim: &str,
         pod_uid: &str,
         steps: &mut crate::start_timing::ClaimSteps,
-    ) -> Result<(String, Option<&'static str>), ClaimError> {
-        self.provision_claim_volume(namespace, claim, pod_uid, steps, true)
-            .await
-            .map(|(_, dev, fs)| (dev, fs))
+    ) -> Result<(String, String, Option<&'static str>), ClaimError> {
+        self.provision_claim_volume(namespace, claim, pod_uid, steps, true).await
     }
 
     /// A claim as a block device on this node, for a virtual machine's disk
@@ -2336,6 +2410,20 @@ impl PodManager {
             .and_then(|pv| pv["spec"]["csi"]["volumeHandle"].as_str())
             .and_then(|handle| volume_id(handle));
         let existing = bound.or_else(|| volume_id(&name));
+        // Whether the engine already says this claim owns it (#372): read
+        // here, from the listing in hand, so a claim owned once costs no
+        // write on every start.
+        let claim_uid = pvc["metadata"]["uid"].as_str().unwrap_or("").to_string();
+        let owned = existing.as_deref().is_some_and(|id| {
+            volumes.as_ref().and_then(|l| l["items"].as_array()).is_some_and(|items| {
+                items.iter().any(|v| {
+                    v["id"].as_str() == Some(id)
+                        && v["owner"]["kind"] == "PersistentVolumeClaim"
+                        && v["owner"]["name"].as_str() == Some(claim)
+                        && (claim_uid.is_empty() || v["owner"]["uid"].as_str() == Some(&claim_uid))
+                })
+            })
+        });
         // **A new volume is charged its class** (#62, #108): refused here as
         // well as by the scheduler, which static pods and pods written onto
         // `spec.nodeName` never meet. Held until it is made. An engine that
@@ -2449,6 +2537,9 @@ impl PodManager {
         // silent downgrade to nvme-tcp, and a downgrade is not something to
         // discover from a mount that behaves oddly later.
         steps.made = how.map(|h| (h, step.elapsed()));
+        if !owned {
+            self.own_claim_volume(&vol_id, namespace, claim, &claim_uid);
+        }
         step = Instant::now();
         let attach = serde_json::json!({ "node": self.node_name, "transport": "ublk" });
         let info: Value = self
@@ -5245,6 +5336,38 @@ impl PodManager {
     }
 
     /// Per-pod network counters from the runtime (for /metrics/cadvisor).
+    /// Each pod's volumes for `/stats/summary` (#372), by (namespace, pod):
+    /// upstream's `VolumeStats` (`name`, `pvcRef`), sized from the engine
+    /// (`capacityBytes` its virtual size, `usedBytes` the bytes it holds of
+    /// its own), with `volumeId`, the id `storm.io/volume.<name>` names.
+    pub async fn pod_volume_stats(&self) -> Vec<((String, String), Vec<Value>)> {
+        let pods: Vec<(String, String, String, Value)> = self
+            .pods
+            .read()
+            .await
+            .values()
+            .map(|p| (p.namespace.clone(), p.name.clone(), p.uid.clone(), p.pod["spec"]["volumes"].clone()))
+            .collect();
+        let held: Vec<_> = pods
+            .into_iter()
+            .map(|(ns, name, uid, spec)| {
+                let ids = self.pod_volume_ids(&uid);
+                (ns, name, spec, ids)
+            })
+            .filter(|(_, _, _, ids)| !ids.is_empty())
+            .collect();
+        if held.is_empty() {
+            return Vec::new();
+        }
+        let listing = self.storage_get("/api/v1/volumes").await.unwrap_or(Value::Null);
+        held.into_iter()
+            .map(|(ns, name, spec, ids)| {
+                let stats = volume_stats(&ns, &name, &spec, &ids, &listing);
+                ((ns, name), stats)
+            })
+            .collect()
+    }
+
     pub async fn pod_network_stats(&self) -> Vec<crate::cri::PodNetworkStats> {
         self.runtime
             .list_pod_network_stats()
@@ -5310,6 +5433,21 @@ impl PodManager {
     /// start went (#132): one INFO line, the histograms, and, for a pod the
     /// apiserver has, the `storm.io/start-timing` annotation and a
     /// `StartTiming` Event. Anything else: nothing.
+    /// Record that a pod's volume `name` is the volume `id` (#372).
+    fn record_pod_volume(&self, uid: &str, name: &str, id: &str) {
+        self.pod_volumes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(uid.to_string())
+            .or_default()
+            .insert(name.to_string(), id.to_string());
+    }
+
+    /// A pod's volumes and the volume behind each (#372), by pod volume name.
+    pub fn pod_volume_ids(&self, uid: &str) -> std::collections::BTreeMap<String, String> {
+        self.pod_volumes.lock().unwrap_or_else(|e| e.into_inner()).get(uid).cloned().unwrap_or_default()
+    }
+
     /// Each container's previous run in a pod (#130), for `lastState`.
     pub fn last_terminated(&self, uid: &str) -> HashMap<String, LastTerminated> {
         self.last_terminated.lock().unwrap_or_else(|e| e.into_inner()).get(uid).cloned().unwrap_or_default()
@@ -5326,12 +5464,19 @@ impl PodManager {
             Some(p) => p.container_ids.clone(),
             None => return Default::default(),
         };
-        self.annotations_for(ids).await
+        self.annotations_for(uid, ids).await
     }
 
-    /// [`Self::container_annotations`] for these containers (name → id).
-    async fn annotations_for(&self, ids: HashMap<String, String>) -> serde_json::Map<String, Value> {
+    /// [`Self::container_annotations`] for these containers (name → id), and
+    /// the pod's claims as `storm.io/volume.<name>` (#372).
+    async fn annotations_for(&self, uid: &str, ids: HashMap<String, String>) -> serde_json::Map<String, Value> {
         let mut out = serde_json::Map::new();
+        for (name, id) in self.pod_volume_ids(uid) {
+            let key = format!("volume.{name}");
+            if key.len() <= 63 {
+                out.insert(format!("storm.io/{key}"), serde_json::json!(id));
+            }
+        }
         for (name, cid) in ids {
             let Some(info) = self.runtime.container_image_info(&cid).await else { continue };
             let mut put = |what: &str, v: Value| {
@@ -5345,6 +5490,11 @@ impl PodManager {
             }
             if let Some(v) = info.instance {
                 put("instance", serde_json::json!(v));
+            }
+            // The image's digest beside its root and golden (#372), so the
+            // chain image → golden → root holds on the object itself.
+            if let Some(d) = info.image_id.filter(|d| !d.is_empty()) {
+                put("image-digest", serde_json::json!(d));
             }
             if let Some(g) = info.golden {
                 put("golden", serde_json::json!(g));
@@ -5363,7 +5513,7 @@ impl PodManager {
         if self.api_url.is_empty() || pod["metadata"]["resourceVersion"].as_str().is_none() {
             return;
         }
-        let annotations = self.annotations_for(ids).await;
+        let annotations = self.annotations_for(uid, ids).await;
         if annotations.is_empty() {
             return;
         }
@@ -5785,6 +5935,7 @@ impl PodManager {
             }
             self.kept_inits.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
             self.last_terminated.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
+            self.pod_volumes.lock().unwrap_or_else(|e| e.into_inner()).remove(uid);
             if let Some(sandbox) = &state.sandbox_id {
                 stopped(self.runtime.stop_pod_sandbox(sandbox).await)?;
                 stopped(self.runtime.remove_pod_sandbox(sandbox).await)?;
@@ -8333,6 +8484,43 @@ pub(crate) mod tests {
         assert_eq!(pv.2["spec"]["capacity"]["storage"], "1Pi");
     }
 
+    /// #372: the summary's volumes name the ids the annotations do, their
+    /// claims and the engine's sizes.
+    #[test]
+    fn a_pods_volume_stats_name_their_volume_ids() {
+        let spec = json!([{"name": "data", "persistentVolumeClaim": {"claimName": "db"}}, {"name": "x", "csi": {}},
+            {"name": "scratch", "ephemeral": {"volumeClaimTemplate": {}}}]);
+        let ids = std::collections::BTreeMap::from([("data".to_string(), "v-1".to_string()), ("x".to_string(), "h-2".to_string()),
+            ("scratch".to_string(), "v-3".to_string())]);
+        let listing = json!({"items": [{"id": "v-1", "virtual_size_bytes": 1024, "allocated_bytes": 10}]});
+        let s = volume_stats("ns", "web", &spec, &ids, &listing);
+        assert_eq!(s[1]["pvcRef"], json!({"name": "web-scratch", "namespace": "ns"}), "an ephemeral volume's claim");
+        assert_eq!(s[0], json!({"name": "data", "volumeId": "v-1", "pvcRef": {"name": "db", "namespace": "ns"},
+            "capacityBytes": 1024, "usedBytes": 10}));
+        assert_eq!(s[2], json!({"name": "x", "volumeId": "h-2"}), "another driver's: its handle, no engine sizes");
+    }
+
+    /// #372: a claim's volume is said to be the claim's in the engine, as
+    /// `{"owner": …}`, and once it is, a later start writes nothing.
+    #[tokio::test]
+    async fn a_claims_volume_is_owned_by_its_claim() {
+        let w = claim_world(raw_claim("16Mi", "Block")).await;
+        let mgr = claim_manager(&w);
+        let mut steps = crate::start_timing::ClaimSteps::default();
+        let (vol, _, _) = mgr.provision_claim_timed("default", "raw", "uid-1", &mut steps).await.unwrap();
+        assert_eq!(vol, "vol-raw");
+        let put = seen(&w, |(m, p, _)| m == "PUT" && p == "/api/v1/volumes/vol-raw/owner").await.expect("the owner was written");
+        assert_eq!(put.2, json!({"owner": {"kind": "PersistentVolumeClaim", "namespace": "default", "name": "raw", "uid": "c-1"}}));
+
+        let owned = json!({"id": "vol-raw", "name": crate::storage::volume_name("default", "raw"),
+            "owner": {"kind": "PersistentVolumeClaim", "namespace": "default", "name": "raw", "uid": "c-1"}});
+        let w = claim_world_with(raw_claim("16Mi", "Block"), None, vec![owned]).await;
+        let mgr = claim_manager(&w);
+        mgr.provision_claim_timed("default", "raw", "uid-1", &mut Default::default()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!w.calls.lock().unwrap().iter().any(|(m, p, _)| m == "PUT" && p.ends_with("/owner")), "already its claim's");
+    }
+
     /// #95: a claim's steps, as the start timing reports them. Each one here is
     /// at least one request to the fake apiserver or stormblock.
     #[tokio::test]
@@ -10076,8 +10264,15 @@ pub(crate) mod tests {
         assert_eq!(a["storm.io/image-resolved.app"], "2026-10-08T00:00:00Z");
         assert_eq!(a["storm.io/golden.app"], "img-0");
         assert_eq!(a["storm.io/image-build.app"], json!(r#"{"version":"1.0"}"#));
+        // #372: the image's digest, and each claim's volume by the pod's name for it.
+        assert_eq!(a["storm.io/image-digest.app"], "sha256:00");
+        assert!(a.keys().all(|k| !k.starts_with("storm.io/volume.")), "no claims, no volume keys");
+        mgr.record_pod_volume("uid-ann", "data", "6f1c-vol");
+        let a = mgr.container_annotations("uid-ann").await;
+        assert_eq!(a["storm.io/volume.data"], "6f1c-vol");
+        assert_eq!(mgr.pod_volume_ids("uid-ann").get("data").map(String::as_str), Some("6f1c-vol"));
         let long = HashMap::from([("c".repeat(60), "x".to_string())]);
-        assert!(mgr.annotations_for(long).await.is_empty());
+        assert!(mgr.annotations_for("uid-none", long).await.is_empty());
     }
 
     /// #131: a started pod's network-status entries come from its sandbox,

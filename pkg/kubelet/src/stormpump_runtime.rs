@@ -1531,7 +1531,9 @@ impl RuntimeService for StormpumpRuntime {
         })?;
         let volume = crate::container_roots::volume_name(&id);
         self.making.lock().unwrap_or_else(|e| e.into_inner()).insert(volume.clone());
-        let owner = serde_json::json!({ "kind": "Pod", "namespace": namespace, "name": pod, "uid": pod_uid });
+        // Its Pod and container (#372), so the engine's listing and the
+        // console say whose root it is.
+        let owner = crate::container_roots::root_owner(&namespace, &pod, &pod_uid, &config.name);
         let made = roots.make(&volume, &config.image, &owner).await;
         let made = match made {
             Ok(m) => m,
