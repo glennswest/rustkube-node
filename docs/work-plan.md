@@ -23,6 +23,10 @@ Doing:
        (`volume_from_snapshot`, the engine id by name; grown to the request by 1).
 3. [ ] describe pvc: the PV's csi.volumeAttributes carry `storm.io/volume-id`; events on the claim for resize and restore.
 4. [ ] docs (docs/csi.md / node-volumes.md, README), CHANGELOG; sc-build; stage; proof on a pvetest after stormcos ships the classes.
+Progress: 1-3 written (d459de2 resize, 362dbfe snapshots + restore, 14fa185/ea0bea9 fixes; docs b64d440, 1649dde). Filed
+stormcos#1032 (allowVolumeExpansion true + VolumeSnapshotClass stormblock). Test suite `pvc` (9ba6c6e, test/src/pvc.rs, on
+request): grow under a pod (`grows` workload), shrink refused, snapshot readyToUse, restore into 512Mi, snapshot deleted.
+Next: sc-build (kubelet + test crate) → fix → stage → hold `--after stormcos#1032`, then the suite on a pvetest with both.
 
 ### Shipped (proof pending): #383 (P0), a template listed `broken` is waited on forever (server8 12.92, pvc-ext4j-64m)
 
