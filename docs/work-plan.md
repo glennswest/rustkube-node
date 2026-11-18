@@ -4,6 +4,13 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #397 (P3), live migration post-copy (stormvm#132)
+
+2026-11-18. stormvm → 1632135. vm_migration: MigrationConfiguration (resolve: KubeVirt CR migrations, then policy_for over
+MigrationPolicies; recorded by the target in target_ready as migrationConfiguration), tuning(config), Progress, POSTCOPY_PAUSED;
+Migrator gains start_post_copy. vm_manager: per-migration Convergence on the source, switch once, mode PostCopy, abort refused in
+post-copy, postcopy-paused fails. stormcos serves neither CRD: filed. Live: stormvm#132's two-node run (needs stormcos#354).
+
 ### Shipped (proof pending): #393 (P0), exec cannot find cilium's postStart `bash` (12.93 tombstoned)
 
 2026-11-18. caa7d29 (#374) started running hooks; exec resolved argv[0] only in `root_path` (the container's root mount), while

@@ -35,7 +35,7 @@
 use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
-use stormvm_control::migration::{Tls, Tuning};
+use stormvm_control::migration::{PostCopyPolicy, Tls, Tuning};
 
 /// Which stormstorage migration is which disk's, on the VMI: a JSON object
 /// `{"migrationUid": "...", "disks": {"<disk>": "<stormstorage id>"}}`. The
@@ -245,8 +245,114 @@ pub fn send_uri(address: &str, port: u16) -> String {
 
 /// The same tuning on both ends: a source with multifd fails at once against
 /// a target without it.
-pub fn tuning() -> Tuning {
-    Tuning::default()
+pub fn tuning(config: &MigrationConfiguration) -> Tuning {
+    Tuning { post_copy: config.allow_post_copy, ..Tuning::default() }
+}
+
+/// KubeVirt's migration configuration as one migration uses it (#397): the
+/// cluster's `migrations`, then the best-matching `MigrationPolicy` over it.
+/// Resolved once, by the target before it arms, and recorded on the VMI as
+/// upstream records it (`status.migrationState.migrationConfiguration`), so
+/// the source sends with the same answer: `postcopy-ram` set on one end only
+/// fails the migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MigrationConfiguration {
+    /// `allowPostCopy`: switch to post-copy when pre-copy stops converging.
+    pub allow_post_copy: bool,
+    /// `completionTimeoutPerGiB`: seconds of pre-copy per GiB of guest
+    /// memory before it switches (upstream: before it gives up, unless
+    /// post-copy is allowed).
+    pub completion_timeout_per_gib: u64,
+}
+
+impl Default for MigrationConfiguration {
+    /// Upstream's defaults: no post-copy, 150 s per GiB.
+    fn default() -> Self {
+        MigrationConfiguration { allow_post_copy: false, completion_timeout_per_gib: 150 }
+    }
+}
+
+impl MigrationConfiguration {
+    /// What a `migrations` block or a policy's `spec` sets, over `self`.
+    fn over(mut self, v: &Value) -> MigrationConfiguration {
+        if let Some(b) = v["allowPostCopy"].as_bool() {
+            self.allow_post_copy = b;
+        }
+        if let Some(n) = v["completionTimeoutPerGiB"].as_u64().filter(|n| *n > 0) {
+            self.completion_timeout_per_gib = n;
+        }
+        self
+    }
+
+    /// As upstream writes it in `migrationConfiguration`.
+    pub fn json(&self) -> Value {
+        json!({"allowPostCopy": self.allow_post_copy, "completionTimeoutPerGiB": self.completion_timeout_per_gib})
+    }
+
+    /// The one recorded on the VMI, if any.
+    pub fn of(vmi: &Value) -> Option<MigrationConfiguration> {
+        let c = &vmi["status"]["migrationState"]["migrationConfiguration"];
+        c.is_object().then(|| MigrationConfiguration::default().over(c))
+    }
+
+    /// When the source switches: pre-copy stalled for ten polls, or past
+    /// `completionTimeoutPerGiB` for the guest's memory.
+    pub fn policy(&self, memory_bytes: u64, poll: std::time::Duration) -> PostCopyPolicy {
+        let gib = memory_bytes.div_ceil(1 << 30).max(1);
+        PostCopyPolicy {
+            max_pre_copy: std::time::Duration::from_secs(self.completion_timeout_per_gib.saturating_mul(gib)),
+            poll,
+            ..PostCopyPolicy::default()
+        }
+    }
+}
+
+/// Whether every label `selector` asks for is in `labels`, and how many.
+fn matched(selector: &Value, labels: &Value) -> Option<usize> {
+    let want = match selector.as_object() {
+        None => return Some(0),
+        Some(w) => w,
+    };
+    want.iter().all(|(k, v)| labels[k] == *v).then_some(want.len())
+}
+
+/// The `MigrationPolicy` that applies to a VMI, upstream's way: every label
+/// of its `virtualMachineInstanceSelector` on the VMI and of its
+/// `namespaceSelector` on the namespace; of those, the one matching the most
+/// labels, a tie going to the first by name.
+pub fn policy_for<'a>(policies: &'a [Value], vmi_labels: &Value, ns_labels: &Value) -> Option<&'a Value> {
+    let mut best: Option<(usize, &str, &Value)> = None;
+    for p in policies {
+        let sel = &p["spec"]["selectors"];
+        let (Some(a), Some(b)) = (
+            matched(&sel["virtualMachineInstanceSelector"], vmi_labels),
+            matched(&sel["namespaceSelector"], ns_labels),
+        ) else {
+            continue;
+        };
+        let name = p["metadata"]["name"].as_str().unwrap_or("");
+        let better = match best {
+            None => true,
+            Some((n, bn, _)) => a + b > n || (a + b == n && name < bn),
+        };
+        if better {
+            best = Some((a + b, name, p));
+        }
+    }
+    best.map(|(_, _, p)| p)
+}
+
+/// The configuration for a VMI: upstream's defaults, the cluster's
+/// `KubeVirt` `spec.configuration.migrations`, then its policy's `spec`.
+pub fn resolve(kubevirts: &[Value], policies: &[Value], vmi: &Value, ns: &Value) -> MigrationConfiguration {
+    let mut c = MigrationConfiguration::default();
+    if let Some(kv) = kubevirts.first() {
+        c = c.over(&kv["spec"]["configuration"]["migrations"]);
+    }
+    if let Some(p) = policy_for(policies, &vmi["metadata"]["labels"], &ns["metadata"]["labels"]) {
+        c = c.over(&p["spec"]);
+    }
+    c
 }
 
 /// Where a machine's TLS material is laid out: its run directory under
@@ -287,9 +393,24 @@ fn now() -> String {
 }
 
 /// The target can receive: where to send.
-pub fn target_ready(address: &str, port: u16) -> Value {
-    json!({"targetNodeAddress": address, "targetDirectMigrationNodePorts": {port.to_string(): 0}})
+pub fn target_ready(address: &str, port: u16, config: &MigrationConfiguration) -> Value {
+    json!({
+        "targetNodeAddress": address,
+        "targetDirectMigrationNodePorts": {port.to_string(): 0},
+        "migrationConfiguration": config.json(),
+    })
 }
+
+/// The source switched to post-copy (#397): upstream's `mode`.
+pub fn post_copy() -> Value {
+    json!({"mode": "PostCopy"})
+}
+
+/// Why a migration paused in post-copy is a failure: the guest is on two
+/// nodes and runs on neither until the link is back (qemu's
+/// `migrate-recover`, which nothing here does).
+pub const POSTCOPY_PAUSED: &str = "the migration paused in post-copy (postcopy-paused): the link to the target \
+     failed, and the guest's memory is split between the two nodes, so it runs on neither until the link is recovered";
 
 /// The source has started sending.
 pub fn sending() -> Value {
@@ -387,17 +508,28 @@ impl Stormstorage<'_> {
 }
 
 /// The migration verbs of one machine, as the kubelet calls them:
+/// One `query-migrate`: qemu's state and bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Progress {
+    pub state: String,
+    pub remaining: u64,
+    pub total: u64,
+}
+
 /// `stormvm_control::Machine` in production, a fake in tests. Errors are the
 /// hypervisor's words: they go on the migration as they are.
 #[async_trait::async_trait]
 pub trait Migrator: Send + Sync {
-    /// Send to a target waiting on `to`.
-    async fn send(&self, to: &str, tls: &Tls) -> Result<(), String>;
+    /// Send to a target waiting on `to`, with `config`'s tuning.
+    async fn send(&self, to: &str, tls: &Tls, config: &MigrationConfiguration) -> Result<(), String>;
     /// Arm a machine started with `-incoming defer` to receive on `listen`.
-    async fn receive(&self, listen: &str, tls: &Tls) -> Result<(), String>;
+    async fn receive(&self, listen: &str, tls: &Tls, config: &MigrationConfiguration) -> Result<(), String>;
     /// How the transfer is going: qemu's word (`active`, `completed`,
-    /// `failed`, `cancelled`, `none`).
-    async fn progress(&self) -> Result<String, String>;
+    /// `failed`, `cancelled`, `none`, `postcopy-active`, `postcopy-paused`)
+    /// and its bytes.
+    async fn progress(&self) -> Result<Progress, String>;
+    /// Switch a migration under way to post-copy (`migrate-start-postcopy`).
+    async fn start_post_copy(&self) -> Result<(), String>;
     /// Stop sending; the source keeps running.
     async fn cancel(&self) -> Result<(), String>;
     /// The machine's run state (`running`, `paused`, `inmigrate`, …).
@@ -407,14 +539,20 @@ pub trait Migrator: Send + Sync {
 
 #[async_trait::async_trait]
 impl Migrator for stormvm_control::Machine {
-    async fn send(&self, to: &str, tls: &Tls) -> Result<(), String> {
-        self.send_migration(to, tls, tuning()).await.map_err(|e| e.to_string())
+    async fn send(&self, to: &str, tls: &Tls, config: &MigrationConfiguration) -> Result<(), String> {
+        self.send_migration(to, tls, tuning(config)).await.map_err(|e| e.to_string())
     }
-    async fn receive(&self, listen: &str, tls: &Tls) -> Result<(), String> {
-        self.receive_migration_tls(listen, tls, tuning()).await.map_err(|e| e.to_string())
+    async fn receive(&self, listen: &str, tls: &Tls, config: &MigrationConfiguration) -> Result<(), String> {
+        self.receive_migration_tls(listen, tls, tuning(config)).await.map_err(|e| e.to_string())
     }
-    async fn progress(&self) -> Result<String, String> {
-        self.migration().await.map(|m| m.state).map_err(|e| e.to_string())
+    async fn progress(&self) -> Result<Progress, String> {
+        self.migration()
+            .await
+            .map(|m| Progress { state: m.state, remaining: m.remaining, total: m.total })
+            .map_err(|e| e.to_string())
+    }
+    async fn start_post_copy(&self) -> Result<(), String> {
+        stormvm_control::Machine::start_post_copy(self).await.map_err(|e| e.to_string())
     }
     async fn cancel(&self) -> Result<(), String> {
         let sock = self.control.as_deref().ok_or("no control socket")?;
@@ -434,6 +572,46 @@ mod tests {
 
     fn vmi(state: Value) -> Value {
         json!({"metadata": {"uid": "u1"}, "status": {"nodeName": "a", "migrationState": state}})
+    }
+
+    #[test]
+    fn post_copy_comes_from_the_cluster_then_the_best_policy() {
+        let vmi = json!({"metadata": {"labels": {"tier": "db", "team": "a"}}});
+        let ns = json!({"metadata": {"labels": {"env": "prod"}}});
+        // Nothing served: upstream's defaults.
+        assert_eq!(resolve(&[], &[], &vmi, &ns), MigrationConfiguration::default());
+        let kv = json!({"spec": {"configuration": {"migrations": {"allowPostCopy": true, "completionTimeoutPerGiB": 60}}}});
+        assert_eq!(resolve(&[kv.clone()], &[], &vmi, &ns), MigrationConfiguration { allow_post_copy: true, completion_timeout_per_gib: 60 });
+        let policy = |name: &str, vmi: Value, ns: Value, allow: bool| json!({
+            "metadata": {"name": name},
+            "spec": {"allowPostCopy": allow, "selectors": {"virtualMachineInstanceSelector": vmi, "namespaceSelector": ns}},
+        });
+        let ps = vec![
+            policy("broad", json!({"team": "a"}), json!({}), false),
+            policy("narrow", json!({"team": "a", "tier": "db"}), json!({"env": "prod"}), true),
+            policy("other", json!({"team": "b"}), json!({}), false),
+        ];
+        assert_eq!(policy_for(&ps, &vmi["metadata"]["labels"], &ns["metadata"]["labels"]).unwrap()["metadata"]["name"], "narrow");
+        // The policy over the cluster: allowed, the cluster's timeout kept.
+        assert_eq!(resolve(&[kv], &ps, &vmi, &ns), MigrationConfiguration { allow_post_copy: true, completion_timeout_per_gib: 60 });
+        // A policy the namespace does not match is not this VMI's.
+        let dev = json!({"metadata": {"labels": {"env": "dev"}}});
+        assert_eq!(policy_for(&ps, &vmi["metadata"]["labels"], &dev["metadata"]["labels"]).unwrap()["metadata"]["name"], "broad");
+    }
+
+    #[test]
+    fn the_target_records_the_configuration_the_source_sends_with() {
+        let c = MigrationConfiguration { allow_post_copy: true, completion_timeout_per_gib: 30 };
+        let ready = target_ready("10.0.0.2", 49152, &c);
+        assert_eq!(ready["migrationConfiguration"]["allowPostCopy"], true);
+        let vmi = json!({"status": {"migrationState": ready}});
+        assert_eq!(MigrationConfiguration::of(&vmi), Some(c));
+        assert!(tuning(&c).post_copy);
+        assert!(!tuning(&MigrationConfiguration::default()).post_copy);
+        // An older target recorded none: the source sends without post-copy.
+        assert_eq!(MigrationConfiguration::of(&json!({"status": {"migrationState": {}}})), None);
+        // 30 s per GiB of a 4 GiB guest before it switches.
+        assert_eq!(c.policy(4 << 30, std::time::Duration::from_secs(1)).max_pre_copy, std::time::Duration::from_secs(120));
     }
 
     #[test]
@@ -494,7 +672,7 @@ mod tests {
         assert_eq!(listen_uri(49152), "tcp:0.0.0.0:49152");
         assert_eq!(send_uri("192.168.16.20", 49152), "tcp:192.168.16.20:49152");
         assert_eq!(send_uri("fd00::2", 49152), "tcp:[fd00::2]:49152");
-        assert_eq!(target_ready("10.0.0.2", 49152)["targetDirectMigrationNodePorts"], json!({"49152": 0}));
+        assert_eq!(target_ready("10.0.0.2", 49152, &MigrationConfiguration::default())["targetDirectMigrationNodePorts"], json!({"49152": 0}));
         let f = failed("x", true);
         assert_eq!((f["failed"].clone(), f["abortStatus"].clone()), (json!(true), json!("Succeeded")));
         assert!(failed("x", false)["abortStatus"].is_null());
@@ -526,7 +704,7 @@ mod tests {
         let m = DiskMigration::of(&json!({"id": "vm-1-0", "state": "synced",
             "target": {"node": "b", "name": "default.web-1-root", "id": "e7"}}));
         assert_eq!((m.state.as_str(), m.target_id.as_deref()), ("synced", Some("e7")));
-        let config = Config::default();
+        let config = MigrationConfiguration::default();
         assert!(config.missing().unwrap().contains("stormstorage"));
         assert_eq!(config.port(), DEFAULT_PORT);
     }

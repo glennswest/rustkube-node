@@ -1127,6 +1127,10 @@ pub struct VmManager {
     /// Migrations sent from here, by migration uid, so a status write that
     /// failed does not send twice (#40).
     sent: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Pre-copy's progress per migration sent from here that allows
+    /// post-copy (#397): when it started and how it is converging, until it
+    /// switches (then `None`).
+    pre_copy: std::sync::Mutex<HashMap<String, Option<(std::time::Instant, stormvm_control::migration::Convergence)>>>,
     /// Migrations whose disks are finished (cut over and completed, or
     /// aborted), by migration uid (#40).
     disks_done: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -1151,6 +1155,8 @@ struct Incoming {
     vm: Vm,
     spec: VmSpec,
     port: u16,
+    /// What it armed with, recorded beside `targetNodeAddress` (#397).
+    config: crate::vm_migration::MigrationConfiguration,
     /// `targetNodeAddress` written.
     reported: bool,
     snoopers: Vec<(String, stormvm_net::Snooper)>,
@@ -1420,6 +1426,7 @@ impl VmManager {
             incoming: Default::default(),
             forced: Default::default(),
             sent: Default::default(),
+            pre_copy: Default::default(),
             disks_done: Default::default(),
             moved_disks: Default::default(),
             disk_moves: Default::default(),
@@ -5494,8 +5501,17 @@ impl VmManager {
             self.due_in(uid, poll);
             return true;
         };
+        // What the target resolved and recorded (#397); none from an older
+        // target, which armed without post-copy.
+        let config = mig::MigrationConfiguration::of(object).unwrap_or_default();
+        let switched = self.pre_copy.lock().unwrap_or_else(|e| e.into_inner()).get(&s.uid).is_some_and(|p| p.is_none());
         if started {
-            if s.abort_requested {
+            if s.abort_requested && switched {
+                // The guest runs on the target now, and what it has not been
+                // sent is only on the source: cancelling loses it.
+                self.event(object, "Warning", "AbortRefused",
+                           "the migration is in post-copy: it cannot be aborted, it finishes").await;
+            } else if s.abort_requested {
                 match machine.cancel().await {
                     Ok(()) => self.fail_migration(object, s, "aborted while sending", true).await,
                     Err(e) => {
@@ -5505,15 +5521,50 @@ impl VmManager {
                 }
                 return true;
             }
-            match machine.progress().await.as_deref() {
-                Ok("completed") => {
+            match machine.progress().await {
+                Ok(p) if p.state == "completed" => {
+                    let how = if switched { " (post-copy)" } else { "" };
                     if self.write_migration(object, &s.uid, mig::completed()).await {
-                        self.event(object, "Normal", "Migrated", &format!("moved to {target}")).await;
+                        self.event(object, "Normal", "Migrated", &format!("moved to {target}{how}")).await;
                     }
+                    self.pre_copy.lock().unwrap_or_else(|e| e.into_inner()).remove(&s.uid);
                     self.due_in(uid, poll);
                 }
-                Ok(state @ ("failed" | "cancelled")) => {
-                    self.fail_migration(object, s, &format!("the transfer {state}"), false).await;
+                Ok(p) if matches!(p.state.as_str(), "failed" | "cancelled") => {
+                    self.pre_copy.lock().unwrap_or_else(|e| e.into_inner()).remove(&s.uid);
+                    self.fail_migration(object, s, &format!("the transfer {}", p.state), false).await;
+                }
+                Ok(p) if p.state == "postcopy-paused" => {
+                    self.pre_copy.lock().unwrap_or_else(|e| e.into_inner()).remove(&s.uid);
+                    self.fail_migration(object, s, mig::POSTCOPY_PAUSED, false).await;
+                }
+                // Pre-copy, allowed to switch (#397): stormvm's convergence
+                // test, one poll at a time.
+                Ok(p) if p.state == "active" && config.allow_post_copy && !switched => {
+                    let policy = config.policy(p.total, poll);
+                    let switch = {
+                        let mut pre = self.pre_copy.lock().unwrap_or_else(|e| e.into_inner());
+                        let entry = pre.entry(s.uid.clone()).or_insert_with(|| Some((std::time::Instant::now(), Default::default())));
+                        match entry {
+                            Some((since, seen)) => seen.observe(&policy, p.remaining, since.elapsed()),
+                            None => false,
+                        }
+                    };
+                    if switch {
+                        match machine.start_post_copy().await {
+                            Ok(()) => {
+                                self.pre_copy.lock().unwrap_or_else(|e| e.into_inner()).insert(s.uid.clone(), None);
+                                info!(vm = %vm.name, "pre-copy stalled at {} bytes remaining: switched to post-copy", p.remaining);
+                                self.write_migration(object, &s.uid, mig::post_copy()).await;
+                                self.event(object, "Normal", "PostCopy", &format!(
+                                    "pre-copy stopped converging at {} bytes remaining: the guest runs on {target}, its memory follows",
+                                    p.remaining
+                                )).await;
+                            }
+                            Err(e) => warn!(vm = %vm.name, "the switch to post-copy was refused: {e}"),
+                        }
+                    }
+                    self.due_in(uid, poll);
                 }
                 Ok(_) => self.due_in(uid, poll),
                 Err(e) => {
@@ -5537,7 +5588,7 @@ impl VmManager {
             }
         };
         tls.hostname = Some(target.clone());
-        match machine.send(&mig::send_uri(&address, port), &tls).await {
+        match machine.send(&mig::send_uri(&address, port), &tls, &config).await {
             Ok(()) => {
                 self.sent.lock().unwrap_or_else(|e| e.into_inner()).insert(s.uid.clone());
                 info!(vm = %vm.name, "sending to {target} ({address}:{port})");
@@ -5639,7 +5690,7 @@ impl VmManager {
             if let Some(inc) = incoming.get_mut(uid) {
                 if !inc.reported {
                     inc.reported = self
-                        .write_migration(object, &s.uid, mig::target_ready(&self.migration.node_ip, inc.port))
+                        .write_migration(object, &s.uid, mig::target_ready(&self.migration.node_ip, inc.port, &inc.config))
                         .await;
                 }
                 self.due_in(uid, poll);
@@ -5678,7 +5729,7 @@ impl VmManager {
         match self.receive(uid, object, s, &copies).await {
             Ok(mut inc) => {
                 inc.reported = self
-                    .write_migration(object, &s.uid, mig::target_ready(&self.migration.node_ip, inc.port))
+                    .write_migration(object, &s.uid, mig::target_ready(&self.migration.node_ip, inc.port, &inc.config))
                     .await;
                 self.event(object, "Normal", "MigrationTargetReady",
                            &format!("receiving on {}:{}", self.migration.node_ip, inc.port)).await;
@@ -5688,6 +5739,38 @@ impl VmManager {
         }
         self.due_in(uid, poll);
         true
+    }
+
+    /// The migration configuration for a VMI (#397), as upstream resolves it:
+    /// the `KubeVirt` CR's `migrations`, then the best-matching
+    /// `MigrationPolicy`. A resource the cluster does not serve (stormcos
+    /// installs neither yet) is none: upstream's defaults, no post-copy.
+    async fn migration_configuration(&self, object: &Value) -> crate::vm_migration::MigrationConfiguration {
+        let list = |path: String| async move {
+            if self.api_url.is_empty() {
+                return Vec::new();
+            }
+            match self.api.get(format!("{}{path}", self.api_url)).send_retrying(retry::Policy::API).await {
+                Ok(r) if r.status().is_success() => {
+                    r.json::<Value>().await.ok().and_then(|v| v["items"].as_array().cloned()).unwrap_or_default()
+                }
+                _ => Vec::new(),
+            }
+        };
+        let ns_name = object["metadata"]["namespace"].as_str().unwrap_or("default");
+        let (kubevirts, policies) = tokio::join!(
+            list("/apis/kubevirt.io/v1/kubevirts".into()),
+            list("/apis/migrations.kubevirt.io/v1alpha1/migrationpolicies".into()),
+        );
+        let ns = if policies.is_empty() {
+            Value::Null
+        } else {
+            match self.api.get(format!("{}/api/v1/namespaces/{ns_name}", self.api_url)).send_retrying(retry::Policy::API).await {
+                Ok(r) if r.status().is_success() => r.json::<Value>().await.unwrap_or_default(),
+                _ => Value::Null,
+            }
+        };
+        crate::vm_migration::resolve(&kubevirts, &policies, object, &ns)
     }
 
     /// Attach the copies, start the machine waiting for its memory
@@ -5795,6 +5878,7 @@ impl VmManager {
             vm: rec,
             spec: vm,
             port,
+            config: self.migration_configuration(object).await,
             reported: false,
             snoopers: snoopers.take(),
             registration: reg,
@@ -5805,7 +5889,7 @@ impl VmManager {
                 let mut last = String::from("no answer");
                 let mut ok = false;
                 for _ in 0..50 {
-                    match m.receive(&mig::listen_uri(port), &tls).await {
+                    match m.receive(&mig::listen_uri(port), &tls, &inc.config).await {
                         Ok(()) => {
                             ok = true;
                             break;
@@ -8590,21 +8674,34 @@ mod tests {
     struct FakeMig {
         calls: std::sync::Mutex<Vec<String>>,
         progress: std::sync::Mutex<String>,
+        /// `ram.remaining` each poll answers (#397).
+        remaining: std::sync::Mutex<u64>,
     }
 
     #[async_trait::async_trait]
     impl crate::vm_migration::Migrator for FakeMig {
-        async fn send(&self, to: &str, tls: &stormvm_control::migration::Tls) -> Result<(), String> {
-            self.calls.lock().unwrap().push(format!("send {to} {}", tls.hostname.as_deref().unwrap_or("")));
+        async fn send(&self, to: &str, tls: &stormvm_control::migration::Tls, c: &crate::vm_migration::MigrationConfiguration) -> Result<(), String> {
+            let pc = if c.allow_post_copy { " post-copy" } else { "" };
+            self.calls.lock().unwrap().push(format!("send {to} {}{pc}", tls.hostname.as_deref().unwrap_or("")));
             *self.progress.lock().unwrap() = "active".into();
             Ok(())
         }
-        async fn receive(&self, listen: &str, _: &stormvm_control::migration::Tls) -> Result<(), String> {
-            self.calls.lock().unwrap().push(format!("receive {listen}"));
+        async fn receive(&self, listen: &str, _: &stormvm_control::migration::Tls, c: &crate::vm_migration::MigrationConfiguration) -> Result<(), String> {
+            let pc = if c.allow_post_copy { " post-copy" } else { "" };
+            self.calls.lock().unwrap().push(format!("receive {listen}{pc}"));
             Ok(())
         }
-        async fn progress(&self) -> Result<String, String> {
-            Ok(self.progress.lock().unwrap().clone())
+        async fn progress(&self) -> Result<crate::vm_migration::Progress, String> {
+            Ok(crate::vm_migration::Progress {
+                state: self.progress.lock().unwrap().clone(),
+                remaining: *self.remaining.lock().unwrap(),
+                total: 1 << 30,
+            })
+        }
+        async fn start_post_copy(&self) -> Result<(), String> {
+            self.calls.lock().unwrap().push("start-postcopy".into());
+            *self.progress.lock().unwrap() = "postcopy-active".into();
+            Ok(())
         }
         async fn cancel(&self) -> Result<(), String> {
             self.calls.lock().unwrap().push("cancel".into());
@@ -9079,6 +9176,65 @@ mod tests {
         assert_eq!(disks[0].device, "/dev/ublk-vol-moved");
         assert!(e.cloned.lock().unwrap().is_empty(), "no clone made by name");
         assert!(owned.contains(&"vol-moved".to_string()), "still the machine's own disk");
+    }
+
+    /// #397: a migration the target recorded as allowing post-copy is sent
+    /// with it; pre-copy that sets no new low for ten polls switches once,
+    /// `mode: PostCopy` recorded; an abort is then refused; it completes.
+    #[tokio::test]
+    async fn a_stalled_pre_copy_switches_to_post_copy_once() {
+        let n = mig_node("a").await;
+        n.m.vms.lock().await.insert("u1".into(), source_vm("v-root", true));
+        let mut obj = migrating(json!({"migrationUid": "m1", "sourceNode": "a", "targetNode": "b"}));
+        n.m.reconcile_one("u1", Some(&obj)).await.unwrap();
+        let record = n.seen.lock().unwrap().patches.iter().find(|(p, _)| p == "vm-u1").unwrap().1["metadata"]["annotations"].clone();
+        obj["metadata"]["annotations"] = record;
+        obj["status"]["migrationState"]["targetNodeAddress"] = json!("10.0.0.2");
+        obj["status"]["migrationState"]["targetDirectMigrationNodePorts"] = json!({"49152": 0});
+        obj["status"]["migrationState"]["migrationConfiguration"] = json!({"allowPostCopy": true, "completionTimeoutPerGiB": 3600});
+        n.m.reconcile_one("u1", Some(&obj)).await.unwrap();
+        assert_eq!(*n.fake.calls.lock().unwrap(), ["send tcp:10.0.0.2:49152 b post-copy"]);
+
+        // Pre-copy stuck at the same remaining: the first poll sets the low,
+        // ten more set none, and it switches.
+        *n.fake.remaining.lock().unwrap() = 500 << 20;
+        for _ in 0..10 {
+            n.m.reconcile_one("u1", Some(&obj)).await.unwrap();
+        }
+        assert!(!n.fake.calls.lock().unwrap().iter().any(|c| c == "start-postcopy"), "not yet");
+        n.m.reconcile_one("u1", Some(&obj)).await.unwrap();
+        assert_eq!(n.fake.calls.lock().unwrap().iter().filter(|c| *c == "start-postcopy").count(), 1);
+        assert!(state_writes(&n.seen).iter().any(|w| w["mode"] == "PostCopy"));
+
+        // In post-copy: an abort is refused (nothing cancelled), polls go on.
+        obj["status"]["migrationState"]["abortRequested"] = json!(true);
+        n.m.reconcile_one("u1", Some(&obj)).await.unwrap();
+        assert!(!n.fake.calls.lock().unwrap().iter().any(|c| c == "cancel"));
+        assert_eq!(n.fake.calls.lock().unwrap().iter().filter(|c| *c == "start-postcopy").count(), 1, "switched once");
+
+        *n.fake.progress.lock().unwrap() = "completed".into();
+        n.m.reconcile_one("u1", Some(&obj)).await.unwrap();
+        assert!(state_writes(&n.seen).iter().any(|w| w["completed"] == json!(true)));
+    }
+
+    /// #397: post-copy that loses its link is a failed migration, said plainly.
+    #[tokio::test]
+    async fn a_paused_post_copy_fails_the_migration() {
+        let n = mig_node("a").await;
+        n.m.vms.lock().await.insert("u1".into(), source_vm("v-root", true));
+        let mut obj = migrating(json!({"migrationUid": "m1", "sourceNode": "a", "targetNode": "b"}));
+        n.m.reconcile_one("u1", Some(&obj)).await.unwrap();
+        let record = n.seen.lock().unwrap().patches.iter().find(|(p, _)| p == "vm-u1").unwrap().1["metadata"]["annotations"].clone();
+        obj["metadata"]["annotations"] = record;
+        obj["status"]["migrationState"]["targetNodeAddress"] = json!("10.0.0.2");
+        obj["status"]["migrationState"]["targetDirectMigrationNodePorts"] = json!({"49152": 0});
+        n.m.reconcile_one("u1", Some(&obj)).await.unwrap();
+        assert_eq!(*n.fake.calls.lock().unwrap(), ["send tcp:10.0.0.2:49152 b"], "no configuration recorded: no post-copy");
+        *n.fake.progress.lock().unwrap() = "postcopy-paused".into();
+        n.m.reconcile_one("u1", Some(&obj)).await.unwrap();
+        let w = state_writes(&n.seen);
+        let failed = w.iter().find(|w| w["failed"] == json!(true)).expect("failed");
+        assert!(failed["failureReason"].as_str().unwrap().contains("postcopy-paused"), "{failed}");
     }
 
     /// #40, the source: each disk mirrored to the target and recorded; sent

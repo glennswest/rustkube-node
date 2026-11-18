@@ -1132,6 +1132,20 @@ through the VMI's `status.migrationState`, upstream KubeVirt's contract (#40):
   ends; writes `startTimestamp`, then `completed` or `failed` (with
   `failureReason`) and `endTimestamp`. `abortRequested` before sending fails
   it at once, while sending cancels the transfer (`abortStatus: Succeeded`).
+- **Post-copy, when allowed** (#397, stormvm#132): the target resolves the
+  migration's configuration as upstream does (the `KubeVirt` CR's
+  `spec.configuration.migrations`, then the best-matching `MigrationPolicy`
+  by its VMI and namespace selectors; neither is served on stormcos yet, so
+  the default is upstream's: no post-copy, 150 s per GiB) and records it as
+  `migrationState.migrationConfiguration`. Both ends set `postcopy-ram` from
+  it. The source watches pre-copy's `remaining`. When it sets no new low for
+  ten polls, or pre-copy has run past `completionTimeoutPerGiB` × the guest's
+  GiB, it switches (`migrate-start-postcopy`), once: `mode: PostCopy`, Event
+  `PostCopy`, `Migrated` says `(post-copy)`. From then an abort is refused
+  (`AbortRefused`): the guest runs on the target and what it lacks is only on
+  the source. `postcopy-paused` (the link lost mid post-copy) fails the
+  migration with that said plainly: the guest runs on neither node until the
+  link is recovered.
 - **After.** The source's paused copy is stopped at once (never asked, never
   resumed, nothing reported), its disks detached; it is not started again
   while `status.nodeName` still names the source. The target adopts the
