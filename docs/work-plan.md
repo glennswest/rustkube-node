@@ -275,6 +275,8 @@ Done: ed82a55. sc-build passed (VM sc-build-172af788f1, 673 kubelet unit, a_stal
 Stage build 5dd1f49bb2b8. Held `--after-install rustkube-node>=ed82a55@any:pve`. Resume: `stormcentral test run rustkube-node golden`; close on a pass.
 2026-11-18: pvetest1 runs 12.92 (rustkube-node 18a4a4b), pvetest2 12.93-flowsdn (4d0cb9f); both contain 6b36f19. Ran golden at 4d0cb9f:
 7cb87fb2e3 (pvetest1), 2b38113e35 (pvetest2); held `--after-run 2b38113e35`. Resume: `stormcentral test show <id>`; pass → close #344; fail → fix what it names.
+2026-11-18: ed82a55 (stale /v1 record) is in 12.94 (rustkube-node 8686267); pvetest1 passed that install. Run 7d1775d365 on
+pvetest1 (golden at 8686267); #344 and #373 held `--after-run 7d1775d365`. Pass → close both; fail → fix what it names.
 
 2026-11-10. stormvm 6e188a6 (the lock) has `stormvm_node::golden` (root_disk, sealer_spec, DEIDENTIFY/DEIDENTIFIED, provenance) and the
 flow in its CLI (`make_golden`). Not in a library, so the kubelet runs the steps itself. Chosen: no owner on the golden (#75's sweep deletes
