@@ -22,6 +22,14 @@ Done: caa7d29 (hooks, 2 unit tests; sc-build: 639 kubelet unit, clippy, no warni
 `member`, exec client; `cd test` sc-build: 65 tests, clippy -D warnings clean). Stage build 9842594f16e9 (caa7d29+).
 Medium on pvetest2 at d23c631 queued (before a release carries the hooks: the hook halves of `pod-multi-exec` and
 `pod-multi-stop-order` are expected to fail there; the rest names the runtime's gaps). Resume: `stormcentral test list` → show it.
+5f536439dd (pvetest2, d23c631): `pod-multi-ready` failed only on order: containerStatuses ["b","a"] (HashMap order) → 595766e sorts
+them by name, as upstream (unit test; sc-build 640 kubelet unit, `cd test` 65, clippy). The multi cases now go on past a failed ready.
+`pvc-size-class-16gi` failed because the node's room shrank mid-run (16Gi→4Gi): filed #377. Stage build a48d70c57065 (595766e).
+c2b13f8de1 (pvetest2, 595766e test, the node's older kubelet): ready, localhost, logs, restart pass; exec mechanics pass; the hook halves
+(postStart file, preStop files) fail as expected (no hooks in that kubelet); `pod-multi-ipc` fails: stormpump's sandbox holds only a
+netns, every container gets its own IPC ns and /dev/shm → filed stormpump#244. Part 3 → #378, proposed `--after stormd#75`.
+Open: the proof pod `default/multi-<node>` (owner's question, posted on the issue). Then: medium on a pve machine with a release carrying
+595766e (hooks + order); `pod-multi-ipc` after stormpump#244.
 
 ### Shipped (waits for the proof on a node): #372 (P0), traceability: root clones owned by their Pod, pods carry instance/golden/digest/volume ids, mirror pods declare the service's volumes
 
