@@ -39,7 +39,7 @@ missing arg: the first sc-build failed to compile them), 46c1e6f (two clippy war
 token). Next: sc-build 46c1e6f; stage; then the proof needs stormblock#399/#400 and stormcos#1027 on a node: `shipped` with the issue's
 proof, `--after` those.
 
-### Paused for P0 #380: #373, VMI/VM status.volumes[] (stormvm#129); restored disks owned; stormvm → d952a0c
+### Shipped (proof pending): #373, VMI/VM status.volumes[] (stormvm#129); restored disks owned; stormvm → d952a0c
 
 2026-11-18. stormvm c9cd494..d952a0c: no manifest change; the kubelet calls none of the changed `stormvm_block` signatures. Pinned at
 d952a0c, not main: main's 47fb0d3 adds a backups route whose kubelet half is #380. Plan: (1) rev-only bump (pkg/kubelet/Cargo.toml + lock).
@@ -52,6 +52,8 @@ when retained). Tests; docs; CHANGELOG; sc-build; stage; shipped with the VMI pr
 Done (code): e996fed (bump, status.volumes on VMI + VM, restore owners, 4 tests, README/status.md/CHANGELOG). Paused 2026-11-18 for
 P0 #380. sc-build e996fed passed (`--locked` build, test: 643 kubelet unit, clippy). Resume: `component stage rustkube-node`; `shipped` with proof `api:/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{name} ~
 "volumes":\[\{"name"` on a node with a VM; comment on #373 why restored disks are owned by their PVC, not the VM.
+Resumed 2026-11-18: stage build b9f04c1ce43c (4872307); comment posted (PVC-owned restored disks); `shipped` with proof
+`api:/apis/kubevirt.io/v1/virtualmachineinstances ~ "volumes":\[\{"name"`: closes when a test machine with it shows a VMI's volumes.
 
 ### In progress: #374 (P0), multi-container pods proven on every test machine
 
