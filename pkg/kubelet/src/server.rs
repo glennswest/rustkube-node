@@ -2932,7 +2932,7 @@ mod console_tests {
     fn app_with_console(run_dir: &str) -> Router {
         let rt = Arc::new(super::tests::NoopRt);
         let pm = Arc::new(PodManager::new(rt.clone(), rt, "test-node"));
-        router_with_console(pm, None, console(run_dir, crate::engine::DEFAULT_URL))
+        router_with_console(pm, None, console(run_dir, crate::engine::DEFAULT_URL, Vec::new()))
     }
 
     async fn get(app: Router, uri: &str) -> axum::http::Response<Body> {
@@ -3139,7 +3139,7 @@ mod console_tests {
             .unwrap();
         // The verb admits loopback, as the doors do.
         req.extensions_mut().insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
-        let resp = console(run_dir, "http://127.0.0.1:9").oneshot(req).await.unwrap();
+        let resp = console(run_dir, "http://127.0.0.1:9", Vec::new()).oneshot(req).await.unwrap();
         let (status, body) = status_and_body(resp).await;
 
         assert!(!body.contains("not told where stormblock is"), "{status}: {body}");
