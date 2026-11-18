@@ -4,7 +4,7 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #373, VMI/VM status.volumes[] (stormvm#129); restored disks owned; stormvm → d952a0c
+### Paused for P0 #380: #373, VMI/VM status.volumes[] (stormvm#129); restored disks owned; stormvm → d952a0c
 
 2026-11-18. stormvm c9cd494..d952a0c: no manifest change; the kubelet calls none of the changed `stormvm_block` signatures. Pinned at
 d952a0c, not main: main's 47fb0d3 adds a backups route whose kubelet half is #380. Plan: (1) rev-only bump (pkg/kubelet/Cargo.toml + lock).
@@ -14,6 +14,10 @@ changes. (3) restore: `RestoreEngine::set_owner`; a restored **disk** is owned b
 deletes an owned, unused volume once its VM is gone, and a claim-bound disk is lent (`owned: false` in volumes::status), so a VM owner
 would let the sweep delete what a PVC still binds. The restored **memory state** volume is the machine's: owner VirtualMachine (or none
 when retained). Tests; docs; CHANGELOG; sc-build; stage; shipped with the VMI proof.
+Done (code): e996fed (bump, status.volumes on VMI + VM, restore owners, 4 tests, README/status.md/CHANGELOG). Paused 2026-11-18 for
+P0 #380 while sc-build of e996fed ran (log tmp/sc-373.log is local and not kept: re-run). Resume: sc-build e996fed (`--locked` build/test/clippy);
+fix if red; `component stage rustkube-node`; `shipped` with proof `api:/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{name} ~
+"volumes":\[\{"name"` on a node with a VM; comment on #373 why restored disks are owned by their PVC, not the VM.
 
 ### In progress: #374 (P0), multi-container pods proven on every test machine
 
