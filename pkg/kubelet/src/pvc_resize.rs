@@ -637,9 +637,10 @@ mod tests {
 
     /// One fake for the apiserver and the engine: the claim, its PV, the
     /// engine's volume, and what the engine answers a grow.
-    async fn world(claim: Value, grow: (u16, Value)) -> (String, std::sync::Arc<std::sync::Mutex<Vec<(String, String, Value)>>>) {
-        use std::sync::{Arc, Mutex};
-        let calls: Arc<Mutex<Vec<(String, String, Value)>>> = Arc::default();
+    type Calls = std::sync::Arc<std::sync::Mutex<Vec<(String, String, Value)>>>;
+
+    async fn world(claim: Value, grow: (u16, Value)) -> (String, Calls) {
+        let calls: Calls = Calls::default();
         let log = calls.clone();
         let app = axum::Router::new().fallback(move |method: axum::http::Method, uri: axum::http::Uri, body: axum::body::Bytes| {
             let (log, claim, grow) = (log.clone(), claim.clone(), grow.clone());
