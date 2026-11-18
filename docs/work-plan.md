@@ -4,6 +4,14 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### Reopened: #373 (P?), VMI status.volumes[]: the shipped proof could not hold
+
+2026-11-18. The proof ran on pvetest2 (12.93-flowsdn) and saw a golden-suite VMI. The regex `"volumes":\[\{"name"` cannot
+match a golden root (serde_json sorts keys: `golden` first), and a plain install has no VMI at all. Evidence instead: golden's new
+`vmi-status-volumes` case (e461d00; test crate clippy -D warnings + 68 tests, VM sc-build-b00da010ec). Run 091aa06da3 went to
+pvetest1 (12.92, kubelet 18a4a4b without e996fed): cancelled. Held `--after-install rustkube-node>=ed82a55@any:pve` with #344:
+one golden run decides both; close #373 quoting `vmi-status-volumes`.
+
 ### Done: #390 (P1), bump stormvm to f11ac55 (stormvm#37: memory snapshot state device through qemu's root)
 
 2026-11-18. Rev-only (a302b3e → f11ac55: no manifest change upstream; fd97183 dropped NIC `vlan`/`rate_mbytes`, unused here). sc-build;
