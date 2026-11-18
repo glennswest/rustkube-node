@@ -4,6 +4,21 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #374 (P0), multi-container pods proven on every test machine
+
+2026-11-18. Found: the kubelet runs init containers, sidecars (#111: stopped last, last declared first), per-container probes,
+restarts and `lastState`; exec/logs per container exist (#56). **Missing: lifecycle hooks** (`postStart`, `preStop`: no code at all).
+The stormpump runtime shares the sandbox's netns, but IPC is only host-or-not (`Share.ipc`): whether a pod's containers share one IPC
+namespace and `/dev/shm` is unknown; the test names it.
+Plan: (1) kubelet: `lifecycle.postStart` (exec/httpGet/sleep, after the start; a failure kills the container, FailedPostStartHook)
+and `preStop` (before the stop's SIGTERM, inside the grace; FailedPreStopHook), unit tests. (2) test: workload `member` (serves its
+name on a port, reaches its peers on localhost before it binds, writes /dev/shm, crashes once on a marker, writes its stop time on
+SIGTERM); an exec client (`pods/exec` WebSocket, v5.channel.k8s.io); medium cases `pod-multi-*` on pod `medium-multi`: init + sidecar
++ a + b, emptyDir + claim, per-container resources/probes/hooks: all ready, phase/conditions, per-container status and logs, exec -c,
+shared netns, IPC, a restart of a alone, stop order (sidecar last, from stop times on the claim). (3) docs, CHANGELOG; sc-build both;
+medium on pvetest1/2. (4) The proof pod `default/multi-<node>` must outlive a run; the suites cannot write `default` and drain what
+they make: owner's question if no better proof. Part 3 (node services' helpers) waits on stormd#75: own issue, `--after`.
+
 ### Shipped (waits for the proof on a node): #372 (P0), traceability: root clones owned by their Pod, pods carry instance/golden/digest/volume ids, mirror pods declare the service's volumes
 
 2026-11-18. Found: the kubelet *does* pass `owner {kind: Pod, …}` to `Roots::make`, but a pulled image's root (fstemplate clone, which takes
