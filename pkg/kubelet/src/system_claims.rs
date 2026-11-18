@@ -624,7 +624,7 @@ mod tests {
     #[test]
     fn facts_come_from_the_engines_listing() {
         let golden = json!({"id": "g", "name": "fastetcd-data.golden"});
-        let v = json!({"id": "v", "name": "fastetcd-data", "virtual_size_bytes": 1u64 << 30,
+        let v = json!({"id": "9b1e0c52-0000-4000-8000-000000000001", "name": "fastetcd-data", "virtual_size_bytes": 1u64 << 30,
                        "fs": {"kind": "ext4"}, "fs_uuid": "u-1", "parent": "g",
                        "health": "healthy", "access": "rw", "role": "data"});
         let names = HashMap::from([("g".to_string(), "fastetcd-data.golden".to_string())]);
