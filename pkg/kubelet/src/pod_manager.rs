@@ -3118,14 +3118,30 @@ impl PodManager {
         if let Some(id) = self.storage_volume_id(name).await {
             return Ok(id);
         }
-        groups.restore(name, &found.group).await.map_err(|e| {
-            ClaimError::Failed(format!("restoring VolumeSnapshot {namespace}/{snapshot} into {name}: {e}"))
-        })?;
+        let restore = || async {
+            groups.restore(name, &found.group).await.map_err(|e| {
+                ClaimError::Failed(format!("restoring VolumeSnapshot {namespace}/{snapshot} into {name}: {e}"))
+            })
+        };
+        let v1 = restore().await?;
         // The restore answers `/v1`'s id; attach, owner and every later call
-        // take the engine's (the #344 lesson): the volume by name.
-        let id = self.storage_volume_id(name).await.ok_or_else(|| {
-            ClaimError::Failed(format!("restored {name} from {snapshot}, but the engine does not list it by name"))
-        })?;
+        // take the engine's (the #344 lesson): the volume by name. `/v1` is
+        // idempotent by name, so a record left by an earlier claim of this
+        // name whose volume was deleted under it is handed back empty (#344,
+        // runs 2b38113e35 / 7cb87fb2e3): deleted, and restored once more.
+        let id = match self.storage_volume_id(name).await {
+            Some(id) => id,
+            None => {
+                warn!("claim {namespace}/{claim}: the restore answered {v1}, with no volume named {name}: a stale /v1 record; deleting it and restoring again");
+                self.storage_delete(&format!("/v1/volumes/{v1}")).await.map_err(|e| {
+                    ClaimError::Failed(format!("restoring into {name}: deleting the stale /v1 record {v1}: {e}"))
+                })?;
+                restore().await?;
+                self.storage_volume_id(name).await.ok_or_else(|| {
+                    ClaimError::Failed(format!("restored {name} from {snapshot}, but the engine does not list it by name"))
+                })?
+            }
+        };
         info!("claim {namespace}/{claim}: restored from VolumeSnapshot {snapshot} (content {}, group {})", found.content, found.group.id);
         self.claim_event(pvc, "Normal", "Restored", &format!(
             "restored from VolumeSnapshot {snapshot} ({size} bytes; grown to the request once bound)"

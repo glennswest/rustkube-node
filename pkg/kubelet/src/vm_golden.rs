@@ -141,6 +141,12 @@ pub trait Engine: Send + Sync {
     async fn digest(&self, id: &str) -> Option<String>;
     /// Gone already is done.
     async fn delete_volume(&self, id: &str) -> Result<(), String>;
+    /// A `/v1` volume by its `/v1` id: the record and the engine volume
+    /// under it (stormblock's `DELETE /v1/volumes/{id}`). Gone already is
+    /// done. Deleting the engine volume alone leaves the record, which a
+    /// later restore of the same name is handed back (`/v1` is idempotent
+    /// by name), runs 2b38113e35 and 7cb87fb2e3.
+    async fn delete_v1_volume(&self, id: &str) -> Result<(), String>;
     /// Every group snapshot named `name` deleted. None is done.
     async fn delete_groups_named(&self, name: &str) -> Result<(), String>;
     async fn delete_group(&self, id: &str) -> Result<(), String>;
@@ -166,6 +172,9 @@ pub trait Machines: Send + Sync {
 pub struct Made {
     pub group: Option<String>,
     pub copy: Option<String>,
+    /// The copy's `/v1` id: removed through `/v1`, so no record of the
+    /// golden's name outlives it.
+    pub copy_v1: Option<String>,
     pub sealer: Option<Registration>,
 }
 
@@ -332,12 +341,31 @@ impl Goldens {
         // are `/api/v1` calls and take the engine's id, found by name. Run
         // 9f184d6390 attached the `/v1` id (404), and its cleanup's delete
         // of that id was a 404 too, taken as done: the copy stayed.
-        let v1 = self.engine.volume_from_snapshot(&golden, &snap).await
+        //
+        // `/v1` is idempotent by name: a record of the golden's name left by
+        // an earlier attempt whose copy was deleted under it (runs 2b38113e35,
+        // 7cb87fb2e3: the no-agent attempt, then the good one, same name) is
+        // handed back with no volume under it. Such a record is deleted and
+        // the copy made once more.
+        let mut v1 = self.engine.volume_from_snapshot(&golden, &snap).await
             .map_err(|e| format!("copying {}'s root disk as {golden}: {e}", vm.name))?;
-        let copy = match self.engine.volume_named(&golden).await {
+        made.copy_v1 = Some(v1.clone());
+        let mut listed = self.engine.volume_named(&golden).await;
+        if matches!(listed, Ok(None)) {
+            warn!("golden {golden}: the restore answered {v1}, which has no volume named {golden}: a stale /v1 record; deleting it and copying again");
+            self.engine.delete_v1_volume(&v1).await
+                .map_err(|e| format!("copying {}'s root disk as {golden}: deleting the stale /v1 record {v1}: {e}", vm.name))?;
+            made.copy_v1 = None;
+            v1 = self.engine.volume_from_snapshot(&golden, &snap).await
+                .map_err(|e| format!("copying {}'s root disk as {golden} (again): {e}", vm.name))?;
+            made.copy_v1 = Some(v1.clone());
+            listed = self.engine.volume_named(&golden).await;
+        }
+        let copy = match listed {
             Ok(Some(id)) => id,
             Ok(None) => return Err(format!(
-                "copying {}'s root disk as {golden}: the engine made {v1} but lists no volume named {golden}; not removed: the copy {v1}",
+                "copying {}'s root disk as {golden}: the engine made {v1} but lists no volume named {golden}, \
+                 after a stale record was deleted and the copy made again",
                 vm.name
             )),
             Err(e) => return Err(format!(
@@ -367,6 +395,7 @@ impl Goldens {
         // 5. Sealed. From here it is a golden: nothing below removes it.
         self.engine.seal(&copy).await.map_err(|e| format!("sealing {golden}: {e}"))?;
         made.copy = None;
+        made.copy_v1 = None;
         if let Err(e) = self.engine.delete_group(&group.id).await {
             warn!("golden {golden}: the snapshot group {} was not deleted: {e}", group.id);
         }
@@ -403,6 +432,12 @@ impl Goldens {
                 left.push(format!("the sealer {}/{}: {e}", sreg.namespace, sreg.name));
             }
         }
+        // Through `/v1` first: the record and the volume both go.
+        if let Some(v1) = &made.copy_v1 {
+            if let Err(e) = self.engine.delete_v1_volume(v1).await {
+                left.push(format!("the copy's /v1 record {v1}: {e}"));
+            }
+        }
         if let Some(copy) = &made.copy {
             if let Err(e) = self.engine.delete_volume(copy).await {
                 left.push(format!("the copy {copy}: {e}"));
@@ -427,6 +462,7 @@ impl Goldens {
         let made = Made {
             sealer,
             copy: obj["status"]["volumeId"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
+            copy_v1: None,
             group: None,
         };
         let mut left = self.remove(&made).await;
@@ -620,6 +656,15 @@ impl Engine for Stormblock {
         let id = id.to_string();
         gone_is_done(self.blocking(format!("delete volume {id}"), move |c| c.delete_volume(&id).map_err(|e| e.to_string())).await)
     }
+    async fn delete_v1_volume(&self, id: &str) -> Result<(), String> {
+        let url = format!("{}/v1/volumes/{id}", self.client.url());
+        let r = self.client.delete(&url).await.map_err(|e| format!("DELETE /v1/volumes/{id}: {e}"))?;
+        if r.status().is_success() || r.status().as_u16() == 404 {
+            return Ok(());
+        }
+        let code = r.status();
+        Err(format!("DELETE /v1/volumes/{id}: {code}: {}", r.text().await.unwrap_or_default().chars().take(200).collect::<String>()))
+    }
     async fn delete_groups_named(&self, name: &str) -> Result<(), String> {
         let n = name.to_string();
         let groups = self.blocking(format!("group snapshots {name}"), move |c| {
@@ -697,13 +742,19 @@ mod tests {
         made: StdMutex<Vec<String>>,
         /// The made copy is not listed by name.
         unlisted: bool,
+        /// The first restore answers a stale /v1 record (no volume under
+        /// it); once that is deleted, restores are listed.
+        stale_once: bool,
+        /// /v1 ids deleted.
+        v1_deleted: StdMutex<Vec<String>>,
     }
 
     #[async_trait]
     impl Engine for FakeEngine {
         async fn volume_named(&self, name: &str) -> Result<Option<String>, String> {
             self.log.lock().unwrap().push(format!("named {name}"));
-            if !self.unlisted && self.made.lock().unwrap().iter().any(|n| n == name) {
+            let stale = self.stale_once && self.v1_deleted.lock().unwrap().is_empty();
+            if !self.unlisted && !stale && self.made.lock().unwrap().iter().any(|n| n == name) {
                 return Ok(Some("v-copy".into()));
             }
             Ok(self.existing.clone())
@@ -711,6 +762,9 @@ mod tests {
         async fn volume_from_snapshot(&self, name: &str, s: &stormvm_block::Snapshot) -> Result<String, String> {
             self.log.lock().unwrap().push(format!("copy {name} from {}", s.id));
             self.made.lock().unwrap().push(name.to_string());
+            if self.stale_once && self.v1_deleted.lock().unwrap().is_empty() {
+                return Ok("vol-stale".into());
+            }
             // The /v1 id, which is not the engine's (run 9f184d6390).
             Ok("vol-v1copy".into())
         }
@@ -724,6 +778,11 @@ mod tests {
         }
         async fn delete_volume(&self, id: &str) -> Result<(), String> {
             self.log.lock().unwrap().push(format!("delete volume {id}"));
+            Ok(())
+        }
+        async fn delete_v1_volume(&self, id: &str) -> Result<(), String> {
+            self.log.lock().unwrap().push(format!("delete v1 {id}"));
+            self.v1_deleted.lock().unwrap().push(id.to_string());
             Ok(())
         }
         async fn delete_groups_named(&self, name: &str) -> Result<(), String> {
@@ -850,11 +909,14 @@ mod tests {
         let err = gs.make(&request(None, None), &vmi(), &source(run), &mut made).await.unwrap_err();
         assert!(err.contains("guest agent"), "{err}");
         assert_eq!(made.copy.as_deref(), Some("v-copy"));
+        assert_eq!(made.copy_v1.as_deref(), Some("vol-v1copy"));
         assert_eq!(made.group.as_deref(), Some("g-1"));
         assert!(made.sealer.is_some());
         log.lock().unwrap().clear();
         assert!(gs.remove(&made).await.is_empty());
-        assert_eq!(*log.lock().unwrap(), vec!["stop base-sealer", "delete volume v-copy", "delete group g-1"]);
+        // The /v1 record first, so a later request of the same name is not
+        // handed it back (runs 2b38113e35, 7cb87fb2e3).
+        assert_eq!(*log.lock().unwrap(), vec!["stop base-sealer", "delete v1 vol-v1copy", "delete volume v-copy", "delete group g-1"]);
     }
 
     /// The copy is attached, sealed and deleted by the engine's id, never
@@ -869,8 +931,12 @@ mod tests {
                          FakeMachines { log: log.clone(), run_dir: run.into(), ..Default::default() }, run);
         let mut made = Made::default();
         let err = gs.make(&request(None, None), &vmi(), &source(run), &mut made).await.unwrap_err();
-        assert!(err.contains("not removed: the copy vol-v1copy"), "{err}");
+        assert!(err.contains("lists no volume named"), "{err}");
         assert_eq!(made.copy, None, "the /v1 id is never handed to an /api/v1 call");
+        assert_eq!(made.copy_v1.as_deref(), Some("vol-v1copy"), "removed through /v1");
+        let left = gs.remove(&made).await;
+        assert!(left.is_empty(), "{left:?}");
+        assert!(log.lock().unwrap().iter().any(|l| l == "delete v1 vol-v1copy"));
         assert!(!log.lock().unwrap().iter().any(|l| l.starts_with("start ")), "no sealer on an unknown copy");
     }
 
@@ -884,7 +950,33 @@ mod tests {
                          FakeMachines { log: log.clone(), run_dir: run.into(), ..Default::default() }, run);
         let mut made = Made::default();
         assert!(gs.make(&request(None, None), &vmi(), &source(run), &mut made).await.is_err());
-        assert_eq!(made, Made { group: Some("g-1".into()), copy: Some("v-copy".into()), sealer: None });
+        assert_eq!(made, Made { group: Some("g-1".into()), copy: Some("v-copy".into()), copy_v1: Some("vol-v1copy".into()), sealer: None });
+        gs.remove(&made).await;
+        let log = log.lock().unwrap();
+        let v1 = log.iter().position(|l| l == "delete v1 vol-v1copy").expect("the /v1 record deleted");
+        let vol = log.iter().position(|l| l == "delete volume v-copy").expect("then the engine volume");
+        assert!(v1 < vol, "{log:?}");
+    }
+
+    /// A stale /v1 record of the golden's name (an earlier attempt's, its
+    /// volume deleted under it, runs 2b38113e35 / 7cb87fb2e3): deleted, and
+    /// the copy made again, once.
+    #[tokio::test]
+    async fn a_stale_v1_record_of_the_name_is_deleted_and_the_copy_made_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().to_str().unwrap();
+        let log: Log = Default::default();
+        let gs = goldens(FakeEngine { log: log.clone(), stale_once: true, ..Default::default() },
+                         FakeMachines { log: log.clone(), run_dir: run.into(), ..Default::default() }, run);
+        let mut made = Made::default();
+        let status = gs.make(&request(None, None), &vmi(), &source(run), &mut made).await.unwrap();
+        assert_eq!(status["phase"], SEALED);
+        assert_eq!(status["volumeId"], "v-copy");
+        let log = log.lock().unwrap();
+        let copies = log.iter().filter(|l| l.starts_with("copy ")).count();
+        assert_eq!(copies, 2, "{log:?}");
+        assert!(log.iter().any(|l| l == "delete v1 vol-stale"), "{log:?}");
+        assert!(!log.iter().any(|l| l == "delete v1 vol-v1copy"), "the golden itself is kept: {log:?}");
     }
 
     /// A golden of that name already there: refused before anything is made.

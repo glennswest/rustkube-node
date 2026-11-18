@@ -238,6 +238,11 @@ The rkn-golden-9f184d6390 copy (ed22779b-…) stays on pvetest2's engine: tests 
 Done: 6b36f19. sc-build (VM sc-build-646357b46b): --locked build/test (633 kubelet unit), test crate clippy -D warnings + 61 tests.
 (An earlier run with kubelet clippy filed #369: a pre-existing never_loop in pod_manager.rs:3781; closed as part of #227.) Stage 573ea87ea979.
 Held `--after-install rustkube-node>=6b36f19@any:pve`. Resume: `stormcentral test run rustkube-node golden` on that machine; close on a pass.
+2026-11-18 (later): 2b38113e35 (pvetest2) and 7cb87fb2e3 (pvetest1) at 4d0cb9f: no-agent fails correctly now; golden-sealed fails
+`the engine made vol-… but lists no volume named rkn-golden-…`. Cause: /v1 create is idempotent by name; the no-agent cleanup deleted the
+copy by engine id (/api/v1), which leaves the /v1 record; the second request (same name) got it back, empty. Fix: Made.copy_v1, removed
+through DELETE /v1/volumes/{id} first; a restore answered a record with no volume of the name deletes it and restores once (also #379's
+snapshot restore). Engine side filed: stormblock#668. Then sc-build, stage, hold --after-install of the fix, rerun golden.
 2026-11-18: pvetest1 runs 12.92 (rustkube-node 18a4a4b), pvetest2 12.93-flowsdn (4d0cb9f); both contain 6b36f19. Ran golden at 4d0cb9f:
 7cb87fb2e3 (pvetest1), 2b38113e35 (pvetest2); held `--after-run 2b38113e35`. Resume: `stormcentral test show <id>`; pass → close #344; fail → fix what it names.
 
