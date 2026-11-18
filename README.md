@@ -1237,9 +1237,16 @@ its disks and its guest agent. The steps are stormvm's (`stormvm_node::golden`):
 2. A volume is made from the snapshot under `spec.golden`, and booted once as
    a *sealer*: the source's machine with the copy as its only disk, no NIC, no
    seed, the guest agent on. `Sealing`, with `status.volumeId`.
-3. Through the agent, the sealer runs stormvm's de-identify script (cloud-init
-   state, machine-id, SSH host keys, hostname, logs) and must print its end
-   marker; it powers off and the copy is detached.
+3. The sealer runs stormvm's de-identify script (cloud-init state,
+   machine-id, SSH host keys, hostname, logs) and must print its end marker;
+   it powers off and the copy is detached. It runs from PID 1, as
+   `stormvm-seal.service`, which the sealer's SMBIOS type 11 credentials
+   install on a guest with systemd ≥ 256; the kubelet reads its result from
+   the sealer's serial log (`STORMVM-SEAL <copy id> …` markers). Only when the
+   unit says nothing for 90 s after the agent answers (an older systemd, or
+   none) does the guest agent run it, because qemu-ga's `guest-exec` is denied
+   every write on an SELinux-enforcing guest (stormvm#135, #399). That
+   failure names the agent's SELinux domain and mode.
 4. The copy is sealed and the group snapshot deleted. `Sealed`, with `node`,
    `volumeId`, `volume`, `sha256` (the engine's digest), `arch`, `firmware`,
    `provenance` (`vm:<ns>/<vm>@<time>`) and `sealedAt`.

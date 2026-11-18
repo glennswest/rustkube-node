@@ -7371,37 +7371,61 @@ impl crate::vm_golden::Machines for VmManager {
         Ok(reg)
     }
 
-    async fn deidentify(&self, reg: &stormvm_node::console::Registration, within: std::time::Duration) -> Result<(), String> {
+    async fn deidentify(
+        &self,
+        reg: &stormvm_node::console::Registration,
+        copy: &str,
+        within: std::time::Duration,
+    ) -> Result<(), String> {
+        use crate::vm_golden::{await_seal, unit_said, SealTimes, Sealing};
         let agent = reg.agent_socket.clone().ok_or_else(|| "the sealer has no agent channel".to_string())?;
         let gone_now = || async {
             let (Some(ring), Some(h)) = (self.ring.clone(), reg.workload) else { return false };
             matches!(tokio::task::spawn_blocking(move || ring.query(Handle(h))).await, Ok(Ok(c)) if exited(c.aux))
         };
-        let deadline = tokio::time::Instant::now() + within;
-        loop {
-            if stormvm_control::qga::ping(&agent).await.is_ok() {
-                break;
+        // What the sealer's own unit said on its console (stormvm#135, #399).
+        let serial_log = reg.serial_log.clone();
+        let unit = || unit_said(serial_log.as_deref(), copy);
+        let agent_up = || {
+            let agent = agent.clone();
+            async move { stormvm_control::qga::ping(&agent).await.is_ok() }
+        };
+        match await_seal(unit, agent_up, &gone_now, SealTimes::within(within)).await? {
+            Sealing::ByUnit => {
+                info!(vm = %reg.name, namespace = %reg.namespace, "de-identified by {}", stormvm_node::golden::SEAL_UNIT);
+                // It powers itself off.
             }
-            if gone_now().await {
-                return Err("the sealer exited before its guest agent answered".into());
+            Sealing::ByAgent => {
+                // A guest whose systemd is older than 256, or that has none:
+                // the agent runs it, as before stormvm#135.
+                let script = stormvm_node::golden::DEIDENTIFY;
+                let r = stormvm_control::qga::exec(&agent, "/bin/sh", &["-c", script], std::time::Duration::from_secs(300))
+                    .await
+                    .map_err(|e| format!("de-identifying the copy: {e}"))?;
+                if r.exit != 0 || !r.stdout.contains(stormvm_node::golden::DEIDENTIFIED) {
+                    // Which domain the agent ran it in: `virt_qemu_ga_t` and
+                    // Enforcing is stormvm#135 on a guest the unit missed.
+                    let context = stormvm_control::qga::exec(
+                        &agent,
+                        "/bin/sh",
+                        &["-c", "id -Z 2>/dev/null; getenforce 2>/dev/null"],
+                        std::time::Duration::from_secs(10),
+                    )
+                    .await
+                    .map(|c| c.stdout.split_whitespace().collect::<Vec<_>>().join(" "))
+                    .unwrap_or_default();
+                    return Err(format!(
+                        "de-identifying the copy through the agent failed (exit {}; {} never started, and the agent ran \
+                         as {context:?}): {}{}",
+                        r.exit,
+                        stormvm_node::golden::SEAL_UNIT,
+                        r.stdout.trim(),
+                        r.stderr.trim()
+                    ));
+                }
+                stormvm_control::qga::power_off(&agent).await.map_err(|e| format!("powering the sealer off: {e}"))?;
             }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "the copy's guest agent did not answer within {}s: a golden is de-identified by the guest's \
-                     own agent, and an image without qemu-guest-agent can't be (stormvm#17)",
-                    within.as_secs()
-                ));
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
-        let script = stormvm_node::golden::DEIDENTIFY;
-        let r = stormvm_control::qga::exec(&agent, "/bin/sh", &["-c", script], std::time::Duration::from_secs(300))
-            .await
-            .map_err(|e| format!("de-identifying the copy: {e}"))?;
-        if r.exit != 0 || !r.stdout.contains(stormvm_node::golden::DEIDENTIFIED) {
-            return Err(format!("de-identifying the copy failed (exit {}): {}{}", r.exit, r.stdout.trim(), r.stderr.trim()));
-        }
-        stormvm_control::qga::power_off(&agent).await.map_err(|e| format!("powering the sealer off: {e}"))?;
         // Waited for; one that does not go is stopped by `stop_sealer`.
         let gone = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
         while !gone_now().await && tokio::time::Instant::now() < gone {

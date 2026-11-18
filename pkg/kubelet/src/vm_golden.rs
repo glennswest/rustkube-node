@@ -15,10 +15,14 @@
 //! 2. **Copy** it: a volume made from the snapshot, under `spec.golden`.
 //! 3. **Boot the copy** as a short-lived *sealer* (`sealer_spec`: the
 //!    source's machine, the copy as its only disk, no NIC, no seed, the agent
-//!    on), and wait for its agent.
-//! 4. **De-identify** it through the agent (`DEIDENTIFY`), and check the
-//!    script got to its end (`DEIDENTIFIED`); it powers off and the copy is
-//!    detached.
+//!    on, and `stormvm-seal.service` handed over SMBIOS credentials), and
+//!    wait until its agent answers or the unit speaks on the serial console.
+//! 4. **De-identify** it (`DEIDENTIFY`), and check the script got to its end
+//!    (`DEIDENTIFIED`). From PID 1 by the unit where the guest's systemd
+//!    (≥ 256) took it, because qemu-ga's `guest-exec` is denied every write
+//!    on an SELinux-enforcing guest (stormvm#135, #399); through the agent
+//!    only when the unit stayed silent for `UNIT_GRACE` ([`await_seal`]). It
+//!    powers off and the copy is detached.
 //! 5. **Seal** the copy, delete the group snapshot, and write `Sealed` with
 //!    the volume's id, digest, firmware and provenance.
 //!
@@ -160,9 +164,11 @@ pub trait Machines: Send + Sync {
         -> Result<stormvm_block::GroupSnapshot, String>;
     /// The sealer started, registered under `uid`.
     async fn start_sealer(&self, uid: &str, spec: &VmSpec) -> Result<Registration, String>;
-    /// Wait for its agent, run [`g::DEIDENTIFY`] and check it got to its
-    /// end, then power it off.
-    async fn deidentify(&self, reg: &Registration, within: std::time::Duration) -> Result<(), String>;
+    /// Wait for it to be up, have [`g::DEIDENTIFY`] run (by its unit, else
+    /// by its agent: [`await_seal`]) and check it got to its end, and see it
+    /// powered off. `copy` is the copy's volume id, the nonce in the unit's
+    /// console markers.
+    async fn deidentify(&self, reg: &Registration, copy: &str, within: std::time::Duration) -> Result<(), String>;
     /// Stopped (if it still runs), its disk detached, its registration gone.
     async fn stop_sealer(&self, reg: &Registration) -> Result<(), String>;
 }
@@ -387,8 +393,8 @@ impl Goldens {
             .map_err(|e| format!("starting the sealer: {e}"))?;
         made.sealer = Some(sreg.clone());
 
-        // 4. De-identified by its own agent, then stopped and let go.
-        self.machines.deidentify(&sreg, BOOT_TIMEOUT).await?;
+        // 4. De-identified by its own unit (or agent), then stopped and let go.
+        self.machines.deidentify(&sreg, &copy, BOOT_TIMEOUT).await?;
         self.machines.stop_sealer(&sreg).await.map_err(|e| format!("stopping the sealer: {e}"))?;
         made.sealer = None;
 
@@ -683,6 +689,215 @@ impl Engine for Stormblock {
     }
 }
 
+/// Who de-identified the sealer, as [`await_seal`] found it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sealing {
+    /// `stormvm-seal.service` did, from PID 1, and the guest powers itself
+    /// off.
+    ByUnit,
+    /// The unit never spoke (systemd < 256, or none): the agent must run
+    /// [`g::DEIDENTIFY`], as before stormvm#135.
+    ByAgent,
+}
+
+/// How long [`await_seal`] waits for each step.
+#[derive(Debug, Clone, Copy)]
+pub struct SealTimes {
+    /// For the sealer to be up: its agent answers, or the unit spoke.
+    pub boot: std::time::Duration,
+    /// After that, for the unit to speak ([`g::UNIT_GRACE`]).
+    pub grace: std::time::Duration,
+    /// For a unit that started to finish.
+    pub done: std::time::Duration,
+    pub poll: std::time::Duration,
+}
+
+impl SealTimes {
+    pub fn within(boot: std::time::Duration) -> SealTimes {
+        SealTimes {
+            boot,
+            grace: g::UNIT_GRACE,
+            done: std::time::Duration::from_secs(300),
+            poll: std::time::Duration::from_secs(2),
+        }
+    }
+}
+
+/// The order `stormvm golden` waits for a sealer in (stormvm#135, #399):
+///
+/// 1. up: `agent_up` answers, or `unit` (the serial log read for the copy's
+///    markers, [`g::SealLog::read`]) is not `Silent`;
+/// 2. the unit is given `grace` to speak;
+/// 3. if it spoke, `done` for it to finish: [`Sealing::ByUnit`] when it
+///    de-identified, else the failure with its exit and output;
+/// 4. if it stayed silent, [`Sealing::ByAgent`].
+///
+/// `gone` is whether the sealer has exited: one gone before it was up, or
+/// before the unit it started finished, is a failure.
+pub async fn await_seal<U, A, AF, G, GF>(unit: U, agent_up: A, gone: G, t: SealTimes) -> Result<Sealing, String>
+where
+    U: Fn() -> g::SealLog,
+    A: Fn() -> AF,
+    AF: std::future::Future<Output = bool>,
+    G: Fn() -> GF,
+    GF: std::future::Future<Output = bool>,
+{
+    use tokio::time::{sleep, Instant};
+    let deadline = Instant::now() + t.boot;
+    loop {
+        if unit() != g::SealLog::Silent || agent_up().await {
+            break;
+        }
+        if gone().await {
+            return Err("the sealer exited before its guest agent answered or its unit started".into());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "the copy's guest agent did not answer within {}s, and {} did not start: a golden is de-identified \
+                 by the guest itself, and an image with neither qemu-guest-agent nor systemd >= 256 can't be (stormvm#17)",
+                t.boot.as_secs(),
+                g::SEAL_UNIT
+            ));
+        }
+        sleep(t.poll).await;
+    }
+    let grace = Instant::now() + t.grace;
+    while unit() == g::SealLog::Silent && Instant::now() < grace {
+        sleep(t.poll).await;
+    }
+    if unit() == g::SealLog::Silent {
+        return Ok(Sealing::ByAgent);
+    }
+    let done = Instant::now() + t.done;
+    let said = loop {
+        let said = unit();
+        if matches!(said, g::SealLog::Done { .. }) {
+            break said;
+        }
+        if gone().await {
+            // Read once more: the unit writes its last lines, then powers off.
+            let said = unit();
+            if matches!(said, g::SealLog::Done { .. }) {
+                break said;
+            }
+            return Err(format!("de-identifying the copy: the sealer exited before {} finished", g::SEAL_UNIT));
+        }
+        if Instant::now() >= done {
+            return Err(format!(
+                "de-identifying the copy: {} started and did not finish within {}s",
+                g::SEAL_UNIT,
+                t.done.as_secs()
+            ));
+        }
+        sleep(t.poll).await;
+    };
+    if said.deidentified() {
+        return Ok(Sealing::ByUnit);
+    }
+    let g::SealLog::Done { exit, output } = said else { unreachable!("only Done leaves the loop") };
+    Err(format!("de-identifying the copy failed in {} (exit {exit}): {}", g::SEAL_UNIT, output.trim()))
+}
+
+/// What the sealer's unit has said on its serial log so far, for `copy`'s
+/// markers. No log, or none readable yet, is `Silent`.
+pub fn unit_said(serial_log: Option<&str>, copy: &str) -> g::SealLog {
+    serial_log
+        .and_then(|p| std::fs::read(p).ok())
+        .map(|b| g::SealLog::read(&String::from_utf8_lossy(&b), copy))
+        .unwrap_or(g::SealLog::Silent)
+}
+
+#[cfg(test)]
+mod seal_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    fn fast() -> SealTimes {
+        SealTimes {
+            boot: Duration::from_millis(200),
+            grace: Duration::from_millis(60),
+            done: Duration::from_millis(200),
+            poll: Duration::from_millis(5),
+        }
+    }
+
+    fn done(nonce: &str, exit: i32, out: &str) -> String {
+        format!(
+            "{}\r\nkernel noise\n{}\n{out}\n{} {exit}\n",
+            g::seal_marker(nonce, "start"),
+            g::seal_marker(nonce, "begin"),
+            g::seal_marker(nonce, "exit")
+        )
+    }
+
+    // The unit spoke before the agent answered: never asks the agent to run it.
+    #[tokio::test]
+    async fn a_unit_that_de_identified_is_the_answer() {
+        let log = done("v-copy", 0, g::DEIDENTIFIED);
+        let r = await_seal(|| g::SealLog::read(&log, "v-copy"), || async { false }, || async { false }, fast()).await;
+        assert_eq!(r, Ok(Sealing::ByUnit));
+    }
+
+    // A unit that started after the agent was up is waited for, not raced.
+    #[tokio::test]
+    async fn a_unit_that_starts_within_the_grace_is_waited_for() {
+        let n = AtomicUsize::new(0);
+        let full = done("c", 0, g::DEIDENTIFIED);
+        let start = format!("{}\n", g::seal_marker("c", "start"));
+        let unit = || match n.fetch_add(1, Ordering::SeqCst) {
+            0..=2 => g::SealLog::Silent,
+            3..=6 => g::SealLog::read(&start, "c"),
+            _ => g::SealLog::read(&full, "c"),
+        };
+        let r = await_seal(unit, || async { true }, || async { false }, fast()).await;
+        assert_eq!(r, Ok(Sealing::ByUnit));
+    }
+
+    #[tokio::test]
+    async fn a_unit_that_failed_says_what_it_said() {
+        let log = done("c", 1, "rm: cannot remove '/etc/hostname': Permission denied");
+        let r = await_seal(|| g::SealLog::read(&log, "c"), || async { true }, || async { false }, fast()).await;
+        let e = r.unwrap_err();
+        assert!(e.contains("exit 1") && e.contains("Permission denied") && e.contains(g::SEAL_UNIT), "{e}");
+    }
+
+    // An earlier sealing's lines (another copy) are not this one's.
+    #[tokio::test]
+    async fn a_silent_unit_leaves_it_to_the_agent() {
+        let old = done("v-old", 0, g::DEIDENTIFIED);
+        let r = await_seal(|| g::SealLog::read(&old, "v-new"), || async { true }, || async { false }, fast()).await;
+        assert_eq!(r, Ok(Sealing::ByAgent));
+    }
+
+    #[tokio::test]
+    async fn a_unit_that_never_finishes_fails() {
+        let log = format!("{}\n", g::seal_marker("c", "start"));
+        let r = await_seal(|| g::SealLog::read(&log, "c"), || async { true }, || async { false }, fast()).await;
+        assert!(r.unwrap_err().contains("did not finish"));
+    }
+
+    #[tokio::test]
+    async fn neither_agent_nor_unit_is_a_timeout_and_gone_is_said() {
+        let r = await_seal(|| g::SealLog::Silent, || async { false }, || async { false }, fast()).await;
+        assert!(r.unwrap_err().contains("did not answer"));
+        let r = await_seal(|| g::SealLog::Silent, || async { false }, || async { true }, fast()).await;
+        assert!(r.unwrap_err().contains("exited before"));
+    }
+
+    #[test]
+    fn the_serial_log_is_read_for_the_copy() {
+        let dir = std::env::temp_dir().join(format!("rkn-seal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("0.log");
+        assert_eq!(unit_said(Some(p.to_str().unwrap()), "c"), g::SealLog::Silent, "no log yet");
+        assert_eq!(unit_said(None, "c"), g::SealLog::Silent);
+        std::fs::write(&p, done("c", 0, g::DEIDENTIFIED)).unwrap();
+        assert!(unit_said(Some(p.to_str().unwrap()), "c").deidentified());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -826,7 +1041,7 @@ mod tests {
             let logging = stormvm_node::plan::Logging::pod("/var/log/pods/x", 0);
             Ok(Registration::of(spec, uid, &logging, &self.run_dir))
         }
-        async fn deidentify(&self, reg: &Registration, _within: std::time::Duration) -> Result<(), String> {
+        async fn deidentify(&self, reg: &Registration, _copy: &str, _within: std::time::Duration) -> Result<(), String> {
             self.log.lock().unwrap().push(format!("deidentify {}", reg.name));
             if self.no_agent { Err("the copy's guest agent did not answer within 300s".into()) } else { Ok(()) }
         }
