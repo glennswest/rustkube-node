@@ -8,7 +8,10 @@
 //! - `medium` (< 30 min): claims of the built-in `stormblock` class at every
 //!   size class and at arbitrary sizes, end to end (`medium.rs`, #64), the
 //!   node's own volumes as complete PV + PVC pairs (`node_volumes.rs`, #59),
-//!   and pod features and failure paths (`pods.rs`, #61).
+//!   pod features and failure paths (`pods.rs`, #61), and a multi-container
+//!   pod: init, sidecar and two app containers sharing network, IPC and
+//!   volumes, with hooks, per-container status, logs, exec and restarts
+//!   (`multi.rs`, #374).
 //! - `csi` (< 15 min, #52): the kubelet's CSI node side against a real driver
 //!   process, this image's own (`csi.rs`, `csi_driver.rs`).
 //! - `multus` (< 10 min, #233): a pod's extra networks by the Multus
@@ -36,6 +39,7 @@ pub mod k8s;
 pub mod long;
 pub mod medium;
 pub mod metadata;
+pub mod multi;
 pub mod multus;
 pub mod node_volumes;
 pub mod pods;

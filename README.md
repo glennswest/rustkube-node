@@ -1307,6 +1307,18 @@ kubelet is under test, not the scheduler.
     volume). Skipped, saying why, on a release that doesn't show that.
   - `pod-image-on-no-list` (#332): a bare image on neither list waits with the registry's
     "not here": its 404, or on a node with peers the cluster demand's "no peer has it" (#79).
+  - `pod-multi-*` (#374): one pod, `medium-multi`, with an init container, a sidecar
+    (`restartPolicy: Always`) and app containers `a` and `b`. They share an emptyDir, a 1Mi claim
+    (an emptyDir without the class), the network and IPC; each runs `member`, which reaches its
+    peers on 127.0.0.1 before it listens. `pod-multi-ready`: Running, every condition True, init
+    Completed, the sidecar started, `a` and `b` ready with their own `resources`.
+    `pod-multi-localhost`: `b` reached `a` and the sidecar on 127.0.0.1. `pod-multi-logs`: each
+    container's `log?container=` is its own. `pod-multi-exec`: `exec -c b` (the `pods/exec`
+    WebSocket) finds init's file; `exec -c a` finds its postStart hook's file. `pod-multi-ipc`:
+    `b` reads `a`'s `/dev/shm`. `pod-multi-restart`: `a` crashes once and restarts alone
+    (`lastState` exit 1, its `--previous` log); `b` and the sidecar keep their ids.
+    `pod-multi-stop-order` (with the class): after the delete, a reader pod on the claim finds
+    both preStop hooks' files, and the sidecar's SIGTERM after `a`'s and `b`'s.
 
   And claims of the built-in `stormblock` class (#64):
   - It makes a claim at every filesystem size class (1Mi … 16Ti) and at

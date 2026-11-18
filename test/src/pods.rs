@@ -17,6 +17,7 @@
 //!   on its own root (`storm.io/instance.main`, the engine volume id of its
 //!   `ctr-…` clone, not the listed volume). A release with no list, or one that mounts the
 //!   image anyway, cannot show that, so the case skips and says which.
+//! - `pod-multi-*` (#374): the multi-container pod, `multi.rs`.
 //! - `pod-image-on-no-list` (#332): a bare image name on neither list gets the
 //!   registry's "not here" (its 404, or with peers the cluster demand's "no peer
 //!   has it", #79) and never runs.
@@ -45,6 +46,11 @@ pub async fn run(env: Arc<Env>, api: Api) -> Vec<(String, Outcome, u128)> {
         ("pod-image-on-no-list", |e, a| Box::pin(async move { image_on_no_list(&e, &a).await })),
         ("pod-rdma", |e, a| Box::pin(async move { rdma(&e, &a).await })),
     ];
+    // The multi-container pod's cases (#374): one pod, its cases in order.
+    let multi = {
+        let (env, api) = (env.clone(), api.clone());
+        tokio::spawn(async move { crate::multi::run(&env, &api).await })
+    };
     let tasks: Vec<_> = cases
         .into_iter()
         .map(|(name, f)| {
@@ -59,6 +65,10 @@ pub async fn run(env: Arc<Env>, api: Api) -> Vec<(String, Outcome, u128)> {
     let mut out = Vec::new();
     for t in tasks {
         out.push(t.await.unwrap_or_else(|e| ("pod-case".into(), Outcome::Infra(format!("panicked: {e}")), 0)));
+    }
+    match multi.await {
+        Ok(v) => out.extend(v),
+        Err(e) => out.push(("pod-multi".into(), Outcome::Infra(format!("panicked: {e}")), 0)),
     }
     out
 }

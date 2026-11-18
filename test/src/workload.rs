@@ -40,6 +40,15 @@
 //!   `<status> <body>`; exit 0 whatever the kubelet answered (the suite
 //!   judges), 1 when it could not be asked.
 //!
+//! - `member <name> <port> <dir> <stop-dir|-> [<peer-port>=<text>...]` (#374): one
+//!   container of the multi-container pod. Writes `/dev/shm/multi-<name>`
+//!   (IPC), reaches each peer on `127.0.0.1:<peer-port>` until its answer holds
+//!   `<text>` (the pod's network), and only then listens on `<port>`, answering
+//!   every connection `HTTP/1.0 200` with `<name>` (so a readiness probe of the
+//!   port says the peers were reached). A file `<dir>/crash-<name>` makes it
+//!   delete the file and exit 1, once. On SIGTERM it writes the time (unix
+//!   nanoseconds) to `<stop-dir>/stop-<name>` and exits 0.
+//!
 //! A directory `path` means a filesystem volume: the data goes in
 //! `<path>/rustkube-node-test.bin`. Anything else is a raw block device,
 //! written from offset 0. Exit 0 on success, 1 on a mismatch or error; one
@@ -58,6 +67,7 @@ pub fn is_workload(args: &[String]) -> bool {
         Some(
             "fill" | "verify" | "size-at-least" | "sized" | "echo" | "exit" | "sleep" | "fail-once"
                 | "write-file" | "expect-file" | "expect-env" | "expect-nics" | "read-file" | "vm-instance" | "rdma-view"
+                | "member"
         )
     )
 }
@@ -76,6 +86,9 @@ pub fn main(args: &[String]) -> i32 {
         println!("sleeping {secs} s");
         std::thread::sleep(std::time::Duration::from_secs(secs));
         return 0;
+    }
+    if args[0] == "member" {
+        return member(args);
     }
     let result = run(args);
     let hold = (args[0] == "expect-nics" && result.is_ok()).then(|| args.get(1).and_then(|c| c.parse().ok()).unwrap_or(0));
@@ -145,6 +158,109 @@ fn vm_instance(address: &str, workload: bool) -> Result<String, String> {
         let body = r.text().await.unwrap_or_default();
         Ok(format!("{status} {}", body.trim()))
     })
+}
+
+static TERMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn mark_term(_: libc::c_int) {
+    TERMED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// `member` (#374); see the module's list. Returns the exit code.
+fn member(args: &[String]) -> i32 {
+    use std::io::{BufRead, BufReader};
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+    let (Some(name), Some(port), Some(dir), Some(stop_dir)) = (args.get(1), args.get(2), args.get(3), args.get(4)) else {
+        println!("member: missing arguments");
+        return 2;
+    };
+    // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
+    unsafe { libc::signal(libc::SIGTERM, mark_term as *const () as libc::sighandler_t) };
+    let peers: Vec<(String, String)> = args[5..]
+        .iter()
+        .filter_map(|p| p.split_once('=').map(|(a, b)| (a.to_string(), b.to_string())))
+        .collect();
+    let stop = |code: i32| -> i32 {
+        if stop_dir != "-" {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+            let path = format!("{stop_dir}/stop-{name}");
+            match File::create(&path).and_then(|mut f| f.write_all(nanos.to_string().as_bytes()).and_then(|_| f.sync_all())) {
+                Ok(()) => println!("{name}: stopping, wrote {path}"),
+                Err(e) => println!("{name}: stopping, {path}: {e}"),
+            }
+        }
+        code
+    };
+    let crash = format!("{dir}/crash-{name}");
+    let crashed = |crash: &str| -> bool {
+        if std::path::Path::new(crash).exists() {
+            let _ = std::fs::remove_file(crash);
+            println!("{name}: crashing as asked");
+            return true;
+        }
+        false
+    };
+    match std::fs::write(format!("/dev/shm/multi-{name}"), name) {
+        Ok(()) => println!("{name}: wrote /dev/shm/multi-{name}"),
+        Err(e) => println!("{name}: /dev/shm/multi-{name}: {e}"),
+    }
+    let mut reached = vec![false; peers.len()];
+    while reached.iter().any(|r| !r) {
+        for (i, (p, want)) in peers.iter().enumerate() {
+            if reached[i] {
+                continue;
+            }
+            let got = TcpStream::connect(format!("127.0.0.1:{p}")).and_then(|mut c| {
+                c.set_read_timeout(Some(Duration::from_secs(2)))?;
+                c.write_all(b"GET / HTTP/1.0\r\n\r\n")?;
+                let mut s = String::new();
+                let _ = c.read_to_string(&mut s);
+                Ok(s)
+            });
+            if let Some(s) = got.ok().filter(|s| s.contains(want.as_str())) {
+                println!("{name}: reached {want} on 127.0.0.1:{p}: {}", s.lines().last().unwrap_or(""));
+                reached[i] = true;
+            }
+        }
+        if TERMED.load(std::sync::atomic::Ordering::SeqCst) {
+            return stop(0);
+        }
+        if crashed(&crash) {
+            return 1;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let listener = match TcpListener::bind(format!("0.0.0.0:{port}")) {
+        Ok(l) => l,
+        Err(e) => {
+            println!("{name}: listen on {port}: {e}");
+            return 1;
+        }
+    };
+    let _ = listener.set_nonblocking(true);
+    println!("{name}: serving on {port}");
+    loop {
+        if TERMED.load(std::sync::atomic::Ordering::SeqCst) {
+            return stop(0);
+        }
+        if crashed(&crash) {
+            return 1;
+        }
+        match listener.accept() {
+            Ok((mut c, _)) => {
+                let _ = c.set_nonblocking(false);
+                let _ = c.set_read_timeout(Some(Duration::from_millis(500)));
+                // The request's first line, if one comes; a plain connect
+                // (a tcpSocket probe) sends nothing.
+                let mut line = String::new();
+                let _ = BufReader::new(&c).read_line(&mut line);
+                let body = format!("{name}\n");
+                let _ = c.write_all(format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes());
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
 }
 
 extern "C" fn on_term(_: libc::c_int) {

@@ -144,6 +144,93 @@ impl Api {
     }
 }
 
+/// What an exec gave back (#374): stdout, stderr, and the status the server
+/// sent on channel 3 (`{"status":"Success"}`, or why not).
+#[derive(Debug, Default, Clone)]
+pub struct Exec {
+    pub stdout: String,
+    pub stderr: String,
+    pub status: String,
+}
+
+impl Exec {
+    /// The command exited 0, as the status says.
+    pub fn ok(&self) -> bool {
+        self.status.contains("\"Success\"")
+    }
+}
+
+/// `%`-encode a query value: everything but unreserved characters.
+pub fn query_value(v: &str) -> String {
+    v.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+impl Api {
+    /// `kubectl exec -c <container> -- <cmd>` (#374): the apiserver's
+    /// `pods/exec` door, a WebSocket (`v5.channel.k8s.io`, else v4) the
+    /// apiserver proxies to the kubelet. No stdin, no terminal. Each binary
+    /// frame's first byte is its channel: 1 stdout, 2 stderr, 3 the status.
+    /// Read until the server closes or `window` passes.
+    pub async fn exec(&self, ns: &str, pod: &str, container: &str, cmd: &[&str], window: Duration) -> Result<Exec, String> {
+        use tokio::io::AsyncReadExt;
+
+        let mut query = format!("container={}&stdout=true&stderr=true", query_value(container));
+        for c in cmd {
+            query.push_str(&format!("&command={}", query_value(c)));
+        }
+        let path = format!("/api/v1/namespaces/{ns}/pods/{pod}/exec?{query}");
+        let mut req = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .header("connection", "Upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-protocol", "v5.channel.k8s.io, v4.channel.k8s.io")
+            .header("sec-websocket-key", "c3Rvcm12bS10ZXN0LWtleQ==");
+        if let Some(t) = &self.token {
+            req = req.bearer_auth(t);
+        }
+        let resp = req.send().await.map_err(|e| format!("GET {path}: {e}"))?;
+        if resp.status().as_u16() != 101 {
+            let code = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("exec in {ns}/{pod} -c {container} answered {code}, not a WebSocket: {}", short(&Value::String(body))));
+        }
+        let mut io = resp.upgrade().await.map_err(|e| format!("upgrading {path}: {e}"))?;
+        let deadline = tokio::time::Instant::now() + window;
+        let (mut buf, mut out, mut chunk) = (Vec::new(), Exec::default(), vec![0u8; 16 * 1024]);
+        'read: loop {
+            let n = match tokio::time::timeout_at(deadline, io.read(&mut chunk)).await {
+                Err(_) | Ok(Ok(0)) | Ok(Err(_)) => break,
+                Ok(Ok(n)) => n,
+            };
+            buf.extend_from_slice(&chunk[..n]);
+            while let Some((op, payload, used)) = ws_frame(&buf) {
+                buf.drain(..used);
+                match op {
+                    0..=2 if !payload.is_empty() => {
+                        let text = String::from_utf8_lossy(&payload[1..]).into_owned();
+                        match payload[0] {
+                            1 => out.stdout.push_str(&text),
+                            2 => out.stderr.push_str(&text),
+                            3 => out.status.push_str(&text),
+                            _ => {}
+                        }
+                    }
+                    8 => break 'read,
+                    _ => {}
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// One WebSocket frame from the front of `buf` (RFC 6455 §5.2): its opcode,
 /// its payload (unmasked) and how many bytes it took; `None` while `buf`
 /// does not yet hold a whole frame.
