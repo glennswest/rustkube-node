@@ -581,7 +581,7 @@ mod tests {
         // Nothing served: upstream's defaults.
         assert_eq!(resolve(&[], &[], &vmi, &ns), MigrationConfiguration::default());
         let kv = json!({"spec": {"configuration": {"migrations": {"allowPostCopy": true, "completionTimeoutPerGiB": 60}}}});
-        assert_eq!(resolve(&[kv.clone()], &[], &vmi, &ns), MigrationConfiguration { allow_post_copy: true, completion_timeout_per_gib: 60 });
+        assert_eq!(resolve(std::slice::from_ref(&kv), &[], &vmi, &ns), MigrationConfiguration { allow_post_copy: true, completion_timeout_per_gib: 60 });
         let policy = |name: &str, vmi: Value, ns: Value, allow: bool| json!({
             "metadata": {"name": name},
             "spec": {"allowPostCopy": allow, "selectors": {"virtualMachineInstanceSelector": vmi, "namespaceSelector": ns}},
