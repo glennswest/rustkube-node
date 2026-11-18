@@ -23,6 +23,11 @@ create `scheduled_snapshot`. A bad annotation: one Event on the VM per distinct 
 (4) restore from the store: a restore whose snapshot's group is gone from the node but whose backup point is on its store: Transfer::restore
 (store→node), kept in the restore's status, then the restored volumes are bound and rewired as today's.
 Tests per part; docs (README, configuration.md), CHANGELOG; sc-build; stage. The ship waits on stormblock#399/#400 (waitingEngine until then).
+Done (code): 5593ae6 (vm_backup.rs, restore from a store, `--backup-store`, console stores, 7 tests, docs), 73b73d2 (console tests'
+missing arg: the first sc-build failed to compile them), 46c1e6f (two clippy warnings of mine: `from_store` → `copied_from_store`,
+`from_ref`). sc-build 73b73d2: 650 kubelet unit pass. Filed stormcos#1027 (nodes' `--backup-store forge=…@forge1` and forge1's engine
+token). Next: sc-build 46c1e6f; stage; then the proof needs stormblock#399/#400 and stormcos#1027 on a node: `shipped` with the issue's
+proof, `--after` those.
 
 ### Paused for P0 #380: #373, VMI/VM status.volumes[] (stormvm#129); restored disks owned; stormvm → d952a0c
 
