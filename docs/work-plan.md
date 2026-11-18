@@ -60,6 +60,8 @@ it, a unit test that it holds every kind the loop acts on. CHANGELOG; sc-build; 
 Done: d6a1408 (unit test; sc-build 651 kubelet unit, clippy, no warning on a changed line). Stage build requested. Held
 `--after-install rustkube-node>=d6a1408@any:pve`. Resume: stormvm's next medium on that machine (`stormcentral test list` → stormvm medium,
 `show` it): `snapshot-restore`'s claim at ≲ 2 s from the POST → close #381 quoting it.
+2026-11-18: pvetest2 (12.93-flowsdn, 4d0cb9f) carries d6a1408; a session may not run stormvm's suite (403). Last medium 5665334161
+(pvetest3, before the fix): complete in 27058 ms. Told stormvm#127 (its close condition is this check); held `--after stormvm#127`.
 
 ### In progress: #380 (P0), VM backups off the node: the kubelet's half of stormvm#31 (decision A)
 
