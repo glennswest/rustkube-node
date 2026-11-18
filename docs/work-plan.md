@@ -4,6 +4,26 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #380 (P0), VM backups off the node: the kubelet's half of stormvm#31 (decision A)
+
+2026-11-18. stormvm → a302b3e (main: 47fb0d3 backup Transfer/spec/console route; no manifest change). Plan, in `vm_backup.rs` (new) beside
+`vm_snapshot.rs` / `vm_restore.rs`, behind a `BackupEngine` seam (Transfer::step, a group by id, points, prune) for tests:
+(1) stores: `--backup-store name=url@node[,token=<file>]` (repeatable; env BACKUP_STORES `;`-separated). The kubelet has no TOML config,
+so a flag, not the issue's `[backup] stores`. A store is another engine with its own token: a token file per store; none = the node's
+token (only right for the node's own engine). Provisioning the forge store's flag and token on nodes is stormcos's (file it).
+The console router gets `backup_stores` (GET …/backups lists the store's points).
+(2) backup: a VirtualMachineSnapshot this node took, `Succeeded`, with `storm.io/backup-to`: Transfer::backup(group by
+`virtualMachineSnapshotContentName`, disks from `storm.io/snapshot-disks`, base = the newest `done` backup of the same VM taken here whose
+group is still on the node), kept in `status["storm.io/backup-transfer"]`, stepped once per pass off the runtime (spawn_blocking),
+`status["storm.io/backup"]` = backup_status; requeued every few s while unfinished; waitingEngine retried, never failed; an unknown store
+is waitingEngine with why. Done: delete the older done backups' node groups (status `storm.io/backupBaseReleased`), prune the store
+to the VM policy's keep, delete scheduled snapshots whose points went.
+(3) schedule: VMs registered on this node with `policy(vm) = Some(p)`, `due(p, newest snapshot labelled storm.io/backup-of=<vm>)` →
+create `scheduled_snapshot`. A bad annotation: one Event on the VM per distinct problem.
+(4) restore from the store: a restore whose snapshot's group is gone from the node but whose backup point is on its store: Transfer::restore
+(store→node), kept in the restore's status, then the restored volumes are bound and rewired as today's.
+Tests per part; docs (README, configuration.md), CHANGELOG; sc-build; stage. The ship waits on stormblock#399/#400 (waitingEngine until then).
+
 ### Paused for P0 #380: #373, VMI/VM status.volumes[] (stormvm#129); restored disks owned; stormvm → d952a0c
 
 2026-11-18. stormvm c9cd494..d952a0c: no manifest change; the kubelet calls none of the changed `stormvm_block` signatures. Pinned at
