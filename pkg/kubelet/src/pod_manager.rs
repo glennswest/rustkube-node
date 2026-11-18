@@ -2721,6 +2721,10 @@ impl PodManager {
     /// again: the refusal is the same on every retry, so a claim that only
     /// retried the clone waited forever (#140). Any other refusal is the
     /// claim's wait, with stormblock's answer in it.
+    ///
+    /// A template the engine already *lists* as `broken` takes the same path
+    /// before any clone is tried (#383): only the formatting states wait, and
+    /// a state this kubelet does not know is a failure named on the claim.
     async fn clone_blank(
         &self,
         class: &str,
@@ -2731,18 +2735,38 @@ impl PodManager {
         // One blank per (size, fs, redundancy, spread) (#71): the clone
         // inherits the blank's policy.
         let blank = policy.blank_name(class);
-        let template = match self.storage_template_state(&blank).await {
+        let template = match self.storage_template_status(&blank).await {
+            Some(TemplateStatus::Ready(id)) => id,
             // A blank not sealed yet cannot be cloned. Formatting a
             // 1 TiB class takes minutes (stormblock#141), and the claim
             // waits with the state named rather than failing a clone.
-            Some((id, state)) if state == "ready" => id,
-            Some((_, state)) => {
+            Some(TemplateStatus::Making(_, state)) => {
                 self.claim_event(claim, "Normal", "Provisioning", &format!(
                     "waiting for the {class} blank {blank} to be formatted and sealed ({state})"
                 )).await;
                 return Err(ClaimError::Failed(format!(
                     "waiting for volume {name}: template {blank} {state}"
                 )))
+            }
+            // Final (#383): nothing formats or seals a broken template, and
+            // no clone is tried to be refused, so waiting was forever.
+            Some(TemplateStatus::Broken(id, reason)) => {
+                warn!("template {blank} is broken ({reason}); deleting it to mint it again");
+                let again = self.remint(&blank, &id, class, policy).await;
+                let why = format!("template {blank} is broken ({reason}); {again}");
+                self.claim_event(claim, "Warning", "ProvisioningFailed", &why).await;
+                return Err(ClaimError::Failed(format!("waiting for volume {name}: {why}")));
+            }
+            // Never a wait (#383): a state that means "never" would be
+            // waited on forever, with nothing on the claim to say why.
+            Some(TemplateStatus::Unknown(_, state)) => {
+                let why = format!(
+                    "template {blank} is in state {state:?}, which this kubelet does not know; \
+                     not waiting on it (expected ready, {})",
+                    TEMPLATE_MAKING.join(", ")
+                );
+                self.claim_event(claim, "Warning", "ProvisioningFailed", &why).await;
+                return Err(ClaimError::Failed(format!("waiting for volume {name}: {why}")));
             }
             // Mint it, rather than refusing the claim (#45).
             //
@@ -2791,14 +2815,7 @@ impl PodManager {
             Ok(v) => v,
             Err(r) if r.template_broken() => {
                 warn!("template {blank} is broken ({r}); deleting it to mint it again");
-                let path = format!("/api/v1/fstemplates/{template}");
-                let again = match self.storage_delete(&path).await {
-                    Ok(()) => match self.mint_template(&blank, class, policy).await {
-                        Ok(_) => "deleted; minted again, cloning on the next try".to_string(),
-                        Err(e) => format!("deleted; {e}"),
-                    },
-                    Err(e) => format!("could not delete it: {e}"),
-                };
+                let again = self.remint(&blank, &template, class, policy).await;
                 let why = format!("template {blank} is broken ({r}); {again}");
                 self.claim_event(claim, "Warning", "ProvisioningFailed", &why).await;
                 return Err(ClaimError::Failed(format!("waiting for volume {name}: {why}")));
@@ -2820,6 +2837,25 @@ impl PodManager {
             .ok_or_else(|| {
                 ClaimError::Failed(format!("clone of {blank} returned no volume: {created}"))
             })
+    }
+
+    /// Delete a broken template (by id) and mint it again (#140, #383).
+    /// Answers what happened, for the claim's event: the mint runs in the
+    /// background and its completion wakes the claim, which clones then.
+    async fn remint(
+        &self,
+        blank: &str,
+        id: &str,
+        class: &str,
+        policy: &crate::storage::ClaimPolicy,
+    ) -> String {
+        match self.storage_delete(&format!("/api/v1/fstemplates/{id}")).await {
+            Ok(()) => match self.mint_template(blank, class, policy).await {
+                Ok(_) => "deleted; minted again, cloning on the next try".to_string(),
+                Err(e) => format!("deleted; minted again ({e}), cloning when it is ready"),
+            },
+            Err(e) => format!("could not delete it: {e}"),
+        }
     }
 
     /// A volume's id by name, or `None` when this node has no such volume.
@@ -2923,9 +2959,14 @@ impl PodManager {
                 changed.send_modify(|generation| *generation = generation.wrapping_add(1));
             });
         }
-        match self.storage_template_state(blank).await {
-            Some((id, state)) if state == "ready" => Ok(id),
-            Some((_, state)) => Err(format!("template {blank} {state}")),
+        match self.storage_template_status(blank).await {
+            Some(TemplateStatus::Ready(id)) => Ok(id),
+            Some(TemplateStatus::Broken(_, reason)) => {
+                Err(format!("template {blank} broken ({reason})"))
+            }
+            Some(TemplateStatus::Making(_, state) | TemplateStatus::Unknown(_, state)) => {
+                Err(format!("template {blank} {state}"))
+            }
             None => match self
                 .minting
                 .lock()
@@ -3024,16 +3065,15 @@ impl PodManager {
         })
     }
 
-    /// A filesystem template's id and state (`ready`, `awaiting_format`,
-    /// `awaiting_seed`), by name.
-    /// An engine that reports no state is taken as ready, which is what every
-    /// template it answered for was before states existed.
-    async fn storage_template_state(&self, name: &str) -> Option<(String, String)> {
+    /// A filesystem template by name, sorted into what a claim does with it
+    /// ([`TemplateStatus`]). An engine that reports no state is taken as
+    /// ready, which is what every template it answered for was before states
+    /// existed.
+    async fn storage_template_status(&self, name: &str) -> Option<TemplateStatus> {
         let t: Value = self
             .storage_get(&format!("/api/v1/fstemplates/{name}"))
             .await?;
-        let id = t["id"].as_str()?.to_string();
-        Some((id, t["state"].as_str().unwrap_or("ready").to_string()))
+        TemplateStatus::of(&t)
     }
 
     /// DELETE on stormblock's management API on this node.
@@ -6083,6 +6123,43 @@ impl PodManager {
 /// `NotOurs` is permanent and deterministic, so the same fallback would give
 /// a pod scratch storage *forever* because its claim belongs to another
 /// driver, which is that trade's cost without its benefit.
+/// The states of a template still being made, which a claim waits on: the
+/// engine's own (`awaiting_format`, `awaiting_seed`, stormblock
+/// `fs/template.rs`) and the steps named in #383 (`formatting`, `sealing`).
+const TEMPLATE_MAKING: &[&str] = &["awaiting_format", "formatting", "sealing", "awaiting_seed"];
+
+/// What a claim does with a filesystem template the engine lists (#383).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TemplateStatus {
+    /// Sealed: clone it. Also an engine that names no state (before states).
+    Ready(String),
+    /// Still being made ([`TEMPLATE_MAKING`]): wait, with the state named.
+    Making(String, String),
+    /// Final: the engine's reason. Delete it and mint it again.
+    Broken(String, String),
+    /// A state this kubelet does not know: a failure, never a wait.
+    Unknown(String, String),
+}
+
+impl TemplateStatus {
+    /// From the engine's template object: `None` without an id.
+    ///
+    /// stormblock lists a broken template as `"state": "broken"` with the
+    /// reason in `"broken"`; either one alone is taken as broken too.
+    fn of(t: &Value) -> Option<Self> {
+        let id = t["id"].as_str()?.to_string();
+        let state = t["state"].as_str().unwrap_or("ready");
+        let reason = t["broken"].as_str().filter(|r| !r.is_empty());
+        Some(match (state, reason) {
+            (_, Some(r)) => Self::Broken(id, r.to_string()),
+            ("broken", None) => Self::Broken(id, "the engine gave no reason".into()),
+            ("ready", None) => Self::Ready(id),
+            (s, None) if TEMPLATE_MAKING.contains(&s) => Self::Making(id, s.to_string()),
+            (s, None) => Self::Unknown(id, s.to_string()),
+        })
+    }
+}
+
 /// Lay down a blank filesystem for a size class, once: `POST /api/v1/fstemplates`.
 ///
 /// The name is `template_name`'s, and that matters more than it looks:
@@ -8254,6 +8331,150 @@ pub(crate) mod tests {
         assert!(e.to_string().starts_with("stormblock POST /api/v1/fstemplates/t/clone: no answer"), "{e}");
     }
 
+    /// A stormblock that lists `pvc-ext4j-64m` as `state` (with `broken`'s
+    /// reason) until it is deleted, then 404 until it is minted, then `ready`
+    /// as `tpl-2`; only `tpl-2` clones (#383). Counts DELETEs and mints.
+    async fn listing_stormblock(
+        state: &'static str,
+        broken: Option<&'static str>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::routing::{get as http_get, post as http_post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let mints = Arc::new(AtomicUsize::new(0));
+        let (d1, d2, m1, m2) = (deletes.clone(), deletes.clone(), mints.clone(), mints.clone());
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/fstemplates/{name}",
+                http_get(move || {
+                    let (d, m) = (d1.clone(), m1.clone());
+                    async move {
+                        if m.load(Ordering::SeqCst) > 0 {
+                            Ok(axum::Json(json!({"id": "tpl-2", "state": "ready"})))
+                        } else if d.load(Ordering::SeqCst) > 0 {
+                            Err(axum::http::StatusCode::NOT_FOUND)
+                        } else {
+                            Ok(axum::Json(json!({"id": "tpl-1", "state": state, "broken": broken})))
+                        }
+                    }
+                })
+                .delete(move || {
+                    let d = d2.clone();
+                    async move {
+                        d.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(json!({"deleted": "tpl-1"}))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/fstemplates/{id}/clone",
+                http_post(|axum::extract::Path(id): axum::extract::Path<String>| async move {
+                    if id == "tpl-2" {
+                        (axum::http::StatusCode::CREATED, axum::Json(json!({"volume_id": "vol-1"})))
+                    } else {
+                        (axum::http::StatusCode::CONFLICT, axum::Json(json!({"error": "not this one", "code": 409})))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/fstemplates",
+                http_post(move || {
+                    let n = m2.clone();
+                    async move {
+                        n.fetch_add(1, Ordering::SeqCst);
+                        (axum::http::StatusCode::CREATED, axum::Json(json!({})))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), deletes, mints)
+    }
+
+    #[tokio::test]
+    async fn a_template_listed_broken_is_deleted_minted_again_and_cloned() {
+        // #383: server8's kept pvc-ext4j-64m, listed `broken`, was waited on
+        // for 25 minutes as if it were still being formatted.
+        use std::sync::atomic::Ordering;
+        let (url, deletes, mints) = listing_stormblock(
+            "broken",
+            Some("its sealed volume 5c1e0b7a is gone"),
+        )
+        .await;
+        let (_rt, mgr) = manager();
+        let mgr = with_stormblock(mgr, &url);
+        let mut changes = mgr.subscribe_volume_changes();
+        let e = mgr.clone_blank("64M", "pvc-ns-d", &Value::Null, &Default::default()).await.unwrap_err().to_string();
+        assert!(
+            e.contains("template pvc-ext4j-64m is broken (its sealed volume 5c1e0b7a is gone); deleted; minted again"),
+            "{e}"
+        );
+        assert_eq!(deletes.load(Ordering::SeqCst), 1);
+        // The mint's completion wakes the claim, and the next pass clones.
+        tokio::time::timeout(std::time::Duration::from_secs(2), changes.changed())
+            .await
+            .expect("the mint finishes")
+            .unwrap();
+        assert_eq!(mints.load(Ordering::SeqCst), 1);
+        let vol = mgr.clone_blank("64M", "pvc-ns-d", &Value::Null, &Default::default()).await.unwrap();
+        assert_eq!(vol, "vol-1");
+        assert_eq!(deletes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_state_the_kubelet_does_not_know_is_a_failure_not_a_wait() {
+        use std::sync::atomic::Ordering;
+        let (url, deletes, mints) = listing_stormblock("quarantined", None).await;
+        let (_rt, mgr) = manager();
+        let mgr = with_stormblock(mgr, &url);
+        let e = mgr.clone_blank("64M", "pvc-ns-d", &Value::Null, &Default::default()).await.unwrap_err().to_string();
+        assert!(e.contains("template pvc-ext4j-64m is in state \"quarantined\", which this kubelet does not know"), "{e}");
+        assert!(!e.contains("formatted and sealed"), "{e}");
+        assert_eq!(deletes.load(Ordering::SeqCst), 0);
+        assert_eq!(mints.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_template_still_formatting_is_waited_on_and_kept() {
+        use std::sync::atomic::Ordering;
+        let (url, deletes, mints) = listing_stormblock("formatting", None).await;
+        let (_rt, mgr) = manager();
+        let mgr = with_stormblock(mgr, &url);
+        let e = mgr.clone_blank("64M", "pvc-ns-d", &Value::Null, &Default::default()).await.unwrap_err().to_string();
+        assert_eq!(e, "waiting for volume pvc-ns-d: template pvc-ext4j-64m formatting");
+        assert_eq!(deletes.load(Ordering::SeqCst), 0);
+        assert_eq!(mints.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn template_states_sort_into_what_a_claim_does() {
+        let of = |t: Value| TemplateStatus::of(&t).unwrap();
+        let id = || "t".to_string();
+        assert_eq!(of(json!({"id": "t"})), TemplateStatus::Ready(id()));
+        assert_eq!(of(json!({"id": "t", "state": "ready"})), TemplateStatus::Ready(id()));
+        for s in ["awaiting_format", "formatting", "sealing", "awaiting_seed"] {
+            assert_eq!(of(json!({"id": "t", "state": s})), TemplateStatus::Making(id(), s.into()));
+        }
+        assert_eq!(
+            of(json!({"id": "t", "state": "broken", "broken": "gone"})),
+            TemplateStatus::Broken(id(), "gone".into())
+        );
+        assert_eq!(
+            of(json!({"id": "t", "state": "broken"})),
+            TemplateStatus::Broken(id(), "the engine gave no reason".into())
+        );
+        // An engine that set the reason but kept the old state.
+        assert_eq!(
+            of(json!({"id": "t", "state": "ready", "broken": "gone"})),
+            TemplateStatus::Broken(id(), "gone".into())
+        );
+        assert_eq!(of(json!({"id": "t", "state": "odd"})), TemplateStatus::Unknown(id(), "odd".into()));
+        assert_eq!(TemplateStatus::of(&json!({"state": "ready"})), None);
+    }
+
     #[test]
     fn which_clone_refusals_mean_a_broken_template() {
         let r = |code, error: &str| {
@@ -8285,8 +8506,8 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            mgr.storage_template_state("pvc-ext4j-1m").await,
-            Some(("tpl-1".into(), "ready".into()))
+            mgr.storage_template_status("pvc-ext4j-1m").await,
+            Some(TemplateStatus::Ready("tpl-1".into()))
         );
         assert_eq!(posts.load(Ordering::SeqCst), 1);
     }

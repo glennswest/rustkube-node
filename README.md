@@ -581,6 +581,11 @@ FailedMount Event and container message. A refusal that means the template
 itself is broken (its sealed volume missing or not sealed, or no sealed
 snapshot recorded) deletes the template and mints it again, so the next
 claim clones a sound one rather than meeting the same refusal forever (#140).
+A template the engine already *lists* as `broken` (a kept record whose sealed volume is gone, stormblock's
+`broken` reason) takes the same path before any clone is tried, with the reason in the claim's
+`ProvisioningFailed` event (`template … is broken (<reason>); deleted; minted again`); only `awaiting_format`,
+`formatting`, `sealing` and `awaiting_seed` wait, and a state the kubelet does not know is a
+`ProvisioningFailed` naming it, never a wait (#383).
 **The claim itself says so** (#70), with external-provisioner's reasons: a Normal `Provisioning` while its
 class's blank is minted or formats, a Warning `ProvisioningFailed` with stormblock's words when a mint or a
 clone is refused, and a Normal `ProvisioningSucceeded` once it is cloned (`kubectl describe pvc`; repeats
