@@ -29,7 +29,7 @@ half (`system` or `data`) and is recorded as the `storm.io/role` annotation.
 
 - PV: `claimRef` with the claim's uid, `csi.driver` `stormblock.storm.io`,
   `csi.volumeHandle` = the volume, `csi.fsType` from the volume's `fs.kind`,
-  `csi.volumeAttributes` `storm.io/golden` and `storm.io/fs-uuid`, annotations
+  `csi.volumeAttributes` `storm.io/volume-id` (the engine's id, #379), `storm.io/golden` and `storm.io/fs-uuid`, annotations
   `pv.kubernetes.io/provisioned-by`, `storm.io/node`, `storm.io/health`,
   `storm.io/access`, `storm.io/role`.
 - PVC: `pv.kubernetes.io/bind-completed`, `pv.kubernetes.io/bound-by-controller`,

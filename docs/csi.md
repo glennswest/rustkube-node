@@ -107,6 +107,9 @@ as upstream's kubelet does: `capacity` = the new size, `Resizing` and `FileSyste
 capability grows it all from the controller, and the status is finished the same way. A refusal is a
 `FileSystemResizeFailed` Warning, tried again.
 
+The built-in class (`stormblock.storm.io`) is not a CSI driver; its claims grow through `pvc_resize.rs`, both halves
+on the node that holds the volume (#379, README "Growing a claim").
+
 ## Mount propagation: the decision
 
 The driver mounts **in its own container's mount namespace**. For the pod to
