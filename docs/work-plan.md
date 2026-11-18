@@ -43,6 +43,10 @@ pass → `shipped` with proof (a VolumeSnapshot readyToUse, a grown claim) / clo
 - Built 38e17aa (+ rust-version 1.83, #384): sc-build passed, 655 kubelet tests. Stage build fadb1ad3c0e7.
   The workspace's clippy backlog (#384-#386, filed by sc-build when clippy was run) is pre-existing, not #383's.
 - Proof: `console:template pvc-ext4j-64m is broken .* minted again` on an install with a kept broken template.
+- 2026-11-18, reopened by the proof check: pvetest2 (12.93-flowsdn) had no broken template, so the console line could not show.
+  Scope narrowed by the master (stormblock#663: the engine keeps no `broken` state): an unknown state fails (done); a clone refused
+  because the template vanished between the listing and the clone (404 `fstemplate … not found`) mints it at once and clones
+  on the wake, once. Doing that now (`template_gone`), with a unit test; the proof becomes the warm claim probes on an install.
 
 ### In progress: #381 (P1), VirtualMachineRestore waits up to 60 s: vm_maintenance_loop does not watch restores (stormvm#127)
 

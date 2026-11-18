@@ -2819,6 +2819,19 @@ impl PodManager {
             .await
         {
             Ok(v) => v,
+            // Gone between the listing and the clone (#383, after stormblock#663:
+            // the engine keeps no broken templates, a template that is not whole is
+            // deleted): mint it now, once, and clone when the mint wakes the claim.
+            Err(r) if r.template_gone() => {
+                warn!("template {blank} vanished before its clone ({r}); minting it again");
+                let again = match self.mint_template(&blank, class, policy).await {
+                    Ok(_) => "minted again, cloning on the next try".to_string(),
+                    Err(e) => format!("minting it again ({e}), cloning when it is ready"),
+                };
+                let why = format!("template {blank} was gone when it was cloned; {again}");
+                self.claim_event(claim, "Normal", "Provisioning", &why).await;
+                return Err(ClaimError::Failed(format!("waiting for volume {name}: {why}")));
+            }
             Err(r) if r.template_broken() => {
                 warn!("template {blank} is broken ({r}); deleting it to mint it again");
                 let again = self.remint(&blank, &template, class, policy).await;
@@ -6350,6 +6363,12 @@ impl EngineRefusal {
     /// it; the template has to be made again. A template that is not `ready`
     /// yet ("fstemplate … is awaiting_format — seal it before cloning") is
     /// still being made, and is not broken.
+    /// The template itself is gone (`fstemplate … not found`): made again by
+    /// a mint, as one never made is (#383).
+    fn template_gone(&self) -> bool {
+        self.status == Some(404) && self.body.contains("fstemplate") && self.body.contains("not found")
+    }
+
     fn template_broken(&self) -> bool {
         let body = self.body.as_str();
         match self.status {
@@ -8477,6 +8496,63 @@ pub(crate) mod tests {
         let vol = mgr.clone_blank("64M", "pvc-ns-d", &Value::Null, &Default::default()).await.unwrap();
         assert_eq!(vol, "vol-1");
         assert_eq!(deletes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_template_gone_before_its_clone_is_minted_once_and_cloned() {
+        // #383 after stormblock#663: listed ready, deleted by the engine before
+        // the clone. The clone's 404 mints it (once), the mint wakes the claim,
+        // and the next pass clones the new one.
+        use axum::routing::{get as http_get, post as http_post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mints = Arc::new(AtomicUsize::new(0));
+        let (m1, m2) = (mints.clone(), mints.clone());
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/fstemplates/{name}",
+                http_get(move || {
+                    let m = m1.clone();
+                    async move {
+                        let id = if m.load(Ordering::SeqCst) > 0 { "tpl-2" } else { "tpl-1" };
+                        axum::Json(json!({"id": id, "state": "ready"}))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/fstemplates/{id}/clone",
+                http_post(|axum::extract::Path(id): axum::extract::Path<String>| async move {
+                    if id == "tpl-2" {
+                        (axum::http::StatusCode::CREATED, axum::Json(json!({"volume_id": "vol-1"})))
+                    } else {
+                        (axum::http::StatusCode::NOT_FOUND, axum::Json(json!({"error": format!("fstemplate {id} not found"), "code": 404})))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/fstemplates",
+                http_post(move || {
+                    let n = m2.clone();
+                    async move {
+                        n.fetch_add(1, Ordering::SeqCst);
+                        (axum::http::StatusCode::CREATED, axum::Json(json!({})))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (_rt, mgr) = manager();
+        let mgr = with_stormblock(mgr, &url);
+        let mut changes = mgr.subscribe_volume_changes();
+        let e = mgr.clone_blank("64M", "pvc-ns-d", &Value::Null, &Default::default()).await.unwrap_err().to_string();
+        assert!(e.contains("template pvc-ext4j-64m was gone when it was cloned; minted again"), "{e}");
+        tokio::time::timeout(std::time::Duration::from_secs(2), changes.changed())
+            .await
+            .expect("the mint finishes")
+            .unwrap();
+        assert_eq!(mints.load(Ordering::SeqCst), 1);
+        assert_eq!(mgr.clone_blank("64M", "pvc-ns-d", &Value::Null, &Default::default()).await.unwrap(), "vol-1");
+        assert_eq!(mints.load(Ordering::SeqCst), 1, "minted once");
     }
 
     #[tokio::test]
