@@ -27,6 +27,10 @@ Progress: 1-3 written (d459de2 resize, 362dbfe snapshots + restore, 14fa185/ea0b
 stormcos#1032 (allowVolumeExpansion true + VolumeSnapshotClass stormblock). Test suite `pvc` (9ba6c6e, test/src/pvc.rs, on
 request): grow under a pod (`grows` workload), shrink refused, snapshot readyToUse, restore into 512Mi, snapshot deleted.
 Next: sc-build (kubelet + test crate) → fix → stage → hold `--after stormcos#1032`, then the suite on a pvetest with both.
+Built bb83e44: sc-build passed (VM sc-build-5abd9b6000; 671 kubelet unit, all suites); test crate clippy -D warnings + 67 tests
+(sc-build-aae7b16ee6); clippy names nothing in pvc_resize/pvc_snapshot. Stage build b4675c8907ba. Held `--after glennswest/stormcos#1032`.
+Resume: once a pvetest runs a release with rustkube-node >= bb83e44 and stormcos#1032, `stormcentral test run rustkube-node pvc`;
+pass → `shipped` with proof (a VolumeSnapshot readyToUse, a grown claim) / close #379.
 
 ### Shipped (proof pending): #383 (P0), a template listed `broken` is waited on forever (server8 12.92, pvc-ext4j-64m)
 
