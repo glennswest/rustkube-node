@@ -457,6 +457,10 @@ impl ClaimBinder {
                 name: volume.to_string(),
                 ..Default::default()
             });
+        // The engine's size when it says one (#379): a grown volume is past
+        // its class, and a restore is its snapshot's size until grown to its
+        // claim. The class's, which is what was made, otherwise.
+        let bytes = if facts.bytes > 0 { facts.bytes } else { bytes };
         facts.bytes = bytes;
 
         // The claim first, so the volume's claimRef can carry its uid: a PV
@@ -511,9 +515,11 @@ impl ClaimBinder {
                 "accessModes": ["ReadWriteOnce"],
                 "capacity": capacity,
             });
-        } else {
+        } else if pvc["status"]["allocatedResourceStatuses"].is_null() {
             // Bound by the binder to the request-sized PV: the capacity is
-            // the class's, which is what `df` in the pod shows.
+            // the class's, which is what `df` in the pod shows. Not while a
+            // grow is under way (#379): the claim's capacity follows its
+            // filesystem, and writing the volume's here would skip it.
             pvc["status"]["capacity"] = capacity;
         }
         if pvc == before {

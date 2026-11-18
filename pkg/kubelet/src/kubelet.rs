@@ -913,6 +913,8 @@ impl Kubelet {
     async fn csi_sweep_loop(self: Arc<Self>) {
         let worker = self.watches.worker("kubelet-csi-sweep");
         let api = self.config.api_server_url.clone();
+        let events = (!api.is_empty())
+            .then(|| crate::events::EventRecorder::new(self.api_client.clone(), &api, &self.config.node_name));
         loop {
             let work = worker.next().await;
             worker.run(async {
@@ -923,6 +925,17 @@ impl Kubelet {
                 self.watches.observe(&self.api_client, format!("{api}/api/v1/persistentvolumeclaims"));
                 let teardown = self.pod_manager.sweep_csi_volumes().await;
                 let expansion = self.pod_manager.expand_csi_volumes().await;
+                // The built-in class's claims grown (#379): the engine, the
+                // PV, and the filesystem once a pod here mounts it.
+                let grown = crate::pvc_resize::pass(
+                    &self.api_client,
+                    &api,
+                    &self.config.engine,
+                    &self.config.node_name,
+                    events.as_ref(),
+                )
+                .await;
+                let expansion = expansion || grown;
                 // A built-in claim asked onto another node (#338): its pod
                 // going here is what its cutover waits for.
                 let moving = self.pod_manager.move_claims().await;

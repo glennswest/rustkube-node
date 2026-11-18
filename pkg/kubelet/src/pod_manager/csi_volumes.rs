@@ -17,6 +17,7 @@
 use retry::RetryExt;
 use super::{ClaimError, PodManager};
 use crate::csi::{self, VolumeSpec};
+use crate::pvc_resize::{resize_due, resized_status};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -624,44 +625,6 @@ impl PodManager {
             Err(_) => true,
         }
     }
-}
-
-/// The size a claim's filesystem is to grow to, when the control plane has
-/// grown its volume and left the rest to the node (#42): the claim says
-/// `NodeResizePending` (or `FileSystemResizePending`), and the PV's capacity is
-/// past the claim's. The PV's quantity as written, and its bytes.
-pub fn resize_due(pv: &Value, pvc: &Value) -> Option<(String, u64)> {
-    let st = &pvc["status"];
-    let pending = st["allocatedResourceStatuses"]["storage"].as_str() == Some("NodeResizePending")
-        || st["conditions"].as_array().is_some_and(|cs| {
-            cs.iter().any(|c| c["type"] == "FileSystemResizePending" && c["status"] == "True")
-        });
-    if !pending {
-        return None;
-    }
-    let want = pv["spec"]["capacity"]["storage"].as_str()?;
-    let want_bytes = crate::storage::parse_quantity(want)?;
-    let have = st["capacity"]["storage"].as_str().and_then(crate::storage::parse_quantity).unwrap_or(0);
-    (want_bytes > have).then(|| (want.to_string(), want_bytes))
-}
-
-/// The claim's status once its filesystem is grown, as upstream's kubelet
-/// writes it: the new capacity, `Resizing` and `FileSystemResizePending` gone,
-/// `allocatedResourceStatuses.storage` dropped. A merge patch (conditions
-/// replaced whole).
-pub fn resized_status(pvc: &Value, quantity: &str) -> Value {
-    let conditions: Vec<Value> = pvc["status"]["conditions"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|c| !matches!(c["type"].as_str(), Some("Resizing") | Some("FileSystemResizePending")))
-        .cloned()
-        .collect();
-    serde_json::json!({ "status": {
-        "capacity": { "storage": quantity },
-        "conditions": conditions,
-        "allocatedResourceStatuses": null,
-    }})
 }
 
 impl PodManager {

@@ -124,6 +124,9 @@ pub fn claim_name(volume: &str, node: &str) -> String {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct VolumeFacts {
     pub name: String,
+    /// The engine's id of the volume (#379, stormblock#649): what
+    /// `describe pv` names in its CSI source, beside the handle (the name).
+    pub id: Option<String>,
     pub bytes: u64,
     /// `fs.kind`: `ext4`, `xfs`, …
     pub fs_type: Option<String>,
@@ -147,6 +150,7 @@ impl VolumeFacts {
         let s = |k: &str| v[k].as_str().filter(|x| !x.is_empty()).map(String::from);
         VolumeFacts {
             name: s("name").unwrap_or_default(),
+            id: s("id"),
             bytes: v["virtual_size_bytes"].as_u64().unwrap_or(0),
             fs_type: v["fs"]["kind"].as_str().filter(|x| !x.is_empty()).map(String::from),
             fs_uuid: s("fs_uuid"),
@@ -170,6 +174,9 @@ pub fn csi_source(f: &VolumeFacts) -> Value {
         csi["fsType"] = json!(t);
     }
     let mut attrs = Map::new();
+    if let Some(id) = &f.id {
+        attrs.insert("storm.io/volume-id".into(), json!(id));
+    }
     if let Some(g) = &f.golden {
         attrs.insert("storm.io/golden".into(), json!(g));
     }
@@ -583,6 +590,7 @@ mod tests {
     fn facts(name: &str) -> VolumeFacts {
         VolumeFacts {
             name: name.into(),
+            id: Some("9b1e0c52-0000-4000-8000-000000000001".into()),
             bytes: 1 << 30,
             fs_type: Some("ext4".into()),
             fs_uuid: Some("u-1".into()),
@@ -649,6 +657,7 @@ mod tests {
         assert_eq!(pv["spec"]["csi"]["fsType"], "ext4");
         assert_eq!(pv["spec"]["csi"]["volumeAttributes"]["storm.io/golden"], "fastetcd-data");
         assert_eq!(pv["spec"]["csi"]["volumeAttributes"]["storm.io/fs-uuid"], "u-1");
+        assert_eq!(pv["spec"]["csi"]["volumeAttributes"]["storm.io/volume-id"], "9b1e0c52-0000-4000-8000-000000000001");
         let a = &pv["metadata"]["annotations"];
         assert_eq!(a["pv.kubernetes.io/provisioned-by"], DRIVER);
         assert_eq!(a["storm.io/health"], "healthy");
