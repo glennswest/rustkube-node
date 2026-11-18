@@ -4,6 +4,20 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #372 (P0), traceability: root clones owned by their Pod, pods carry instance/golden/digest/volume ids, mirror pods declare the service's volumes
+
+2026-11-18. Found: the kubelet *does* pass `owner {kind: Pod, …}` to `Roots::make`, but a pulled image's root (fstemplate clone, which takes
+no owner) sets it after with `PUT /volumes/{id}/owner` and the bare owner as the body. stormblock reads `{"owner": …}` (`OwnerRequest`), so
+the PUT *cleared* it: every `ctr-ct-*` on forge1 reads unclaimed. Built-in claims (`clone_blank`, `raw_volume`, snapshots) send no owner.
+Plan: (1) container_roots: `{"owner": …}` body, `container` in the owner (stormblock ignores unknown fields; file the field), warn on
+failure; the sweep already deletes `ctr-*` roots no live container holds. (2) built-in claims: owner `PersistentVolumeClaim` (ns, name, uid)
+set on every provision (`PUT …/owner`, off the start path). (3) pod annotations: `storm.io/image-digest.<c>` beside instance/golden, and
+`storm.io/volume.<name>` = engine id for each built-in claim volume the pod attached. (4) mirror pods: system_claims' engine listing kept;
+each service gets `spec.volumes` (root as hostPath of its mount, data/state/logs as its system PVC), `volumeMounts` where mounted,
+`storm.io/instance.<svc>` / `storm.io/golden.<svc>` / `storm.io/volume.<name>`; an existing mirror is patched when they differ.
+(5) `/stats/summary`: each pod's `volume[]` (name, pvcRef, capacity/used from the engine) with `storm.io/volume-id`.
+Then tests, docs (api.md, status.md), CHANGELOG; sc-build; stage; shipped with proof `api:/api/v1/pods ~ "storm.io/instance\.`.
+
 ### Done: #367 (P3), stormvm → c9cd494: a memory snapshot's state through fd:, not file: (stormvm#37)
 
 2026-11-13. 16 commits fast-forward on 13a0781, code only in stormvm-control snapshot.rs (#37) and stormvm-vmm qemu.rs (#76 usb-tablet);
