@@ -15,8 +15,7 @@ deletes an owned, unused volume once its VM is gone, and a claim-bound disk is l
 would let the sweep delete what a PVC still binds. The restored **memory state** volume is the machine's: owner VirtualMachine (or none
 when retained). Tests; docs; CHANGELOG; sc-build; stage; shipped with the VMI proof.
 Done (code): e996fed (bump, status.volumes on VMI + VM, restore owners, 4 tests, README/status.md/CHANGELOG). Paused 2026-11-18 for
-P0 #380 while sc-build of e996fed ran (log tmp/sc-373.log is local and not kept: re-run). Resume: sc-build e996fed (`--locked` build/test/clippy);
-fix if red; `component stage rustkube-node`; `shipped` with proof `api:/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{name} ~
+P0 #380. sc-build e996fed passed (`--locked` build, test: 643 kubelet unit, clippy). Resume: `component stage rustkube-node`; `shipped` with proof `api:/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{name} ~
 "volumes":\[\{"name"` on a node with a VM; comment on #373 why restored disks are owned by their PVC, not the VM.
 
 ### In progress: #374 (P0), multi-container pods proven on every test machine
