@@ -10,6 +10,9 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 event or the sweep's requeue (≤ `SWEEP_EVERY`, 60 s). Fix: the watched paths as one constant `VM_MAINTENANCE_WATCHES` with restores in
 it, a unit test that it holds every kind the loop acts on. CHANGELOG; sc-build; stage; shipped with proof on stormvm's medium
 `snapshot-restore` (claim within ~2 s).
+Done: d6a1408 (unit test; sc-build 651 kubelet unit, clippy, no warning on a changed line). Stage build requested. Held
+`--after-install rustkube-node>=d6a1408@any:pve`. Resume: stormvm's next medium on that machine (`stormcentral test list` → stormvm medium,
+`show` it): `snapshot-restore`'s claim at ≲ 2 s from the POST → close #381 quoting it.
 
 ### In progress: #380 (P0), VM backups off the node: the kubelet's half of stormvm#31 (decision A)
 
