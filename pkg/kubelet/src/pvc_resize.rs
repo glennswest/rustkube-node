@@ -156,10 +156,11 @@ pub fn decide(pv: &Value, pvc: &Value, volume_bytes: u64) -> Step {
     if let Some((quantity, bytes)) = resize_due(pv, pvc) {
         return Step::Expand { quantity, bytes };
     }
-    // The volume holds the request but the claim says less: a grow whose
-    // writes did not all land, or a restore made smaller than its claim
-    // and grown since.
-    if capacity(pvc) < want {
+    // The volume holds the request but the claim says less, in a grow this
+    // started (`allocatedResources` is written before the engine is asked):
+    // its later writes did not all land. A claim the binder has not given a
+    // capacity yet is not a grow.
+    if capacity(pvc) < want && !pvc["status"]["allocatedResources"].is_null() {
         return Step::Record { bytes: volume_bytes };
     }
     Step::Nothing
@@ -575,7 +576,11 @@ mod tests {
     #[test]
     fn a_grown_volume_waits_for_the_node_then_expands() {
         // The engine has it, the PV and claim do not yet: record.
-        assert_eq!(decide(&pv("1Gi"), &pvc("3Gi", "1Gi"), 3 * GI), Step::Record { bytes: 3 * GI });
+        let mut started = pvc("3Gi", "1Gi");
+        started["status"]["allocatedResources"] = json!({ "storage": "3Gi" });
+        assert_eq!(decide(&pv("1Gi"), &started, 3 * GI), Step::Record { bytes: 3 * GI });
+        // Not a grow this started (a claim the binder has not sized): nothing.
+        assert_eq!(decide(&pv("1Gi"), &pvc("3Gi", "1Gi"), 3 * GI), Step::Nothing);
         // Recorded: the claim is pending on the node.
         let mut c = pvc("3Gi", "1Gi");
         let s = grown_status(&c, "3Gi");
