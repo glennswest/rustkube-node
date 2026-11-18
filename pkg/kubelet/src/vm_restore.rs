@@ -367,7 +367,7 @@ impl Snapshots {
         // one was done, #380): its disks come back from the store's point.
         // The memory is not on the store: the VM starts cold.
         let state_member = if group.is_none() && !engine_disks.is_empty() {
-            for (disk, made, bytes) in self.from_store(obj, req, snap, group_id).await? {
+            for (disk, made, bytes) in self.copied_from_store(obj, req, snap, group_id).await? {
                 let (_, claim) = names(ns, &req.vm, &disk, &req.name);
                 let claim_uid = self.bind_restored(ns, &claim, &made, bytes, obj).await.map_err(Step::Wait)?;
                 engine
@@ -511,7 +511,7 @@ impl Snapshots {
     /// point its backup left on a store (#380): stormvm's `Transfer`
     /// (store → node), kept in the restore's status and stepped one round a
     /// pass. Done: each disk with the volume it landed in and its size.
-    async fn from_store(
+    async fn copied_from_store(
         &self,
         obj: &Value,
         req: &spec::RestoreRequest,

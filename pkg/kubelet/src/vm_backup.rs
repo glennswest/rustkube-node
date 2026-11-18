@@ -760,7 +760,7 @@ pub(crate) mod tests {
 
         // Settled: a later pass does nothing to it.
         fake.calls.lock().unwrap().clear();
-        b.pass(&[b1.clone()]).await;
+        b.pass(std::slice::from_ref(&b1)).await;
         assert!(fake.calls.lock().unwrap().is_empty(), "{:?}", fake.calls.lock().unwrap());
 
         // The next one: diffed against b1's group, which then goes.
