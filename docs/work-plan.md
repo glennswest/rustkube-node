@@ -35,7 +35,7 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
   its log, a running pod's in 5520 ms with its log. The run's two failures (`pod-multi-ipc`, `pod-multi-stop-order`) are
   #374's known gaps, not #416. #416 closed.
 
-### Waiting on stormvm medium 38f972439d (pvetest2): #415, stormvm → ac884c7 (cloud-hypervisor disks state image_type=raw, stormvm#134)
+### Waiting on a stormvm medium run on pvetest3 (master to queue): #415, stormvm → ac884c7 (cloud-hypervisor disks state image_type=raw, stormvm#134)
 
 2026-11-19. Rev-only bump of every stormvm git dep (2a60a3c → ac884c7, 196d128): `--disk …,image_type=raw` on every disk and
 `"image_type": "Raw"` on `vm.add-disk`, so chv v53 no longer guesses a blank data disk raw and refuses sector-0 writes (mkfs EIO,
@@ -45,6 +45,11 @@ Done: sc-build passed (sc-build-14f8ab0db4). Stage bf640b188e40. Held `--after-i
 stormvm run) stormvm medium on that machine; `chv-data-disk-mkfs` passing → close #415.
 2026-11-19: install met (pvetest2 runs a passed 12.96-flowsdn carrying 196d128). stormvm medium 38f972439d (stormvm 2baa379,
 ahead of ac884c7) is queued on pvetest2; held `--after-run 38f972439d`. Resume: read its `chv-data-disk-mkfs` result.
+2026-11-19: 38f972439d ended `error` (pvetest2's apiserver did not answer /readyz; no tests ran). 20b11481c4 (pvetest1) failed
+`chv-data-disk-mkfs` (dd EINVAL), but pvetest1 runs 12.95 (rustkube-node 8686267, stormvm 2a60a3c), from before the fix, so it does not count.
+pvetest3 runs 12.96 (rustkube-node 6682813 ⊇ 196d128, stormvm 148b0f8 ⊇ ac884c7): that is the machine. Our token cannot queue
+stormvm's suite (403). `--after stormvm#134` is refused as circular (#134 waits on #415). Asked the master (note) to queue
+stormvm medium on pvetest3 and hand #415 the run id. Facts posted on stormvm#134. Resume: that run's `chv-data-disk-mkfs`.
 
 ### Done: #410 and #411, stub sweep flags the vendored CRI api.proto and retry's 501 test
 
