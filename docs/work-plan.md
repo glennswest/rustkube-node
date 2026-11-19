@@ -4,6 +4,15 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #399 (golden suite on fedora-44, SELinux enforcing)
+- Run 7ffb659a57 (golden, pvetest3 12.96, carries b515348): `golden-no-agent-fails` failed because the agentless guest
+  ended **Sealed**. That is b515348 working: the copy sealed itself by `stormvm-seal.service` from PID 1, no agent needed.
+  `golden-sealed` then failed only because that request took the run's golden name. `golden-sources-boot` and
+  `vmi-status-volumes` passed.
+- Fix (test only): the no-agent guest also masks systemd-debug-generator (link to /dev/null in
+  /etc/systemd/system-generators) and `stormvm-seal.service`, so its copy has neither way in and must end Failed.
+  Docs (README, vm_golden) say a guest with the unit but no agent seals. Then sc-build, rerun golden on pvetest3.
+
 ### Done: #416 (P2), logs follow=true never ends for a terminated container
 - Cause: `container_logs`' follow loop ended only when the pod left the node (`pod_uid` none).
 - Fix: `follow_log` asks, when a poll finds nothing new, whether the run ended:

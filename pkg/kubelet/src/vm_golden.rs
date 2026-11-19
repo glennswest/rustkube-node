@@ -27,8 +27,9 @@
 //!    the volume's id, digest, firmware and provenance.
 //!
 //! On any failure the request is `Failed` with the reason, and the copy and
-//! the group are deleted. A guest with no agent is `Failed`: a golden that
-//! was not de-identified is worse than none. A request runs once: one already
+//! the group are deleted. A guest with neither an agent nor the seal unit
+//! (systemd < 256) is `Failed`: a golden that was not de-identified is worse
+//! than none. One with the unit but no agent seals by the unit. A request runs once: one already
 //! `Sealed` or `Failed` is left alone.
 //!
 //! **No owner on the golden.** stormvm's CLI gives the copy its VM as owner.

@@ -1253,8 +1253,9 @@ its disks and its guest agent. The steps are stormvm's (`stormvm_node::golden`):
    `provenance` (`vm:<ns>/<vm>@<time>`) and `sealedAt`.
 
 Any failure is `Failed` with the reason, and the sealer, the copy and the
-group are removed. A guest with no agent is `Failed`: a golden that was not
-de-identified is worse than none. A request runs once: `Sealed` and `Failed`
+group are removed. A guest with neither its agent nor `stormvm-seal.service`
+(systemd < 256) is `Failed`: a golden that was not de-identified is worse than
+none. A guest with the unit but no agent seals by the unit. A request runs once: `Sealed` and `Failed`
 are left alone, and one this node was running when its kubelet restarted is
 `Failed` and cleaned up (ask again). A volume already named `spec.golden` is
 refused before anything is made (stormblock's create by name would answer it,

@@ -9,15 +9,20 @@
 //! node, with no NIC:
 //!
 //! - one prints its `/etc/machine-id` on its console when cloud-init is done;
-//! - one masks and stops its qemu-guest-agent, then says so on its console.
+//! - one can't be sealed: it masks and stops its qemu-guest-agent, and masks
+//!   systemd-debug-generator and `stormvm-seal.service`, so its copy has
+//!   neither of the kubelet's two ways in (#399), then says so on its
+//!   console.
 //!
 //! Then, with one golden name `G` for the run (`rkn-golden-<run>`):
 //!
 //! - `vmi-status-volumes` (#373): the source VMI's `status.volumes[]` names
 //!   its root disk: role `root`, its golden, its engine volume, `owned`.
-//! - `golden-no-agent-fails`: a request for `G` from the agentless VM ends
-//!   `Failed` (the copy's agent never answers, and an undeidentified golden
-//!   is worse than none), and its message names nothing left behind.
+//! - `golden-no-agent-fails`: a request for `G` from that VM ends `Failed`
+//!   (the copy's agent never answers and its seal unit never starts, and an
+//!   undeidentified golden is worse than none), and its message names
+//!   nothing left behind. Masking the agent alone is not enough since #399:
+//!   the copy then seals itself by its unit, from PID 1 (run 7ffb659a57).
 //! - `golden-sealed`: a request for the same `G` from the other VM ends
 //!   `Sealed`, with the volume's id and its sha256. The name being free
 //!   again is itself the proof the failed attempt removed its copy: the
@@ -91,10 +96,17 @@ pub fn says_its_id() -> String {
 }
 
 /// Cloud-init that takes the guest agent away for good, then says so.
+/// Keeps the copy's `stormvm-seal.service` from starting: the unit and its
+/// `multi-user.target` drop-in come as SMBIOS credentials that
+/// systemd-debug-generator writes out, so the generator is masked (a
+/// `/dev/null` link in `/etc/systemd/system-generators`), and the unit too.
+pub const NO_SEAL_UNIT: &str =
+    "mkdir -p /etc/systemd/system-generators && ln -sf /dev/null /etc/systemd/system-generators/systemd-debug-generator && systemctl mask stormvm-seal.service";
+
 pub fn has_no_agent() -> String {
     let (head, _) = NO_AGENT_MARKER.rsplit_once('-').unwrap_or((NO_AGENT_MARKER, ""));
     format!(
-        "#cloud-config\nruncmd:\n  - [ sh, -c, \"systemctl mask --now qemu-guest-agent; sync; echo {head}-$((1+1)) > /dev/console\" ]\n"
+        "#cloud-config\nruncmd:\n  - [ sh, -c, \"systemctl mask --now qemu-guest-agent; {NO_SEAL_UNIT}; sync; echo {head}-$((1+1)) > /dev/console\" ]\n"
     )
 }
 
@@ -153,7 +165,7 @@ pub fn machine_id(console: &str) -> Option<String> {
 pub fn judge_failed(obj: &Value) -> Outcome {
     let (phase, msg) = (s(obj, "/status/phase"), s(obj, "/status/message"));
     if phase != "Failed" {
-        return Outcome::Fail(format!("a guest with no agent ended {phase:?}, not Failed: {}", short(&obj["status"])));
+        return Outcome::Fail(format!("a guest with no agent and no seal unit ended {phase:?}, not Failed: {}", short(&obj["status"])));
     }
     if msg.contains("not removed") {
         return Outcome::Fail(format!("Failed, but left something behind: {msg}"));
@@ -415,6 +427,10 @@ mod tests {
     fn the_markers_are_not_in_the_commands() {
         assert!(!has_no_agent().contains(NO_AGENT_MARKER));
         assert!(has_no_agent().contains("RKN-GOLDEN-NOAGENT-$((1+1))"));
+        // Both ways in are shut: the agent, and the seal unit's generator (#399).
+        assert!(has_no_agent().contains("systemctl mask --now qemu-guest-agent"));
+        assert!(has_no_agent().contains("/etc/systemd/system-generators/systemd-debug-generator"));
+        assert!(has_no_agent().contains("systemctl mask stormvm-seal.service"));
         // The command text carries the marker but no id after it.
         assert_eq!(machine_id(&says_its_id()), None);
     }
