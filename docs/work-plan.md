@@ -85,6 +85,9 @@ pvetest1/pvetest2. Suite `pvc` runs ae59cdb016 (pvetest1, cilium) and 822829e52d
 Both failed `pvc-grow` alike: `0 is left for claims` (61362Mi total, 57962/53323Mi free, 60909/128202Mi committed). PVs
 sum to ~19 GiB: container roots (`ctr-*`, #104) are charged their golden's size. Fix: roots are not committed; the refusal names
 the five largest committed volumes. Then sc-build, stage, and the suite again on an install with it.
+Done: 9de861a. sc-build passed (VM sc-build-9caf34115d; full `cargo test --locked`), capacity tests 8/8 incl. the new one and
+no clippy finding in capacity.rs (job 6aca965920). Stage build ae84e748ffba. Held `--after-install rustkube-node>=9de861a@any:pve`.
+Resume: `stormcentral test run rustkube-node pvc`; if a refusal still says 0 left, its `largest:` names what to look at next.
 
 ### Shipped (proof pending): #383 (P0), a template listed `broken` is waited on forever (server8 12.92, pvc-ext4j-64m)
 
