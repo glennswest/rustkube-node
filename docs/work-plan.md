@@ -4,7 +4,7 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #416 (P2), logs follow=true never ends for a terminated container
+### Waiting on medium b5770e2238 (pvetest3): #416 (P2), logs follow=true never ends for a terminated container
 - Cause: `container_logs`' follow loop ended only when the pod left the node (`pod_uid` none).
 - Fix: `follow_log` asks, when a poll finds nothing new, whether the run ended:
   `PodManager::container_run_ended` (pod finished/gone, terminated for good, init done,
@@ -17,6 +17,9 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
   and this session's token cannot start sc's suite. So the check moves into rustkube-node's own medium suite: `pod-logs-follow-ends`
   (a finished pod's `log?follow=true` ends within 20 s; a running pod's followed log ends once it exits). Then sc-build, run
   rustkube-node medium on pvetest2, close #416 on its pass.
+- c3cf5fa: `pod-logs-follow-ends` (test/src/pods.rs, `Api::follow`). sc-build-04b67b7860: test crate's `cargo test` + clippy
+  `-D warnings` passed. pvetest2's apiserver is not answering, so medium went to pvetest3 (12.96: rustkube-node 6682813, stage
+  431db0a4429b, carries 779cbf1): run b5770e2238. Held `--after-run b5770e2238`. Resume: its `pod-logs-follow-ends` passing → close.
 
 ### Waiting on stormvm medium 38f972439d (pvetest2): #415, stormvm → ac884c7 (cloud-hypervisor disks state image_type=raw, stormvm#134)
 
