@@ -18,6 +18,11 @@
 //!   `ctr-…` clone, not the listed volume). A release with no list, or one that mounts the
 //!   image anyway, cannot show that, so the case skips and says which.
 //! - `pod-multi-*` (#374): the multi-container pod, `multi.rs`.
+//! - `pod-logs-follow-ends` (#416): `log?follow=true` (`kubectl logs -f`,
+//!   what `oc debug POD -- CMD` follows) ends with the container's run. A
+//!   finished pod's followed log is sent whole and the stream ends within
+//!   [`FOLLOW_WINDOW`]; a running pod's (`sleep 8`) is followed from the start
+//!   and ends within that window after it exits.
 //! - `pod-image-on-no-list` (#332): a bare image name on neither list gets the
 //!   registry's "not here" (its 404, or with peers the cluster demand's "no peer
 //!   has it", #79) and never runs.
@@ -37,7 +42,7 @@ const MARGIN: Duration = Duration::from_secs(120);
 /// Each case, run in parallel by `medium::run`: (test name, outcome, ms).
 pub async fn run(env: Arc<Env>, api: Api) -> Vec<(String, Outcome, u128)> {
     type Case = fn(Arc<Env>, Api) -> std::pin::Pin<Box<dyn std::future::Future<Output = Outcome> + Send>>;
-    let cases: [(&str, Case); 7] = [
+    let cases: [(&str, Case); 8] = [
         ("pod-restart-on-failure", |e, a| Box::pin(async move { restart_on_failure(&e, &a).await })),
         ("pod-init-first", |e, a| Box::pin(async move { init_first(&e, &a).await })),
         ("pod-config", |e, a| Box::pin(async move { config(&e, &a).await })),
@@ -45,6 +50,7 @@ pub async fn run(env: Arc<Env>, api: Api) -> Vec<(String, Outcome, u128)> {
         ("pod-carried-image", |e, a| Box::pin(async move { carried_image(&e, &a).await })),
         ("pod-image-on-no-list", |e, a| Box::pin(async move { image_on_no_list(&e, &a).await })),
         ("pod-rdma", |e, a| Box::pin(async move { rdma(&e, &a).await })),
+        ("pod-logs-follow-ends", |e, a| Box::pin(async move { logs_follow_ends(&e, &a).await })),
     ];
     // The multi-container pod's cases (#374): one pod, its cases in order.
     let multi = {
@@ -115,6 +121,63 @@ async fn restart_on_failure(env: &Env, api: &Api) -> Outcome {
         Ok(l) if l.contains("first run") => Outcome::Pass("Succeeded after 1 restart; the previous log is the failed run".into()),
         Ok(l) => Outcome::Fail(format!("the previous log is not the failed run: {}", crate::api::short(&Value::String(l)))),
         Err(e) => Outcome::Fail(format!("the previous log could not be read: {e}")),
+    }
+}
+
+/// How long a followed log may stay open once the run it follows has ended
+/// (sc's `logs-follow-ends` allows the same, #416).
+pub const FOLLOW_WINDOW: Duration = Duration::from_secs(20);
+
+/// How long the running pod of `pod-logs-follow-ends` sleeps.
+const FOLLOW_SLEEP_SECS: u64 = 8;
+
+/// The verdict on one followed log: it ended in time and carries `want`.
+pub fn follow_verdict(what: &str, f: &crate::api::Followed, want: &str, allowed_ms: u128) -> Result<String, String> {
+    let tail = crate::api::short(&Value::String(f.text.clone()));
+    if !f.ended {
+        return Err(format!("{what}: still open after {} ms (got {tail})", f.ms));
+    }
+    if f.ms > allowed_ms {
+        return Err(format!("{what}: ended only after {} ms, allowed {allowed_ms}", f.ms));
+    }
+    if !f.text.contains(want) {
+        return Err(format!("{what}: ended in {} ms without {want:?} (got {tail})", f.ms));
+    }
+    Ok(format!("{what} ended in {} ms with its log", f.ms))
+}
+
+async fn logs_follow_ends(env: &Env, api: &Api) -> Outcome {
+    let window_ms = FOLLOW_WINDOW.as_millis();
+    // A finished pod: the stream is the whole log, then the end.
+    let done = k8s::pod(env, "medium-follow-done", &["echo", "follow-ok"]);
+    let first = match finished(env, api, &done).await {
+        Ok(p) if s(&p, "/status/phase") == "Succeeded" => {
+            let path = format!("{}/medium-follow-done/log?follow=true", k8s::pods(env));
+            match api.follow(&path, FOLLOW_WINDOW).await {
+                Ok(f) => follow_verdict("a Succeeded pod's follow", &f, "follow-ok", window_ms),
+                Err(e) => return Outcome::Infra(e),
+            }
+        }
+        Ok(p) => return Outcome::Infra(format!("medium-follow-done ended {}, not Succeeded", s(&p, "/status/phase"))),
+        Err(o) => return o,
+    };
+    // A running pod: followed while it runs, the end once it exits.
+    let secs = FOLLOW_SLEEP_SECS.to_string();
+    let sleeper = k8s::pod(env, "medium-follow-run", &["sleep", &secs]);
+    if let Err(e) = api.create(&k8s::pods(env), &sleeper).await {
+        return Outcome::Infra(e);
+    }
+    if let Err(e) = k8s::pod_running(env, api, "medium-follow-run", within(env)).await {
+        return Outcome::Infra(e);
+    }
+    let path = format!("{}/medium-follow-run/log?follow=true", k8s::pods(env));
+    let second = match api.follow(&path, FOLLOW_WINDOW + Duration::from_secs(FOLLOW_SLEEP_SECS)).await {
+        Ok(f) => follow_verdict("a running pod's follow", &f, "sleeping", window_ms + u128::from(FOLLOW_SLEEP_SECS) * 1000),
+        Err(e) => return Outcome::Infra(e),
+    };
+    match (first, second) {
+        (Ok(a), Ok(b)) => Outcome::Pass(format!("{a}; {b}")),
+        (Err(e), _) | (_, Err(e)) => Outcome::Fail(e),
     }
 }
 
@@ -406,6 +469,17 @@ async fn waits_for_image(env: &Env, api: &Api, name: &str, image: &str) -> Outco
 mod tests {
     use super::*;
     use crate::k8s::tests::env;
+
+    /// #416: a follow passes only when it ended, in time, with the log.
+    #[test]
+    fn a_follow_passes_only_ended_in_time_with_its_log() {
+        let f = |text: &str, ended, ms| crate::api::Followed { text: text.into(), ended, ms };
+        assert!(follow_verdict("x", &f("follow-ok\n", true, 300), "follow-ok", 20_000).is_ok());
+        let open = follow_verdict("x", &f("follow-ok\n", false, 20_000), "follow-ok", 20_000).unwrap_err();
+        assert!(open.contains("still open"), "{open}");
+        assert!(follow_verdict("x", &f("follow-ok\n", true, 25_000), "follow-ok", 20_000).unwrap_err().contains("only after"));
+        assert!(follow_verdict("x", &f("", true, 10), "follow-ok", 20_000).unwrap_err().contains("without"));
+    }
 
     /// #348: the asking pod requests one unit; the plain one nothing; the
     /// check wants every uverbs device and rdma_cm plus IPC_LOCK on the one,

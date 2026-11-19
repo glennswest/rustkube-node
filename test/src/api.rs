@@ -170,6 +170,44 @@ pub fn query_value(v: &str) -> String {
         .collect()
 }
 
+/// What a followed log (`log?follow=true`) gave within its window.
+pub struct Followed {
+    pub text: String,
+    /// The server ended the stream (the response body is complete).
+    pub ended: bool,
+    pub ms: u128,
+}
+
+impl Api {
+    /// `kubectl logs -f` (#416): GET `path` (a `pods/<pod>/log?follow=true`)
+    /// and read the stream until the server ends it or `window` passes.
+    /// Not retried: a follow that is cut is the answer under test.
+    pub async fn follow(&self, path: &str, window: Duration) -> Result<Followed, String> {
+        let t = std::time::Instant::now();
+        let mut req = self.http.get(format!("{}{path}", self.base)).timeout(window + Duration::from_secs(5));
+        if let Some(tok) = &self.token {
+            req = req.bearer_auth(tok);
+        }
+        let mut resp = req.send().await.map_err(|e| format!("GET {path}: {e}"))?;
+        let code = resp.status().as_u16();
+        if code != 200 {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("GET {path}: HTTP {code}: {}", text.chars().take(300).collect::<String>()));
+        }
+        let mut body = Vec::new();
+        let end = tokio::time::Instant::now() + window;
+        let ended = loop {
+            match tokio::time::timeout_at(end, resp.chunk()).await {
+                Err(_) => break false,
+                Ok(Ok(Some(c))) => body.extend_from_slice(&c),
+                Ok(Ok(None)) => break true,
+                Ok(Err(e)) => return Err(format!("GET {path}: the stream broke after {} bytes: {e}", body.len())),
+            }
+        };
+        Ok(Followed { text: String::from_utf8_lossy(&body).into_owned(), ended, ms: t.elapsed().as_millis() })
+    }
+}
+
 impl Api {
     /// `kubectl exec -c <container> -- <cmd>` (#374): the apiserver's
     /// `pods/exec` door, a WebSocket (`v5.channel.k8s.io`, else v4) the

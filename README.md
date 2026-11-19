@@ -1399,6 +1399,9 @@ kubelet is under test, not the scheduler.
     volume). Skipped, saying why, on a release that doesn't show that.
   - `pod-image-on-no-list` (#332): a bare image on neither list waits with the registry's
     "not here": its 404, or on a node with peers the cluster demand's "no peer has it" (#79).
+  - `pod-logs-follow-ends` (#416): `log?follow=true` ends with the container's run: a Succeeded
+    pod's followed log is sent whole and ends within 20 s; a running pod (`sleep 8`) is followed
+    from the start and its stream ends within 20 s of its exit.
   - `pod-multi-*` (#374): one pod, `medium-multi`, with an init container, a sidecar
     (`restartPolicy: Always`) and app containers `a` and `b`. They share an emptyDir, a 1Mi claim
     (an emptyDir without the class), the network and IPC; each runs `member`, which reaches its
