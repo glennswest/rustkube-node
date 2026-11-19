@@ -4,12 +4,17 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #400, a filesystem claim's StorageClass tier on the blank's clone; tier `fast` (stormblock#672, #377)
+### Waiting on stormcos#1039: #400, a filesystem claim's StorageClass tier on the blank's clone; tier `fast` (stormblock#672, #377)
 
 2026-11-19. stormblock 151230ad (v24.30.0) takes `tier` on `POST /api/v1/fstemplates/{id}/clone`. `storage::TIERS` gains `fast`;
 `clone_blank` sends `policy.tier` in the clone body; the `TierNotApplied` Warning goes. Blank names unchanged (the blank takes no
 tier, one blank serves every tier). Tests: parse `fast`; the clone carries `tier: fast`, none without; no TierNotApplied. Then
 sc-build, stage, shipped with proof on server8 (a `stormblock-fast` PVC's legs on the `fast` slab).
+Done: 590d62b (tier on the clone, `fast`, test), 9a102f5 (ProvisioningSucceeded adds `, its writes on tier <t>`). sc-build passed
+(VMs sc-build-cf81921988, sc-build-ffd25b7ef1: 688 kubelet unit incl. the new clone-tier test). Stage 2d7c5b02f6a2. (#408 was a
+spurious failure: `sc-build scripts/sc-build.sh`, that script is gone (#51); use plain `sc-build`.) Held `--after stormcos#1039`
+(server8's SSD `fast` slab and the `stormblock-fast` class). Resume: on server8, a `stormblock-fast` PVC bound, its event says
+`its writes on tier fast`, and `GET /api/v1/volumes/{id}/legs` shows the `fast` slab → close #400.
 
 ### Shipped (proof pending): #167 (P0), kubelet talks to sbregistry over TLS with the engine token (stormblock-registry#55)
 
