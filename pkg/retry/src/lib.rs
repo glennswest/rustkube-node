@@ -654,7 +654,7 @@ mod tests {
         for m in ["operation timed out", "Connection refused (os error 111)", "HTTP 503 Service Unavailable", "502 Bad Gateway"] {
             assert_eq!(class_of_message(m), Class::Infra, "{m}");
         }
-        for m in ["404 Not Found: no such group", "volume is not sealed", "501 Not Implemented", "HTTP 400"] {
+        for m in ["404 Not Found: no such group", "volume is not sealed", "501 Not Implemented", "HTTP 400"] { // stub-sweep: allow (an HTTP status in a test)
             assert_eq!(class_of_message(m), Class::Real, "{m}");
         }
     }

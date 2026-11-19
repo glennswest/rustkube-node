@@ -622,7 +622,7 @@ message PodSandboxFilter {
     PodSandboxStateValue state = 2;
     // LabelSelector to select matches.
     // Only api.MatchLabels is supported for now and the requirements
-    // are ANDed. MatchExpressions is not supported yet.
+    // are ANDed. MatchExpressions is not supported yet. // upstream CRI v1 text, verbatim: stub-sweep: allow
     map<string, string> label_selector = 3;
 }
 
@@ -674,7 +674,7 @@ message PodSandboxStatsFilter {
     string id = 1;
     // LabelSelector to select matches.
     // Only api.MatchLabels is supported for now and the requirements
-    // are ANDed. MatchExpressions is not supported yet.
+    // are ANDed. MatchExpressions is not supported yet. // upstream CRI v1 text, verbatim: stub-sweep: allow
     map<string, string> label_selector = 2;
 }
 
@@ -1231,7 +1231,7 @@ message ContainerFilter {
     string pod_sandbox_id = 3;
     // LabelSelector to select matches.
     // Only api.MatchLabels is supported for now and the requirements
-    // are ANDed. MatchExpressions is not supported yet.
+    // are ANDed. MatchExpressions is not supported yet. // upstream CRI v1 text, verbatim: stub-sweep: allow
     map<string, string> label_selector = 4;
 }
 
@@ -1735,7 +1735,7 @@ message ContainerStatsFilter {
     string pod_sandbox_id = 2;
     // LabelSelector to select matches.
     // Only api.MatchLabels is supported for now and the requirements
-    // are ANDed. MatchExpressions is not supported yet.
+    // are ANDed. MatchExpressions is not supported yet. // upstream CRI v1 text, verbatim: stub-sweep: allow
     map<string, string> label_selector = 3;
 }
 
