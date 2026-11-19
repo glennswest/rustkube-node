@@ -189,7 +189,11 @@ impl Suite {
         }
         let claim = match self.grown("grow", 256 * MIB, within).await {
             Ok(c) => c,
-            Err(e) => return Outcome::Fail(e),
+            Err(e) => {
+                // What the node said, so a stuck claim names its step.
+                let events = k8s::events_for(&self.env, &self.api, "PersistentVolumeClaim", "grow").await.unwrap_or_default();
+                return Outcome::Fail(format!("{e}; events: {events:?}"));
+            }
         };
         let took = t.elapsed().as_secs();
         let pod = match self.finished("grow-pod", within).await {

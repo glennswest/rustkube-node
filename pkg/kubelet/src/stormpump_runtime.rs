@@ -1836,11 +1836,16 @@ impl RuntimeService for StormpumpRuntime {
                             mounts.push(handle);
                             // The pod's fsGroup on the claim's filesystem, now
                             // that PID 1 has mounted it and before anything runs
-                            // on it (#171). The kubelet sees the mount: the
-                            // host's /run is its /run.
+                            // on it (#171). Through PID 1's root, not this
+                            // /run: a private bind, where a claim mounted
+                            // after the kubelet started is the empty tmpfs
+                            // directory under it (#379).
                             if let Some(o) = &ownership {
                                 let ro = o.readonly.get(i).copied().unwrap_or(false);
-                                match crate::volume_ownership::set(std::path::Path::new(&host), o.gid, ro, o.policy) {
+                                let dir = crate::pvc_resize::claim_dir(src, &host).map_err(|e| {
+                                    RingError::Detail(format!("setting fsGroup {} on the claim {src}: {e}", o.gid))
+                                })?;
+                                match crate::volume_ownership::set(&dir, o.gid, ro, o.policy) {
                                     Ok(n) if n > 0 => tracing::info!(claim = %src, gid = o.gid, changed = n, "fsGroup applied"),
                                     Ok(_) => {}
                                     Err(e) => {

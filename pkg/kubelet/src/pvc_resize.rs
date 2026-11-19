@@ -381,12 +381,16 @@ async fn expand(w: &Writer<'_>, vol: &Value, quantity: &str, bytes: u64) -> bool
     let Some(device) = device_of(vol) else {
         // Not attached here: no pod has it. Upstream's kubelet grows it when
         // one mounts it, and so does this (the pod's start is a pass).
+        debug!("claim {}/{}: filesystem grow waits for a pod here (the volume is not attached)", w.ns, w.claim);
         return false;
     };
     let mountinfo = std::fs::read_to_string("/proc/1/mountinfo")
         .or_else(|_| std::fs::read_to_string("/proc/self/mountinfo"))
         .unwrap_or_default();
-    let Some(mount) = mount_of(&mountinfo, &device) else { return false };
+    let Some(mount) = mount_of(&mountinfo, &device, dev_numbers(&device)) else {
+        debug!("claim {}/{}: filesystem grow waits for a pod here ({device} is not mounted)", w.ns, w.claim);
+        return false;
+    };
     let pv = w.pv_name().to_string();
     let grown = tokio::task::spawn_blocking(move || grow_mounted(&device, &mount, bytes))
         .await
@@ -420,14 +424,19 @@ pub fn device_of(vol: &Value) -> Option<String> {
 }
 
 /// Where `device` is mounted, from a mountinfo: the claim's own mount
-/// (`/run/stormpump/pvc/<dev>`) first, else the first mount of it.
-pub fn mount_of(mountinfo: &str, device: &str) -> Option<String> {
+/// (`/run/stormpump/pvc/<dev>`) first, else the first mount of it. A line is
+/// the device's by its source, or by its `maj:min` when that is known (the
+/// engine finds a device's mounts the same way, stormblock `mounts_of`).
+pub fn mount_of(mountinfo: &str, device: &str, numbers: Option<(u32, u32)>) -> Option<String> {
+    let majmin = numbers.map(|(a, b)| format!("{a}:{b}"));
     let mut found: Vec<String> = mountinfo
         .lines()
         .filter_map(|l| {
             let (left, right) = l.split_once(" - ")?;
             let source = right.split(' ').nth(1)?;
-            (source == device).then(|| left.split(' ').nth(4).map(unescape))?
+            let fields: Vec<&str> = left.split(' ').collect();
+            let ours = source == device || majmin.as_deref().is_some_and(|m| fields.get(2) == Some(&m));
+            ours.then(|| fields.get(4).map(|m| unescape(m)))?
         })
         .collect();
     let dev = device.rsplit('/').next().unwrap_or(device);
@@ -451,6 +460,53 @@ const XFS_IOC_FSGEOMETRY_V1: libc::c_ulong = 0x8070_5864;
 /// `_IOW('X', 110, struct xfs_growfs_data)` (16 bytes).
 const XFS_IOC_FSGROWFSDATA: libc::c_ulong = 0x4010_586e;
 
+/// The block device's `maj:min`, from sysfs (no device node needed).
+pub fn dev_numbers(device: &str) -> Option<(u32, u32)> {
+    let dev = device.rsplit('/').next()?;
+    let text = std::fs::read_to_string(format!("/sys/class/block/{dev}/dev")).ok()?;
+    let (a, b) = text.trim().split_once(':')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
+}
+
+/// Where this process can reach a claim's filesystem that PID 1 mounted at
+/// `mount` (`/run/stormpump/pvc/<dev>`), in the order tried.
+///
+/// The plain path is **not** enough: the kubelet's `/run` is a private bind
+/// of the node's (stormcos `mount hostrun /run`), so a claim PID 1 mounts
+/// after the kubelet started is, from here, the empty tmpfs directory under
+/// it. PID 1's own root sees the mount (the kubelet shares the node's PID
+/// namespace); `/hostroot` is the node's root bound `rslave`, which hears it.
+pub fn claim_candidates(mount: &str) -> Vec<std::path::PathBuf> {
+    vec![format!("/proc/1/root{mount}").into(), mount.into(), format!("/hostroot{mount}").into()]
+}
+
+/// The first of `candidates` that is on the device `numbers`: the directory
+/// to open for the claim's filesystem. An error names what each one was.
+pub fn on_device(numbers: (u32, u32), candidates: &[std::path::PathBuf]) -> Result<std::path::PathBuf, String> {
+    use std::os::unix::fs::MetadataExt;
+    let mut seen = Vec::new();
+    for c in candidates {
+        match std::fs::metadata(c) {
+            Ok(m) => {
+                let have = (libc::major(m.dev()), libc::minor(m.dev()));
+                if have == numbers {
+                    return Ok(c.clone());
+                }
+                seen.push(format!("{} is on {}:{}", c.display(), have.0, have.1));
+            }
+            Err(e) => seen.push(format!("{}: {e}", c.display())),
+        }
+    }
+    Err(format!("the filesystem of device {}:{} is not reachable here ({})", numbers.0, numbers.1, seen.join("; ")))
+}
+
+/// The directory of the claim's filesystem on `device`, mounted at `mount`
+/// by PID 1, as this process can open it ([`claim_candidates`]).
+pub fn claim_dir(device: &str, mount: &str) -> Result<std::path::PathBuf, String> {
+    let numbers = dev_numbers(device).ok_or_else(|| format!("{device}: no maj:min in /sys/class/block"))?;
+    on_device(numbers, &claim_candidates(mount))
+}
+
 /// The bytes the kernel says the block device holds.
 fn device_bytes(device: &str) -> Option<u64> {
     let dev = device.rsplit('/').next()?;
@@ -471,10 +527,9 @@ pub fn grow_mounted(device: &str, mount: &str, bytes: u64) -> Result<String, Str
         }
         _ => bytes,
     };
-    // The mount as the kubelet sees it, else through PID 1's root.
-    let dir = std::fs::File::open(mount)
-        .or_else(|_| std::fs::File::open(format!("/proc/1/root{mount}")))
-        .map_err(|e| format!("opening {mount}: {e}"))?;
+    // The claim's own filesystem, never the directory under it.
+    let path = claim_dir(device, mount)?;
+    let dir = std::fs::File::open(&path).map_err(|e| format!("opening {}: {e}", path.display()))?;
     let fd = dir.as_raw_fd();
     let mut sfs: libc::statfs = unsafe { std::mem::zeroed() };
     // SAFETY: fd is open for the call; sfs is a valid out-pointer.
@@ -621,11 +676,41 @@ mod tests {
 512 36 259:7 / /run/other rw shared:9 - ext4 /dev/ublkb7 rw
 513 36 259:7 / /run/stormpump/pvc/ublkb7 rw shared:10 - ext4 /dev/ublkb7 rw
 514 36 259:8 / /run/stormpump/pvc/ublkb8 rw shared:11 - ext4 /dev/ublkb8 rw";
-        assert_eq!(mount_of(mi, "/dev/ublkb7").as_deref(), Some("/run/stormpump/pvc/ublkb7"));
-        assert_eq!(mount_of(mi, "/dev/ublkb8").as_deref(), Some("/run/stormpump/pvc/ublkb8"));
-        assert_eq!(mount_of(mi, "/dev/ublkb9"), None);
+        assert_eq!(mount_of(mi, "/dev/ublkb7", None).as_deref(), Some("/run/stormpump/pvc/ublkb7"));
+        assert_eq!(mount_of(mi, "/dev/ublkb8", None).as_deref(), Some("/run/stormpump/pvc/ublkb8"));
+        assert_eq!(mount_of(mi, "/dev/ublkb9", None), None);
         let other = "600 36 259:9 / /mnt/a\\040b rw - xfs /dev/ublkb9 rw";
-        assert_eq!(mount_of(other, "/dev/ublkb9").as_deref(), Some("/mnt/a b"));
+        assert_eq!(mount_of(other, "/dev/ublkb9", None).as_deref(), Some("/mnt/a b"));
+    }
+
+    #[test]
+    fn a_mount_whose_source_reads_otherwise_is_found_by_its_numbers() {
+        let mi = "700 36 259:12 / /run/stormpump/pvc/ublkb12 rw - ext4 /proc/self/fd/9 rw";
+        assert_eq!(mount_of(mi, "/dev/ublkb12", None), None);
+        assert_eq!(mount_of(mi, "/dev/ublkb12", Some((259, 12))).as_deref(), Some("/run/stormpump/pvc/ublkb12"));
+        assert_eq!(mount_of(mi, "/dev/ublkb12", Some((259, 13))), None);
+    }
+
+    #[test]
+    fn the_claim_is_reached_through_pid_1_first() {
+        let c = claim_candidates("/run/stormpump/pvc/ublkb7");
+        let c: Vec<String> = c.iter().map(|p| p.display().to_string()).collect();
+        assert_eq!(c, ["/proc/1/root/run/stormpump/pvc/ublkb7", "/run/stormpump/pvc/ublkb7", "/hostroot/run/stormpump/pvc/ublkb7"]);
+    }
+
+    #[test]
+    fn a_directory_on_another_device_is_not_the_claim() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir();
+        let d = std::fs::metadata(&dir).unwrap().dev();
+        let here = (libc::major(d), libc::minor(d));
+        let missing = std::path::PathBuf::from("/nonexistent/claim");
+        // The first that is on the device, past one that is not there.
+        assert_eq!(on_device(here, &[missing.clone(), dir.clone()]).unwrap(), dir);
+        // None on it: an error that names each, never the directory under it.
+        let e = on_device((here.0, here.1.wrapping_add(1)), &[missing, dir.clone()]).unwrap_err();
+        assert!(e.contains("/nonexistent/claim:"), "{e}");
+        assert!(e.contains(&format!("{} is on {}:{}", dir.display(), here.0, here.1)), "{e}");
     }
 
     #[test]

@@ -1,8 +1,9 @@
 //! `fsGroup` on a claim's filesystem (#171): upstream's `SetVolumeOwnership`.
 //!
 //! A claim is an ext4 that PID 1 mounts at `/run/stormpump/pvc/<dev>` when the
-//! container that uses it is started (the kubelet sees that mount: the host's
-//! `/run` is bound at its `/run`). A fresh one is `0755 root:root`, so a
+//! container that uses it is started. The kubelet walks it through PID 1's
+//! root (`pvc_resize::claim_dir`, #379): its own `/run` is a private bind of
+//! the node's, where that mount is not seen. A fresh one is `0755 root:root`, so a
 //! non-root container could read it and not write it. Before the spawn, the
 //! tree is given to the pod's `fsGroup`, as upstream's kubelet does it:
 //!
