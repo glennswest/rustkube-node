@@ -149,6 +149,13 @@ no clippy finding in capacity.rs (job 6aca965920). Stage build ae84e748ffba. Hel
 Resume: `stormcentral test run rustkube-node pvc`; if a refusal still says 0 left, its `largest:` names what to look at next.
 2026-11-19: 12.96 carries rustkube-node 6682813 ⊇ 9de861a (passed on pvetest2, flowsdn). Suite `pvc` at 6682813: runs
 96c71a4214 (pvetest2) and 2a90785356 (pvetest3, cilium, its 12.96 install still running). Pass → shipped + close #379.
+2a90785356 (pvetest3): pvc-classes pass; capacity fixed (the claim placed, the engine grew it), but pvc-grow failed stuck at
+`FileSystemResizePending`/`NodeResizePending`. Cause (from stormcos build-goldens.sh): the kubelet's `/run` is `mount hostrun /run`,
+a private bind, so stormpump's later claim mount at /run/stormpump/pvc/<dev> is an empty tmpfs dir from the kubelet's side;
+`grow_mounted` opened that first (only ext4/xfs → error). Same path is #171's fsGroup walk (never run live): it chowned the tmpfs dir.
+pvc-tier-fast failed separately: the pod mount refuses class stormblock-fast (#400's, noted there).
+Doing: `claim_dir(device, mount)` opens the claim where its st_dev is the device's maj:min (/proc/1/root<mount>, <mount>,
+/hostroot<mount>), used by grow_mounted and by the fsGroup walk; mount_of matches maj:min too; test prints the claim's events on fail.
 
 ### Shipped (proof pending): #383 (P0), a template listed `broken` is waited on forever (server8 12.92, pvc-ext4j-64m)
 
