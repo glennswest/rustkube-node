@@ -4,7 +4,7 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### Waiting on stormcos#1039: #400, a filesystem claim's StorageClass tier on the blank's clone; tier `fast` (stormblock#672, #377)
+### Waiting on server8's install (rustkube-node>=9a102f5): #400, a filesystem claim's StorageClass tier on the blank's clone; tier `fast` (stormblock#672, #377)
 
 2026-11-19. stormblock 151230ad (v24.30.0) takes `tier` on `POST /api/v1/fstemplates/{id}/clone`. `storage::TIERS` gains `fast`;
 `clone_blank` sends `policy.tier` in the clone body; the `TierNotApplied` Warning goes. Blank names unchanged (the blank takes no
@@ -19,6 +19,9 @@ spurious failure: `sc-build scripts/sc-build.sh`, that script is gone (#51); use
 binds, a pod writes/reads it, ProvisioningSucceeded says `its writes on tier fast`; skip without the class), so the proof is a
 run on server8: `stormcentral test run rustkube-node pvc` once an install carries rustkube-node 9a102f5+ and stormcos#1039. Then
 hold `--after-install rustkube-node>=<this commit>@server8`.
+Done: b0f72e2 + 0cde885 (match-arm fix; #409 filed and auto-closed). sc-build test crate passed (sc-build-17b258b797, tests +
+clippy -D warnings). Kubelet unchanged: stage 2d7c5b02f6a2 stands. Held `--after-install rustkube-node>=9a102f5@server8`.
+Resume: `stormcentral test run rustkube-node pvc` on server8 → pvc-tier-fast pass + legs on `fast` slab → close #400.
 
 ### Shipped (proof pending): #167 (P0), kubelet talks to sbregistry over TLS with the engine token (stormblock-registry#55)
 
