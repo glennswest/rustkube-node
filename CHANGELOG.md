@@ -2,7 +2,7 @@
 
 ## 2026-11-19
 
-- **feat:** A filesystem claim's StorageClass `tier` is sent on the clone of its blank (#400, stormblock#377): stormblock v24.30.0 puts the clone's own writes on that tier, while what it shares with the blank stays where the blank is. The `TierNotApplied` Warning is gone. `tier` takes `fast`, the blade's SSD beside its system HDD (stormblock#672, stormcos#1039's `stormblock-fast`). An engine before v24.30.0 ignores the field.
+- **feat:** A filesystem claim's StorageClass `tier` is sent on the clone of its blank (#400, stormblock#377): stormblock v24.30.0 puts the clone's own writes on that tier, while what it shares with the blank stays where the blank is. The `TierNotApplied` Warning is gone; the claim's `ProvisioningSucceeded` names the tier (`, its writes on tier fast`). `tier` takes `fast`, the blade's SSD beside its system HDD (stormblock#672, stormcos#1039's `stormblock-fast`). An engine before v24.30.0 ignores the field.
 - **feat:** The kubelet reaches sbregistry under the node rule (#167, stormblock-registry#55). `--registry-ca` (`REGISTRY_CA_FILE`) is the CA an `https://` `--registry` is verified against, and nothing else is. Like `--stormblock-ca` (#312), it is read at each new connection, and an `https://` registry with no CA stops the kubelet at start. Every request (golden records, `/v1/clones`, deleting a stray clone) carries the engine's token as `Bearer`, which the registry takes as admin. It is read at each request, so a token minted or rotated after start is used. It goes over TLS, or in clear only to this host (`127.0.0.1`, `::1`, `localhost`). Nothing changes until stormcos runs the kubelet with `--registry https://127.0.0.1:5100 --registry-ca /data/stormcert/ca.crt` (stormcos#355).
 
 ## 2026-11-18
