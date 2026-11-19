@@ -345,7 +345,9 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
     let vscs = api.list(&format!("{SNAP_API}/volumesnapshotclasses")).await.ok().flatten().unwrap_or_default();
     let suite = Suite { env: env.clone(), api: api.clone() };
     match classes_missing(sc.as_ref(), &vscs) {
-        Some(why) => r.record("pvc-classes", Outcome::Skip(why), 0, None),
+        Some(why) => {
+            r.record("pvc-classes", Outcome::Skip(why), 0, None);
+        }
         None => {
             let class = vscs.iter().find(|v| s(v, "/driver") == PROVISIONER).map(|v| s(v, "/metadata/name").to_string()).unwrap_or_default();
             r.record("pvc-classes", Outcome::Pass(format!("{CLASS} expands; VolumeSnapshotClass {class}")), 0, None);
