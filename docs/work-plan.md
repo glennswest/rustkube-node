@@ -80,6 +80,8 @@ Built bb83e44: sc-build passed (VM sc-build-5abd9b6000; 671 kubelet unit, all su
 (sc-build-aae7b16ee6); clippy names nothing in pvc_resize/pvc_snapshot. Stage build b4675c8907ba. Held `--after glennswest/stormcos#1032`.
 Resume: once a pvetest runs a release with rustkube-node >= bb83e44 and stormcos#1032, `stormcentral test run rustkube-node pvc`;
 pass → `shipped` with proof (a VolumeSnapshot readyToUse, a grown claim) / close #379.
+2026-11-18: 12.95 carries both (rustkube-node 8686267 ⊇ bb83e44; rustkube-apiserver at stormcos 3045fd0 ⊇ 6a4dfe5), passed on
+pvetest1/pvetest2. Suite `pvc` runs ae59cdb016 (pvetest1, cilium) and 822829e52d (pvetest2, flowsdn) at 7e13d76.
 
 ### Shipped (proof pending): #383 (P0), a template listed `broken` is waited on forever (server8 12.92, pvc-ext4j-64m)
 
