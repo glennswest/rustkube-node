@@ -314,8 +314,9 @@ pub fn claim_source(pvc: &Value) -> Option<ClaimSource> {
 /// stormblock's failure-domain rungs (its `placement::domain::RUNGS`), widest
 /// first. `drive` is its default.
 pub const RUNGS: [&str; 11] = ["site", "building", "room", "row", "rack", "node", "hba", "shelf", "set", "bay", "drive"];
-/// stormblock's tiers.
-pub const TIERS: [&str; 4] = ["hot", "warm", "cool", "cold"];
+/// stormblock's tiers. `fast` is a blade's SSD beside its system HDD
+/// (stormblock#672): nothing lands there unless its class asks (#400).
+pub const TIERS: [&str; 5] = ["hot", "warm", "cool", "cold", "fast"];
 
 /// How a claim's volume is protected, from its StorageClass (#71).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -742,6 +743,9 @@ mod tests {
         assert_eq!(r5.scheme, Scheme::Parity { data: 4, parity: 1 });
         assert_eq!(r5.blank_name("64M"), "pvc-ext4j-64m-raid5-4p1-drive");
         assert_eq!(r5.tier.as_deref(), Some("cold"));
+        // #400: the SSD tier (stormblock#672).
+        let fast = ClaimPolicy::from_class(Some(&sc(json!({"tier": "fast"})))).unwrap();
+        assert_eq!(fast.tier.as_deref(), Some("fast"));
         assert!((r5.scheme.overhead() - 1.25).abs() < 1e-9);
         let r6 = ClaimPolicy::from_class(Some(&sc(json!({"redundancy": "raid6:4+2"})))).unwrap();
         assert_eq!(r6.engine_fields()["redundancy"], "raid6:4+2");

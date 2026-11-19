@@ -2619,14 +2619,8 @@ impl PodManager {
                 // it descends from a sealed volume, records lineage, and
                 // stamps the clone with its own filesystem UUID — two live
                 // filesystems must never claim one identity (stormblock#76).
-                // A tier is a preference stormblock keeps only on volumes it
-                // creates, not yet on blanks or clones (stormblock#377).
-                if let Some(t) = &policy.tier {
-                    self.claim_event(&pvc, "Warning", "TierNotApplied", &format!(
-                        "tier {t} is not applied to a filesystem claim yet: stormblock takes a tier on a \
-                         volume it creates, not on a blank or its clones; the claim uses the blank's tier"
-                    )).await;
-                }
+                // The class's tier goes on the clone (#400, stormblock#377):
+                // the clone's own writes land there.
                 self.clone_blank(class, &name, &pvc, &policy).await?
             }
         };
@@ -2813,7 +2807,16 @@ impl PodManager {
         // Through the template, not the volume: `fstemplates/{id}/clone`
         // gives the clone its own filesystem UUID and verifies it, so
         // two claims never present one identity (stormblock#76).
-        let body = serde_json::json!({ "name": name, "verify": true });
+        //
+        // The class's tier rides on the clone (#400, stormblock#377, v24.30.0):
+        // the clone's own writes go to that tier, while what it shares with
+        // the blank stays where the blank is. The blank itself takes no tier,
+        // so one blank serves every tier. An engine before v24.30.0 ignores
+        // the field.
+        let mut body = serde_json::json!({ "name": name, "verify": true });
+        if let Some(t) = &policy.tier {
+            body["tier"] = serde_json::json!(t);
+        }
         let created = match self
             .storage_post(&format!("/api/v1/fstemplates/{template}/clone"), &body)
             .await
@@ -8872,7 +8875,8 @@ pub(crate) mod tests {
     }
 
     /// #71: a filesystem claim of a mirrored class mints the blank for its
-    /// size and policy, with the policy, and says the tier is not applied.
+    /// size and policy, with the policy; the blank takes no tier (#400: the
+    /// clone does).
     #[tokio::test]
     async fn a_class_policy_mints_its_own_blank() {
         let w = policy_world(raw_claim("16Mi", "Filesystem"), Some(mirror_class()), (201, json!({"template": {}}))).await;
@@ -8885,7 +8889,51 @@ pub(crate) mod tests {
         assert!(mint.2.get("tier").is_none(), "fstemplates take no tier (stormblock#377)");
         let looked = w.calls.lock().unwrap().iter().any(|(m, p, _)| m == "GET" && p == "/api/v1/fstemplates/pvc-ext4j-16m-mirror2-shelf");
         assert!(looked, "the policy's blank is the one looked for");
-        assert!(seen(&w, |(m, p, b)| m == "POST" && p.ends_with("/events") && b["reason"] == "TierNotApplied").await.is_some());
+        assert!(w.calls.lock().unwrap().iter().all(|(_, _, b)| b["reason"] != "TierNotApplied"), "#400: no TierNotApplied");
+    }
+
+    /// #400: a filesystem claim's class tier is sent on the blank's clone
+    /// (stormblock#377); a class with no tier sends none.
+    #[tokio::test]
+    async fn a_filesystem_claims_tier_rides_on_the_clone() {
+        let calls: Arc<Mutex<Vec<(String, String, Value)>>> = Arc::default();
+        let log = calls.clone();
+        let app = axum::Router::new().fallback(
+            move |method: axum::http::Method, uri: axum::http::Uri, body: axum::body::Bytes| {
+                let log = log.clone();
+                async move {
+                    let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    let path = uri.path().to_string();
+                    log.lock().unwrap().push((method.to_string(), path.clone(), body));
+                    match (method.as_str(), path.as_str()) {
+                        ("GET", "/api/v1/fstemplates/pvc-ext4j-64m") => axum::Json(json!({"id": "t1", "state": "ready"})),
+                        ("POST", "/api/v1/fstemplates/t1/clone") => axum::Json(json!({"volume_id": "vol-c"})),
+                        _ => axum::Json(json!({})),
+                    }
+                }
+            },
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let (_rt, mgr) = manager();
+        let mgr = with_stormblock(mgr, &url);
+        let clone_body = || {
+            calls.lock().unwrap().iter().rev()
+                .find(|(m, p, _)| m == "POST" && p == "/api/v1/fstemplates/t1/clone")
+                .map(|c| c.2.clone()).expect("cloned")
+        };
+
+        let fast = crate::storage::ClaimPolicy { tier: Some("fast".into()), ..Default::default() };
+        assert_eq!(mgr.clone_blank("64M", "pvc-ns-d", &Value::Null, &fast).await.unwrap(), "vol-c");
+        let b = clone_body();
+        assert_eq!((b["name"].clone(), b["verify"].clone(), b["tier"].clone()), (json!("pvc-ns-d"), json!(true), json!("fast")));
+
+        assert_eq!(mgr.clone_blank("64M", "pvc-ns-e", &Value::Null, &Default::default()).await.unwrap(), "vol-c");
+        let b = clone_body();
+        assert_eq!(b["name"], "pvc-ns-e");
+        assert!(b.get("tier").is_none(), "no tier in the class, none on the clone: {b}");
+        assert!(calls.lock().unwrap().iter().all(|(_, _, b)| b["reason"] != "TierNotApplied"));
     }
 
     /// #71: a raw Block claim carries the policy and the tier itself.

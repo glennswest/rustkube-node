@@ -515,7 +515,7 @@ claim's volume is protected, as stormblock spells it (stormblock#151):
 |---|---|---|
 | `redundancy` | `none` (default), `mirror` (= `mirror:2`), `mirror:N`, `raid1`, `raid10`, `raid5:D+1` / `raid5:N`, `raid6:D+2` / `raid6:N`, `parity:D+P`; an `@rung` suffix sets the spread | copies or parity legs, each on its own failure domain |
 | `spread` | `site` `building` `room` `row` `rack` `node` `hba` `shelf` `set` `bay` `drive` (default `drive`) | the rung the legs differ at; must agree with an `@rung` |
-| `tier` | `hot` `warm` `cool` `cold` | a preference, never a refusal; applied to `volumeMode: Block` claims only until stormblock#377 (a filesystem claim gets a `TierNotApplied` Warning) |
+| `tier` | `hot` `warm` `cool` `cold` `fast` | a preference, never a refusal. A `volumeMode: Block` claim's volume is created on it; a filesystem claim's clone of its blank puts its own writes there, while what it shares with the blank stays where the blank is (#400, stormblock#377, engine v24.30.0). `fast` is a blade's SSD beside its system HDD (stormblock#672): nothing lands there unless a class asks |
 
 Any other key is refused on the claim (`ProvisioningFailed`), except `csi.storage.k8s.io/*` and the two stormcos's
 class has always carried, `kind: clone` and `fsType: ext4` (#232: a class's parameters are immutable on a running
