@@ -4,13 +4,16 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #167 (P0), kubelet talks to sbregistry over TLS with the engine token (stormblock-registry#55)
+### Shipped (proof pending): #167 (P0), kubelet talks to sbregistry over TLS with the engine token (stormblock-registry#55)
 
 2026-11-19. StormpumpImages.with_tls(ca, TokenSource::from_env()): reqwest client with EngineTrust::for_service(ca, "registry",
 "--registry-ca") (no public roots, CA re-read per connection), `request()` adds `Bearer <engine token>` when the registry is https
 or loopback. `--registry-ca`/`REGISTRY_CA_FILE`; https with no CA stops at start. Default URL unchanged: stormcos#355 sets
 `--registry https://127.0.0.1:5100 --registry-ca /data/stormcert/ca.crt` when it turns TLS+auth on. Tests: TLS registry from the
 CA gets the token; other CA / no CA reach nothing; token only over TLS or to this host. Then sc-build, stage, tell stormcos#355.
+Done: 31bb64f. sc-build passed (VMs sc-build-8caf0d41a0, sc-build-80ab09b5da: 687 kubelet unit incl. the 2 new, main's CA test);
+clippy names nothing in the changed lines. Stage b350de4ec026. stormcos#355 (held after this) told the flags. Shipped, proof: cilium
+ready (pulled images through the registry client). The TLS path is live with stormcos#355.
 
 ### Waiting on an install with b515348: #399 (P3), golden sealer de-identifies from a systemd unit (stormvm#135)
 
