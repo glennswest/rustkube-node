@@ -4,6 +4,13 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #416 (P2), logs follow=true never ends for a terminated container
+- Cause: `container_logs`' follow loop ended only when the pod left the node (`pod_uid` none).
+- Fix: `follow_log` asks, when a poll finds nothing new, whether the run ended:
+  `PodManager::container_run_ended` (pod finished/gone, terminated for good, init done,
+  runtime Exited/NotFound) or `newer_run_on_disk` (a restart). Then sends the rest and closes.
+- Next: sc-build, image (stage), shipped with proof from sc's `logs-follow-ends`.
+
 ### Waiting on an install (rustkube-node>=196d128): #415, stormvm → ac884c7 (cloud-hypervisor disks state image_type=raw, stormvm#134)
 
 2026-11-19. Rev-only bump of every stormvm git dep (2a60a3c → ac884c7, 196d128): `--disk …,image_type=raw` on every disk and

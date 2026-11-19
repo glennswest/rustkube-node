@@ -6033,6 +6033,37 @@ impl PodManager {
             .map(|p| p.uid.clone())
     }
 
+    /// Has the current run of `container` ended (#416)? What ends a followed
+    /// log (`kubectl logs -f`), as upstream: the pod gone from this node, the
+    /// container terminated for good or the pod finished, an init container
+    /// done, or the runtime saying the container has exited or is gone.
+    /// A container not started yet (no id) has not ended. A runtime that does
+    /// not answer is not taken as an exit: the stream would end too soon.
+    pub async fn container_run_ended(&self, namespace: &str, name: &str, container: &str) -> bool {
+        let id = {
+            let pods = self.pods.read().await;
+            let Some(p) = pods.values().find(|p| p.namespace == namespace && p.name == name) else {
+                return true;
+            };
+            if p.terminated.contains_key(container)
+                || p.sandbox_stopped
+                || matches!(p.phase.as_str(), "Succeeded" | "Failed")
+                || p.init_statuses.iter().any(|i| i.name == container && i.state == "terminated")
+            {
+                return true;
+            }
+            match p.container_ids.get(container) {
+                Some(id) => id.clone(),
+                None => return false,
+            }
+        };
+        match self.runtime.container_status(&id).await {
+            Ok(s) => s.state == ContainerState::Exited,
+            Err(CriError::NotFound(_)) => true,
+            Err(_) => false,
+        }
+    }
+
     pub async fn pods_json(&self) -> Value {
         let pods = self.pods.read().await;
         let mut items: Vec<Value> = pods
@@ -9448,6 +9479,30 @@ pub(crate) mod tests {
         assert_eq!((r.state.as_str(), r.reason.as_str(), r.restart_count), ("waiting", "CrashLoopBackOff", 1));
         // Inside its back-off the next try waits rather than recreating it.
         assert!(matches!(mgr.start_pod(&p).await, Err(CriError::Pending(m)) if m.contains("back-off")));
+    }
+
+    #[tokio::test]
+    async fn a_containers_run_ends_when_it_exits_is_gone_or_its_pod_is() {
+        // #416: what ends `kubectl logs -f`.
+        let (rt, mgr) = manager();
+        let p = pod("uid-run", "run", "Always", simple_container());
+        mgr.start_pod(&p).await.unwrap();
+        assert!(!mgr.container_run_ended("default", "run", "app").await, "running");
+        assert!(!mgr.container_run_ended("default", "run", "other").await, "not started");
+        let cid = mgr.pods.read().await["uid-run"].container_ids["app"].clone();
+        rt.set_container_state(&cid, ContainerState::Exited, 1);
+        assert!(mgr.container_run_ended("default", "run", "app").await, "exited, before any restart");
+        rt.containers.lock().unwrap().remove(&cid);
+        assert!(mgr.container_run_ended("default", "run", "app").await, "gone from the runtime");
+        assert!(mgr.container_run_ended("default", "gone", "app").await, "no such pod here");
+
+        // restartPolicy Never: recorded as terminated for good, and Succeeded.
+        let p = pod("uid-once", "once", "Never", simple_container());
+        mgr.start_pod(&p).await.unwrap();
+        let cid = mgr.pods.read().await["uid-once"].container_ids["app"].clone();
+        rt.set_container_state(&cid, ContainerState::Exited, 0);
+        assert_eq!(mgr.check_pod_status("uid-once").await.unwrap().phase, "Succeeded");
+        assert!(mgr.container_run_ended("default", "once", "app").await, "Completed");
     }
 
     #[tokio::test]

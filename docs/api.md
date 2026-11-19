@@ -70,7 +70,13 @@ A line loses its time, stream and tag only when it carries them (#136): CRI
 or stormd's (`<RFC 3339> <stream> <severity> <msg>`). Every other line, which is
 every stormpump container's (no per-line metadata), comes back as written, so
 `timestamps`/`since*` have nothing to act on there. A last line with no newline
-is returned by a plain read, and by `follow` once the pod is gone.
+is returned by a plain read, and by `follow` once the run has ended.
+
+`follow` ends when the followed run does (#416), as upstream: once nothing new is in the file, the kubelet
+asks whether the run ended (the pod finished or left the node, the container terminated for good, an init
+container done, the runtime says it exited or no longer has it, or a restart began a newer `<restart>.log`).
+If it has, the rest of the file is sent and the stream closes. So `kubectl logs -f` of a finished pod prints
+its log and returns, and `oc debug -- CMD` returns when the command does.
 
 
 The SPDY session (`spdy.rs`) answers each stream with a SYN_REPLY, echoes

@@ -1895,8 +1895,9 @@ mod tests {
 /// does not have a 404 rather than an empty body.
 ///
 /// `follow=true` streams: the file as it stands is sent first, then whatever is
-/// appended to it, until the container is gone from this node or the client
-/// hangs up. That is the half of `kubectl logs -f` that lives here — the
+/// appended to it, until the run ends (the container exits or is gone, a
+/// restart starts a newer run, the pod finishes or leaves this node, #416) or
+/// the client hangs up. That is the half of `kubectl logs -f` that lives here — the
 /// apiserver already passes the body through chunk by chunk (rustkube#55), so
 /// buffering on this side was what made `-f` print once and stop.
 async fn container_logs(
@@ -1952,37 +1953,14 @@ async fn container_logs(
     // `tailLines` applies to the log as it stood, not to each new line.
     let opts = LogOptions { tail_lines: None, ..opts };
     tokio::spawn(async move {
-        let mut offset = consumed as u64;
-        loop {
-            // The container going away is what ends `-f` upstream; without
-            // this the stream would hold open forever on a finished pod.
-            if pm.pod_uid(&namespace, &pod).await.is_none() {
-                // Its last line, if the container ended mid-line (#136).
-                if let Ok(rest) = rest_from(&path, offset) {
-                    let out = cap(filter_log(&rest, &opts), &mut budget);
-                    if !out.is_empty() {
-                        let _ = tx.send(Ok(out.into_bytes())).await;
-                    }
-                }
-                return;
-            }
-            match tail_from(&path, &mut offset) {
-                Ok(chunk) if !chunk.is_empty() => {
-                    let out = cap(filter_log(&chunk, &opts), &mut budget);
-                    if !out.is_empty() && tx.send(Ok(out.into_bytes())).await.is_err() {
-                        return; // client hung up
-                    }
-                    if budget == Some(0) {
-                        return;
-                    }
-                }
-                Ok(_) => {}
-                // A read error mid-follow (the file rotated out from under us,
-                // the mount went away) ends the stream rather than spinning.
-                Err(_) => return,
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
+        // The run ends the stream (#416): the container exited or is gone, or
+        // a restart began a newer run than the one followed.
+        let ended = || {
+            let (pm, path) = (pm.clone(), path.clone());
+            let (namespace, pod, container) = (namespace.clone(), pod.clone(), container.clone());
+            async move { newer_run_on_disk(&path) || pm.container_run_ended(&namespace, &pod, &container).await }
+        };
+        follow_log(&path, consumed as u64, &opts, budget, tx, ended, std::time::Duration::from_millis(500)).await;
     });
 
     Response::builder()
@@ -1994,6 +1972,70 @@ async fn container_logs(
         .unwrap_or_else(|e| {
             (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response()
         })
+}
+
+/// Stream what is appended to `path` from `offset` into `tx`, until the run
+/// ends, the budget is spent, the file cannot be read or the client hangs up.
+///
+/// `ended` is asked only when a poll found nothing new, as upstream asks the
+/// runtime only at the end of the file: a run that ended while it was still
+/// writing has all of it sent first. Once it has ended, the rest of the file
+/// goes too, a last line with no newline included (#136), and the stream ends
+/// (#416: `kubectl logs -f` of a finished container returned only when the
+/// pod left the node).
+async fn follow_log<F, Fut>(
+    path: &str,
+    mut offset: u64,
+    opts: &LogOptions,
+    mut budget: Option<usize>,
+    tx: tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
+    ended: F,
+    poll: std::time::Duration,
+) where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    loop {
+        match tail_from(path, &mut offset) {
+            Ok(chunk) if !chunk.is_empty() => {
+                let out = cap(filter_log(&chunk, opts), &mut budget);
+                if !out.is_empty() && tx.send(Ok(out.into_bytes())).await.is_err() {
+                    return; // client hung up
+                }
+                if budget == Some(0) {
+                    return;
+                }
+            }
+            Ok(_) => {
+                if ended().await {
+                    if let Ok(rest) = rest_from(path, offset) {
+                        let out = cap(filter_log(&rest, opts), &mut budget);
+                        if !out.is_empty() {
+                            let _ = tx.send(Ok(out.into_bytes())).await;
+                        }
+                    }
+                    return;
+                }
+            }
+            // A read error mid-follow (the file rotated out from under us,
+            // the mount went away) ends the stream rather than spinning.
+            Err(_) => return,
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// Is there a newer run than the `<restart>.log` at `path` (#416)? A restart
+/// writes `<restart+1>.log`, so the run followed has ended.
+fn newer_run_on_disk(path: &str) -> bool {
+    let path = std::path::Path::new(path);
+    let run = |p: &std::path::Path| -> Option<u32> { p.file_name()?.to_str()?.strip_suffix(".log")?.parse().ok() };
+    let (Some(this), Some(dir)) = (run(path), path.parent()) else {
+        return false;
+    };
+    std::fs::read_dir(dir)
+        .map(|rd| rd.filter_map(|e| e.ok()).any(|e| run(&e.path()).is_some_and(|r| r > this)))
+        .unwrap_or(false)
 }
 
 /// `containerLogs` for a node service's mirror pod: its stormd log volume
@@ -2495,6 +2537,78 @@ fn filter_log(body: &str, opts: &LogOptions) -> String {
 #[cfg(test)]
 mod log_tests {
     use super::*;
+
+    /// Everything a follow sends until it closes the stream; panics if it
+    /// is still open after `within`.
+    async fn drained(
+        mut rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
+        within: std::time::Duration,
+    ) -> String {
+        let mut got = Vec::new();
+        tokio::time::timeout(within, async {
+            while let Some(c) = rx.recv().await {
+                got.extend(c.unwrap());
+            }
+        })
+        .await
+        .expect("the followed log ends");
+        String::from_utf8(got).unwrap()
+    }
+
+    #[tokio::test]
+    async fn following_a_finished_run_ends_after_its_log() {
+        // #416: `sh -c "echo follow-ok"`, Completed; the head was sent, and
+        // the follow ends at once with the rest (a last line with no newline).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("0.log");
+        std::fs::write(&path, "follow-ok\nlast").unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let opts = LogOptions::default();
+        let poll = std::time::Duration::from_millis(10);
+        tokio::spawn(async move { follow_log(&path, 10, &opts, None, tx, || async { true }, poll).await });
+        assert_eq!(drained(rx, std::time::Duration::from_secs(5)).await, "last\n");
+    }
+
+    #[tokio::test]
+    async fn a_followed_run_sends_what_it_writes_then_ends_when_it_does() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("0.log");
+        std::fs::write(&file, "").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let done = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let d = done.clone();
+        let poll = std::time::Duration::from_millis(10);
+        tokio::spawn(async move {
+            let opts = LogOptions::default();
+            follow_log(&path, 0, &opts, None, tx, || { let d = d.clone(); async move { d.load(Ordering::SeqCst) } }, poll).await
+        });
+
+        std::fs::OpenOptions::new().append(true).open(&file).unwrap().write_all(b"one\n").unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+        assert_eq!(first.unwrap(), b"one\n", "a running container is followed");
+        // Still open while it runs.
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await.is_err());
+
+        // It writes its last line and exits: that line, then the end.
+        std::fs::OpenOptions::new().append(true).open(&file).unwrap().write_all(b"two\n").unwrap();
+        done.store(true, Ordering::SeqCst);
+        assert_eq!(drained(rx, std::time::Duration::from_secs(5)).await, "two\n");
+    }
+
+    #[test]
+    fn a_restart_is_a_newer_run_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |n: u32| dir.path().join(format!("{n}.log")).to_string_lossy().into_owned();
+        std::fs::write(run(0), "").unwrap();
+        assert!(!newer_run_on_disk(&run(0)), "the newest run");
+        std::fs::write(run(1), "").unwrap();
+        assert!(newer_run_on_disk(&run(0)), "restarted: run 0 has ended");
+        assert!(!newer_run_on_disk(&run(1)));
+    }
 
     fn cri(lines: &[(&str, &str)]) -> String {
         lines
