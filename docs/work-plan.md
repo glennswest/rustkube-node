@@ -75,7 +75,7 @@ ready (pulled images through the registry client). The TLS path is live with sto
 pvetest3 (12.96 cilium, ⊇ 9293d81) cilium-90553 is Running, cilium-agent ready, image resolved 16:17:10Z. Re-shipped with the proof
 limited to the cilium machines (`on pvetest1,pvetest3`), --commit 31bb64f.
 
-### Waiting on an install with b515348: #399 (P3), golden sealer de-identifies from a systemd unit (stormvm#135)
+### Waiting on golden 7ffb659a57 (pvetest3): #399 (P3), golden sealer de-identifies from a systemd unit (stormvm#135)
 
 2026-11-18. stormvm 1632135 → 2a60a3c (sealer_spec hands the copy `stormvm-seal.service` via SMBIOS type 11 credentials; also
 closes #394's lag). `Machines::deidentify` gains the copy's volume id (nonce). Order, as `stormvm golden` (make_golden): up = the
@@ -85,6 +85,8 @@ adds `id -Z; getenforce`. Unit tests on the decision with a fake log. Then sc-bu
 Done: b515348 (vm_golden::await_seal + unit_said, 7 seal_tests). sc-build passed (build + 684 kubelet unit); no clippy findings in
 the changed code (crate-wide ones are #385/#386). Stage build 015557193cf1. Closed #394 (fixes in the pin). #399 and #344 held
 `--after-install rustkube-node>=b515348@any:pve`. Resume: run #344's golden suite; pass → close #399, #344 (and #373); fail → fix it.
+2026-11-19: install met (12.96 carries 6682813 ⊇ b515348). golden 7ffb659a57 (5d96107) queued on pvetest3 (12.96; pvetest2's apiserver
+not answering, pvetest1 on 12.95). Held `--after-run 7ffb659a57`.
 
 ### Shipped (proof pending): #397 (P3), live migration post-copy (stormvm#132)
 
