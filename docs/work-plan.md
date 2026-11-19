@@ -62,6 +62,9 @@ CA gets the token; other CA / no CA reach nothing; token only over TLS or to thi
 Done: 31bb64f. sc-build passed (VMs sc-build-8caf0d41a0, sc-build-80ab09b5da: 687 kubelet unit incl. the 2 new, main's CA test);
 clippy names nothing in the changed lines. Stage b350de4ec026. stormcos#355 (held after this) told the flags. Shipped, proof: cilium
 ready (pulled images through the registry client). The TLS path is live with stormcos#355.
+2026-11-19: the proof was checked on pvetest2 (12.96-flowsdn), which runs no cilium (items: []), and the issue reopened. On
+pvetest3 (12.96 cilium, ⊇ 9293d81) cilium-90553 is Running, cilium-agent ready, image resolved 16:17:10Z. Re-shipped with the proof
+limited to the cilium machines (`on pvetest1,pvetest3`), --commit 31bb64f.
 
 ### Waiting on an install with b515348: #399 (P3), golden sealer de-identifies from a systemd unit (stormvm#135)
 
