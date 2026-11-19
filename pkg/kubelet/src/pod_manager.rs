@@ -2849,8 +2849,9 @@ impl PodManager {
             }
         };
         if created["volume_id"].is_string() {
+            let tier = policy.tier.as_deref().map(|t| format!(", its writes on tier {t}")).unwrap_or_default();
             self.claim_event(claim, "Normal", "ProvisioningSucceeded", &format!(
-                "volume {name} cloned from the {class} blank {blank}"
+                "volume {name} cloned from the {class} blank {blank}{tier}"
             )).await;
         }
         created["volume_id"]
