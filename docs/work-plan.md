@@ -15,7 +15,7 @@ Done: b515348 (vm_golden::await_seal + unit_said, 7 seal_tests). sc-build passed
 the changed code (crate-wide ones are #385/#386). Stage build 015557193cf1. Closed #394 (fixes in the pin). #399 and #344 held
 `--after-install rustkube-node>=b515348@any:pve`. Resume: run #344's golden suite; pass → close #399, #344 (and #373); fail → fix it.
 
-### In progress: #397 (P3), live migration post-copy (stormvm#132)
+### Shipped (proof pending): #397 (P3), live migration post-copy (stormvm#132)
 
 2026-11-18. stormvm → 1632135. vm_migration: MigrationConfiguration (resolve: KubeVirt CR migrations, then policy_for over
 MigrationPolicies; recorded by the target in target_ready as migrationConfiguration), tuning(config), Progress, POSTCOPY_PAUSED;
@@ -24,6 +24,9 @@ post-copy, postcopy-paused fails. stormcos serves neither CRD: filed. Live: stor
 Done: 4349a70 (+ a007e71 test fix, 3462483 clippy). sc-build passed (VM sc-build-873846f9a6, 677 kubelet unit: policy resolution,
 configuration recorded/read, a stalled pre-copy switches once, abort refused in post-copy, postcopy-paused fails). Stage 500bc7a9aabb.
 Filed stormcos#1038 (MigrationPolicy CRD). Held `--after stormcos#1038`; the live run is stormvm#132's (two test nodes).
+2026-11-18: back with stormcos#1038 in_release (3045fd0). stormvm#132 is proposed after this issue, so holding #397 for the live
+post-copy run would be circular (as #390/#381). Shipped, proof: the node serves MigrationPolicyList; the live switch is stormvm#132's
+(its run needs a MigrationPolicy with allowPostCopy: true).
 
 ### Shipped (proof pending): #393 (P0), exec cannot find cilium's postStart `bash` (12.93 tombstoned)
 
