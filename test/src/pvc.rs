@@ -19,6 +19,11 @@
 //!   400 MiB.
 //! - `pvc-snapshot-deleted`: deleting the snapshot deletes its content
 //!   (`deletionPolicy: Delete`).
+//! - `pvc-tier-fast` (#400): where StorageClass `stormblock-fast` is (tier
+//!   `fast`, stormcos#1039), a 64Mi claim of it binds, a pod writes and reads
+//!   it, and its `ProvisioningSucceeded` event says `its writes on tier fast`
+//!   (the kubelet sent the tier on the blank's clone). A skip where the class
+//!   is not there (a node with no SSD beside a rotating system drive).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -32,6 +37,9 @@ use crate::report::{Outcome, Report};
 
 const MARGIN: Duration = Duration::from_secs(20);
 const SNAP_API: &str = "/apis/snapshot.storage.k8s.io/v1";
+/// The fast tier's class (stormcos#1039) and the tier it names (#400).
+pub const FAST_CLASS: &str = "stormblock-fast";
+pub const FAST_TIER: &str = "fast";
 const SEED: u64 = 379;
 const BYTES: u64 = 8 * MIB;
 
@@ -55,7 +63,27 @@ pub fn restored_claim(env: &Env, name: &str, request: &str, snap: &str) -> Value
     c
 }
 
-/// A pod pinned to the node holding `claim`, running `grows` on it: the
+/// A 64Mi claim of [`FAST_CLASS`].
+pub fn fast_claim(env: &Env, name: &str) -> Value {
+    let mut c = k8s::claim(env, name, "64Mi");
+    c["spec"]["storageClassName"] = json!(FAST_CLASS);
+    c
+}
+
+/// Why StorageClass `sc` (the [`FAST_CLASS`] read) is no fast tier of the
+/// built-in driver, or `None` when it is.
+pub fn fast_class_missing(sc: Option<&Value>) -> Option<String> {
+    match sc {
+        None => Some(format!("no StorageClass {FAST_CLASS} (stormcos#1039: a node with an SSD beside a rotating system drive)")),
+        Some(c) if s(c, "/provisioner") != PROVISIONER => Some(format!("StorageClass {FAST_CLASS} is {:?}'s", s(c, "/provisioner"))),
+        Some(c) if s(c, "/parameters/tier") != FAST_TIER => {
+            Some(format!("StorageClass {FAST_CLASS} names tier {:?}, not {FAST_TIER}", s(c, "/parameters/tier")))
+        }
+        Some(_) => None,
+    }
+}
+
+/// The pod pinned to the node holding `claim`, running `grows` on it: the
 /// pattern written (or read back), then its filesystem waited on until it
 /// holds `want` bytes.
 pub fn grows_pod(env: &Env, name: &str, claim: &str, want: u64) -> Value {
@@ -252,6 +280,36 @@ impl Suite {
         }
     }
 
+    /// #400: a claim of the fast class binds, holds data, and the kubelet says
+    /// its clone was sent tier fast.
+    async fn tier_fast(&self) -> Outcome {
+        let sc = match self.api.get(&format!("/apis/storage.k8s.io/v1/storageclasses/{FAST_CLASS}")).await {
+            Ok(sc) => sc,
+            Err(e) => return Outcome::Infra(e),
+        };
+        if let Some(why) = fast_class_missing(sc.as_ref()) {
+            return Outcome::Skip(why);
+        }
+        let within = self.env.budget(Duration::from_secs(300), MARGIN);
+        if let Err(e) = self.api.create(&k8s::pvcs(&self.env), &fast_claim(&self.env, "fast")).await {
+            return Outcome::Infra(e);
+        }
+        if let Err(e) = self.api.create(&k8s::pods(&self.env), &grows_pod(&self.env, "fast-pod", "fast", 32 * MIB)).await {
+            return Outcome::Infra(e);
+        }
+        let pod = match self.finished("fast-pod", within).await {
+            Ok(d) => d,
+            Err(e) => return Outcome::Fail(format!("a pod on the fast claim: {e}")),
+        };
+        let events = k8s::events_for(&self.env, &self.api, "PersistentVolumeClaim", "fast").await.unwrap_or_default();
+        let want = format!("its writes on tier {FAST_TIER}");
+        match events.iter().find(|e| e.starts_with("ProvisioningSucceeded:")) {
+            Some(e) if e.contains(&want) => Outcome::Pass(format!("pod: {pod}; {e}")),
+            Some(e) => Outcome::Fail(format!("the claim's event does not say {want:?}: {e}")),
+            None => Outcome::Fail(format!("no ProvisioningSucceeded event on the fast claim: {events:?}")),
+        }
+    }
+
     async fn snapshot_deleted(&self) -> Outcome {
         let path = format!("{}/grow-snap", snapshots(&self.env));
         let content = match self.api.get(&path).await {
@@ -285,24 +343,26 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
         }
     };
     let vscs = api.list(&format!("{SNAP_API}/volumesnapshotclasses")).await.ok().flatten().unwrap_or_default();
-    if let Some(why) = classes_missing(sc.as_ref(), &vscs) {
-        r.record("pvc-classes", Outcome::Skip(why), 0, None);
-        return;
-    }
-    let class = vscs.iter().find(|v| s(v, "/driver") == PROVISIONER).map(|v| s(v, "/metadata/name").to_string()).unwrap_or_default();
-    r.record("pvc-classes", Outcome::Pass(format!("{CLASS} expands; VolumeSnapshotClass {class}")), 0, None);
-
     let suite = Suite { env: env.clone(), api: api.clone() };
-    let grew = r.run("pvc-grow", suite.grow()).await;
-    if grew {
-        r.run("pvc-shrink-refused", suite.shrink_refused()).await;
+    match classes_missing(sc.as_ref(), &vscs) {
+        Some(why) => r.record("pvc-classes", Outcome::Skip(why), 0, None),
+        None => {
+            let class = vscs.iter().find(|v| s(v, "/driver") == PROVISIONER).map(|v| s(v, "/metadata/name").to_string()).unwrap_or_default();
+            r.record("pvc-classes", Outcome::Pass(format!("{CLASS} expands; VolumeSnapshotClass {class}")), 0, None);
+            let grew = r.run("pvc-grow", suite.grow()).await;
+            if grew {
+                r.run("pvc-shrink-refused", suite.shrink_refused()).await;
+            }
+            let cut = grew && r.run("pvc-snapshot", suite.snapshot(&class)).await;
+            if cut {
+                r.run("pvc-restore", suite.restore()).await;
+            }
+            // Before the claims go: the snapshot's content is deleted from its claim's node.
+            r.run("pvc-snapshot-deleted", suite.snapshot_deleted()).await;
+        }
     }
-    let cut = grew && r.run("pvc-snapshot", suite.snapshot(&class)).await;
-    if cut {
-        r.run("pvc-restore", suite.restore()).await;
-    }
-    // Before the claims go: the snapshot's content is deleted from its claim's node.
-    r.run("pvc-snapshot-deleted", suite.snapshot_deleted()).await;
+    // The fast tier needs none of #379's classes, only its own (stormcos#1039).
+    r.run("pvc-tier-fast", suite.tier_fast()).await;
     if let Err(e) = k8s::drain(&env, &api, Duration::from_secs(30)).await {
         r.record("cleanup", Outcome::Infra(e), 0, None);
     }
@@ -321,6 +381,18 @@ mod tests {
         let why = classes_missing(Some(&fixed), &[]).unwrap();
         assert!(why.contains("does not allow volume expansion") && why.contains("no VolumeSnapshotClass"), "{why}");
         assert!(classes_missing(None, &[vsc]).unwrap().contains("no StorageClass"));
+    }
+
+    #[test]
+    fn the_fast_class_is_judged() {
+        let fast = json!({ "provisioner": PROVISIONER, "parameters": { "tier": "fast" } });
+        assert_eq!(fast_class_missing(Some(&fast)), None);
+        assert!(fast_class_missing(None).unwrap().contains("no StorageClass stormblock-fast"));
+        let bulk = json!({ "provisioner": PROVISIONER, "parameters": { "tier": "bulk" } });
+        assert!(fast_class_missing(Some(&bulk)).unwrap().contains("names tier \"bulk\""));
+        let c = fast_claim(&k8s::tests::env(), "fast");
+        assert_eq!(c["spec"]["storageClassName"], "stormblock-fast");
+        assert_eq!(c["spec"]["resources"]["requests"]["storage"], "64Mi");
     }
 
     #[test]

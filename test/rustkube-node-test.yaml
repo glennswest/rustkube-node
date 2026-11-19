@@ -23,7 +23,9 @@
 #             pvc (< 15 min, on request): a built-in claim grown online
 #             under its pod, a VolumeSnapshot of it restored into a larger
 #             claim, the snapshot's content deleted with it (#379); a skip
-#             until stormcos#1032's classes are on the node.
+#             until stormcos#1032's classes are on the node. And a
+#             stormblock-fast claim's clone on tier fast (#400; a skip
+#             without stormcos#1039's class).
 #   requires: []            (storage comes from the node's stormblock engine
 #                            through the kubelet. Where the class is not
 #                            offered — no StorageClass stormblock of

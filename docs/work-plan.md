@@ -15,6 +15,10 @@ Done: 590d62b (tier on the clone, `fast`, test), 9a102f5 (ProvisioningSucceeded 
 spurious failure: `sc-build scripts/sc-build.sh`, that script is gone (#51); use plain `sc-build`.) Held `--after stormcos#1039`
 (server8's SSD `fast` slab and the `stormblock-fast` class). Resume: on server8, a `stormblock-fast` PVC bound, its event says
 `its writes on tier fast`, and `GET /api/v1/volumes/{id}/legs` shows the `fast` slab → close #400.
+2026-11-19 (resumed: stormcos#1039 in_release). Adding test case `pvc-tier-fast` to the `pvc` suite (a `stormblock-fast` claim
+binds, a pod writes/reads it, ProvisioningSucceeded says `its writes on tier fast`; skip without the class), so the proof is a
+run on server8: `stormcentral test run rustkube-node pvc` once an install carries rustkube-node 9a102f5+ and stormcos#1039. Then
+hold `--after-install rustkube-node>=<this commit>@server8`.
 
 ### Shipped (proof pending): #167 (P0), kubelet talks to sbregistry over TLS with the engine token (stormblock-registry#55)
 

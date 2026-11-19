@@ -92,7 +92,9 @@ cluster_read = [
 # its content deleted with it. Claims, pods and VolumeSnapshots are made in
 # the run's namespace (its Role). Reads the StorageClass and the
 # VolumeSnapshotClasses (stormcos#1032 ships them) and the content a snapshot
-# is bound to. On request (`stormcentral test run rustkube-node pvc`).
+# is bound to. `pvc-tier-fast` (#400) reads StorageClass stormblock-fast
+# (stormcos#1039) by the same storageclasses read. On request
+# (`stormcentral test run rustkube-node pvc`).
 budget_secs = 900
 cluster_read = [
   { apiGroup = "", resource = "nodes" },

@@ -25,6 +25,8 @@
 //! - `pvc` (< 15 min, #379, on request only): a claim of the built-in class
 //!   grown online under its pod, a `VolumeSnapshot` of it, and that snapshot
 //!   restored into a larger claim (`pvc.rs`). Needs stormcos#1032's classes.
+//!   And a claim of `stormblock-fast` says its clone writes to tier fast
+//!   (#400; a skip without stormcos#1039's class).
 //! - `long` (the night): waves of pods sized from the node's capacity,
 //!   measuring start latency and what each wave leaves behind (`long.rs`).
 //!
