@@ -147,6 +147,8 @@ the five largest committed volumes. Then sc-build, stage, and the suite again on
 Done: 9de861a. sc-build passed (VM sc-build-9caf34115d; full `cargo test --locked`), capacity tests 8/8 incl. the new one and
 no clippy finding in capacity.rs (job 6aca965920). Stage build ae84e748ffba. Held `--after-install rustkube-node>=9de861a@any:pve`.
 Resume: `stormcentral test run rustkube-node pvc`; if a refusal still says 0 left, its `largest:` names what to look at next.
+2026-11-19: 12.96 carries rustkube-node 6682813 ⊇ 9de861a (passed on pvetest2, flowsdn). Suite `pvc` at 6682813: runs
+96c71a4214 (pvetest2) and 2a90785356 (pvetest3, cilium, its 12.96 install still running). Pass → shipped + close #379.
 
 ### Shipped (proof pending): #383 (P0), a template listed `broken` is waited on forever (server8 12.92, pvc-ext4j-64m)
 
