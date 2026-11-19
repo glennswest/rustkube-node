@@ -4,6 +4,13 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #415, stormvm → ac884c7 (cloud-hypervisor disks state image_type=raw, stormvm#134)
+
+2026-11-19. Rev-only bump of every stormvm git dep (2a60a3c → ac884c7, 196d128): `--disk …,image_type=raw` on every disk and
+`"image_type": "Raw"` on `vm.add-disk`, so chv v53 no longer guesses a blank data disk raw and refuses sector-0 writes (mkfs EIO,
+buildbox2#52, blocks stormcentral#1457). No kubelet code changes. Then sc-build, stage, shipped (proof: stormvm medium's
+`chv-data-disk-mkfs`).
+
 ### Done: #410 and #411, stub sweep flags the vendored CRI api.proto and retry's 501 test
 
 2026-11-19. The four lines (`api.proto` 625/677/1234/1738) are kubernetes/cri-api's own comment on `label_selector`, which is a
