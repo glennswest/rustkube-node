@@ -13,6 +13,10 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
   and closed); clippy `-p kubelet --all-targets -D warnings` names nothing in the changed lines (the rest is #385/#386).
   Stage build 431db0a4429b. Held `--after-install rustkube-node>=779cbf1`: the check is sc's medium `logs-follow-ends`
   (and `cmd-debug-command`/`cmd-debug-exit`) on a machine running it; no node keeps a finished pod an install proof could read.
+- 2026-11-19: install met (pvetest2 12.96-flowsdn, 16:06Z). Every sc medium run predates it (newest a8323af680 15:17Z on 12.95),
+  and this session's token cannot start sc's suite. So the check moves into rustkube-node's own medium suite: `pod-logs-follow-ends`
+  (a finished pod's `log?follow=true` ends within 20 s; a running pod's followed log ends once it exits). Then sc-build, run
+  rustkube-node medium on pvetest2, close #416 on its pass.
 
 ### Waiting on stormvm medium 38f972439d (pvetest2): #415, stormvm → ac884c7 (cloud-hypervisor disks state image_type=raw, stormvm#134)
 
