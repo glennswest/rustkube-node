@@ -12,6 +12,8 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 - Fix (test only): the no-agent guest also masks systemd-debug-generator (link to /dev/null in
   /etc/systemd/system-generators) and `stormvm-seal.service`, so its copy has neither way in and must end Failed.
   Docs (README, vm_golden) say a guest with the unit but no agent seals. Then sc-build, rerun golden on pvetest3.
+- c67e99d. sc-build-57672419e4: test crate's `cargo test` + clippy `-D warnings`, and the workspace build, passed. Golden run
+  e8a109ddd9 queued on pvetest3 (12.96). Held `--after-run e8a109ddd9`. Resume: all four golden tests pass → close #399.
 
 ### Done: #416 (P2), logs follow=true never ends for a terminated container
 - Cause: `container_logs`' follow loop ended only when the pod left the node (`pod_uid` none).
