@@ -156,6 +156,11 @@ a private bind, so stormpump's later claim mount at /run/stormpump/pvc/<dev> is 
 pvc-tier-fast failed separately: the pod mount refuses class stormblock-fast (#400's, noted there).
 Doing: `claim_dir(device, mount)` opens the claim where its st_dev is the device's maj:min (/proc/1/root<mount>, <mount>,
 /hostroot<mount>), used by grow_mounted and by the fsGroup walk; mount_of matches maj:min too; test prints the claim's events on fail.
+Done: d3fab69. sc-build passed (sc-build-6837a325b2: 695 kubelet unit incl. 3 new; sc-build-63e42371d4: test crate clippy -D warnings
++ 69 tests, kubelet clippy nothing in pvc_resize/volume_ownership/the fsGroup call). Stage build 8ffd40ec379d. 96c71a4214 cancelled
+(old code). pvc-tier-fast's refusal commented on #400 (provisioned_here takes only `stormblock`).
+Resume: held `--after-install rustkube-node>=d3fab69@any:pve`; then `stormcentral test run rustkube-node pvc`. A stuck grow now prints the
+claim's events (FileSystemResizeFailed names each place tried). Pass → shipped with proof / close #379.
 
 ### Shipped (proof pending): #383 (P0), a template listed `broken` is waited on forever (server8 12.92, pvc-ext4j-64m)
 
