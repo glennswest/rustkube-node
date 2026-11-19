@@ -184,7 +184,7 @@ claim's events (FileSystemResizeFailed names each place tried). Pass → shipped
   Stage build b3e26b8573c7. Shipped with proof `log:warm probes: container \(3 times\), claim and VM` (a passed install
   gates on the warm claim probe, stormcentral testhosts.rs warm_verdict). #387 (a real broken-template case) waits on stormblock#664.
 
-### In progress: #381 (P1), VirtualMachineRestore waits up to 60 s: vm_maintenance_loop does not watch restores (stormvm#127)
+### Done: #381 (P1), VirtualMachineRestore waits up to 60 s: vm_maintenance_loop does not watch restores (stormvm#127)
 
 2026-11-18. Confirmed: the loop observes snapshots, goldens, VMs, VMIs, not `virtualmachinerestores`; a new restore waits for an unrelated
 event or the sweep's requeue (≤ `SWEEP_EVERY`, 60 s). Fix: the watched paths as one constant `VM_MAINTENANCE_WATCHES` with restores in
@@ -195,6 +195,10 @@ Done: d6a1408 (unit test; sc-build 651 kubelet unit, clippy, no warning on a cha
 `show` it): `snapshot-restore`'s claim at ≲ 2 s from the POST → close #381 quoting it.
 2026-11-18: pvetest2 (12.93-flowsdn, 4d0cb9f) carries d6a1408; a session may not run stormvm's suite (403). Last medium 5665334161
 (pvetest3, before the fix): complete in 27058 ms. Told stormvm#127 (its close condition is this check); held `--after stormvm#127`.
+2026-11-19: seen live. stormvm medium d592a8302e (pvetest1, 11-18 21:05, installed 20:50 with a release ≥ 12.93, all of which carry
+d6a1408: the next newest-release runs went to pvetest1 and server8, which runs 12.94): `snapshot-restore` claim at 259 ms, complete at
+523 ms; `memsnap-restore` claim at 284 ms, complete at 559 ms (before: 27-35 s, luckiest 2.0 s). Later runs 962d779375/abecfa0130
+(12.96) errored before testing (apiserver /readyz). Closed #381; told stormvm#127.
 
 ### In progress: #380 (P0), VM backups off the node: the kubelet's half of stormvm#31 (decision A)
 
