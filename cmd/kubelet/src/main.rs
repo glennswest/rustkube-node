@@ -58,8 +58,16 @@ struct Cli {
     pod_manifest_path: String,
 
     /// Where the registry that mints image clones lives (--runtime=stormpump).
+    /// The engine's token goes with every request, as `Bearer`, over TLS or to
+    /// this host only (#167, stormblock-registry#55).
     #[arg(long, default_value = "http://127.0.0.1:5100")]
     registry: String,
+
+    /// The CA file an https:// --registry is verified against, and nothing
+    /// else is (#167), read at each new connection as --stormblock-ca is.
+    /// Required with https://, unused with http://.
+    #[arg(long, env = "REGISTRY_CA_FILE")]
+    registry_ca: Option<String>,
 
     /// This node's stormblock engine API: claims, VM disks and pulled images
     /// are cloned and attached through it. Its token is read from
@@ -298,10 +306,19 @@ fn container_log_rotation(size: &str, files: usize) -> anyhow::Result<kubelet::c
 /// The engine's CA (#312): an empty value is none, and an `https://` engine
 /// with none could never be reached, so that is said at start.
 fn engine_ca(url: &str, ca: Option<&str>) -> anyhow::Result<Option<std::path::PathBuf>> {
+    service_ca("--stormblock", url, "--stormblock-ca", "engine", ca)
+}
+
+/// The registry's CA (#167), checked as the engine's is.
+fn registry_ca(url: &str, ca: Option<&str>) -> anyhow::Result<Option<std::path::PathBuf>> {
+    service_ca("--registry", url, "--registry-ca", "registry", ca)
+}
+
+fn service_ca(flag: &str, url: &str, ca_flag: &str, what: &str, ca: Option<&str>) -> anyhow::Result<Option<std::path::PathBuf>> {
     let ca = ca.map(str::trim).filter(|c| !c.is_empty());
     anyhow::ensure!(
         ca.is_some() || !url.to_ascii_lowercase().starts_with("https://"),
-        "--stormblock {url} needs --stormblock-ca: an https engine is verified against that CA and nothing else"
+        "{flag} {url} needs {ca_flag}: an https {what} is verified against that CA and nothing else"
     );
     Ok(ca.map(std::path::PathBuf::from))
 }
@@ -462,6 +479,7 @@ async fn main() -> anyhow::Result<()> {
     // engine mints it at start), and the client keeps looking for it.
     let engine_ca = engine_ca(&cli.stormblock, cli.stormblock_ca.as_deref())?;
     let engine = kubelet::engine::EngineClient::from_env_with_ca(&cli.stormblock, engine_ca.as_deref());
+    let registry_ca = registry_ca(&cli.registry, cli.registry_ca.as_deref())?;
     tracing::info!("stormblock engine: {engine:?}");
     kubelet::startup::mark("engine");
 
@@ -513,6 +531,8 @@ async fn main() -> anyhow::Result<()> {
                         kubelet::stormpump_runtime::StormpumpImages::new(
                             cli.registry.clone(),
                         )
+                        // TLS from the node CA and the engine's token (#167).
+                        .with_tls(registry_ca.as_deref(), kubelet::engine::TokenSource::from_env())
                         .with_image_configs(configs)
                         // Goldens carried and not mounted are found there (#294).
                         .with_roots(roots),
@@ -803,6 +823,14 @@ mod tests {
             Some(std::path::PathBuf::from("/data/stormcert/ca.crt"))
         );
         assert_eq!(engine_ca("http://127.0.0.1:9090", None).unwrap(), None);
+        // The registry's the same (#167).
+        let e = registry_ca("https://127.0.0.1:5100", None).unwrap_err().to_string();
+        assert!(e.contains("--registry https://127.0.0.1:5100 needs --registry-ca"), "{e}");
+        assert_eq!(
+            registry_ca("https://127.0.0.1:5100", Some("/data/stormcert/ca.crt")).unwrap(),
+            Some(std::path::PathBuf::from("/data/stormcert/ca.crt"))
+        );
+        assert_eq!(registry_ca("http://127.0.0.1:5100", None).unwrap(), None);
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {

@@ -21,7 +21,8 @@ An em dash means there is no environment binding or the value is unset.
 | `--register-with-taints` | `REGISTER_WITH_TAINTS` | Empty; `key=value:Effect` or `key:Effect`, on Node creation only |
 | `--pod-manifest-path` | `POD_MANIFEST_PATH` | `/etc/kubernetes/manifests`; empty string disables static Pods |
 | `--runtime` | — | `native`; choices `native`, `cri`, `stormpump` (`vm` and `--vmm` retired, #13) |
-| `--registry` | — | `http://127.0.0.1:5100`; sbregistry (stormblock-registry), which mints image clones, with `--runtime stormpump` |
+| `--registry` | — | `http://127.0.0.1:5100`; sbregistry (stormblock-registry), which mints image clones, with `--runtime stormpump`. The engine's token (as `--stormblock` finds it) goes as `Bearer` over `https://`, or in clear only to this host (#167) |
+| `--registry-ca` | `REGISTRY_CA_FILE` | none; the CA file an `https://` `--registry` is verified against, and nothing else is, read at each new connection as `--stormblock-ca` is (#167). Unused with `http://` |
 | `--stormblock` | `STORMBLOCK_URL` | `http://127.0.0.1:9090`; engine for claims, VM disks and images. `https://` needs `--stormblock-ca` (#312) |
 | `--stormblock-ca` | `STORMBLOCK_CA_FILE` | none; the CA file an `https://` `--stormblock` is verified against, and nothing else is. Unused with `http://` |
 | `--cri-socket` | `CRI_SOCKET` | CRI auto-detection, or `/run/stormpump.sock` for stormpump |
@@ -150,6 +151,13 @@ retrying once only if changed. Until the engine has accepted a token (a boot,
 50 ms, up to 3 s) and retries with the new token: the engine can answer before
 it writes this boot's token, and a fallback file can still hold last boot's.
 A wait that gives up is not repeated for the same token.
+
+Registry TLS (#167, stormblock-registry#55) is the same, with `--registry` and
+`--registry-ca`: once the registry serves `:5100` from a stormcert pair
+(stormcos#355), the node runs `--registry https://127.0.0.1:5100 --registry-ca
+/data/stormcert/ca.crt`. Every request carries the engine's token, which the
+registry takes as admin (`/v1/clones` needs it). The token is re-read at each
+request. It is never sent in clear to another host.
 
 Engine TLS (#312, stormcos#374): the URL's scheme decides. `https://` with no
 `--stormblock-ca` stops the kubelet at start; there are no public roots and no

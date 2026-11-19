@@ -2462,6 +2462,10 @@ pub struct StormpumpImages {
     /// The registry's base URL, e.g. `http://127.0.0.1:5100`.
     registry: String,
     http: reqwest::Client,
+    /// The engine's token, sent as `Bearer` (#167, stormblock-registry#55):
+    /// the registry takes it as admin, which `/v1/clones` needs. Read at each
+    /// request, so a token the engine mints or rotates after start is used.
+    token: crate::engine::TokenSource,
     /// image ref -> the reference a container is created from
     /// (`template:<name>`, the image's sealed golden here), for images whose
     /// golden this kubelet has already found. Keyed on the ref as written: a
@@ -2578,11 +2582,39 @@ impl StormpumpImages {
         StormpumpImages {
             registry: registry.into(),
             http: reqwest::Client::new(),
+            token: crate::engine::TokenSource::none(),
             pulled: Mutex::new(HashMap::new()),
             configs: Arc::default(),
             release_manifest: None,
             host_nqn: node_host_nqn(),
             roots: None,
+        }
+    }
+
+    /// Reach the registry as the node rule says (#167, stormblock-registry#55):
+    /// an `https://` registry is verified against `ca` and nothing else (no
+    /// public roots; none given, an https registry is refused), re-read at
+    /// each new connection as the engine's is (#312), and `token` goes with
+    /// every request.
+    pub fn with_tls(mut self, ca: Option<&std::path::Path>, token: crate::engine::TokenSource) -> StormpumpImages {
+        let trust = crate::engine::EngineTrust::for_service(ca, "registry", "--registry-ca");
+        self.http = reqwest::Client::builder()
+            .use_preconfigured_tls(trust.client_config())
+            .build()
+            .expect("the registry's HTTP client builds with its own rustls config");
+        self.token = token;
+        self
+    }
+
+    /// A request to the registry, with the token when there is one and it
+    /// may be sent: over TLS, or to this host (the registry refuses a
+    /// credential sent in clear from off the host, and the kubelet does not
+    /// send one).
+    pub(crate) fn request(&self, method: reqwest::Method, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+        let rb = self.http.request(method, url);
+        match self.token.read() {
+            Some(t) if may_send_token(&self.registry) => rb.bearer_auth(t),
+            _ => rb,
         }
     }
 
@@ -2626,7 +2658,7 @@ impl StormpumpImages {
         if let Ok(mut path) = url.path_segments_mut() {
             path.pop_if_empty().extend(["v1", "goldens", image]);
         }
-        let config = match self.http.get(url.clone()).timeout(CONFIG_LOOKUP_TIMEOUT).send_retrying(retry::Policy::REGISTRY).await {
+        let config = match self.request(reqwest::Method::GET, url.clone()).timeout(CONFIG_LOOKUP_TIMEOUT).send_retrying(retry::Policy::REGISTRY).await {
             Ok(r) if r.status().is_success() => r
                 .json::<serde_json::Value>()
                 .await
@@ -2652,8 +2684,7 @@ impl StormpumpImages {
     async fn demand(&self, image: &str) -> Result<Option<serde_json::Value>, String> {
         let url = format!("{}/v1/clones", self.registry.trim_end_matches('/'));
         let resp = self
-            .http
-            .post(&url)
+            .request(reqwest::Method::POST, &url)
             .json(&clone_request(image, self.host_nqn.as_deref()))
             .send_retrying(retry::Policy::REGISTRY)
             .await
@@ -2667,7 +2698,7 @@ impl StormpumpImages {
         }
         // Ready in the meantime: the clone is not wanted (#104).
         if let Some(id) = answer["id"].as_str() {
-            let gone = self.http.delete(format!("{url}/{id}")).send_retrying(retry::Policy::REGISTRY).await;
+            let gone = self.request(reqwest::Method::DELETE, format!("{url}/{id}")).send_retrying(retry::Policy::REGISTRY).await;
             if !matches!(gone, Ok(ref r) if r.status().is_success() || r.status().as_u16() == 404) {
                 tracing::warn!(image = %image, clone = %id, "a registry clone minted by the demand was not deleted (the registry reaps it)");
             }
@@ -2676,7 +2707,7 @@ impl StormpumpImages {
         if let Ok(mut path) = again.path_segments_mut() {
             path.pop_if_empty().extend(["v1", "goldens", image]);
         }
-        let record = match self.http.get(again).send_retrying(retry::Policy::REGISTRY).await {
+        let record = match self.request(reqwest::Method::GET, again).send_retrying(retry::Policy::REGISTRY).await {
             Ok(r) if r.status().is_success() => r.json().await.ok(),
             _ => None,
         };
@@ -2902,8 +2933,7 @@ impl StormpumpImages {
             path.pop_if_empty().extend(["v1", "goldens", image]);
         }
         let resp = self
-            .http
-            .get(url.clone())
+            .request(reqwest::Method::GET, url.clone())
             .send_retrying(retry::Policy::REGISTRY)
             .await
             .map_err(|e| CriError::ImagePull(format!("registry {url} did not answer for {image}: {e}")))?;
@@ -2929,6 +2959,25 @@ impl StormpumpImages {
         // What it is and where it came from (#130).
         self.configs.put_provenance(&reference, crate::image_config::provenance_of_record(&record));
         Ok(reference)
+    }
+}
+
+/// Whether a credential may go to the registry at `url`: over `https://`, or
+/// in clear only to this host (#167).
+fn may_send_token(url: &str) -> bool {
+    let Ok(u) = reqwest::Url::parse(url) else { return false };
+    match u.scheme() {
+        "https" => true,
+        "http" => match u.host_str() {
+            Some(h) if h.eq_ignore_ascii_case("localhost") => true,
+            Some(h) => h
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|a| a.is_loopback()),
+            None => false,
+        },
+        _ => false,
     }
 }
 
@@ -3990,6 +4039,42 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (url, state)
+    }
+
+    /// #167: the token goes over TLS, or in clear only to this host; never
+    /// in clear across the network, and not at all when there is none.
+    #[test]
+    fn the_registry_token_is_sent_over_tls_or_to_this_host_only() {
+        for (url, ok) in [
+            ("https://127.0.0.1:5100", true),
+            ("https://node1.g16.lo:5100", true),
+            ("http://127.0.0.1:5100", true),
+            ("http://localhost:5100", true),
+            ("http://[::1]:5100", true),
+            ("http://192.168.16.101:5100", false),
+            ("http://node1.g16.lo:5100", false),
+            ("not a url", false),
+        ] {
+            assert_eq!(may_send_token(url), ok, "{url}");
+        }
+        let token = || crate::engine::TokenSource::files([write_token("t0k")]);
+        let auth = |img: &StormpumpImages, url: &str| {
+            img.request(reqwest::Method::GET, url).build().unwrap().headers().get("authorization").map(|v| v.to_str().unwrap().to_string())
+        };
+        let local = StormpumpImages::new("http://127.0.0.1:5100").with_tls(None, token());
+        assert_eq!(auth(&local, "http://127.0.0.1:5100/v1/goldens/x").as_deref(), Some("Bearer t0k"));
+        let remote = StormpumpImages::new("http://192.168.16.101:5100").with_tls(None, token());
+        assert_eq!(auth(&remote, "http://192.168.16.101:5100/v1/goldens/x"), None);
+        let none = StormpumpImages::new("http://127.0.0.1:5100");
+        assert_eq!(auth(&none, "http://127.0.0.1:5100/v1/goldens/x"), None, "no token source: no header");
+    }
+
+    /// A token file for a test, kept for the test's life.
+    fn write_token(t: &str) -> std::path::PathBuf {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let f = dir.join("api_token");
+        std::fs::write(&f, t).unwrap();
+        f
     }
 
     /// #236, end to end: the demand a pull posts names this host.

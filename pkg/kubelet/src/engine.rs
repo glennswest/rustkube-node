@@ -142,7 +142,7 @@ impl TokenSource {
     }
 
     /// The token as it is now, or `None` when none is found yet.
-    fn read(&self) -> Option<String> {
+    pub(crate) fn read(&self) -> Option<String> {
         if let Some(t) = &self.explicit {
             return Some(t.clone());
         }
@@ -196,6 +196,10 @@ struct Inner {
 #[derive(Debug)]
 pub struct EngineTrust {
     ca: Option<PathBuf>,
+    /// What is verified, and the flag naming its CA, for the log (#167: the
+    /// registry is verified the same way).
+    what: &'static str,
+    flag: &'static str,
     provider: Arc<rustls::crypto::CryptoProvider>,
     /// The CA's bytes as last used, and the verifier made from them.
     current: Mutex<Option<(Vec<u8>, Arc<rustls::client::WebPkiServerVerifier>)>>,
@@ -205,8 +209,16 @@ pub struct EngineTrust {
 
 impl EngineTrust {
     pub fn new(ca: Option<&Path>) -> EngineTrust {
+        EngineTrust::for_service(ca, "stormblock engine", "--stormblock-ca")
+    }
+
+    /// The same check for another node API (#167: sbregistry's `:5100`),
+    /// named `what` in the log, its CA given by `flag`.
+    pub fn for_service(ca: Option<&Path>, what: &'static str, flag: &'static str) -> EngineTrust {
         EngineTrust {
             ca: ca.map(Path::to_path_buf),
+            what,
+            flag,
             provider: Arc::new(rustls::crypto::ring::default_provider()),
             current: Mutex::new(None),
             said: Mutex::new(None),
@@ -216,7 +228,7 @@ impl EngineTrust {
     fn say(&self, what: String) {
         let mut said = self.said.lock().unwrap_or_else(|e| e.into_inner());
         if said.as_deref() != Some(what.as_str()) {
-            warn!("stormblock engine TLS: {what}");
+            warn!("{} TLS: {what}", self.what);
             *said = Some(what);
         }
     }
@@ -239,7 +251,7 @@ impl EngineTrust {
     /// The verifier to use for a connection being made now.
     fn verifier(&self) -> Result<Arc<rustls::client::WebPkiServerVerifier>, String> {
         let Some(path) = &self.ca else {
-            return Err("an https engine URL needs a CA, and no --stormblock-ca was given".to_string());
+            return Err(format!("an https {} URL needs a CA, and no {} was given", self.what, self.flag));
         };
         let read = std::fs::read(path);
         let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
@@ -250,7 +262,7 @@ impl EngineTrust {
                 }
                 match self.build(&pem) {
                     Ok(verifier) => {
-                        info!("stormblock engine TLS: verifying against {}", path.display());
+                        info!("{} TLS: verifying against {}", self.what, path.display());
                         *current = Some((pem, verifier.clone()));
                         return Ok(verifier);
                     }
@@ -269,7 +281,7 @@ impl EngineTrust {
     }
 
     /// The client TLS config: this verifier, no client certificate.
-    fn client_config(self) -> rustls::ClientConfig {
+    pub fn client_config(self) -> rustls::ClientConfig {
         rustls::ClientConfig::builder_with_provider(self.provider.clone())
             .with_safe_default_protocol_versions()
             .expect("ring's provider supports the default TLS versions")
@@ -1107,6 +1119,32 @@ mod tests {
         assert_eq!(c.get(&path).await.unwrap().status(), StatusCode::OK);
         assert_eq!(c.post(&path, &serde_json::json!({})).await.unwrap().status(), StatusCode::OK);
         assert_eq!(*seen.lock().unwrap(), ["Bearer node", "Bearer node"]);
+    }
+
+    /// #167: the registry's client, verified against `--registry-ca` the way
+    /// the engine's is, sends the engine token; another CA's certificate, or
+    /// no CA at all, reaches nothing and sends nothing.
+    #[tokio::test]
+    async fn the_registry_over_tls_is_verified_against_its_ca_and_sent_the_token() {
+        use crate::stormpump_runtime::StormpumpImages;
+        let dir = tempfile::tempdir().unwrap();
+        let ca = TestCa::new();
+        let file = dir.path().join("ca.crt");
+        std::fs::write(&file, ca.pem()).unwrap();
+        let token = || TokenSource { explicit: Some("engine-token".into()), files: vec![], env: "$X" };
+
+        let (url, seen) = ca.engine("127.0.0.1").await;
+        let img = StormpumpImages::new(&url).with_tls(Some(&file), token());
+        let r = img.request(Method::GET, format!("{url}/api/v1/volumes")).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(*seen.lock().unwrap(), ["Bearer engine-token"]);
+
+        let (url, seen) = TestCa::new().engine("127.0.0.1").await;
+        let img = StormpumpImages::new(&url).with_tls(Some(&file), token());
+        assert!(img.request(Method::GET, format!("{url}/api/v1/volumes")).send().await.is_err(), "another CA");
+        let img = StormpumpImages::new(&url).with_tls(None, token());
+        assert!(img.request(Method::GET, format!("{url}/api/v1/volumes")).send().await.is_err(), "no CA");
+        assert!(seen.lock().unwrap().is_empty(), "nothing reached it");
     }
 
     /// The other half: another CA's certificate fails the handshake, so

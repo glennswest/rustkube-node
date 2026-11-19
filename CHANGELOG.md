@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-19
+
+- **feat:** The kubelet reaches sbregistry under the node rule (#167, stormblock-registry#55). `--registry-ca` (`REGISTRY_CA_FILE`) is the CA an `https://` `--registry` is verified against, and nothing else is. Like `--stormblock-ca` (#312), it is read at each new connection, and an `https://` registry with no CA stops the kubelet at start. Every request (golden records, `/v1/clones`, deleting a stray clone) carries the engine's token as `Bearer`, which the registry takes as admin. It is read at each request, so a token minted or rotated after start is used. It goes over TLS, or in clear only to this host (`127.0.0.1`, `::1`, `localhost`). Nothing changes until stormcos runs the kubelet with `--registry https://127.0.0.1:5100 --registry-ca /data/stormcert/ca.crt` (stormcos#355).
+
 ## 2026-11-18
 
 - **fix:** Containers' roots (`ctr-*`, #104) no longer count against the room for claims (#379). Each was charged its golden's full size, as if it were a claim. On pvetest1 and pvetest2 (12.95) the node's own pods then committed 60909Mi and 128202Mi of a 61362Mi data slab, with over 53 GiB free. So `pvc` runs ae59cdb016 and 822829e52d could not place even a 64Mi claim (`0 is left for claims`). A root is ephemeral, as upstream's writable layer is; what it writes is still bounded by the slabs' free space. A refusal now names the five volumes that commit the most (`; largest: …`), so the claim's events say what fills the node.

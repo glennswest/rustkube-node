@@ -7,7 +7,7 @@ Audited from `pkg/kubelet/src/server.rs` and the CLI at main 0c4a931 (2026-11-13
 | `0.0.0.0:10250` HTTPS | Kubelet listener, configurable with `--kubelet-port` |
 | `127.0.0.1:6443` HTTP | CLI's outbound apiserver default; stormcos overrides to node HTTPS |
 | `127.0.0.1:9090` HTTP, or HTTPS with `--stormblock-ca` (#312) | Outbound stormblock management API, `--stormblock` |
-| `127.0.0.1:5100` HTTP | Outbound sbregistry (stormblock-registry, the registry that mints image clones), `--registry` |
+| `127.0.0.1:5100` HTTP, or HTTPS with `--registry-ca` (#167) | Outbound sbregistry (stormblock-registry, the registry that mints image clones), `--registry`, with the engine's token as `Bearer` |
 | `/run/stormpump.sock` Unix socket | Default stormpump ring bootstrap; stormcos uses `/hostrun/stormpump.sock` |
 | `/var/lib/kubelet/plugins_registry/*` Unix sockets | CSI registrar discovery, then node-plugin Unix endpoints |
 | `127.0.0.1:9081`–`9085` HTTP | Outbound, read: each node service's stormd API (`[api] bind` in its golden's stormd config, found through boot.d under `/hostroot`; 9085 is this golden's own), `GET /api/v1/processes` and `/api/v1/events?since=` for mirror pods (#215). A config whose `[api]` asks for TLS or a credential is not read yet (#218) |
