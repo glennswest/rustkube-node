@@ -4,7 +4,7 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### Waiting on medium b5770e2238 (pvetest3): #416 (P2), logs follow=true never ends for a terminated container
+### Done: #416 (P2), logs follow=true never ends for a terminated container
 - Cause: `container_logs`' follow loop ended only when the pod left the node (`pod_uid` none).
 - Fix: `follow_log` asks, when a poll finds nothing new, whether the run ended:
   `PodManager::container_run_ended` (pod finished/gone, terminated for good, init done,
@@ -20,6 +20,9 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 - c3cf5fa: `pod-logs-follow-ends` (test/src/pods.rs, `Api::follow`). sc-build-04b67b7860: test crate's `cargo test` + clippy
   `-D warnings` passed. pvetest2's apiserver is not answering, so medium went to pvetest3 (12.96: rustkube-node 6682813, stage
   431db0a4429b, carries 779cbf1): run b5770e2238. Held `--after-run b5770e2238`. Resume: its `pod-logs-follow-ends` passing → close.
+- 2026-11-19: b5770e2238 (pvetest3, 12.96) `pod-logs-follow-ends` passed: a Succeeded pod's follow ended in 47 ms with
+  its log, a running pod's in 5520 ms with its log. The run's two failures (`pod-multi-ipc`, `pod-multi-stop-order`) are
+  #374's known gaps, not #416. #416 closed.
 
 ### Waiting on stormvm medium 38f972439d (pvetest2): #415, stormvm → ac884c7 (cloud-hypervisor disks state image_type=raw, stormvm#134)
 
