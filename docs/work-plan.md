@@ -82,6 +82,9 @@ Resume: once a pvetest runs a release with rustkube-node >= bb83e44 and stormcos
 pass → `shipped` with proof (a VolumeSnapshot readyToUse, a grown claim) / close #379.
 2026-11-18: 12.95 carries both (rustkube-node 8686267 ⊇ bb83e44; rustkube-apiserver at stormcos 3045fd0 ⊇ 6a4dfe5), passed on
 pvetest1/pvetest2. Suite `pvc` runs ae59cdb016 (pvetest1, cilium) and 822829e52d (pvetest2, flowsdn) at 7e13d76.
+Both failed `pvc-grow` alike: `0 is left for claims` (61362Mi total, 57962/53323Mi free, 60909/128202Mi committed). PVs
+sum to ~19 GiB: container roots (`ctr-*`, #104) are charged their golden's size. Fix: roots are not committed; the refusal names
+the five largest committed volumes. Then sc-build, stage, and the suite again on an install with it.
 
 ### Shipped (proof pending): #383 (P0), a template listed `broken` is waited on forever (server8 12.92, pvc-ext4j-64m)
 

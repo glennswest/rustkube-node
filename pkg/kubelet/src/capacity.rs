@@ -11,7 +11,13 @@
 //!   bytes (`/api/v1/slabs`, role `data`), and what is committed: the virtual
 //!   size of every writable data volume (claims, node service volumes, VM
 //!   disks). Not sealed volumes, goldens or the class blanks (`pvc-ext4j-*`),
-//!   which are what claims are cloned *from* and are never written. A blank
+//!   which are what claims are cloned *from* and are never written. Not
+//!   containers' roots either (`ctr-*`, #104, #379): each is a clone of its
+//!   image's golden, made per container and deleted with it, the node's
+//!   ephemeral storage as upstream's writable layer is. Charged its golden's
+//!   full size, the roots of a node's own pods committed more than its whole
+//!   data slab and no claim fitted. What they write is still bounded by the
+//!   `free` half below. A blank
 //!   is stormblock's fstemplate: formatted on `fstemplate-<name>-raw`, sealed
 //!   as `fstemplate-<fs>-<name>`; both are sources, sealed yet or not, so a
 //!   1 TiB blank being minted does not crowd out the claim that asked for it
@@ -53,7 +59,7 @@ impl Default for Policy {
 }
 
 /// The node's data slabs, as the policy reads them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Capacity {
     pub total: u64,
     pub free: u64,
@@ -61,7 +67,13 @@ pub struct Capacity {
     pub reserve: u64,
     /// What a new claim may have.
     pub available: u64,
+    /// The volumes that commit the most, largest first (name, bytes charged):
+    /// a refusal names them, so what fills the node is in the claim's events.
+    pub largest: Vec<(String, u64)>,
 }
+
+/// How many of the largest committed volumes a refusal names.
+const NAMED: usize = 5;
 
 /// stormblock's prefix for a template's own volumes (its `TEMPLATE_PREFIX`):
 /// `fstemplate-<name>-raw` while it formats, `fstemplate-<fs>-<name>` sealed.
@@ -78,27 +90,36 @@ fn is_source(v: &Value) -> bool {
         || crate::storage::is_class_blank(name)
 }
 
+/// Is this volume a container's root (#104): ephemeral, never charged?
+fn is_container_root(v: &Value) -> bool {
+    v["name"].as_str().unwrap_or("").starts_with(crate::container_roots::VOLUME_PREFIX)
+}
+
 impl Capacity {
     /// From the engine's slab and volume listings (their `items`).
     pub fn of(slabs: &[Value], volumes: &[Value], policy: &Policy) -> Capacity {
         let data = |v: &Value| v["role"].as_str() == Some("data");
         let total: u64 = slabs.iter().filter(|s| data(s)).filter_map(|s| s["total_bytes"].as_u64()).sum();
         let free: u64 = slabs.iter().filter(|s| data(s)).filter_map(|s| s["free_bytes"].as_u64()).sum();
-        let committed: u64 = volumes
+        let mut charged: Vec<(String, u64)> = volumes
             .iter()
-            .filter(|v| data(v) && !is_source(v))
+            .filter(|v| data(v) && !is_source(v) && !is_container_root(v))
             // What it costs on the drives: its size times its redundancy
             // (#71: a mirror is charged twice).
             .filter_map(|v| {
                 let size = v["virtual_size_bytes"].as_u64()?;
                 let scheme = crate::storage::Scheme::of_listing(v["redundancy"].as_str().unwrap_or("none"));
-                Some((size as f64 * scheme.overhead()).ceil() as u64)
+                let name = v["name"].as_str().or_else(|| v["id"].as_str()).unwrap_or("?").to_string();
+                Some((name, (size as f64 * scheme.overhead()).ceil() as u64))
             })
-            .sum();
+            .collect();
+        let committed: u64 = charged.iter().map(|(_, b)| b).sum();
+        charged.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        charged.truncate(NAMED);
         let reserve = (total as f64 * policy.reserve_percent.clamp(0.0, 100.0) / 100.0) as u64;
         let allowed = (total as f64 * policy.overcommit.max(0.0)) as u64;
         let available = allowed.saturating_sub(committed).min(free).saturating_sub(reserve);
-        Capacity { total, free, committed, reserve, available }
+        Capacity { total, free, committed, reserve, available, largest: charged }
     }
 
     /// The largest size class a new claim can have here, if any.
@@ -125,16 +146,26 @@ impl Capacity {
             format!(
                 "not enough room on this node's data slabs for the {class} class ({}): {} is left \
                  for claims ({} total, {} free, {} committed by volumes here, {} reserved, \
-                 overcommit {})",
+                 overcommit {}){}",
                 q(bytes),
                 q(self.available),
                 q(self.total),
                 q(self.free),
                 q(self.committed),
                 q(self.reserve),
-                policy.overcommit
+                policy.overcommit,
+                self.named()
             )
         })
+    }
+
+    /// `; largest: a 4Gi, b 1Gi`, or nothing when nothing is committed.
+    fn named(&self) -> String {
+        if self.largest.is_empty() {
+            return String::new();
+        }
+        let list: Vec<String> = self.largest.iter().map(|(n, b)| format!("{n} {}", q(*b))).collect();
+        format!("; largest: {}", list.join(", "))
     }
 }
 
@@ -322,6 +353,7 @@ mod tests {
         assert_eq!(c.largest_class(), Some(("256G", 256 * GI)));
         let why = c.refusal("1T", TI, &Policy::default()).unwrap();
         assert!(why.contains("not enough room") && why.contains("1T class (1Ti)"), "{why}");
+        assert!(why.ends_with("; largest: pvc-default-big 1Ti, fastetcd-data 8Gi"), "{why}");
         assert!(c.refusal("256G", 256 * GI, &Policy::default()).is_none());
     }
 
@@ -360,7 +392,7 @@ mod tests {
 
     #[test]
     fn the_published_object_is_what_the_scheduler_reads() {
-        let c = Capacity { total: 2 * TI, free: 2 * TI, committed: 0, reserve: 0, available: 300 * GI };
+        let c = Capacity { total: 2 * TI, free: 2 * TI, committed: 0, reserve: 0, available: 300 * GI, ..Default::default() };
         let o = object("node1", &c);
         assert_eq!(o["metadata"]["name"], "stormblock-node1");
         assert_eq!(o["metadata"]["namespace"], "kube-system");
@@ -391,5 +423,32 @@ mod tests {
         ];
         let c = Capacity::of(&slabs, &vols, &Policy { overcommit: 1.0, reserve_percent: 0.0, alert_percent: 85.0 });
         assert_eq!(c.committed, 30 * GI);
+    }
+
+    /// #379: pvetest1's shape. A 60 GiB data slab, the node's own claims, and
+    /// container roots cloned from big goldens. The roots are not charged, so
+    /// a 64 MiB claim fits; the refusal of one that does not names the largest.
+    #[test]
+    fn container_roots_are_not_charged_and_a_refusal_names_the_largest() {
+        const MI: u64 = 1 << 20;
+        let slabs = [slab("data", 61_362 * MI, 57_962 * MI)];
+        let mut vols = vec![
+            vol("system-data-pvetest1", "data", 4 * GI, false),
+            vol("kubelet-data-pvetest1", "data", 4 * GI, false),
+            vol("pod-logs-pvetest1", "data", 2 * GI, false),
+        ];
+        for i in 0..10 {
+            vols.push(vol(&format!("ctr-{i:064x}"), "data", 4 * GI, false));
+        }
+        let c = Capacity::of(&slabs, &vols, &Policy::default());
+        assert_eq!(c.committed, 10 * GI, "the claims, not the roots");
+        assert!(c.refusal("64M", 64 * MI, &Policy::default()).is_none());
+        assert_eq!(c.largest.len(), 3);
+        assert_eq!(c.largest[0], ("kubelet-data-pvetest1".to_string(), 4 * GI), "largest first, ties by name");
+        let why = c.refusal("1T", TI, &Policy::default()).unwrap();
+        assert!(why.ends_with("; largest: kubelet-data-pvetest1 4Gi, system-data-pvetest1 4Gi, pod-logs-pvetest1 2Gi"), "{why}");
+        // At most five named.
+        let many: Vec<Value> = (0..8).map(|i| vol(&format!("pvc-{i}"), "data", GI, false)).collect();
+        assert_eq!(Capacity::of(&slabs, &many, &Policy::default()).largest.len(), 5);
     }
 }

@@ -662,7 +662,8 @@ clones keep the class size, and the overcommit ratio is 1.0:
   reserve`, where `committed` is the virtual size of every writable data-role
   volume (claims, node service volumes, VM disks; not goldens, sealed volumes or
   the class blanks: stormblock's `fstemplate-*` volumes, still formatting or
-  sealed, #209) and `reserve` is `--storage-reserve-percent` (5) of the data
+  sealed, #209; not containers' roots, `ctr-*`, which are ephemeral like
+  upstream's writable layer and bounded only by `data free`, #379) and `reserve` is `--storage-reserve-percent` (5) of the data
   slabs.
 - **Published:** `CSIStorageCapacity` `kube-system/stormblock-<node>` (class
   `stormblock`, topology `kubernetes.io/hostname`), `capacity` = the room and
@@ -671,8 +672,8 @@ clones keep the class size, and the overcommit ratio is 1.0:
   the CSIDriver says `storageCapacity: true` (stormcos#151).
 - **Refused at provision** too (static pods and `spec.nodeName` pods meet no
   scheduler): a new volume whose class does not fit leaves the pod waiting with
-  `not enough room on this node's data slabs for the <class> class …` and the
-  numbers, and nothing is made. The check and the create are serialized. An
+  `not enough room on this node's data slabs for the <class> class …`, the
+  numbers and the five volumes that commit the most, and nothing is made. The check and the create are serialized. An
   engine with no slab API is not checked.
 - **Alert:** gauges `kubelet_stormblock_data_bytes{kind}` and
   `kubelet_stormblock_data_used_percent`; past `--storage-alert-percent` (85)
