@@ -14,6 +14,11 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
   Docs (README, vm_golden) say a guest with the unit but no agent seals. Then sc-build, rerun golden on pvetest3.
 - c67e99d. sc-build-57672419e4: test crate's `cargo test` + clippy `-D warnings`, and the workspace build, passed. Golden run
   e8a109ddd9 queued on pvetest3 (12.96). Held `--after-run e8a109ddd9`. Resume: all four golden tests pass → close #399.
+- 2026-11-19: e8a109ddd9 ended `error`: a stormcentral restart interrupted it at 'wait for the apiserver', and it is not run again.
+  Re-running golden @c67e99d was refused on pvetest3 and pvetest2 because neither apiserver answers. Both were wedged on 12.96 by
+  nextnfs-operator's `shared` run (stormblock#685, stormcos#1237); syslog stops after stormblock-init's hand-over. pvetest1 runs 12.95,
+  which lacks b515348. Held `--after stormblock#685`. Resume: `stormcentral test run rustkube-node golden --commit c67e99db2c01`
+  on a 12.96+ machine; all four pass → close #399 (and #344).
 
 ### Done: #416 (P2), logs follow=true never ends for a terminated container
 - Cause: `container_logs`' follow loop ended only when the pod left the node (`pod_uid` none).
