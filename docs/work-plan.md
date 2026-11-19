@@ -9,7 +9,10 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 - Fix: `follow_log` asks, when a poll finds nothing new, whether the run ended:
   `PodManager::container_run_ended` (pod finished/gone, terminated for good, init done,
   runtime Exited/NotFound) or `newer_run_on_disk` (a restart). Then sends the rest and closes.
-- Next: sc-build, image (stage), shipped with proof from sc's `logs-follow-ends`.
+- 779cbf1. sc-build: `cargo build && cargo test` passed (the run's only failure was my misnamed clippy `-p`, filed as #417
+  and closed); clippy `-p kubelet --all-targets -D warnings` names nothing in the changed lines (the rest is #385/#386).
+  Stage build 431db0a4429b. Held `--after-install rustkube-node>=779cbf1`: the check is sc's medium `logs-follow-ends`
+  (and `cmd-debug-command`/`cmd-debug-exit`) on a machine running it; no node keeps a finished pod an install proof could read.
 
 ### Waiting on an install (rustkube-node>=196d128): #415, stormvm → ac884c7 (cloud-hypervisor disks state image_type=raw, stormvm#134)
 
