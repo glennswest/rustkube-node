@@ -4,13 +4,15 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #410, stub sweep flags the vendored CRI api.proto
+### Done: #410, stub sweep flags the vendored CRI api.proto
 
 2026-11-19. The four lines (`api.proto` 625/677/1234/1738) are kubernetes/cri-api's own comment on `label_selector`, which is a
 `map<string,string>`: the wire API has no MatchExpressions field to stub, and the kubelet sends none. Not a gap. They end with
 `stub-sweep: allow`, as the rule says for a line that quotes a marker; so does retry's test of a `501 Not Implemented` status.
 `deploy/check-stubs.sh` (copied from stormcentral) runs in `cargo test` (`cmd/kubelet/tests/no_stubs.rs`), so plain sc-build
 refuses a marker. Then sc-build, close #410 (no image: no shipped behaviour changes).
+Done: cd97314. sc-build passed (sc-build-961885f4cb: build + cargo test, `no_stubs` 1 passed). #412 was my own command (`-p kubelet`,
+the crate is `kubelet-cmd`). The clippy run stops on #385 (ebpf cfg, not this change).
 
 ### Waiting on server8's install (rustkube-node>=9a102f5): #400, a filesystem claim's StorageClass tier on the blank's clone; tier `fast` (stormblock#672, #377)
 
