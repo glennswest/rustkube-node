@@ -4,7 +4,7 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### Done: #410, stub sweep flags the vendored CRI api.proto
+### Done: #410 and #411, stub sweep flags the vendored CRI api.proto and retry's 501 test
 
 2026-11-19. The four lines (`api.proto` 625/677/1234/1738) are kubernetes/cri-api's own comment on `label_selector`, which is a
 `map<string,string>`: the wire API has no MatchExpressions field to stub, and the kubelet sends none. Not a gap. They end with
