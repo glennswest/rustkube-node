@@ -4,6 +4,16 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #429 (P3), attach to a tty/stdin container after a kubelet restart on stormpump
+
+Plan (2026-11-20): stormpump#260 (cfb238e) keeps a deposit across the client's detach and hands a copy back with
+`DEPOSIT_TAKE` (op 11). The stormpump pin cannot move alone (stormvm pins 9877a97 and its plan types cross into the
+kubelet), so, as with `OP_DEPOSIT_WITHDRAW`, the kubelet speaks it by number: a kept deposit is tag `0xFE` + name on the
+attach socket; the take's copy is read on the ring thread right after its completion (`aux = 1`). At start the
+console's own end (the pty master, or stdin's write end) is deposited kept as `console/<container id>`; on adoption it
+is taken back and the `Console` rebuilt from it; at removal it is withdrawn. An engine older than #260 closes the
+unknown deposit and answers the take EINVAL, so attach is refused as before (6b9e6b9).
+
 ### Done: #443 (P1), review: probes drop httpHeaders; gRPC probes are a TCP connect
 
 bb0746994c84 and ff200a3eb18a fixed in e85741a (+ bec01fc borrow fix, 78e9317 doc wording the stub sweep caught).
