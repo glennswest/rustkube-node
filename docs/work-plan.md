@@ -4,6 +4,13 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### Blocked: #429 (P3), attach to a tty/stdin container after a kubelet restart
+2026-11-20. Needs the engine to keep a deposited fd across the client's detach and hand it back: none exists (ABI.md,
+deposits close when the client goes). Filed stormpump#260 (kept deposits + DEPOSIT_TAKE). Held `--after stormpump#260`.
+Resume: bump stormpump; at start_container deposit the console master / stdin writer as kept `console/<id>`; on adopt
+(StormpumpRuntime::adopt) take it back into a crate::exec::Console; withdraw at removal; drop the #334 refusal in attach_to.
+Also: a tty container may get SIGHUP when the old kubelet's master closes (PTY semantics, not seen on a node).
+
 ### In progress: #430 (P2), real-time pods on stormpump (and #204's resolution, which it needs)
 2026-11-20. stormpump 9877a97 has `Sched` and `Demand::Exclusive` already. Plan, one commit each:
 1. #204: `spec.runtimeClassName` → GET RuntimeClass → handler (cached by name; upstream's handler is immutable). Missing
