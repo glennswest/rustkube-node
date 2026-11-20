@@ -4,6 +4,12 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #438 (P1), review: 2 findings in cri_grpc.rs
+2026-11-20. 1435d062f12a: runAsNonRoot checked in CriGrpcClient::create_container (runAsUser, else ImageStatus uid/username;
+upstream's verifyRunAsNonRoot), CreateContainerConfigError. b5b60b0a92c0: already fixed by #118 (pod_manager
+build_container_config → no_new_privs → cri_grpc LinuxContainerSecurityContext.no_new_privs; cri_grpc_roundtrip asserts it);
+no change. Next: sc-build, close.
+
 ### Done: #437 (P1), review: 12 major findings in pod_manager.rs
 2026-11-20. One commit per group, each naming its finding ids, each with tests:
 1. Secrets/ConfigMaps: dc6872a9854f (Secret values as bytes), 1f318a543243 (volume `items` keys/paths, stale files

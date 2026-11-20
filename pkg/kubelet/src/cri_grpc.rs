@@ -369,6 +369,41 @@ fn to_proto_container_config(config: &ContainerConfig) -> proto::ContainerConfig
     }
 }
 
+/// The user an image runs as, from CRI ImageStatus.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ImageUser {
+    pub uid: Option<i64>,
+    pub username: String,
+}
+
+/// `runAsNonRoot` against the user the container will run as, by
+/// upstream's rule (kuberuntime `verifyRunAsNonRoot`): `runAsUser` when the
+/// pod gives one (`image` is then not asked, `None`), else the image's user.
+/// UID 0 is refused; so is an image that names no user (it runs as root)
+/// and one whose user is a name, which cannot be checked to be non-root
+/// (1435d062f12a).
+pub fn verify_run_as_non_root(config: &ContainerConfig, image: Option<ImageUser>) -> Result<(), String> {
+    if config.run_as_non_root != Some(true) {
+        return Ok(());
+    }
+    if let Some(uid) = config.run_as_user {
+        return if uid == 0 {
+            Err("container's runAsUser breaks non-root policy (runAsNonRoot is true, runAsUser 0)".into())
+        } else {
+            Ok(())
+        };
+    }
+    let image = image.unwrap_or_default();
+    match (image.uid, image.username.as_str()) {
+        (Some(0), _) => Err("container has runAsNonRoot and image will run as root (UID 0)".into()),
+        (Some(_), _) => Ok(()),
+        (None, "") => Err("container has runAsNonRoot and image names no user, so it will run as root".into()),
+        (None, name) => Err(format!(
+            "container has runAsNonRoot and image has non-numeric user ({name}), cannot verify user is non-root"
+        )),
+    }
+}
+
 /// Map SELinux label parts to the CRI `SeLinuxOption`. Shared by the sandbox
 /// and its containers so the two cannot be labelled by different code.
 fn to_proto_selinux(s: &crate::cri::SeLinuxOptions) -> proto::SeLinuxOption {
@@ -567,6 +602,22 @@ impl RuntimeService for CriGrpcClient {
         config: &ContainerConfig,
         sandbox_config: &PodSandboxConfig,
     ) -> Result<String, CriError> {
+        // runAsNonRoot is the kubelet's to check, as upstream's kuberuntime
+        // checks it: a CRI runtime is never told it (#437's sibling #438,
+        // 1435d062f12a). Refused before anything is created.
+        if config.run_as_non_root == Some(true) {
+            let image_user = match config.run_as_user {
+                Some(_) => None,
+                None => Some(self.image_user(&config.image).await?),
+            };
+            if let Err(message) = verify_run_as_non_root(config, image_user) {
+                return Err(CriError::Container {
+                    container: config.name.clone(),
+                    reason: "CreateContainerConfigError".into(),
+                    message,
+                });
+            }
+        }
         let resp = self
             .runtime
             .clone()
@@ -770,6 +821,23 @@ impl ImageService for CriGrpcClient {
             .map_err(|e| CriError::ImagePull(format!("{image}: {}", e.message())))?
             .into_inner();
         Ok(resp.image_ref)
+    }
+
+    /// The user `image` runs as, by the runtime's ImageStatus: its numeric
+    /// UID, else its user name (empty: the image names no user).
+    async fn image_user(&self, image: &str) -> Result<ImageUser, CriError> {
+        let resp = self
+            .images
+            .clone()
+            .image_status(proto::ImageStatusRequest {
+                image: Some(proto::ImageSpec { image: image.to_string(), ..Default::default() }),
+                verbose: false,
+            })
+            .await
+            .map_err(rpc_err)?
+            .into_inner();
+        let i = resp.image.ok_or_else(|| CriError::NotFound(format!("image {image}")))?;
+        Ok(ImageUser { uid: i.uid.map(|u| u.value), username: i.username })
     }
 
     async fn image_status(&self, image: &str) -> Result<Option<ImageInfo>, CriError> {

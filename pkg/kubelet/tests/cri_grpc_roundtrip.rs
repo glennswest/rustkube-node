@@ -29,6 +29,9 @@ struct MockCri {
     events: Option<Vec<proto::ContainerEventResponse>>,
     /// Answer RuntimeConfig with this cgroup driver (#24); `None`: Unimplemented.
     cgroup_driver: Option<proto::CgroupDriver>,
+    /// Answer ImageStatus with this image user (uid, username); `None`:
+    /// Unimplemented (#438).
+    image_user: Option<(Option<i64>, String)>,
 }
 
 fn unimplemented<T>() -> Result<T> {
@@ -288,7 +291,16 @@ impl proto::image_service_server::ImageService for MockCri {
         &self,
         _: Request<proto::ImageStatusRequest>,
     ) -> Result<proto::ImageStatusResponse> {
-        unimplemented()
+        let Some((uid, username)) = self.image_user.clone() else { return unimplemented() };
+        Ok(Response::new(proto::ImageStatusResponse {
+            image: Some(proto::Image {
+                id: "sha256:feedface".into(),
+                uid: uid.map(|value| proto::Int64Value { value }),
+                username,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
     }
     async fn remove_image(
         &self,
@@ -550,4 +562,61 @@ async fn sandboxes_get_a_cgroup_parent_in_the_runtimes_driver() {
     client.run_pod_sandbox(&config).await.unwrap();
     let parent = recorded.lock().unwrap().sandbox_config.clone().unwrap().linux.unwrap().cgroup_parent;
     assert_eq!(parent, "kubepods-podu1.slice");
+}
+
+/// #438 (1435d062f12a): runAsNonRoot is checked before CreateContainer on
+/// the CRI path, against runAsUser or the image's user, as upstream does.
+#[test]
+fn run_as_non_root_is_checked_against_the_effective_user() {
+    use kubelet::cri_grpc::{verify_run_as_non_root, ImageUser};
+    let cfg = |non_root: Option<bool>, user: Option<i64>| ContainerConfig {
+        name: "app".into(),
+        run_as_non_root: non_root,
+        run_as_user: user,
+        ..Default::default()
+    };
+    let img = |uid: Option<i64>, name: &str| Some(ImageUser { uid, username: name.into() });
+    // Not asked for: anything goes.
+    assert!(verify_run_as_non_root(&cfg(None, Some(0)), None).is_ok());
+    assert!(verify_run_as_non_root(&cfg(Some(false), None), img(Some(0), "")).is_ok());
+    // runAsUser decides when given.
+    assert!(verify_run_as_non_root(&cfg(Some(true), Some(0)), None).unwrap_err().contains("runAsUser"));
+    assert!(verify_run_as_non_root(&cfg(Some(true), Some(1000)), None).is_ok());
+    // Else the image's user.
+    assert!(verify_run_as_non_root(&cfg(Some(true), None), img(Some(0), "root")).unwrap_err().contains("run as root"));
+    assert!(verify_run_as_non_root(&cfg(Some(true), None), img(None, "")).unwrap_err().contains("names no user"));
+    assert!(verify_run_as_non_root(&cfg(Some(true), None), img(None, "nginx")).unwrap_err().contains("non-numeric user (nginx)"));
+    assert!(verify_run_as_non_root(&cfg(Some(true), None), img(Some(101), "")).is_ok());
+}
+
+/// #438 (1435d062f12a): over the socket, a runAsNonRoot container whose
+/// image runs as root is refused as CreateContainerConfigError and never
+/// reaches CreateContainer; a non-root image is created.
+#[tokio::test]
+async fn a_root_image_under_run_as_non_root_is_never_created() {
+    for (uid, refused) in [(Some(0), true), (Some(1001), false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = MockCri { image_user: Some((uid, String::new())), ..Default::default() };
+        let (socket, recorded) = start_mock_with(dir.path(), mock).await;
+        let client = CriGrpcClient::new(&socket);
+        let container = ContainerConfig {
+            name: "app".into(),
+            image: "busybox:latest".into(),
+            run_as_non_root: Some(true),
+            ..Default::default()
+        };
+        let r = client.create_container("sb-abc123", &container, &sandbox_config()).await;
+        if refused {
+            match r {
+                Err(kubelet::cri::CriError::Container { container, reason, .. }) => {
+                    assert_eq!((container.as_str(), reason.as_str()), ("app", "CreateContainerConfigError"));
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+            assert!(recorded.lock().unwrap().container_config.is_none(), "CreateContainer was never sent");
+        } else {
+            assert_eq!(r.unwrap(), "ctr-def456");
+            assert!(recorded.lock().unwrap().container_config.is_some());
+        }
+    }
 }
