@@ -524,12 +524,20 @@ async fn main() -> anyhow::Result<()> {
                     let roots = Arc::new(kubelet::container_roots::Roots::new(engine.clone(), node_name.clone()));
                     let rt = Arc::new(
                         rt.with_cni(cni_invoker)
+                            // What an earlier kubelet of this boot started is
+                            // taken back, not started again (#334).
+                            .with_state(kubelet::stormpump_runtime::STATE_FILE)
                             .with_image_configs(configs.clone())
                             .with_roots(roots.clone())
                             // Each workload's identity for cadvisor (#84).
                             .with_identities(kubelet::workload_identity::Publisher::default()),
                     );
                     engine_ring = rt.ring_client();
+                    // The records written after every change (#334).
+                    tokio::spawn(rt.clone().keep_state());
+                    // What ended while no kubelet listened (#334), before
+                    // anything is listed.
+                    rt.adopt().await;
                     // Roots a kubelet that died mid-create or mid-removal left.
                     {
                         let rt = rt.clone();

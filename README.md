@@ -815,6 +815,21 @@ with `CAP_IPC_LOCK` effective. A pod that doesn't ask must see neither.
   handle and its disks. Whenever the VMI set is read (the watch's LIST and
   each change), a registered machine the kubelet does not know is adopted
   when its VMI still wants it, and stopped when not.
+- **A pod outlives a kubelet restart on stormpump too** (#334). The engine
+  keeps the kubelet's workloads and their handles while it is away, and hands
+  it the exits it missed when it attaches again with the same token. The
+  kubelet writes every sandbox and container, with its engine handles, to
+  `/var/lib/kubelet/stormpump-runtime.json` after each change. A restarted
+  kubelet reads it before it lists, sweeps or adopts anything; asks the engine
+  about each running workload (one that ended meanwhile is recorded as
+  exited, a handle the engine no longer knows as exit 255); then adopts the
+  pods as on any runtime. The same container ids and restart counts are kept,
+  and nothing is started again. The file carries the boot id: another boot's
+  handles may name other workloads, so its records are never read. A
+  container's terminal or stdin (`tty`/`stdin: true`) was a descriptor the old
+  kubelet held. `kubectl attach` to one after a restart is refused saying so;
+  its logs and exec work. Unit-tested on a runtime rebuilt from the file; not
+  yet run on a node.
 - A machine started by an older kubelet has no handle recorded. If its VMI is
   gone, it is stopped through its own control socket: `shut_down` (ACPI, within
   its grace), then `quit`.
@@ -1565,7 +1580,8 @@ kubelet is under test, not the scheduler.
     (`restart-kubelet`) SIGTERMs the kubelet and waits for the new one. The
     holder keeps its container, the driver is registered again, a new pod reads
     the file, and the holder's delete is unpublished by the restarted kubelet.
-    Skipped until a restarted kubelet adopts its pods (#334): today it loops the kubelet.
+    Skipped until a test machine runs a kubelet that adopts its pods (#334): on an older
+    one it loops the kubelet. Turned on (`KUBELET_RESTART_ADOPTS`) once one does.
   - `csi-deregistered`: the driver pod deleted, CSINode no longer lists it.
 - **multus** (< 10 min, declared in `test/requires.toml`, run on request, #233):
   a pod's extra networks by the Multus standard, with the standard CNI plugins

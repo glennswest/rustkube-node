@@ -17,7 +17,7 @@ pub enum ContainerState {
 }
 
 /// CRI pod sandbox state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum PodSandboxState {
     Ready = 0,
     #[default]
@@ -36,7 +36,10 @@ pub struct PodSandboxSummary {
 }
 
 /// Pod sandbox configuration.
-#[derive(Debug, Clone, Default)]
+/// Serializable: the stormpump runtime keeps each sandbox's config on disk,
+/// so a restarted kubelet adopts the pod (#334).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PodSandboxConfig {
     pub name: String,
     pub uid: String,
@@ -80,7 +83,8 @@ pub struct PodSandboxConfig {
 
 /// One network a pod attaches to (#233), resolved from its
 /// NetworkAttachmentDefinition.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NetworkAttachment {
     /// `namespace/name` of the NetworkAttachmentDefinition: the
     /// `network-status` entry's name.
@@ -96,7 +100,8 @@ pub struct NetworkAttachment {
 }
 
 /// Port mapping for a pod sandbox.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PortMapping {
     pub protocol: String,
     pub container_port: i32,
@@ -182,7 +187,8 @@ pub struct ContainerConfig {
 }
 
 /// SELinux label parts (user/role/type/level) for a container.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SeLinuxOptions {
     pub user: String,
     pub role: String,
@@ -194,7 +200,7 @@ pub struct SeLinuxOptions {
 /// Unset means the runtime uses its default profile, which answers blocked
 /// syscalls with EPERM; workloads that program the datapath (Cilium) must run
 /// `Unconfined` or even a plain apiserver call inside an init container fails.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SeccompProfile {
     /// No seccomp filtering.
     Unconfined,

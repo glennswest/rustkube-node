@@ -160,7 +160,8 @@ impl ImageConfigs {
 
 /// Where an image came from (#130): what a container status's `imageID` and
 /// the pod's per-container annotations say.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Provenance {
     /// `sha256:<hex>`: the image's manifest digest (a pulled image), or the
     /// sealed golden's device digest from the release manifest (a pallet).

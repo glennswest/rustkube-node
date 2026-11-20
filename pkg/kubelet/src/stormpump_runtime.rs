@@ -54,6 +54,9 @@ use tokio::sync::Mutex;
 
 use crate::stormpump_ring::{RingClient, RingError};
 
+mod state;
+pub use state::STATE_FILE;
+
 /// How long a root whose mount timed out waits for the engine to let go of it
 /// before it is left for the next start's sweep (#292).
 const ROOT_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(3600);
@@ -364,6 +367,24 @@ pub struct StormpumpRuntime {
     /// `config` init dumps and exits at once). Kept until the start records
     /// the handle, the last [`UNCLAIMED_EXITS`].
     unclaimed: std::sync::Mutex<std::collections::VecDeque<crate::stormpump_ring::Exited>>,
+    /// Where the sandboxes and containers are recorded (#334); `None`: not
+    /// kept (tests, and a runtime made without [`Self::with_state`]).
+    state_file: Option<std::path::PathBuf>,
+    /// This boot's id, written with the records.
+    boot: String,
+    /// Told after each change, for [`Self::keep_state`] to write the records.
+    dirty: Arc<tokio::sync::Notify>,
+}
+
+/// Tells [`StormpumpRuntime::keep_state`] when it is dropped: put at the top
+/// of each call that changes a record, so every way out of it (a `?`, an
+/// early return) is a write.
+struct Changed<'a>(&'a tokio::sync::Notify);
+
+impl Drop for Changed<'_> {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
 }
 
 /// How many unclaimed exits are kept (#285).
@@ -397,6 +418,9 @@ impl StormpumpRuntime {
             making: Default::default(),
             identities: None,
             unclaimed: Default::default(),
+            state_file: None,
+            boot: state::boot_id(),
+            dirty: Default::default(),
         })
     }
 
@@ -495,6 +519,102 @@ impl StormpumpRuntime {
         self
     }
 
+    /// Keep the sandboxes and containers at `path`, and take back what an
+    /// earlier kubelet of this boot recorded there (#334). Read before
+    /// anything lists, sweeps or adopts.
+    pub fn with_state(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        let path = path.into();
+        if let Some(file) = state::load(&path, &self.boot) {
+            let sandboxes = self.sandboxes.get_mut();
+            for r in file.sandboxes {
+                let sb = r.into_sandbox();
+                sandboxes.insert(sb.id.clone(), sb);
+            }
+            let containers = self.containers.get_mut();
+            for r in file.containers {
+                let c = r.into_container();
+                containers.insert(c.id.clone(), c);
+            }
+            tracing::info!(
+                path = %path.display(), sandboxes = sandboxes.len(), containers = containers.len(),
+                "stormpump: an earlier kubelet's sandboxes and containers taken back"
+            );
+        }
+        self.state_file = Some(path);
+        self
+    }
+
+    /// Ask the engine about each workload taken back by [`Self::with_state`]
+    /// (#334): one that ended while no kubelet was there to hear it, or whose
+    /// exit an earlier kubelet heard after its last write, is recorded as
+    /// exited. A handle the engine no longer knows (`ESTALE`) has ended too;
+    /// its code is not known, so it is said as 255.
+    pub async fn adopt(&self) {
+        let _changed = self.changes();
+        let Ok(ring) = self.ring() else { return };
+        let running: Vec<(String, Handle)> = self
+            .containers
+            .lock()
+            .await
+            .values()
+            .filter(|c| c.state == ContainerState::Running)
+            .filter_map(|c| c.workload_handle.map(|h| (c.id.clone(), h)))
+            .collect();
+        for (id, h) in running {
+            let ring = ring.clone();
+            let asked = tokio::task::spawn_blocking(move || ring.query_info(h)).await;
+            let ended = match asked {
+                Ok(Ok(Some(info))) if info.exited() => Some(info.exit_status as u32),
+                Ok(Ok(_)) => None,
+                Ok(Err(RingError::Failed { errno: crate::stormpump_ring::ESTALE, .. })) => Some(255 << 8),
+                Ok(Err(e)) => {
+                    tracing::warn!(container = %id, "stormpump: an adopted workload not asked about: {e}");
+                    None
+                }
+                Err(_) => None,
+            };
+            if let Some(status) = ended {
+                if let Some(c) = self.containers.lock().await.get_mut(&id) {
+                    record_exit(c, status);
+                }
+            }
+        }
+    }
+
+    /// The guard every changing call holds (see [`Changed`]).
+    fn changes(&self) -> Changed<'_> {
+        Changed(&self.dirty)
+    }
+
+    /// Write the records now (#334). Nothing when the runtime keeps none.
+    pub async fn save(&self) {
+        let Some(path) = &self.state_file else { return };
+        let file = {
+            let sandboxes = self.sandboxes.lock().await;
+            let containers = self.containers.lock().await;
+            state::File {
+                boot_id: self.boot.clone(),
+                sandboxes: sandboxes.values().map(state::SandboxRecord::of).collect(),
+                containers: containers.values().map(state::ContainerRecord::of).collect(),
+            }
+        };
+        if let Err(e) = state::write(path, &file) {
+            tracing::warn!(path = %path.display(), "stormpump: runtime records not written: {e}");
+        }
+    }
+
+    /// Write the records after every change, for as long as the kubelet
+    /// runs (#334).
+    pub async fn keep_state(self: Arc<Self>) {
+        if self.state_file.is_none() {
+            return;
+        }
+        loop {
+            self.dirty.notified().await;
+            self.save().await;
+        }
+    }
+
     pub fn new(socket: impl Into<String>) -> StormpumpRuntime {
         StormpumpRuntime {
             socket: socket.into(),
@@ -510,6 +630,9 @@ impl StormpumpRuntime {
             making: Default::default(),
             identities: None,
             unclaimed: Default::default(),
+            state_file: None,
+            boot: state::boot_id(),
+            dirty: Default::default(),
         }
     }
 
@@ -644,6 +767,7 @@ impl StormpumpRuntime {
     /// [`Self::absorb_exits`] without the ring: record the exits, then try
     /// again every removal one of them (or the retry interval) unblocks.
     async fn note_exits(&self, exits: Vec<crate::stormpump_ring::Exited>) {
+        let _changed = self.changes();
         let retry;
         {
         let mut containers = self.containers.lock().await;
@@ -1138,6 +1262,7 @@ impl RuntimeService for StormpumpRuntime {
     }
 
     async fn run_pod_sandbox(&self, config: &PodSandboxConfig) -> Result<String, CriError> {
+        let _changed = self.changes();
         self.probe()?;
         self.retry_failed_networks().await;
         let id = self.mint_id("sb");
@@ -1362,6 +1487,7 @@ impl RuntimeService for StormpumpRuntime {
     /// stop (or the removal) runs it again; a failed release keeps the handle
     /// for the removal to retry.
     async fn stop_pod_sandbox(&self, sandbox_id: &str) -> Result<(), CriError> {
+        let _changed = self.changes();
         let existing = self.sandboxes.lock().await.get(sandbox_id).cloned();
         let Some(sb) = existing else { return Ok(()) };
         if let (Some(invoker), Some(ns)) = (&self.cni, &sb.netns) {
@@ -1395,6 +1521,7 @@ impl RuntimeService for StormpumpRuntime {
     }
 
     async fn remove_pod_sandbox(&self, sandbox_id: &str) -> Result<(), CriError> {
+        let _changed = self.changes();
         // Removals the engine refused before (a restart's old container,
         // #90) are tried again now, since they are what this waits on.
         let pending: Vec<String> = self.containers.lock().await.values()
@@ -1492,6 +1619,7 @@ impl RuntimeService for StormpumpRuntime {
         config: &ContainerConfig,
         _sandbox_config: &PodSandboxConfig,
     ) -> Result<String, CriError> {
+        let _changed = self.changes();
         // The sandbox first, the engine second. A request naming a sandbox
         // that does not exist is wrong whether or not stormpump is running,
         // and answering it with "no stormpump on this node" sends the reader
@@ -1740,6 +1868,7 @@ impl RuntimeService for StormpumpRuntime {
     }
 
     async fn start_container(&self, container_id: &str) -> Result<(), CriError> {
+        let _changed = self.changes();
         self.probe()?;
         let (spec, path, log_dir, sandbox_id, mount_sources, stdio, ownership) = {
             let containers = self.containers.lock().await;
@@ -1953,6 +2082,7 @@ impl RuntimeService for StormpumpRuntime {
     }
 
     async fn stop_container(&self, container_id: &str, timeout: i64) -> Result<(), CriError> {
+        let _changed = self.changes();
         let workload = {
             let containers = self.containers.lock().await;
             containers
@@ -1976,6 +2106,7 @@ impl RuntimeService for StormpumpRuntime {
     }
 
     async fn remove_container(&self, container_id: &str) -> Result<(), CriError> {
+        let _changed = self.changes();
         // Asked for from here on, whatever the engine answers: the runtime
         // finishes it if this attempt is refused (#90).
         {
@@ -2304,7 +2435,7 @@ async fn attach_to(
 ) -> Result<crate::cri::ExecSession, CriError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     runtime.absorb_exits().await;
-    let (workload, console, log_file, qualified) = {
+    let (workload, console, log_file, qualified, lost) = {
         let containers = runtime.containers.lock().await;
         let c = containers
             .get(container_id)
@@ -2315,8 +2446,17 @@ async fn attach_to(
             .workload_handle
             .filter(|_| c.state == ContainerState::Running)
             .ok_or_else(|| CriError::Runtime(format!("container {qualified} is not running")))?;
-        (workload, c.console.clone(), c.log_file.clone(), qualified)
+        // A terminal the kubelet held before it restarted (#334) closed
+        // with that process; the container runs on without it.
+        let lost = c.console.is_none() && c.stdio.as_ref().is_some_and(|s| s.tty || s.stdin);
+        (workload, c.console.clone(), c.log_file.clone(), qualified, lost)
     };
+    if lost && (io.tty || io.stdin) {
+        return Err(CriError::Runtime(format!(
+            "container {qualified}'s terminal and stdin were held by the kubelet before it restarted, \
+             and closed with it; its logs and exec still work (rustkube-node#334)"
+        )));
+    }
     let terminal = console.as_ref().filter(|c| c.pty.is_some());
     if io.tty && terminal.is_none() {
         return Err(CriError::Runtime(format!(
@@ -4391,5 +4531,189 @@ mod tests {
         );
         r.remove_pod_sandbox("sb-1").await.unwrap();
         assert!(r.containers.lock().await.is_empty());
+    }
+
+    /// #334: what one kubelet ran, as the next one reads it back. The pod
+    /// `default/web` (uid `uid-1`): sandbox `sb-1` (engine handle 5), its
+    /// container `app` (`ct-1`) running as workload 77, with its root, its
+    /// volumes and its exec context.
+    async fn recorded_runtime(path: &std::path::Path) -> StormpumpRuntime {
+        let r = StormpumpRuntime::new("/nonexistent/stormpump.sock").with_state(path);
+        r.sandboxes.lock().await.insert(
+            "sb-1".into(),
+            Sandbox {
+                id: "sb-1".into(),
+                handle: Some(Handle(5)),
+                config: PodSandboxConfig {
+                    uid: "uid-1".into(),
+                    name: "web".into(),
+                    namespace: "default".into(),
+                    log_directory: "/var/log/pods/default_web_uid-1".into(),
+                    ..Default::default()
+                },
+                state: PodSandboxState::Ready,
+                created_at: 11,
+                netns: Some("/proc/4242/ns/net".into()),
+                ip: "10.0.0.9".into(),
+                made: None,
+                identity_file: None,
+                network_status: Some(serde_json::json!([{"name": "cilium", "ips": ["10.0.0.9"]}])),
+            },
+        );
+        let mut c = bare("ct-1", "sb-1");
+        c.name = "app".into();
+        c.pod = "web".into();
+        c.state = ContainerState::Running;
+        c.started_at = 22;
+        c.workload_handle = Some(Handle(77));
+        c.spec_handle = Some(Handle(76));
+        c.root_handle = Some(Handle(78));
+        c.volume_handles = vec![Handle(78), Handle(79)];
+        c.root_volume = Some("ctr-ct-1".into());
+        c.exec_base = Some(ExecBase {
+            env: vec!["PATH=/bin".into()],
+            cwd: "/srv".into(),
+            uid: 1000,
+            gid: 1000,
+            caps: stormpump::spec::Caps {
+                base: stormpump::spec::CapBase::Standard,
+                add: vec!["NET_ADMIN".into()],
+                drop: vec![],
+                no_new_privs: true,
+            },
+            groups: vec![2000],
+        });
+        r.containers.lock().await.insert("ct-1".into(), c);
+        r.save().await;
+        r
+    }
+
+    /// #334: a runtime rebuilt from the file (a new object, as after a
+    /// restart) lists the same sandbox and container, with the same ids and
+    /// engine handles, and can still exec; an exit the engine held while no
+    /// kubelet listened is claimed by the adopted container.
+    #[tokio::test]
+    async fn a_restarted_runtime_takes_back_what_the_last_one_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stormpump-runtime.json");
+        drop(recorded_runtime(&path).await);
+
+        let r = StormpumpRuntime::new("/nonexistent/stormpump.sock").with_state(&path);
+        let sbs = r.list_pod_sandbox().await.unwrap();
+        assert_eq!(sbs.len(), 1);
+        assert_eq!((sbs[0].id.as_str(), sbs[0].uid.as_str(), sbs[0].name.as_str()), ("sb-1", "uid-1", "web"));
+        assert_eq!(sbs[0].state, PodSandboxState::Ready);
+        assert_eq!(r.pod_sandbox_status("sb-1").await.unwrap().ip, "10.0.0.9");
+        let cs = r.list_containers(Some("sb-1")).await.unwrap();
+        assert_eq!(cs.len(), 1);
+        assert_eq!((cs[0].id.as_str(), cs[0].name.as_str(), cs[0].state), ("ct-1", "app", ContainerState::Running));
+        {
+            let containers = r.containers.lock().await;
+            let c = &containers["ct-1"];
+            assert_eq!((c.workload_handle, c.spec_handle, c.root_handle), (Some(Handle(77)), Some(Handle(76)), Some(Handle(78))));
+            assert_eq!(c.volume_handles, vec![Handle(78), Handle(79)]);
+            assert_eq!(c.root_volume.as_deref(), Some("ctr-ct-1"));
+            let b = c.exec_base.as_ref().expect("exec still works on an adopted container");
+            assert_eq!((b.cwd.as_str(), b.uid, b.groups.clone()), ("/srv", 1000, vec![2000]));
+            assert_eq!(b.caps.base, stormpump::spec::CapBase::Standard);
+            assert_eq!((b.caps.add.clone(), b.caps.no_new_privs), (vec!["NET_ADMIN".to_string()], true));
+        }
+        assert_eq!(r.sandboxes.lock().await["sb-1"].handle, Some(Handle(5)));
+
+        // The engine hands back the exit it held (exit 1).
+        r.note_exits(vec![crate::stormpump_ring::Exited { handle: Handle(77), status: 256 }]).await;
+        let st = r.container_status("ct-1").await.unwrap();
+        assert_eq!((st.state, st.exit_code), (ContainerState::Exited, 1));
+        // ... and that is written too: a third kubelet sees it ended.
+        r.save().await;
+        let again = StormpumpRuntime::new("/nonexistent/stormpump.sock").with_state(&path);
+        assert_eq!(again.container_status("ct-1").await.unwrap().state, ContainerState::Exited);
+    }
+
+    /// #334: a record from another boot names handles a new engine may have
+    /// given to other workloads. It is never read.
+    #[tokio::test]
+    async fn another_boots_records_are_not_taken_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stormpump-runtime.json");
+        let mut r = recorded_runtime(&path).await;
+        r.boot = "an-earlier-boot".into();
+        r.save().await;
+        let fresh = StormpumpRuntime::new("/nonexistent/stormpump.sock").with_state(&path);
+        assert!(fresh.list_pod_sandbox().await.unwrap().is_empty());
+        assert!(fresh.list_containers(None).await.unwrap().is_empty());
+        // Unreadable is nothing to adopt, not a failure to start.
+        std::fs::write(&path, b"{not json").unwrap();
+        let fresh = StormpumpRuntime::new("/nonexistent/stormpump.sock").with_state(&path);
+        assert!(fresh.list_pod_sandbox().await.unwrap().is_empty());
+    }
+
+    /// #334: every change is written: the guard each changing call holds
+    /// tells `keep_state`, which writes the file.
+    #[tokio::test]
+    async fn a_change_is_written_by_keep_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stormpump-runtime.json");
+        let r = Arc::new(recorded_runtime(&path).await);
+        tokio::spawn(r.clone().keep_state());
+        r.note_exits(vec![crate::stormpump_ring::Exited { handle: Handle(77), status: 9 }]).await;
+        let mut seen = None;
+        for _ in 0..200 {
+            let back = StormpumpRuntime::new("/nonexistent/stormpump.sock").with_state(&path);
+            let st = back.container_status("ct-1").await.unwrap();
+            if st.state == ContainerState::Exited {
+                seen = Some(st.exit_code);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(seen, Some(137), "SIGKILL, written");
+    }
+
+    /// #334, the kubelet's half: `recover_state` on a runtime rebuilt from
+    /// the file adopts the pod, and the next sync starts nothing (a second
+    /// sandbox would need the engine, which this test has not got: any
+    /// attempt fails the pod instead of leaving it Running).
+    #[tokio::test]
+    async fn a_restarted_kubelet_adopts_the_pod_and_starts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stormpump-runtime.json");
+        drop(recorded_runtime(&path).await);
+        let r = Arc::new(StormpumpRuntime::new("/nonexistent/stormpump.sock").with_state(&path));
+        let images = Arc::new(StormpumpImages::new("registry.invalid"));
+        let mgr = crate::pod_manager::PodManager::new(r.clone(), images, "test-node");
+        mgr.recover_state().await.unwrap();
+        let pod = serde_json::json!({
+            "metadata": {"name": "web", "namespace": "default", "uid": "uid-1"},
+            "spec": {"nodeName": "test-node", "restartPolicy": "Always",
+                     "containers": [{"name": "app", "image": "busybox:latest"}]},
+            "status": {"phase": "Running"},
+        });
+        let outcome = mgr.sync_pods(&[pod]).await;
+        assert_eq!(outcome.updates.len(), 1);
+        assert_eq!(outcome.updates[0].phase, "Running", "{}", outcome.updates[0].message);
+        assert_eq!(r.sandboxes.lock().await.len(), 1, "no second sandbox");
+        let ids: Vec<String> = r.list_containers(None).await.unwrap().into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec!["ct-1".to_string()], "the same container, not a new one");
+    }
+
+    /// #334: an adopted container's terminal was the old kubelet's. Attach to
+    /// it says so, rather than that it never had one.
+    #[tokio::test]
+    async fn attach_to_an_adopted_terminal_says_it_closed_with_the_old_kubelet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stormpump-runtime.json");
+        let r = recorded_runtime(&path).await;
+        r.containers.lock().await.get_mut("ct-1").unwrap().stdio = Some(StdioWanted {
+            stdin: true,
+            tty: true,
+            slots: vec![("ct-1.tty".into(), 0)],
+            log_file: Default::default(),
+        });
+        r.save().await;
+        let back = StormpumpRuntime::new("/nonexistent/stormpump.sock").with_state(&path);
+        let io = crate::exec::ExecIo { stdin: true, stdout: true, stderr: false, tty: true };
+        let err = back.attach_process("ct-1", io).await.err().expect("refused");
+        assert!(err.to_string().contains("closed with it") && err.to_string().contains("#334"), "{err}");
     }
 }
