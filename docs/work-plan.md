@@ -4,7 +4,7 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #437 (P1), review: 12 major findings in pod_manager.rs
+### Done: #437 (P1), review: 12 major findings in pod_manager.rs
 2026-11-20. One commit per group, each naming its finding ids, each with tests:
 1. Secrets/ConfigMaps: dc6872a9854f (Secret values as bytes), 1f318a543243 (volume `items` keys/paths, stale files
    removed), e635cb20b82e (a required missing Secret/ConfigMap/key → VolumeNotReady/ConfigNotReady, optional skips;
@@ -16,6 +16,10 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 4. c57f2ce7c38d: probe threshold stops the container; restartPolicy decides (sidecars Always).
 5. 2eee3c8b1cb1: hostPorts → PodSandboxConfig.port_mappings (CRI), stormpump path portMappings or refusal.
 6. 0417958a2e64: claim migration ID kept locally and retried; no second start.
+Done: 2aaefd2 + 4d1c998 (group 1), 412bd7e (2; claims' subPath refused until stormpump#274), ef7f9be (3, 4),
+eabd981 (5; cilium-cni/flowsdn-cni count as serving hostPorts), f6db0fe (6: adopt the live copy from stormstorage's
+`GET /api/v1/migrations`, abort a failed one; no local memo needed), docs d6d6ff2. sc-build 320b18f27d at d6d6ff2: kubelet
+763/0, cni 28/0 (warnings are #386's). Stage requested; issue closed.
 
 ### In progress: #378, node services' mirror pods: one container per stormd helper process
 2026-11-20. stormd#75 is in (d1c5966): `GET /api/v1/volumes` per container; goldens carry `goldens[].process`, the only
