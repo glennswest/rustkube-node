@@ -43,6 +43,23 @@ pub struct CriGrpcClient {
 }
 
 impl CriGrpcClient {
+    /// The user `image` runs as, by the runtime's ImageStatus: its numeric
+    /// UID, else its user name (empty: the image names no user).
+    async fn image_user(&self, image: &str) -> Result<ImageUser, CriError> {
+        let resp = self
+            .images
+            .clone()
+            .image_status(proto::ImageStatusRequest {
+                image: Some(proto::ImageSpec { image: image.to_string(), ..Default::default() }),
+                verbose: false,
+            })
+            .await
+            .map_err(rpc_err)?
+            .into_inner();
+        let i = resp.image.ok_or_else(|| CriError::NotFound(format!("image {image}")))?;
+        Ok(ImageUser { uid: i.uid.map(|u| u.value), username: i.username })
+    }
+
     /// Create a client for a CRI socket (e.g. `/run/crio/crio.sock` or
     /// `unix:///run/containerd/containerd.sock`). Connects lazily — the
     /// socket is dialed on first RPC and redialed as needed.
@@ -821,23 +838,6 @@ impl ImageService for CriGrpcClient {
             .map_err(|e| CriError::ImagePull(format!("{image}: {}", e.message())))?
             .into_inner();
         Ok(resp.image_ref)
-    }
-
-    /// The user `image` runs as, by the runtime's ImageStatus: its numeric
-    /// UID, else its user name (empty: the image names no user).
-    async fn image_user(&self, image: &str) -> Result<ImageUser, CriError> {
-        let resp = self
-            .images
-            .clone()
-            .image_status(proto::ImageStatusRequest {
-                image: Some(proto::ImageSpec { image: image.to_string(), ..Default::default() }),
-                verbose: false,
-            })
-            .await
-            .map_err(rpc_err)?
-            .into_inner();
-        let i = resp.image.ok_or_else(|| CriError::NotFound(format!("image {image}")))?;
-        Ok(ImageUser { uid: i.uid.map(|u| u.value), username: i.username })
     }
 
     async fn image_status(&self, image: &str) -> Result<Option<ImageInfo>, CriError> {
