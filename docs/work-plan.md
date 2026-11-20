@@ -4,6 +4,20 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #334 (P1), a kubelet restart adopts no pods on stormpump
+2026-11-20. Cause (issue): StormpumpRuntime's sandbox/container maps are memory only; the engine keeps the workloads and
+their handles across a reattach with the same TOKEN and hands back exits held while away (stormpump DESIGN "That gap is
+closed"). Plan:
+1. `<state_root>/stormpump-runtime.json`: every sandbox and container with its engine handles (spec, workload, volumes,
+   root, sandbox), config, state, times, exec base (env/cwd/uid/gid/caps/groups), log paths, provenance. Written whole
+   (atomic rename) after each change; `with_state(path)` loads it before the root sweep and recover_state.
+2. Adoption checks each recorded workload with QUERY: exited → recorded exit; ESTALE/unknown handle → exited (unknown
+   code); a sandbox whose handle is stale is dropped with its containers.
+3. Tests on a runtime rebuilt from the file (not the same object): adopted sandbox/containers listed with same ids,
+   exec base kept, an exit held while away claimed; recover_state on the rebuilt runtime creates nothing new.
+4. A tty/stdin container's console (a PTY the kubelet held) does not survive: attach to it is refused saying so; gap filed.
+Then sc-build, stage, `csi` suite's `csi-kubelet-restart` enabled (KUBELET_RESTART_ADOPTS in test/src/csi.rs).
+
 ### Done: #428 (P0), four critical review findings
 2026-11-20. From stormcentral's Findings (`/api/v1/findings?project=rustkube-node`). Plan, one commit per finding:
 1. 547a888e434e cni invoker: plugin type must be a plain file name; the resolved binary must sit in a CNI bin dir.
