@@ -48,6 +48,18 @@ pub const TOKEN: [u8; 16] = *b"rustkube-kubelet";
 /// predates `Op::DepositWithdraw`, and the lock cannot move until stormvm#65.
 pub const OP_DEPOSIT_WITHDRAW: u8 = 9;
 
+/// `DEPOSIT_TAKE` (stormpump#260), by number for the same reason: a copy of a
+/// kept deposit handed back on the attach socket.
+pub const OP_DEPOSIT_TAKE: u8 = 11;
+
+/// The first byte of a kept deposit, and of the copy `DEPOSIT_TAKE` sends
+/// back (stormpump#260; `transport::KEPT_TAG`, which the locked stormpump
+/// predates). An engine older than #260 closes a deposit it does not know.
+pub const KEPT_TAG: u8 = 0xFE;
+
+/// The engine's answer for a take with nothing kept under that name.
+pub const ENOENT: i32 = 2;
+
 /// The engine's answer for a handle that was already released.
 pub const ESTALE: i32 = 116;
 /// The engine's answer for an op it does not know, or a malformed argument.
@@ -79,6 +91,9 @@ struct Request {
 struct Reply {
     cqe: Cqe,
     arena: Vec<u8>,
+    /// The copy a `DEPOSIT_TAKE` was answered with (stormpump#260), read off
+    /// the attach socket on the ring thread, which owns it.
+    taken: Option<std::os::fd::OwnedFd>,
 }
 
 /// A descriptor to hand the engine, under a name.
@@ -91,6 +106,9 @@ struct Reply {
 struct Deposit {
     name: String,
     fd: std::os::fd::OwnedFd,
+    /// Kept (stormpump#260): no spawn consumes it, and it outlives this
+    /// client's connection until it is withdrawn.
+    kept: bool,
     reply: mpsc::Sender<Result<(), RingError>>,
 }
 
@@ -432,12 +450,49 @@ impl RingClient {
     /// The name is the whole binding: the spec says "the tap for eth0 arrives
     /// on fd 9", and this says which descriptor that name means.
     pub fn deposit_fd(&self, name: &str, fd: std::os::fd::OwnedFd) -> Result<(), RingError> {
+        self.deposit(name, fd, false)
+    }
+
+    /// Hand the engine a descriptor to **keep** for this client across its
+    /// own restart (stormpump#260, rustkube-node#429): a container's pty
+    /// master or the write end of its stdin. The engine holds it until
+    /// [`Self::deposit_withdraw`], and [`Self::deposit_take`] gives a
+    /// restarted kubelet (same [`TOKEN`]) a copy. The caller keeps its own
+    /// descriptor: pass a duplicate.
+    pub fn deposit_kept_fd(&self, name: &str, fd: std::os::fd::OwnedFd) -> Result<(), RingError> {
+        self.deposit(name, fd, true)
+    }
+
+    /// A copy of what this client deposited kept under `name`
+    /// (stormpump#260). `None` when nothing is kept under it: never
+    /// deposited, withdrawn, or an engine older than #260 (which answers the
+    /// op it does not know `EINVAL`, and closed the kept deposit on arrival).
+    pub fn deposit_take(&self, name: &str) -> Result<Option<std::os::fd::OwnedFd>, RingError> {
+        match self.request(
+            Sqe { opcode: OP_DEPOSIT_TAKE, ..Default::default() },
+            Some(name.as_bytes().to_vec()),
+            false,
+        ) {
+            Ok(reply) if reply.cqe.aux == 1 => match reply.taken {
+                Some(fd) => Ok(Some(fd)),
+                None => Err(RingError::Detail(format!(
+                    "stormpump answered DEPOSIT_TAKE for {name}, and no descriptor arrived"
+                ))),
+            },
+            Ok(_) => Ok(None),
+            Err(RingError::Failed { errno: ENOENT | EINVAL, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn deposit(&self, name: &str, fd: std::os::fd::OwnedFd, kept: bool) -> Result<(), RingError> {
         let (reply, answer) = mpsc::channel();
         {
             let tx = self.deposits.lock().map_err(|_| RingError::Gone)?;
             tx.send(Deposit {
                 name: name.to_string(),
                 fd,
+                kept,
                 reply,
             })
             .map_err(|_| RingError::Gone)?;
@@ -1023,11 +1078,12 @@ fn run(
         // at all, and a spawn that names one must not be submitted before the
         // engine has it.
         while let Ok(dep) = deposits.try_recv() {
-            let result = stormpump::transport::deposit_fd(
-                stream,
-                &dep.name,
-                std::os::fd::AsRawFd::as_raw_fd(&dep.fd),
-            )
+            let raw = std::os::fd::AsRawFd::as_raw_fd(&dep.fd);
+            let result = if dep.kept {
+                send_kept(stream, &dep.name, raw)
+            } else {
+                stormpump::transport::deposit_fd(stream, &dep.name, raw)
+            }
             .map_err(|e| RingError::Detail(format!("depositing {}: {e}", dep.name)));
             // The descriptor is dropped here, after the send: the engine has
             // its own copy from SCM_RIGHTS, and holding ours would leak one
@@ -1117,11 +1173,16 @@ fn run(
                     let answer = if cqe.is_err() {
                         Err(RingError::Failed { op, errno: -cqe.result as i32, step: cqe.aux })
                     } else {
-                        Ok(Reply { cqe, arena })
+                        let taken = take_answered(op, &cqe, stream);
+                        Ok(Reply { cqe, arena, taken })
                     };
                     let _ = reply.send(answer);
                 }
                 Answer::Abandoned(op, settled) => {
+                    // A take nobody waits for any more: its copy is still on
+                    // the socket, and is read off it so the next is not
+                    // mistaken for it.
+                    drop(take_answered(op, &cqe, stream));
                     if let Some(sqe) = undo_late(op, &cqe) {
                         tracing::warn!(op, handle = cqe.handle().0, "a request given up on completed late; undoing it");
                         if op == Op::Spawn as u8 {
@@ -1148,6 +1209,112 @@ fn run(
             }
         });
     }
+}
+
+/// The copy a `DEPOSIT_TAKE` was answered with (stormpump#260): on the attach
+/// socket before its completion was published, so it is read now, without
+/// waiting. `None` for any other op, a refusal, or `aux` 0.
+fn take_answered(op: u8, cqe: &Cqe, stream: &std::os::unix::net::UnixStream) -> Option<std::os::fd::OwnedFd> {
+    if op != OP_DEPOSIT_TAKE || cqe.is_err() || cqe.aux != 1 {
+        return None;
+    }
+    match receive_kept(stream) {
+        Ok((_, fd)) => Some(fd),
+        Err(e) => {
+            tracing::warn!("stormpump answered DEPOSIT_TAKE, and its descriptor could not be read: {e}");
+            None
+        }
+    }
+}
+
+/// Send `fd` kept under `name` (stormpump#260's `deposit_kept_fd`): the tag
+/// [`KEPT_TAG`], then the name, with the descriptor as `SCM_RIGHTS`.
+pub(crate) fn send_kept(stream: &std::os::unix::net::UnixStream, name: &str, fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if name.is_empty() || name.len() > 64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a deposited descriptor needs a name of 1..=64 bytes",
+        ));
+    }
+    let mut payload = Vec::with_capacity(1 + name.len());
+    payload.push(KEPT_TAG);
+    payload.extend_from_slice(name.as_bytes());
+    let mut iov = libc::iovec { iov_base: payload.as_mut_ptr().cast(), iov_len: payload.len() };
+    let fds = [fd];
+    // SAFETY: CMSG_SPACE only computes a size.
+    let space = unsafe { libc::CMSG_SPACE(std::mem::size_of_val(&fds) as u32) } as usize;
+    let mut cmsg_buf = vec![0u8; space];
+    // SAFETY: an all-zero msghdr is valid; every pointer is set below.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr().cast();
+    msg.msg_controllen = space as _;
+    // SAFETY: the control buffer is sized by CMSG_SPACE for one descriptor,
+    // and the header and iovec outlive the call.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&fds) as u32) as _;
+        std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(cmsg).cast::<std::os::fd::RawFd>(), 1);
+        if libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Read a kept deposit's copy (stormpump#260's `receive_taken`), without
+/// blocking: its name and the descriptor, close-on-exec.
+pub(crate) fn receive_kept(stream: &std::os::unix::net::UnixStream) -> std::io::Result<(String, std::os::fd::OwnedFd)> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let mut buf = [0u8; 96];
+    let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
+    // SAFETY: CMSG_SPACE only computes a size.
+    let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<std::os::fd::RawFd>() as u32) } as usize;
+    let mut cmsg_buf = vec![0u8; space];
+    // SAFETY: an all-zero msghdr is valid; every pointer is set below.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr().cast();
+    msg.msg_controllen = space as _;
+    // SAFETY: the buffers are sized above and outlive the call.
+    let n = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut got: Option<std::os::fd::OwnedFd> = None;
+    // SAFETY: walking the control messages the kernel just wrote; each
+    // descriptor in them is ours, owned (and so closed) from here.
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                let count = ((*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize)
+                    / std::mem::size_of::<std::os::fd::RawFd>();
+                let data = libc::CMSG_DATA(cmsg).cast::<std::os::fd::RawFd>();
+                for i in 0..count {
+                    let fd = std::os::fd::OwnedFd::from_raw_fd(data.add(i).read_unaligned());
+                    if got.is_none() {
+                        got = Some(fd);
+                    }
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+        }
+    }
+    let Some(fd) = got else {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "no descriptor arrived"));
+    };
+    if n < 1 || buf[0] != KEPT_TAG {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "not a kept deposit"));
+    }
+    let n = n as usize;
+    let end = buf[..n].iter().position(|&b| b == 0).unwrap_or(n);
+    Ok((String::from_utf8_lossy(&buf[1..end]).into_owned(), fd))
 }
 
 /// Put `req` on the ring, its payload in a region of its own (#292). Gives it
@@ -1234,6 +1401,58 @@ mod tests {
             w.exited(1000 + h, 0);
         }
         assert_eq!(w.recent.len(), RECENT_EXITS, "bounded");
+    }
+
+    /// #429: a kept deposit is stormpump#260's: `0xFE`, the name, and the
+    /// descriptor; the copy a take sends back reads as its name and the same
+    /// open file; anything tagged otherwise is refused (and closed).
+    #[test]
+    fn a_kept_deposit_is_tagged_kept_and_its_copy_reads_back() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (r, w) = crate::exec::pipe().unwrap();
+        send_kept(&a, "console/ct-1", w.as_raw_fd()).unwrap();
+        drop(w);
+        let (name, fd) = receive_kept(&b).unwrap();
+        assert_eq!(name, "console/ct-1");
+        std::fs::File::from(fd).write_all(b"same").unwrap();
+        let mut got = [0u8; 4];
+        std::fs::File::from(r).read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"same");
+        // The bytes the engine reads: the tag, then the name, nothing else.
+        let (r, _w) = crate::exec::pipe().unwrap();
+        send_kept(&a, "n", r.as_raw_fd()).unwrap();
+        let mut raw = [0u8; 8];
+        assert_eq!((&b).read(&mut raw).unwrap(), 2);
+        assert_eq!(&raw[..2], &[KEPT_TAG, b'n']);
+        // An ordinary deposit is not a kept copy.
+        stormpump::transport::deposit_fd(&a, "tap0", r.as_raw_fd()).unwrap();
+        assert!(receive_kept(&b).is_err());
+        // Nothing waiting is an error, not a wait.
+        assert_eq!(receive_kept(&b).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert!(send_kept(&a, "", r.as_raw_fd()).is_err() && send_kept(&a, &"x".repeat(65), r.as_raw_fd()).is_err());
+        assert!(console_name_fits());
+    }
+
+    /// The kept console's name fits the engine's 64 bytes for any id the
+    /// runtime mints (`ct-<run tag>-<n, hex>`).
+    fn console_name_fits() -> bool {
+        format!("console/ct-{:08x}-{:08x}", u32::MAX, u64::MAX).len() <= 64
+    }
+
+    /// #429: only a successful take with `aux = 1` reads the socket.
+    #[test]
+    fn only_an_answered_take_reads_a_descriptor() {
+        let (_a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut ok = Cqe::ok(1, Handle::NONE);
+        ok.aux = 1;
+        assert!(take_answered(Op::Spawn as u8, &ok, &b).is_none());
+        let mut none = ok;
+        none.aux = 0;
+        assert!(take_answered(OP_DEPOSIT_TAKE, &none, &b).is_none());
+        // Answered, and nothing arrived: said, and `None`.
+        assert!(take_answered(OP_DEPOSIT_TAKE, &ok, &b).is_none());
     }
 
     /// #174: the grace reaches the engine in `inline_b`, in milliseconds;

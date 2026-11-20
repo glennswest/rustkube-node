@@ -884,10 +884,17 @@ with `CAP_IPC_LOCK` effective. A pod that doesn't ask must see neither.
   pods as on any runtime. The same container ids and restart counts are kept,
   and nothing is started again. The file carries the boot id: another boot's
   handles may name other workloads, so its records are never read. A
-  container's terminal or stdin (`tty`/`stdin: true`) was a descriptor the old
-  kubelet held. `kubectl attach` to one after a restart is refused saying so;
-  its logs and exec work. Unit-tested on a runtime rebuilt from the file; not
-  yet run on a node.
+  container's terminal or stdin (`tty`/`stdin: true`) is a descriptor the
+  kubelet holds (the pty master, or stdin's write end). At start a copy is
+  deposited with the engine as a *kept* deposit, `console/<container id>`
+  (#429, stormpump#260): the engine holds it while no kubelet does, so the
+  terminal does not hang up, and a restarted kubelet takes it back
+  (`DEPOSIT_TAKE`) when it adopts the container; `kubectl attach` then reaches
+  the same terminal or stdin. It is withdrawn when the container is removed.
+  On an engine older than stormpump#260 nothing is kept, and attach after a
+  restart is refused saying so; logs and exec work. Unit-tested on a runtime
+  rebuilt from the file and on the kept-deposit wire format; not yet run on a
+  node.
 - A machine started by an older kubelet has no handle recorded. If its VMI is
   gone, it is stopped through its own control socket: `shut_down` (ACPI, within
   its grace), then `quit`.

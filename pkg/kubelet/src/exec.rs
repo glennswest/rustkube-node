@@ -92,39 +92,77 @@ pub struct Console {
 }
 
 impl Console {
-    /// Make one for a container (`stdin`, `tty` as its spec says): the console
-    /// and the descriptors to deposit for its 0 (and 1, 2 with a terminal).
-    pub fn make(stdin: bool, tty: bool, log_file: std::path::PathBuf) -> io::Result<(Console, ChildEnds)> {
-        let io = ExecIo { stdin, stdout: tty, stderr: false, tty };
-        let (stdio, ends) = make(&io)?;
-        let output = tty.then(|| tokio::sync::broadcast::channel(256).0);
+    /// Make one for a container (`stdin`, `tty` as its spec says): the console,
+    /// the descriptors to deposit for its 0 (and 1, 2 with a terminal), and a
+    /// copy of the console's own end (the pty master, or stdin's write end)
+    /// for the engine to keep across a kubelet restart (#429).
+    pub fn make(stdin: bool, tty: bool, log_file: std::path::PathBuf) -> io::Result<(Console, ChildEnds, OwnedFd)> {
+        if tty {
+            let (master, slave) = open_pty()?;
+            let kept = master.try_clone()?;
+            let console = Console::of_terminal(master, stdin, log_file)?;
+            let theirs = (0..3).map(|fd| Ok((fd, slave.try_clone()?))).collect::<io::Result<Vec<_>>>()?;
+            return Ok((console, ChildEnds(theirs), kept));
+        }
+        let (r, w) = pipe()?;
+        let kept = w.try_clone()?;
+        let console = Console::of_stdin(w, log_file)?;
+        Ok((console, ChildEnds(vec![(0, r)]), kept))
+    }
+
+    /// The console of a container a restarted kubelet adopted (#429), from
+    /// the end the engine kept for it: its pty master with `tty`, else the
+    /// write end of its stdin.
+    pub fn restore(stdin: bool, tty: bool, log_file: std::path::PathBuf, kept: OwnedFd) -> io::Result<Console> {
+        if tty {
+            Console::of_terminal(kept, stdin, log_file)
+        } else {
+            Console::of_stdin(kept, log_file)
+        }
+    }
+
+    fn of_stdin(w: OwnedFd, log_file: std::path::PathBuf) -> io::Result<Console> {
+        let stdin: Writer = Box::pin(tokio::net::unix::pipe::Sender::from_owned_fd(w)?);
+        Ok(Console { stdin: tokio::sync::Mutex::new(Some(stdin)), output: None, pty: None, log_file })
+    }
+
+    /// A terminal's console: its output read here, into the log file and to
+    /// each attach.
+    fn of_terminal(master: OwnedFd, stdin: bool, log_file: std::path::PathBuf) -> io::Result<Console> {
+        // Reads and writes on the master go through the blocking pool: a pty
+        // is not a pipe, and tokio's pipe types refuse it.
+        let read = std::fs::File::from(master.try_clone()?);
+        let input: Option<Writer> = if stdin {
+            Some(Box::pin(tokio::fs::File::from_std(std::fs::File::from(master.try_clone()?))))
+        } else {
+            None
+        };
+        let output = tokio::sync::broadcast::channel(256).0;
         let console = Console {
-            stdin: tokio::sync::Mutex::new(stdio.stdin),
-            output: output.clone(),
-            pty: stdio.pty,
+            stdin: tokio::sync::Mutex::new(input),
+            output: Some(output.clone()),
+            pty: Some(Pty(master)),
             log_file: log_file.clone(),
         };
-        // A terminal's output: into the log, and to each attach.
-        if let (Some(mut out), Some(output)) = (stdio.stdout, output) {
-            tokio::spawn(async move {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut log = tokio::fs::OpenOptions::new().create(true).append(true).open(&log_file).await.ok();
-                let mut buf = vec![0u8; 32 * 1024];
-                loop {
-                    match out.read(&mut buf).await {
-                        // EIO once the container's last descriptor on it closed.
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            if let Some(f) = log.as_mut() {
-                                let _ = f.write_all(&buf[..n]).await;
-                            }
-                            let _ = output.send(axum::body::Bytes::copy_from_slice(&buf[..n]));
+        let mut out = tokio::fs::File::from_std(read);
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut log = tokio::fs::OpenOptions::new().create(true).append(true).open(&log_file).await.ok();
+            let mut buf = vec![0u8; 32 * 1024];
+            loop {
+                match out.read(&mut buf).await {
+                    // EIO once the container's last descriptor on it closed.
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if let Some(f) = log.as_mut() {
+                            let _ = f.write_all(&buf[..n]).await;
                         }
+                        let _ = output.send(axum::body::Bytes::copy_from_slice(&buf[..n]));
                     }
                 }
-            });
-        }
-        Ok((console, ends))
+            }
+        });
+        Ok(console)
     }
 }
 
@@ -331,7 +369,7 @@ mod tests {
     async fn a_terminal_containers_output_reaches_its_log_and_each_attach() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("0.log");
-        let (console, ends) = Console::make(true, true, log.clone()).unwrap();
+        let (console, ends, _kept) = Console::make(true, true, log.clone()).unwrap();
         let mut attached = console.output.as_ref().unwrap().subscribe();
         assert_eq!(ends.0.iter().map(|(fd, _)| *fd).collect::<Vec<_>>(), [0, 1, 2]);
         let mut slave = std::fs::File::from(ends.0.into_iter().nth(1).unwrap().1);
@@ -342,6 +380,58 @@ mod tests {
         assert!(std::fs::read_to_string(&log).unwrap().starts_with("hello"));
         // Its stdin reaches the container.
         console.stdin.lock().await.as_mut().unwrap().write_all(b"ls\n").await.unwrap();
+    }
+
+    /// #429: the end kept for the engine is the console's own: what is
+    /// written on it reaches the container's stdin.
+    #[tokio::test]
+    async fn the_kept_end_of_a_stdin_console_is_its_write_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let (console, ends, kept) = Console::make(true, false, dir.path().join("0.log")).unwrap();
+        assert!(console.pty.is_none() && console.output.is_none());
+        assert_eq!(ends.0.iter().map(|(fd, _)| *fd).collect::<Vec<_>>(), [0]);
+        std::fs::File::from(kept).write_all(b"kept\n").unwrap();
+        let mut child_in = std::fs::File::from(ends.0.into_iter().next().unwrap().1);
+        let mut buf = [0u8; 5];
+        child_in.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"kept\n");
+    }
+
+    /// #429: a restarted kubelet's console, from the pty master the engine
+    /// kept: the terminal's output reaches the log and each attach, and its
+    /// stdin and resize reach the terminal.
+    #[tokio::test]
+    async fn a_terminal_restored_from_its_kept_master_reads_writes_and_resizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("0.log");
+        let (master, slave) = open_pty().unwrap();
+        let console = Console::restore(true, true, log.clone(), master).unwrap();
+        let mut attached = console.output.as_ref().unwrap().subscribe();
+        let mut slave = std::fs::File::from(slave);
+        slave.write_all(b"after\n").unwrap();
+        let got = attached.recv().await.unwrap();
+        assert!(got.starts_with(b"after"), "{got:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(std::fs::read_to_string(&log).unwrap().starts_with("after"));
+        console.stdin.lock().await.as_mut().unwrap().write_all(b"x\n").await.unwrap();
+        console.stdin.lock().await.as_mut().unwrap().flush().await.unwrap();
+        let mut buf = [0u8; 1];
+        slave.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"x");
+        console.pty.as_ref().unwrap().resize(90, 30).unwrap();
+    }
+
+    /// #429: a stdin-only console restored from its kept write end.
+    #[tokio::test]
+    async fn a_stdin_console_restored_from_its_kept_write_end_reaches_the_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let (r, w) = pipe().unwrap();
+        let console = Console::restore(true, false, dir.path().join("0.log"), w).unwrap();
+        assert!(console.pty.is_none());
+        console.stdin.lock().await.as_mut().unwrap().write_all(b"in").await.unwrap();
+        let mut got = [0u8; 2];
+        std::fs::File::from(r).read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"in");
     }
 
     #[test]

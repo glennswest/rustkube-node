@@ -18,9 +18,11 @@
 //! engine may have given to other workloads, so it is never read: the file
 //! carries the boot id.
 //!
-//! **Not carried:** a container's console (`tty: true` / `stdin: true`), a PTY
-//! the kubelet held, which closes with the process. `kubectl attach` to such
-//! a container after a restart is refused saying so; logs and exec work.
+//! **Not in the file:** a container's console (`tty: true` / `stdin: true`),
+//! a descriptor (its PTY master or stdin's write end). The engine keeps a
+//! copy of it instead (#429, stormpump#260), and [`StormpumpRuntime::adopt`]
+//! takes it back. An engine that kept none (older than stormpump#260) leaves
+//! `kubectl attach` refused saying so; logs and exec work.
 
 use super::*;
 use serde::{Deserialize, Serialize};

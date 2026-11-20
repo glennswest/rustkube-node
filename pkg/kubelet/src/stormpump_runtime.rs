@@ -235,6 +235,11 @@ fn stdio_wanted(id: &str, config: &ContainerConfig, log_dir: &str) -> Option<Std
     Some(StdioWanted { stdin: config.stdin, tty: config.tty, slots, log_file: log_file_of(config, log_dir) })
 }
 
+/// The name a container's console end is kept under in the engine (#429).
+fn console_deposit(container_id: &str) -> String {
+    format!("console/{container_id}")
+}
+
 /// `<log dir>/<restart>.log`, the file the spec's `log_name` names.
 fn log_file_of(config: &ContainerConfig, log_dir: &str) -> std::path::PathBuf {
     let name = config.log_path.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("0.log");
@@ -628,6 +633,47 @@ impl StormpumpRuntime {
                 }
             }
         }
+        self.take_back_consoles(&ring).await;
+    }
+
+    /// Take back the console of each adopted container that has one (#429):
+    /// the end the engine kept for it (its pty master, or its stdin's write
+    /// end), so `kubectl attach` reaches it again. None kept (an engine older
+    /// than stormpump#260, or a container started by a kubelet before #429)
+    /// leaves it as it was: attach then says the console closed.
+    async fn take_back_consoles(&self, ring: &Arc<RingClient>) {
+        let wanted: Vec<(String, StdioWanted)> = self
+            .containers
+            .lock()
+            .await
+            .values()
+            .filter(|c| c.state == ContainerState::Running && c.console.is_none())
+            .filter_map(|c| c.stdio.clone().map(|s| (c.id.clone(), s)))
+            .collect();
+        for (id, stdio) in wanted {
+            let (r, name) = (ring.clone(), console_deposit(&id));
+            let taken = match tokio::task::spawn_blocking(move || r.deposit_take(&name)).await {
+                Ok(Ok(taken)) => taken,
+                Ok(Err(e)) => {
+                    tracing::warn!(container = %id, "stormpump: its console's kept end not taken back: {e}");
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            let Some(fd) = taken else {
+                tracing::info!(container = %id, "stormpump: no console kept for it; attach says the terminal closed");
+                continue;
+            };
+            match crate::exec::Console::restore(stdio.stdin, stdio.tty, stdio.log_file.clone(), fd) {
+                Ok(console) => {
+                    if let Some(c) = self.containers.lock().await.get_mut(&id) {
+                        c.console = Some(Arc::new(console));
+                        tracing::info!(container = %id, tty = stdio.tty, stdin = stdio.stdin, "stormpump: console taken back");
+                    }
+                }
+                Err(e) => tracing::warn!(container = %id, "stormpump: its kept console end is unusable: {e}"),
+            }
+        }
     }
 
     /// The guard every changing call holds (see [`Changed`]).
@@ -891,6 +937,16 @@ impl StormpumpRuntime {
             roots.destroy(&volume).await.map_err(CriError::Runtime)?;
             if let Some(c) = self.containers.lock().await.get_mut(container_id) {
                 c.root_volume = None;
+            }
+        }
+        // Its console's kept end (#429): nothing ties it to the workload, so
+        // the engine holds it until it is withdrawn. A refusal is said and
+        // does not hold the removal: what stays is a descriptor, until PID 1
+        // ends, not a resource the next container needs.
+        let console = self.containers.lock().await.get(container_id).and_then(|c| c.stdio.as_ref().map(|_| console_deposit(&c.id)));
+        if let Some(name) = console {
+            if let Err(e) = self.on_ring(move |r| r.deposit_withdraw(&name)).await {
+                tracing::warn!(container = %container_id, "stormpump: its console's kept end not withdrawn: {e}");
             }
         }
         if let Some(c) = self.containers.lock().await.remove(container_id) {
@@ -2008,19 +2064,22 @@ impl RuntimeService for StormpumpRuntime {
         }
 
         // `stdin: true` / `tty: true` (#56): the kubelet's ends kept, the
-        // container's deposited under the names its spec gives them.
-        let (console, deposits) = match &stdio {
+        // container's deposited under the names its spec gives them. A copy
+        // of the kubelet's own end is deposited *kept* (#429), so a restarted
+        // kubelet takes it back, and the terminal does not hang up while no
+        // kubelet holds it.
+        let (console, deposits, kept) = match &stdio {
             Some(w) => {
-                let (console, ends) = crate::exec::Console::make(w.stdin, w.tty, w.log_file.clone())
+                let (console, ends, kept) = crate::exec::Console::make(w.stdin, w.tty, w.log_file.clone())
                     .map_err(|e| CriError::Runtime(format!("container {container_id}: its stdin or terminal: {e}")))?;
                 let deposits: Vec<(String, std::os::fd::OwnedFd)> = ends
                     .0
                     .into_iter()
                     .filter_map(|(fd, end)| w.slots.iter().find(|(_, f)| *f == fd).map(|(n, _)| (n.clone(), end)))
                     .collect();
-                (Some(Arc::new(console)), deposits)
+                (Some(Arc::new(console)), deposits, Some((console_deposit(container_id), kept)))
             }
-            None => (None, Vec::new()),
+            None => (None, Vec::new(), None),
         };
 
         let (workload, held, volumes_took, spawn_took) = self
@@ -2032,6 +2091,10 @@ impl RuntimeService for StormpumpRuntime {
                 let result = (|| {
                 for (name, fd) in deposits {
                     r.deposit_fd(&name, fd)?;
+                    deposited.push(name);
+                }
+                if let Some((name, fd)) = kept {
+                    r.deposit_kept_fd(&name, fd)?;
                     deposited.push(name);
                 }
                 // Its own root, registered at create and released at removal.
@@ -2534,15 +2597,17 @@ async fn attach_to(
             .workload_handle
             .filter(|_| c.state == ContainerState::Running)
             .ok_or_else(|| CriError::Runtime(format!("container {qualified} is not running")))?;
-        // A terminal the kubelet held before it restarted (#334) closed
-        // with that process; the container runs on without it.
+        // A terminal the kubelet held before it restarted (#334), and the
+        // engine kept no copy of (older than stormpump#260, or started
+        // before #429): it closed with that process.
         let lost = c.console.is_none() && c.stdio.as_ref().is_some_and(|s| s.tty || s.stdin);
         (workload, c.console.clone(), c.log_file.clone(), qualified, lost)
     };
     if lost && (io.tty || io.stdin) {
         return Err(CriError::Runtime(format!(
             "container {qualified}'s terminal and stdin were held by the kubelet before it restarted, \
-             and closed with it; its logs and exec still work (rustkube-node#334)"
+             and stormpump kept no copy of them, so they closed with it; its logs and exec still work \
+             (rustkube-node#429)"
         )));
     }
     let terminal = console.as_ref().filter(|c| c.pty.is_some());
@@ -4802,7 +4867,7 @@ mod tests {
         let back = StormpumpRuntime::new("/nonexistent/stormpump.sock").with_state(&path);
         let io = crate::exec::ExecIo { stdin: true, stdout: true, stderr: false, tty: true };
         let err = back.attach_process("ct-1", io).await.err().expect("refused");
-        assert!(err.to_string().contains("closed with it") && err.to_string().contains("#334"), "{err}");
+        assert!(err.to_string().contains("closed with it") && err.to_string().contains("#429"), "{err}");
     }
 
     /// #430: a real-time container's spec carries `Demand::Exclusive` in the
