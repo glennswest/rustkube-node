@@ -4,6 +4,14 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #443 (P1), review: probes drop httpHeaders; gRPC probes are a TCP connect
+
+bb0746994c84: carry `httpGet.httpHeaders` through the host (reqwest) and pod-netns (raw HTTP/1.0) paths, `Host`
+overriding, `User-Agent: kube-probe/1.36` and `Accept: */*` unless set (as upstream). ff200a3eb18a: a real
+`grpc.health.v1.Health/Check` (vendored `proto/grpc/health/v1/health.proto`) with `grpc.service` and the timeout,
+SERVING only; in the pod netns the socket is connected on a setns thread and handed to tonic. Tests: local
+servers for headers/Host and a tonic health server for SERVING / NOT_SERVING / unimplemented / non-gRPC.
+
 ### Waiting on the owner: #442 (P1), review: the native runtime never provides the image rootfs
 
 The finding (`runtime.rs:136`, 3d780a09c92c) is real but is one of several gaps in `--runtime native`: no image
