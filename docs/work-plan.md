@@ -4,6 +4,13 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #444 (P1), review: VM restore takes a failed VMI lookup as a stopped VM
+
+f948ce2ee55f (`vm_restore.rs:280` at a354e09e690a): the stop-before-restore check was `api_object(vmi).is_some()`, and
+`api_object` is `None` for any failure. Plan: `api_lookup` → `Ok(Some)` / `Ok(None)` only on a 404 / `Err` otherwise;
+the check proceeds only on a confirmed 404, and waits (retried next pass) on an error or a body that is not JSON.
+Tests: the fake apiserver answers a stored `__status`/`__raw` marker; a 500 and a malformed VMI make nothing.
+
 ### Built, node run pending: #429 (P3), attach to a tty/stdin container after a kubelet restart on stormpump
 
 Built in 66838de; sc-build passed (VM sc-build-a4fc712f82, build + every test); clippy on the touched files shows only
