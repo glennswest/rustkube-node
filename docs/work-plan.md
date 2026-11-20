@@ -17,6 +17,13 @@ never says why. Plan:
    it is; `vmi-agent-keys` (a VMI with a qemuGuestAgent key reaches AccessCredentialsSynchronized True).
 Then sc-build, run golden on a pve machine now (the probe needs no new kubelet), stage, and the keys case once installed.
 Written: kubelet (agent_ping, Access.agent_said), test (qga-probe workload, golden vmi-agent-answers/vmi-agent-keys).
+Done: 8b0ab10..bec2968 (code, tests, docs; build-failure #425 closed by the passing rerun). sc-build passed: workspace build/test
+(the_access_condition_says_what_did_not_arrive), test crate test + clippy -D warnings (the_agent_probe_and_keys_are_judged);
+kubelet clippy: one finding in my test line fixed (from_ref), the rest predate it. Stage build c45ec96f6c7b.
+Golden run 6986230043 queued on pvetest2 (newest passed release, old kubelet). Held `--after-run 6986230043`. Resume: read
+`vmi-agent-answers`: ping answered + guest-network-get-interfaces enabled/answered → why the old kubelet never saw it is
+elsewhere; ping answered but interfaces refused/disabled → the fix is the cause, close once vmi-agent-keys passes on an install
+with c45ec96f6c7b's commit; ping not answered → the node's channel (stormvm/stormpump), file there with the probe's words.
 
 ### Waiting on an install: #421 (P2), direct kernel boot from the golden's kernel (vmcloud-image-operator#62, stormvm#111)
 2026-11-20. Finding: no mount is needed. stormvm's machine spec is `root: Root::Inherit`, which stormpump documents as "the
