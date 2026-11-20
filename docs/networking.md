@@ -20,6 +20,7 @@ stormcos main (`deploy/image.toml`, `deploy/manifests/50-cilium-config.yaml`,
 | Writing the conflist, serving CNI ADD | the Cilium agent | a host-network DaemonSet Pod, so it starts before any Pod network exists |
 | Pod-to-Pod routes, Pod egress (masquerade to the node's address) | Cilium | the datapath; Pod egress then leaves by the **node's** default route |
 | Services (ClusterIP, NodePort) | Cilium (`kube-proxy-replacement: true`) | the packaged kube-proxy is not run in any stormcos edition (#145, #155) |
+| A container's `hostPort` | kubelet + the CNI | the sandbox's port mappings (#437): the CRI runtime gets them; on stormpump the default network's ADD/DEL carries them as `runtimeConfig.portMappings`, never an extra network's. A chain with no plugin of that capability refuses the ADD; `cilium-cni` and `flowsdn-cni` count, since their agents serve hostPorts from the Pod object (kube-proxy replacement) |
 | `NetworkUnavailable` condition | the CNI | cilium-operator sets it False (reason `CiliumIsUp`) once the node's Cilium agent Pod is up (`set-cilium-is-up-condition: 'true'` in stormcos's config; cilium `operator/watchers/node_taint.go`). The kubelet never writes it and keeps it across heartbeats, as it keeps every condition it does not own |
 
 In the flowsdn edition flowsdn takes Cilium's rows.
