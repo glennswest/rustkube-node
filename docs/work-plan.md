@@ -4,6 +4,19 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #437 (P1), review: 12 major findings in pod_manager.rs
+2026-11-20. One commit per group, each naming its finding ids, each with tests:
+1. Secrets/ConfigMaps: dc6872a9854f (Secret values as bytes), 1f318a543243 (volume `items` keys/paths, stale files
+   removed), e635cb20b82e (a required missing Secret/ConfigMap/key → VolumeNotReady/ConfigNotReady, optional skips;
+   404 vs API failure), 699efd7029fe (envFrom with prefix/optional, explicit env wins).
+2. 0f6ec9a72d6c: subPath/subPathExpr resolved inside the volume (no `..`, no symlink escape), refused where it can't be.
+3. restart_container: 1e8f97747676 (old container confirmed gone first), 12e774c42aec (new ID recorded before start,
+   removed on a start error), 6735237ca645 (startup_passed/probe state reset), 6c156be85e7f (resolv.conf mount kept;
+   one shared mount assembly).
+4. c57f2ce7c38d: probe threshold stops the container; restartPolicy decides (sidecars Always).
+5. 2eee3c8b1cb1: hostPorts → PodSandboxConfig.port_mappings (CRI), stormpump path portMappings or refusal.
+6. 0417958a2e64: claim migration ID kept locally and retried; no second start.
+
 ### In progress: #378, node services' mirror pods: one container per stormd helper process
 2026-11-20. stormd#75 is in (d1c5966): `GET /api/v1/volumes` per container; goldens carry `goldens[].process`, the only
 per-process volume fact (one mount namespace). Plan:
