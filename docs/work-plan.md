@@ -55,6 +55,8 @@ would have seen the agent too: it never asked. Cause: on stormpump a VMI's worke
 pass that starts a machine sets none (`absorb_ends_for` runs before the start; the finalizer patch is not an intent change), so the
 guest is never polled. Fix: `first_look`: the start pass sets the look at AGENT_FIRST. Then sc-build, stage, golden on an install
 carrying it (`vmi-agent-keys` True).
+Done 25bc12e; sc-build passed (715 kubelet tests; no clippy finding in the changed lines). Stage build f06cb62e004e. Held
+`--after-install rustkube-node>=25bc12e`. Resume: run the golden suite on that machine; `vmi-agent-keys` True → close #405.
 
 ### Waiting on an install: #421 (P2), direct kernel boot from the golden's kernel (vmcloud-image-operator#62, stormvm#111)
 2026-11-20. Finding: no mount is needed. stormvm's machine spec is `root: Root::Inherit`, which stormpump documents as "the
