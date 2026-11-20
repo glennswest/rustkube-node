@@ -330,26 +330,21 @@ fn control_poll_delay(elapsed: std::time::Duration) -> std::time::Duration {
     }
 }
 
-/// `status` until the control socket can be connected to, for at most `within`.
-/// Only "not connectable" is waited out: any answer, an error too, means it is
-/// bound. A socket still missing after `within` is that error.
+/// `connect` until the control socket takes a connection, for at most `within`.
+/// Only "not connectable" is waited out: any other answer, an error too, means
+/// it is bound. A socket still missing after `within` is that error.
 ///
-/// `last_ask` is when the latest `status` began. Every earlier one was refused,
-/// so the socket took a connection then, give or take a poll, and the time since
-/// is the wait for its answer: qemu greets from its main loop, later than it binds.
-async fn control_when_up<F, Fut>(
-    mut status: F,
-    within: std::time::Duration,
-    last_ask: &std::sync::Mutex<std::time::Instant>,
-) -> Result<stormvm_control::Status, stormvm_control::ControlError>
+/// A connection taken is Running (#325, decision A): qemu's QMP greets from
+/// its main loop ~20 ms after it binds, and a caller acting on Running queues
+/// on that greeting instead of failing, which is what #303 needed.
+async fn control_when_up<F, Fut>(mut connect: F, within: std::time::Duration) -> Result<(), stormvm_control::ControlError>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<stormvm_control::Status, stormvm_control::ControlError>>,
+    Fut: std::future::Future<Output = Result<(), stormvm_control::ControlError>>,
 {
     let started = std::time::Instant::now();
     loop {
-        *last_ask.lock().unwrap_or_else(|e| e.into_inner()) = std::time::Instant::now();
-        match status().await {
+        match connect().await {
             Err(stormvm_control::ControlError::Unreachable(..)) if started.elapsed() < within => {
                 tokio::time::sleep(control_poll_delay(started.elapsed())).await;
             }
@@ -358,10 +353,19 @@ where
     }
 }
 
+/// One connect to a control socket, closed at once: is it bound and listening?
+/// Nothing is said on it, so a QMP or API client after it is its first.
+async fn connect_control(path: &str) -> Result<(), stormvm_control::ControlError> {
+    tokio::net::UnixStream::connect(path)
+        .await
+        .map(drop)
+        .map_err(|e| stormvm_control::ControlError::Unreachable(path.to_string(), e))
+}
+
 /// What the wait for a started machine's control socket came to (#303).
 #[derive(Debug, PartialEq)]
 enum ControlUp {
-    /// It answered a status: an error answer counts, the socket is bound.
+    /// It took a connection: the socket is bound (#325).
     Answered,
     /// The hypervisor exited first: its exit is what the VMI will say.
     Exited,
@@ -370,10 +374,10 @@ enum ControlUp {
 }
 
 /// Wait for `answer` (a `control_when_up`) or `exited`, whichever comes first,
-/// bounded by `within` (a bound socket that never answers is a hung wait).
+/// bounded by `within` (a connect that never returns is a hung wait).
 async fn await_control<A, E>(answer: A, exited: E, within: std::time::Duration) -> ControlUp
 where
-    A: std::future::Future<Output = Result<stormvm_control::Status, stormvm_control::ControlError>>,
+    A: std::future::Future<Output = Result<(), stormvm_control::ControlError>>,
     E: std::future::Future<Output = ()>,
 {
     let raced = async {
@@ -387,7 +391,7 @@ where
     };
     match tokio::time::timeout(within + std::time::Duration::from_secs(1), raced).await {
         Ok(up) => up,
-        Err(_) => ControlUp::NotUp("its status did not come back".into()),
+        Err(_) => ControlUp::NotUp("its connect did not come back".into()),
     }
 }
 
@@ -2450,11 +2454,12 @@ impl VmManager {
             self.pod_nets.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), net);
         }
         let on_pod_network = self.pod_nets.lock().unwrap_or_else(|e| e.into_inner()).contains_key(uid);
-        // Running means the machine answers (#303): qemu binds its QMP socket
-        // a moment after the spawn, and a client acting on Running at once
-        // (a snapshot, a verb, hotplug) found no socket there.
-        let t = match control_of(&registration) {
-            Some(machine) => {
+        // Running means the control socket takes a connection (#303, #325 A):
+        // qemu binds its QMP socket a moment after the spawn, and a client
+        // acting on Running at once (a snapshot, a verb, hotplug) found no
+        // socket there. Its greeting comes ~20 ms later; callers queue on it.
+        let t = match control_of(&registration).and_then(|m| m.control) {
+            Some(control) => {
                 let exited = async {
                     loop {
                         match exits.recv().await {
@@ -2464,15 +2469,11 @@ impl VmManager {
                         }
                     }
                 };
-                let last_ask = std::sync::Mutex::new(t);
-                match await_control(control_when_up(|| machine.status(), CONTROL_UP_WITHIN, &last_ask), exited, CONTROL_UP_WITHIN).await {
-                    ControlUp::Answered => {
-                        steps.control_answer = Some(last_ask.lock().unwrap_or_else(|e| e.into_inner()).elapsed());
-                    }
-                    ControlUp::Exited => {}
+                match await_control(control_when_up(|| connect_control(&control), CONTROL_UP_WITHIN), exited, CONTROL_UP_WITHIN).await {
+                    ControlUp::Answered | ControlUp::Exited => {}
                     ControlUp::NotUp(why) => {
                         let why = format!(
-                            "the hypervisor runs, but its control socket did not answer within {}s: {why}",
+                            "the hypervisor runs, but its control socket took no connection within {}s: {why}",
                             CONTROL_UP_WITHIN.as_secs()
                         );
                         warn!(vm = %vm.name, "{why}");
@@ -7456,18 +7457,16 @@ mod tests {
     // #325: a socket bound a moment after the spawn is found at once, not at
     // the next 100 ms; only "not connectable" is waited out; the bound holds.
     #[tokio::test]
-    async fn control_when_up_asks_soon_and_stops_at_an_answer() {
+    async fn control_when_up_asks_soon_and_stops_at_a_connect() {
         use std::cell::Cell;
         use std::time::Duration;
-        use stormvm_control::{ControlError, Status};
+        use stormvm_control::ControlError;
         assert_eq!(control_poll_delay(Duration::ZERO), Duration::from_millis(5));
         assert_eq!(control_poll_delay(Duration::from_millis(99)), Duration::from_millis(5));
         assert_eq!(control_poll_delay(Duration::from_millis(100)), Duration::from_millis(25));
         assert_eq!(control_poll_delay(Duration::from_secs(1)), Duration::from_millis(100));
         let unreachable =
             || ControlError::Unreachable("control.sock".into(), std::io::Error::from(std::io::ErrorKind::NotFound));
-
-        let last_ask = std::sync::Mutex::new(std::time::Instant::now());
 
         // Three refused connects, then bound: well under one old 100 ms sleep each.
         let asked = Cell::new(0);
@@ -7477,29 +7476,16 @@ mod tests {
                 asked.set(asked.get() + 1);
                 let n = asked.get();
                 let unreachable = &unreachable;
-                async move {
-                    if n <= 3 {
-                        Err(unreachable())
-                    } else {
-                        // Bound, and slow to answer: what `control/answer` is for.
-                        tokio::time::sleep(Duration::from_millis(40)).await;
-                        Ok(Status { state: "running".into(), paused: false })
-                    }
-                }
+                async move { if n <= 3 { Err(unreachable()) } else { Ok(()) } }
             },
             Duration::from_secs(5),
-            &last_ask,
         )
         .await;
         assert!(up.is_ok());
         assert_eq!(asked.get(), 4);
-        assert!(t.elapsed() < Duration::from_millis(300), "took {:?}", t.elapsed());
-        // The latest ask began after the three refusals and took the answer's time.
-        let answer = last_ask.lock().unwrap().elapsed();
-        assert!(answer >= Duration::from_millis(40), "{answer:?}");
-        assert!(answer < t.elapsed(), "{answer:?} of {:?}", t.elapsed());
+        assert!(t.elapsed() < Duration::from_millis(100), "took {:?}", t.elapsed());
 
-        // An error answer is a bound socket: asked once.
+        // Any other error is a bound socket: asked once.
         let asked = Cell::new(0);
         let up = control_when_up(
             || {
@@ -7507,7 +7493,6 @@ mod tests {
                 async { Err(ControlError::Refused("no".into())) }
             },
             Duration::from_secs(5),
-            &last_ask,
         )
         .await;
         assert!(matches!(up, Err(ControlError::Refused(_))));
@@ -7516,9 +7501,39 @@ mod tests {
         // Never bound: that error, once the bound has passed.
         let t = std::time::Instant::now();
         let within = Duration::from_millis(30);
-        let up = control_when_up(|| { let unreachable = &unreachable; async move { Err(unreachable()) } }, within, &last_ask).await;
+        let up = control_when_up(|| { let unreachable = &unreachable; async move { Err(unreachable()) } }, within).await;
         assert!(matches!(up, Err(ControlError::Unreachable(..))));
         assert!(t.elapsed() >= within);
+    }
+
+    // #325 A: a real socket is up the moment it listens, before anything is
+    // accepted or said on it (qemu greets later, from its main loop); a path
+    // with no socket, or one nothing listens on, is not connectable.
+    #[tokio::test]
+    async fn connect_control_is_up_once_the_socket_listens() {
+        use stormvm_control::ControlError;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let path_s = path.to_str().unwrap().to_string();
+        assert!(matches!(connect_control(&path_s).await, Err(ControlError::Unreachable(..))));
+        // Bound and listening, never accepting: a connect still lands in its backlog.
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        assert!(connect_control(&path_s).await.is_ok());
+        // The listener gone and its path left behind, as an exited qemu leaves it.
+        drop(listener);
+        assert!(matches!(connect_control(&path_s).await, Err(ControlError::Unreachable(..))));
+        // The whole wait, against a socket bound 20 ms after it began.
+        let late = path.clone();
+        std::fs::remove_file(&path).unwrap();
+        let binder = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            tokio::net::UnixListener::bind(&late).unwrap()
+        });
+        let t = std::time::Instant::now();
+        let up = control_when_up(|| connect_control(&path_s), std::time::Duration::from_secs(5)).await;
+        assert!(up.is_ok(), "{up:?}");
+        assert!(t.elapsed() < std::time::Duration::from_millis(100), "took {:?}", t.elapsed());
+        drop(binder.await.unwrap());
     }
 
     // #303: Running waits for the control socket, the exit, or the bound.
@@ -7526,13 +7541,13 @@ mod tests {
     async fn control_up_answered_exited_or_not_up() {
         use std::time::Duration;
         let never = || std::future::pending::<()>();
-        let ok = async { Ok(stormvm_control::Status { state: "running".into(), paused: false }) };
+        let ok = async { Ok(()) };
         assert_eq!(await_control(ok, never(), Duration::from_millis(50)).await, ControlUp::Answered);
-        // An error answer is a bound socket.
+        // Any error but "not connectable" is a bound socket.
         let refused = async { Err(stormvm_control::ControlError::Refused("no".into())) };
         assert_eq!(await_control(refused, never(), Duration::from_millis(50)).await, ControlUp::Answered);
         // The hypervisor exits before it binds: no waiting out the bound.
-        let pending = std::future::pending::<Result<stormvm_control::Status, stormvm_control::ControlError>>();
+        let pending = std::future::pending::<Result<(), stormvm_control::ControlError>>();
         let t = std::time::Instant::now();
         assert_eq!(await_control(pending, async {}, Duration::from_secs(5)).await, ControlUp::Exited);
         assert!(t.elapsed() < Duration::from_secs(1));
@@ -7546,7 +7561,7 @@ mod tests {
         assert!(matches!(await_control(gone, never(), Duration::from_millis(50)).await,
             ControlUp::NotUp(why) if why.contains("control.sock is not connectable")));
         // A bound socket that never answers is bounded too.
-        let hung = std::future::pending::<Result<stormvm_control::Status, stormvm_control::ControlError>>();
+        let hung = std::future::pending::<Result<(), stormvm_control::ControlError>>();
         assert!(matches!(await_control(hung, never(), Duration::from_millis(10)).await, ControlUp::NotUp(_)));
     }
 

@@ -159,15 +159,17 @@ is answered:
 | `window` | waiting for the deposit window: another start's taps (#100) |
 | `launch` | taps, plan and the engine's spawn |
 | `record` | identity published, the registration rewritten with the handle |
-| `control` | the hypervisor's control socket answering a status (#303), at most 10 s, asked every 5 ms for the first 100 ms, then every 25 ms to 1 s, then every 100 ms (#325); the hypervisor's exit ends it early. `control/answer=`, after `attempts=`, is its part after the socket took a connection: qemu's QMP greets from its main loop, later than it binds |
+| `control` | the hypervisor's control socket taking a connection (#303, #325), at most 10 s, tried every 5 ms for the first 100 ms, then every 25 ms to 1 s, then every 100 ms; the hypervisor's exit ends it early |
 | `report` | the `Running` status patch |
 | `total` | seen → `Running` answered |
 
-A VMI reads `Running` only once its hypervisor answers on its control socket (QMP for qemu,
-the API socket for cloud-hypervisor; #303). Before, it read `Running` at the engine's spawn, and a
-client acting on it at once (a snapshot, a `/vmVerb`, hotplug) found no socket. A hypervisor that
-runs but has not answered within 10 s is reported `Running` anyway, with a Warning
-`ControlNotReady` Event that names the error.
+A VMI reads `Running` only once its hypervisor's control socket (QMP for qemu, the API socket
+for cloud-hypervisor) takes a connection (#303). Before, it read `Running` at the engine's spawn,
+and a client acting on it at once (a snapshot, a `/vmVerb`, hotplug) found no socket. The kubelet
+connects and closes; it does not wait for qemu's QMP greeting, which comes from qemu's main loop
+about 20 ms after the bind (#325), so a client acting on `Running` may wait that long for it. A
+hypervisor that runs but takes no connection within 10 s is reported `Running` anyway, with a
+Warning `ControlNotReady` Event that names the error.
 
 `attempts` counts start attempts. The `Started` Event is queued after `Running`, not awaited
 before it (an Event POST took 0.5–0.7 s on a busy apiserver).

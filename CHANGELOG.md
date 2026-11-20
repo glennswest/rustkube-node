@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-20
+
+- **perf:** A VMI reads `Running` once its control socket takes a connection, not once qemu answers a status on it (#325, decision A; stormcos#804 fix 17). The kubelet connects and closes, so the wait no longer includes qemu's QMP greeting, which comes from its main loop ~20 ms after the bind: on 12.74-era pve installs a later VM's `control` was 33 ms at p50, of which the bind was 12. A client acting on `Running` (a snapshot, a verb) still finds the socket, as #303 needed, and queues on the greeting. The hypervisor's exit and the 10 s bound end the wait as before; `ControlNotReady` now says the socket "took no connection". `control/answer=` is gone from `storm.io/start-timing`: nothing after the connect is waited.
+
 ## 2026-11-19
 
 - **feat:** Each node service's mirror pod is in its own project (#418, stormcos#1020). `--mirror-namespaces` (`MIRROR_NAMESPACES`, default `/etc/kubernetes/mirror-namespaces.json`, which stormcos ships) maps a PID 1 asset to its namespace (`{"stormblock": "storm-block", …}`). An asset the map does not name, or no file, keeps `kube-system`. The map is read again when it changes. A mirror is created only once its Namespace exists. One left in another namespace is deleted once its new one exists. Its events, stormd's events and `containerLogs` go with it. So do the service's system claims: a mirror's `persistentVolumeClaim` resolves only in its own namespace (#372). Each claim is made in the service's namespace, its PV's `claimRef` follows, and the old claim is deleted on the pass after. The mirror and claim watches are cluster-wide. medium's `node-volumes-pairs` reads claims in every namespace, and the new `node-services-namespaces` checks that each service is mirrored once, with its claims beside it.
