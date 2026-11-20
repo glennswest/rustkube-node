@@ -33,6 +33,12 @@ the guest's replies have no gateway (flowsdn's ARP on the veth); csumerr moving 
 Done 3736f83; sc-build (test crate test + clippy -D warnings) passed. Golden run 343d192458 on pvetest2. Held `--after-run 343d192458`.
 Run 343d192458 was interrupted at `running` (stormcentral restarted), no result. Same image rerun as 4d7e677e89 on pvetest2
 (2026-11-20). Held `--after-run 4d7e677e89`. Resume as above: read the RKN-PODNETNET lines quoted by vmi-pod-network.
+Run 4d7e677e89: SYNs reach the guest (in 0→90), its replies retransmit (retrans 80), and its neighbour for the gateway
+10.173.0.1 stays INCOMPLETE: nothing answers its ARP. Cause: flowsdn's CNI pins the gateway with a PERMANENT neighbour entry
+in the pod netns (gateway → host veth MAC, flowsdn-cni runtime.rs) and its datapath answers no ARP; stormvm's bridge_binding
+does not carry that entry to the guest (down + new MAC flush it). Fix is stormvm-net's: filed stormvm#138 (keep the gateway
+MAC, answer the guest's ARP for it on vmbr0). Held `--after stormvm#138`. Resume: bump the stormvm rev (and LeaseRecord if
+the gateway MAC must survive a kubelet restart), sc-build, stage, golden rerun on pvetest2; vmi-pod-network passing closes.
 
 ### In progress: #405 (P2), AccessCredentialsSynchronized stuck at "waiting for the guest agent to answer"
 2026-11-20. Ruled out (stormcos_qa#52 on the issue): the golden runs qemu-guest-agent and the guest has org.qemu.guest_agent.0.
