@@ -140,8 +140,9 @@ struct Cli {
     metadata_max_staleness: u64,
 
     /// stormstorage's API, which mirrors a migrating VM's disks to the target
-    /// node (#40, stormstorage#44). Unset: VMIs are not migrated from or to
-    /// this node, and a migration says why.
+    /// node (#40, stormstorage#44) and holds mirrored VM disks filled from a
+    /// golden (#404). Unset: VMIs are not migrated from or to this node, a
+    /// VMI asking for a mirrored disk does not start here, and each says why.
     #[arg(long, env = "STORMSTORAGE_URL")]
     stormstorage: Option<String>,
 

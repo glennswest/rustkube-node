@@ -103,7 +103,7 @@ PVCs; README, "Restores"). A VMI's live migration is driven by its `status.migra
 migration"): no kubelet route; the memory travels qemu to qemu over TLS on the target's `--migration-port`
 (49152 up, one per arriving machine), which must be reachable from the other nodes. A running disk is moved to another
 node's storage by the VMI annotation `storm.io/move-disks` (`{"<disk>": "<node>"}`); the kubelet's progress and
-outcome are in `storm.io/disk-moves` (#302; README, "A running disk moved off the node"): no kubelet route either. A stopped
+outcome are in `storm.io/disk-moves` (#302; README, "A running disk moved off the node"): no kubelet route either. A golden's disk named in the VMI annotation `storm.io/mirrored-disks` (`{"<disk>": <copies ≥ 2>}`) is a stormstorage mirrored volume filled from the golden (#404; README, "A VM disk mirrored across nodes from its golden"): no kubelet route. A stopped
 VirtualMachine's disks move by `storm.io/move-to: <node>` on the VM, reported in `storm.io/move-status` and the template's
 `storm.io/disk-moves` (#339; README, "A stopped VM's disks moved to another node"). A bound built-in claim moves by `storm.io/move-to` on its PVC, reported in
 `storm.io/move-state`, `storm.io/move-progress` and `storm.io/move-reason` (#338; README, "A built-in claim moved to another node").

@@ -2385,8 +2385,10 @@ impl VmManager {
         // that does not exist costs a failed status and no cleanup.
         let owner = self.owner_of(obj).await;
         let t = steps.since("owner", t);
-        let (disks, owned_volumes) =
-            self.resolve_disks_as(uid, &vm, &boot_keys, &owner, fresh, Resolving::Start(steps.disks_mut())).await?;
+        let mirrored = self.mirror_requests(obj, &vm)?;
+        let (disks, owned_volumes) = self
+            .resolve_disks_as(uid, &vm, &boot_keys, &owner, fresh, &mirrored, Resolving::Start(steps.disks_mut()))
+            .await?;
         let t = steps.since("disks", t);
 
         // The pod log directory, because that is where `kubectl logs` looks.
@@ -2985,6 +2987,7 @@ impl VmManager {
         if !self.release_pod_network(&vm.uid).await {
             return false;
         }
+        self.withdraw_mirrored(vm).await;
         deregister(&vm.namespace, &vm.name);
         crate::vm_hotplug::remove(&self.hot_dir, &vm.namespace, &vm.name);
         self.hot_records.lock().unwrap_or_else(|e| e.into_inner()).remove(&vm.uid);
@@ -3018,13 +3021,16 @@ impl VmManager {
         owner: &Value,
         fresh: &mut Vec<String>,
     ) -> Result<(Vec<ResolvedDisk>, Vec<String>), StartFail> {
-        self.resolve_disks_as(uid, vm, keys, owner, fresh, Resolving::Start(&mut Vec::new())).await
+        self.resolve_disks_as(uid, vm, keys, owner, fresh, &Default::default(), Resolving::Start(&mut Vec::new())).await
     }
 
     /// Clone or attach every disk of `vm`, as above. [`Resolving::Hot`] for
     /// disks added to a running machine (#247), where a failure gives back
     /// only these disks, never the machine's others (a start gives back every
     /// CSI disk of the VMI); [`Resolving::Start`] keeps each disk's time (#259).
+    /// A golden's disk named in `mirrored` (disk → copies, #404) is a
+    /// stormstorage mirrored volume filled from the golden, not a local clone.
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_disks_as(
         &self,
         uid: &str,
@@ -3032,6 +3038,7 @@ impl VmManager {
         keys: &[String],
         owner: &Value,
         fresh: &mut Vec<String>,
+        mirrored: &std::collections::BTreeMap<String, u32>,
         mut how: Resolving<'_>,
     ) -> Result<(Vec<ResolvedDisk>, Vec<String>), StartFail> {
         let hot = matches!(how, Resolving::Hot);
@@ -3039,7 +3046,17 @@ impl VmManager {
         let mut owned: Vec<String> = Vec::new();
         for d in &vm.disks {
             let began = std::time::Instant::now();
+            let on_mirror = matches!(d.from, DiskSource::Golden(_)) && mirrored.contains_key(&d.name);
             let volume_id = match &d.from {
+                DiskSource::Golden(g) if on_mirror => {
+                    match self.mirrored_disk(vm, &d.name, g, d.size.as_deref(), mirrored[&d.name], owner).await {
+                        Ok(id) => id,
+                        Err(e) => {
+                            self.give_back_disks(uid, &done, hot.then_some(vm)).await;
+                            return Err(e);
+                        }
+                    }
+                }
                 DiskSource::Golden(g) => {
                     // Both qualified by namespace, through stormvm's own
                     // definitions so the standalone and cluster paths cannot
@@ -3214,7 +3231,9 @@ impl VmManager {
             // is deleting data the machine was only borrowing. stormvm's own
             // `delete` states the rule. Listed rather than excluded, so a
             // source stormvm adds later is kept until someone decides.
-            let ours = matches!(
+            // A mirrored disk (#404) is stormstorage's volume, deleted
+            // through stormstorage by the sweep, never as an engine volume.
+            let ours = !on_mirror && matches!(
                 d.from,
                 DiskSource::Golden(_) | DiskSource::CloudInit | DiskSource::Empty
             );
@@ -4006,8 +4025,13 @@ impl VmManager {
                 }
             }
             let owner = if add.is_empty() { Value::Null } else { self.owner_of(obj).await };
+            let mirrored = if add.is_empty() { Ok(Default::default()) } else { self.mirror_requests(obj, &spec) };
             for name in &add {
-                match self.add_hot_disk(&mut vm, &spec, name, &owner, machine.as_ref()).await {
+                let added = match &mirrored {
+                    Ok(m) => self.add_hot_disk(&mut vm, &spec, name, &owner, m, machine.as_ref()).await,
+                    Err(e) => Err(StartFail::Failed(e.message().to_string())),
+                };
+                match added {
                     Ok(target) => {
                         info!(vm = %vm.name, disk = %name, %target, "disk added");
                         self.event_of(&vm, "Normal", "DiskAdded", &format!("disk {name} added at {target}")).await;
@@ -4088,6 +4112,7 @@ impl VmManager {
         spec: &VmSpec,
         name: &str,
         owner: &Value,
+        mirrored: &std::collections::BTreeMap<String, u32>,
         machine: &dyn crate::vm_hotplug::Hotplug,
     ) -> Result<String, StartFail> {
         let Some(d) = spec.disks.iter().find(|d| d.name == name).cloned() else {
@@ -4105,7 +4130,7 @@ impl VmManager {
         let mut fresh = Vec::new();
         let resolved = {
             let _disks = self.disk_lifecycle.read().await;
-            self.resolve_disks_as(&vm.uid, &one, &[], owner, &mut fresh, Resolving::Hot).await
+            self.resolve_disks_as(&vm.uid, &one, &[], owner, &mut fresh, mirrored, Resolving::Hot).await
         };
         let (done, owned) = match resolved {
             Ok(r) => r,
@@ -4530,6 +4555,64 @@ impl VmManager {
         Ok(list["items"].as_array().cloned().unwrap_or_default())
     }
 
+    /// The VMI's mirrored disks (#404): disk → copies. A request that does
+    /// not parse, names a disk that is not a golden's, or cannot be met
+    /// because this node has no stormstorage fails the start, saying why.
+    fn mirror_requests(&self, obj: &Value, vm: &VmSpec) -> Result<std::collections::BTreeMap<String, u32>, StartFail> {
+        use crate::vm_mirrored_root as mr;
+        let asked = mr::requests(obj).map_err(StartFail::Failed)?;
+        if let Some(why) = mr::refusal(&asked, vm) {
+            return Err(StartFail::Failed(why));
+        }
+        if !asked.is_empty() && self.migration.stormstorage.is_none() {
+            return Err(StartFail::Failed(format!(
+                "{}: a mirrored disk is stormstorage's, and this node has no stormstorage (--stormstorage)",
+                mr::REQUEST
+            )));
+        }
+        Ok(asked)
+    }
+
+    /// Disk `disk` from golden `g` on a stormstorage mirrored volume (#404):
+    /// made once from the golden, waited for until stormstorage's copy is
+    /// done, served to this node's host. The id this node's engine attaches.
+    async fn mirrored_disk(
+        &self,
+        vm: &VmSpec,
+        disk: &str,
+        g: &str,
+        size: Option<&str>,
+        copies: u32,
+        owner: &Value,
+    ) -> Result<String, StartFail> {
+        use crate::vm_mirrored_root as mr;
+        let Some(ss) = self.migration.stormstorage.as_ref() else {
+            return Err(StartFail::Failed(format!("disk {disk}: mirrored, and this node has no stormstorage")));
+        };
+        let not_yet = |e: mr::NotYet| match e {
+            mr::NotYet::Wait(w) => StartFail::Waiting(format!("disk {disk}: {w}")),
+            mr::NotYet::Fail(f) => StartFail::Failed(format!("disk {disk}: {f}")),
+        };
+        let name = mr::volume_name(vm, disk);
+        let v = mr::find_or_create(ss, &self.engine, &self.storage, &name, g, size, copies, &self.node_name, owner)
+            .await
+            .map_err(not_yet)?;
+        if left_by_another(&v, owner) {
+            return Err(StartFail::Waiting(format!(
+                "disk {disk}: volume {name} was left by an earlier {} of this name; waiting for it to be removed",
+                v["owner"]["kind"].as_str().unwrap_or("owner")
+            )));
+        }
+        match mr::seeded(&name, &v).map_err(|e| StartFail::Failed(format!("disk {disk}: {e}")))? {
+            mr::Seeded::No(why) => return Err(StartFail::Waiting(format!("disk {disk}: {why}"))),
+            mr::Seeded::Yes(_) => {}
+        }
+        let served = mr::serve_to(ss, &name, &mr::host_nqn(&self.node_name)).await.map_err(not_yet)?;
+        let id = mr::served_id(&name, &served);
+        info!(volume = %name, served = %id, "disk {disk} is on mirrored volume {name}");
+        Ok(id)
+    }
+
     /// The volume a previous start made for disk `disk` (named `name`), if
     /// there is one, with its owner brought up to `owner` (#75).
     ///
@@ -4618,6 +4701,11 @@ impl VmManager {
         };
         for v in volumes {
             let Some(id) = v["id"].as_str() else { continue };
+            // A mirrored disk's leg, served volume or seed (#404) is
+            // stormstorage's: deleted with its volume, below.
+            if v["name"].as_str().is_some_and(crate::vm_mirrored_root::is_part) {
+                continue;
+            }
             let owner = &v["owner"];
             let Some(path) = owner_path(owner) else { continue };
             if held.contains(id) || v["in_use"].as_bool() == Some(true) {
@@ -4646,7 +4734,71 @@ impl VmManager {
             // volume is still there for the next sweep.
             again = Some(SWEEP_EVERY);
         }
+        if self.sweep_mirrored().await {
+            again = Some(SWEEP_EVERY);
+        }
         again
+    }
+
+    /// Delete the mirrored disks (#404) whose owner has gone for good and
+    /// that serve no host, through stormstorage. `true` when one is left to
+    /// look at again (an owner not asked, a delete refused).
+    async fn sweep_mirrored(&self) -> bool {
+        use crate::vm_mirrored_root as mr;
+        let Some(ss) = self.migration.stormstorage.as_ref() else { return false };
+        let volumes = match mr::list(ss).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!("mirrored disks not swept: stormstorage {e}");
+                return true;
+            }
+        };
+        let mut again = false;
+        for v in volumes.iter().filter(|v| mr::sweepable(v)) {
+            let Some(name) = v["name"].as_str() else { continue };
+            let owner = &v["owner"];
+            let Some(path) = owner_path(owner) else { continue };
+            let (status, obj) = match self.api.get(format!("{}{path}", self.api_url)).send_retrying(retry::Policy::API).await {
+                Ok(r) => {
+                    let status = r.status().as_u16();
+                    (status, r.json::<Value>().await.ok())
+                }
+                Err(_) => {
+                    again = true;
+                    continue;
+                }
+            };
+            if !owner_gone(status, obj.as_ref(), owner) {
+                continue;
+            }
+            match mr::delete(ss, name).await {
+                Ok(()) => info!(volume = %name, "deleted mirrored disk {name}: its {} {}/{} is gone",
+                                owner["kind"].as_str().unwrap_or(""),
+                                owner["namespace"].as_str().unwrap_or(""),
+                                owner["name"].as_str().unwrap_or("")),
+                Err(e) => {
+                    warn!(volume = %name, "mirrored disk not deleted: {e}");
+                    again = true;
+                }
+            }
+        }
+        again
+    }
+
+    /// A stopped machine's mirrored disks (#404) are no longer served to
+    /// this node. Asked of stormstorage for each disk (no such volume: not a
+    /// mirrored disk). Best effort: a host left served keeps the volume from
+    /// the sweep, never deletes anything.
+    async fn withdraw_mirrored(&self, vm: &Vm) {
+        use crate::vm_mirrored_root as mr;
+        let Some(ss) = self.migration.stormstorage.as_ref() else { return };
+        let host = mr::host_nqn(&self.node_name);
+        for d in &vm.disks {
+            let name = mr::name_of(&vm.namespace, &vm.name, &d.name);
+            if let Err(e) = mr::withdraw(ss, &name, &host).await {
+                warn!(vm = %vm.name, volume = %name, "this node is still served {name}: {e}");
+            }
+        }
     }
 
     /// [`Self::release`], and the disks on other drivers' claims (#157):
@@ -7338,7 +7490,7 @@ impl crate::vm_golden::Machines for VmManager {
         let ring = self.ring.clone().ok_or_else(|| "no ring to stormpump: only the engine starts a machine".to_string())?;
         let (mut fresh, mut times) = (Vec::new(), Vec::new());
         let (disks, _) = self
-            .resolve_disks_as(uid, spec, &[], &Value::Null, &mut fresh, Resolving::Start(&mut times))
+            .resolve_disks_as(uid, spec, &[], &Value::Null, &mut fresh, &Default::default(), Resolving::Start(&mut times))
             .await
             .map_err(|e| e.message().to_string())?;
         let dir = format!("{LOG_ROOT}/{}_{}_{uid}/{}", spec.namespace, spec.name, spec.name);
@@ -10798,6 +10950,171 @@ mod tests {
     }
 
     /// A VMI with one disk, `data`, from the given volume source.
+    /// #404: a golden's disk asked to be mirrored is made once in
+    /// stormstorage from the golden, waited for until the copy is done,
+    /// served to this node's host and attached through this node's engine;
+    /// it is not the machine's own engine volume. The stop withdraws the host.
+    #[tokio::test]
+    async fn a_mirrored_root_is_made_from_its_golden_and_attached_once_copied() {
+        use axum::extract::Path;
+        use axum::routing::{get, post};
+        type Shared<T> = Arc<std::sync::Mutex<T>>;
+        let seen: Shared<Vec<String>> = Arc::default();
+        let made: Shared<Option<Value>> = Arc::default();
+        let state: Shared<&'static str> = Arc::new(std::sync::Mutex::new("pending"));
+        let hosts: Shared<Vec<String>> = Arc::default();
+        let (s1, s2, s3, s4) = (seen.clone(), seen.clone(), seen.clone(), seen.clone());
+        let (m1, m2, st1, h1, h2) = (made.clone(), made.clone(), state.clone(), hosts.clone(), hosts.clone());
+        let app = axum::Router::new()
+            // The engine: the golden, and the attach.
+            .route("/api/v1/volumes/fedora-43", get(|| async { axum::Json(json!({"id": "g1", "virtual_size_bytes": 4096})) }))
+            .route(
+                "/api/v1/volumes/{id}/attach",
+                post(move |Path(id): Path<String>| {
+                    let s = s1.clone();
+                    async move {
+                        s.lock().unwrap().push(format!("attach {id}"));
+                        axum::Json(json!({ "device_hint": format!("/dev/ublk-{id}") }))
+                    }
+                }),
+            )
+            // stormstorage.
+            .route(
+                "/ss/api/v1/volumes",
+                post(move |axum::Json(b): axum::Json<Value>| {
+                    let (s, m) = (s2.clone(), m1.clone());
+                    async move {
+                        s.lock().unwrap().push("create".into());
+                        *m.lock().unwrap() = Some(b.clone());
+                        axum::Json(json!({"name": b["name"], "owner": b["owner"], "seed": {"golden": "fedora-43", "state": "pending"}}))
+                    }
+                }),
+            )
+            .route(
+                "/ss/api/v1/volumes/{name}",
+                get(move |Path(name): Path<String>| {
+                    let (m, st, h) = (m2.clone(), st1.clone(), h1.clone());
+                    async move {
+                        let Some(b) = m.lock().unwrap().clone() else {
+                            return (axum::http::StatusCode::NOT_FOUND, axum::Json(json!({})));
+                        };
+                        let hosts: Vec<Value> = h.lock().unwrap().iter().map(|n| json!({"host_nqn": n})).collect();
+                        let local = if hosts.is_empty() { Value::Null } else { json!("served-1") };
+                        (axum::http::StatusCode::OK, axum::Json(json!({"name": name, "owner": b["owner"],
+                            "seed": {"golden": "fedora-43", "state": *st.lock().unwrap(), "bytes_total": 4096, "bytes_remaining": 1024},
+                            "export": {"hosts": hosts, "local_id": local}})))
+                    }
+                }),
+            )
+            .route(
+                "/ss/api/v1/volumes/{name}/export/hosts",
+                post(move |axum::Json(b): axum::Json<Value>| {
+                    let (s, h) = (s3.clone(), h2.clone());
+                    async move {
+                        s.lock().unwrap().push("serve".into());
+                        h.lock().unwrap().push(b["host_nqn"].as_str().unwrap_or("").to_string());
+                        axum::Json(json!({"host_nqn": b["host_nqn"]}))
+                    }
+                }),
+            )
+            .route(
+                "/ss/api/v1/volumes/{name}/export/hosts/{nqn}",
+                axum::routing::delete(move |Path((name, _nqn)): Path<(String, String)>| {
+                    let s = s4.clone();
+                    async move {
+                        s.lock().unwrap().push(format!("withdraw {name}"));
+                        axum::Json(json!({"withdrawn": "done"}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = crate::vm_migration::Config {
+            stormstorage: Some(crate::engine::EngineClient::new(&format!("{url}/ss"), crate::engine::TokenSource::none())),
+            ..Default::default()
+        };
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), &url)
+            .with_storage(crate::engine::EngineClient::new(&url, crate::engine::TokenSource::none()))
+            .with_migration(config);
+
+        let mut obj = vmi("n1");
+        obj["metadata"]["annotations"] = json!({ crate::vm_mirrored_root::REQUEST: r#"{"root": 2}"# });
+        obj["spec"]["domain"]["devices"] = json!({ "disks": [{ "name": "root", "disk": { "bus": "virtio" } }] });
+        obj["spec"]["volumes"] = json!([{ "name": "root", "containerDisk": { "image": "fedora-43" } }]);
+        let spec: VmSpec = stormvm_spec::kube::from_kube(&obj).unwrap();
+        let mirrored = m.mirror_requests(&obj, &spec).unwrap();
+        let owner = json!({"kind": "VirtualMachine", "namespace": "default", "name": "web", "uid": "vm-uid"});
+        let (mm, sp, ow, mi) = (&m, &spec, &owner, &mirrored);
+        let resolve = move || async move {
+            mm.resolve_disks_as("u1", sp, &[], ow, &mut Vec::new(), mi, Resolving::Start(&mut Vec::new())).await
+        };
+
+        // Made from the golden, on this node, and the start waits for the copy.
+        match resolve().await {
+            Err(StartFail::Waiting(w)) => assert!(w.contains("start copying"), "{w}"),
+            other => panic!("{other:?}"),
+        }
+        let body = made.lock().unwrap().clone().unwrap();
+        let name = crate::vm_mirrored_root::volume_name(&spec, "root");
+        assert_eq!(body, crate::vm_mirrored_root::create_body(&name, "fedora-43", 4096, 2, "n1", &owner));
+        *state.lock().unwrap() = "copying";
+        match resolve().await {
+            Err(StartFail::Waiting(w)) => assert!(w.contains("1024 of 4096 bytes left"), "{w}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(seen.lock().unwrap().iter().filter(|x| *x == "create").count(), 1, "made once");
+
+        // Done: served to this node and attached here; not the machine's own.
+        *state.lock().unwrap() = "done";
+        let (disks, owned) = resolve().await.unwrap();
+        assert_eq!(disks[0].device, "/dev/ublk-served-1");
+        assert_eq!(disks[0].volume_id.as_deref(), Some("served-1"));
+        assert!(owned.is_empty(), "stormstorage's volume, never deleted as an engine volume");
+        assert_eq!(*hosts.lock().unwrap(), vec![crate::vm_mirrored_root::host_nqn("n1")]);
+        assert!(seen.lock().unwrap().ends_with(&["serve".to_string(), "attach served-1".to_string()]));
+
+        // The stop withdraws this node's host.
+        let vm = Vm {
+            namespace: spec.namespace.clone(),
+            name: spec.name.clone(),
+            uid: "u1".into(),
+            log_dir: String::new(),
+            handle: Handle::NONE,
+            disks,
+            phase: Phase::Running,
+            exit_code: 0,
+            started_unix: 0,
+            ready_unix: None,
+            owned_volumes: owned,
+            nics: Vec::new(),
+            message: String::new(),
+            access: Access::default(),
+            hot: crate::vm_hotplug::Size::default(),
+        };
+        m.withdraw_mirrored(&vm).await;
+        assert!(seen.lock().unwrap().contains(&format!("withdraw {name}")));
+    }
+
+    /// #404: a mirror request that cannot be met fails the start, saying why.
+    #[tokio::test]
+    async fn a_mirror_request_needs_stormstorage_and_a_goldens_disk() {
+        let m = VmManager::new(None, "n1", reqwest::Client::new(), "");
+        let mut obj = vmi("n1");
+        obj["metadata"]["annotations"] = json!({ crate::vm_mirrored_root::REQUEST: r#"{"root": 2}"# });
+        obj["spec"]["domain"]["devices"] = json!({ "disks": [{ "name": "root", "disk": { "bus": "virtio" } }] });
+        obj["spec"]["volumes"] = json!([{ "name": "root", "containerDisk": { "image": "fedora-43" } }]);
+        let spec: VmSpec = stormvm_spec::kube::from_kube(&obj).unwrap();
+        match m.mirror_requests(&obj, &spec) {
+            Err(StartFail::Failed(w)) => assert!(w.contains("no stormstorage"), "{w}"),
+            other => panic!("{other:?}"),
+        }
+        obj["metadata"]["annotations"] = json!({ crate::vm_mirrored_root::REQUEST: r#"{"data": 2}"# });
+        assert!(matches!(m.mirror_requests(&obj, &spec), Err(StartFail::Failed(w)) if w.contains("no disk data")));
+        obj["metadata"]["annotations"] = json!({});
+        assert!(m.mirror_requests(&obj, &spec).unwrap().is_empty());
+    }
+
     fn vm_with(volume: Value) -> VmSpec {
         let mut obj = vmi("n1");
         obj["spec"]["domain"]["devices"] = json!({ "disks": [{ "name": "data", "disk": { "bus": "virtio" } }] });

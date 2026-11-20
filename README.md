@@ -1177,6 +1177,44 @@ restarted mid-migration (the migration fails; the guest stays on the source).
 Not run against two real nodes yet: stormstorage runs only on `sno` nodes
 until stormstorage#56/stormcos#354.
 
+### A VM disk mirrored across nodes from its golden
+
+A golden's disk is normally a copy-on-write clone on the node's own engine,
+so it lives and dies with that node. A disk named in the VMI annotation
+`storm.io/mirrored-disks` (`{"<disk>": <copies>}`, at least 2; set it in a
+VirtualMachine's template so every VMI carries it) is instead a stormstorage
+volume, RAID1 across nodes, filled once from the golden (#404,
+stormstorage#113 option B', stormstorage#116):
+
+    metadata:
+      annotations:
+        storm.io/mirrored-disks: '{"root": 2}'
+
+1. The kubelet starting the machine asks stormstorage for
+   `<namespace>.<vm>-<disk>.mirrored` once: `POST /api/v1/volumes {name,
+   size_bytes, raid: "mirror", replicas, from_golden, prefer_node: <this
+   node>, owner}`. `size_bytes` is the golden's size on this node, or the
+   disk's `size` when larger. A 409 (no placed node holds the golden) waits.
+2. Until stormstorage's `seed.state` is `done` the machine stays Pending,
+   saying how many bytes are left; a failed copy is retried by stormstorage
+   after its cooldown, and the condition says why.
+3. Once done it is served to this node's host NQN (`POST
+   …/export/hosts`; `/etc/nvme/hostnqn`, else
+   `nqn.2026-09.lo.storm:host-<node>`, stormblock's own fallback), and this
+   node's stormblock attaches the served volume (`export.local_id`) as ublk:
+   a peer's volume over NVMe/TCP when the head is another node
+   (stormblock#328). The guest boots from it.
+
+The next start, here or on another node, finds the volume by name and boots
+from it as it is. A stop withdraws the node's host. The volume is the
+VirtualMachine's (#75): once the VM is gone and no host is served, the
+kubelet's sweep deletes it through stormstorage. The engine's sweep never
+deletes its legs. It needs `--stormstorage`. A request naming a disk that
+is not a golden's, or on a node with no stormstorage, fails the start
+saying why. A mirrored disk is not the machine's own engine volume, so a
+live migration or a disk move refuses it, as it refuses a claim. A disk
+added to a running machine is mirrored the same way.
+
 ### A running disk moved off the node
 
 A disk can move to another node's storage while its VM keeps running where

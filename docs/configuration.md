@@ -32,7 +32,7 @@ An em dash means there is no environment binding or the value is unset.
 | `--no-cni` | — | `false`; disables the kubelet CNI invoker; see runtime caveat below |
 | `--storage-overcommit` | `STORAGE_OVERCOMMIT` | `1.0`: committed bytes allowed per byte of stormblock data slab; a claim is charged its full class (#62, #108) |
 | `--storage-reserve-percent` | `STORAGE_RESERVE_PERCENT` | `5`: percent of the data slabs kept back from claims (#62) |
-| `--stormstorage` | `STORMSTORAGE_URL` | unset: stormstorage's API, which mirrors a migrating VM's disks (#40, stormstorage#44). Unset: no VMI migrates from or to this node, and its migration says why |
+| `--stormstorage` | `STORMSTORAGE_URL` | unset: stormstorage's API, which mirrors a migrating VM's disks (#40, stormstorage#44) and holds a VMI's `storm.io/mirrored-disks` (#404). Unset: no VMI migrates from or to this node, a VMI asking for a mirrored disk does not start here, and each says why |
 | `--stormstorage-token-file` | `STORMSTORAGE_TOKEN_FILE` | `/run/stormstorage/api_token`: stormstorage's `[api] api_token`, read at each call |
 | `--migration-tls-cert`, `--migration-tls-key`, `--migration-tls-ca` | `MIGRATION_TLS_CERT`, `_KEY`, `_CA` | unset: the node's certificate (serverAuth and clientAuth), its key and the cluster CA for live migration's TLS (#40, stormvm#30), copied into the machine's run directory for each migration. All three or none |
 | `--migration-port` | `MIGRATION_PORT` | `49152`: the first port a VM arriving by live migration listens on, one more per machine arriving at once (64) |

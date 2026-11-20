@@ -2992,7 +2992,7 @@ pub const HOST_NQN_FILES: [&str; 2] = ["/hostroot/etc/nvme/hostnqn", "/etc/nvme/
 
 /// This node's NVMe host NQN, if it has one (#236): the first readable
 /// `nqn.`… line of [`HOST_NQN_FILES`].
-fn node_host_nqn() -> Option<String> {
+pub(crate) fn node_host_nqn() -> Option<String> {
     HOST_NQN_FILES.iter().find_map(|p| host_nqn_in(&std::fs::read_to_string(p).ok()?))
 }
 
