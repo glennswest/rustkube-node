@@ -2,6 +2,12 @@
 
 ## 2026-11-20
 
+- **fix:** Container restarts (#437).
+  - A restart waits until the old container is confirmed stopped and removed (1e8f97747676). Both errors were ignored, so a busy or briefly unreachable runtime could leave the old process running beside its replacement, with the same volumes and ports.
+  - The replacement's ID is recorded as soon as it is created (12e774c42aec). A start that fails or times out stops and removes it; one that cannot be removed then is removed by the next try before anything else is made. Before, each failed start left an untracked container (possibly running) and a new root.
+  - A restarted container's startup probe runs again, and it is not ready until it passes (6735237ca645). The first run's pass was kept, so a slow replacement met its liveness probe at once.
+  - A restarted container keeps the kubelet's `/etc/resolv.conf` (6c156be85e7f): start and restart now build mounts in one place (`container_mounts`). On stormpump every restart is a fresh root, so a restarted container lost cluster DNS.
+- **fix:** A startup or liveness probe that gives up stops the container, and its restart policy decides what follows (#437, c57f2ce7c38d). Under `restartPolicy: Never` it stays terminated; before, it was always recreated, so a Job's container could run twice. Always and OnFailure still restart it, and native sidecars always do.
 - **fix:** `volumeMounts[].subPath` and `subPathExpr` bind the path inside the volume, not the whole volume (#437, 0f6ec9a72d6c). A ConfigMap key at `/etc/app.conf` binds that one file, and a directory of an emptyDir or hostPath is made if it is not there. A subpath that leaves its volume or goes through a symlink is refused with `CreateContainerConfigError`, and so is one missing from a ConfigMap/Secret/projected volume. `subPathExpr` expands `$(VAR)` from the container's env. A subPath on a claim filesystem the engine mounts from its device is refused until stormpump can bind a directory of one (stormpump#274).
 - **fix:** ConfigMaps and Secrets reach a container as they are in the API (#437).
   - A Secret's value is written byte for byte (dc6872a9854f). It went through a lossy UTF-8 conversion, so a keystore's 0xff became U+FFFD.

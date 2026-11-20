@@ -116,6 +116,11 @@ pub struct PodState {
     /// (and pod IP) given back, its containers' records and logs kept until
     /// the Pod object goes.
     pub sandbox_stopped: bool,
+    /// Containers whose recorded replacement was created but did not start,
+    /// and could not be removed then (#437, 12e774c42aec). The next pass
+    /// removes and recreates it rather than waiting on a container that
+    /// never runs.
+    pub unstarted: std::collections::HashSet<String>,
 }
 
 /// What one init container did.
@@ -3734,7 +3739,7 @@ impl PodManager {
                     started: HashMap::new(),
                     terminated: HashMap::new(),
                     init_statuses: Vec::new(),
-                    sandbox_stopped: false,
+                    sandbox_stopped: false, unstarted: Default::default(),
                 },
             );
             recovered += 1;
@@ -4231,13 +4236,11 @@ impl PodManager {
             let image_ref = self.startup_image(pod,image, spec).await?;
             let mut envs = self.resolve_env(pod, spec, pod_ip).await?;
             merge_env(&mut envs, self.service_account_env());
-            let mut mounts = resolve_mounts(spec, volumes, &envs).map_err(|message| CriError::Container {
+            let mounts = container_mounts(spec, volumes, &envs, sa_mount, dns_mount).map_err(|message| CriError::Container {
                 container: cname.to_string(),
                 reason: "CreateContainerConfigError".into(),
                 message,
             })?;
-            push_mount(&mut mounts, sa_mount.clone());
-            push_mount(&mut mounts, dns_mount.clone());
             let mut config = build_container_config(spec, &image_ref, envs, mounts);
             apply_pod_namespaces(&mut config, pod);
             config.realtime = realtime_of(pod, &sandbox_config.runtime_handler, &config.name);
@@ -4580,7 +4583,7 @@ impl PodManager {
             sandbox_id:Some(sandbox_id.clone()),container_ids:HashMap::new(),
             phase:"Starting".into(),pod:pod.clone(),pod_ip:None,
             restart_counts:HashMap::new(),ready:HashMap::new(),liveness_failures:HashMap::new(),
-            startup_passed:HashMap::new(),started:HashMap::new(),terminated:HashMap::new(),init_statuses:Vec::new(),sandbox_stopped:false,
+            startup_passed:HashMap::new(),started:HashMap::new(),terminated:HashMap::new(),init_statuses:Vec::new(),sandbox_stopped:false,unstarted:Default::default(),
         });
         sandbox_id
         };
@@ -4722,13 +4725,11 @@ impl PodManager {
                 .resolve_env(pod, container_spec, pod_ip.as_deref())
                 .await?;
             merge_env(&mut envs, self.service_account_env());
-            let mut mounts = resolve_mounts(container_spec, &volumes, &envs).map_err(|message| CriError::Container {
+            let mounts = container_mounts(container_spec, &volumes, &envs, &sa_mount, &dns_mount).map_err(|message| CriError::Container {
                 container: container_name.to_string(),
                 reason: "CreateContainerConfigError".into(),
                 message,
             })?;
-            push_mount(&mut mounts, sa_mount.clone());
-            push_mount(&mut mounts, dns_mount.clone());
             let mut container_config =
                 build_container_config(container_spec, &image_ref, envs, mounts);
             apply_pod_namespaces(&mut container_config, pod);
@@ -4860,7 +4861,7 @@ impl PodManager {
                     started: started_map,
                     terminated: HashMap::new(),
                     init_statuses: init_statuses.clone(),
-                    sandbox_stopped: false,
+                    sandbox_stopped: false, unstarted: Default::default(),
                 },
             );
         }
@@ -5132,16 +5133,17 @@ impl PodManager {
                                 );
                                 if *failures >= threshold {
                                     info!(
-                                        "Startup threshold reached — restarting {}/{}/{name}",
+                                        "Startup threshold reached — stopping {}/{}/{name}",
                                         state.namespace, state.name
                                     );
                                     if self
-                                        .restart_container(
+                                        .probe_gave_up(
                                             &mut state,
                                             &name,
                                             &cid,
                                             &spec,
                                             &sandbox_config,
+                                            &restart_policy,
                                             &mut container_statuses,
                                         )
                                         .await
@@ -5190,16 +5192,17 @@ impl PodManager {
                                 );
                                 if *failures >= threshold {
                                     info!(
-                                        "Liveness threshold reached — restarting {}/{}/{name}",
+                                        "Liveness threshold reached — stopping {}/{}/{name}",
                                         state.namespace, state.name
                                     );
                                     restarted = self
-                                        .restart_container(
+                                        .probe_gave_up(
                                             &mut state,
                                             &name,
                                             &cid,
                                             &spec,
                                             &sandbox_config,
+                                            &restart_policy,
                                             &mut container_statuses,
                                         )
                                         .await;
@@ -5342,6 +5345,34 @@ impl PodManager {
                             reason: terminated_reason(&status.reason, status.exit_code).to_string(),
                             message: status.message.clone(),
                         });
+                    }
+                }
+                // A replacement that was created but did not start, and was
+                // not removed then (#437, 12e774c42aec): removed and made
+                // again, on the crash-loop clock, rather than waited on.
+                ContainerState::Created if state.unstarted.contains(&name) && !spec.is_null() => {
+                    let key = crate::crashloop::CrashLoopBackoff::key(uid, &name);
+                    if let Some(left) = self.backoff.wait(&key) {
+                        self.due_in(uid, left);
+                        state.ready.insert(name.clone(), false);
+                        container_statuses.push(ContainerStatusReport {
+                            started_at: 0,
+                            finished_at: 0,
+                            name: name.clone(),
+                            container_id: cid.clone(),
+                            state: "waiting".to_string(),
+                            ready: false,
+                            restart_count,
+                            exit_code: 0,
+                            image: status.image.clone(),
+                            image_ref: status.image_ref,
+                            reason: "RunContainerError".to_string(),
+                            message: format!("back-off {}s starting container {name} again", left.as_secs()),
+                        });
+                    } else {
+                        self.restart_container(&mut state, &name, &cid, &spec, &sandbox_config, &mut container_statuses)
+                            .await;
+                        self.restarted_backoff(uid, &key);
                     }
                 }
                 ContainerState::Created | ContainerState::Unknown => {
@@ -5575,6 +5606,20 @@ impl PodManager {
 
     /// Stop, remove, and recreate a container. Returns true on success;
     /// on failure the container is reported as waiting and retried next sync.
+    ///
+    /// #437:
+    /// - The old container must be gone before its replacement is made
+    ///   (1e8f97747676): a stop or remove that fails is a restart that waits,
+    ///   with the old ID kept, never two of one container in the sandbox at
+    ///   once with the same volumes and ports. Only the runtime saying it does
+    ///   not have the container counts as gone.
+    /// - The new ID is recorded as soon as it is created (12e774c42aec). A
+    ///   start that fails or times out stops and removes it; if that fails
+    ///   too, the next restart finds it recorded and removes it first.
+    /// - A new run's probes start over (6735237ca645): its startup probe
+    ///   runs again, and it is not ready until it passes.
+    /// - Its mounts are the start path's (`container_mounts`), resolv.conf
+    ///   included (6c156be85e7f).
     async fn restart_container(
         &self,
         state: &mut PodState,
@@ -5584,143 +5629,239 @@ impl PodManager {
         sandbox_config: &PodSandboxConfig,
         container_statuses: &mut Vec<ContainerStatusReport>,
     ) -> bool {
-        let _ = self.runtime.stop_container(old_cid, 5).await;
-        let _ = self.runtime.remove_container(old_cid).await;
-
-        let restart_count = state
-            .restart_counts
-            .entry(name.to_string())
-            .and_modify(|c| *c += 1)
-            .or_insert(1);
-        let restart_count = *restart_count;
-        state.liveness_failures.insert(name.to_string(), 0);
+        let image = spec["image"].as_str().unwrap_or("");
+        let restart_count = state.restart_counts.get(name).copied().unwrap_or(0);
+        let wait = |state: &mut PodState,
+                    statuses: &mut Vec<ContainerStatusReport>,
+                    cid: &str,
+                    restart_count: u32,
+                    message: String| {
+            warn!("Container {}/{}/{name}: {message}", state.namespace, state.name);
+            self.due_in(&state.uid, deadlines::RECHECK);
+            state.ready.insert(name.to_string(), false);
+            statuses.push(ContainerStatusReport {
+                started_at: 0,
+                finished_at: 0,
+                name: name.to_string(),
+                container_id: cid.to_string(),
+                state: "waiting".to_string(),
+                ready: false,
+                restart_count,
+                exit_code: 0,
+                image: image.to_string(),
+                image_ref: String::new(),
+                reason: String::new(),
+                message,
+            });
+            false
+        };
 
         let sandbox_id = match &state.sandbox_id {
             Some(id) => id.clone(),
             None => {
-                error!(
-                    "Cannot restart {}/{}/{name}: no sandbox",
-                    state.namespace, state.name
-                );
-                self.due_in(&state.uid, deadlines::RECHECK);
-                return false;
+                return wait(state, container_statuses, old_cid, restart_count, "cannot restart: no sandbox".into());
             }
         };
+        if !old_cid.is_empty() {
+            if let Err(e) = self.confirm_gone(old_cid).await {
+                return wait(
+                    state,
+                    container_statuses,
+                    old_cid,
+                    restart_count,
+                    format!("previous container {old_cid} not confirmed gone, so no replacement yet: {e}"),
+                );
+            }
+        }
 
-        let image = spec["image"].as_str().unwrap_or("");
+        let restart_count = {
+            let c = state.restart_counts.entry(name.to_string()).or_insert(0);
+            *c += 1;
+            *c
+        };
+        // A new run: every probe outcome of the last one is forgotten.
+        state.liveness_failures.insert(name.to_string(), 0);
+        state.startup_passed.remove(name);
+        state.started.remove(name);
+        state.ready.insert(name.to_string(), false);
+
         // A volume this node must not provision stops the restart: the same
         // reason is on the pod's status from the start path, and retrying
         // every tick would not change it.
         let volumes = match self.resolve_volumes(&state.pod).await {
             Ok(v) => v,
-            Err(e) => {
-                warn!("Container {}/{}/{name}: {e}", state.namespace, state.name);
-                self.due_in(&state.uid, deadlines::RECHECK);
-                return false;
-            }
+            Err(e) => return wait(state, container_statuses, old_cid, restart_count, e.to_string()),
         };
         let mut envs = match self.resolve_env(&state.pod, spec, state.pod_ip.as_deref()).await {
             Ok(e) => e,
-            Err(e) => {
-                warn!("Container {}/{}/{name}: {e}", state.namespace, state.name);
-                self.due_in(&state.uid, deadlines::RECHECK);
-                return false;
-            }
+            Err(e) => return wait(state, container_statuses, old_cid, restart_count, e.to_string()),
         };
         merge_env(&mut envs, self.service_account_env());
-        let mut mounts = match resolve_mounts(spec, &volumes, &envs) {
+        let sa_mount = match self.service_account_mount(&state.pod).await {
             Ok(m) => m,
-            Err(e) => {
-                warn!("Container {}/{}/{name}: {e}", state.namespace, state.name);
-                self.due_in(&state.uid, deadlines::RECHECK);
-                return false;
-            }
+            Err(e) => return wait(state, container_statuses, old_cid, restart_count, e.to_string()),
         };
-        match self.service_account_mount(&state.pod).await {
-            Ok(m) => push_mount(&mut mounts, m),
-            Err(e) => {
-                warn!("Container {}/{}/{name}: {e}", state.namespace, state.name);
-                self.due_in(&state.uid, deadlines::RECHECK);
-                return false;
-            }
-        }
-        // Capture the pod's namespace-sharing flags before `state` is borrowed
-        // by the async block below (which also mutably borrows `state` later).
-        let pod_for_ns = state.pod.clone();
-        let pod_ip_for_hook = state.pod_ip.clone();
-        let result = async move {
+        let dns_mount = match self.resolv_conf_mount(&state.pod) {
+            Ok(m) => m,
+            Err(e) => return wait(state, container_statuses, old_cid, restart_count, e.to_string()),
+        };
+        let mounts = match container_mounts(spec, &volumes, &envs, &sa_mount, &dns_mount) {
+            Ok(m) => m,
+            Err(e) => return wait(state, container_statuses, old_cid, restart_count, e),
+        };
+
+        let pod = state.pod.clone();
+        let created = async {
             let image_ref = self.ensure_image(image, spec).await?;
             // Its RuntimeClass again (#430): a real-time container restarts on
             // its isolated cores, never on the shared pool. Not known now is
             // a failed restart, retried.
-            let handler = self.runtime_handler(&pod_for_ns).await?;
+            let handler = self.runtime_handler(&pod).await?;
             let mut config = build_container_config(spec, &image_ref, envs, mounts);
-            apply_pod_namespaces(&mut config, &pod_for_ns);
-            config.realtime = realtime_of(&pod_for_ns, &handler, &config.name);
+            apply_pod_namespaces(&mut config, &pod);
+            config.realtime = realtime_of(&pod, &handler, &config.name);
             config.attempt = restart_count;
             ensure_container_log_dir(&sandbox_config.log_directory, &config.name);
             // After every run on disk, not only the restart count, which a
             // kubelet restart resets (#216).
             new_log_run(&mut config, &sandbox_config.log_directory, restart_count);
-            let cid = self
-                .runtime
-                .create_container(&sandbox_id, &config, sandbox_config)
-                .await?;
-            self.runtime.start_container(&cid).await?;
-            self.post_start(&pod_for_ns, spec, &cid, &sandbox_id, pod_ip_for_hook.as_deref().unwrap_or("")).await;
+            let cid = self.runtime.create_container(&sandbox_id, &config, sandbox_config).await?;
             Ok::<(String, String), CriError>((cid, image_ref))
         }
         .await;
-
-        match result {
-            Ok((new_cid, image_ref)) => {
-                state
-                    .container_ids
-                    .insert(name.to_string(), new_cid.clone());
-                state.started.insert(name.to_string(), Instant::now());
-                let ready = spec["readinessProbe"].is_null();
-                state.ready.insert(name.to_string(), ready);
-                container_statuses.push(ContainerStatusReport {
-                    started_at: 0,
-                    finished_at: 0,
-                    name: name.to_string(),
-                    container_id: new_cid,
-                    state: "running".to_string(),
-                    ready,
-                    restart_count,
-                    exit_code: 0,
-                    image: image.to_string(),
-                    image_ref,
-                    reason: String::new(),
-                    message: String::new(),
-                });
-                // Its new run is on a new clone (#130).
-                self.annotate_containers(&state.pod, state.container_ids.clone()).await;
-                true
-            }
+        let (new_cid, image_ref) = match created {
+            Ok(c) => c,
             Err(e) => {
-                self.due_in(&state.uid, deadlines::RECHECK);
-                error!(
-                    "Failed to restart container {}/{}/{name}: {e}",
+                return wait(state, container_statuses, old_cid, restart_count, format!("not recreated: {e}"))
+            }
+        };
+        // Recorded before it is started: a start that fails or times out
+        // leaves a container the next pass must find.
+        state.container_ids.insert(name.to_string(), new_cid.clone());
+
+        if let Err(e) = self.runtime.start_container(&new_cid).await {
+            // A start that timed out may have started it: stop and remove it
+            // now, so nothing runs that the kubelet does not track. If that
+            // fails, it stays recorded, and the next restart removes it first.
+            state.unstarted.insert(name.to_string());
+            let cleanup = match self.confirm_gone(&new_cid).await {
+                Ok(()) => "removed".to_string(),
+                Err(c) => format!("kept for the next try to remove ({c})"),
+            };
+            return wait(
+                state,
+                container_statuses,
+                &new_cid,
+                restart_count,
+                format!("restarted container {new_cid} did not start: {e}; {cleanup}"),
+            );
+        }
+        state.unstarted.remove(name);
+        self.post_start(&pod, spec, &new_cid, &sandbox_id, state.pod_ip.as_deref().unwrap_or("")).await;
+        state.started.insert(name.to_string(), Instant::now());
+        // Not ready until its startup probe passes, if it has one.
+        let ready = spec["readinessProbe"].is_null() && spec["startupProbe"].is_null();
+        state.ready.insert(name.to_string(), ready);
+        container_statuses.push(ContainerStatusReport {
+            started_at: 0,
+            finished_at: 0,
+            name: name.to_string(),
+            container_id: new_cid,
+            state: "running".to_string(),
+            ready,
+            restart_count,
+            exit_code: 0,
+            image: image.to_string(),
+            image_ref,
+            reason: String::new(),
+            message: String::new(),
+        });
+        // Its new run is on a new clone (#130).
+        self.annotate_containers(&state.pod, state.container_ids.clone()).await;
+        true
+    }
+
+    /// A startup or liveness probe reached its failure threshold (#437,
+    /// c57f2ce7c38d). The container is killed, and what follows is its
+    /// restart policy's (a native sidecar's is Always): Always and OnFailure
+    /// restart it (a killed container exits non-zero); Never leaves it
+    /// terminated, as upstream does, instead of running a one-shot again.
+    ///
+    /// `true` when the container's status was reported here.
+    #[allow(clippy::too_many_arguments)]
+    async fn probe_gave_up(
+        &self,
+        state: &mut PodState,
+        name: &str,
+        cid: &str,
+        spec: &Value,
+        sandbox_config: &PodSandboxConfig,
+        restart_policy: &str,
+        container_statuses: &mut Vec<ContainerStatusReport>,
+    ) -> bool {
+        if matches!(restart_policy, "Always" | "OnFailure") {
+            return self
+                .restart_container(state, name, cid, spec, sandbox_config, container_statuses)
+                .await;
+        }
+        match self.runtime.stop_container(cid, RESTART_STOP_GRACE_SECS).await {
+            Ok(()) | Err(CriError::NotFound(_)) => {}
+            Err(e) => {
+                warn!(
+                    "Container {}/{}/{name}: its probe gave up, and it could not be stopped: {e}",
                     state.namespace, state.name
                 );
-                state.ready.insert(name.to_string(), false);
-                container_statuses.push(ContainerStatusReport {
-                    started_at: 0,
-                    finished_at: 0,
-                    name: name.to_string(),
-                    container_id: String::new(),
-                    state: "waiting".to_string(),
-                    ready: false,
-                    restart_count,
-                    exit_code: 0,
-                    image: image.to_string(),
-                    image_ref: String::new(),
-                    reason: String::new(),
-                    message: String::new(),
-                });
-                false
+                self.due_in(&state.uid, deadlines::RECHECK);
+                return false;
             }
+        }
+        let (exit_code, reason, message, started_at, finished_at, image_ref) =
+            match self.runtime.container_status(cid).await {
+                Ok(s) if s.state == ContainerState::Exited => (
+                    s.exit_code,
+                    terminated_reason(&s.reason, s.exit_code).to_string(),
+                    s.message,
+                    s.started_at,
+                    s.finished_at,
+                    s.image_ref,
+                ),
+                // Killed: what a SIGKILLed process exits with.
+                _ => (137, "Error".to_string(), String::new(), 0, 0, String::new()),
+            };
+        info!(
+            "Container {}/{}/{name}: its probe gave up — not restarting (policy {restart_policy}), exit {exit_code}",
+            state.namespace, state.name
+        );
+        state.terminated.insert(name.to_string(), exit_code);
+        state.ready.insert(name.to_string(), false);
+        container_statuses.push(ContainerStatusReport {
+            started_at,
+            finished_at,
+            name: name.to_string(),
+            container_id: cid.to_string(),
+            state: "terminated".to_string(),
+            ready: false,
+            restart_count: state.restart_counts.get(name).copied().unwrap_or(0),
+            exit_code,
+            image: spec["image"].as_str().unwrap_or("").to_string(),
+            image_ref,
+            reason,
+            message,
+        });
+        true
+    }
+
+    /// Stop and remove a container, and say whether it is gone: `Ok` only
+    /// when both succeeded or the runtime does not have it (#437,
+    /// 1e8f97747676).
+    async fn confirm_gone(&self, cid: &str) -> Result<(), CriError> {
+        match self.runtime.stop_container(cid, RESTART_STOP_GRACE_SECS).await {
+            Ok(()) | Err(CriError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+        match self.runtime.remove_container(cid).await {
+            Ok(()) | Err(CriError::NotFound(_)) => Ok(()),
+            Err(e) => Err(e),
         }
     }
 
@@ -6203,7 +6344,7 @@ impl PodManager {
             phase: "Running".into(), pod: pod.clone(), pod_ip: None,
             restart_counts: HashMap::new(), ready: HashMap::new(), liveness_failures: HashMap::new(),
             startup_passed: HashMap::new(), started: HashMap::new(), terminated: HashMap::new(),
-            init_statuses: Vec::new(), sandbox_stopped: false,
+            init_statuses: Vec::new(), sandbox_stopped: false, unstarted: Default::default(),
         });
     }
 
@@ -6324,7 +6465,7 @@ impl PodManager {
                 started: HashMap::new(),
                 terminated: HashMap::new(),
                 init_statuses: Vec::new(),
-                sandbox_stopped: false,
+                sandbox_stopped: false, unstarted: Default::default(),
             },
         );
         info!("Registered restored pod {namespace}/{name} with sandbox {sandbox_id}");
@@ -6989,6 +7130,10 @@ fn pod_volume_dir(state_root: &str, uid: &str, kind: &str, name: &str) -> String
 /// Standard in-cluster ServiceAccount credential mount path.
 const SA_MOUNT_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
 
+/// The grace a container gets when it is stopped to be restarted or after
+/// a probe gave up on it.
+const RESTART_STOP_GRACE_SECS: i64 = 5;
+
 /// Effective imagePullPolicy for a container: explicit value, else the K8s
 /// default (Always for an untagged or `:latest` image, IfNotPresent otherwise).
 fn effective_pull_policy(spec: &Value, image: &str) -> &'static str {
@@ -7067,6 +7212,24 @@ fn push_mount(mounts: &mut Vec<Mount>, mount: Option<Mount>) {
             mounts.push(m);
         }
     }
+}
+
+/// A container's mounts, the same on its first start and every restart
+/// (#437, 6c156be85e7f: a restart rebuilt them without the generated
+/// `/etc/resolv.conf`, so a restarted container lost cluster DNS): its
+/// volumes and devices, then the ServiceAccount credentials and the
+/// kubelet's resolv.conf where the container does not mount its own.
+fn container_mounts(
+    spec: &Value,
+    volumes: &HashMap<String, ResolvedVolume>,
+    env: &[(String, String)],
+    sa_mount: &Option<Mount>,
+    dns_mount: &Option<Mount>,
+) -> Result<Vec<Mount>, String> {
+    let mut mounts = resolve_mounts(spec, volumes, env)?;
+    push_mount(&mut mounts, sa_mount.clone());
+    push_mount(&mut mounts, dns_mount.clone());
+    Ok(mounts)
 }
 
 /// The two API objects whose keys the kubelet writes as files or env.
@@ -8081,6 +8244,8 @@ pub(crate) mod tests {
         missing_images: Mutex<std::collections::HashSet<String>>,
         fail_create: Mutex<std::collections::HashSet<String>>,
         fail_start: Mutex<std::collections::HashSet<String>>,
+        /// Container ids whose remove fails (#437).
+        fail_remove: Mutex<std::collections::HashSet<String>>,
         /// Every stop_container: the container and its grace (#225).
         stop_graces: Mutex<Vec<(String, i64)>>,
         /// Every exec_sync: the container and its command (#374), and the
@@ -8296,6 +8461,9 @@ pub(crate) mod tests {
         }
 
         async fn remove_container(&self, container_id: &str) -> Result<(), CriError> {
+            if self.fail_remove.lock().unwrap().contains(container_id) {
+                return Err(CriError::Runtime(format!("{container_id}: injected remove failure")));
+            }
             self.containers.lock().unwrap().remove(container_id);
             self.removed_containers
                 .lock()
@@ -8425,7 +8593,7 @@ pub(crate) mod tests {
             started: HashMap::new(),
             terminated: HashMap::new(),
             init_statuses: Vec::new(),
-            sandbox_stopped: false,
+            sandbox_stopped: false, unstarted: Default::default(),
         }
     }
 
@@ -9717,7 +9885,7 @@ pub(crate) mod tests {
             sandbox_id: None, container_ids: HashMap::new(), phase: "Running".into(), pod: p.clone(),
             pod_ip: None, restart_counts: HashMap::new(), ready: HashMap::new(),
             liveness_failures: HashMap::new(), startup_passed: HashMap::new(), started: HashMap::new(),
-            terminated: HashMap::new(), init_statuses: Vec::new(), sandbox_stopped: false,
+            terminated: HashMap::new(), init_statuses: Vec::new(), sandbox_stopped: false, unstarted: Default::default(),
         });
         let next = mgr.refresh_tokens().await.unwrap();
         assert!(next > std::time::Duration::from_secs(2800), "{next:?}");
@@ -12282,5 +12450,116 @@ pub(crate) mod tests {
         assert_eq!(u.phase, "Pending");
         assert_eq!(u.container_statuses[0].reason, "CreateContainerConfigError");
         assert!(rt.last_container_config.lock().unwrap().is_none());
+    }
+
+    // ---- #437: restarts and probes ----
+
+    async fn tracked(mgr: &PodManager, uid: &str) -> PodState {
+        mgr.pods.read().await.get(uid).cloned().unwrap()
+    }
+
+    /// #437 1e8f97747676: a restart whose stop of the old container fails
+    /// makes no replacement and keeps the old ID.
+    #[tokio::test]
+    async fn a_restart_waits_until_the_old_container_is_gone() {
+        let (rt, mgr) = manager();
+        let p = pod("uid-437-r1", "web", "Always", simple_container());
+        mgr.sync_pods(&[p.clone()]).await;
+        let old = rt.container_ids().pop().unwrap();
+        rt.set_container_state(&old, ContainerState::Exited, 1);
+        rt.fail_stop.store(true, Ordering::SeqCst);
+
+        let u = mgr.sync_pods(&[p]).await.updates.remove(0);
+        assert_eq!(rt.container_ids(), vec![old.clone()], "no replacement while the old one may run");
+        assert!(!rt.removed_containers.lock().unwrap().contains(&old));
+        let cs = &u.container_statuses[0];
+        assert_eq!((cs.state.as_str(), cs.container_id.as_str(), cs.restart_count), ("waiting", old.as_str(), 0));
+        assert_eq!(tracked(&mgr, "uid-437-r1").await.container_ids["app"], old);
+    }
+
+    /// #437 12e774c42aec: the replacement is recorded before it is started;
+    /// a failed start removes it, and one that cannot be removed stays
+    /// recorded, so it is removed before anything else is made.
+    #[tokio::test]
+    async fn a_failed_restart_start_keeps_track_of_the_new_container() {
+        let (rt, mgr) = manager();
+        let p = pod("uid-437-r2", "web", "Always", simple_container());
+        mgr.sync_pods(&[p.clone()]).await;
+        let old = rt.container_ids().pop().unwrap();
+        rt.set_container_state(&old, ContainerState::Exited, 1);
+        rt.fail_start.lock().unwrap().insert("app".into());
+        let new = format!("c-app-{}", rt.next_id.load(Ordering::SeqCst));
+        rt.fail_remove.lock().unwrap().insert(new.clone());
+
+        let u = mgr.sync_pods(&[p.clone()]).await.updates.remove(0);
+        let st = tracked(&mgr, "uid-437-r2").await;
+        assert_eq!(st.container_ids["app"], new, "recorded though its start failed");
+        assert!(st.unstarted.contains("app"));
+        assert_eq!(u.container_statuses[0].container_id, new);
+        assert_eq!(rt.container_ids(), vec![new.clone()], "the old one went first");
+
+        // The next try (past its back-off) removes it before making another.
+        rt.fail_start.lock().unwrap().clear();
+        rt.fail_remove.lock().unwrap().clear();
+        mgr.backoff.forget_pod("uid-437-r2");
+        let u = mgr.sync_pods(&[p]).await.updates.remove(0);
+        assert!(rt.removed_containers.lock().unwrap().contains(&new));
+        assert_eq!(u.container_statuses[0].state, "running");
+        let st = tracked(&mgr, "uid-437-r2").await;
+        assert!(!st.unstarted.contains("app"));
+        assert_eq!(rt.container_ids(), vec![st.container_ids["app"].clone()]);
+    }
+
+    /// #437 6735237ca645 and 6c156be85e7f: a restarted container's startup
+    /// probe runs again (it is not ready before it passes), and it keeps the
+    /// kubelet's resolv.conf.
+    #[tokio::test]
+    async fn a_restarted_container_starts_its_probes_over_and_keeps_resolv_conf() {
+        let (rt, mgr) = manager();
+        let c = json!({
+            "name": "app", "image": "busybox:latest",
+            "startupProbe": {"exec": {"command": ["up"]}, "failureThreshold": 30}
+        });
+        let p = pod("uid-437-r3", "web", "Always", c);
+        mgr.sync_pods(&[p.clone()]).await;
+        let has_resolv = |cfg: &ContainerConfig| cfg.mounts.iter().any(|m| m.container_path == "/etc/resolv.conf");
+        assert!(has_resolv(&rt.last_container_config().unwrap()));
+        rt.set_exec_exit_code(0);
+        mgr.expire_probes();
+        let u = mgr.sync_pods(&[p.clone()]).await.updates.remove(0);
+        assert!(u.container_statuses[0].ready, "startup probe passed");
+        assert_eq!(tracked(&mgr, "uid-437-r3").await.startup_passed.get("app"), Some(&true));
+
+        let old = rt.container_ids().pop().unwrap();
+        rt.set_container_state(&old, ContainerState::Exited, 1);
+        let u = mgr.sync_pods(&[p]).await.updates.remove(0);
+        assert_eq!(u.container_statuses[0].restart_count, 1);
+        assert!(!u.container_statuses[0].ready, "not ready before its startup probe passes again");
+        let st = tracked(&mgr, "uid-437-r3").await;
+        assert_eq!(st.startup_passed.get("app"), None);
+        assert_eq!(st.ready.get("app"), Some(&false));
+        assert!(has_resolv(&rt.last_container_config().unwrap()), "the restart kept resolv.conf");
+    }
+
+    /// #437 c57f2ce7c38d: a liveness probe that gives up on a Never pod's
+    /// container stops it, and it is not made again.
+    #[tokio::test]
+    async fn a_probe_that_gives_up_under_never_does_not_restart() {
+        let (rt, mgr) = manager();
+        let c = json!({
+            "name": "app", "image": "busybox:latest",
+            "livenessProbe": {"exec": {"command": ["check"]}, "failureThreshold": 1}
+        });
+        let p = pod("uid-437-r4", "job", "Never", c);
+        mgr.sync_pods(&[p.clone()]).await;
+        let cid = rt.container_ids().pop().unwrap();
+        rt.set_exec_exit_code(1);
+        mgr.expire_probes();
+        let u = mgr.sync_pods(&[p]).await.updates.remove(0);
+        let cs = &u.container_statuses[0];
+        assert_eq!((cs.state.as_str(), cs.restart_count), ("terminated", 0));
+        assert!(rt.stop_graces.lock().unwrap().iter().any(|(c, _)| *c == cid));
+        assert_eq!(rt.container_ids(), vec![cid], "no second run");
+        assert!(tracked(&mgr, "uid-437-r4").await.terminated.contains_key("app"));
     }
 }
