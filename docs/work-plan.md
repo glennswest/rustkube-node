@@ -4,7 +4,11 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #444 (P1), review: VM restore takes a failed VMI lookup as a stopped VM
+### Done: #444 (P1), review: VM restore takes a failed VMI lookup as a stopped VM
+
+Fixed in e397beb; sc-build passed (VM sc-build-90ac5631d2: 780 kubelet tests ok, `a_failed_vmi_lookup_is_not_a_stopped_vm`
+new). Closed.
+
 
 f948ce2ee55f (`vm_restore.rs:280` at a354e09e690a): the stop-before-restore check was `api_object(vmi).is_some()`, and
 `api_object` is `None` for any failure. Plan: `api_lookup` → `Ok(Some)` / `Ok(None)` only on a 404 / `Err` otherwise;
