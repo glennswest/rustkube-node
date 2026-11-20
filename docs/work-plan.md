@@ -14,6 +14,9 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 4. e4aaa109678b claim move cutover: on a cutover error GET the migration, abort only if still pre-cutover; cut_over/completed
    go on to retirement and PV rebinding.
 Then sc-build (workspace + clippy), stage build, close #428.
+Done: 23560db (cni), 057153f (API volumes, new api_files.rs), d0e68d3 (vm_golden), 61e7086 (claim move), each with tests
+and a CHANGELOG line; README updated for #2 and #4. sc-build at 61e7086 queued (kubelet + cni tests). Resume: read
+tmp/sc-build-428b.log or `stormcentral buildvm status`; pass → clippy check of changed lines, stage, close #428.
 
 ### In progress: #426 (P2), a pod-network VMI reports its pod IP but nothing reaches it (pvetest2 flowsdn)
 2026-11-20. First live run of #88's path (never run on a node before). Read: stormvm's bridge binding moves the pod IP and
