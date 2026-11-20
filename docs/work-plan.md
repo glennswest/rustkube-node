@@ -4,6 +4,14 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### Waiting on the owner: #442 (P1), review: the native runtime never provides the image rootfs
+
+The finding (`runtime.rs:136`, 3d780a09c92c) is real but is one of several gaps in `--runtime native`: no image
+unpack, no `linux.namespaces` (it never joins the sandbox netns), no image config, and `pull_image` is `Ok` on
+failure. Nothing deploys it; it is only the CLI default. Asked on the issue: A retire `native` (default `stormpump`,
+keep the CRIU `MigrationService` stormpump uses; recommended, matching #13 and no-stubs), B build it out, C require
+`--runtime` (not a fix). `wait-owner` run 2026-11-20. No code changed yet.
+
 ### Done: #441 (P1), review: ClientIP affinity in kube-proxy's iptables rules
 2026-11-20. 3394445b5e43: `ServiceInfo.session_affinity: Option<u32>` (timeout, default 10800); SEP DNAT `-m recent --set`,
 SVC chain `--rcheck --seconds N --reap` per endpoint before the statistic split (upstream's rules). af3cd57; sc-build 8431643aba passed (proxy 36). Closed.
