@@ -71,8 +71,10 @@
 //! made it. `cleanup` reports it by name as a skip. So this suite runs on
 //! request (`stormcentral test run rustkube-node golden`), in no gate.
 //!
-//! Needs `kvm` (`test/requires.toml`) and vmimages' CRD, which vmimages
-//! installs at its start (a release with vmimages 60119d9 or later).
+//! Needs `kvm` (`test/requires.toml`). The golden requests also need
+//! vmimages' CRD, which vmimages installs at its start (a release with
+//! vmimages 60119d9 or later): without it `golden-crd` is a skip and only the
+//! requests are left out; the VMI cases run.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -478,18 +480,19 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
     let root = source_golden();
     let t = Instant::now();
 
-    // Nothing to ask without the CRD: a release older than vmimages 60119d9.
-    match api.list(&requests(&env)).await {
-        Ok(Some(_)) => {}
+    // No golden to ask for without the CRD (a release older than vmimages
+    // 60119d9); the VMI cases (#405, #421, #426, #404) run all the same.
+    let crd = match api.list(&requests(&env)).await {
+        Ok(Some(_)) => true,
         Ok(None) => {
-            r.record("golden-crd", Outcome::Skip(format!("{API} {KIND} is not served here: vmimages 60119d9 or later installs it")), 0, None);
-            return;
+            r.record("golden-crd", Outcome::Skip(format!("{API} {KIND} is not served here: vmimages 60119d9 or later installs it; the golden requests are not asked")), 0, None);
+            false
         }
         Err(e) => {
             r.record("golden-crd", Outcome::Infra(e), 0, None);
-            return;
+            false
         }
-    }
+    };
 
     let (says_id, no_agent) = (says_its_id(), has_no_agent());
     let (src, noagent, agent_vm, podnet) = tokio::join!(
@@ -541,7 +544,7 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
         r.record("vmi-status-volumes", o, t.elapsed().as_millis(), None);
     }
 
-    if noagent.is_ok() {
+    if noagent.is_ok() && crd {
         let t = Instant::now();
         let o = match suite.ask(ASK_FAIL, NO_AGENT, &golden).await {
             Ok(v) => judge_failed(&v),
@@ -551,7 +554,7 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
     }
 
     let mut sealed = false;
-    if let Some(src_id) = &source_id {
+    if let Some(src_id) = source_id.as_ref().filter(|_| crd) {
         let t = Instant::now();
         let o = match suite.ask(ASK_SEAL, SOURCE, &golden).await {
             Ok(v) => judge_sealed(&v, &golden),
