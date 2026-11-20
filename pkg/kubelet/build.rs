@@ -7,6 +7,8 @@
 //! - `proto/pluginregistration/api.proto`: the kubelet plugin-registration API
 //!   (k8s.io/kubelet v0.32.0), which a driver's registrar serves on its socket in
 //!   `/var/lib/kubelet/plugins_registry` (`csi_plugins.rs`)
+//! - `proto/grpc/health/v1/health.proto`: the gRPC health protocol, which a
+//!   `grpc` probe calls (`health.rs`)
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Server codegen is for tests only (a mock CRI runtime, a mock CSI driver
@@ -19,6 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/api.proto",
                 "proto/csi/csi.proto",
                 "proto/pluginregistration/api.proto",
+                "proto/grpc/health/v1/health.proto",
             ],
             &["proto"],
         )?;
