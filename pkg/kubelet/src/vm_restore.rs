@@ -1097,4 +1097,81 @@ pub(crate) mod tests {
         assert!(is_cloud_init(&vm(), "cloudinitdisk") && !is_cloud_init(&vm(), "rootdisk"));
         assert_eq!(names("web", "web-1", "rootdisk", "r1"), ("web.web-1-rootdisk-restore-r1".into(), "web-1-rootdisk-restore-r1".into()));
     }
+
+    /// A CA and an engine serving TLS from it (#318): the engine's URL, and
+    /// the requests that reached it.
+    async fn tls_engine(ca: &rcgen::Certificate, ca_key: &rcgen::KeyPair) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
+            .unwrap()
+            .signed_by(&key, ca, ca_key)
+            .unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let (a, b) = (seen.clone(), seen.clone());
+        let app = axum::Router::new()
+            .route("/api/v1/volumes/{id}", axum::routing::delete(move |axum::extract::Path(id): axum::extract::Path<String>| {
+                let a = a.clone();
+                async move {
+                    a.lock().unwrap().push(format!("delete {id}"));
+                    "{}"
+                }
+            }))
+            .route("/v1/group-snapshots/{id}", axum::routing::get(move |axum::extract::Path(id): axum::extract::Path<String>| {
+                let b = b.clone();
+                async move {
+                    b.lock().unwrap().push(format!("group {id}"));
+                    axum::http::StatusCode::NOT_FOUND
+                }
+            }));
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem(cert.pem().into_bytes(), key.serialize_pem().into_bytes())
+            .await
+            .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(axum_server::from_tcp_rustls(listener, tls).serve(app.into_make_service()));
+        (format!("https://127.0.0.1:{port}"), seen)
+    }
+
+    fn test_ca() -> (rcgen::Certificate, rcgen::KeyPair) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        (params.self_signed(&key).unwrap(), key)
+    }
+
+    /// #318's done-when, at the client: stormvm's engine client, as a restore
+    /// (and a snapshot, the golden and backup calls) builds it, reaches an
+    /// engine serving TLS from the CA in `STORMBLOCK_CA_FILE`, which is where
+    /// the kubelet puts `--stormblock-ca`; an engine with another CA's
+    /// certificate is refused and nothing reaches it. One test, because the
+    /// variable is the process's.
+    #[tokio::test]
+    async fn a_restore_reaches_an_https_engine_through_the_kubelets_ca_and_no_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ca, ca_key) = test_ca();
+        let file = dir.path().join("ca.crt");
+        std::fs::write(&file, ca.pem()).unwrap();
+        // What the kubelet's main does with --stormblock-ca.
+        std::env::set_var("STORMBLOCK_CA_FILE", &file);
+
+        let (url, seen) = tls_engine(&ca, &ca_key).await;
+        let engine = Stormblock(url);
+        let (group, deleted) = tokio::task::spawn_blocking(move || (engine.group("g-1"), engine.delete_volume("v-1")))
+            .await
+            .unwrap();
+        assert!(matches!(group, Ok(None)), "{group:?}");
+        assert_eq!(deleted, Ok(()));
+        assert_eq!(*seen.lock().unwrap(), ["group g-1", "delete v-1"]);
+
+        // An engine whose certificate is another CA's: refused, nothing sent.
+        let (other, other_key) = test_ca();
+        let (url, seen) = tls_engine(&other, &other_key).await;
+        let engine = Stormblock(url);
+        let deleted = tokio::task::spawn_blocking(move || engine.delete_volume("v-2")).await.unwrap();
+        std::env::remove_var("STORMBLOCK_CA_FILE");
+        let err = deleted.expect_err("another CA's engine is not trusted");
+        assert!(err.to_lowercase().contains("certificate") || err.to_lowercase().contains("tls"), "{err}");
+        assert!(seen.lock().unwrap().is_empty(), "nothing reached it");
+    }
 }

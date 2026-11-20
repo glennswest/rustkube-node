@@ -392,10 +392,29 @@ fn api_server_url(given: Option<String>, kubeconfig_server: Option<String>) -> S
         .unwrap_or_else(|| DEFAULT_APISERVER.to_string())
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     // Each startup step timed from here (#262).
     kubelet::startup::begin();
+    let cli = Cli::parse();
+    // One CA for every engine client (#318). stormvm's own clients (VM
+    // snapshot, restore, the golden and backup calls, the console's
+    // `snapshot`) read `STORMBLOCK_CA_FILE` and take no CA argument, so the
+    // flag's file is put there, before the runtime starts a thread that
+    // could read the environment while it changes. The flag and the variable
+    // are one setting already: the flag falls back to it.
+    if let Some(ca) = cli.stormblock_ca.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        std::env::set_var(ENGINE_CA_ENV, ca);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(cli))
+}
+
+/// What `--stormblock-ca` also reads, and what stormvm's clients read.
+const ENGINE_CA_ENV: &str = "STORMBLOCK_CA_FILE";
+
+async fn run(cli: Cli) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -403,7 +422,6 @@ async fn main() -> anyhow::Result<()> {
         .init();
     kubelet::startup::mark("logging");
 
-    let cli = Cli::parse();
     let node_name = cli
         .node_name
         .clone()

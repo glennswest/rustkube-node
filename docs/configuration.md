@@ -25,7 +25,7 @@ An em dash means there is no environment binding or the value is unset.
 | `--registry-ca` | `REGISTRY_CA_FILE` | none; the CA file an `https://` `--registry` is verified against, and nothing else is, read at each new connection as `--stormblock-ca` is (#167). Unused with `http://` |
 | `--mirror-namespaces` | `MIRROR_NAMESPACES` | `/etc/kubernetes/mirror-namespaces.json`; a flat JSON object from a node service (PID 1 asset) to the namespace its mirror pod and system claims live in, `{"stormblock": "storm-block", …}` (#418, stormcos#1020). Read again when it changes (its directory is watched). No file, an unparsable one, or an asset it does not name: `kube-system` |
 | `--stormblock` | `STORMBLOCK_URL` | `http://127.0.0.1:9090`; engine for claims, VM disks and images. `https://` needs `--stormblock-ca` (#312) |
-| `--stormblock-ca` | `STORMBLOCK_CA_FILE` | none; the CA file an `https://` `--stormblock` is verified against, and nothing else is. Unused with `http://` |
+| `--stormblock-ca` | `STORMBLOCK_CA_FILE` | none; the CA file an `https://` `--stormblock` is verified against, and nothing else is. Unused with `http://`. Given as the flag, the kubelet also puts it in `STORMBLOCK_CA_FILE` before it starts. stormvm's own engine clients read that variable: VM snapshot (and its CSI group), restore, golden and backup calls, and the console router's `snapshot` (#318). Unset, those fall back to `/etc/stormcert/ca.crt`, then `/data/stormcert/ca.crt` |
 | `--cri-socket` | `CRI_SOCKET` | CRI auto-detection, or `/run/stormpump.sock` for stormpump |
 | `--cni-conf-dir` | `CNI_CONF_DIR` | `/etc/cni/net.d`; watched (inotify) unless `--no-cni`: a change wakes the Pods waiting for a network config (#148) |
 | `--cni-bin-dir` | `CNI_BIN_DIR` | `/opt/cni/bin` |
