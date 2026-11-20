@@ -68,6 +68,12 @@ pub struct LeaseRecord {
     /// before stormvm#85) or a multus NIC's `vmnetN`.
     #[serde(default)]
     pub bridge: Option<String>,
+    /// The pod gateway's MAC, from the CNI's pinned neighbour entry
+    /// (flowsdn), which the responder answers the guest's ARP with
+    /// (stormvm#138, #426). A record written before has none: that guest's
+    /// ARP for its gateway stays unanswered until the VMI restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_mac: Option<String>,
 }
 
 impl LeaseRecord {
@@ -83,6 +89,7 @@ impl LeaseRecord {
             search: l.search.clone(),
             hostname: l.hostname.clone(),
             mtu: l.mtu,
+            gateway_mac: l.gateway_mac.map(|m| format_mac(&m)),
         }
     }
 
@@ -96,8 +103,13 @@ impl LeaseRecord {
             search: self.search.clone(),
             hostname: self.hostname.clone(),
             mtu: self.mtu,
+            gateway_mac: self.gateway_mac.as_deref().map(stormvm_net::dhcp::parse_mac).transpose()?,
         })
     }
+}
+
+fn format_mac(m: &[u8; 6]) -> String {
+    m.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
 }
 
 /// A NetworkAttachmentDefinition ADDed into a VMI's sandbox (stormvm#85):
@@ -463,6 +475,7 @@ mod tests {
                 hostname: Some("web-1".into()),
                 mtu: Some(1450),
                 bridge: None,
+                gateway_mac: None,
             }],
             ..Default::default()
         }
@@ -601,6 +614,22 @@ mod tests {
         assert_eq!(LeaseRecord::of(1, "02:00:00:00:00:07", &l, Some("vmnet1")).bridge.as_deref(), Some("vmnet1"));
     }
 
+    /// stormvm#138 (#426): the gateway's MAC survives the record, so an
+    /// adopted guest's ARP for its gateway is still answered.
+    #[test]
+    fn the_gateway_mac_round_trips_through_the_record() {
+        let mut l = record().leases[0].lease().unwrap();
+        assert_eq!(l.gateway_mac, None, "a record written before stormvm#138");
+        l.gateway_mac = Some([0x0e, 0xa1, 0x02, 0xb3, 0xc4, 0xff]);
+        let r = LeaseRecord::of(0, "0a:58:0a:00:01:05", &l, None);
+        assert_eq!(r.gateway_mac.as_deref(), Some("0e:a1:02:b3:c4:ff"));
+        let back: LeaseRecord = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back.lease().unwrap().gateway_mac, l.gateway_mac);
+        let mut bad = r.clone();
+        bad.gateway_mac = Some("nonsense".into());
+        assert!(bad.lease().is_err());
+    }
+
     /// stormvm#85: the multus networks and what DEL needs survive the disk; a
     /// record written before them still reads.
     #[test]
@@ -660,6 +689,7 @@ mod tests {
             tap: "t0".into(),
             mac: "02:00:00:00:00:02".into(),
             attach,
+            bandwidth: Default::default(),
         };
         let host = nic(stormvm_net::Attach::Bridge("stormbr0".into()));
         let pod = nic(stormvm_net::Attach::Pod(stormvm_spec::PodBinding::Bridge));
