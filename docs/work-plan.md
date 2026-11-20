@@ -27,7 +27,7 @@ eabd981 (5; cilium-cni/flowsdn-cni count as serving hostPorts), f6db0fe (6: adop
 `GET /api/v1/migrations`, abort a failed one; no local memo needed), docs d6d6ff2. sc-build 320b18f27d at d6d6ff2: kubelet
 763/0, cni 28/0 (warnings are #386's). Stage requested; issue closed.
 
-### In progress: #378, node services' mirror pods: one container per stormd helper process
+### Shipped (proof pending): #378, node services' mirror pods: one container per stormd helper process
 2026-11-20. stormd#75 is in (d1c5966): `GET /api/v1/volumes` per container; goldens carry `goldens[].process`, the only
 per-process volume fact (one mount namespace). Plan:
 1. stormd_api: `Process.goldens` from `/api/v1/volumes` (role golden, by `goldens[].process`), read in stormd_poll.
@@ -47,6 +47,10 @@ No shipped service names a process after itself (rustkube-apiserver: apiserver/s
 apiserver-listening; rustkube-node: kubelet), so the name rule split nothing: 1301cb7 reads stormd's `helper` flag instead
 (filed stormd#80). sc-build 5b1411f5c7 passed (746). Held `--after stormd#80`. Resume: file on stormcos to mark
 stormcert-renew `helper = true`, hold `--after-install` of that; proof `api:` the rustkube-apiserver mirror's containers.
+2026-11-20 (later): stormcos 8a7d7ad marks stormcert-renew `helper = true` (stormcos#1483 shipped, rustkube-apiserver
+stage requested). `--after-install stormcos>=…` refused (stormcos is no registry component), so #378 is `shipped` with
+proof `api:/api/v1/pods?fieldSelector=spec.nodeName={name} ~ "name":"stormcert-renew"` (mirror pod `stormcert-<node>`);
+master told it holds only on a release with that stage. If it comes back failed on an older release: re-ship once one does.
 2026-11-20: stormd#80 done (stormd 5bc5380, `"helper"` in /api/v1/processes, the field 1301cb7 parses). Filed
 stormcos#1483 (mark `stormcert-renew` `helper = true` in build-goldens.sh). Held `--after stormcos#1483`. Resume: take
 stormcos's commit, hold `--after-install stormcos>=<commit>`, then `shipped` with proof
