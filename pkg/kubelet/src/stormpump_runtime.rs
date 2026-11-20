@@ -4882,7 +4882,7 @@ mod tests {
         let with = |n: usize| ContainerConfig {
             name: "app".into(),
             mounts: (0..n)
-                .map(|i| Mount { container_path: format!("/m{i}"), host_path: format!("/host/{i}"), ..Default::default() })
+                .map(|i| crate::cri::Mount { container_path: format!("/m{i}"), host_path: format!("/host/{i}"), ..Default::default() })
                 .collect(),
             ..Default::default()
         };
