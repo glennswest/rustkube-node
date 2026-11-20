@@ -30,6 +30,7 @@ CNI_ALIAS_MAC, no address, on vmbr0 with the tap; vmbr0 169.254 /32): nothing wr
 quotes them from before and after the connect. Then sc-build (test crate), golden rerun on pvetest2. Resume: in/passive not
 moving → SYNs never reach the guest (flowsdn → veth → vmbr0 → tap); in moving, retrans moving, gateway neigh FAILED/INCOMPLETE →
 the guest's replies have no gateway (flowsdn's ARP on the veth); csumerr moving → offload on the tap/veth path; sshd=0 → the guest.
+Done 3736f83; sc-build (test crate test + clippy -D warnings) passed. Golden run 343d192458 on pvetest2. Held `--after-run 343d192458`.
 
 ### In progress: #405 (P2), AccessCredentialsSynchronized stuck at "waiting for the guest agent to answer"
 2026-11-20. Ruled out (stormcos_qa#52 on the issue): the golden runs qemu-guest-agent and the guest has org.qemu.guest_agent.0.
