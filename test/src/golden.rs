@@ -463,18 +463,18 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
     );
 
     // The guest agent as the node reaches it, and keys through it (#405).
-    let t = Instant::now();
+    let ta = Instant::now();
     let o = match &agent_vm {
         Err(e) => Outcome::Infra(format!("VMI {AGENT} did not boot: {e}")),
         Ok(_) => suite.agent_probe().await,
     };
-    r.record("vmi-agent-answers", o, t.elapsed().as_millis(), None);
-    let t = Instant::now();
+    r.record("vmi-agent-answers", o, ta.elapsed().as_millis(), None);
+    let ta = Instant::now();
     let o = match &agent_vm {
         Err(_) => Outcome::Skip(format!("VMI {AGENT} did not boot")),
         Ok(_) => suite.agent_keys().await,
     };
-    r.record("vmi-agent-keys", o, t.elapsed().as_millis(), None);
+    r.record("vmi-agent-keys", o, ta.elapsed().as_millis(), None);
     let source_id = src.as_deref().ok().and_then(machine_id);
     r.record(
         "golden-sources-boot",
