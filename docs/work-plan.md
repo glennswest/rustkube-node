@@ -214,6 +214,7 @@ Done: d3fab69. sc-build passed (sc-build-6837a325b2: 695 kubelet unit incl. 3 ne
 (old code). pvc-tier-fast's refusal commented on #400 (provisioned_here takes only `stormblock`).
 Resume: held `--after-install rustkube-node>=d3fab69@any:pve`; then `stormcentral test run rustkube-node pvc`. A stuck grow now prints the
 claim's events (FileSystemResizeFailed names each place tried). Pass → shipped with proof / close #379.
+2026-11-19: hold met (pvetest1 and pvetest2 run passed 12.97 installs ⊇ d3fab69). Doing: suite `pvc` at main on them.
 
 ### Shipped (proof pending): #383 (P0), a template listed `broken` is waited on forever (server8 12.92, pvc-ext4j-64m)
 
