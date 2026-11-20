@@ -4,6 +4,19 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #378, node services' mirror pods: one container per stormd helper process
+2026-11-20. stormd#75 is in (d1c5966): `GET /api/v1/volumes` per container; goldens carry `goldens[].process`, the only
+per-process volume fact (one mount namespace). Plan:
+1. stormd_api: `Process.goldens` from `/api/v1/volumes` (role golden, by `goldens[].process`), read in stormd_poll.
+   `split(asset, procs)`: with a process named after the service, every other non-one-shot process is a helper; the
+   main container is `representative` of the rest (one-shots stay init-like). No process of that name: one container.
+2. mirror: `with_helpers`: helper containers after [0] (image as the service's), each with its goldens' volumeMounts
+   (volumes as inline CSI `stormblock.storm.io`, read-only, `volumeAttributes.volume_id`), its own containerStatuses
+   entry (with_stormd's mapping), `storm.io/instance.<helper>` = the service's root clone (one root). Ready conditions
+   over every container. Applied last (resets earlier helpers), so the engine's volumes and stormd's compose.
+   volumes_current/status_current compare every container.
+3. Tests: split, golden parsing, a pod with a helper (spec, statuses, conditions), a change in a helper rewrites.
+
 ### Blocked: #429 (P3), attach to a tty/stdin container after a kubelet restart
 2026-11-20. Needs the engine to keep a deposited fd across the client's detach and hand it back: none exists (ABI.md,
 deposits close when the client goes). Filed stormpump#260 (kept deposits + DEPOSIT_TAKE). Held `--after stormpump#260`.
