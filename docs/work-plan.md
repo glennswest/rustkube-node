@@ -374,6 +374,10 @@ Resume: `stormcentral test show 369f7f9253` / `3cc92c9f01`; pass → shipped wit
 (pvetest1), 124e0760c2 (pvetest2) at 158e7fc. If the gate fails again → file on stormcos (the node's services), hold `--after` it.
 124e0760c2 was cut off by a stormcentral restart (at 'API health'); rerun a6cccb9a06 (pvetest2, df04939). Held `--after-run
 939abd40a1`. Resume: `stormcentral test show 939abd40a1` / `a6cccb9a06`; pass → close #379; fail → the claim's events.
+939abd40a1 and a6cccb9a06 errored at the same API-health gate. Every component's runs on pvetest1/2/3 do (stormupdate
+103dd43a0a, stormblock-csi 7c72a1f2f6, stormcos-options 2ab8ff2d7c, stormraid a403e5dad7): stormcluster#123 (12.97's :9102
+fails the loopback health probe from boot). Held `--after stormcluster#123`. Resume: `stormcentral test run rustkube-node pvc
+--tag pvetest1` (and pvetest2); pass → close #379; fail → the claim's events.
 
 ### Shipped (proof pending): #383 (P0), a template listed `broken` is waited on forever (server8 12.92, pvc-ext4j-64m)
 
