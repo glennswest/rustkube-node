@@ -305,11 +305,37 @@ fn image_id(c: &Container) -> String {
 /// addresses / MAC the pod asked for, offered as `runtimeConfig`.
 fn attachment_pod(base: &cni::PodNetwork, a: &crate::cri::NetworkAttachment) -> cni::PodNetwork {
     let mut p = base.clone().on_interface(&a.ifname);
+    // hostPorts are the default network's (#437), as upstream's runtimes do.
+    p.runtime_config.remove("portMappings");
     if !a.ips.is_empty() {
         p.runtime_config.insert("ips".into(), serde_json::json!(a.ips));
     }
     if let Some(m) = &a.mac {
         p.runtime_config.insert("mac".into(), serde_json::json!(m));
+    }
+    p
+}
+
+/// The pod on its default network, with its hostPorts offered as CNI's
+/// `portMappings` (#437, 2eee3c8b1cb1), on ADD and DEL alike: the plugin
+/// that took them (portmap, Cilium) needs them to undo its rules. A network
+/// with no plugin taking them refuses the ADD (`cni::unserved_capability`).
+fn default_pod(id: &str, netns: &str, config: &PodSandboxConfig) -> cni::PodNetwork {
+    let mut p = cni::PodNetwork::new(id, netns, &config.namespace, &config.name, &config.uid);
+    if !config.port_mappings.is_empty() {
+        let maps: Vec<serde_json::Value> = config
+            .port_mappings
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "hostPort": m.host_port,
+                    "containerPort": m.container_port,
+                    "protocol": m.protocol.to_ascii_lowercase(),
+                    "hostIP": m.host_ip,
+                })
+            })
+            .collect();
+        p.runtime_config.insert("portMappings".into(), serde_json::Value::Array(maps));
     }
     p
 }
@@ -441,7 +467,7 @@ impl StormpumpRuntime {
     /// tried; the first error is answered. DEL of a network never added is
     /// allowed by the CNI contract, so a half-made sandbox is undone whole.
     async fn del_networks(&self, invoker: &cni::CniInvoker, id: &str, netns: &str, config: &PodSandboxConfig) -> Result<(), String> {
-        let base = cni::PodNetwork::new(id, netns, &config.namespace, &config.name, &config.uid);
+        let base = default_pod(id, netns, config);
         let mut first: Option<String> = None;
         for a in config.networks.iter().rev() {
             let r = match cni::NetworkConfigList::from_json(&a.config, &a.name) {
@@ -1389,13 +1415,7 @@ impl RuntimeService for StormpumpRuntime {
             };
             match ready {
                 Ok(_) => {
-                    let pod = cni::PodNetwork::new(
-                        &id,
-                        ns,
-                        &config.namespace,
-                        &config.name,
-                        &config.uid,
-                    );
+                    let pod = default_pod(&id, ns, &config);
                     let adding = std::time::Instant::now();
                     let added = match &config.default_network {
                         Some(d) => match cni::NetworkConfigList::from_json(&d.config, &d.name) {
@@ -4809,5 +4829,27 @@ mod tests {
         for h in ["", crate::realtime::HANDLER_SOFT, crate::realtime::HANDLER_HARD] {
             assert!(!matches!(r.run_pod_sandbox(&cfg(h)).await, Err(CriError::Refused { .. })), "{h:?}");
         }
+    }
+
+    /// #437 (2eee3c8b1cb1): hostPorts reach the default network as CNI
+    /// `portMappings` (protocol lower-case), never an extra network.
+    #[test]
+    fn host_ports_are_the_default_networks_port_mappings() {
+        let config = PodSandboxConfig {
+            name: "p".into(), namespace: "ns".into(), uid: "u".into(),
+            port_mappings: vec![crate::cri::PortMapping {
+                protocol: "UDP".into(), container_port: 53, host_port: 5353, host_ip: "10.0.0.1".into(),
+            }],
+            ..Default::default()
+        };
+        let p = default_pod("sb-1", "/proc/1/ns/net", &config);
+        assert_eq!(
+            p.runtime_config["portMappings"],
+            serde_json::json!([{"hostPort": 5353, "containerPort": 53, "protocol": "udp", "hostIP": "10.0.0.1"}])
+        );
+        let a = crate::cri::NetworkAttachment { name: "ns/lan".into(), ifname: "net1".into(), ..Default::default() };
+        assert!(!attachment_pod(&p, &a).runtime_config.contains_key("portMappings"));
+        let none = default_pod("sb-1", "/proc/1/ns/net", &PodSandboxConfig::default());
+        assert!(none.runtime_config.is_empty());
     }
 }

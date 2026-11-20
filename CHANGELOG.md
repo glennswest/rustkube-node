@@ -2,6 +2,7 @@
 
 ## 2026-11-20
 
+- **fix:** A container's `hostPort` reaches the pod's sandbox (#437, 2eee3c8b1cb1). The sandbox's port mappings were always empty, so a pod asking for a node port ran with nothing forwarding it. On the CRI path the runtime now gets them. On stormpump they go to the default network as CNI `runtimeConfig.portMappings` (protocol lower-case; extra networks never get them), on ADD and DEL. A network whose chain has no plugin with that capability refuses the ADD and names itself; Cilium and flowsdn serve hostPorts from the Pod object, so their chains count. A hostNetwork pod has none.
 - **fix:** Container restarts (#437).
   - A restart waits until the old container is confirmed stopped and removed (1e8f97747676). Both errors were ignored, so a busy or briefly unreachable runtime could leave the old process running beside its replacement, with the same volumes and ports.
   - The replacement's ID is recorded as soon as it is created (12e774c42aec). A start that fails or times out stops and removes it; one that cannot be removed then is removed by the next try before anything else is made. Before, each failed start left an untracked container (possibly running) and a new root.

@@ -7075,7 +7075,7 @@ fn build_sandbox_config(pod: &Value) -> PodSandboxConfig {
         ],
         labels: extract_labels(pod),
         annotations: HashMap::new(),
-        port_mappings: vec![],
+        port_mappings: host_port_mappings(pod),
         host_network: pod["spec"]["hostNetwork"].as_bool().unwrap_or(false),
         host_pid: pod["spec"]["hostPID"].as_bool().unwrap_or(false),
         host_ipc: pod["spec"]["hostIPC"].as_bool().unwrap_or(false),
@@ -7094,6 +7094,29 @@ fn build_sandbox_config(pod: &Value) -> PodSandboxConfig {
         // From the pod's RuntimeClass, before the sandbox (#204).
         runtime_handler: String::new(),
     }
+}
+
+/// The node ports a pod's containers ask for (#437, 2eee3c8b1cb1): every
+/// `ports[]` entry with a `hostPort`, its protocol (TCP unless said) and
+/// `hostIP`. A hostNetwork pod's ports are the node's already, so it has none.
+fn host_port_mappings(pod: &Value) -> Vec<crate::cri::PortMapping> {
+    if pod["spec"]["hostNetwork"].as_bool().unwrap_or(false) {
+        return Vec::new();
+    }
+    let in_range = |v: &Value| v.as_i64().filter(|p| (1..=65535).contains(p)).map(|p| p as i32);
+    ["initContainers", "containers"]
+        .iter()
+        .flat_map(|k| pod["spec"][*k].as_array().into_iter().flatten())
+        .flat_map(|c| c["ports"].as_array().into_iter().flatten())
+        .filter_map(|p| {
+            Some(crate::cri::PortMapping {
+                host_port: in_range(&p["hostPort"])?,
+                container_port: in_range(&p["containerPort"])?,
+                protocol: p["protocol"].as_str().unwrap_or("TCP").to_string(),
+                host_ip: p["hostIP"].as_str().unwrap_or("").to_string(),
+            })
+        })
+        .collect()
 }
 
 /// The PVC names a pod mounts, in spec order.
@@ -7561,46 +7584,6 @@ fn resolve_mounts(
     Ok(mounts)
 }
 
-/// Expand `$(NAME)` in a `subPathExpr` from the container's env, as
-/// upstream does: `$$` is a literal `$`, and a name the env does not set is
-/// left as written.
-fn expand_env_refs(s: &str, env: &[(String, String)]) -> String {
-    let mut out = String::new();
-    let mut rest = s;
-    while let Some(i) = rest.find('$') {
-        out.push_str(&rest[..i]);
-        let after = &rest[i + 1..];
-        if let Some(r) = after.strip_prefix('$') {
-            out.push('$');
-            rest = r;
-        } else if let Some(body) = after.strip_prefix('(') {
-            match body.find(')') {
-                Some(end) => {
-                    let name = &body[..end];
-                    match env.iter().rev().find(|(k, _)| k == name) {
-                        Some((_, v)) => out.push_str(v),
-                        None => {
-                            out.push_str("$(");
-                            out.push_str(name);
-                            out.push(')');
-                        }
-                    }
-                    rest = &body[end + 1..];
-                }
-                None => {
-                    out.push_str(&rest[i..]);
-                    rest = "";
-                }
-            }
-        } else {
-            out.push('$');
-            rest = after;
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
 /// The host path of `sub` inside the directory volume at `base` (#437,
 /// 0f6ec9a72d6c), checked where the host sees it (`on_host`).
 ///
@@ -7679,7 +7662,11 @@ fn mount_source(
             return Err(format!("volume {vol}: subPath and subPathExpr are mutually exclusive"))
         }
         (Some(s), None) => s.to_string(),
-        (None, Some(e)) => expand_env_refs(e, env),
+        (None, Some(e)) => {
+            // `$(NAME)` from the container's env, as its command's are.
+            let vars: HashMap<&str, &str> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            expand_env_refs(e, &vars)
+        }
     };
     if resolved.fstype.is_some() || resolved.block {
         // The engine mounts a claim's filesystem from its device inside the
@@ -12429,13 +12416,6 @@ pub(crate) mod tests {
         assert!(!outside.path().join("x").exists());
     }
 
-    #[test]
-    fn sub_path_expr_expands_like_upstream() {
-        let env = vec![("A".to_string(), "1".to_string()), ("B".to_string(), "two".to_string())];
-        assert_eq!(expand_env_refs("$(A)/x-$(B)", &env), "1/x-two");
-        assert_eq!(expand_env_refs("$$(A)/$(NOPE)", &env), "$(A)/$(NOPE)");
-        assert_eq!(expand_env_refs("cost$5/$(A", &env), "cost$5/$(A");
-    }
 
     /// A subPath mount on the start path: a refusal is
     /// CreateContainerConfigError, and no container is created.
@@ -12561,5 +12541,32 @@ pub(crate) mod tests {
         assert!(rt.stop_graces.lock().unwrap().iter().any(|(c, _)| *c == cid));
         assert_eq!(rt.container_ids(), vec![cid], "no second run");
         assert!(tracked(&mgr, "uid-437-r4").await.terminated.contains_key("app"));
+    }
+
+    /// #437 (2eee3c8b1cb1): a container's hostPorts reach the sandbox; a
+    /// port with no hostPort, and a hostNetwork pod's, do not.
+    #[test]
+    fn host_ports_reach_the_sandbox_config() {
+        let mut c = simple_container();
+        c["ports"] = json!([
+            {"containerPort": 80, "hostPort": 8080},
+            {"containerPort": 53, "hostPort": 5353, "protocol": "UDP", "hostIP": "10.0.0.1"},
+            {"containerPort": 9090}
+        ]);
+        let mut p = pod("uid-437-hp", "web", "Always", c);
+        let got: Vec<(String, i32, i32, String)> = build_sandbox_config(&p)
+            .port_mappings
+            .into_iter()
+            .map(|m| (m.protocol, m.container_port, m.host_port, m.host_ip))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("TCP".into(), 80, 8080, String::new()),
+                ("UDP".into(), 53, 5353, "10.0.0.1".into())
+            ]
+        );
+        p["spec"]["hostNetwork"] = json!(true);
+        assert!(build_sandbox_config(&p).port_mappings.is_empty());
     }
 }

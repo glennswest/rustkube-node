@@ -46,6 +46,35 @@ pub struct NetworkConfigList {
     pub source_path: PathBuf,
 }
 
+/// `runtimeConfig` the pod needs served that no plugin of `config` takes
+/// (rustkube-node#437, 2eee3c8b1cb1). Only `portMappings` is a must: a
+/// hostPort no plugin forwards is a pod that runs while nothing reaches it,
+/// so the ADD is refused, naming the network. `ips` and `mac` stay offers,
+/// as Multus treats them.
+///
+/// Cilium and flowsdn serve hostPorts without the capability: their agents
+/// read them from the Pod object and program them in their datapath (as
+/// part of replacing kube-proxy, which both do on stormcos). A chain with
+/// either plugin serves them.
+pub fn unserved_capability(config: &NetworkConfigList, pod: &PodNetwork) -> Option<String> {
+    let wanted = pod.runtime_config.get("portMappings").and_then(Value::as_array).is_some_and(|a| !a.is_empty());
+    let served = config.plugins.iter().any(|p| {
+        p["capabilities"]["portMappings"] == json!(true)
+            || matches!(p["type"].as_str(), Some(HOST_PORT_FROM_POD_SPEC_A | HOST_PORT_FROM_POD_SPEC_B))
+    });
+    (wanted && !served).then(|| {
+        format!(
+            "the pod asks for hostPort, and no plugin of network '{}' ({:?}) has the portMappings capability \
+             (add the portmap plugin to the chain)",
+            config.name, config.source_path
+        )
+    })
+}
+
+/// CNI plugins whose agents serve hostPorts from the Pod object.
+const HOST_PORT_FROM_POD_SPEC_A: &str = "cilium-cni";
+const HOST_PORT_FROM_POD_SPEC_B: &str = "flowsdn-cni";
+
 /// Identity of the pod whose network is being set up or torn down.
 #[derive(Debug, Clone)]
 pub struct PodNetwork {
@@ -229,6 +258,9 @@ impl CniInvoker {
     /// CNI ADD of an explicit network (a NetworkAttachmentDefinition's, or a
     /// replaced default network) on `pod.ifname`.
     pub async fn add_network(&self, config: &NetworkConfigList, pod: &PodNetwork) -> Result<CniResult, CniError> {
+        if let Some(why) = unserved_capability(config, pod) {
+            return Err(CniError::NetworkNotFound(why));
+        }
         let config = config.clone();
         info!(
             "CNI ADD {}/{} via network '{}' ({:?}) on {}",
@@ -783,5 +815,47 @@ exit 1
         assert!(!outside.path().join("out").read_dir().unwrap().any(|_| true), "nothing ran outside");
         assert!(!bin.path().join("sub/out").read_dir().unwrap().any(|_| true), "nothing ran below");
         assert!(is_plain_plugin_name("macvlan") && is_plain_plugin_name("host-local"));
+    }
+
+    /// rustkube-node#437 (2eee3c8b1cb1): a pod's hostPorts need a plugin
+    /// that takes `portMappings`; without one the ADD is refused, before any
+    /// plugin runs, naming the network.
+    #[tokio::test]
+    async fn host_ports_need_a_plugin_that_maps_them() {
+        let conf = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut pod = pod();
+        pod.runtime_config.insert(
+            "portMappings".into(),
+            json!([{"hostPort": 8080, "containerPort": 80, "protocol": "tcp", "hostIP": ""}]),
+        );
+        let without = NetworkConfigList::from_json(
+            r#"{"cniVersion":"1.0.0","name":"podnet","plugins":[{"type":"bridge"}]}"#,
+            "podnet",
+        )
+        .unwrap();
+        let with = NetworkConfigList::from_json(
+            r#"{"cniVersion":"1.0.0","name":"podnet","plugins":[{"type":"bridge"},{"type":"portmap","capabilities":{"portMappings":true}}]}"#,
+            "podnet",
+        )
+        .unwrap();
+        let why = unserved_capability(&without, &pod).unwrap();
+        assert!(why.contains("hostPort") && why.contains("podnet"), "{why}");
+        assert_eq!(unserved_capability(&with, &pod), None);
+        // Cilium and flowsdn serve hostPorts from the Pod object.
+        for t in ["cilium-cni", "flowsdn-cni"] {
+            let agent = NetworkConfigList::from_json(
+                &format!(r#"{{"cniVersion":"1.0.0","name":"podnet","plugins":[{{"type":"{t}"}}]}}"#),
+                "podnet",
+            )
+            .unwrap();
+            assert_eq!(unserved_capability(&agent, &pod), None, "{t}");
+        }
+        // No hostPorts asked: nothing to serve.
+        assert_eq!(unserved_capability(&without, &self::pod()), None);
+        // Refused before any plugin runs (the bin dir is empty).
+        let invoker = CniInvoker::new(conf.path(), vec![bin.path().to_path_buf()]);
+        let e = invoker.add_network(&without, &pod).await.unwrap_err().to_string();
+        assert!(e.contains("portMappings capability"), "{e}");
     }
 }
