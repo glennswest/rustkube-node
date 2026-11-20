@@ -4,6 +4,19 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #405 (P2), AccessCredentialsSynchronized stuck at "waiting for the guest agent to answer"
+2026-11-20. Ruled out (stormcos_qa#52 on the issue): the golden runs qemu-guest-agent and the guest has org.qemu.guest_agent.0.
+Read: the socket path matches stormvm's (`<run>/<ns>/<name>/agent.sock`), qemu's chardev is a single-client server, nothing in
+stormvm holds it open. Kubelet flaw: `agent_up` is "guest-network-get-interfaces succeeded within 2 s", so an agent that answers
+that command with an error (disabled by the guest's qemu-ga allow/block list, say) reads as no agent for ever, and the condition
+never says why. Plan:
+1. kubelet: agent up = `guest-ping` answered; addresses asked only then; the last ping error kept on `Access` and named in the
+   condition ("waiting for the guest agent to answer: <error>").
+2. golden suite: `vmi-agent-answers` (a privileged pod with hostPath of the VMI's run dir runs `/test qga-probe <sock>`: guest-ping,
+   guest-info's enabled commands, guest-network-get-interfaces) on the source VMI: runs on any current release and says which end
+   it is; `vmi-agent-keys` (a VMI with a qemuGuestAgent key reaches AccessCredentialsSynchronized True).
+Then sc-build, run golden on a pve machine now (the probe needs no new kubelet), stage, and the keys case once installed.
+
 ### Waiting on an install: #421 (P2), direct kernel boot from the golden's kernel (vmcloud-image-operator#62, stormvm#111)
 2026-11-20. Finding: no mount is needed. stormvm's machine spec is `root: Root::Inherit`, which stormpump documents as "the
 host's mount view", and `/data/vmimages` is a pallet volume mounted on the host (stormcos boot.d `volume vmidata /data/vmimages`);
