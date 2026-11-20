@@ -19,6 +19,11 @@ golden vmi-pod-network); the golden suite no longer returns when vmimages' CRD i
 `golden-crd` skip), only the requests need it. sc-build passed (workspace + test crate clippy -D warnings; #427 closed by the
 rerun); kubelet clippy: nothing in the changed lines. Stage build 6daebaa5b1c4. Golden run a31775e9fc on pvetest2 (also #405's
 probe). Held `--after-run a31775e9fc`. Resume: vmi-pod-network's detail says lease (console) vs datapath (connect); fix there.
+Run a31775e9fc: the guest holds 10.173.250.13/32 (its lease: DHCP is fine; stormvm's responder sends option 121 with the
+gateway on-link, so /32 is not the fault) and no pod connects to it; the connect error was blank (the suite read only the
+termination message, #162), fixed in 701679d under #405. Rerun 2aa5de7dc7 on pvetest2. Held `--after-run 2aa5de7dc7`. Resume:
+`Host is unreachable` → no neighbour for the IP on the node (flowsdn's route/ARP to the sandbox's vmbr0); timeout → the
+guest's replies are lost (its ARP for the gateway through the tap/vmbr0/veth); connected → the datapath works, look again.
 
 ### In progress: #405 (P2), AccessCredentialsSynchronized stuck at "waiting for the guest agent to answer"
 2026-11-20. Ruled out (stormcos_qa#52 on the issue): the golden runs qemu-guest-agent and the guest has org.qemu.guest_agent.0.
