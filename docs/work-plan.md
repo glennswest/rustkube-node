@@ -4,13 +4,14 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #443 (P1), review: probes drop httpHeaders; gRPC probes are a TCP connect
+### Done: #443 (P1), review: probes drop httpHeaders; gRPC probes are a TCP connect
 
-bb0746994c84: carry `httpGet.httpHeaders` through the host (reqwest) and pod-netns (raw HTTP/1.0) paths, `Host`
-overriding, `User-Agent: kube-probe/1.36` and `Accept: */*` unless set (as upstream). ff200a3eb18a: a real
-`grpc.health.v1.Health/Check` (vendored `proto/grpc/health/v1/health.proto`) with `grpc.service` and the timeout,
-SERVING only; in the pod netns the socket is connected on a setns thread and handed to tonic. Tests: local
-servers for headers/Host and a tonic health server for SERVING / NOT_SERVING / unimplemented / non-gRPC.
+bb0746994c84 and ff200a3eb18a fixed in e85741a (+ bec01fc borrow fix, 78e9317 doc wording the stub sweep caught).
+`httpGet` sends `httpHeaders` on the host and pod-netns paths (`Host` overrides; `User-Agent: kube-probe/1.36`,
+`Accept: */*` unless set; CR/LF refused). `grpc` calls `grpc.health.v1.Health/Check` with `service`, SERVING only;
+in the pod netns the socket is connected on a setns thread and handed to tonic. 9 new tests in `health::tests`.
+Full `sc-build` passed on 78e9317 (VM sc-build-5af0b51f5f: 774 kubelet tests ok). HTTPS probes in the pod netns are
+still a connect only: gap #452, proposed. Stage golden requested.
 
 ### Waiting on the owner: #442 (P1), review: the native runtime never provides the image rootfs
 
