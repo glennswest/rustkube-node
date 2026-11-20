@@ -7510,6 +7510,8 @@ fn build_container_config(
         supplemental_groups: Vec::new(),
         // The node's RDMA verbs devices, when asked for (#348).
         rdma: crate::rdma::requested(spec),
+        // Set by the caller from the pod's RuntimeClass (#430, `realtime_of`).
+        realtime: None,
     }
 }
 
