@@ -46,6 +46,16 @@
 //! (once only): it is `Failed`, and what the status recorded is removed (the
 //! sealer stopped, the copy by its recorded id, the group by its name).
 //! A copy made in the instant before its id was written is left behind.
+//!
+//! **Except a copy that is already sealed** (rustkube-node#428, finding
+//! dbdab3f85f46). The engine seals before the final `Sealed` status is
+//! written, so a restart, or a status write that failed, can leave a
+//! finished golden behind a `Sealing` status. Before anything is removed the
+//! engine is asked: a sealed copy is the golden, and the request is finished
+//! `Sealed` instead (its digest read again). An engine that does not answer
+//! removes nothing; the next pass asks again. A final status write that fails
+//! while the kubelet runs is kept and written again on every pass until it
+//! is taken.
 
 use async_trait::async_trait;
 use retry::RetryExt;
@@ -144,6 +154,9 @@ pub trait Engine: Send + Sync {
     async fn seal(&self, id: &str) -> Result<(), String>;
     /// The sealed volume's sha256, when the engine has it.
     async fn digest(&self, id: &str) -> Option<String>;
+    /// Whether the volume with the engine id `id` is sealed: `None` when the
+    /// engine has no such volume.
+    async fn volume_sealed(&self, id: &str) -> Result<Option<bool>, String>;
     /// Gone already is done.
     async fn delete_volume(&self, id: &str) -> Result<(), String>;
     /// A `/v1` volume by its `/v1` id: the record and the engine volume
@@ -198,6 +211,10 @@ pub struct Goldens {
     absent_said: std::sync::atomic::AtomicBool,
     /// Told when a run ends, so the next pass sees what it wrote.
     completed: Arc<tokio::sync::Notify>,
+    /// `<ns>/<name>` → a `Sealed` status the API did not take: written
+    /// again on every pass until it is (#428). The golden is sealed; only
+    /// its status is behind.
+    unwritten: Mutex<std::collections::HashMap<String, Value>>,
 }
 
 impl Goldens {
@@ -222,6 +239,7 @@ impl Goldens {
             in_flight: Mutex::new(HashSet::new()),
             absent_said: std::sync::atomic::AtomicBool::new(false),
             completed: Arc::new(tokio::sync::Notify::new()),
+            unwritten: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -248,6 +266,15 @@ impl Goldens {
                 continue;
             }
             let key = format!("{ns}/{name}");
+            let held = self.unwritten.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned();
+            if let Some(status) = held {
+                // Sealed already; only its status is behind. Never decided
+                // again, so it is never abandoned (#428).
+                if obj["status"]["phase"].as_str() == Some(SEALED) || self.finish_sealed(&obj, status).await {
+                    self.unwritten.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+                }
+                continue;
+            }
             let in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner()).contains(&key);
             let reg = self.source(&obj);
             match decide(&obj, &self.node, reg.is_some(), in_flight) {
@@ -293,10 +320,11 @@ impl Goldens {
             Ok(status) => {
                 info!("{ns}/{name}: golden {} sealed ({})", obj["spec"]["golden"].as_str().unwrap_or(""),
                       status["volumeId"].as_str().unwrap_or(""));
-                self.patch_status(obj, status).await;
-                self.event(obj, "Normal", "Sealed", &format!(
-                    "golden {} made from VM {}", obj["spec"]["golden"].as_str().unwrap_or(""),
-                    obj["spec"]["vm"].as_str().unwrap_or(""))).await;
+                if !self.finish_sealed(obj, status.clone()).await {
+                    warn!("{ns}/{name}: golden sealed, its status not written: kept, and written again next pass");
+                    self.unwritten.lock().unwrap_or_else(|e| e.into_inner())
+                        .insert(format!("{ns}/{name}"), status);
+                }
             }
             Err(why) => {
                 let left = self.remove(&made).await;
@@ -409,10 +437,7 @@ impl Goldens {
         made.group = None;
         let sha256 = self.engine.digest(&copy).await;
         let now = chrono::Utc::now();
-        let firmware = match vm.firmware.kind {
-            stormvm_spec::FirmwareType::Bios => "bios",
-            _ => "uefi",
-        };
+        let firmware = firmware_of(&vm);
         let mut status = json!({
             "phase": SEALED,
             "message": format!("sealed from VM {}'s root disk {}", vm.name, root.name),
@@ -461,17 +486,28 @@ impl Goldens {
     /// A request this node took and is not running (a kubelet restart):
     /// what its status says it made is removed, and it is `Failed`.
     pub async fn abandon(&self, obj: &Value) {
-        let (ns, _) = ns_name(obj);
+        let (ns, name) = ns_name(obj);
         let vm = obj["spec"]["vm"].as_str().unwrap_or("");
         let golden = obj["spec"]["golden"].as_str().unwrap_or("");
         let uid = sealer_uid(obj);
         let sealer = stormvm_node::console::find(&self.run_dir, ns, &format!("{vm}-sealer")).filter(|r| r.uid == uid);
-        let made = Made {
-            sealer,
-            copy: obj["status"]["volumeId"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
-            copy_v1: None,
-            group: None,
-        };
+        let copy = obj["status"]["volumeId"].as_str().filter(|s| !s.is_empty()).map(str::to_string);
+        // A copy the engine sealed is the golden, whatever the status says
+        // (#428): finished, never deleted. Unknown is not "not sealed".
+        if let Some(id) = &copy {
+            match self.engine.volume_sealed(id).await {
+                Ok(Some(true)) => {
+                    self.adopt_sealed(obj, id, sealer.as_ref()).await;
+                    return;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("{ns}/{name}: is the copy {id} sealed? {e}; nothing removed, asked again next pass");
+                    return;
+                }
+            }
+        }
+        let made = Made { sealer, copy, copy_v1: None, group: None };
         let mut left = self.remove(&made).await;
         if !golden.is_empty() {
             if let Err(e) = self.engine.delete_groups_named(&group_name(ns, vm, golden)).await {
@@ -485,6 +521,62 @@ impl Goldens {
             why = format!("{why} (not removed: {})", left.join("; "));
         }
         self.fail(obj, &why).await;
+    }
+
+    /// A request whose copy the engine had sealed when the kubelet restarted
+    /// (or whose final status was not taken): the sealer, if still
+    /// registered, stopped; the group removed; `Sealed` written (#428).
+    async fn adopt_sealed(&self, obj: &Value, copy: &str, sealer: Option<&Registration>) {
+        let (ns, name) = ns_name(obj);
+        let vm = obj["spec"]["vm"].as_str().unwrap_or("");
+        let golden = obj["spec"]["golden"].as_str().unwrap_or("");
+        if let Some(sreg) = sealer {
+            if let Err(e) = self.machines.stop_sealer(sreg).await {
+                warn!("{ns}/{name}: the sealer {}/{} not stopped: {e}", sreg.namespace, sreg.name);
+            }
+        }
+        if !golden.is_empty() {
+            if let Err(e) = self.engine.delete_groups_named(&group_name(ns, vm, golden)).await {
+                warn!("{ns}/{name}: the snapshot group {} not deleted: {e}", group_name(ns, vm, golden));
+            }
+        }
+        // The firmware is the VM's; when its VMI is gone it is not said.
+        let firmware = self.vmi(obj).await.ok()
+            .and_then(|v| stormvm_spec::kube::from_kube(&v).ok())
+            .map(|vm: VmSpec| firmware_of(&vm));
+        let now = chrono::Utc::now();
+        let mut status = json!({
+            "phase": SEALED,
+            "message": format!("sealed from VM {vm}; the kubelet restarted before its status was written"),
+            "node": self.node,
+            "volumeId": copy,
+            "volume": golden,
+            "arch": std::env::consts::ARCH,
+            "provenance": g::provenance(ns, vm, now.timestamp().max(0) as u64),
+            "sealedAt": now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        });
+        if let Some(f) = firmware {
+            status["firmware"] = json!(f);
+        }
+        if let Some(sha) = self.engine.digest(copy).await {
+            status["sha256"] = json!(sha);
+        }
+        info!("{ns}/{name}: golden {golden} ({copy}) was sealed before the restart: finished, not removed");
+        if !self.finish_sealed(obj, status.clone()).await {
+            self.unwritten.lock().unwrap_or_else(|e| e.into_inner()).insert(format!("{ns}/{name}"), status);
+        }
+    }
+
+    /// The `Sealed` status written and its Event said; `false` when the API
+    /// did not take it.
+    async fn finish_sealed(&self, obj: &Value, status: Value) -> bool {
+        if !self.patch_status(obj, status).await {
+            return false;
+        }
+        self.event(obj, "Normal", "Sealed", &format!(
+            "golden {} made from VM {}", obj["spec"]["golden"].as_str().unwrap_or(""),
+            obj["spec"]["vm"].as_str().unwrap_or(""))).await;
+        true
     }
 
     async fn fail(&self, obj: &Value, why: &str) {
@@ -524,6 +616,9 @@ impl Goldens {
     }
 
     async fn vmi(&self, obj: &Value) -> Result<Value, String> {
+        if self.api_url.is_empty() {
+            return Err("no API to read the VMI from".into());
+        }
         let (ns, _) = ns_name(obj);
         let vm = obj["spec"]["vm"].as_str().unwrap_or("");
         let url = format!("{}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{vm}", self.api_url);
@@ -563,18 +658,25 @@ impl Goldens {
         Some(list["items"].as_array().cloned().unwrap_or_default())
     }
 
-    async fn patch_status(&self, obj: &Value, status: Value) {
+    /// Whether the API took it (no API: nothing to write, taken).
+    async fn patch_status(&self, obj: &Value, status: Value) -> bool {
         if self.api_url.is_empty() {
-            return;
+            return true;
         }
         let (ns, name) = ns_name(obj);
         let url = format!("{}/apis/{API}/namespaces/{ns}/{RESOURCE}/{name}/status", self.api_url);
         match self.api.patch(&url).header("content-type", "application/merge-patch+json")
             .json(&json!({ "status": status })).send_retrying(retry::Policy::API).await
         {
-            Ok(r) if r.status().is_success() => {}
-            Ok(r) => warn!("{ns}/{name}: golden status not written: {}", r.status()),
-            Err(e) => warn!("{ns}/{name}: golden status not written: {e}"),
+            Ok(r) if r.status().is_success() => true,
+            Ok(r) => {
+                warn!("{ns}/{name}: golden status not written: {}", r.status());
+                false
+            }
+            Err(e) => {
+                warn!("{ns}/{name}: golden status not written: {e}");
+                false
+            }
         }
     }
 
@@ -582,6 +684,13 @@ impl Goldens {
         if let Some(r) = &self.events {
             r.object_event(API, KIND, obj, etype, reason, message).await;
         }
+    }
+}
+
+fn firmware_of(vm: &VmSpec) -> &'static str {
+    match vm.firmware.kind {
+        stormvm_spec::FirmwareType::Bios => "bios",
+        _ => "uefi",
     }
 }
 
@@ -658,6 +767,17 @@ impl Engine for Stormblock {
         }
         let v: Value = r.json().await.ok()?;
         v["sha256"].as_str().map(str::to_string)
+    }
+    async fn volume_sealed(&self, id: &str) -> Result<Option<bool>, String> {
+        let url = format!("{}/api/v1/volumes", self.client.url());
+        let r = self.client.get(&url).await.map_err(|e| format!("listing volumes: {e}"))?;
+        if !r.status().is_success() {
+            return Err(format!("listing volumes: {}", r.status()));
+        }
+        let list: Value = r.json().await.map_err(|e| format!("listing volumes: {e}"))?;
+        Ok(list["items"].as_array().into_iter().flatten()
+            .find(|v| v["id"].as_str() == Some(id))
+            .map(|v| v["sealed"].as_bool().unwrap_or(false)))
     }
     async fn delete_volume(&self, id: &str) -> Result<(), String> {
         let id = id.to_string();
@@ -963,6 +1083,10 @@ mod tests {
         stale_once: bool,
         /// /v1 ids deleted.
         v1_deleted: StdMutex<Vec<String>>,
+        /// Engine ids the engine lists as sealed (#428).
+        sealed: Vec<String>,
+        /// The engine does not answer whether a volume is sealed.
+        sealed_unknown: bool,
     }
 
     #[async_trait]
@@ -991,6 +1115,13 @@ mod tests {
         async fn digest(&self, id: &str) -> Option<String> {
             self.log.lock().unwrap().push(format!("digest {id}"));
             Some("abc123".into())
+        }
+        async fn volume_sealed(&self, id: &str) -> Result<Option<bool>, String> {
+            self.log.lock().unwrap().push(format!("sealed? {id}"));
+            if self.sealed_unknown {
+                return Err("listing volumes: connection refused".into());
+            }
+            Ok(self.sealed.iter().any(|s| s == id).then_some(true))
         }
         async fn delete_volume(&self, id: &str) -> Result<(), String> {
             self.log.lock().unwrap().push(format!("delete volume {id}"));
@@ -1241,9 +1372,109 @@ mod tests {
         obj["status"]["volumeId"] = json!("v-copy");
         gs.abandon(&obj).await;
         assert_eq!(*log.lock().unwrap(), vec![
+            "sealed? v-copy",
             "stop base-sealer",
             "delete volume v-copy",
             "delete groups ci.base.golden-company-base",
         ]);
+    }
+
+    /// #428 (finding dbdab3f85f46): the engine sealed the copy, then the
+    /// kubelet restarted (or the final status write failed). The status says
+    /// `Sealing` with the copy's id. The copy is the golden: it is finished,
+    /// never deleted.
+    #[tokio::test]
+    async fn a_copy_sealed_before_a_restart_is_finished_not_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().to_str().unwrap();
+        let log: Log = Default::default();
+        let machines = FakeMachines { log: log.clone(), run_dir: run.into(), ..Default::default() };
+        let engine = FakeEngine { log: log.clone(), sealed: vec!["v-copy".into()], ..Default::default() };
+        let gs = goldens(engine, machines, run);
+        let mut obj = request(Some(SEALING), Some("n1"));
+        obj["status"]["volumeId"] = json!("v-copy");
+        gs.abandon(&obj).await;
+        let log = log.lock().unwrap().clone();
+        assert!(!log.iter().any(|l| l.starts_with("delete volume") || l.starts_with("delete v1")), "{log:?}");
+        assert_eq!(log, vec!["sealed? v-copy", "delete groups ci.base.golden-company-base", "digest v-copy"]);
+        assert!(gs.unwritten.lock().unwrap().is_empty(), "written (no API here)");
+    }
+
+    /// An engine that does not say whether the copy is sealed: nothing is
+    /// removed and the request is not failed; the next pass asks again.
+    #[tokio::test]
+    async fn an_engine_that_does_not_answer_removes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().to_str().unwrap();
+        let log: Log = Default::default();
+        let machines = FakeMachines { log: log.clone(), run_dir: run.into(), ..Default::default() };
+        let engine = FakeEngine { log: log.clone(), sealed_unknown: true, ..Default::default() };
+        let gs = goldens(engine, machines, run);
+        let mut obj = request(Some(SEALING), Some("n1"));
+        obj["status"]["volumeId"] = json!("v-copy");
+        gs.abandon(&obj).await;
+        assert_eq!(*log.lock().unwrap(), vec!["sealed? v-copy"]);
+    }
+
+    /// The final `Sealed` write is refused once: the status is kept, the
+    /// next pass writes it, and the sealed copy is never deleted.
+    #[tokio::test]
+    async fn a_refused_sealed_status_is_kept_and_written_next_pass() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let patches = Arc::new(AtomicUsize::new(0));
+        let written = Arc::new(StdMutex::new(Vec::<Value>::new()));
+        let stored = {
+            let mut o = request(Some(SEALING), Some("n1"));
+            o["status"]["volumeId"] = json!("v-copy");
+            o
+        };
+        let list = json!({ "items": [stored.clone()] });
+        let (p, w) = (patches.clone(), written.clone());
+        let app = axum::Router::new()
+            .route(
+                "/apis/storm.io/v1alpha1/virtualmachinegoldens",
+                axum::routing::get(move || {
+                    let list = list.clone();
+                    async move { axum::Json(list) }
+                }),
+            )
+            .route(
+                "/apis/storm.io/v1alpha1/namespaces/ci/virtualmachinegoldens/company-base/status",
+                axum::routing::patch(move |axum::Json(body): axum::Json<Value>| {
+                    let (p, w) = (p.clone(), w.clone());
+                    async move {
+                        // The first write is refused (not retried: a 422).
+                        if p.fetch_add(1, Ordering::SeqCst) == 0 {
+                            return axum::http::StatusCode::UNPROCESSABLE_ENTITY;
+                        }
+                        w.lock().unwrap().push(body);
+                        axum::http::StatusCode::OK
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().to_str().unwrap();
+        let log: Log = Default::default();
+        let machines = FakeMachines { log: log.clone(), run_dir: run.into(), ..Default::default() };
+        let engine = FakeEngine { log: log.clone(), sealed: vec!["v-copy".into()], ..Default::default() };
+        let gs = Arc::new(Goldens::new(reqwest::Client::new(), &url, "n1", run, Arc::new(engine), Arc::new(machines)));
+
+        gs.abandon(&stored).await;
+        assert_eq!(patches.load(Ordering::SeqCst), 1);
+        assert!(gs.unwritten.lock().unwrap().contains_key("ci/company-base"), "kept");
+
+        gs.sync().await;
+        assert_eq!(patches.load(Ordering::SeqCst), 2);
+        assert!(gs.unwritten.lock().unwrap().is_empty(), "taken");
+        let w = written.lock().unwrap();
+        assert_eq!(w[0]["status"]["phase"], SEALED);
+        assert_eq!(w[0]["status"]["volumeId"], "v-copy");
+        assert_eq!(w[0]["status"]["sha256"], "abc123");
+        let log = log.lock().unwrap();
+        assert!(!log.iter().any(|l| l.starts_with("delete volume")), "{log:?}");
     }
 }
