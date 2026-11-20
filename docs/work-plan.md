@@ -308,6 +308,10 @@ b5770e2238 (pvetest3, 12.96, carries hooks): ready, localhost, logs, exec, resta
 Next: the test says why (exec -c sidecar in `pod-multi-exec`; the stop-order failure lists the files and PreStop/Killing events), sc-build,
 medium again, then fix the kubelet side. Close when every `pod-multi-*` passes (ipc after stormpump#244).
 871c8e6: sc-build-c7c9a5c3fb (test crate test + clippy -D warnings) passed. Medium 108455c2fe queued on pvetest1 (12.95, kubelet 8686267 has the hooks).
+108455c2fe: the multi pod never started (pvetest1 12.95 lacks #379: `0 is left` for the 1Mi claim), so no multi case ran but ready.
+pvetest2/pvetest3 (12.96, have #379) are wedged by stormblock#685. Held `--after stormblock#685`. Resume: `stormcentral test run
+rustkube-node medium --tag pvetest3 --commit <head>`; read `pod-multi-exec` (exec -c sidecar) and `pod-multi-stop-order`'s files/events,
+fix the kubelet's sidecar preStop; `pod-multi-ipc` waits on stormpump#244.
 
 ### Shipped (waits for the proof on a node): #372 (P0), traceability: root clones owned by their Pod, pods carry instance/golden/digest/volume ids, mirror pods declare the service's volumes
 
