@@ -4,7 +4,15 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #429 (P3), attach to a tty/stdin container after a kubelet restart on stormpump
+### Built, node run pending: #429 (P3), attach to a tty/stdin container after a kubelet restart on stormpump
+
+Built in 66838de; sc-build passed (VM sc-build-a4fc712f82, build + every test); clippy on the touched files shows only
+older findings (#386). New tests: `stormpump_ring::tests::a_kept_deposit_is_tagged_kept_and_its_copy_reads_back`,
+`only_an_answered_take_reads_a_descriptor`, three `exec::tests` (kept end, restore of a terminal and of stdin). Not seen
+on a node: no suite restarts the kubelet with a tty pod (`csi-kubelet-restart` waits on #334). Held `--after` #334; when
+it comes back, add a tty+stdin pod and an attach after the restart to that case, then ship with its log line
+`stormpump: console taken back`.
+
 
 Plan (2026-11-20): stormpump#260 (cfb238e) keeps a deposit across the client's detach and hands a copy back with
 `DEPOSIT_TAKE` (op 11). The stormpump pin cannot move alone (stormvm pins 9877a97 and its plan types cross into the
