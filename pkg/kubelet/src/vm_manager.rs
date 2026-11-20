@@ -1120,6 +1120,9 @@ pub struct VmManager {
     resume_tried: std::sync::Mutex<std::collections::HashSet<String>>,
     /// stormstorage, the node's certificate and address, for migrations (#40).
     migration: crate::vm_migration::Config,
+    /// Where a direct-kernel VM's kernel and initramfs may be read from
+    /// (#421, `--vm-kernel-dirs`).
+    kernel_dirs: Vec<String>,
     /// A machine's migration verbs: its control socket, or a fake in tests.
     migrator: MigrateMachine,
     /// Machines receiving a migration here, by uid, until it completes (#40).
@@ -1437,6 +1440,7 @@ impl VmManager {
             resuming: Default::default(),
             resume_tried: Default::default(),
             migration: crate::vm_migration::Config::default(),
+            kernel_dirs: vec![crate::vm_kernel_boot::DEFAULT_DIR.to_string()],
             migrator: Arc::new(|vm: &Vm| {
                 machine_of(vm).map(|m| Arc::new(m) as Arc<dyn crate::vm_migration::Migrator>)
             }),
@@ -1453,6 +1457,13 @@ impl VmManager {
 
     /// stormstorage, the node's certificate and address, for live
     /// migrations (#40).
+    /// Where a direct-kernel VM's kernel and initramfs may be read from
+    /// (#421, `--vm-kernel-dirs`).
+    pub fn with_kernel_dirs(mut self, dirs: Vec<String>) -> VmManager {
+        self.kernel_dirs = dirs;
+        self
+    }
+
     pub fn with_migration(mut self, config: crate::vm_migration::Config) -> VmManager {
         self.migration = config;
         self
@@ -2398,6 +2409,11 @@ impl VmManager {
         // that does not exist costs a failed status and no cleanup.
         let owner = self.owner_of(obj).await;
         let t = steps.since("owner", t);
+        // A kernel from outside the kernel directories, before anything is
+        // made for the machine (#421).
+        if let Some(why) = crate::vm_kernel_boot::refusal(&vm, &self.kernel_dirs) {
+            return Err(StartFail::Failed(why));
+        }
         let mirrored = self.mirror_requests(obj, &vm)?;
         let (disks, owned_volumes) = self
             .resolve_disks_as(uid, &vm, &boot_keys, &owner, fresh, &mirrored, Resolving::Start(steps.disks_mut()))
@@ -2616,6 +2632,12 @@ impl VmManager {
         pod: Option<&crate::vm_network::PodNet>,
         incoming: Option<&str>,
     ) -> Result<(Handle, NicsMade, stormvm_node::console::Registration), String> {
+        // Every machine this node starts (a start, a migration's target, a
+        // restore, the sealer) reads its kernel only from the kernel
+        // directories: the hypervisor opens it in the node's view (#421).
+        if let Some(why) = crate::vm_kernel_boot::refusal(vm, &self.kernel_dirs) {
+            return Err(why);
+        }
         // NICs, before the plan: the tap has to exist so its descriptor can
         // be named, and it has to be deposited so the engine can find it by
         // that name.

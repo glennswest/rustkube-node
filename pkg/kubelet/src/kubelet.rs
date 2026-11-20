@@ -97,6 +97,9 @@ pub struct KubeletConfig {
     pub migration: crate::vm_migration::Config,
     /// Backup stores (#380, `--backup-store`).
     pub backup_stores: Vec<crate::vm_backup::Store>,
+    /// Where a direct-kernel VM's kernel and initramfs may be read from
+    /// (#421, `--vm-kernel-dirs`).
+    pub vm_kernel_dirs: Vec<String>,
 }
 
 impl Default for KubeletConfig {
@@ -137,6 +140,7 @@ impl Default for KubeletConfig {
             container_log: Default::default(),
             migration: Default::default(),
             backup_stores: Vec::new(),
+            vm_kernel_dirs: vec![crate::vm_kernel_boot::DEFAULT_DIR.to_string()],
         }
     }
 }
@@ -309,6 +313,7 @@ impl Kubelet {
             .with_claims(self.pod_manager.clone())
             .with_cni(cni)
             .with_max_staleness(self.config.metadata_max_staleness)
+            .with_kernel_dirs(self.config.vm_kernel_dirs.clone())
             // Live migrations (#40): the target says this address.
             .with_migration(crate::vm_migration::Config { node_ip: self.node_ip.clone(), ..self.config.migration.clone() })
             // Each machine's hypervisor identity for cadvisor (#84).

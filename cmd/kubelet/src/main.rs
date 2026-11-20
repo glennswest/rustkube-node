@@ -172,6 +172,13 @@ struct Cli {
     #[arg(long = "backup-store", env = "BACKUP_STORES", value_delimiter = ';')]
     backup_store: Vec<String>,
 
+    /// Where a direct-kernel VM's `storm.io/kernel` and `storm.io/initrd` may
+    /// be (#421): comma-separated directories. The hypervisor reads them in
+    /// the node's view, so a path under none of them fails the start. Empty:
+    /// no direct kernel boot.
+    #[arg(long, env = "VM_KERNEL_DIRS", default_value = kubelet::vm_kernel_boot::DEFAULT_DIR)]
+    vm_kernel_dirs: String,
+
     /// Pods this node takes: its capacity and allocatable `pods`, which the
     /// scheduler holds it to (#165). Upstream's default; stormcos sets 250.
     #[arg(long, env = "MAX_PODS", default_value_t = kubelet::node_status::DEFAULT_MAX_PODS)]
@@ -763,6 +770,7 @@ async fn main() -> anyhow::Result<()> {
             node_ip: String::new(),
         },
         backup_stores,
+        vm_kernel_dirs: kubelet::vm_kernel_boot::parse_dirs(&cli.vm_kernel_dirs),
         ..Default::default()
     };
     kubelet::startup::mark("credentials");

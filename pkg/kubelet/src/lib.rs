@@ -63,6 +63,7 @@ pub mod vm_network;
 pub mod vm_restore;
 pub mod vm_migrate;
 pub mod vm_migration;
+pub mod vm_kernel_boot;
 pub mod vm_mirrored_root;
 pub mod vm_snapshot;
 

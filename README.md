@@ -1178,6 +1178,29 @@ restarted mid-migration (the migration fails; the guest stays on the source).
 Not run against two real nodes yet: stormstorage runs only on `sno` nodes
 until stormstorage#56/stormcos#354.
 
+### Direct kernel boot from the golden's own kernel
+
+A VMI can skip the firmware and boot loader and start its golden's kernel
+straight away (#421, stormvm#111, vmcloud-image-operator#62). vmimages reads
+each golden's kernel, initramfs and command line out of it on every node
+that has the golden and publishes them on the `CloudImage`'s `status.boot`;
+the VMI names them with three annotations:
+
+    storm.io/kernel: /data/vmimages/boot/fedora-44-x86_64/vmlinuz
+    storm.io/initrd: /data/vmimages/boot/fedora-44-x86_64/initrd
+    storm.io/cmdline: <status.boot.cmdline>
+
+stormvm renders them as qemu's `-kernel`/`-initrd`/`-append`
+(cloud-hypervisor `--kernel`/`--initramfs`/`--cmdline`). No mount is made:
+the machine's stormpump spec runs in the node's mount view
+(`Root::Inherit`), where `/data/vmimages` is mounted, so the hypervisor
+opens the paths as named. Because it reads them in the node's view, the
+kubelet allows only files under `--vm-kernel-dirs` (default
+`/data/vmimages/boot`): each path must be absolute, with no `.` or `..`
+component. Anything else (`/data/stormcert/…` as an initramfs would put the
+node's key in guest memory) fails the start, saying why. Every start of a
+machine is checked: a VMI's, a live migration's target, a restore's.
+
 ### A VM disk mirrored across nodes from its golden
 
 A golden's disk is normally a copy-on-write clone on the node's own engine,
