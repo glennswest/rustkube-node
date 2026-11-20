@@ -4,7 +4,7 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #418 (P0), mirror pods in each service's project (stormcos#1020)
+### Shipped (proof pending): #418 (P0), mirror pods in each service's project (stormcos#1020)
 2026-11-19. Plan: `mirror_namespaces.rs`: `--mirror-namespaces` (env `MIRROR_NAMESPACES`, default
 /etc/kubernetes/mirror-namespaces.json), a flat `asset → namespace` map, re-read when its mtime changes; no file or no entry =
 kube-system. The mirror pass lists node-service pods cluster-wide, creates each in its asset's namespace once that Namespace exists
@@ -14,6 +14,10 @@ take the map's namespace. **Also the system claims** (not in the issue, but a mi
 own namespace, #372): each service's PVCs go to its namespace, the PV's claimRef follows (namespace+name+uid), and the old
 kube-system claim is deleted after. Then tests, docs (configuration.md, api.md, status.md), CHANGELOG; sc-build; stage; shipped
 with proof `api:/api/v1/namespaces/storm-block/pods ~ "name":"stormblock-{name}"`.
+Done: 21b95cd (code, tests, docs), fe54c32 (test clippy, #419). sc-build-f140e9660a: `cargo build/test --locked` passed (699 kubelet
+unit incl. mirror_namespaces, displaced_mirrors, a_claim_moves_to_its_services_namespace); test crate test + clippy -D warnings passed
+(fe54c32); kubelet clippy names no changed line (#386's remain). stormcos already ships the map (deploy/node/projects.py) and the
+Namespaces (08-projects.yaml). Stage build 95d8e0c59a37. Shipped with the storm-block proof; medium's `node-services-namespaces` checks it on runs.
 
 ### In progress: #399 (golden suite on fedora-44, SELinux enforcing)
 - Run 7ffb659a57 (golden, pvetest3 12.96, carries b515348): `golden-no-agent-fails` failed because the agentless guest
