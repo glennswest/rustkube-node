@@ -14,6 +14,11 @@ start, so "Running with its IP" says nothing about the guest. Plan:
 2. golden suite `vmi-pod-network`: a VMI on `pod: {}` prints its addresses on its console; a pod connects to <ip>:22. Says
    whether the guest got its lease (console) and whether the datapath carries it (connect).
 Then sc-build, golden run on pvetest2 (flowsdn) now (the probe half needs no new kubelet), stage.
+Done: kubelet (pod_address_not_taken, a pod bridge NIC's tap snooped, `PodAddressNotTaken` once per machine), test (tcp-connect,
+golden vmi-pod-network); the golden suite no longer returns when vmimages' CRD is missing (6986230043 on pvetest2 ran nothing:
+`golden-crd` skip), only the requests need it. sc-build passed (workspace + test crate clippy -D warnings; #427 closed by the
+rerun); kubelet clippy: nothing in the changed lines. Stage build 6daebaa5b1c4. Golden run a31775e9fc on pvetest2 (also #405's
+probe). Held `--after-run a31775e9fc`. Resume: vmi-pod-network's detail says lease (console) vs datapath (connect); fix there.
 
 ### In progress: #405 (P2), AccessCredentialsSynchronized stuck at "waiting for the guest agent to answer"
 2026-11-20. Ruled out (stormcos_qa#52 on the issue): the golden runs qemu-guest-agent and the guest has org.qemu.guest_agent.0.
@@ -31,7 +36,7 @@ Written: kubelet (agent_ping, Access.agent_said), test (qga-probe workload, gold
 Done: 8b0ab10..bec2968 (code, tests, docs; build-failure #425 closed by the passing rerun). sc-build passed: workspace build/test
 (the_access_condition_says_what_did_not_arrive), test crate test + clippy -D warnings (the_agent_probe_and_keys_are_judged);
 kubelet clippy: one finding in my test line fixed (from_ref), the rest predate it. Stage build c45ec96f6c7b.
-Golden run 6986230043 queued on pvetest2 (newest passed release, old kubelet). Held `--after-run 6986230043`. Resume: read
+Golden run 6986230043 on pvetest2 ran nothing (vmimages' CRD missing, the suite returned); fixed under #426, rerun a31775e9fc. Held `--after-run a31775e9fc`. Resume: read
 `vmi-agent-answers`: ping answered + guest-network-get-interfaces enabled/answered → why the old kubelet never saw it is
 elsewhere; ping answered but interfaces refused/disabled → the fix is the cause, close once vmi-agent-keys passes on an install
 with c45ec96f6c7b's commit; ping not answered → the node's channel (stormvm/stormpump), file there with the probe's words.
