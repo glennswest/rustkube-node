@@ -260,6 +260,13 @@ Done: d3fab69. sc-build passed (sc-build-6837a325b2: 695 kubelet unit incl. 3 ne
 Resume: held `--after-install rustkube-node>=d3fab69@any:pve`; then `stormcentral test run rustkube-node pvc`. A stuck grow now prints the
 claim's events (FileSystemResizeFailed names each place tried). Pass → shipped with proof / close #379.
 2026-11-19: hold met (pvetest1 and pvetest2 run passed 12.97 installs ⊇ d3fab69). Doing: suite `pvc` at main on them.
+2026-11-20: run 369f7f9253 (pvetest1) skipped both cases: no expanding class, no VolumeSnapshotClass, no stormblock-fast. pvetest1
+runs 12.78 (stormcentral says so when asked to run on it), from before stormcos#1032 and before 9de861a/d3fab69: it says nothing
+about this. 3cc92c9f01 (pvetest2) was cut off by a stormcentral restart. No machine runs a release with d3fab69: 12.97
+(rustkube-node e31b987 ⊇ d3fab69, rustkube-apiserver de12b6f ⊇ 6a4dfe5) shows no installs (pvetest3's ended failed); the newest
+passed are 12.94 (8686267) and 12.96 (6682813), both before d3fab69, so the suite would only repeat a known failure (runs
+ae8d98f50f/8d25602ce0 queued then cancelled). No code change. Held `--after-install rustkube-node>=d3fab69@any:pve`.
+Resume: `stormcentral test run rustkube-node pvc` on that machine; `pvc-classes` must pass first (else the install lacks #1032).
 Runs 369f7f9253 (pvetest1) and 3cc92c9f01 (pvetest2) at 0802be2, queued behind the nightly and release-gate runs. Held `--after-run 369f7f9253`.
 Resume: `stormcentral test show 369f7f9253` / `3cc92c9f01`; pass → shipped with proof / close #379; fail → the claim's events.
 
