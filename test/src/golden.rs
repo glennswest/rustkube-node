@@ -101,6 +101,9 @@ pub const PODNET: &str = "gold-podnet";
 pub const PODNET_CLIENT: &str = "gold-podnet-client";
 /// Printed with the guest's addresses; the shell makes the last part.
 pub const PODNET_MARKER: &str = "RKN-PODNET-2";
+/// Printed every 5 s by the pod-network guest with what it sees of its own
+/// network (#426); the shell makes the last part.
+pub const PODNET_NET_MARKER: &str = "RKN-PODNETNET-2";
 pub const AGENT_PROBE: &str = "gold-agent-probe";
 pub const AGENT_SECRET: &str = "gold-agent-key";
 /// A well-formed ed25519 public key nobody holds the private half of.
@@ -336,6 +339,9 @@ impl Suite {
         let Some(ip) = now["status"]["interfaces"][0]["ipAddress"].as_str().filter(|i| !i.is_empty()).map(str::to_string) else {
             return Outcome::Fail(format!("the VMI reports no pod IP: {}", short(&now["status"])));
         };
+        // What the guest sees of its network, before and after the connect
+        // (#426): its counters say which way the packets were lost.
+        let before = self.guest_net(PODNET).await;
         let target = format!("{ip}:22");
         let pods = k8s::pods(&self.env);
         if let Err(e) = self.api.create(&pods, &k8s::pod(&self.env, PODNET_CLIENT, &["tcp-connect", &target, "120"])).await {
@@ -345,7 +351,18 @@ impl Suite {
             Ok(d) => Ok(k8s::said(&self.env, &self.api, PODNET_CLIENT, &d).await),
             Err(e) => Err(e),
         };
-        judge_pod_network(&ip, booted.as_ref().err(), held.as_deref(), connect, &events)
+        let after = self.guest_net(PODNET).await;
+        match judge_pod_network(&ip, booted.as_ref().err(), held.as_deref(), connect, &events) {
+            Outcome::Fail(m) => Outcome::Fail(format!("{m}; {}", guest_net_said(before.as_deref(), after.as_deref()))),
+            o => o,
+        }
+    }
+
+    /// The last [`PODNET_NET_MARKER`] line on `vmi`'s console, read for 12 s
+    /// (the guest prints one every 5 s).
+    async fn guest_net(&self, vmi: &str) -> Option<String> {
+        let seen = self.api.console(&self.env.namespace, vmi, Duration::from_secs(12), |_| false).await.ok()?;
+        podnet_net(&seen)
     }
 
     /// The VMI for #405: a key for root through the guest agent.
@@ -626,9 +643,35 @@ pub fn judge_status_volumes(vmi: &Value, golden: &str) -> Outcome {
 /// A VMI on this node on the pod network (the bridge binding, #426), whose
 /// console says its IPv4 addresses once cloud-init has run.
 pub fn podnet_vmi(env: &Env, root: &str) -> Value {
+    let head = |m: &'static str| m.rsplit_once('-').map_or(m, |(h, _)| h);
+    // Every 5 s, what the guest sees of its own network (#426): its default
+    // route, whether the gateway answers a ping and its neighbour entry, its
+    // TCP counters (passive opens, segments in and out, retransmits, bad
+    // checksums), the NIC's packet counters and whether sshd listens.
+    let echo = format!(
+        "  echo \"{}-$((1+1)) dev=$dev gw=$gw ping=$p neigh=$nb $t rx=$rx tx=$tx sshd=$l\" > /dev/console",
+        head(PODNET_NET_MARKER)
+    );
+    let net = [
+        "#!/bin/sh",
+        "while :; do",
+        "  dev=$(ip -4 route show default | awk '{print $5; exit}')",
+        "  gw=$(ip -4 route show default | awk '{print $3; exit}')",
+        "  if ping -c1 -W1 \"$gw\" >/dev/null 2>&1; then p=ok; else p=no; fi",
+        "  t=$(awk '/^Tcp:/{n++; if (n==2) print \"passive=\"$7\" in=\"$11\" out=\"$12\" retrans=\"$13\" csumerr=\"$16}' /proc/net/snmp)",
+        "  nb=$(ip -4 neigh show | tr '\\n' ',')",
+        "  rx=$(cat /sys/class/net/$dev/statistics/rx_packets); tx=$(cat /sys/class/net/$dev/statistics/tx_packets)",
+        "  l=$(ss -Hltn 'sport = :22' | wc -l)",
+        echo.as_str(),
+        "  sleep 5",
+        "done",
+    ]
+    .iter()
+    .map(|l| format!("      {l}\n"))
+    .collect::<String>();
     let user_data = format!(
-        "#cloud-config\nruncmd:\n  - [ sh, -c, \"sync; echo {}-$((1+1)) $(ip -4 -o addr show scope global | awk '{{print $4}}' | tr '\\\\n' ' ') > /dev/console\" ]\n",
-        PODNET_MARKER.rsplit_once('-').map_or(PODNET_MARKER, |(h, _)| h)
+        "#cloud-config\nwrite_files:\n  - path: /usr/local/sbin/rkn-net\n    permissions: '0755'\n    content: |\n{net}runcmd:\n  - [ sh, -c, \"sync; echo {}-$((1+1)) $(ip -4 -o addr show scope global | awk '{{print $4}}' | tr '\\\\n' ' ') > /dev/console\" ]\n  - [ systemd-run, --unit, rkn-net, /usr/local/sbin/rkn-net ]\n",
+        head(PODNET_MARKER)
     );
     let mut v = vmi(env, PODNET, root, &user_data);
     v["spec"]["domain"]["devices"]["interfaces"] = json!([{ "name": "default", "bridge": {} }]);
@@ -640,6 +683,18 @@ pub fn podnet_vmi(env: &Env, root: &str) -> Value {
 pub fn podnet_addresses(console: &str) -> Option<String> {
     let i = console.rfind(PODNET_MARKER)?;
     Some(console[i + PODNET_MARKER.len()..].lines().next().unwrap_or("").trim().to_string())
+}
+
+/// The guest's last network line, after [`PODNET_NET_MARKER`].
+pub fn podnet_net(console: &str) -> Option<String> {
+    let i = console.rfind(PODNET_NET_MARKER)?;
+    Some(console[i + PODNET_NET_MARKER.len()..].lines().next().unwrap_or("").trim().to_string())
+}
+
+/// What the guest saw before and after the connect, for a failure.
+pub fn guest_net_said(before: Option<&str>, after: Option<&str>) -> String {
+    let or = |l: Option<&str>| l.map_or_else(|| "(no line on its console)".to_string(), str::to_string);
+    format!("the guest before the connect: {}; after: {}", or(before), or(after))
 }
 
 /// `vmi-pod-network`.
@@ -934,6 +989,11 @@ mod tests {
         assert_eq!(v["spec"]["networks"][0]["pod"], serde_json::json!({}));
         let ud = s(&v, "/spec/volumes/1/cloudInitNoCloud/userData");
         assert!(ud.contains("RKN-PODNET-$((1+1))") && !ud.contains(PODNET_MARKER), "{ud}");
+        assert!(ud.contains("RKN-PODNETNET-$((1+1))") && !ud.contains(PODNET_NET_MARKER), "{ud}");
+        assert!(ud.contains("      while :; do\n") && ud.contains("systemd-run, --unit, rkn-net"), "{ud}");
+        assert_eq!(podnet_net("RKN-PODNETNET-2 a\nRKN-PODNETNET-2 dev=eth0 retrans=3\r\nx"), Some("dev=eth0 retrans=3".into()));
+        assert_eq!(podnet_net("RKN-PODNET-2 10.1.2.3/32"), None);
+        assert_eq!(guest_net_said(Some("in=1"), None), "the guest before the connect: in=1; after: (no line on its console)");
     }
 
     #[test]

@@ -24,6 +24,12 @@ gateway on-link, so /32 is not the fault) and no pod connects to it; the connect
 termination message, #162), fixed in 701679d under #405. Rerun 2aa5de7dc7 on pvetest2. Held `--after-run 2aa5de7dc7`. Resume:
 `Host is unreachable` → no neighbour for the IP on the node (flowsdn's route/ARP to the sandbox's vmbr0); timeout → the
 guest's replies are lost (its ARP for the gateway through the tap/vmbr0/veth); connected → the datapath works, look again.
+Run 2aa5de7dc7: timed out (guest holds 10.173.36.98/32). Read stormvm's bridge_binding (KubeVirt's shape: the CNI veth gets
+CNI_ALIAS_MAC, no address, on vmbr0 with the tap; vmbr0 169.254 /32): nothing wrong by reading. Next: the guest prints
+`RKN-PODNETNET` lines every 5 s (gateway neighbour + ping, TCP passive/in/out/retrans/csumerr, NIC rx/tx, sshd), and the failure
+quotes them from before and after the connect. Then sc-build (test crate), golden rerun on pvetest2. Resume: in/passive not
+moving → SYNs never reach the guest (flowsdn → veth → vmbr0 → tap); in moving, retrans moving, gateway neigh FAILED/INCOMPLETE →
+the guest's replies have no gateway (flowsdn's ARP on the veth); csumerr moving → offload on the tap/veth path; sshd=0 → the guest.
 
 ### In progress: #405 (P2), AccessCredentialsSynchronized stuck at "waiting for the guest agent to answer"
 2026-11-20. Ruled out (stormcos_qa#52 on the issue): the golden runs qemu-guest-agent and the guest has org.qemu.guest_agent.0.
