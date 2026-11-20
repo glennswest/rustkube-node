@@ -36,6 +36,9 @@ sc-build c1dc239e78 at d7e9d97 passed (743 kubelet, 79 test crate with clippy -D
 missing `realtime: None` and the suite's early returns). Stage build 11fe39b2092c. #204 commented (resolution done,
 stormvisor dispatch left). `wait-owner` on the taint (recommended A). Resume: taint per the answer (A: nothing; C:
 `--realtime-dedicated` flag → register-with-taints), then hold `--after stormcos#1477` and run `realtime`.
+2026-11-20: answered A (master): no taint, nothing to build; docs say so. Held `--after stormcos#1477`. Resume: on a
+machine with its isolated set and the RuntimeClasses, `stormcentral test run rustkube-node realtime --tag <it>`; pass
+(realtime-soft-fifo read back FIFO 80, 2 cores, mems on their nodes; hard refused naming PREEMPT_RT) → close #430.
 
 ### In progress: #318 (P2), --stormblock-ca for stormvm's engine clients
 2026-11-20. stormvm 319333d already has 59dc498 (`STORMBLOCK_CA_FILE` in stormvm-block, no CA argument on the console's

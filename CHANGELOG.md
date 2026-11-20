@@ -2,6 +2,7 @@
 
 ## 2026-11-20
 
+- **docs:** Real-time nodes carry no `stormpump.io/realtime:NoSchedule` taint (#430, option A, decided 2026-11-20): the isolated cores are guarded by the `stormpump.io/isolated-cores` resource and the engine. A taint would stop a single-node cluster from scheduling its own pods.
 - **feat:** Real-time pods on stormpump (#430, stormpump#252), and `runtimeClassName` honoured (#204).
   - `runtimeClassName` resolves to its RuntimeClass's handler; a missing one is a wait. The CRI path passes the handler on, and a runtime that does not serve it refuses the pod instead of running it unconfined.
   - A `realtime-soft`/`realtime-hard` pod's containers holding `stormpump.io/isolated-cores` get `Demand::Exclusive` and `Sched::Fifo`/`RoundRobin` from the `stormpump.io/realtime` annotation, checked before the sandbox. `realtime-hard` without PREEMPT_RT is refused (`RealtimeRefused`).

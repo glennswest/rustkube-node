@@ -791,9 +791,9 @@ The Node says what it can give: allocatable `stormpump.io/isolated-cores` is the
 number of whole cores in PID 1's `--isolate` set (SMT siblings once), so the
 scheduler's resource fit counts them. The labels are `stormpump.io/realtime=hard|soft|none`
 and `kernel.stormpump.io/preempt=rt|dynamic|full|none` (from the kernel's version
-and `/sys/kernel/realtime`), patched when they change. No taint is set: whether a
-node with isolated cores should carry `stormpump.io/realtime:NoSchedule` is the
-owner's open question on #430. Unit-tested; not run on a node, which needs an
+and `/sys/kernel/realtime`), patched when they change. No taint is set (decided on #430, option A): the isolated cores are guarded by
+the resource and the engine, and a `NoSchedule` taint would stop a single-node
+cluster from scheduling its own pods. Unit-tested; not run on a node, which needs an
 isolated set (stormcos#1477).
 
 ### RDMA verbs for a pod that asks
