@@ -2770,30 +2770,50 @@ async fn mirror_node_services(
                 let mut pod = crate::mirror::mirror_pod_with(a, node, "", &started, health.get(&a.name));
                 pod["metadata"]["namespace"] = Value::String(ns.to_string());
                 crate::mirror::with_provenance(&mut pod, golden.as_ref(), host_ip);
-                let from_stormd = apply_stormd(&mut pod, a, stormd);
+                let helpers = apply_stormd(&mut pod, a, stormd);
+                let from_stormd = helpers.is_some();
                 // The golden's annotations (#130) are metadata, which the
                 // status write below does not carry: patched when they differ.
                 let mut want = golden.as_ref().map(crate::mirror::golden_annotations).unwrap_or_default();
                 // The service's volumes (#372): spec and annotations, patched
                 // when they differ. Kept as they are when the engine did not
                 // answer.
-                let mut spec = None;
                 match &volumes {
                     Some(sv) => {
                         crate::mirror::with_volumes(&mut pod, sv);
                         want.extend(sv.annotations.clone());
-                        if !crate::mirror::volumes_current(existing, &pod) {
-                            spec = Some(serde_json::json!({
-                                "volumes": pod["spec"]["volumes"].as_array().cloned().unwrap_or_default(),
-                                "containers": pod["spec"]["containers"],
-                            }));
-                        }
                     }
                     None => {
                         pod["spec"]["volumes"] = existing["spec"]["volumes"].clone();
                         pod["spec"]["containers"] = existing["spec"]["containers"].clone();
                     }
                 }
+                // Its helper processes' containers (#378), from stormd: after
+                // the volumes, which they extend. stormd silent: as they are.
+                match &helpers {
+                    Some(h) => {
+                        crate::mirror::with_helpers(&mut pod, &a.name, h, a.restarts);
+                        for p in h {
+                            let key = format!("storm.io/instance.{}", p.name);
+                            if let Some(v) = pod["metadata"]["annotations"].get(&key) {
+                                want.insert(key, v.clone());
+                            }
+                        }
+                    }
+                    None => {
+                        pod["spec"]["volumes"] = existing["spec"]["volumes"].clone();
+                        pod["spec"]["containers"] = existing["spec"]["containers"].clone();
+                        if let Some(sv) = &volumes {
+                            crate::mirror::with_volumes(&mut pod, sv);
+                        }
+                    }
+                }
+                let spec = (!crate::mirror::volumes_current(existing, &pod)).then(|| {
+                    serde_json::json!({
+                        "volumes": pod["spec"]["volumes"].as_array().cloned().unwrap_or_default(),
+                        "containers": pod["spec"]["containers"],
+                    })
+                });
                 if spec.is_some() || want.iter().any(|(k, v)| existing["metadata"]["annotations"][k] != *v) {
                     let mut body = serde_json::json!({"metadata": {"annotations": want}});
                     if let Some(spec) = spec {
@@ -2868,7 +2888,9 @@ async fn mirror_node_services(
                 if let Some(sv) = &volumes {
                     crate::mirror::with_volumes(&mut pod, sv);
                 }
-                apply_stormd(&mut pod, a, stormd);
+                if let Some(h) = apply_stormd(&mut pod, a, stormd) {
+                    crate::mirror::with_helpers(&mut pod, &a.name, &h, a.restarts);
+                }
                 let created = client.post(&base).json(&pod).send_repeatable(retry::Policy::API).await;
                 if !matches!(created, Ok(ref r) if r.status().is_success() || r.status() == 409) {
                     apimachinery::reactor::failed();
@@ -2893,22 +2915,20 @@ async fn mirror_node_services(
 }
 
 /// A running service's container status from its stormd (#215), when stormd
-/// answered. Returns whether it did.
+/// answered: its helper processes (#378), for [`crate::mirror::with_helpers`];
+/// `None` when stormd did not answer.
 fn apply_stormd(
     pod: &mut Value,
     a: &crate::mirror::Asset,
     stormd: &std::collections::HashMap<String, Vec<crate::stormd_api::Process>>,
-) -> bool {
+) -> Option<Vec<crate::stormd_api::Process>> {
     if !a.running {
-        return false;
+        return None;
     }
-    match stormd.get(&a.name).and_then(|procs| crate::stormd_api::representative(&a.name, procs)) {
-        Some(p) => {
-            crate::mirror::with_stormd(pod, &a.name, &p, a.restarts);
-            true
-        }
-        None => false,
-    }
+    let procs = stormd.get(&a.name)?;
+    let (main, helpers) = crate::stormd_api::split(&a.name, procs);
+    crate::mirror::with_stormd(pod, &a.name, &main?, a.restarts);
+    Some(helpers)
 }
 
 /// Ask every running host-network service's stormd, every
@@ -2965,6 +2985,19 @@ async fn stormd_poll(
             // What its config runs once (#226): init-like, never the state.
             for p in &mut procs {
                 p.one_shot = service.one_shots.contains(&p.name);
+            }
+            // Each process's goldens (#378, stormd#75). An older stormd (no
+            // route): none, and its helpers declare no mounts.
+            if let Ok(r) = http.get(format!("{base}/api/v1/volumes")).send().await {
+                if r.status().is_success() {
+                    if let Ok(v) = r.json::<Value>().await {
+                        for (process, g) in stormd_api::parse_goldens(&v) {
+                            if let Some(p) = procs.iter_mut().find(|p| p.name == process) {
+                                p.goldens.push(g);
+                            }
+                        }
+                    }
+                }
             }
             now.insert(a.name.clone(), procs);
             if api_url.is_empty() {

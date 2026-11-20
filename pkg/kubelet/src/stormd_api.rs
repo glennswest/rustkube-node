@@ -211,6 +211,62 @@ pub struct Process {
     pub one_shot: bool,
     /// Why the container is not ready, when [`representative`] knows.
     pub reason: Option<String>,
+    /// The goldens stormd presents to this process (#378, stormd#75), from
+    /// its `GET /api/v1/volumes`: the one volume fact that is a process's own
+    /// (a service's processes share one mount namespace).
+    pub goldens: Vec<Golden>,
+}
+
+/// A golden presented to one process (#378).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Golden {
+    /// The process's name for it (`[[process.golden]] name`).
+    pub name: String,
+    /// The engine volume's id and name.
+    pub volume_id: Option<String>,
+    pub volume: String,
+    /// Where it is mounted in the service's container; empty for an image
+    /// golden (a device node) or one not presented.
+    pub mounts: Vec<String>,
+    /// stormd's word: `attached`, `missing` or `unverified`.
+    pub state: String,
+}
+
+/// The goldens in stormd's `GET /api/v1/volumes` (stormd#75), by the process
+/// each is presented to.
+pub fn parse_goldens(v: &Value) -> Vec<(String, Golden)> {
+    let mut out = Vec::new();
+    for item in v["items"].as_array().into_iter().flatten().filter(|i| i["role"] == "golden") {
+        for g in item["goldens"].as_array().into_iter().flatten() {
+            let (Some(process), Some(name)) = (g["process"].as_str(), g["name"].as_str()) else { continue };
+            out.push((
+                process.to_string(),
+                Golden {
+                    name: name.to_string(),
+                    volume_id: item["volume_id"].as_str().filter(|i| !i.is_empty()).map(str::to_string),
+                    volume: item["name"].as_str().unwrap_or("").to_string(),
+                    mounts: item["mounts"].as_array().into_iter().flatten().filter_map(|m| m.as_str().map(str::to_string)).collect(),
+                    state: item["state"].as_str().unwrap_or("").to_string(),
+                },
+            ));
+        }
+    }
+    out
+}
+
+/// A service's mirror containers (#378): with a process named after the
+/// service, that is the main container, and every other process that is not
+/// a one-shot is a helper (a log shipper, a cert client) with a container of
+/// its own; the main one stands for the rest ([`representative`]: one-shots
+/// stay init-like). With no process of that name nothing is told apart: one
+/// container, as before.
+pub fn split(asset: &str, procs: &[Process]) -> (Option<Process>, Vec<Process>) {
+    if !procs.iter().any(|p| p.name == asset && !p.one_shot) {
+        return (representative(asset, procs), Vec::new());
+    }
+    let (helpers, rest): (Vec<Process>, Vec<Process>) =
+        procs.iter().cloned().partition(|p| p.name != asset && !p.one_shot);
+    (representative(asset, &rest), helpers)
 }
 
 /// `GET /api/v1/processes`'s array.
@@ -228,6 +284,7 @@ pub fn parse_processes(v: &Value) -> Vec<Process> {
             stopped_at: p["stopped_at"].as_str().map(str::to_string),
             one_shot: false,
             reason: None,
+            goldens: Vec::new(),
         })
         .filter(|p| !p.name.is_empty())
         .collect()
@@ -527,5 +584,45 @@ name = "steady"
 restart_policy = "Always"
 "#;
         assert_eq!(one_shots(c), ["stormcert-client-etcd", "migrate"]);
+    }
+
+    /// #378: stormd#75's golden items, by the process each is presented to.
+    #[test]
+    fn goldens_are_read_by_process() {
+        let v = serde_json::json!({"container": "stormlb", "items": [
+            {"volume_id": "vol-root", "name": "stormlb", "role": "root", "mounts": ["/"], "state": "attached"},
+            {"volume_id": "vol-g1", "name": "golden-fluent-1a2b", "role": "golden", "mounts": ["/goldens/fluent"],
+             "state": "attached", "goldens": [{"process": "log-shipper", "name": "fluent"}]},
+            {"name": "golden-boot", "role": "golden", "state": "missing", "reason": "not presented",
+             "goldens": [{"process": "stormlb", "name": "boot"}]}]});
+        let g = parse_goldens(&v);
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].0, "log-shipper");
+        assert_eq!(g[0].1, Golden { name: "fluent".into(), volume_id: Some("vol-g1".into()), volume: "golden-fluent-1a2b".into(),
+            mounts: vec!["/goldens/fluent".into()], state: "attached".into() });
+        assert_eq!((g[1].0.as_str(), g[1].1.state.as_str(), g[1].1.mounts.len(), g[1].1.volume_id.clone()), ("stormlb", "missing", 0, None));
+    }
+
+    /// #378: with a process named after the service, the other long-running
+    /// processes are helpers and the main container stands for itself and
+    /// the one-shots; without one, nothing is split.
+    #[test]
+    fn helpers_are_split_from_the_service_process() {
+        let p = |name: &str, state: &str, ready: bool, one_shot: bool| Process {
+            name: name.into(), state: state.into(), ready, one_shot, ..Default::default()
+        };
+        let procs = vec![
+            p("stormcert-client-lb", "stopped", false, true),
+            p("stormlb", "running", true, false),
+            p("log-shipper", "running", false, false),
+        ];
+        let (main, helpers) = split("stormlb", &procs);
+        let main = main.unwrap();
+        assert_eq!((main.name.as_str(), main.ready), ("stormlb", true), "a helper's unreadiness is its own now");
+        assert_eq!(helpers.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["log-shipper"]);
+        // No process named after the service: one container, as before.
+        let (main, helpers) = split("kubelet", &procs);
+        assert!(helpers.is_empty());
+        assert!(!main.unwrap().ready, "every long-running process counts");
     }
 }

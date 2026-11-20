@@ -326,6 +326,30 @@ pub fn mirror_pod_with(
 /// conditions. The pod's phase stays `Running`, as upstream's does for a
 /// container restarting under `restartPolicy: Always`.
 pub fn with_stormd(pod: &mut Value, container: &str, p: &crate::stormd_api::Process, pid1_restarts: u32) {
+    let pod_name = pod["metadata"]["name"].as_str().unwrap_or("").to_string();
+    let ready = container_from_stormd(&mut pod["status"]["containerStatuses"][0], &pod_name, container, p, pid1_restarts);
+    let not_ready = |c: &mut Value| {
+        c["status"] = json!("False");
+        c["reason"] = json!("ContainersNotReady");
+        c["message"] = json!(match &p.reason {
+            Some(why) => format!("containers with unready status: [{container}]: {why}"),
+            None => format!("containers with unready status: [{container}]"),
+        });
+    };
+    for c in pod["status"]["conditions"].as_array_mut().into_iter().flatten() {
+        if c["type"] == "Ready" || c["type"] == "ContainersReady" {
+            if ready {
+                *c = json!({ "type": c["type"].clone(), "status": "True" });
+            } else {
+                not_ready(c);
+            }
+        }
+    }
+}
+
+/// One container status from one stormd process (see [`with_stormd`]);
+/// whether it is ready.
+fn container_from_stormd(cs: &mut Value, pod_name: &str, container: &str, p: &crate::stormd_api::Process, pid1_restarts: u32) -> bool {
     let terminated = |finished: Option<&str>| {
         let code = p.exit_code.unwrap_or(0);
         let mut t = json!({ "exitCode": code, "reason": if code == 0 { "Completed" } else { "Error" } });
@@ -344,14 +368,12 @@ pub fn with_stormd(pod: &mut Value, container: &str, p: &crate::stormd_api::Proc
         }
         "CrashLoopBackOff" => (
             json!({ "waiting": { "reason": "CrashLoopBackOff",
-                "message": format!("back-off restarting failed container {container} in pod {}",
-                    pod["metadata"]["name"].as_str().unwrap_or("")) } }),
+                "message": format!("back-off restarting failed container {container} in pod {pod_name}") } }),
             false,
         ),
         "stopped" | "failed" => (json!({ "terminated": terminated(p.stopped_at.as_deref()) }), false),
         _ => (json!({ "waiting": { "reason": "ContainerCreating" } }), false),
     };
-    let cs = &mut pod["status"]["containerStatuses"][0];
     cs["state"] = state;
     cs["ready"] = json!(ready);
     cs["started"] = json!(matches!(p.state.as_str(), "running" | "stopping"));
@@ -361,20 +383,114 @@ pub fn with_stormd(pod: &mut Value, container: &str, p: &crate::stormd_api::Proc
             cs["lastState"] = json!({ "terminated": terminated(p.stopped_at.as_deref()) });
         }
     }
-    let not_ready = |c: &mut Value| {
-        c["status"] = json!("False");
-        c["reason"] = json!("ContainersNotReady");
-        c["message"] = json!(match &p.reason {
-            Some(why) => format!("containers with unready status: [{container}]: {why}"),
-            None => format!("containers with unready status: [{container}]"),
-        });
-    };
+    ready
+}
+
+/// The marker on a mirror pod's golden volumes (#378), so a pass replaces
+/// the ones the last pass declared.
+pub const GOLDEN_VOLUME_ATTR: &str = "storm.io/golden-of";
+
+/// A volume name for helper `process`'s golden `name`: a DNS label.
+fn golden_volume_name(process: &str, name: &str) -> String {
+    let mut n: String = format!("golden-{process}-{name}")
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .collect();
+    n.truncate(63);
+    n.trim_end_matches('-').to_string()
+}
+
+/// The helper processes' containers (#378, stormd#75): after the service's
+/// own (`[0]`), one per helper, in stormd's order. Each has the service's
+/// image, the `volumeMounts` of the goldens stormd presents to it (declared
+/// as read-only inline volumes of the built-in driver with their engine id;
+/// a golden not presented has no mount), its own `containerStatuses` entry
+/// from its process as [`with_stormd`] maps one, and
+/// `storm.io/instance.<helper>`: the service's root clone, which every
+/// process runs on. The pod is Ready when every container is. Helpers and
+/// golden volumes an earlier pass declared are replaced.
+pub fn with_helpers(pod: &mut Value, asset: &str, helpers: &[crate::stormd_api::Process], pid1_restarts: u32) {
+    let pod_name = pod["metadata"]["name"].as_str().unwrap_or("").to_string();
+    let image = pod["spec"]["containers"][0]["image"].clone();
+    // One golden for every process of the service.
+    let image_id = pod["status"]["containerStatuses"][0]["imageID"].clone();
+    let root = pod["metadata"]["annotations"][format!("storm.io/instance.{asset}")].clone();
+    if let Some(cs) = pod["spec"]["containers"].as_array_mut() {
+        cs.truncate(1);
+    }
+    if let Some(st) = pod["status"]["containerStatuses"].as_array_mut() {
+        st.truncate(1);
+    }
+    if let Some(vs) = pod["spec"]["volumes"].as_array_mut() {
+        vs.retain(|v| v["csi"]["volumeAttributes"][GOLDEN_VOLUME_ATTR].is_null());
+    }
+    let mut unready: Vec<String> = Vec::new();
+    if pod["status"]["containerStatuses"][0]["ready"] != true {
+        unready.push(asset.to_string());
+    }
+    for h in helpers {
+        let mut mounts = Vec::new();
+        for g in &h.goldens {
+            let vname = golden_volume_name(&h.name, &g.name);
+            for at in &g.mounts {
+                mounts.push(json!({ "name": vname, "mountPath": at, "readOnly": true }));
+            }
+            if g.mounts.is_empty() {
+                continue;
+            }
+            let mut attrs = json!({ GOLDEN_VOLUME_ATTR: h.name, "golden": g.volume });
+            if let Some(id) = &g.volume_id {
+                attrs["volume_id"] = json!(id);
+            }
+            let vol = json!({ "name": vname, "csi": { "driver": "stormblock.storm.io", "readOnly": true, "volumeAttributes": attrs } });
+            match pod["spec"]["volumes"].as_array_mut() {
+                Some(vs) => vs.push(vol),
+                None => pod["spec"]["volumes"] = json!([vol]),
+            }
+        }
+        let mut c = json!({ "name": h.name, "image": image });
+        if !mounts.is_empty() {
+            c["volumeMounts"] = json!(mounts);
+        }
+        if let Some(cs) = pod["spec"]["containers"].as_array_mut() {
+            cs.push(c);
+        }
+        let mut status = json!({ "name": h.name, "image": image });
+        if !image_id.is_null() {
+            status["imageID"] = image_id.clone();
+        }
+        let ready = container_from_stormd(&mut status, &pod_name, &h.name, h, pid1_restarts);
+        if !ready {
+            unready.push(h.name.clone());
+        }
+        if let Some(st) = pod["status"]["containerStatuses"].as_array_mut() {
+            st.push(status);
+        }
+        // An annotation key's name part is at most 63 characters.
+        let key = format!("storm.io/instance.{}", h.name);
+        if !root.is_null() && format!("instance.{}", h.name).len() <= 63 {
+            pod["metadata"]["annotations"][key] = root.clone();
+        }
+    }
+    if helpers.is_empty() {
+        return;
+    }
+    let ready = unready.is_empty();
     for c in pod["status"]["conditions"].as_array_mut().into_iter().flatten() {
         if c["type"] == "Ready" || c["type"] == "ContainersReady" {
             if ready {
                 *c = json!({ "type": c["type"].clone(), "status": "True" });
             } else {
-                not_ready(c);
+                // The service's own reason (its one-shots, its probe), if it
+                // gave one, stays after the list.
+                let why = c["message"].as_str().and_then(|m| m.split_once("]: ")).map(|(_, w)| w.to_string());
+                c["status"] = json!("False");
+                c["reason"] = json!("ContainersNotReady");
+                c["message"] = json!(match why {
+                    Some(w) if unready.iter().any(|u| u == asset) => format!("containers with unready status: [{}]: {w}", unready.join(" ")),
+                    _ => format!("containers with unready status: [{}]", unready.join(" ")),
+                });
             }
         }
     }
@@ -443,20 +559,26 @@ pub fn status_current(existing: &Value, want: &Value) -> bool {
         c.sort();
         c
     };
-    let (ec, wc) = (&e["containerStatuses"][0], &w["containerStatuses"][0]);
     let start_same = match (&e["startTime"], &w["startTime"]) {
         (Value::Null, Value::Null) => true,
         (a, b) => seconds_apart(a, b).is_some_and(|d| d <= 5),
     };
+    // Every container (#378: a helper's too), by position.
+    let statuses = |s: &Value| s["containerStatuses"].as_array().map_or(0, Vec::len);
+    let same = |ec: &Value, wc: &Value| {
+        ec["name"] == wc["name"]
+            && ec["ready"] == wc["ready"]
+            && ec["restartCount"] == wc["restartCount"]
+            && state_kind(ec) == state_kind(wc)
+            && ec["state"]["waiting"]["reason"] == wc["state"]["waiting"]["reason"]
+            && ec["lastState"] == wc["lastState"]
+            && ec["state"]["terminated"]["message"] == wc["state"]["terminated"]["message"]
+            && ec["imageID"] == wc["imageID"]
+    };
     e["phase"] == w["phase"]
         && conditions(e) == conditions(w)
-        && ec["ready"] == wc["ready"]
-        && ec["restartCount"] == wc["restartCount"]
-        && state_kind(ec) == state_kind(wc)
-        && ec["state"]["waiting"]["reason"] == wc["state"]["waiting"]["reason"]
-        && ec["lastState"] == wc["lastState"]
-        && ec["state"]["terminated"]["message"] == wc["state"]["terminated"]["message"]
-        && ec["imageID"] == wc["imageID"]
+        && statuses(e) == statuses(w)
+        && (0..statuses(w).max(1)).all(|i| same(&e["containerStatuses"][i], &w["containerStatuses"][i]))
         && e["hostIP"] == w["hostIP"]
         && start_same
 }
@@ -566,7 +688,18 @@ pub fn with_volumes(pod: &mut Value, sv: &ServiceVolumes) {
         pod["metadata"]["annotations"][k] = v.clone();
     }
     if !sv.volumes.is_empty() {
-        pod["spec"]["volumes"] = json!(sv.volumes);
+        // The helpers' golden volumes (#378) are stormd's to declare, not the
+        // engine listing's: kept, so their containers' mounts still resolve.
+        let goldens: Vec<Value> = pod["spec"]["volumes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|v| !v["csi"]["volumeAttributes"][GOLDEN_VOLUME_ATTR].is_null())
+            .cloned()
+            .collect();
+        let mut all = sv.volumes.clone();
+        all.extend(goldens);
+        pod["spec"]["volumes"] = json!(all);
     }
     if !sv.mounts.is_empty() {
         pod["spec"]["containers"][0]["volumeMounts"] = json!(sv.mounts);
@@ -578,8 +711,16 @@ pub fn with_volumes(pod: &mut Value, sv: &ServiceVolumes) {
 pub fn volumes_current(existing: &Value, want: &Value) -> bool {
     let none = Value::Array(vec![]);
     let or_none = |v: &Value| if v.is_null() { none.clone() } else { v.clone() };
-    or_none(&existing["spec"]["volumes"]) == or_none(&want["spec"]["volumes"])
-        && or_none(&existing["spec"]["containers"][0]["volumeMounts"]) == or_none(&want["spec"]["containers"][0]["volumeMounts"])
+    // Each container's name and mounts (#378: the helpers' too).
+    let containers = |p: &Value| -> Vec<(Value, Value)> {
+        p["spec"]["containers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|c| (c["name"].clone(), or_none(&c["volumeMounts"])))
+            .collect()
+    };
+    or_none(&existing["spec"]["volumes"]) == or_none(&want["spec"]["volumes"]) && containers(existing) == containers(want)
 }
 
 /// The golden a mirror pod's service runs from (#130).
@@ -1186,4 +1327,68 @@ mod tests {
         assert_eq!(gone, [("kube-system", "stormblock-n1")]);
     }
 
+    /// #378: a service with a helper process: the helper is a container of
+    /// its own, with its golden's mount (an inline read-only volume of the
+    /// built-in driver), its own status, and the service's root as its
+    /// instance; the pod is Ready only when every container is. Applying it
+    /// again replaces, never adds; the engine's volumes keep the goldens.
+    #[test]
+    fn a_helper_process_is_a_container_with_its_own_golden_and_status() {
+        use crate::stormd_api::{Golden, Process};
+        let a = Asset { name: "stormlb".into(), running: true, restarts: 1, age_secs: 5, ..Default::default() };
+        let mut pod = mirror_pod(&a, "n1", "u", "2026-11-20T10:00:00Z");
+        pod["status"]["containerStatuses"][0]["imageID"] = json!("sha256:abc");
+        let plain = pod.clone();
+        let items = vec![json!({"id": "vol-root", "name": "stormlb", "mounted_at": "/run/stormpump/sys/stormlb"})];
+        with_volumes(&mut pod, &service_volumes(&items, "stormlb", "n1"));
+        let running = |name: &str, ready: bool| Process {
+            name: name.into(), state: "running".into(), ready, started_at: Some("2026-11-20T10:00:01Z".into()), ..Default::default()
+        };
+        with_stormd(&mut pod, "stormlb", &running("stormlb", true), a.restarts);
+        let mut shipper = running("log-shipper", true);
+        shipper.goldens = vec![Golden {
+            name: "fluent".into(), volume_id: Some("vol-g1".into()), volume: "golden-fluent-1a2b".into(),
+            mounts: vec!["/goldens/fluent".into()], state: "attached".into(),
+        }];
+        let cert = Process { name: "cert-client".into(), state: "CrashLoopBackOff".into(), restarts: 4, ..Default::default() };
+        with_helpers(&mut pod, "stormlb", &[shipper.clone(), cert.clone()], a.restarts);
+
+        let names: Vec<&str> = pod["spec"]["containers"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["stormlb", "log-shipper", "cert-client"]);
+        assert_eq!(pod["spec"]["containers"][1]["volumeMounts"],
+            json!([{"name": "golden-log-shipper-fluent", "mountPath": "/goldens/fluent", "readOnly": true}]));
+        assert!(pod["spec"]["containers"][2].get("volumeMounts").is_none(), "no golden, no mounts");
+        let vols = pod["spec"]["volumes"].as_array().unwrap();
+        assert_eq!(vols[0]["name"], "root", "the engine's volumes first");
+        let g = vols.iter().find(|v| v["name"] == "golden-log-shipper-fluent").expect("its golden's volume");
+        assert_eq!(g["csi"]["driver"], "stormblock.storm.io");
+        assert_eq!((g["csi"]["readOnly"].as_bool(), g["csi"]["volumeAttributes"]["volume_id"].as_str()), (Some(true), Some("vol-g1")));
+        let st = pod["status"]["containerStatuses"].as_array().unwrap();
+        assert_eq!(st.len(), 3);
+        assert_eq!((st[1]["name"].as_str(), st[1]["ready"].as_bool(), st[1]["imageID"].as_str()), (Some("log-shipper"), Some(true), Some("sha256:abc")));
+        assert_eq!(st[2]["state"]["waiting"]["reason"], "CrashLoopBackOff");
+        assert_eq!(st[2]["restartCount"], 5, "its own restarts and PID 1's");
+        let ready = pod["status"]["conditions"].as_array().unwrap().iter().find(|c| c["type"] == "Ready").unwrap().clone();
+        assert_eq!((ready["status"].as_str(), ready["message"].as_str()), (Some("False"), Some("containers with unready status: [cert-client]")));
+        let ann = &pod["metadata"]["annotations"];
+        assert_eq!((ann["storm.io/instance.log-shipper"].as_str(), ann["storm.io/instance.cert-client"].as_str()), (Some("vol-root"), Some("vol-root")));
+
+        // A write is due against the pod without them, and not again after it.
+        assert!(!volumes_current(&plain, &pod));
+        assert!(!status_current(&plain, &pod));
+        assert!(volumes_current(&pod, &pod) && status_current(&pod, &pod));
+        // Again: the same, not more.
+        let mut again = pod.clone();
+        with_helpers(&mut again, "stormlb", &[shipper.clone(), cert.clone()], a.restarts);
+        assert_eq!(again, pod);
+        // The engine's volumes again (stormd silent this pass): the golden stays.
+        with_volumes(&mut again, &service_volumes(&items, "stormlb", "n1"));
+        assert!(again["spec"]["volumes"].as_array().unwrap().iter().any(|v| v["name"] == "golden-log-shipper-fluent"));
+        // A helper that comes good is news; the pod is then Ready.
+        let mut healed = pod.clone();
+        with_helpers(&mut healed, "stormlb", &[shipper, Process { state: "running".into(), ready: true, ..cert }], a.restarts);
+        assert!(!status_current(&pod, &healed));
+        let ready = healed["status"]["conditions"].as_array().unwrap().iter().find(|c| c["type"] == "Ready").unwrap().clone();
+        assert_eq!(ready, json!({"type": "Ready", "status": "True"}));
+    }
 }

@@ -2,6 +2,7 @@
 
 ## 2026-11-20
 
+- **feat:** A node service's mirror pod has one container per stormd helper process (#378, stormd#75). With a process named after the service, every other long-running process (a log shipper, a renewing cert client) is a container after it. Each has its own status, `storm.io/instance.<process>`, and `volumeMounts` for the goldens stormd presents to it (read from stormd's `GET /api/v1/volumes`; inline read-only volumes of the built-in driver). The pod is Ready when every container is. Services without a process of their own name keep one container.
 - **docs:** Real-time nodes carry no `stormpump.io/realtime:NoSchedule` taint (#430, option A, decided 2026-11-20): the isolated cores are guarded by the `stormpump.io/isolated-cores` resource and the engine. A taint would stop a single-node cluster from scheduling its own pods.
 - **feat:** Real-time pods on stormpump (#430, stormpump#252), and `runtimeClassName` honoured (#204).
   - `runtimeClassName` resolves to its RuntimeClass's handler; a missing one is a wait. The CRI path passes the handler on, and a runtime that does not serve it refuses the pod instead of running it unconfined.
