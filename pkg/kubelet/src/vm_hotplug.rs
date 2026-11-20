@@ -190,6 +190,9 @@ pub trait Hotplug: Send + Sync {
     async fn unpause(&self) -> Result<(), String> {
         Err("this machine cannot be unpaused here".into())
     }
+    /// Whether the guest's vCPUs are stopped, as the machine reports it
+    /// (#449: a disk move is done only once its guest runs).
+    async fn paused(&self) -> Result<bool, String>;
     /// Put the disk on device `from` onto device `to`, which holds the same
     /// bytes (#302, stormvm#29). The old device is free once this returns.
     async fn switch_disk(&self, _from: &str, _to: &str, _discard: bool) -> Result<(), String> {
@@ -240,6 +243,9 @@ impl Hotplug for stormvm_control::Machine {
     }
     async fn unpause(&self) -> Result<(), String> {
         stormvm_control::Machine::unpause(self).await.map_err(|e| e.to_string())
+    }
+    async fn paused(&self) -> Result<bool, String> {
+        stormvm_control::Machine::status(self).await.map(|s| s.paused).map_err(|e| e.to_string())
     }
     async fn switch_disk(&self, from: &str, to: &str, discard: bool) -> Result<(), String> {
         let sw = stormvm_control::hotplug::DiskSwitch { from: from.into(), to: to.into(), discard };

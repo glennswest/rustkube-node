@@ -1173,6 +1173,9 @@ pub struct VmManager {
     /// Each VMI's disk-move record as this kubelet last wrote it (#302), by
     /// uid: the watch's copy can still be the one before.
     disk_moves: std::sync::Mutex<HashMap<String, std::collections::BTreeMap<String, crate::vm_disk_move::Move>>>,
+    /// VMIs whose disk-move record here is not on the VMI yet (#449,
+    /// 0eccd916ccf5): the patch failed, and the next pass writes it again.
+    disk_moves_unwritten: std::sync::Mutex<std::collections::HashSet<String>>,
     /// A stopped VirtualMachine's disks this kubelet is moving (#339), by
     /// the VM's uid: its own entries as last done, kept until written.
     stopped_moves: std::sync::Mutex<HashMap<String, std::collections::BTreeMap<String, crate::vm_disk_move::Move>>>,
@@ -1204,6 +1207,39 @@ struct Resume {
     restore: String,
     volume_id: String,
     since: std::time::Instant,
+}
+
+/// What a resuming machine's state says to do (#251, #449).
+#[derive(Debug, PartialEq, Eq)]
+enum ResumeStep {
+    /// It runs: the resume is done.
+    Resumed,
+    /// Not yet (loading, its control socket not up, or an unpause refused):
+    /// asked again; a refused unpause is said.
+    Wait(Option<String>),
+    /// Past [`RESUME_WAIT`]: a cold boot, for this reason.
+    GiveUp(String),
+}
+
+/// `state` is the machine's own word (or why it could not be read);
+/// `unpaused` the answer to an unpause, when it was paused and asked.
+///
+/// **A refused unpause is not a cold boot** (#449, ec3bbd2a528a): a control
+/// socket that did not answer once is not a guest that cannot run. It is
+/// asked again until the deadline, like a guest still loading.
+fn resume_step(state: Result<&str, &str>, unpaused: Option<Result<(), String>>, elapsed: std::time::Duration) -> ResumeStep {
+    match (state, &unpaused) {
+        (Ok("running"), _) | (_, Some(Ok(()))) => return ResumeStep::Resumed,
+        _ => {}
+    }
+    let refused = unpaused.and_then(Result::err);
+    if elapsed <= RESUME_WAIT {
+        return ResumeStep::Wait(refused);
+    }
+    ResumeStep::GiveUp(match refused {
+        Some(e) => format!("the state loaded, but the guest would not run within {}s: {e}", RESUME_WAIT.as_secs()),
+        None => format!("the guest did not run within {}s of starting from its state ({state:?})", RESUME_WAIT.as_secs()),
+    })
 }
 
 /// How long a guest has to load its saved memory and run (#251): a guest
@@ -1380,6 +1416,86 @@ pub fn status_volumes(obj: &Value, disks: &[ResolvedDisk]) -> Option<Value> {
     Some(v)
 }
 
+/// What a VMI's resume annotation names (#251), as far as it can be
+/// checked from the VMI itself (#449, 5dba1ccb44f2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResumeTarget {
+    namespace: String,
+    restore: String,
+    /// The VirtualMachine that owns the VMI, and its uid.
+    vm: String,
+    vm_uid: String,
+    /// The state volume: the name the restore gives it, nothing else.
+    volume: String,
+}
+
+/// The annotation's restore and volume, checked against the VMI: the
+/// restore is in the VMI's namespace, the VMI is a VirtualMachine's, and
+/// the volume is the one a restore of that VM by that restore is named
+/// ([`crate::vm_restore::state_name`]).
+fn resume_target(vmi: &Value, want: &Value) -> Result<ResumeTarget, String> {
+    let ns = vmi["metadata"]["namespace"].as_str().unwrap_or("default");
+    let restore = want["restore"].as_str().unwrap_or("");
+    let Some((rns, rname)) = restore.split_once('/') else {
+        return Err(format!("its restore {restore:?} is not <namespace>/<name>"));
+    };
+    if rns != ns || rname.is_empty() || rname.contains('/') {
+        return Err(format!("its restore {restore} is not one of namespace {ns}"));
+    }
+    let owner = vmi["metadata"]["ownerReferences"]
+        .as_array()
+        .and_then(|o| o.iter().find(|o| o["kind"] == "VirtualMachine"))
+        .ok_or("the VMI is not a VirtualMachine's")?;
+    let vm = owner["name"].as_str().unwrap_or("");
+    let vm_uid = owner["uid"].as_str().unwrap_or("");
+    if vm.is_empty() || vm_uid.is_empty() {
+        return Err("the VMI's VirtualMachine owner names no VM or uid".into());
+    }
+    let volume = want["volume"].as_str().unwrap_or("");
+    let expected = crate::vm_restore::state_name(ns, vm, rname);
+    if volume != expected {
+        return Err(format!("its state volume {volume:?} is not {expected}, the one restore {rname} of {vm} makes"));
+    }
+    Ok(ResumeTarget { namespace: ns.into(), restore: rname.into(), vm: vm.into(), vm_uid: vm_uid.into(), volume: expected })
+}
+
+/// The restore is the one the annotation says: it restores this VM, and its
+/// memory is still waiting to be resumed.
+fn restore_names(restore: &Value, t: &ResumeTarget) -> Result<(), String> {
+    let req = stormvm_spec::snapshot::restore_request(restore).map_err(|e| format!("VirtualMachineRestore {}: {e}", t.restore))?;
+    if req.vm != t.vm {
+        return Err(format!("VirtualMachineRestore {} restores {}, not {}", t.restore, req.vm, t.vm));
+    }
+    match restore["status"][crate::vm_restore::MEMORY_STATUS].as_str() {
+        Some("pending") => Ok(()),
+        other => Err(format!("VirtualMachineRestore {} has no memory waiting to be resumed ({other:?})", t.restore)),
+    }
+}
+
+/// The state volume is the VM's own, as the restore made it: owned by that
+/// VirtualMachine (kind, namespace, name and uid), or unowned only when the
+/// VM keeps its disks ([`RETAIN_ANNOTATION`], which a restore leaves unowned).
+fn state_owned(record: &Value, vm: &Value, t: &ResumeTarget) -> Result<(), String> {
+    if vm["metadata"]["uid"].as_str() != Some(t.vm_uid.as_str()) {
+        return Err(format!("VirtualMachine {} is not the one that owns this VMI (another of the same name)", t.vm));
+    }
+    let owner = &record["owner"];
+    if owner.is_null() || owner.as_object().is_some_and(|o| o.is_empty()) {
+        if vm["metadata"]["annotations"][RETAIN_ANNOTATION].as_str() == Some("true") {
+            return Ok(());
+        }
+        return Err(format!("its state volume {} has no owner", t.volume));
+    }
+    let ours = owner["kind"] == "VirtualMachine"
+        && owner["namespace"].as_str() == Some(t.namespace.as_str())
+        && owner["name"].as_str() == Some(t.vm.as_str())
+        && owner["uid"].as_str() == Some(t.vm_uid.as_str());
+    if !ours {
+        return Err(format!("its state volume {} is not VirtualMachine {}'s: owner {owner}", t.volume, t.vm));
+    }
+    Ok(())
+}
+
 fn owner_vm(obj: &Value) -> Option<&str> {
     obj["metadata"]["ownerReferences"]
         .as_array()?
@@ -1517,6 +1633,7 @@ impl VmManager {
             disks_done: Default::default(),
             moved_disks: Default::default(),
             disk_moves: Default::default(),
+            disk_moves_unwritten: Default::default(),
             stopped_moves: Default::default(),
         }
     }
@@ -3889,20 +4006,55 @@ impl VmManager {
         if let Some(vm) = owner_vm(obj) {
             self.consume_resume(&ns, vm).await;
         }
+        // **Verified before anything is attached, deleted or told** (#449,
+        // 5dba1ccb44f2): the annotation is anyone's to write who can write a
+        // VMI, and the kubelet acts on it with the engine's own credentials.
         let want: Value = serde_json::from_str(text).unwrap_or(Value::Null);
-        let restore = want["restore"].as_str().unwrap_or("").to_string();
-        let volume = want["volume"].as_str().unwrap_or("").to_string();
-        let told = restore.clone();
+        let target = match resume_target(obj, &want) {
+            Ok(t) => t,
+            Err(why) => {
+                warn!(%uid, "not resumed, the resume named is refused: {why}");
+                return None;
+            }
+        };
+        let restore_path =
+            format!("/apis/snapshot.kubevirt.io/v1beta1/namespaces/{}/virtualmachinerestores/{}", target.namespace, target.restore);
+        let refused = |why: String| {
+            warn!(%uid, "not resumed, the resume named is refused: {why}");
+            None
+        };
+        match self.api_lookup(&restore_path).await {
+            Ok(Some(r)) => {
+                if let Err(why) = restore_names(&r, &target) {
+                    return refused(why);
+                }
+            }
+            Ok(None) => return refused(format!("VirtualMachineRestore {}/{} does not exist", target.namespace, target.restore)),
+            Err(e) => return refused(format!("VirtualMachineRestore {}/{} could not be read: {e}", target.namespace, target.restore)),
+        }
+        // The restore is real and this VM's: from here on it is told.
+        let told = format!("{}/{}", target.namespace, target.restore);
+        let volume = target.volume.clone();
         let cold = |why: String| async move {
             warn!(%uid, "not resumed from the saved state: {why}");
             self.report_resume(&told, Err(why)).await;
             None
         };
-        let id = match self.volume_named(&volume).await {
-            Ok(Some(v)) => v["id"].as_str().unwrap_or(&volume).to_string(),
+        let vm_path = format!("/apis/kubevirt.io/v1/namespaces/{}/virtualmachines/{}", target.namespace, target.vm);
+        let vm = match self.api_lookup(&vm_path).await {
+            Ok(Some(vm)) => vm,
+            Ok(None) => return cold(format!("VirtualMachine {} does not exist", target.vm)).await,
+            Err(e) => return cold(format!("VirtualMachine {} could not be read: {e}", target.vm)).await,
+        };
+        let record = match self.volume_named(&volume).await {
+            Ok(Some(v)) => v,
             Ok(None) => return cold(format!("its state volume {volume} is gone")).await,
             Err(e) => return cold(format!("its state volume {volume} could not be looked up: {e}")).await,
         };
+        if let Err(why) = state_owned(&record, &vm, &target) {
+            return cold(why).await;
+        }
+        let id = record["id"].as_str().unwrap_or(&volume).to_string();
         let attached = self
             .post(&format!("{}/api/v1/volumes/{id}/attach", self.storage), &json!({ "transport": "ublk" }))
             .await;
@@ -3915,7 +4067,23 @@ impl VmManager {
             }
         };
         info!(%uid, %volume, %device, "starting from the saved state");
-        Some((Resume { restore: restore.clone(), volume_id: id, since: std::time::Instant::now() }, device))
+        Some((Resume { restore: format!("{}/{}", target.namespace, target.restore), volume_id: id, since: std::time::Instant::now() }, device))
+    }
+
+    /// An object from the apiserver: `None` only on a 404, an error for
+    /// anything else that is not the object (#449).
+    async fn api_lookup(&self, path: &str) -> Result<Option<Value>, String> {
+        if self.api_url.is_empty() {
+            return Err("no apiserver".into());
+        }
+        let r = self.api.get(format!("{}{path}", self.api_url)).send_retrying(retry::Policy::API).await.map_err(|e| e.to_string())?;
+        if r.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !r.status().is_success() {
+            return Err(r.status().to_string());
+        }
+        r.json().await.map(Some).map_err(|e| format!("not an object: {e}"))
     }
 
     /// The resume taken off the VirtualMachine's template (#251): it is one
@@ -3948,26 +4116,37 @@ impl VmManager {
             self.due_in(uid, HOT_SETTLE);
             return;
         };
-        let state = machine.status().await.map(|s| s.state);
-        match state.as_deref() {
-            Ok("running") => self.finish_resume(uid, Ok(())).await,
-            Ok("paused") | Ok("postmigrate") => match machine.unpause().await {
-                Ok(()) => self.finish_resume(uid, Ok(())).await,
-                Err(e) => self.finish_resume(uid, Err(format!("the state loaded, but the guest would not run: {e}"))).await,
-            },
-            _ if since.elapsed() > RESUME_WAIT => {
-                let why = format!("the guest did not run within {}s of starting from its state ({state:?})", RESUME_WAIT.as_secs());
-                self.finish_resume(uid, Err(why)).await;
-                // Stopped like a deletion; the next pass starts it cold.
-                if self.stop(&vm).await {
-                    self.vms.lock().await.remove(uid);
-                    self.withdraw_identity(uid);
+        let state = machine.status().await.map(|s| s.state).map_err(|e| e.to_string());
+        let unpaused = match state.as_deref() {
+            Ok("paused") | Ok("postmigrate") => Some(machine.unpause().await.map_err(|e| e.to_string())),
+            _ => None,
+        };
+        match resume_step(state.as_deref(), unpaused, since.elapsed()) {
+            ResumeStep::Resumed => self.finish_resume(uid, Ok(())).await,
+            ResumeStep::Wait(said) => {
+                if let Some(e) = said {
+                    warn!(%uid, "the state loaded, but the guest would not run yet (tried again): {e}");
                 }
                 self.due_in(uid, HOT_SETTLE);
             }
-            // Loading (`inmigrate`), or the control socket not up yet.
-            _ => self.due_in(uid, HOT_SETTLE),
+            ResumeStep::GiveUp(why) => self.cold_restart(uid, &vm, why).await,
         }
+    }
+
+    /// A resume given up (#251, #449): the machine stopped first, like a
+    /// deletion; only once it is, the resume is finished (its state volume
+    /// let go, the restore told `cold-boot`) and the machine forgotten, so the
+    /// next pass starts it cold (a VMI's resume is tried once). A stop that
+    /// is refused keeps the resume, and it is tried again.
+    async fn cold_restart(&self, uid: &str, vm: &Vm, why: String) {
+        if !self.stop(vm).await {
+            warn!(%uid, "a resume given up ({why}), but the machine did not stop; tried again");
+            return self.due_in(uid, HOT_SETTLE);
+        }
+        self.vms.lock().await.remove(uid);
+        self.withdraw_identity(uid);
+        self.finish_resume(uid, Err(why)).await;
+        self.due_in(uid, HOT_SETTLE);
     }
 
     /// The outcome of a resume (#251): the state volume detached and deleted
@@ -6294,17 +6473,30 @@ impl VmManager {
         crate::vm_disk_move::records(object)
     }
 
-    /// Write the disk-move record onto the VMI (and keep it here).
+    /// Write the disk-move record onto the VMI, and keep it here.
+    ///
+    /// **Kept here whether or not the write went through** (#449,
+    /// 0eccd916ccf5): a record can name a migration just started, and losing
+    /// it would have the next pass start another (or fail on the one that
+    /// holds the source). This kubelet goes by what it keeps, and a record
+    /// not on the VMI yet is written again on the next pass. `false` when the
+    /// VMI does not have it.
     async fn write_disk_moves(
         &self,
         uid: &str,
         object: &Value,
         records: &std::collections::BTreeMap<String, crate::vm_disk_move::Move>,
     ) -> bool {
-        if !self.annotate(object, crate::vm_disk_move::record_patch(uid, records)).await {
-            let vmi = object["metadata"]["name"].as_str().unwrap_or("");
-            warn!(%vmi, "the disk-move record was not written; retried");
-            return false;
+        let written = self.annotate(object, crate::vm_disk_move::record_patch(uid, records)).await;
+        {
+            let mut unwritten = self.disk_moves_unwritten.lock().unwrap_or_else(|e| e.into_inner());
+            if written {
+                unwritten.remove(uid);
+            } else {
+                let vmi = object["metadata"]["name"].as_str().unwrap_or("");
+                warn!(%vmi, "the disk-move record was not written; kept here and written again on the next pass");
+                unwritten.insert(uid.to_string());
+            }
         }
         self.disk_moves.lock().unwrap_or_else(|e| e.into_inner()).insert(uid.to_string(), records.clone());
         let moved: std::collections::BTreeMap<String, String> = records
@@ -6318,7 +6510,7 @@ impl VmManager {
         } else {
             all.insert(uid.to_string(), moved);
         }
-        true
+        written
     }
 
     /// A deleted VMI's disk copies in flight (#302) aborted: the copy goes,
@@ -6364,8 +6556,13 @@ impl VmManager {
                     records.remove(&disk);
                 }
                 Step::Start(to) => {
-                    let r = self.start_disk_move(object, &vm, &disk, &to, rec.as_ref()).await;
-                    records.insert(disk, r);
+                    // `None`: not known whether a copy is already running;
+                    // nothing recorded, asked again on the next pass.
+                    if let Some(r) = self.start_disk_move(object, &vm, &disk, &to, rec.as_ref()).await {
+                        records.insert(disk, r);
+                    } else {
+                        self.due_in(uid, dm::POLL);
+                    }
                 }
                 Step::Cancel => {
                     let mut r = rec.expect("a record to cancel");
@@ -6388,8 +6585,11 @@ impl VmManager {
                 }
             }
         }
-        if records != before {
-            self.write_disk_moves(uid, object, &records).await;
+        let unwritten = self.disk_moves_unwritten.lock().unwrap_or_else(|e| e.into_inner()).contains(uid);
+        if records != before || unwritten {
+            if !self.write_disk_moves(uid, object, &records).await {
+                self.due_in(uid, dm::POLL);
+            }
         }
         if records.values().any(dm::Move::active) {
             self.due_in(uid, dm::POLL);
@@ -6397,7 +6597,8 @@ impl VmManager {
     }
 
     /// Start moving disk `disk` to node `to`: refused (saying why) or the
-    /// mirror started.
+    /// mirror started. `None` when stormstorage could not say whether a copy
+    /// of the disk is already running: nothing is started blind.
     async fn start_disk_move(
         &self,
         object: &Value,
@@ -6405,7 +6606,7 @@ impl VmManager {
         disk: &str,
         to: &str,
         prior: Option<&crate::vm_disk_move::Move>,
-    ) -> crate::vm_disk_move::Move {
+    ) -> Option<crate::vm_disk_move::Move> {
         use crate::vm_disk_move as dm;
         let d = vm.disks.iter().find(|d| d.name == disk);
         let volume = d.and_then(|d| d.volume_id.clone());
@@ -6420,7 +6621,7 @@ impl VmManager {
             r
         };
         if d.is_none() {
-            return fail(r, format!("the machine has no disk {disk}"));
+            return Some(fail(r, format!("the machine has no disk {disk}")));
         }
         let kind = stormvm_node::console::find(RUN_ROOT, &vm.namespace, &vm.name).map(|r| r.vmm).unwrap_or_default();
         let seed = stormvm_spec::kube::from_kube(object)
@@ -6431,12 +6632,45 @@ impl VmManager {
         let migrating = crate::vm_migration::State::of(object).is_some_and(|s| s.active());
         if let Some(why) = dm::refusal(disk, &kind, volume.as_deref(), owned, seed, migrating) {
             self.event_of(vm, "Warning", "DiskMoveRefused", &why).await;
-            return fail(r, why);
+            return Some(fail(r, why));
         }
         let Some(ss) = self.migration.stormstorage.as_ref() else {
-            return fail(r, "this node has no stormstorage (--stormstorage)".into());
+            return Some(fail(r, "this node has no stormstorage (--stormstorage)".into()));
         };
-        match crate::vm_migration::Stormstorage(ss).start(&node, &r.from, to).await {
+        let ss = crate::vm_migration::Stormstorage(ss);
+        // A copy already running (#449, 0eccd916ccf5): one this kubelet
+        // started and never recorded (its write failed, or it stopped in
+        // between). stormstorage holds one per source volume: to the same
+        // node it is carried, a failed one is aborted first, one elsewhere
+        // refuses the move.
+        match ss.live_for(&node, &r.from).await {
+            Ok(None) => {}
+            Ok(Some(m)) if m.state == "failed" => {
+                if let Err(e) = ss.step(&m.id, "abort").await {
+                    warn!(vm = %vm.name, %disk, "a failed copy {} of its source not aborted, retried: {e}", m.id);
+                    return None;
+                }
+            }
+            Ok(Some(m)) if m.target_node.is_empty() || m.target_node == to => {
+                info!(vm = %vm.name, %disk, "moving to {to}: migration {} was already running; carried", m.id);
+                r.migration = m.id;
+                r.state = dm::COPYING.into();
+                r.volume = m.target_id.unwrap_or_default();
+                r.bytes_total = m.bytes_total;
+                r.bytes_remaining = m.bytes_remaining;
+                return Some(r);
+            }
+            Ok(Some(m)) => {
+                let why = format!("migration {} of its source to {} is already running", m.id, m.target_node);
+                self.event_of(vm, "Warning", "DiskMoveRefused", &format!("disk {disk}: {why}")).await;
+                return Some(fail(r, why));
+            }
+            Err(e) => {
+                warn!(vm = %vm.name, %disk, "not moved yet: stormstorage's migrations could not be listed: {e}");
+                return None;
+            }
+        }
+        match ss.start(&node, &r.from, to).await {
             Ok(m) => {
                 info!(vm = %vm.name, %disk, "moving to {to}: migration {}", m.id);
                 self.event_of(vm, "Normal", "DiskMoving", &format!("disk {disk}: copying to {to}")).await;
@@ -6445,11 +6679,11 @@ impl VmManager {
                 r.volume = m.target_id.unwrap_or_default();
                 r.bytes_total = m.bytes_total;
                 r.bytes_remaining = m.bytes_remaining;
-                r
+                Some(r)
             }
             Err(e) => {
                 self.event_of(vm, "Warning", "DiskMoveFailed", &format!("disk {disk}: {e}")).await;
-                fail(r, e)
+                Some(fail(r, e))
             }
         }
     }
@@ -6475,7 +6709,10 @@ impl VmManager {
             && vm.disks.iter().any(|d| d.name == disk && d.volume_id.as_deref() == Some(r.volume.as_str()));
         if r.state == dm::SWITCHING {
             if on_copy {
+                // Stopped between the switch and the guest running again: it
+                // may still be paused (#449, e2198b663261).
                 r.state = dm::SWITCHED.into();
+                r.resume = true;
             } else {
                 // A kubelet that stopped half way: the cutover tells.
                 let machine = (self.hot_machine)(&*vm);
@@ -6505,12 +6742,19 @@ impl VmManager {
             }
         }
         if r.state == dm::SWITCHED {
+            if r.resume && !self.resume_after_switch(vm, disk, r).await {
+                return;
+            }
             self.retire_disk_source(vm, disk, r).await;
             return;
         }
         // Copying.
         if on_copy {
             r.state = dm::SWITCHED.into();
+            r.resume = true;
+            if !self.resume_after_switch(vm, disk, r).await {
+                return;
+            }
             self.retire_disk_source(vm, disk, r).await;
             return;
         }
@@ -6637,25 +6881,61 @@ impl VmManager {
             cur.owned_volumes = vm.owned_volumes.clone();
         });
         r.state = dm::SWITCHED.into();
-        let mut ran = Err(String::new());
+        r.resume = true;
         for _ in 0..3 {
-            ran = machine.unpause().await;
-            if ran.is_ok() {
+            if machine.unpause().await.is_ok() {
                 break;
             }
         }
         let paused_ms = began.elapsed().as_millis() as u64;
-        if let Err(e) = ran {
-            r.message = format!("on the copy, but the guest would not run again: {e}");
-            self.event_of(vm, "Warning", "DiskMoveUnpause", &format!("disk {disk}: {}", r.message)).await;
-        }
         info!(vm = %vm.name, %disk, %device, paused_ms, "disk on {}'s copy {}", r.to, r.volume);
         // Its owner as before (#75), where the engine relays it to the peer.
         let owner = self.owner_of(object).await;
         if !owner.is_null() {
             self.set_volume_owner(&r.volume, &owner).await;
         }
-        self.retire_disk_source(vm, disk, r).await;
+        // Done only once the guest runs (#449): else it stays switched, on
+        // record, and each pass tries to run it again.
+        if self.resume_after_switch(vm, disk, r).await {
+            self.retire_disk_source(vm, disk, r).await;
+        }
+    }
+
+    /// The guest of a disk switched onto its copy, running (#449,
+    /// e2198b663261): asked how it is, run if paused, asked again. `true`
+    /// once it runs (`resume` cleared); else why stays in `message`, said
+    /// once as an Event, and the move stays switched for the next pass.
+    async fn resume_after_switch(&self, vm: &Vm, disk: &str, r: &mut crate::vm_disk_move::Move) -> bool {
+        let ran = match (self.hot_machine)(vm) {
+            None => Err("its control socket is not there".to_string()),
+            Some(m) => match m.paused().await {
+                Ok(false) => Ok(()),
+                Ok(true) => match m.unpause().await {
+                    Ok(()) => match m.paused().await {
+                        Ok(false) => Ok(()),
+                        Ok(true) => Err("still paused after it was asked to run".to_string()),
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            },
+        };
+        match ran {
+            Ok(()) => {
+                r.resume = false;
+                r.message.clear();
+                true
+            }
+            Err(e) => {
+                let why = format!("on the copy, but the guest would not run again: {e}; tried again");
+                if r.message != why {
+                    self.event_of(vm, "Warning", "DiskMoveUnpause", &format!("disk {disk}: {why}")).await;
+                    r.message = why;
+                }
+                false
+            }
+        }
     }
 
     /// A switch given up before the disk moved: the guest runs again on the
@@ -8483,6 +8763,9 @@ mod tests {
     struct FakeHot {
         calls: std::sync::Mutex<Vec<String>>,
         refuse: std::sync::Mutex<Vec<&'static str>>,
+        /// Its vCPUs stopped (#449): `pause` sets it, an `unpause` not
+        /// refused clears it. Asking is not a call.
+        paused: std::sync::Mutex<bool>,
     }
 
     #[async_trait::async_trait]
@@ -8535,11 +8818,19 @@ mod tests {
         }
         async fn pause(&self) -> Result<(), String> {
             self.calls.lock().unwrap().push("pause".into());
+            *self.paused.lock().unwrap() = true;
             Ok(())
         }
         async fn unpause(&self) -> Result<(), String> {
             self.calls.lock().unwrap().push("unpause".into());
+            if self.refuse.lock().unwrap().contains(&"unpause") {
+                return Err("qmp: the control socket closed".into());
+            }
+            *self.paused.lock().unwrap() = false;
             Ok(())
+        }
+        async fn paused(&self) -> Result<bool, String> {
+            Ok(*self.paused.lock().unwrap())
         }
         async fn switch_disk(&self, from: &str, to: &str, discard: bool) -> Result<(), String> {
             self.calls.lock().unwrap().push(format!("switch {from} {to} {discard}"));
@@ -8639,23 +8930,55 @@ mod tests {
         assert_eq!(crate::vm_hotplug::load(dir.path(), "default", "vm-u-1").unwrap().vcpus, 4, "not given");
     }
 
+    /// A restore `name` of VirtualMachine `vm` in `default`, its memory
+    /// waiting (#251).
+    fn memory_restore(name: &str, vm: &str) -> Value {
+        json!({
+            "apiVersion": "snapshot.kubevirt.io/v1beta1", "kind": "VirtualMachineRestore",
+            "metadata": {"name": name, "namespace": "default"},
+            "spec": {"target": {"apiGroup": "kubevirt.io", "kind": "VirtualMachine", "name": vm},
+                     "virtualMachineSnapshotName": "s1"},
+            "status": {"complete": true, crate::vm_restore::MEMORY_STATUS: "pending"},
+        })
+    }
+
+    /// The VMI `uid` of VirtualMachine `web` (uid `vm-uid`), naming `restore`
+    /// and `volume` to resume from.
+    fn resuming_vmi(uid: &str, restore: &str, volume: &str) -> Value {
+        let mut obj = vmi("n1");
+        obj["metadata"]["uid"] = json!(uid);
+        obj["metadata"]["ownerReferences"] = json!([{"kind": "VirtualMachine", "name": "web", "uid": "vm-uid"}]);
+        obj["metadata"]["annotations"] = json!({
+            crate::vm_restore::RESUME_ANNOTATION: json!({"volume": volume, "restore": restore}).to_string(),
+        });
+        obj
+    }
+
+    fn web_owned(id: &str, name: &str, uid: &str) -> Value {
+        json!({"id": id, "name": name, "owner": {"kind": "VirtualMachine", "namespace": "default", "name": "web", "uid": uid}})
+    }
+
     /// #251: a VMI naming a restore's saved state resumes from it once: the
     /// state volume is found and attached for `-incoming`; a second start of
     /// the same VMI is cold; the outcome gives the volume back (detached and
     /// deleted). A state volume that is gone is a cold boot.
     #[tokio::test]
     async fn a_resume_is_prepared_once_and_its_state_volume_given_back() {
-        let state = json!({"id": "vol-s", "name": "web.web-1-state-restore-r1"});
-        let e = disk_engine(vec![state], vec![]).await;
-        let m = disk_manager(&e, "");
-        let mut obj = vmi("n1");
-        obj["metadata"]["annotations"] = json!({
-            crate::vm_restore::RESUME_ANNOTATION:
-                json!({"volume": "web.web-1-state-restore-r1", "restore": "web/r1"}).to_string(),
-        });
+        let e = disk_engine(
+            vec![web_owned("vol-s", "default.web-state-restore-r1", "vm-uid")],
+            vec![
+                ("/apis/snapshot.kubevirt.io/v1beta1/namespaces/default/virtualmachinerestores/r1", 200, memory_restore("r1", "web")),
+                ("/apis/snapshot.kubevirt.io/v1beta1/namespaces/default/virtualmachinerestores/r2", 200, memory_restore("r2", "web")),
+                ("/apis/kubevirt.io/v1/namespaces/default/virtualmachines/web", 200,
+                 json!({"metadata": {"name": "web", "namespace": "default", "uid": "vm-uid"}})),
+            ],
+        )
+        .await;
+        let m = disk_manager(&e, &e.url);
+        let obj = resuming_vmi("u-1", "default/r1", "default.web-state-restore-r1");
         let (r, device) = m.prepare_resume("u-1", &obj).await.expect("resumed from its state");
         assert_eq!(device, "/dev/ublk-vol-s");
-        assert_eq!((r.volume_id.as_str(), r.restore.as_str()), ("vol-s", "web/r1"));
+        assert_eq!((r.volume_id.as_str(), r.restore.as_str()), ("vol-s", "default/r1"));
         assert!(m.prepare_resume("u-1", &obj).await.is_none(), "a second start of this VMI is cold");
 
         m.resuming.lock().unwrap().insert("u-1".into(), r);
@@ -8664,11 +8987,82 @@ mod tests {
         assert!(m.resuming.lock().unwrap().is_empty());
 
         // Another VMI, its state volume gone: cold.
-        obj["metadata"]["annotations"][crate::vm_restore::RESUME_ANNOTATION] =
-            json!(json!({"volume": "gone", "restore": "web/r2"}).to_string());
-        assert!(m.prepare_resume("u-2", &obj).await.is_none());
+        assert!(m.prepare_resume("u-2", &resuming_vmi("u-2", "default/r2", "default.web-state-restore-r2")).await.is_none());
         // And one naming none starts as ever.
         assert!(m.prepare_resume("u-3", &vmi("n1")).await.is_none());
+    }
+
+    /// #449 (5dba1ccb44f2): a resume annotation is checked before anything
+    /// is attached or deleted: another workload's volume, a restore of
+    /// another namespace or VM, one that does not exist or cannot be read, a
+    /// state volume another VM owns, and a VMI of no VirtualMachine are all
+    /// refused, and the volume each named is left as it was.
+    #[tokio::test]
+    async fn a_resume_naming_what_is_not_its_own_is_refused_and_nothing_deleted() {
+        let e = disk_engine(
+            vec![
+                json!({"id": "vol-db", "name": "default.db-root", "owner": {"kind": "VirtualMachine", "namespace": "default", "name": "db", "uid": "db-uid"}}),
+                web_owned("vol-s3", "default.web-state-restore-r3", "old-uid"),
+                web_owned("vol-s1", "default.web-state-restore-r1", "vm-uid"),
+            ],
+            vec![
+                ("/apis/snapshot.kubevirt.io/v1beta1/namespaces/default/virtualmachinerestores/r1", 200, memory_restore("r1", "web")),
+                ("/apis/snapshot.kubevirt.io/v1beta1/namespaces/default/virtualmachinerestores/r3", 200, memory_restore("r3", "web")),
+                ("/apis/snapshot.kubevirt.io/v1beta1/namespaces/default/virtualmachinerestores/other", 200, memory_restore("other", "db")),
+                ("/apis/snapshot.kubevirt.io/v1beta1/namespaces/default/virtualmachinerestores/broken", 500, json!({})),
+                ("/apis/kubevirt.io/v1/namespaces/default/virtualmachines/web", 200,
+                 json!({"metadata": {"name": "web", "namespace": "default", "uid": "vm-uid"}})),
+            ],
+        )
+        .await;
+        let m = disk_manager(&e, &e.url);
+        let cases = [
+            ("another workload's volume", resuming_vmi("u-a", "default/r1", "default.db-root")),
+            ("another namespace's restore", resuming_vmi("u-b", "kube-system/r1", "kube-system.web-state-restore-r1")),
+            ("a restore of another VM", resuming_vmi("u-c", "default/other", "default.web-state-restore-other")),
+            ("a restore that does not exist", resuming_vmi("u-d", "default/r9", "default.web-state-restore-r9")),
+            ("a restore that cannot be read", resuming_vmi("u-e", "default/broken", "default.web-state-restore-broken")),
+            ("a state volume another VM of the name owns", resuming_vmi("u-f", "default/r3", "default.web-state-restore-r3")),
+        ];
+        for (what, obj) in cases {
+            let uid = obj["metadata"]["uid"].as_str().unwrap().to_string();
+            assert!(m.prepare_resume(&uid, &obj).await.is_none(), "{what}: refused");
+        }
+        let mut orphan = resuming_vmi("u-g", "default/r1", "default.web-state-restore-r1");
+        orphan["metadata"]["ownerReferences"] = json!([]);
+        assert!(m.prepare_resume("u-g", &orphan).await.is_none(), "a VMI of no VirtualMachine: refused");
+        assert!(e.deleted.lock().unwrap().is_empty(), "nothing deleted: {:?}", e.deleted.lock().unwrap());
+        assert_eq!(e.vols.lock().unwrap().len(), 3, "every volume as it was");
+    }
+
+    /// #449: the checks on their own: the annotation against the VMI, the
+    /// restore against the target, the state volume's owner against the VM.
+    #[test]
+    fn a_resume_target_is_the_restores_own_state_of_this_vm() {
+        let obj = resuming_vmi("u-1", "default/r1", "default.web-state-restore-r1");
+        let want: Value = serde_json::from_str(obj["metadata"]["annotations"][crate::vm_restore::RESUME_ANNOTATION].as_str().unwrap()).unwrap();
+        let t = resume_target(&obj, &want).unwrap();
+        assert_eq!((t.vm.as_str(), t.vm_uid.as_str(), t.restore.as_str()), ("web", "vm-uid", "r1"));
+        for (restore, volume) in [("r1", "default.web-state-restore-r1"), ("default/r1/x", "x"), ("default/", "default.web-state-restore-")] {
+            let w = json!({"restore": restore, "volume": volume});
+            assert!(resume_target(&obj, &w).is_err(), "{restore} {volume}");
+        }
+
+        assert!(restore_names(&memory_restore("r1", "web"), &t).is_ok());
+        assert!(restore_names(&memory_restore("r1", "db"), &t).unwrap_err().contains("restores db"));
+        let mut done = memory_restore("r1", "web");
+        done["status"][crate::vm_restore::MEMORY_STATUS] = json!("resumed");
+        assert!(restore_names(&done, &t).unwrap_err().contains("no memory waiting"));
+
+        let vm = json!({"metadata": {"name": "web", "uid": "vm-uid"}});
+        assert!(state_owned(&web_owned("v", "n", "vm-uid"), &vm, &t).is_ok());
+        assert!(state_owned(&web_owned("v", "n", "old"), &vm, &t).is_err());
+        assert!(state_owned(&json!({"id": "v"}), &vm, &t).unwrap_err().contains("no owner"));
+        let mut keeps = vm.clone();
+        keeps["metadata"]["annotations"] = json!({RETAIN_ANNOTATION: "true"});
+        assert!(state_owned(&json!({"id": "v"}), &keeps, &t).is_ok(), "a VM that keeps its disks: unowned is its");
+        let other = json!({"metadata": {"name": "web", "uid": "new-uid"}});
+        assert!(state_owned(&web_owned("v", "n", "vm-uid"), &other, &t).unwrap_err().contains("another of the same name"));
     }
 
     /// #247: a disk added to a running VMI is made and attached as at start,
@@ -8883,6 +9277,11 @@ mod tests {
         volumes: Vec<Value>,
         /// The engine: `<id> <owner uid>` per owner PUT (#339).
         owners: Vec<String>,
+        /// stormstorage: every migration started, `(id, node, volume, to)`,
+        /// for its listing (#449).
+        started: Vec<(String, String, String, String)>,
+        /// The VMI's metadata PATCH answers 500 (#449).
+        fail_vmi_patch: bool,
     }
 
     /// RFC 7386, for the fake apiserver.
@@ -8915,8 +9314,13 @@ mod tests {
             .route(
                 "/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{name}",
                 axum::routing::patch(|State(s): State<S>, Path((_, n)): Path<(String, String)>, axum::Json(b): axum::Json<Value>| async move {
-                    s.lock().unwrap().patches.push((n, b));
-                    axum::Json(json!({}))
+                    use axum::response::IntoResponse as _;
+                    let mut s = s.lock().unwrap();
+                    if s.fail_vmi_patch {
+                        return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                    s.patches.push((n, b));
+                    axum::Json(json!({})).into_response()
                 })
                 .get(|State(s): State<S>| async move {
                     use axum::response::IntoResponse as _;
@@ -8973,9 +9377,23 @@ mod tests {
                 axum::routing::post(|State(s): State<S>, Path((node, vol)): Path<(String, String)>, axum::Json(b): axum::Json<Value>| async move {
                     let mut s = s.lock().unwrap();
                     let id = format!("vm-{vol}");
-                    s.asked.push(format!("start {node}/{vol}→{}", b["to"].as_str().unwrap_or("")));
+                    let to = b["to"].as_str().unwrap_or("").to_string();
+                    s.asked.push(format!("start {node}/{vol}→{to}"));
                     s.disks.insert(id.clone(), "copying".into());
+                    s.started.push((id.clone(), node, vol, to));
                     axum::Json(json!({"id": id, "state": "starting"}))
+                }),
+            )
+            .route(
+                "/api/v1/migrations",
+                axum::routing::get(|State(s): State<S>| async move {
+                    let s = s.lock().unwrap();
+                    let all: Vec<Value> = s.started.iter().map(|(id, node, vol, to)| json!({
+                        "id": id, "source_node": node, "source_volume_id": vol,
+                        "state": s.disks.get(id).cloned().unwrap_or_default(),
+                        "target": {"id": format!("t-{id}"), "node": to},
+                    })).collect();
+                    axum::Json(json!({"migrations": all}))
                 }),
             )
             .route(
@@ -9512,6 +9930,145 @@ mod tests {
         m.move_disks("u1", &obj).await;
         assert_eq!(*fake.calls.lock().unwrap(), ["unpause"]);
         assert_eq!(move_records(&seen).last().unwrap()["root"]["state"], "copying");
+    }
+
+    /// #449 (0eccd916ccf5): the migration just started is kept when its
+    /// record cannot be written: the next pass carries it (no second start)
+    /// and writes the record; one stormstorage already runs for the source is
+    /// carried, not started again.
+    #[tokio::test]
+    async fn a_started_copy_is_kept_when_its_record_is_not_written() {
+        let (m, seen, _fake, _dir) = move_node().await;
+        let obj = move_asked(json!({"root": "b"}));
+        seen.lock().unwrap().fail_vmi_patch = true;
+        m.move_disks("u1", &obj).await;
+        assert_eq!(seen.lock().unwrap().asked, ["start a/v-root→b"]);
+        assert!(move_records(&seen).is_empty(), "nothing on the VMI yet");
+        assert_eq!(m.disk_move_records("u1", &obj)["root"].migration, "vm-v-root", "kept here");
+        assert!(m.take_due("u1").is_some(), "asked again soon");
+
+        // The next pass: no second start, the record written.
+        seen.lock().unwrap().fail_vmi_patch = false;
+        m.move_disks("u1", &obj).await;
+        assert_eq!(seen.lock().unwrap().asked, ["start a/v-root→b"], "not started again");
+        let r = move_records(&seen).last().unwrap().clone();
+        assert_eq!((r["root"]["state"].as_str(), r["root"]["migration"].as_str()), (Some("copying"), Some("vm-v-root")));
+
+        // A kubelet that lost even its own record (a restart): stormstorage's
+        // live migration of the source is carried.
+        let (m2, seen2, _f, _d) = move_node().await;
+        {
+            let mut s = seen2.lock().unwrap();
+            s.started.push(("vm-v-root".into(), "a".into(), "v-root".into(), "b".into()));
+            s.disks.insert("vm-v-root".into(), "copying".into());
+        }
+        m2.move_disks("u1", &obj).await;
+        assert!(seen2.lock().unwrap().asked.is_empty(), "nothing started: {:?}", seen2.lock().unwrap().asked);
+        let r = move_records(&seen2).last().unwrap().clone();
+        assert_eq!((r["root"]["state"].as_str(), r["root"]["migration"].as_str()), (Some("copying"), Some("vm-v-root")));
+        // One to another node refuses the move, naming it.
+        let (m3, seen3, _f, _d) = move_node().await;
+        seen3.lock().unwrap().started.push(("vm-v-root".into(), "a".into(), "v-root".into(), "c".into()));
+        seen3.lock().unwrap().disks.insert("vm-v-root".into(), "copying".into());
+        m3.move_disks("u1", &obj).await;
+        assert!(seen3.lock().unwrap().asked.is_empty());
+        let r = move_records(&seen3).last().unwrap().clone();
+        assert_eq!(r["root"]["state"], "failed");
+        assert!(r["root"]["message"].as_str().unwrap().contains("to c is already running"), "{r}");
+    }
+
+    /// #449 (e2198b663261): a guest that would not run after its disk went
+    /// onto the copy keeps the move switched, its source not retired; each
+    /// pass tries again, and only once the guest runs is the move done. A
+    /// kubelet that stopped between the switch and the unpause finds the
+    /// guest paused and runs it before it finishes.
+    #[tokio::test]
+    async fn a_move_is_done_only_once_its_guest_runs() {
+        let (m, seen, fake, _dir) = move_node().await;
+        let obj = move_asked(json!({"root": "b"}));
+        m.move_disks("u1", &obj).await;
+        seen.lock().unwrap().disks.insert("vm-v-root".into(), "synced".into());
+        fake.refuse.lock().unwrap().push("unpause");
+        m.move_disks("u1", &obj).await;
+        let r = move_records(&seen).last().unwrap().clone();
+        assert_eq!(r["root"]["state"], "switched");
+        assert_eq!(r["root"]["resume"], true);
+        assert!(r["root"]["message"].as_str().unwrap().contains("would not run again"), "{r}");
+        assert!(!seen.lock().unwrap().asked.iter().any(|a| a.starts_with("complete")), "the source not retired");
+        assert_eq!(seen.lock().unwrap().attaches, ["attach t-vm-v-root"], "the source not let go");
+        assert!(m.take_due("u1").is_some(), "tried again");
+
+        // Still refused: still switched, nothing retired.
+        m.move_disks("u1", &obj).await;
+        assert_eq!(move_records(&seen).last().unwrap()["root"]["state"], "switched");
+        // It runs: then done.
+        fake.refuse.lock().unwrap().clear();
+        m.move_disks("u1", &obj).await;
+        let r = move_records(&seen).last().unwrap().clone();
+        assert_eq!(r["root"]["state"], "moved");
+        assert!(r["root"].get("resume").is_none() && r["root"]["message"].is_null(), "{r}");
+        assert!(seen.lock().unwrap().asked.contains(&"complete vm-v-root".to_string()));
+
+        // Restart recovery: switching, the disk on the copy, the guest paused.
+        let (m, seen, fake, _dir) = move_node().await;
+        m.vms.lock().await.update("u1", |vm| vm.disks[0].volume_id = Some("t-vm-v-root".into()));
+        seen.lock().unwrap().disks.insert("vm-v-root".into(), "cut_over".into());
+        *fake.paused.lock().unwrap() = true;
+        let mut obj = move_asked(json!({"root": "b"}));
+        obj["metadata"]["annotations"][crate::vm_disk_move::RECORD] = json!(json!({"root": {
+            "to": "b", "node": "a", "from": "v-root", "migration": "vm-v-root", "state": "switching", "volume": "t-vm-v-root"}}).to_string());
+        m.move_disks("u1", &obj).await;
+        assert_eq!(*fake.calls.lock().unwrap(), ["unpause"], "the guest run first");
+        assert!(!*fake.paused.lock().unwrap());
+        assert_eq!(move_records(&seen).last().unwrap()["root"]["state"], "moved");
+    }
+
+    /// #449 (ec3bbd2a528a): an unpause refused while a guest resumes from
+    /// its state is asked again until the deadline, not a cold boot; past it,
+    /// a cold boot naming the refusal; a guest that runs is resumed.
+    #[test]
+    fn a_refused_unpause_is_tried_again_until_the_resume_deadline() {
+        use std::time::Duration;
+        let soon = Duration::from_secs(5);
+        let late = RESUME_WAIT + Duration::from_secs(1);
+        assert_eq!(resume_step(Ok("running"), None, late), ResumeStep::Resumed);
+        assert_eq!(resume_step(Ok("paused"), Some(Ok(())), soon), ResumeStep::Resumed);
+        assert_eq!(
+            resume_step(Ok("paused"), Some(Err("qmp: closed".into())), soon),
+            ResumeStep::Wait(Some("qmp: closed".into())),
+            "not a cold boot"
+        );
+        let ResumeStep::GiveUp(why) = resume_step(Ok("postmigrate"), Some(Err("qmp: closed".into())), late) else { panic!() };
+        assert!(why.contains("would not run") && why.contains("qmp: closed"), "{why}");
+        assert_eq!(resume_step(Ok("inmigrate"), None, soon), ResumeStep::Wait(None));
+        assert_eq!(resume_step(Err("no socket"), None, soon), ResumeStep::Wait(None));
+        assert!(matches!(resume_step(Ok("inmigrate"), None, late), ResumeStep::GiveUp(_)));
+    }
+
+    /// #449 (ec3bbd2a528a): a resume given up is finished only once its
+    /// machine is stopped; a stop that cannot be confirmed keeps it (the
+    /// machine, the resume and its state volume), tried again.
+    #[tokio::test]
+    async fn a_resume_given_up_keeps_its_state_until_the_machine_stops() {
+        let e = disk_engine(vec![json!({"id": "vol-s", "name": "default.web-state-restore-r1"})], vec![]).await;
+        let m = disk_manager(&e, "");
+        let resume = || Resume { restore: "default/r1".into(), volume_id: "vol-s".into(), since: std::time::Instant::now() };
+        // A machine whose exit cannot be confirmed (no engine handle): kept.
+        m.vms.lock().await.insert("u-1".into(), vm_at("u-1", &[], Phase::Running));
+        m.resuming.lock().unwrap().insert("u-1".into(), resume());
+        let vm = m.vms.lock().await["u-1"].clone();
+        m.cold_restart("u-1", &vm, "the guest would not run".into()).await;
+        assert!(m.resuming.lock().unwrap().contains_key("u-1"), "the resume kept");
+        assert!(m.vms.lock().await.get("u-1").is_some(), "the machine kept");
+        assert!(e.deleted.lock().unwrap().is_empty(), "its state volume kept");
+        // Stopped (it ended): finished, the state given back, forgotten.
+        m.vms.lock().await.insert("u-2".into(), vm_at("u-2", &[], Phase::Failed));
+        m.resuming.lock().unwrap().insert("u-2".into(), resume());
+        let vm = m.vms.lock().await["u-2"].clone();
+        m.cold_restart("u-2", &vm, "the guest would not run".into()).await;
+        assert!(!m.resuming.lock().unwrap().contains_key("u-2"));
+        assert!(m.vms.lock().await.get("u-2").is_none(), "started cold by the next pass");
+        assert_eq!(*e.deleted.lock().unwrap(), ["vol-s"]);
     }
 
     /// #302: a start attaches a moved disk's copy by its id, not a clone

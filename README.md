@@ -1195,11 +1195,19 @@ with `CAP_IPC_LOCK` effective. A pod that doesn't ask must see neither.
     `<ns>.<vm>-state-restore-<restore>`, named on the VirtualMachine's template
     (`storm.io/resume-state`), and the restore says `storm.io/memory: pending`.
     The VMI made from it starts with qemu's `-incoming file:<device>`: the
-    guest resumes where it was saved. The annotation is taken off the template
+    guest resumes where it was saved. Before anything is attached the kubelet
+    checks what the annotation names (#449): the restore is in the VMI's
+    namespace, restores the VMI's own VirtualMachine and still says `pending`;
+    the volume is exactly that restore's state name; and the engine's record
+    of it is owned by that VirtualMachine (same uid), or unowned only for a VM
+    that keeps its disks. Anything else is a cold boot, with nothing attached,
+    deleted, or written to any restore. The annotation is taken off the template
     at that start (a later VMI starts cold), and the VMI tries once. If qemu
     refuses the state (the VM's spec changed since the snapshot) or the guest
     does not run within 10 min, the machine is started again cold from the
-    restored disks. The restore then says `storm.io/memory: resumed` or
+    restored disks. An unpause that is refused is asked again within those
+    10 min (#449), and a machine given up on is stopped before the restore is
+    told `cold-boot`: if the stop is refused, the resume is kept and tried again. The restore then says `storm.io/memory: resumed` or
     `cold-boot` with why (`storm.io/memoryMessage`), with a `Resumed` or
     `ColdBoot` Event on the VMI. The state volume is deleted either way.
 - **A VM disk on another driver's claim** (#157): a `persistentVolumeClaim`
@@ -1345,16 +1353,25 @@ The kubelet running the machine:
 1. asks stormstorage to mirror the disk's volume to a new volume on that node
    (`POST /api/v1/nodes/{node}/volumes/{id}/migrate`, stormstorage#44) and
    writes its record, `storm.io/disk-moves` (per disk: `to`, `node`, `from`,
-   `migration`, `state`, `bytesTotal`, `bytesRemaining`, `volume`, `message`).
+   `migration`, `state`, `bytesTotal`, `bytesRemaining`, `volume`, `message`,
+   and `resume` while the guest is not known to run again).
    The record shows the progress, and a restarted kubelet resumes from it.
+   A record that could not be written is kept by the kubelet and written on the
+   next pass (#449). Before starting, the kubelet asks stormstorage for a copy of
+   the volume already running (`GET /api/v1/migrations`): one to the same node
+   is carried, a failed one is aborted first, and one to another node refuses
+   the move.
 2. Once the copy is `synced`, it pauses the guest, cuts the migration over,
    attaches the copy here through the node's stormblock (a peer's volume over
    NVMe/TCP, served as ublk, stormblock#328), puts the disk on the copy's
    device (stormvm's `switch_disk`: the guest's device, serial and slot don't
    change) and runs the guest again. The guest is paused for one attach and
    two QMP calls (`paused_ms` in the log).
-3. It detaches the old volume here and completes the migration, which retires
-   the old volume. The machine's registration and the record name the copy,
+3. Once the guest is seen running (its machine's status, not only the unpause's
+   answer, #449), it detaches the old volume here and completes the migration,
+   which retires the old volume. Until the guest runs the move stays `switched`
+   with `resume: true` and why in `message`, and every pass (and a restarted
+   kubelet) tries to run it again. The machine's registration and the record name the copy,
    so the next start of the VMI attaches it.
 
 The states are `copying` → `switching` → `switched` → `moved`.

@@ -90,6 +90,11 @@ pub struct Move {
     /// the VirtualMachine's, carried onto each VMI.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stopped: bool,
+    /// The disk is on the copy and the guest is not known to run yet (#449,
+    /// e2198b663261): paused for the switch, or a kubelet stopped in
+    /// between. The move is not done until the guest runs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resume: bool,
 }
 
 impl Move {
