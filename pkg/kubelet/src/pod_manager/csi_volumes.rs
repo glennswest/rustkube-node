@@ -98,11 +98,18 @@ impl PodManager {
             .as_str()
             .filter(|n| !n.is_empty())
             .unwrap_or(default_ns);
-        self.fetch_secret_decoded(ns, name).await.ok_or_else(|| {
-            ClaimError::Failed(format!(
-                "secret {ns}/{name} for the CSI driver cannot be read"
-            ))
-        })
+        // CSI carries secrets as a map of strings (protobuf `string`, UTF-8),
+        // so this is the one reader that converts a value to text.
+        match self.fetch_keyed(super::KeyedKind::Secret, ns, name).await {
+            Ok(Some(data)) => Ok(data
+                .into_iter()
+                .map(|(k, v)| (k, String::from_utf8_lossy(&v).into_owned()))
+                .collect()),
+            Ok(None) => Err(ClaimError::Failed(format!(
+                "secret {ns}/{name} for the CSI driver does not exist"
+            ))),
+            Err(e) => Err(ClaimError::Failed(format!("{e} (for the CSI driver)"))),
+        }
     }
 
     /// Mount a claim bound to an external driver's PV: wait for the attach,
