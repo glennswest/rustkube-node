@@ -892,11 +892,12 @@ impl PodManager {
     /// unit that mounts a volume at the asset's `/var/log/stormd` or an entry
     /// in PID 1's asset table. `None` for anything else.
     pub fn node_service(&self, namespace: &str, pod: &str, container: &str) -> Option<NodeService> {
-        if namespace != "kube-system" {
-            return None;
-        }
         let asset = pod.strip_suffix(&format!("-{}", self.node_name))?;
         if asset.is_empty() || asset != container {
+            return None;
+        }
+        // In its service's project (#418), as the mirror put it.
+        if namespace != crate::mirror_namespaces::current().of(asset) {
             return None;
         }
         let log_dir = crate::node_logs::log_dir(&self.host_root, asset);

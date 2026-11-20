@@ -677,6 +677,36 @@ pub fn stale_mirrors<'a>(pods: &'a Value, node: &str, assets: &[Asset]) -> Vec<&
         .collect()
 }
 
+/// This node's mirrors that are not in their asset's namespace any more
+/// (#418) and whose mirror there already exists: one pod per asset, the old
+/// one deleted only once the new one is in the API. A mirror whose new
+/// namespace has none yet (not created, the Namespace not there) is kept.
+pub fn displaced_mirrors<'a>(
+    pods: &'a Value,
+    node: &str,
+    namespaces: &crate::mirror_namespaces::Namespaces,
+) -> Vec<&'a Value> {
+    let Some(items) = pods["items"].as_array() else {
+        return Vec::new();
+    };
+    let ours = |p: &&Value| {
+        p["metadata"]["labels"]["storm.io/component"] == "node-service" && p["spec"]["nodeName"].as_str() == Some(node)
+    };
+    items
+        .iter()
+        .filter(ours)
+        .filter(|p| {
+            let asset = p["metadata"]["labels"]["storm.io/asset"].as_str().unwrap_or("");
+            let want = namespaces.of(asset);
+            !asset.is_empty()
+                && p["metadata"]["namespace"].as_str() != Some(want)
+                && items.iter().filter(ours).any(|q| {
+                    q["metadata"]["namespace"].as_str() == Some(want) && q["metadata"]["name"] == p["metadata"]["name"]
+                })
+        })
+        .collect()
+}
+
 /// `pod` with the status of an asset that is not running on this boot.
 ///
 /// Pending with the container waiting, not Failed: nothing ran and failed,
@@ -1131,4 +1161,29 @@ mod tests {
         // Nothing listed for it: nothing declared.
         assert_eq!(service_volumes(&items, "sshd", "n1"), ServiceVolumes::default());
     }
+    #[test]
+    fn a_mirror_left_in_another_namespace_goes_once_its_new_one_exists() {
+        let ns = crate::mirror_namespaces::Namespaces::from_pairs([("stormblock", "storm-block"), ("cadvisor", "storm-cadvisor")]);
+        let m = |name: &str, asset: &str, namespace: &str, node: &str| json!({
+            "metadata": {"name": name, "namespace": namespace,
+                         "labels": {"storm.io/component": "node-service", "storm.io/asset": asset}},
+            "spec": {"nodeName": node}});
+        let list = json!({"items": [
+            m("stormblock-n1", "stormblock", "kube-system", "n1"),
+            m("stormblock-n1", "stormblock", "storm-block", "n1"),
+            // Its new one is not there yet: kept.
+            m("cadvisor-n1", "cadvisor", "kube-system", "n1"),
+            // Not in the map: kube-system is its place.
+            m("sshd-n1", "sshd", "kube-system", "n1"),
+            // Another node's.
+            m("stormblock-n2", "stormblock", "kube-system", "n2"),
+            m("stormblock-n2", "stormblock", "storm-block", "n2"),
+        ]});
+        let gone: Vec<(&str, &str)> = displaced_mirrors(&list, "n1", &ns)
+            .iter()
+            .map(|p| (p["metadata"]["namespace"].as_str().unwrap(), p["metadata"]["name"].as_str().unwrap()))
+            .collect();
+        assert_eq!(gone, [("kube-system", "stormblock-n1")]);
+    }
+
 }

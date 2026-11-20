@@ -348,6 +348,8 @@ fn to_secs(t: &str) -> String {
 pub fn event_object(pod: &Value, container: &str, node: &str, e: &StormdEvent) -> Value {
     use sha2::{Digest, Sha256};
     let pod_name = pod["metadata"]["name"].as_str().unwrap_or("");
+    // The mirror's own namespace (#418): its service's project.
+    let namespace = pod["metadata"]["namespace"].as_str().unwrap_or(crate::mirror_namespaces::FALLBACK);
     let digest = Sha256::digest(format!("{}\0{}\0{}\0{}", e.process, e.reason, e.message, e.first).as_bytes());
     let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
     let last_micro = chrono::DateTime::parse_from_rfc3339(&e.last)
@@ -362,11 +364,11 @@ pub fn event_object(pod: &Value, container: &str, node: &str, e: &StormdEvent) -
     json!({
         "apiVersion": "v1",
         "kind": "Event",
-        "metadata": { "name": format!("{pod_name}.{hex}"), "namespace": "kube-system" },
+        "metadata": { "name": format!("{pod_name}.{hex}"), "namespace": namespace },
         "involvedObject": {
             "apiVersion": "v1",
             "kind": "Pod",
-            "namespace": "kube-system",
+            "namespace": namespace,
             "name": pod_name,
             "uid": pod["metadata"]["uid"],
             "fieldPath": format!("spec.containers{{{container}}}"),

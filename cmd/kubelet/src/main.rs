@@ -63,6 +63,13 @@ struct Cli {
     #[arg(long, default_value = "http://127.0.0.1:5100")]
     registry: String,
 
+    /// The map from a node service (PID 1 asset) to the namespace its mirror
+    /// pod and system claims live in (#418, stormcos#1020): a flat JSON
+    /// object, `{"stormblock": "storm-block", …}`. Read again when it changes;
+    /// absent, or an asset it does not name, is kube-system.
+    #[arg(long, env = "MIRROR_NAMESPACES", default_value = kubelet::mirror_namespaces::DEFAULT_PATH)]
+    mirror_namespaces: String,
+
     /// The CA file an https:// --registry is verified against, and nothing
     /// else is (#167), read at each new connection as --stormblock-ca is.
     /// Required with https://, unused with http://.
@@ -480,6 +487,7 @@ async fn main() -> anyhow::Result<()> {
     let engine_ca = engine_ca(&cli.stormblock, cli.stormblock_ca.as_deref())?;
     let engine = kubelet::engine::EngineClient::from_env_with_ca(&cli.stormblock, engine_ca.as_deref());
     let registry_ca = registry_ca(&cli.registry, cli.registry_ca.as_deref())?;
+    kubelet::mirror_namespaces::set_path(&cli.mirror_namespaces);
     tracing::info!("stormblock engine: {engine:?}");
     kubelet::startup::mark("engine");
 

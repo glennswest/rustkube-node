@@ -3,12 +3,16 @@
 //!
 //! 1. **Complete pairs.** Every claim the kubelet mirrors for `STORM_NODE`
 //!    (label `storm.io/system-volume`, annotation `storm.io/node`) is named
-//!    `<volume>-<node>` in `kube-system`, Bound to PV `storm-<volume>-<node>`,
-//!    and that PV's `claimRef` names it by namespace, name and uid. Both carry
+//!    `<volume>-<node>`, in its service's namespace (#418: any namespace,
+//!    listed cluster-wide), Bound to PV `storm-<volume>-<node>`, and that PV's
+//!    `claimRef` names it by namespace, name and uid. Both carry
 //!    the same `storm.io/volume-kind` and `storm.io/component`, and every such
 //!    PV of the node has its claim. There is at least one (every stormcos node
 //!    has `fastetcd-data`).
-//! 2. **Restored:** reported skip. Deleting a `kube-system` claim is not a
+//! 2. **Mirrors in one project** (`node-services-namespaces`, #418): each of
+//!    the node's services has one mirror pod, in one namespace, and every
+//!    claim its `spec.volumes` names is a claim in that namespace.
+//! 3. **Restored:** reported skip. Deleting a `kube-system` claim is not a
 //!    test's to do (the runner grants cluster reads only); the kubelet's
 //!    mirror unit test covers it.
 //!
@@ -24,6 +28,7 @@ use crate::env::Env;
 use crate::k8s;
 use crate::report::Outcome;
 
+/// Where a claim the map does not move lives (the tests' fixtures).
 pub const NAMESPACE: &str = "kube-system";
 const LABEL: &str = "storm.io/system-volume";
 
@@ -47,8 +52,8 @@ fn ours<'a>(objs: &'a [Value], node: &str, pv: bool) -> Vec<&'a Value> {
         .collect()
 }
 
-/// What is wrong with this node's pairs, or nothing. `pvcs` are
-/// `kube-system`'s claims, `pvs` the cluster's volumes.
+/// What is wrong with this node's pairs, or nothing. `pvcs` are the
+/// cluster's system claims (every namespace), `pvs` the cluster's volumes.
 pub fn problems(node: &str, pvcs: &[Value], pvs: &[Value]) -> Vec<String> {
     let claims = ours(pvcs, node, false);
     let volumes = ours(pvs, node, true);
@@ -71,8 +76,15 @@ pub fn problems(node: &str, pvcs: &[Value], pvs: &[Value]) -> Vec<String> {
             continue;
         };
         let r = &pv["spec"]["claimRef"];
-        if r["namespace"].as_str() != Some(NAMESPACE) || r["name"].as_str() != Some(name) {
-            wrong.push(format!("PV {pv_name} claimRef names {}/{}", s(r, "/namespace"), s(r, "/name")));
+        let ns = s(c, "/metadata/namespace");
+        if r["namespace"].as_str() != Some(ns) || r["name"].as_str() != Some(name) {
+            // A claim the kubelet is moving to its service's namespace (#418):
+            // the PV names the new one, and the old goes on the next pass.
+            if claims.iter().any(|o| s(o, "/metadata/name") == name && r["namespace"].as_str() == Some(s(o, "/metadata/namespace"))) {
+                continue;
+            }
+            wrong.push(format!("PV {pv_name} claimRef names {}/{}, not {ns}/{name}", s(r, "/namespace"), s(r, "/name")));
+            continue;
         }
         if r["uid"] != c["metadata"]["uid"] {
             wrong.push(format!("PV {pv_name} claimRef uid {} is not claim {name}'s {}", r["uid"], c["metadata"]["uid"]));
@@ -84,9 +96,9 @@ pub fn problems(node: &str, pvcs: &[Value], pvs: &[Value]) -> Vec<String> {
         }
     }
     for pv in &volumes {
-        let want = s(&pv["spec"]["claimRef"], "/name");
-        if !claims.iter().any(|c| s(c, "/metadata/name") == want) {
-            wrong.push(format!("PV {} has no claim {NAMESPACE}/{want}", s(pv, "/metadata/name")));
+        let (ns, want) = (s(&pv["spec"]["claimRef"], "/namespace"), s(&pv["spec"]["claimRef"], "/name"));
+        if !claims.iter().any(|c| s(c, "/metadata/name") == want && s(c, "/metadata/namespace") == ns) {
+            wrong.push(format!("PV {} has no claim {ns}/{want}", s(pv, "/metadata/name")));
         }
     }
     wrong
@@ -94,9 +106,9 @@ pub fn problems(node: &str, pvcs: &[Value], pvs: &[Value]) -> Vec<String> {
 
 async fn lists(api: &Api) -> Result<(Vec<Value>, Vec<Value>), String> {
     let pvcs = api
-        .list(&format!("/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims"))
+        .list(&format!("/api/v1/persistentvolumeclaims?labelSelector=storm.io%2Fsystem-volume%3Dtrue"))
         .await?
-        .ok_or("kube-system claims are not served")?;
+        .ok_or("claims are not served")?;
     let pvs = api.list(k8s::PVS).await?.ok_or("PVs are not served")?;
     Ok((pvcs, pvs))
 }
@@ -116,7 +128,62 @@ pub async fn pairs(env: &Env, api: &Api) -> Outcome {
     }
 }
 
-/// Check 2: a deleted claim is made again. **Not from a test container**: the
+/// What is wrong with this node's mirror pods (#418), or nothing: an asset
+/// mirrored in more than one namespace, or a mirror naming a claim that is not
+/// in its own namespace. `pods` are the cluster's node-service pods, `pvcs`
+/// the cluster's claims.
+pub fn mirror_problems(node: &str, pods: &[Value], pvcs: &[Value]) -> Vec<String> {
+    let mine: Vec<&Value> = pods.iter().filter(|p| s(p, "/spec/nodeName") == node).collect();
+    let mut wrong = Vec::new();
+    if mine.is_empty() {
+        wrong.push(format!("no node service of {node} has a mirror pod"));
+    }
+    for p in &mine {
+        let (ns, name, asset) = (s(p, "/metadata/namespace"), s(p, "/metadata/name"), label(p, "storm.io/asset"));
+        let elsewhere: Vec<&str> = mine
+            .iter()
+            .filter(|q| label(q, "storm.io/asset") == asset && s(q, "/metadata/namespace") != ns)
+            .map(|q| s(q, "/metadata/namespace"))
+            .collect();
+        if !elsewhere.is_empty() && ns < elsewhere[0] {
+            wrong.push(format!("{asset} is mirrored in {ns} and {}", elsewhere.join(", ")));
+        }
+        for v in p["spec"]["volumes"].as_array().into_iter().flatten() {
+            let Some(claim) = v["persistentVolumeClaim"]["claimName"].as_str() else { continue };
+            if !pvcs.iter().any(|c| s(c, "/metadata/name") == claim && s(c, "/metadata/namespace") == ns) {
+                wrong.push(format!("{ns}/{name} names claim {claim}, which is not in {ns}"));
+            }
+        }
+    }
+    wrong
+}
+
+/// Check 2: each node service is mirrored once, in one namespace, with its
+/// claims beside it (#418).
+pub async fn mirrors(env: &Env, api: &Api) -> Outcome {
+    let pods = match api.list("/api/v1/pods?labelSelector=storm.io%2Fcomponent%3Dnode-service").await {
+        Ok(Some(p)) => p,
+        Ok(None) => return Outcome::Infra("pods are not served".into()),
+        Err(e) => return Outcome::Infra(e),
+    };
+    let pvcs = match api.list("/api/v1/persistentvolumeclaims").await {
+        Ok(Some(p)) => p,
+        Ok(None) => return Outcome::Infra("claims are not served".into()),
+        Err(e) => return Outcome::Infra(e),
+    };
+    let wrong = mirror_problems(&env.node_name, &pods, &pvcs);
+    if !wrong.is_empty() {
+        return Outcome::Fail(wrong.join("; "));
+    }
+    let mut by_ns: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for p in pods.iter().filter(|p| s(p, "/spec/nodeName") == env.node_name) {
+        *by_ns.entry(s(p, "/metadata/namespace")).or_default() += 1;
+    }
+    let said: Vec<String> = by_ns.iter().map(|(ns, n)| format!("{ns} {n}")).collect();
+    Outcome::Pass(format!("each node service mirrored once, its claims beside it: {}", said.join(", ")))
+}
+
+/// Check 3: a deleted claim is made again. **Not from a test container**: the
 /// standard's runner grants a suite cluster-wide reads only (get, list,
 /// watch), and the claims are in `kube-system`, which a test never changes.
 /// The restore is covered by the kubelet's end-to-end mirror test against a
@@ -165,6 +232,36 @@ mod tests {
         let pvs = vec![v1, v2, v3, v4];
         assert_eq!(problems("n1", &pvcs, &pvs), Vec::<String>::new());
         assert_eq!(ours(&pvcs, "n1", false).len(), 2);
+    }
+
+    #[test]
+    fn a_pair_in_its_services_namespace_is_complete_and_a_move_in_flight_is_not_wrong() {
+        let (mut c, mut v) = pair("stormblock-data", "n1", "data");
+        c["metadata"]["namespace"] = json!("storm-block");
+        v["spec"]["claimRef"]["namespace"] = json!("storm-block");
+        // The old claim, still there for one pass.
+        let (old, _) = pair("stormblock-data", "n1", "data");
+        assert_eq!(problems("n1", &[c.clone(), old], &[v.clone()]), Vec::<String>::new());
+        v["spec"]["claimRef"]["namespace"] = json!("kube-system");
+        let p = problems("n1", &[c], &[v]).join("; ");
+        assert!(p.contains("not storm-block/stormblock-data-n1"), "{p}");
+    }
+
+    #[test]
+    fn a_mirror_in_two_namespaces_or_naming_a_claim_elsewhere_is_wrong() {
+        let pod = |ns: &str, asset: &str, claim: Option<&str>| json!({
+            "metadata": {"name": format!("{asset}-n1"), "namespace": ns, "labels": {"storm.io/asset": asset}},
+            "spec": {"nodeName": "n1", "volumes": claim.map(|c| json!([{"name": "data", "persistentVolumeClaim": {"claimName": c}}])).unwrap_or(json!([]))},
+        });
+        let claim = |ns: &str, name: &str| json!({"metadata": {"name": name, "namespace": ns}});
+        let pvcs = [claim("storm-block", "stormblock-data-n1")];
+        let good = [pod("storm-block", "stormblock", Some("stormblock-data-n1")), pod("kube-system", "sshd", None)];
+        assert_eq!(mirror_problems("n1", &good, &pvcs), Vec::<String>::new());
+        let twice = [pod("storm-block", "stormblock", None), pod("kube-system", "stormblock", None)];
+        assert!(mirror_problems("n1", &twice, &pvcs).join("").contains("mirrored in kube-system and storm-block"));
+        let elsewhere = [pod("kube-system", "stormblock", Some("stormblock-data-n1"))];
+        assert!(mirror_problems("n1", &elsewhere, &pvcs).join("").contains("not in kube-system"));
+        assert!(mirror_problems("n1", &[], &pvcs).join("").contains("no node service"));
     }
 
     #[test]

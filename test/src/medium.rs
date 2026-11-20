@@ -202,6 +202,9 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report, pod_cases: PodCases) {
     let o = crate::node_volumes::pairs(&env, &api).await;
     r.record("node-volumes-pairs", o, t.elapsed().as_millis(), None);
     let t = Instant::now();
+    let o = crate::node_volumes::mirrors(&env, &api).await;
+    r.record("node-services-namespaces", o, t.elapsed().as_millis(), None);
+    let t = Instant::now();
     let o = crate::node_volumes::restored(&env, &api, within(&env, Duration::from_secs(120))).await;
     r.record("node-volumes-restored", o, t.elapsed().as_millis(), None);
     record_pod_cases(pod_cases, r).await;

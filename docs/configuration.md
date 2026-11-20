@@ -23,6 +23,7 @@ An em dash means there is no environment binding or the value is unset.
 | `--runtime` | — | `native`; choices `native`, `cri`, `stormpump` (`vm` and `--vmm` retired, #13) |
 | `--registry` | — | `http://127.0.0.1:5100`; sbregistry (stormblock-registry), which mints image clones, with `--runtime stormpump`. The engine's token (as `--stormblock` finds it) goes as `Bearer` over `https://`, or in clear only to this host (#167) |
 | `--registry-ca` | `REGISTRY_CA_FILE` | none; the CA file an `https://` `--registry` is verified against, and nothing else is, read at each new connection as `--stormblock-ca` is (#167). Unused with `http://` |
+| `--mirror-namespaces` | `MIRROR_NAMESPACES` | `/etc/kubernetes/mirror-namespaces.json`; a flat JSON object from a node service (PID 1 asset) to the namespace its mirror pod and system claims live in, `{"stormblock": "storm-block", …}` (#418, stormcos#1020). Read again when it changes (its directory is watched). No file, an unparsable one, or an asset it does not name: `kube-system` |
 | `--stormblock` | `STORMBLOCK_URL` | `http://127.0.0.1:9090`; engine for claims, VM disks and images. `https://` needs `--stormblock-ca` (#312) |
 | `--stormblock-ca` | `STORMBLOCK_CA_FILE` | none; the CA file an `https://` `--stormblock` is verified against, and nothing else is. Unused with `http://` |
 | `--cri-socket` | `CRI_SOCKET` | CRI auto-detection, or `/run/stormpump.sock` for stormpump |

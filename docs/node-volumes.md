@@ -7,19 +7,27 @@ one as a Kubernetes claim: **a PV and its bound PVC** (#49, #59), on every node.
 
 | Object | Name | Notes |
 |---|---|---|
-| PVC | `kube-system/<volume>-<node>` | bound (`volumeName`), `dataSourceRef` = the golden, annotation `storm.io/volume: <volume>` |
+| PVC | `<namespace>/<volume>-<node>` | bound (`volumeName`), `dataSourceRef` = the golden, annotation `storm.io/volume: <volume>` |
 | PV | `storm-<volume>-<node>` | class `stormblock`, reclaim **Retain**, pinned to the node |
+
+The namespace is the component's in `--mirror-namespaces` (#418, stormcos#1020:
+`fastetcd-data` of component `fastetcd` goes where the map puts asset `fastetcd`),
+else `kube-system`: a service's claims are beside its mirror pod, whose
+`persistentVolumeClaim` names a claim in its own namespace. A claim of a service
+the map moves is made in the new namespace once that Namespace exists, the PV's
+`claimRef` follows it, and the claim left in the old namespace is deleted on the
+pass after the PV names the new one, so the PV is bound to one claim throughout.
 
 Names carry the node (owner, #107): every node has a `fastetcd-data`, and a PV
 or claim name exists once per cluster. A service volume is one node's (system
 services have no cross-node RAID), so `fastetcd-data-<node>` is its whole
 identity. To clone one into a pod's claim, name it in `dataSourceRef`
-(`namespace: kube-system`, `name: fastetcd-data-<node>`).
+(`namespace: <its namespace>`, `name: fastetcd-data-<node>`).
 
 Both carry the labels `storm.io/system-volume=true`, `storm.io/volume-kind`
 (`data`, `state` or `logs`) and `storm.io/component`:
 
-    kubectl get pvc -n kube-system -l storm.io/volume-kind=logs
+    kubectl get pvc -A -l storm.io/volume-kind=logs
     kubectl get pv -l storm.io/component=fastetcd
 
 The kind comes from the name's suffix. The engine's `role` is only the slab

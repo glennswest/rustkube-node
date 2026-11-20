@@ -812,8 +812,9 @@ impl Kubelet {
             };
             worker.run(async {
                 if !api.is_empty() {
+                    // Every namespace's: a service's claims are in its project (#418).
                     self.watches.observe(&self.api_client, format!(
-                        "{api}/api/v1/namespaces/{}/persistentvolumeclaims", crate::system_claims::NAMESPACE));
+                        "{api}/api/v1/persistentvolumeclaims?labelSelector=storm.io%2Fsystem-volume%3Dtrue"));
                     self.watches.observe(&self.api_client, format!("{api}/api/v1/persistentvolumes"));
                 }
                 crate::system_claims::mirror(&self.api_client, &api, &self.config.engine, &self.config.node_name).await;
@@ -2039,6 +2040,15 @@ impl Kubelet {
                 }
             });
         }
+        // The mirror namespaces map changed (#418): its directory watched, a
+        // pass reads it again and moves what it moved.
+        {
+            let worker = worker.clone();
+            let map = std::path::PathBuf::from(crate::mirror_namespaces::path());
+            if let Some(dir) = map.parent().map(std::path::Path::to_path_buf) {
+                tokio::spawn(crate::fs_watch::watch(dir, move || worker.enqueue()));
+            }
+        }
         // The engine's volumes changed: a mirror's declared volumes may have
         // (#372).
         {
@@ -2140,7 +2150,7 @@ impl Kubelet {
                 .run(async {
                     if !url.is_empty() {
                         self.watches.observe(&self.api_client, format!(
-                            "{url}/api/v1/namespaces/kube-system/pods?labelSelector=storm.io%2Fcomponent%3Dnode-service"));
+                            "{url}/api/v1/pods?labelSelector=storm.io%2Fcomponent%3Dnode-service"));
                     }
                     let health = self.service_health.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     let procs = stormd.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -2622,9 +2632,11 @@ async fn mirror_node_services(
     // The mirrors there are, read once: what exists is compared rather than
     // written blind (#101). Unreadable: nothing is written, and the pass is
     // retried on the reactor's backoff.
-    let list_url = format!(
-        "{api_url}/api/v1/namespaces/kube-system/pods?labelSelector=storm.io%2Fcomponent%3Dnode-service"
-    );
+    // Each service in its own project (#418, stormcos#1020): the map from
+    // asset to namespace, read again when it changes; the mirrors listed in
+    // every namespace, so one left behind in another is found.
+    let namespaces = crate::mirror_namespaces::current();
+    let list_url = format!("{api_url}/api/v1/pods?labelSelector=storm.io%2Fcomponent%3Dnode-service");
     let listed = match client.get(&list_url).send_retrying(retry::Policy::API).await {
         Ok(r) if r.status().is_success() => r.json::<Value>().await.ok(),
         _ => None,
@@ -2632,6 +2644,28 @@ async fn mirror_node_services(
     let Some(list) = listed else {
         apimachinery::reactor::failed();
         return;
+    };
+    // The Namespaces there are (they come from manifests.d, #418): a mirror is
+    // created only into one that exists, else it waits and the pass retries.
+    // Unread: every create is tried, and one into a missing namespace fails.
+    let present: Option<std::collections::HashSet<String>> =
+        match client.get(format!("{api_url}/api/v1/namespaces")).send_retrying(retry::Policy::API).await {
+            Ok(r) if r.status().is_success() => r.json::<Value>().await.ok().map(|l| {
+                l["items"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|n| n["metadata"]["name"].as_str().map(str::to_owned))
+                    .collect()
+            }),
+            _ => None,
+        };
+    // This node's mirror of `asset` in its namespace, as listed.
+    let mirror_of = |asset: &str| {
+        let (name, ns) = (crate::mirror::mirror_name(asset, node), namespaces.of(asset));
+        list["items"].as_array().into_iter().flatten().find(move |p| {
+            p["metadata"]["name"].as_str() == Some(name.as_str()) && p["metadata"]["namespace"].as_str() == Some(ns)
+        })
     };
 
     // What changed since the last pass, as events on the mirror pods (#50):
@@ -2651,20 +2685,16 @@ async fn mirror_node_services(
                     .format("%Y-%m-%dT%H:%M:%SZ")
                     .to_string();
                 let name = crate::mirror::mirror_name(&a.name, node);
-                let existing = list["items"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .find(|p| p["metadata"]["name"].as_str() == Some(name.as_str()));
+                let existing = mirror_of(&a.name);
                 if let Some(t) = crate::mirror::transition(last.get(&a.name).copied(), a, existing, &started) {
-                    changes.push((existing.cloned(), name, t));
+                    changes.push((existing.cloned(), name, namespaces.of(&a.name).to_string(), t));
                 }
                 last.insert(a.name.clone(), (a.running, a.restarts));
             }
         }
-        for (existing, name, (etype, reason, message)) in changes {
+        for (existing, name, namespace, (etype, reason, message)) in changes {
             let pod = existing.unwrap_or_else(|| serde_json::json!({
-                "metadata": { "name": name, "namespace": "kube-system", "uid": "" }
+                "metadata": { "name": name, "namespace": namespace, "uid": "" }
             }));
             if let Some(r) = &events {
                 r.pod_event(&pod, etype, reason, &message).await;
@@ -2673,9 +2703,10 @@ async fn mirror_node_services(
     }
     for pod in crate::mirror::stale_mirrors(&list, node, &assets) {
         let name = pod["metadata"]["name"].as_str().unwrap_or("");
+        let ns = pod["metadata"]["namespace"].as_str().unwrap_or(crate::mirror_namespaces::FALLBACK);
         let marked = crate::mirror::not_started(pod);
         let put = client
-            .put(format!("{api_url}/api/v1/namespaces/kube-system/pods/{name}/status"))
+            .put(format!("{api_url}/api/v1/namespaces/{ns}/pods/{name}/status"))
             .json(&marked)
             .send_retrying(retry::Policy::API)
             .await;
@@ -2719,18 +2750,16 @@ async fn mirror_node_services(
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
         let name = crate::mirror::mirror_name(&a.name, node);
-        let base = format!("{api_url}/api/v1/namespaces/kube-system/pods");
-        let existing = list["items"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|p| p["metadata"]["name"].as_str() == Some(name.as_str()));
+        let ns = namespaces.of(&a.name);
+        let base = format!("{api_url}/api/v1/namespaces/{ns}/pods");
+        let existing = mirror_of(&a.name);
 
         // The object is long-lived and only its status moves; a status that
         // already says it is not written (#101).
         match existing {
             Some(existing) => {
                 let mut pod = crate::mirror::mirror_pod_with(a, node, "", &started, health.get(&a.name));
+                pod["metadata"]["namespace"] = Value::String(ns.to_string());
                 crate::mirror::with_provenance(&mut pod, golden.as_ref(), host_ip);
                 let from_stormd = apply_stormd(&mut pod, a, stormd);
                 // The golden's annotations (#130) are metadata, which the
@@ -2800,6 +2829,13 @@ async fn mirror_node_services(
                 }
             }
             None => {
+                if present.as_ref().is_some_and(|p| !p.contains(ns)) {
+                    // Its project is not there yet (manifests.d makes it):
+                    // the old mirror, if any, stays until this one exists.
+                    debug!("mirror {name}: namespace {ns} does not exist yet; retried");
+                    apimachinery::reactor::failed();
+                    continue;
+                }
                 if node_uid.is_none() {
                     node_uid = match client.get(format!("{api_url}/api/v1/nodes/{node}")).send_retrying(retry::Policy::API).await {
                         Ok(r) if r.status().is_success() => r
@@ -2818,6 +2854,7 @@ async fn mirror_node_services(
                     return;
                 };
                 let mut pod = crate::mirror::mirror_pod_with(a, node, uid, &started, health.get(&a.name));
+                pod["metadata"]["namespace"] = Value::String(ns.to_string());
                 crate::mirror::with_provenance(&mut pod, golden.as_ref(), host_ip);
                 if let Some(sv) = &volumes {
                     crate::mirror::with_volumes(&mut pod, sv);
@@ -2828,6 +2865,20 @@ async fn mirror_node_services(
                     apimachinery::reactor::failed();
                 }
             }
+        }
+    }
+    // A mirror left in another namespace (kube-system, before #418) goes once
+    // its asset's mirror exists where the map puts it: one pod per asset. Its
+    // own uid as the precondition, so nothing made since under the name goes.
+    for old in crate::mirror::displaced_mirrors(&list, node, &namespaces) {
+        let (ns, name) = (old["metadata"]["namespace"].as_str().unwrap_or(""), old["metadata"]["name"].as_str().unwrap_or(""));
+        let body = serde_json::json!({"apiVersion": "v1", "kind": "DeleteOptions", "gracePeriodSeconds": 0,
+            "preconditions": {"uid": old["metadata"]["uid"]}});
+        match client.delete(format!("{api_url}/api/v1/namespaces/{ns}/pods/{name}")).json(&body).send_retrying(retry::Policy::API).await {
+            Ok(r) if r.status().is_success() || r.status() == 404 || r.status() == 409 => {
+                info!("mirror {ns}/{name}: deleted, its asset's mirror is in {}", namespaces.of(old["metadata"]["labels"]["storm.io/asset"].as_str().unwrap_or("")));
+            }
+            _ => apimachinery::reactor::failed(),
         }
     }
 }
@@ -2924,7 +2975,8 @@ async fn stormd_poll(
                 continue;
             }
             let name = crate::mirror::mirror_name(&a.name, &node);
-            let pod_url = format!("{api_url}/api/v1/namespaces/kube-system/pods/{name}");
+            let ns = crate::mirror_namespaces::current().of(&a.name).to_string();
+            let pod_url = format!("{api_url}/api/v1/namespaces/{ns}/pods/{name}");
             let pod = match api.get(&pod_url).send_retrying(retry::Policy::API).await {
                 Ok(r) if r.status().is_success() => r.json::<Value>().await.ok(),
                 _ => None,
@@ -2954,7 +3006,8 @@ async fn stormd_poll(
 
 /// Create an Event, or bring an existing one's count and times up to date.
 async fn write_event(api: &reqwest::Client, api_url: &str, obj: &Value) -> bool {
-    let base = format!("{api_url}/api/v1/namespaces/kube-system/events");
+    let ns = obj["metadata"]["namespace"].as_str().unwrap_or(crate::mirror_namespaces::FALLBACK);
+    let base = format!("{api_url}/api/v1/namespaces/{ns}/events");
     match api.post(&base).json(obj).send_repeatable(retry::Policy::API).await {
         Ok(r) if r.status().is_success() => true,
         Ok(r) if r.status() == reqwest::StatusCode::CONFLICT => {

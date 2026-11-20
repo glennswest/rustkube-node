@@ -119,7 +119,7 @@ From the code (`storage.rs`, `capacity.rs`, `system_claims.rs`, `csi*.rs`):
 - **Room is enforced:** a claim is charged its full class; the node publishes `CSIStorageCapacity`
   `kube-system/stormblock-<node>` and refuses a claim that does not fit; `SlabFilling` warnings (#62)
 - **Node volumes as objects:** every `*-data`/`*-state`/`*-logs` volume is a bound PV+PVC,
-  `kube-system/<volume>-<node>`, kept current by a reconciler (#59)
+  `<service namespace>/<volume>-<node>`, kept current by a reconciler (#59, #418)
 - **Third-party CSI drivers:** plugin registration, NodeStage/NodePublish/teardown and NodeExpandVolume
   over gRPC, mount propagation onto the engine (#81, #42; `docs/csi.md`)
 
@@ -147,13 +147,13 @@ KubeVirt `VirtualMachineInstance`s, run through stormvm and the ring (`vm_manage
 
 PID 1 runs the node's services (fastetcd, stormblock, the registry …) from its asset table. The kubelet:
 
-- mirrors each asset as a read-only Pod `kube-system/<asset>-<node>`: state, readiness, restarts and
+- mirrors each asset as a read-only Pod `<namespace>/<asset>-<node>`, in its service's project (#418): state, readiness, restarts and
   Events from the service's stormd API (#215), or Pending `NotStarted` when not started this boot
 - answers `kubectl logs` on it from the service's stormd log volume, or PID 1's last 20 lines of a dead
   incarnation (#72, #124)
 - mirrors their volumes as PV+PVC (previous slide)
 
-So `kubectl get pods -n kube-system` shows the whole node, not only what Kubernetes started.
+So `kubectl get pods -A -l storm.io/component=node-service` shows the whole node, not only what Kubernetes started.
 
 ---
 

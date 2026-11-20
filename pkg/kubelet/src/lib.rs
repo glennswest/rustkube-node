@@ -15,6 +15,7 @@ pub mod exec;
 pub mod events;
 pub mod metrics;
 pub mod mirror;
+pub mod mirror_namespaces;
 pub mod multus;
 pub mod network_status;
 pub mod node_health;
