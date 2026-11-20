@@ -4,6 +4,7 @@
 //! manages pod state machines, health probes, volumes, image pulls,
 //! and reports node status via Lease heartbeats.
 
+pub mod api_files;
 pub mod capacity;
 pub mod cgroups;
 pub mod claim_move;

@@ -566,6 +566,12 @@ secret and projected directories, the ServiceAccount token, resolv.conf and the
 container log directories): they are written before the sandbox, and a write the
 node refuses (a full disk, ENOSPC) leaves the pod waiting with the path and the
 errno, retried until there is room (#129).
+ConfigMap, Secret and projected volumes always mount read-only, whatever
+`volumeMounts.readOnly` says, as upstream does. Their files are written by
+replacing each one: a new file, created exclusively, is renamed over the key, so
+an existing entry is never opened or followed. A key's path must stay inside
+the volume (no `..`, no absolute path, no symlinked directory on the way)
+(#428).
 
 **A pod that cannot start says which container and why, as upstream does** (#133). An image that will not pull
 is a wait: the containers are `waiting: ErrImagePull`, then `ImagePullBackOff`, and the pull is asked again after a

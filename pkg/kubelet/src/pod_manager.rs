@@ -356,6 +356,11 @@ pub struct ResolvedVolume {
     pub path: String,
     pub fstype: Option<String>,
     pub block: bool,
+    /// A volume the kubelet writes from the API (configMap, secret,
+    /// projected): mounted read-only whatever `volumeMounts.readOnly` says,
+    /// as upstream does, so a container cannot plant a symlink where the
+    /// kubelet writes next (rustkube-node#428, finding 551d194231b5).
+    pub api: bool,
 }
 
 /// Where a node service's logs are (#72, #124): its stormd log volume, and
@@ -1489,7 +1494,7 @@ impl PodManager {
                 if let Some(ca) = &self.ca_pem {
                     let has_sat = sources.iter().any(|s| !s["serviceAccountToken"].is_null());
                     if has_sat {
-                        std::fs::write(format!("{dir}/ca.crt"), ca)
+                        crate::api_files::write_in(&dir, "ca.crt", ca, 0o644)
                             .map_err(|e| pod_dir_error(&name, &dir, e))?;
                     }
                 }
@@ -1527,6 +1532,7 @@ impl PodManager {
                                             path: dir,
                                             fstype: None,
                                             block: false,
+                                            api: false,
                                         },
                                     );
                                     continue;
@@ -1573,6 +1579,7 @@ impl PodManager {
                                 path: device,
                                 block: fstype.is_none(),
                                 fstype: fstype.map(String::from),
+                                api: false,
                             },
                         );
                         continue;
@@ -1619,6 +1626,7 @@ impl PodManager {
                                 path: dir,
                                 fstype: None,
                                 block: false,
+                                api: false,
                             },
                         );
                         continue;
@@ -1730,12 +1738,18 @@ impl PodManager {
                     }
                 }
             }
+            // What the kubelet writes from the API is never the container's
+            // to write: see `ResolvedVolume::api`.
+            let api = !vol["configMap"].is_null()
+                || !vol["secret"].is_null()
+                || vol["projected"]["sources"].is_array();
             map.insert(
                 name,
                 ResolvedVolume {
                     path: host_path,
                     fstype: None,
                     block: false,
+                    api,
                 },
             );
         }
@@ -3260,7 +3274,7 @@ impl PodManager {
                     let path = it["path"].as_str().unwrap_or("");
                     if let Some(fp) = it["fieldRef"]["fieldPath"].as_str() {
                         if let Some(val) = self.downward_field(pod, fp, None) {
-                            std::fs::write(format!("{dir}/{path}"), val)?;
+                            crate::api_files::write_in(dir, path, val.as_bytes(), 0o644)?;
                         }
                     }
                 }
@@ -3325,7 +3339,7 @@ impl PodManager {
         else {
             return Ok(false);
         };
-        write_atomic(&format!("{dir}/{path}"), token.as_bytes())?;
+        crate::api_files::write_in(dir, path, token.as_bytes(), 0o644)?;
         let now = chrono::Utc::now();
         let f = TokenFile {
             file: format!("{dir}/{path}"),
@@ -3360,7 +3374,9 @@ impl PodManager {
                 .await
             {
                 Some((token, expires)) => {
-                    if let Err(e) = write_atomic(&f.file, token.as_bytes()) {
+                    if let Err(e) =
+                        crate::api_files::write_atomic(std::path::Path::new(&f.file), token.as_bytes(), 0o644)
+                    {
                         warn!(file = %f.file, "ServiceAccount token not refreshed: {e}");
                         continue;
                     }
@@ -3498,9 +3514,9 @@ impl PodManager {
         let dir = pod_volume_dir(&self.state_root, uid, "secret", "kube-api-access");
         let written = (|| -> std::io::Result<()> {
             std::fs::create_dir_all(&dir)?;
-            std::fs::write(format!("{dir}/namespace"), namespace)?;
+            crate::api_files::write_in(&dir, "namespace", namespace.as_bytes(), 0o644)?;
             if let Some(ca) = &self.ca_pem {
-                std::fs::write(format!("{dir}/ca.crt"), ca)?;
+                crate::api_files::write_in(&dir, "ca.crt", ca, 0o644)?;
             }
             Ok(())
         })();
@@ -6876,14 +6892,14 @@ fn write_projected_items(
                 let key = it["key"].as_str().unwrap_or("");
                 let path = it["path"].as_str().unwrap_or(key);
                 if let Some(s) = data.get(key).and_then(|v| v.as_str()) {
-                    std::fs::write(format!("{dir}/{path}"), s)?;
+                    crate::api_files::write_in(dir, path, s.as_bytes(), 0o644)?;
                 }
             }
         }
         None => {
             for (key, val) in data {
                 if let Some(s) = val.as_str() {
-                    std::fs::write(format!("{dir}/{key}"), s)?;
+                    crate::api_files::write_in(dir, key, s.as_bytes(), 0o644)?;
                 }
             }
         }
@@ -6901,25 +6917,19 @@ fn materialize_files(
     if let Some(data) = data {
         for (key, val) in data {
             if let Some(s) = val.as_str() {
-                std::fs::write(format!("{dir}/{key}"), s)?;
+                crate::api_files::write_in(dir, key, s.as_bytes(), 0o644)?;
             }
         }
     }
     Ok(())
 }
 
-/// Write decoded Secret entries as files `<dir>/<key>` (0600 best-effort).
+/// Write decoded Secret entries as files `<dir>/<key>` (0600), symlink-safe (`api_files`).
 fn materialize_secret_files(dir: &str, data: Option<&HashMap<String, String>>) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     if let Some(data) = data {
         for (key, val) in data {
-            let path = format!("{dir}/{key}");
-            std::fs::write(&path, val)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-            }
+            crate::api_files::write_in(dir, key, val.as_bytes(), 0o600)?;
         }
     }
     Ok(())
@@ -7021,14 +7031,6 @@ fn refresh_at(
     now + chrono::Duration::seconds(life * 4 / 5)
 }
 
-/// Write a file whole, by a rename in its directory: a container reading the
-/// token through the directory's bind sees the old one or the new one.
-fn write_atomic(path: &str, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = format!("{path}.tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
-}
-
 /// Resolve a container's `volumeMounts` (and `volumeDevices`, #67) to CRI
 /// mounts using the pod's resolved volumes. Mounts whose volume didn't
 /// resolve are dropped.
@@ -7087,7 +7089,7 @@ fn resolve_volume_mounts(spec: &Value, volumes: &HashMap<String, ResolvedVolume>
                     Some(Mount {
                         container_path: m["mountPath"].as_str().unwrap_or("").to_string(),
                         host_path,
-                        readonly: m["readOnly"].as_bool().unwrap_or(false),
+                        readonly: resolved.api || m["readOnly"].as_bool().unwrap_or(false),
                         propagation: match m["mountPropagation"].as_str() {
                             // Only a privileged container may push mounts back
                             // to the node, as upstream rules. Anything else asking
@@ -9245,9 +9247,10 @@ pub(crate) mod tests {
     #[test]
     fn a_block_volume_is_bound_at_its_device_path_with_no_filesystem() {
         let mut vols = HashMap::new();
-        vols.insert("raw".to_string(), ResolvedVolume { path: "/dev/ublkb7".into(), fstype: None, block: true });
+        vols.insert("raw".to_string(), ResolvedVolume { path: "/dev/ublkb7".into(), fstype: None, block: true, api: false });
         vols.insert("fs".to_string(), ResolvedVolume {
             path: "/dev/ublkb8".into(), fstype: Some("ext4".into()), block: false,
+            api: false,
         });
         let spec = json!({
             "volumeMounts": [{"name": "fs", "mountPath": "/data"}],
@@ -9941,6 +9944,38 @@ pub(crate) mod tests {
         assert_eq!(mode & 0o777, 0o777, "{mode:o}");
     }
 
+    /// rustkube-node#428 (finding 551d194231b5): configMap, secret and
+    /// projected volumes are the kubelet's to write. They mount read-only
+    /// even when `volumeMounts.readOnly` is false or absent, so a container
+    /// cannot replace a key with a symlink; an emptyDir stays writable.
+    #[tokio::test]
+    async fn api_volumes_mount_read_only_whatever_the_mount_says() {
+        let (_rt, mgr) = manager();
+        let p = json!({
+            "metadata": {"uid": "uid-428", "namespace": "default"},
+            "spec": {"volumes": [
+                {"name": "cm", "configMap": {"name": "c"}},
+                {"name": "sec", "secret": {"secretName": "s"}},
+                {"name": "proj", "projected": {"sources": []}},
+                {"name": "scratch", "emptyDir": {}}
+            ]}
+        });
+        let v = mgr.resolve_volumes(&p).await.unwrap();
+        assert!(v["cm"].api && v["sec"].api && v["proj"].api && !v["scratch"].api);
+        let spec = json!({"volumeMounts": [
+            {"name": "cm", "mountPath": "/cm", "readOnly": false},
+            {"name": "sec", "mountPath": "/sec"},
+            {"name": "proj", "mountPath": "/proj", "readOnly": false},
+            {"name": "scratch", "mountPath": "/scratch"}
+        ]});
+        let ro: Vec<(String, bool)> =
+            resolve_mounts(&spec, &v).into_iter().map(|m| (m.container_path, m.readonly)).collect();
+        assert_eq!(
+            ro,
+            vec![("/cm".into(), true), ("/sec".into(), true), ("/proj".into(), true), ("/scratch".into(), false)]
+        );
+    }
+
     /// #98: runAsUser / runAsGroup / runAsNonRoot from the container, else the pod.
     #[test]
     fn run_as_comes_from_the_container_else_the_pod() {
@@ -9977,6 +10012,7 @@ pub(crate) mod tests {
                 path: "/sys/fs/bpf".to_string(),
                 fstype: None,
                 block: false,
+                api: false,
             },
         );
         let spec = json!({
@@ -10022,6 +10058,7 @@ pub(crate) mod tests {
                 path: "/var/lib/kubelet".to_string(),
                 fstype: None,
                 block: false,
+                api: false,
             },
         );
         let spec = |privileged: bool| {
