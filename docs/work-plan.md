@@ -4,6 +4,17 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #418 (P0), mirror pods in each service's project (stormcos#1020)
+2026-11-19. Plan: `mirror_namespaces.rs`: `--mirror-namespaces` (env `MIRROR_NAMESPACES`, default
+/etc/kubernetes/mirror-namespaces.json), a flat `asset → namespace` map, re-read when its mtime changes; no file or no entry =
+kube-system. The mirror pass lists node-service pods cluster-wide, creates each in its asset's namespace once that Namespace exists
+(else skipped and retried, the old mirror kept), deletes a mirror of the same asset left in another namespace once the new one exists;
+status/events/stormd events go to the pod's namespace; the watch is cluster-wide and the map's dir is watched. Logs (`node_service`)
+take the map's namespace. **Also the system claims** (not in the issue, but a mirror's `persistentVolumeClaim` resolves only in its
+own namespace, #372): each service's PVCs go to its namespace, the PV's claimRef follows (namespace+name+uid), and the old
+kube-system claim is deleted after. Then tests, docs (configuration.md, api.md, status.md), CHANGELOG; sc-build; stage; shipped
+with proof `api:/api/v1/namespaces/storm-block/pods ~ "name":"stormblock-{name}"`.
+
 ### In progress: #399 (golden suite on fedora-44, SELinux enforcing)
 - Run 7ffb659a57 (golden, pvetest3 12.96, carries b515348): `golden-no-agent-fails` failed because the agentless guest
   ended **Sealed**. That is b515348 working: the copy sealed itself by `stormvm-seal.service` from PID 1, no agent needed.
