@@ -4,6 +4,17 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #426 (P2), a pod-network VMI reports its pod IP but nothing reaches it (pvetest2 flowsdn)
+2026-11-20. First live run of #88's path (never run on a node before). Read: stormvm's bridge binding moves the pod IP and
+MAC off the CNI's interface onto vmbr0 with the tap; the guest NIC, the lease and the status all carry the pod's MAC; the
+DHCP responder answers only that MAC and says nothing. The kubelet watches no tap for a pod NIC and reports the pod IP from the
+start, so "Running with its IP" says nothing about the guest. Plan:
+1. kubelet: snoop the tap of a pod bridge-binding NIC (as host-bridge and address-less multus NICs are); 60 s after start with
+   the pod IP not seen from the guest, a Warning event `PodAddressNotTaken` on the VMI (IP, MAC, tap), once per machine.
+2. golden suite `vmi-pod-network`: a VMI on `pod: {}` prints its addresses on its console; a pod connects to <ip>:22. Says
+   whether the guest got its lease (console) and whether the datapath carries it (connect).
+Then sc-build, golden run on pvetest2 (flowsdn) now (the probe half needs no new kubelet), stage.
+
 ### In progress: #405 (P2), AccessCredentialsSynchronized stuck at "waiting for the guest agent to answer"
 2026-11-20. Ruled out (stormcos_qa#52 on the issue): the golden runs qemu-guest-agent and the guest has org.qemu.guest_agent.0.
 Read: the socket path matches stormvm's (`<run>/<ns>/<name>/agent.sock`), qemu's chardev is a single-client server, nothing in
