@@ -264,11 +264,30 @@ pub fn generate_rules_with(services: &[ServiceInfo], opts: &RuleOptions) -> Ipta
                 "-A {sep_chain} -s {}/32 -j {CHAIN_MARK_MASQ}",
                 ep.ip
             ));
+            // With ClientIP affinity, the client is recorded in this
+            // endpoint's `recent` list as it is sent here (#441).
+            let remember = if svc.session_affinity.is_some() {
+                format!(" -m recent --name {sep_chain} --set")
+            } else {
+                String::new()
+            };
             nat_rules.push(format!(
-                "-A {sep_chain} -p {proto} -m {proto} -j DNAT --to-destination {}:{}",
+                "-A {sep_chain} -p {proto}{remember} -m {proto} -j DNAT --to-destination {}:{}",
                 ep.ip, ep.port
             ));
             sep_chains.push(sep_chain);
+        }
+
+        // ClientIP affinity (#441, 3394445b5e43), as upstream programs it: a
+        // client seen at an endpoint within the timeout goes back to it,
+        // before any random choice; the entry is refreshed there (`--set`).
+        if let Some(seconds) = svc.session_affinity {
+            for sep_chain in &sep_chains {
+                nat_rules.push(format!(
+                    "-A {svc_chain} -m comment --comment \"{svc_comment}\" -m recent --name {sep_chain} \
+                     --rcheck --seconds {seconds} --reap -j {sep_chain}"
+                ));
+            }
         }
 
         // KUBE-SVC chain: probabilistic load balancing across the SEP chains.
@@ -438,7 +457,7 @@ mod tests {
             key,
             port_name: String::new(),
             endpoints,
-            session_affinity: false,
+            session_affinity: None,
         }
     }
 
@@ -649,5 +668,41 @@ mod tests {
             .position(|r| r.starts_with(&format!("-A {svc_chain} ")))
             .unwrap();
         assert!(rules.nat_rules[first_svc_rule].contains("! -s"));
+    }
+
+    /// #441 (3394445b5e43): ClientIP affinity sends a client seen within the
+    /// timeout back to its endpoint before the random choice, and each
+    /// endpoint records the client; changing the affinity alone changes the
+    /// rules, so a sync applies it.
+    #[test]
+    fn client_ip_affinity_is_programmed_before_the_random_choice() {
+        let key = clusterip_key("default", "web", "10.0.0.10", 80);
+        let eps = vec![ep("10.244.0.1", 8080, true), ep("10.244.0.2", 8080, true)];
+        let plain = generate_rules(&[svc(key.clone(), eps.clone())]);
+        let mut sticky_svc = svc(key.clone(), eps);
+        sticky_svc.session_affinity = Some(600);
+        let sticky = generate_rules(&[sticky_svc]);
+        assert_ne!(plain.to_restore_input(), sticky.to_restore_input(), "affinity alone changes the rules");
+        assert!(!plain.nat_rules.iter().any(|r| r.contains("-m recent")));
+
+        let svc_chain = service_chain_name(&key);
+        let in_svc: Vec<&String> =
+            sticky.nat_rules.iter().filter(|r| r.starts_with(&format!("-A {svc_chain} "))).collect();
+        let seps: Vec<String> = ["10.244.0.1", "10.244.0.2"].iter().map(|ip| endpoint_chain_name(&key, ip, 8080)).collect();
+        // The two affinity checks come first, one per endpoint, then the split.
+        for (i, sep) in seps.iter().enumerate() {
+            let r = in_svc[i];
+            assert!(
+                r.contains(&format!("-m recent --name {sep} --rcheck --seconds 600 --reap -j {sep}")),
+                "{r}"
+            );
+        }
+        assert!(in_svc[2].contains("statistic"), "then the random choice: {}", in_svc[2]);
+        // Each endpoint records the client as it DNATs it.
+        for (sep, ip) in seps.iter().zip(["10.244.0.1", "10.244.0.2"]) {
+            assert!(sticky.nat_rules.iter().any(|r| r.starts_with(&format!("-A {sep} "))
+                && r.contains(&format!("-m recent --name {sep} --set"))
+                && r.contains(&format!("--to-destination {ip}:8080"))));
+        }
     }
 }

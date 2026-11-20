@@ -150,7 +150,7 @@ mod tests {
             },
             port_name: "dns".into(),
             endpoints: ips.iter().map(|ip| Endpoint { ip: ip.to_string(), port: 53, ready: true }).collect(),
-            session_affinity: false,
+            session_affinity: None,
         }
     }
 

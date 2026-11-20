@@ -4,6 +4,10 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #441 (P1), review: ClientIP affinity in kube-proxy's iptables rules
+2026-11-20. 3394445b5e43: `ServiceInfo.session_affinity: Option<u32>` (timeout, default 10800); SEP DNAT `-m recent --set`,
+SVC chain `--rcheck --seconds N --reap` per endpoint before the statistic split (upstream's rules). Next: sc-build, close.
+
 ### Done: #439 (P1), review: mount lists cut to 16 on stormpump
 2026-11-20. 15b9a83130c8: `mounts_fit` refuses a container past `stormpump::spec::MAX_MOUNTS` (now read from the engine,
 not copied) before its root is made (CreateContainerConfigError, count and paths); every `take(MAX_MOUNTS)` removed.

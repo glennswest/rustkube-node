@@ -34,7 +34,23 @@ pub struct ServiceInfo {
     /// by name (and protocol), as upstream does; empty for a lone unnamed port.
     pub port_name: String,
     pub endpoints: Vec<Endpoint>,
-    pub session_affinity: bool,
+    /// `sessionAffinity: ClientIP`: how long, in seconds, a client stays on
+    /// the backend it was sent to (`sessionAffinityConfig.clientIP.timeoutSeconds`,
+    /// upstream's default 10800). `None`: no affinity.
+    pub session_affinity: Option<u32>,
+}
+
+/// Upstream's default ClientIP affinity timeout (3 hours).
+pub const DEFAULT_AFFINITY_SECONDS: u32 = 10800;
+
+/// A Service's ClientIP affinity timeout, `None` without affinity. A timeout
+/// outside upstream's 1..=86400 takes the default (the apiserver refuses one).
+pub fn session_affinity_of(svc: &Value) -> Option<u32> {
+    if svc["spec"]["sessionAffinity"].as_str() != Some("ClientIP") {
+        return None;
+    }
+    let t = svc["spec"]["sessionAffinityConfig"]["clientIP"]["timeoutSeconds"].as_u64();
+    Some(t.filter(|t| (1..=86400).contains(t)).map(|t| t as u32).unwrap_or(DEFAULT_AFFINITY_SECONDS))
 }
 
 /// Thread-safe service map.
@@ -72,7 +88,7 @@ impl ServiceMap {
             }
 
             let svc_type = svc["spec"]["type"].as_str().unwrap_or("ClusterIP");
-            let session_affinity = svc["spec"]["sessionAffinity"].as_str() == Some("ClientIP");
+            let session_affinity = session_affinity_of(svc);
 
             let ports = svc["spec"]["ports"].as_array().cloned().unwrap_or_default();
 
@@ -271,5 +287,33 @@ mod tests {
         m.update_services(std::slice::from_ref(&svc));
         m.update_endpoints(&[]);
         assert!(by_port(&m, 80, "TCP").endpoints.is_empty());
+    }
+
+    /// #441: ClientIP affinity and its timeout reach the service model.
+    #[test]
+    fn client_ip_affinity_and_its_timeout_are_read() {
+        let svc = |spec: serde_json::Value| json!({"metadata": {"name": "s"}, "spec": spec});
+        assert_eq!(session_affinity_of(&svc(json!({"sessionAffinity": "None"}))), None);
+        assert_eq!(session_affinity_of(&svc(json!({}))), None);
+        assert_eq!(session_affinity_of(&svc(json!({"sessionAffinity": "ClientIP"}))), Some(DEFAULT_AFFINITY_SECONDS));
+        assert_eq!(
+            session_affinity_of(&svc(json!({"sessionAffinity": "ClientIP",
+                "sessionAffinityConfig": {"clientIP": {"timeoutSeconds": 60}}}))),
+            Some(60)
+        );
+        assert_eq!(
+            session_affinity_of(&svc(json!({"sessionAffinity": "ClientIP",
+                "sessionAffinityConfig": {"clientIP": {"timeoutSeconds": 0}}}))),
+            Some(DEFAULT_AFFINITY_SECONDS),
+            "out of range takes the default"
+        );
+        let m = ServiceMap::new();
+        m.update_services(&[json!({
+            "metadata": {"name": "web", "namespace": "default"},
+            "spec": {"clusterIP": "10.0.0.10", "sessionAffinity": "ClientIP",
+                "sessionAffinityConfig": {"clientIP": {"timeoutSeconds": 120}},
+                "ports": [{"port": 80, "protocol": "TCP"}]}
+        })]);
+        assert_eq!(by_port(&m, 80, "TCP").session_affinity, Some(120));
     }
 }
