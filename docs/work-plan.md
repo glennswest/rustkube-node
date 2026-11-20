@@ -26,6 +26,12 @@ Not live yet: stormcos gives the kubelet `--stormstorage` (STORMSTORAGE_URL in e
 two storage nodes. Held `--after stormcos#354`. Resume: `stormcentral test run rustkube-node golden` on a multi-node machine whose kubelet
 has stormstorage; `vmi-mirrored-root` passing → shipped/close #404.
 2026-11-20: handed back with stormcos#354 still open; nothing to do until it lands. Held `--after stormcos#354` again.
+2026-11-20 (again): `--after stormcos#354` is met at once because #354's item is shipped (its issue stays open), so the
+item kept coming back. The real gates: (1) an image with d0164ee: stage 9e18b0b5f57e shows no image yet (newest
+golden-rustkube-node-1eb8b16735d1 is 3255cce), asked the master to look; (2) a formed cluster: the kubelet's STORMSTORAGE_URL is
+written only by stormcluster seed/join (stormcluster#89, closed), and a mirror needs two storage nodes. Held
+`--after-install rustkube-node>=d0164ee`; noted the master to run `testhost cluster-test pvetest1 pvetest2 <release>` and then the
+rustkube-node `golden` suite on the formed pair. Resume: `vmi-mirrored-root` passes there → close #404.
 
 ### Shipped (proof pending): #418 (P0), mirror pods in each service's project (stormcos#1020)
 2026-11-19. Plan: `mirror_namespaces.rs`: `--mirror-namespaces` (env `MIRROR_NAMESPACES`, default
