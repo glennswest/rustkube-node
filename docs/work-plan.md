@@ -378,6 +378,8 @@ Resume: `stormcentral test show 369f7f9253` / `3cc92c9f01`; pass → shipped wit
 103dd43a0a, stormblock-csi 7c72a1f2f6, stormcos-options 2ab8ff2d7c, stormraid a403e5dad7): stormcluster#123 (12.97's :9102
 fails the loopback health probe from boot). Held `--after stormcluster#123`. Resume: `stormcentral test run rustkube-node pvc
 --tag pvetest1` (and pvetest2); pass → close #379; fail → the claim's events.
+Handed back unchanged: stormcluster#123's fix is f1de3f6 (h2 ALPN on :9102), not in 12.97; the :9111 half is stormlb#30
+(open, no fix). Held also `--after stormlb#30` and `--after-install stormcluster>=f1de3f6@any:pve`.
 
 ### Shipped (proof pending): #383 (P0), a template listed `broken` is waited on forever (server8 12.92, pvc-ext4j-64m)
 
