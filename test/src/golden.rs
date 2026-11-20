@@ -30,6 +30,14 @@
 //! - `golden-clone-new-identity`: a VMI booted from `G` prints a machine-id,
 //!   and it is not the source's: the copy was de-identified.
 //!
+//! - `vmi-mirrored-root` (#404): a VMI whose root asks
+//!   `storm.io/mirrored-disks: {"root": 2}` boots from a stormstorage
+//!   mirrored volume filled from the golden: Running, its console prints a
+//!   machine-id, and `status.volumes[]` names `mirrored.volume`
+//!   (`<ns>.gold-mirror-root.mirrored`, 2 copies) and the served volume it
+//!   attached. A skip where the node's kubelet has no stormstorage (its
+//!   start says so); the volume is the VMI's and goes with it (the sweep).
+//!
 //! The VMIs and requests are deleted after. **The sealed golden `G` is not**:
 //! a test gets no stormblock admin token, and a storage user deletes only
 //! what it made itself (stormcentral docs/test-standard.md); the kubelet
@@ -56,6 +64,7 @@ pub const KIND: &str = "VirtualMachineGolden";
 pub const SOURCE: &str = "gold-src";
 pub const NO_AGENT: &str = "gold-noagent";
 pub const CLONE: &str = "gold-clone";
+pub const MIRRORED: &str = "gold-mirror";
 pub const ASK_FAIL: &str = "gold-fail";
 pub const ASK_SEAL: &str = "gold-seal";
 
@@ -70,6 +79,9 @@ const BOOT: Duration = Duration::from_secs(600);
 /// its agent 300 s, `vm_golden::BOOT_TIMEOUT`), and the seal.
 const REQUEST: Duration = Duration::from_secs(900);
 const MARGIN: Duration = Duration::from_secs(60);
+/// A mirrored root: stormstorage's copy of the golden onto two legs, then
+/// the boot.
+const MIRRORED_BOOT: Duration = Duration::from_secs(1200);
 
 pub fn vmis(env: &Env) -> String {
     format!("/apis/kubevirt.io/v1/namespaces/{}/virtualmachineinstances", env.namespace)
@@ -222,10 +234,15 @@ struct Suite {
 impl Suite {
     /// Boot VMI `name` and read its console until `enough`: what it said.
     async fn boot(&self, name: &str, root: &str, user_data: &str, enough: fn(&str) -> bool) -> Result<String, String> {
-        self.api.create(&vmis(&self.env), &vmi(&self.env, name, root, user_data)).await?;
+        self.boot_vmi(name, vmi(&self.env, name, root, user_data), BOOT, enough).await
+    }
+
+    /// [`Self::boot`] of a given VMI, within `budget`.
+    async fn boot_vmi(&self, name: &str, obj: Value, budget: Duration, enough: fn(&str) -> bool) -> Result<String, String> {
+        self.api.create(&vmis(&self.env), &obj).await?;
         let path = format!("{}/{name}", vmis(&self.env));
         let path = path.as_str();
-        let within = self.env.budget(BOOT, MARGIN);
+        let within = self.env.budget(budget, MARGIN);
         let end = Instant::now() + within;
         k8s::until(within, || async move {
             let v = self.api.get(path).await?.ok_or_else(|| format!("VMI {name} is gone"))?;
@@ -265,14 +282,34 @@ impl Suite {
         .await
     }
 
+    /// `vmi-mirrored-root` (#404).
+    async fn mirrored_root(&self, root: &str, says_id: &str) -> Outcome {
+        let mut obj = vmi(&self.env, MIRRORED, root, says_id);
+        obj["metadata"]["annotations"] = json!({ MIRROR_ANNOTATION: r#"{"root": 2}"# });
+        let path = format!("{}/{MIRRORED}", vmis(&self.env));
+        let booted = self.boot_vmi(MIRRORED, obj, MIRRORED_BOOT, |c| machine_id(c).is_some()).await;
+        let now = match self.api.get(&path).await {
+            Ok(Some(v)) => v,
+            Ok(None) => return Outcome::Fail(format!("VMI {MIRRORED} is gone")),
+            Err(e) => return Outcome::Infra(e),
+        };
+        match booted {
+            Ok(console) => judge_mirrored(&now, &self.env.namespace, machine_id(&console).as_deref()),
+            Err(e) if no_stormstorage(&now) => {
+                Outcome::Skip(format!("{}'s kubelet has no stormstorage (--stormstorage): {e}", self.env.node_name))
+            }
+            Err(e) => Outcome::Fail(format!("{e}; status: {}", short(&now["status"]))),
+        }
+    }
+
     async fn cleanup(&self) -> Result<(), String> {
         for r in [ASK_FAIL, ASK_SEAL] {
             self.api.delete(&format!("{}/{r}", requests(&self.env))).await?;
         }
-        for v in [SOURCE, NO_AGENT, CLONE] {
+        for v in [SOURCE, NO_AGENT, CLONE, MIRRORED] {
             self.api.delete(&format!("{}/{v}", vmis(&self.env))).await?;
         }
-        for v in [SOURCE, NO_AGENT, CLONE] {
+        for v in [SOURCE, NO_AGENT, CLONE, MIRRORED] {
             k8s::gone(&self.api, &format!("{}/{v}", vmis(&self.env)), Duration::from_secs(120)).await?;
         }
         Ok(())
@@ -358,6 +395,11 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
         r.record("golden-clone-new-identity", o, t.elapsed().as_millis(), None);
     }
 
+    // A root mirrored across nodes from the golden (#404).
+    let t = Instant::now();
+    let o = suite.mirrored_root(&root, &says_id).await;
+    r.record("vmi-mirrored-root", o, t.elapsed().as_millis(), None);
+
     let t = Instant::now();
     let o = match suite.cleanup().await {
         Err(e) => Outcome::Infra(e),
@@ -386,6 +428,34 @@ pub fn judge_status_volumes(vmi: &Value, golden: &str) -> Outcome {
         return Outcome::Fail(format!("the root entry is not complete (volumeID, golden {golden}, owned): {root}"));
     }
     Outcome::Pass(format!("{} volume(s); root: {root}", vols.len()))
+}
+
+/// The VMI annotation that asks for a mirrored disk (the kubelet's
+/// `vm_mirrored_root::REQUEST`).
+pub const MIRROR_ANNOTATION: &str = "storm.io/mirrored-disks";
+
+/// Did the kubelet refuse the mirrored disk for want of stormstorage?
+pub fn no_stormstorage(vmi: &Value) -> bool {
+    vmi["status"].to_string().contains("no stormstorage")
+}
+
+/// `vmi-mirrored-root`: it booted (a machine-id), and its root's
+/// `status.volumes[]` entry names the mirrored volume, 2 copies, and the
+/// served volume it attached.
+pub fn judge_mirrored(vmi: &Value, namespace: &str, id: Option<&str>) -> Outcome {
+    let Some(id) = id else { return Outcome::Fail("Running, but its console printed no machine-id".into()) };
+    let want = format!("{namespace}.{MIRRORED}-root.mirrored");
+    let root = vmi["status"]["volumes"].as_array().and_then(|v| v.iter().find(|e| e["name"] == "root"));
+    let Some(root) = root else {
+        return Outcome::Fail(format!("no root in status.volumes: {}", short(&vmi["status"]["volumes"])));
+    };
+    if root["mirrored"]["volume"] != json!(want) || root["mirrored"]["copies"] != json!(2) {
+        return Outcome::Fail(format!("root is not on {want} with 2 copies: {}", short(root)));
+    }
+    let Some(served) = root["volumeID"].as_str().filter(|v| !v.is_empty()) else {
+        return Outcome::Fail(format!("root names no served volume: {}", short(root)));
+    };
+    Outcome::Pass(format!("booted (machine-id {id}) from {want}, 2 copies, served volume {served}"))
 }
 
 #[cfg(test)]
@@ -463,5 +533,20 @@ mod tests {
         assert!(matches!(judge_identity("a", Some("b")), Outcome::Pass(_)));
         assert!(matches!(judge_identity("a", Some("a")), Outcome::Fail(_)));
         assert!(matches!(judge_identity("a", None), Outcome::Fail(_)));
+    }
+
+    #[test]
+    fn a_mirrored_root_is_judged() {
+        let vmi = |mirrored: Value, id: &str| {
+            serde_json::json!({"status": {"volumes": [{"name": "root", "volumeID": id, "mirrored": mirrored}]}})
+        };
+        let want = serde_json::json!({"volume": "ns.gold-mirror-root.mirrored", "copies": 2});
+        assert!(matches!(judge_mirrored(&vmi(want.clone(), "u-1"), "ns", Some("abc")), Outcome::Pass(_)));
+        assert!(matches!(judge_mirrored(&vmi(want.clone(), "u-1"), "ns", None), Outcome::Fail(_)));
+        assert!(matches!(judge_mirrored(&vmi(want.clone(), ""), "ns", Some("abc")), Outcome::Fail(_)));
+        assert!(matches!(judge_mirrored(&vmi(Value::Null, "u-1"), "ns", Some("abc")), Outcome::Fail(_)));
+        assert!(matches!(judge_mirrored(&vmi(want, "u-1"), "other", Some("abc")), Outcome::Fail(_)));
+        assert!(no_stormstorage(&serde_json::json!({"status": {"conditions": [{"message": "x: this node has no stormstorage (--stormstorage)"}]}})));
+        assert!(!no_stormstorage(&serde_json::json!({"status": {"phase": "Pending"}})));
     }
 }

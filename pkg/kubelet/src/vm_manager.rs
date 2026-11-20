@@ -1321,7 +1321,20 @@ fn gives_up(vm: Option<&Value>) -> bool {
 pub fn status_volumes(obj: &Value, disks: &[ResolvedDisk]) -> Option<Value> {
     let spec: VmSpec = stormvm_spec::kube::from_kube(obj).ok()?;
     let resolved: Vec<(String, Option<String>)> = disks.iter().map(|d| (d.name.clone(), d.volume_id.clone())).collect();
-    Some(stormvm_spec::volumes::status(&spec, &resolved))
+    let mut v = stormvm_spec::volumes::status(&spec, &resolved);
+    // A mirrored disk (#404) says so: its stormstorage volume and copies.
+    if let (Ok(asked), Some(items)) = (crate::vm_mirrored_root::requests(obj), v.as_array_mut()) {
+        for e in items.iter_mut().filter(|e| e.get("volumeID").is_some()) {
+            let Some(name) = e["name"].as_str().map(str::to_string) else { continue };
+            if let Some(copies) = asked.get(&name) {
+                e["mirrored"] = json!({
+                    "volume": crate::vm_mirrored_root::volume_name(&spec, &name),
+                    "copies": copies,
+                });
+            }
+        }
+    }
+    Some(v)
 }
 
 fn owner_vm(obj: &Value) -> Option<&str> {
@@ -11073,6 +11086,11 @@ mod tests {
         assert!(owned.is_empty(), "stormstorage's volume, never deleted as an engine volume");
         assert_eq!(*hosts.lock().unwrap(), vec![crate::vm_mirrored_root::host_nqn("n1")]);
         assert!(seen.lock().unwrap().ends_with(&["serve".to_string(), "attach served-1".to_string()]));
+
+        // status.volumes names the mirrored volume and its copies.
+        let st = status_volumes(&obj, &disks).unwrap();
+        assert_eq!(st[0]["mirrored"], json!({"volume": name, "copies": 2}));
+        assert_eq!(st[0]["volumeID"], "served-1");
 
         // The stop withdraws this node's host.
         let vm = Vm {

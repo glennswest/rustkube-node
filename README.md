@@ -983,8 +983,9 @@ with `CAP_IPC_LOCK` effective. A pod that doesn't ask must see neither.
 - **`status.volumes[]`** (#373, stormvm#129): on the VMI, and on its VirtualMachine (written only when it
   changes), one entry per disk from `stormvm_spec::volumes::status`: `name`, `role` (`root`, `data`,
   `cloud-init`), `volumeID` (stormblock's id, once resolved; none for another driver's claim), `golden`,
-  `source` and `owned` (whether the volume goes with the machine). A hot-added disk is there on the next
-  status write. This is the way from a machine to its volumes; each Volume's `owner` is the way back.
+  `source` and `owned` (whether the volume goes with the machine). A mirrored disk (#404) also has
+  `mirrored {volume, copies}`: its stormstorage volume, and `volumeID` is the served volume this node
+  attached. A hot-added disk is there on the next status write. This is the way from a machine to its volumes; each Volume's `owner` is the way back.
   A restore's volumes get their owner as soon as they are made: a restored disk its PVC (it is a claim and
   outlives the machine; the VM as owner would let the orphan sweep delete it under the claim), the restored
   memory state the VirtualMachine (none with `storm.io/retain-disks`).
@@ -1205,8 +1206,9 @@ stormstorage#113 option B', stormstorage#116):
    a peer's volume over NVMe/TCP when the head is another node
    (stormblock#328). The guest boots from it.
 
-The next start, here or on another node, finds the volume by name and boots
-from it as it is. A stop withdraws the node's host. The volume is the
+`status.volumes[]` names it (`mirrored {volume, copies}`). The next start,
+here or on another node, finds the volume by name and boots from it as it
+is. A stop withdraws the node's host. The volume is the
 VirtualMachine's (#75): once the VM is gone and no host is served, the
 kubelet's sweep deletes it through stormstorage. The engine's sweep never
 deletes its legs. It needs `--stormstorage`. A request naming a disk that
