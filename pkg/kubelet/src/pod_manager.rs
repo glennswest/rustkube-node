@@ -2124,6 +2124,9 @@ impl PodManager {
                 return true;
             }
         }
+        // Where the migration is: what was read, or what a cutover whose
+        // answer was lost turned out to have done.
+        let mut state = mig.state.clone();
         if mig.state == "synced" {
             if m.state == cm::COPYING {
                 info!("PVC {ns}/{claim}: in sync with {}", m.target);
@@ -2176,16 +2179,33 @@ impl PodManager {
                     warn!("PVC {ns}/{claim}: the cutover left {} {} ({}), tried again", m.migration, c.state, c.message);
                     return true;
                 }
-                Err(e) => {
-                    let why = format!("the cutover was refused: {e}");
-                    self.abort_claim_move(pvc, m, cm::FAILED, &why).await;
-                    return false;
-                }
+                // The cutover is the point of no return, and an error says
+                // nothing about which side of it the copy is on: the answer
+                // may be what was lost (#428, finding e4aaa109678b). The
+                // migration is read again and the move goes on from there.
+                Err(e) => match cutover_outcome(&e, Stormstorage(ss).get(&m.migration).await) {
+                    Cutover::Done(now) => {
+                        info!("PVC {ns}/{claim}: the cutover's answer was lost ({e}); {} is {now}", m.migration);
+                        state = now;
+                    }
+                    Cutover::Ask => {
+                        warn!("PVC {ns}/{claim}: the cutover of {} is not known yet ({e}), asked again", m.migration);
+                        return true;
+                    }
+                    Cutover::Refused(why) => {
+                        self.abort_claim_move(pvc, m, cm::FAILED, &why).await;
+                        return false;
+                    }
+                    Cutover::Ended(why) => {
+                        self.abort_claim_move(pvc, &cm::Move { migration: String::new(), ..m.clone() }, cm::FAILED, &why).await;
+                        return false;
+                    }
+                },
             }
         }
         // Cut over: the copy is the claim's. Retire the source, then point
         // the PV at the target, then say so.
-        if mig.state != "completed" {
+        if state != "completed" {
             let done = match Stormstorage(ss).step(&m.migration, "complete").await {
                 Ok(c) => c.state == "completed",
                 Err(e) => {
@@ -6965,6 +6985,35 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
     Ok(out)
 }
 
+/// Where a claim move's cutover stands when its step answered an error
+/// (#428, finding e4aaa109678b).
+#[derive(Debug, PartialEq, Eq)]
+enum Cutover {
+    /// The copy is cut over (or completed, the state it is in): go on to
+    /// retire the source and point the PV at the target.
+    Done(String),
+    /// Not known, or the step failed on the way (a timeout, a 5xx): ask
+    /// again next pass, the claim untouched.
+    Ask,
+    /// Still before the cutover and stormstorage said no: abort the copy.
+    Refused(String),
+    /// The copy failed or was aborted on stormstorage's side.
+    Ended(String),
+}
+
+/// What a cutover error means, from the migration read again after it.
+fn cutover_outcome(err: &str, now: Result<crate::vm_migration::DiskMigration, String>) -> Cutover {
+    let Ok(mig) = now else { return Cutover::Ask };
+    match mig.state.as_str() {
+        "cut_over" | "completed" => Cutover::Done(mig.state.clone()),
+        "failed" | "aborted" => Cutover::Ended(format!("the copy {}: {}", mig.state, mig.message)),
+        "synced" if retry::class_of_message(err) == retry::Class::Real => {
+            Cutover::Refused(format!("the cutover was refused: {err}"))
+        }
+        _ => Cutover::Ask,
+    }
+}
+
 /// Does the pod use volume `name` against its claim's mode (#67)? A Block
 /// claim named in some container's `volumeMounts`, or a Filesystem one in
 /// `volumeDevices`, is refused, as upstream refuses it.
@@ -11098,6 +11147,11 @@ pub(crate) mod tests {
         migrations: HashMap<String, String>,
         /// Everything asked of stormstorage and the engine, in order.
         asked: Vec<String>,
+        /// The next cutover answers this status instead of 200 (#428):
+        /// with `cutover_done`, after cutting over (its answer lost);
+        /// without, having done nothing.
+        cutover_error: Option<u16>,
+        cutover_done: bool,
     }
 
     fn merge(target: &mut Value, patch: &Value) {
@@ -11186,8 +11240,21 @@ pub(crate) mod tests {
                     let mut s = s.lock().unwrap();
                     s.asked.push(format!("{step} {id}"));
                     let next = match step.as_str() { "cutover" => "cut_over", "complete" => "completed", "abort" => "aborted", _ => "copying" };
+                    if step == "cutover" {
+                        if let Some(code) = s.cutover_error.take() {
+                            if s.cutover_done {
+                                s.migrations.insert(id.clone(), next.into());
+                            }
+                            let code = axum::http::StatusCode::from_u16(code).unwrap();
+                            return (code, "cutover: no answer").into_response();
+                        }
+                    }
+                    // After the cutover, an abort is refused: the target is the claim's.
+                    if step == "abort" && matches!(s.migrations.get(&id).map(String::as_str), Some("cut_over" | "completed")) {
+                        return (axum::http::StatusCode::CONFLICT, "cut over: not aborted").into_response();
+                    }
                     s.migrations.insert(id.clone(), next.into());
-                    axum::Json(json!({"id": id, "state": next}))
+                    axum::Json(json!({"id": id, "state": next})).into_response()
                 }))
             .with_state(state.clone());
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -11293,5 +11360,77 @@ pub(crate) mod tests {
         assert_eq!(asked(&s).last().map(String::as_str), Some("abort m-1"));
         assert_eq!(annotation(&s, cm::STATE), cm::ABORTED);
         assert!(annotation(&s, cm::REASON).contains("taken off"));
+    }
+
+    /// A claim move brought to its cutover, with no pod holding it: the
+    /// next `move_claims` pass cuts over.
+    async fn move_at_cutover(err: u16, done: bool) -> (PodManager, Arc<std::sync::Mutex<MoveFake>>) {
+        use crate::claim_move as cm;
+        let (mgr, s) = move_fake(json!({cm::MOVE_TO: "b"})).await;
+        mgr.move_claims().await;
+        let mut f = s.lock().unwrap();
+        f.migrations.insert("m-1".into(), "synced".into());
+        f.cutover_error = Some(err);
+        f.cutover_done = done;
+        drop(f);
+        (mgr, s)
+    }
+
+    /// #428 (finding e4aaa109678b): stormstorage cut over, but its answer
+    /// was lost (a 504). The migration is read again: the move goes on to
+    /// retire the source and point the PV at b. It is never aborted, and the
+    /// claim is never said to have stayed here.
+    #[tokio::test]
+    async fn a_cutover_whose_answer_is_lost_still_moves_the_claim() {
+        use crate::claim_move as cm;
+        let (mgr, s) = move_at_cutover(504, true).await;
+        assert_eq!(mgr.move_claims().await, None, "done");
+        let asked = asked(&s);
+        assert!(!asked.iter().any(|a| a.starts_with("abort")), "{asked:?}");
+        assert_eq!(&asked[asked.len() - 3..], ["cutover m-1", "complete m-1", "rebind"]);
+        assert_eq!(annotation(&s, cm::STATE), cm::COMPLETE);
+        assert_eq!(cm::pv_node(&s.lock().unwrap().pv).as_deref(), Some("b"));
+    }
+
+    /// The cutover failed on the way (a 504) and did nothing: still synced,
+    /// nothing aborted; the next pass cuts over.
+    #[tokio::test]
+    async fn a_cutover_that_did_not_happen_is_asked_again_not_aborted() {
+        use crate::claim_move as cm;
+        let (mgr, s) = move_at_cutover(504, false).await;
+        assert_eq!(mgr.move_claims().await, Some(cm::POLL));
+        assert!(!asked(&s).iter().any(|a| a.starts_with("abort")));
+        assert_eq!(annotation(&s, cm::STATE), cm::CUTTING_OVER);
+        assert_eq!(cm::pv_node(&s.lock().unwrap().pv).as_deref(), Some(NODE), "still here");
+        assert_eq!(mgr.move_claims().await, None, "cut over on the next pass");
+        assert_eq!(annotation(&s, cm::STATE), cm::COMPLETE);
+        assert_eq!(cm::pv_node(&s.lock().unwrap().pv).as_deref(), Some("b"));
+    }
+
+    /// Refused while still synced (a 409): the copy is aborted and the
+    /// claim stays here, with the reason.
+    #[tokio::test]
+    async fn a_cutover_refused_before_it_happens_aborts_the_move() {
+        use crate::claim_move as cm;
+        let (mgr, s) = move_at_cutover(409, false).await;
+        assert_eq!(mgr.move_claims().await, None);
+        assert_eq!(asked(&s).last().map(String::as_str), Some("abort m-1"));
+        assert_eq!(annotation(&s, cm::STATE), cm::FAILED);
+        assert!(annotation(&s, cm::REASON).contains("the cutover was refused"), "{}", annotation(&s, cm::REASON));
+        assert_eq!(cm::pv_node(&s.lock().unwrap().pv).as_deref(), Some(NODE));
+    }
+
+    #[test]
+    fn a_cutover_error_is_read_from_the_migration_after_it() {
+        use crate::vm_migration::DiskMigration;
+        let at = |st: &str| Ok(DiskMigration { id: "m".into(), state: st.into(), ..Default::default() });
+        let lost = "stormstorage 504 Gateway Timeout: cutover";
+        let no = "stormstorage 409 Conflict: not in sync";
+        assert_eq!(cutover_outcome(lost, at("cut_over")), Cutover::Done("cut_over".into()));
+        assert_eq!(cutover_outcome(no, at("completed")), Cutover::Done("completed".into()));
+        assert_eq!(cutover_outcome(lost, at("synced")), Cutover::Ask);
+        assert!(matches!(cutover_outcome(no, at("synced")), Cutover::Refused(_)));
+        assert!(matches!(cutover_outcome(lost, at("failed")), Cutover::Ended(_)));
+        assert_eq!(cutover_outcome(lost, Err("stormstorage: connection refused".into())), Cutover::Ask);
     }
 }

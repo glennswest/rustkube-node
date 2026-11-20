@@ -1433,7 +1433,12 @@ Ready; a target whose CSIStorageCapacity has no room for it; a node with no
 
 **Given up** (the claim stays where it was):
 - A failed copy.
-- A refused cutover (the copy is aborted).
+- A refused cutover (the copy is aborted), when stormstorage still reports the
+  copy in sync after the refusal. A cutover call that errors without an answer
+  (a timeout, a 5xx) is not taken as a refusal. The kubelet reads the migration
+  again: if it is cut over or completed, the move goes on (source retired, PV
+  pointed at the target), and if it is still in sync, the next pass asks again
+  (#428).
 - The request taken off, or changed to another node, before the cutover
   (`aborted`).
 
