@@ -302,7 +302,7 @@ mod tests {
         let spec: stormvm_spec::VmSpec = stormvm_spec::kube::from_kube(&json!({
             "kind": "VirtualMachineInstance",
             "metadata": {"name": "web", "namespace": "default"},
-            "spec": {"domain": {"devices": {"disks": [{"name": "root", "disk": {"bus": "virtio"}}, {"name": "data", "disk": {"bus": "virtio"}}]}},
+            "spec": {"domain": {"memory": {"guest": "1Gi"}, "devices": {"disks": [{"name": "root", "disk": {"bus": "virtio"}}, {"name": "data", "disk": {"bus": "virtio"}}]}},
                      "volumes": [{"name": "root", "containerDisk": {"image": "fedora-43"}},
                                  {"name": "data", "emptyDisk": {"capacity": "1Gi"}}]}
         }))
