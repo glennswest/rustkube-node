@@ -307,6 +307,7 @@ b5770e2238 (pvetest3, 12.96, carries hooks): ready, localhost, logs, exec, resta
 `pod-multi-stop-order` fails: a's preStop file written, the sidecar's absent. pvetest3's syslog ends 17:35, before the run: no kubelet log.
 Next: the test says why (exec -c sidecar in `pod-multi-exec`; the stop-order failure lists the files and PreStop/Killing events), sc-build,
 medium again, then fix the kubelet side. Close when every `pod-multi-*` passes (ipc after stormpump#244).
+871c8e6: sc-build-c7c9a5c3fb (test crate test + clippy -D warnings) passed. Medium 108455c2fe queued on pvetest1 (12.95, kubelet 8686267 has the hooks).
 
 ### Shipped (waits for the proof on a node): #372 (P0), traceability: root clones owned by their Pod, pods carry instance/golden/digest/volume ids, mirror pods declare the service's volumes
 
