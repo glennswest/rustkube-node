@@ -73,8 +73,14 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
     let t = Instant::now();
     let node = match api.get(&format!("/api/v1/nodes/{}", env.node_name)).await {
         Ok(Some(n)) => n,
-        Ok(None) => return r.record("realtime-node", Outcome::Infra(format!("Node {} not found", env.node_name)), 0, None),
-        Err(e) => return r.record("realtime-node", Outcome::Infra(e), 0, None),
+        Ok(None) => {
+            r.record("realtime-node", Outcome::Infra(format!("Node {} not found", env.node_name)), 0, None);
+            return;
+        }
+        Err(e) => {
+            r.record("realtime-node", Outcome::Infra(e), 0, None);
+            return;
+        }
     };
     let label = s(&node, &format!("/metadata/labels/{}", LABEL.replace('/', "~1"))).to_string();
     let preempt = s(&node, &format!("/metadata/labels/{}", PREEMPT_LABEL.replace('/', "~1"))).to_string();
