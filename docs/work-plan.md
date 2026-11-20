@@ -600,7 +600,7 @@ CA is fatal at start; `http://` works as before. Not the client pair (not asked;
        (#227's elsewhere). Live: not run on a node or a real engine; stormcos sets `--stormblock https://127.0.0.1:9090 --stormblock-ca /data/stormcert/ca.crt`.
 2. [x] stormvm-block (snapshot, restore, console `snapshot`) gets the same URL and has no CA: follow-up #318, proposed after stormvm#110; said on stormcos#374.
 
-### In progress: #325 (P2), VM start: `control` a flat ~102 ms, `report` grew (stormcos#804, fix 17)
+### Shipped (proof pending): #325 (P2), VM start: `control` a flat ~102 ms, `report` grew (stormcos#804, fix 17)
 
 2026-11-06. `control`: stormvm's `status_when_up` sleeps a fixed 100 ms after a refused connect, so a socket bound within that costs 100 ms. Target: under 20 ms on a VM, VM Running ~150 ms warm.
 `report`: one merge PATCH. pvetest1 12.61 VMIs 3.7-139 ms, pvetest2 12.61-flowsdn 2.8-118 ms, while pods in the same boots stay 2.5-5.8 ms (12.58.4 VMIs 3.7-22 ms). Not explained yet. Doing:
@@ -615,9 +615,11 @@ CA is fatal at start; `http://` works as before. Not the client pair (not asked;
        move the target to ~50 ms, C keep both and look inside qemu. `wait-owner` run. Resume: A = `control_when_up` stops at the first accepted connect
        (`control/answer` is then 0, or dropped), tests, README/status.md, CHANGELOG, sc-build, stage, close on the next pve bootlog; B = close with the new target.
        `report` on 12.61, before the fix: no PATCH in the bundle logged a retry; pods' status writes in those boots 2.5-5.8 ms. The apiserver's slow lines are in the newer bundles from the reboot on: server7 VMI status PATCHes 223-1562 ms (the kubelet's and others'), so hardware outliers are at least partly the apiserver.
-5. [ ] 2026-11-20, decided A (master on #325, our recommendation): `control_when_up` stops at the first accepted connect to the control socket (a plain
+5. [x] 2026-11-20, decided A (master on #325, our recommendation): `control_when_up` stops at the first accepted connect to the control socket (a plain
        Unix connect, closed at once; no QMP/API exchange). `control/answer=` is dropped: nothing after the connect is waited. #303's exit race and 10 s bound stay.
        Tests, README, status.md, vm_start_timing docs, CHANGELOG; sc-build; stage; `shipped` with the `VMI … started:` line as proof.
+       Done: b0657da. sc-build (VM sc-build-10a512b4c7) build + all tests pass, incl. new `connect_control_is_up_once_the_socket_listens` (a real Unix socket).
+       clippy -p kubelet: nothing on the changed lines (the rest is #386). Stage requested; shipped with proof `on any:pve log:VMI .* started: .*control=([0-9]\.[0-9]|1[0-9])ms` (under 20 ms).
 
 ### Waiting on stormblock#521 + stormpump#199: #311 (P1), X9 blades: container start 4-9 s in `containers`
 
