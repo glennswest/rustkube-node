@@ -852,7 +852,11 @@ with `CAP_IPC_LOCK` effective. A pod that doesn't ask must see neither.
     and the VMI's hostname, held for the machine's life;
   - `status.interfaces[]` has the pod IP from the start and the binding
     stormvm chose (`bridge`, `masquerade`, `passt`, `host-bridge`); the agent
-    and neighbour table do not replace a pod NIC's address.
+    and neighbour table do not replace a pod NIC's address. So the status
+    does not say the guest took it: a bridge-binding NIC's tap is watched
+    (#426), and a guest not seen with its pod IP (no lease, no traffic) 60 s
+    after the start gets a Warning event `PodAddressNotTaken` on the VMI,
+    naming the address, the MAC and the interface, once per machine.
   - `passt: {}` (`pod:passt`): stormvm's plan puts one passt per such NIC on
     the hypervisor's spec as a stormpump helper (`/pallets/passt`, stormcos#565),
     started before it and stopped with it, on the socket qemu's `-netdev stream`

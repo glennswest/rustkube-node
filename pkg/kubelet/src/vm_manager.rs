@@ -1080,6 +1080,9 @@ pub struct VmManager {
     /// the tap is the one place the node sees the lease go by. Not in [`Vm`],
     /// which is cloned freely and a watcher is not.
     snoopers: std::sync::Mutex<HashMap<String, Vec<(String, stormvm_net::Snooper)>>>,
+    /// Machines already told about a pod address their guest never took
+    /// (#426): the event is said once per machine.
+    pod_address_warned: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Where the watchers report a change, for [`Self::spawn_address_pump`]
     /// to write it to the VMI at once rather than on the next sync.
     snoop_tx: tokio::sync::mpsc::UnboundedSender<Snooped>,
@@ -1380,6 +1383,31 @@ struct Snooped {
     addresses: Vec<String>,
 }
 
+/// How long a guest on the pod network has to take its address before the
+/// kubelet says it has not (#426): DHCP at boot is seconds.
+pub const POD_ADDRESS_GRACE_SECS: u64 = 60;
+
+/// Why a pod-network NIC's guest has not taken the pod address the status
+/// reports (#426), when `age_secs` after the start the tap watcher has seen
+/// no lease or traffic of that address from it. `None` before the grace,
+/// for other bindings, and once it has.
+fn pod_address_not_taken(nics: &[NicReport], snooped: &[Vec<String>], age_secs: u64) -> Option<String> {
+    if age_secs < POD_ADDRESS_GRACE_SECS {
+        return None;
+    }
+    nics.iter().zip(snooped.iter().chain(std::iter::repeat(&Vec::new()))).find_map(|(n, seen)| {
+        let ip = n.addresses.first()?;
+        if n.binding != "bridge" || seen.iter().any(|a| a == ip) {
+            return None;
+        }
+        Some(format!(
+            "interface {} ({}): the guest has not taken its pod address {ip} {age_secs} s after the start: no DHCP lease \
+             or traffic of it was seen on its tap, so nothing on the pod network can reach it",
+            n.name, n.mac
+        ))
+    })
+}
+
 /// Per NIC, what the tap watcher saw, over what the agent or the neighbour
 /// table said (#91).
 ///
@@ -1437,6 +1465,7 @@ impl VmManager {
             contact: std::sync::Mutex::new(None),
             max_staleness: METADATA_MAX_STALENESS,
             snoopers: std::sync::Mutex::new(HashMap::new()),
+            pod_address_warned: std::sync::Mutex::new(std::collections::HashSet::new()),
             snoop_tx,
             snoop_rx: std::sync::Mutex::new(Some(snoop_rx)),
             retries: std::sync::Mutex::new(HashMap::new()),
@@ -2871,6 +2900,17 @@ impl VmManager {
                     self.patch_status(&with).await;
                 }
             }
+            // A guest on the pod network that never took its address (#426):
+            // the status reports the pod IP from the start, so this is the
+            // one place that says nothing answers for it.
+            let age = now_unix().saturating_sub(vm.started_unix);
+            if let Some(why) = pod_address_not_taken(&vm.nics, &self.snooped_addresses(&vm.uid, &vm.nics), age) {
+                let first = self.pod_address_warned.lock().unwrap_or_else(|e| e.into_inner()).insert(vm.uid.clone());
+                if first {
+                    warn!(vm = %vm.name, "{why}");
+                    self.event_of(&vm, "Warning", "PodAddressNotTaken", &why).await;
+                }
+            }
             // Its SSH keys through the agent, and the condition (#92).
             self.sync_access(&vm.uid, pinged.err()).await;
             // The next time the guest is asked (#101). Its exit is an event on
@@ -3053,6 +3093,7 @@ impl VmManager {
         deregister(&vm.namespace, &vm.name);
         crate::vm_hotplug::remove(&self.hot_dir, &vm.namespace, &vm.name);
         self.hot_records.lock().unwrap_or_else(|e| e.into_inner()).remove(&vm.uid);
+        self.pod_address_warned.lock().unwrap_or_else(|e| e.into_inner()).remove(&vm.uid);
         self.hot_seen.lock().unwrap_or_else(|e| e.into_inner()).remove(&vm.uid);
         self.stopping.lock().await.remove(&vm.uid);
         info!(vm = %vm.name, "vm stopped");
@@ -3453,9 +3494,13 @@ impl VmManager {
         // and the agent and the neighbour table still answer.
         // A multus NIC whose NAD has no IPAM is the same (stormvm#85): its
         // guest asks the VLAN's own DHCP, seen on the tap in the sandbox.
+        // A NIC with the pod's own address (the bridge binding, #426) is
+        // watched too: its DHCP is ours, and the tap is where the node sees
+        // whether the guest took the address the status reports.
         let watch = match (made.binding, &made.address, sandbox) {
             ("host-bridge", _, _) => Some(None),
             ("multus", None, Some(ns)) => Some(Some(ns)),
+            ("bridge", Some(_), Some(ns)) => Some(Some(ns)),
             _ => None,
         };
         if let Some(inside) = watch {
@@ -7815,6 +7860,25 @@ mod tests {
         assert_eq!(m.running().await.len(), 1, "HTTP 409 must remain retryable");
         server.abort();
 }
+
+    /// #426: a pod-network guest that never took its address is named after
+    /// the grace; one that did, another binding, or too early is not.
+    #[test]
+    fn a_pod_address_the_guest_never_took_is_named() {
+        let nic = |binding: &str| NicReport {
+            name: "default".into(),
+            mac: "0a:16:41:7e:7e:99".into(),
+            addresses: vec!["10.173.204.73".into()],
+            binding: binding.into(),
+        };
+        let why = pod_address_not_taken(&[nic("bridge")], &[vec![]], 61).unwrap();
+        assert!(why.contains("10.173.204.73") && why.contains("0a:16:41:7e:7e:99"), "{why}");
+        assert!(pod_address_not_taken(&[nic("bridge")], &[], 61).is_some(), "no watcher: nothing seen");
+        assert_eq!(pod_address_not_taken(&[nic("bridge")], &[vec![]], 30), None, "within the grace");
+        assert_eq!(pod_address_not_taken(&[nic("bridge")], &[vec!["10.173.204.73".into()]], 600), None, "taken");
+        assert_eq!(pod_address_not_taken(&[nic("host-bridge")], &[vec![]], 600), None, "not the pod's address");
+        assert_eq!(pod_address_not_taken(&[nic("masquerade")], &[vec![]], 600), None);
+    }
 
     /// `AccessCredentialsSynchronized`: every problem named, an agent not yet
     /// heard from is a reason, and the transition time holds while the status

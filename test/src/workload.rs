@@ -67,7 +67,7 @@ pub fn is_workload(args: &[String]) -> bool {
         Some(
             "fill" | "verify" | "size-at-least" | "sized" | "echo" | "exit" | "sleep" | "fail-once"
                 | "write-file" | "expect-file" | "expect-env" | "expect-nics" | "read-file" | "vm-instance" | "rdma-view"
-                | "member" | "grows" | "qga-probe"
+                | "member" | "grows" | "qga-probe" | "tcp-connect"
         )
     )
 }
@@ -143,6 +143,23 @@ fn qga_probe(sock: &str) -> Result<String, String> {
     let ifs = ask("guest-network-get-interfaces").map(|v| serde_json::json!(v.as_array().map_or(0, Vec::len)));
     out.insert("interfaces".into(), said(ifs));
     Ok(serde_json::Value::Object(out).to_string())
+}
+
+/// Connect to `target` (`ip:port`) until it answers or `secs` pass (#426):
+/// how long it took, or the last error (`Host is unreachable` is no
+/// neighbour for the address, a timeout is nothing answering).
+fn tcp_connect(target: &str, secs: u64) -> Result<String, String> {
+    let addr: std::net::SocketAddr = target.parse().map_err(|e| format!("{target}: {e}"))?;
+    let began = std::time::Instant::now();
+    let mut last = String::from("never tried");
+    while began.elapsed().as_secs() < secs {
+        match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5)) {
+            Ok(_) => return Ok(format!("connected to {target} after {} ms", began.elapsed().as_millis())),
+            Err(e) => last = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    Err(format!("{target} did not answer in {secs} s: {last}"))
 }
 
 /// The commands the kubelet uses, whose `enabled` the probe reports.
@@ -366,6 +383,7 @@ fn run(args: &[String]) -> Result<String, String> {
     match args[0].as_str() {
         "rdma-view" => Ok(rdma_view()),
         "qga-probe" => qga_probe(&arg(1, "agent socket")?),
+        "tcp-connect" => tcp_connect(&arg(1, "address:port")?, num(2, "seconds")?),
         "vm-instance" => {
             let address = arg(1, "address")?;
             let workload = args.get(2).map(String::as_str) != Some("no-workload-token");

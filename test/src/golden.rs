@@ -58,6 +58,13 @@
 //! - `vmi-agent-keys` (#405, #92): that VMI's `AccessCredentialsSynchronized`
 //!   is True within 180 s of its boot (its key set through the agent).
 //!
+//! - `vmi-pod-network` (#426, #88): a VMI on `pod: {}` (the bridge binding)
+//!   prints its own IPv4 addresses on its console; a pod on the node then
+//!   connects to the pod IP its status reports, port 22. Passes when it
+//!   connects. Otherwise it says what the guest holds (did it get its lease?)
+//!   and how the connect failed (`Host is unreachable`: nothing answers
+//!   for the address), with the VMI's events.
+//!
 //! The VMIs and requests are deleted after. **The sealed golden `G` is not**:
 //! a test gets no stormblock admin token, and a storage user deletes only
 //! what it made itself (stormcentral docs/test-standard.md); the kubelet
@@ -88,6 +95,10 @@ pub const MIRRORED: &str = "gold-mirror";
 pub const DIRECT: &str = "gold-direct";
 pub const OUTSIDE: &str = "gold-outside";
 pub const AGENT: &str = "gold-agent";
+pub const PODNET: &str = "gold-podnet";
+pub const PODNET_CLIENT: &str = "gold-podnet-client";
+/// Printed with the guest's addresses; the shell makes the last part.
+pub const PODNET_MARKER: &str = "RKN-PODNET-2";
 pub const AGENT_PROBE: &str = "gold-agent-probe";
 pub const AGENT_SECRET: &str = "gold-agent-key";
 /// A well-formed ed25519 public key nobody holds the private half of.
@@ -309,6 +320,29 @@ impl Suite {
         .await
     }
 
+    /// `vmi-pod-network` (#426): `booted` is the VMI's console up to its
+    /// addresses, or why it did not get there.
+    async fn pod_network(&self, booted: Result<String, String>) -> Outcome {
+        let path = format!("{}/{PODNET}", vmis(&self.env));
+        let now = match self.api.get(&path).await {
+            Ok(Some(v)) => v,
+            Ok(None) => return Outcome::Fail(format!("VMI {PODNET} is gone")),
+            Err(e) => return Outcome::Infra(e),
+        };
+        let held = booted.as_deref().ok().and_then(podnet_addresses);
+        let events = k8s::events_for(&self.env, &self.api, "VirtualMachineInstance", PODNET).await.unwrap_or_default();
+        let Some(ip) = now["status"]["interfaces"][0]["ipAddress"].as_str().filter(|i| !i.is_empty()).map(str::to_string) else {
+            return Outcome::Fail(format!("the VMI reports no pod IP: {}", short(&now["status"])));
+        };
+        let target = format!("{ip}:22");
+        let pods = k8s::pods(&self.env);
+        if let Err(e) = self.api.create(&pods, &k8s::pod(&self.env, PODNET_CLIENT, &["tcp-connect", &target, "120"])).await {
+            return Outcome::Infra(e);
+        }
+        let connect = k8s::pod_done(&self.env, &self.api, PODNET_CLIENT, Duration::from_secs(180)).await;
+        judge_pod_network(&ip, booted.as_ref().err(), held.as_deref(), connect.map(|d| d.message), &events)
+    }
+
     /// The VMI for #405: a key for root through the guest agent.
     async fn boot_agent_vm(&self, root: &str, says_id: &str) -> Result<String, String> {
         let secrets = format!("/api/v1/namespaces/{}/secrets", self.env.namespace);
@@ -425,11 +459,13 @@ impl Suite {
         for r in [ASK_FAIL, ASK_SEAL] {
             self.api.delete(&format!("{}/{r}", requests(&self.env))).await?;
         }
-        self.api.delete(&format!("{}/{AGENT_PROBE}", k8s::pods(&self.env))).await?;
-        for v in [SOURCE, NO_AGENT, CLONE, MIRRORED, DIRECT, OUTSIDE, AGENT] {
+        for p in [AGENT_PROBE, PODNET_CLIENT] {
+            self.api.delete(&format!("{}/{p}", k8s::pods(&self.env))).await?;
+        }
+        for v in [SOURCE, NO_AGENT, CLONE, MIRRORED, DIRECT, OUTSIDE, AGENT, PODNET] {
             self.api.delete(&format!("{}/{v}", vmis(&self.env))).await?;
         }
-        for v in [SOURCE, NO_AGENT, CLONE, MIRRORED, DIRECT, OUTSIDE, AGENT] {
+        for v in [SOURCE, NO_AGENT, CLONE, MIRRORED, DIRECT, OUTSIDE, AGENT, PODNET] {
             k8s::gone(&self.api, &format!("{}/{v}", vmis(&self.env)), Duration::from_secs(120)).await?;
         }
         Ok(())
@@ -456,11 +492,17 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
     }
 
     let (says_id, no_agent) = (says_its_id(), has_no_agent());
-    let (src, noagent, agent_vm) = tokio::join!(
+    let (src, noagent, agent_vm, podnet) = tokio::join!(
         suite.boot(SOURCE, &root, &says_id, |c| machine_id(c).is_some()),
         suite.boot(NO_AGENT, &root, &no_agent, |c| c.contains(NO_AGENT_MARKER)),
         suite.boot_agent_vm(&root, &says_id),
+        suite.boot_vmi(PODNET, podnet_vmi(&env, &root), BOOT, |c| c.contains(PODNET_MARKER)),
     );
+
+    // A VMI on the pod network, reached from a pod (#426).
+    let tp = Instant::now();
+    let o = suite.pod_network(podnet).await;
+    r.record("vmi-pod-network", o, tp.elapsed().as_millis(), None);
 
     // The guest agent as the node reaches it, and keys through it (#405).
     let ta = Instant::now();
@@ -573,6 +615,52 @@ pub fn judge_status_volumes(vmi: &Value, golden: &str) -> Outcome {
         return Outcome::Fail(format!("the root entry is not complete (volumeID, golden {golden}, owned): {root}"));
     }
     Outcome::Pass(format!("{} volume(s); root: {root}", vols.len()))
+}
+
+/// A VMI on this node on the pod network (the bridge binding, #426), whose
+/// console says its IPv4 addresses once cloud-init has run.
+pub fn podnet_vmi(env: &Env, root: &str) -> Value {
+    let user_data = format!(
+        "#cloud-config\nruncmd:\n  - [ sh, -c, \"sync; echo {}-$((1+1)) $(ip -4 -o addr show scope global | awk '{{print $4}}' | tr '\\\\n' ' ') > /dev/console\" ]\n",
+        PODNET_MARKER.rsplit_once('-').map_or(PODNET_MARKER, |(h, _)| h)
+    );
+    let mut v = vmi(env, PODNET, root, &user_data);
+    v["spec"]["domain"]["devices"]["interfaces"] = json!([{ "name": "default", "bridge": {} }]);
+    v["spec"]["networks"] = json!([{ "name": "default", "pod": {} }]);
+    v
+}
+
+/// What the guest said it holds, after [`PODNET_MARKER`]: `Some("")` for none.
+pub fn podnet_addresses(console: &str) -> Option<String> {
+    let i = console.rfind(PODNET_MARKER)?;
+    Some(console[i + PODNET_MARKER.len()..].lines().next().unwrap_or("").trim().to_string())
+}
+
+/// `vmi-pod-network`.
+pub fn judge_pod_network(
+    ip: &str,
+    boot_failed: Option<&String>,
+    held: Option<&str>,
+    connect: Result<String, String>,
+    events: &[String],
+) -> Outcome {
+    let guest = match (boot_failed, held) {
+        (_, Some("")) => "the guest says it holds no IPv4 address (no lease)".to_string(),
+        (_, Some(h)) if h.split_whitespace().any(|a| a.split('/').next() == Some(ip)) => format!("the guest holds {h}"),
+        (_, Some(h)) => format!("the guest holds {h}, not {ip}"),
+        (Some(e), None) => format!("the guest never printed its addresses: {e}"),
+        (None, None) => "the guest's addresses are unknown".to_string(),
+    };
+    let line: Value = connect.as_deref().ok().and_then(|m| serde_json::from_str(m).ok()).unwrap_or(Value::Null);
+    let said = line["detail"].as_str().map(str::to_string).unwrap_or_else(|| match &connect {
+        Ok(m) => m.clone(),
+        Err(e) => e.clone(),
+    });
+    if line["ok"] == json!(true) {
+        return Outcome::Pass(format!("a pod reached the VMI's pod IP: {said}; {guest}"));
+    }
+    let ev = if events.is_empty() { String::new() } else { format!("; VMI events: {}", events.join(" | ")) };
+    Outcome::Fail(format!("no pod reaches the VMI's pod IP {ip}: {said}; {guest}{ev}"))
 }
 
 /// `accessCredentials` for root's key through the guest agent.
@@ -818,6 +906,28 @@ mod tests {
         assert!(matches!(judge_direct(&format!("[ 0.0] Linux\n{id}\n"), &b), Outcome::Pass(_)));
         assert!(matches!(judge_direct(&format!("BdsDxe: loading\n{id}\n"), &b), Outcome::Fail(_)));
         assert!(matches!(judge_direct("nothing", &b), Outcome::Fail(_)));
+    }
+
+    #[test]
+    fn the_pod_network_is_judged() {
+        let ok = |d: &str| Ok(serde_json::json!({"workload": "tcp-connect", "ok": true, "detail": d}).to_string());
+        let no = |d: &str| Ok(serde_json::json!({"workload": "tcp-connect", "ok": false, "detail": d}).to_string());
+        assert!(matches!(judge_pod_network("10.1.2.3", None, Some("10.1.2.3/16"), ok("connected"), &[]), Outcome::Pass(_)));
+        match judge_pod_network("10.1.2.3", None, Some(""), no("Host is unreachable (os error 113)"), &["PodAddressNotTaken x".into()]) {
+            Outcome::Fail(m) => assert!(m.contains("no lease") && m.contains("unreachable") && m.contains("PodAddressNotTaken"), "{m}"),
+            o => panic!("{o:?}"),
+        }
+        match judge_pod_network("10.1.2.3", None, Some("10.1.2.3/16"), no("timed out"), &[]) {
+            Outcome::Fail(m) => assert!(m.contains("the guest holds 10.1.2.3/16"), "{m}"),
+            o => panic!("{o:?}"),
+        }
+        assert_eq!(podnet_addresses("x RKN-PODNET-2 10.1.2.3/16 \nmore"), Some("10.1.2.3/16".into()));
+        assert_eq!(podnet_addresses("RKN-PODNET-2 \n"), Some(String::new()));
+        assert_eq!(podnet_addresses("nothing"), None);
+        let v = podnet_vmi(&crate::k8s::tests::env(), "g");
+        assert_eq!(v["spec"]["networks"][0]["pod"], serde_json::json!({}));
+        let ud = s(&v, "/spec/volumes/1/cloudInitNoCloud/userData");
+        assert!(ud.contains("RKN-PODNET-$((1+1))") && !ud.contains(PODNET_MARKER), "{ud}");
     }
 
     #[test]
