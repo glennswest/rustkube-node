@@ -466,6 +466,7 @@ Handed back unchanged: stormcluster#123's fix is f1de3f6 (h2 ALPN on :9102), not
   Done: 25a5ccd. sc-build passed (VM sc-build-aea9558182, 672 kubelet unit incl. a_template_gone_before_its_clone_is_minted_once_and_cloned).
   Stage build b3e26b8573c7. Shipped with proof `log:warm probes: container \(3 times\), claim and VM` (a passed install
   gates on the warm claim probe, stormcentral testhosts.rs warm_verdict). #387 (a real broken-template case) waits on stormblock#664.
+  2026-11-20: stormblock#664 closed as obsolete (no `broken` state since stormblock#663); #387 closed not planned, no code.
 
 ### Done: #381 (P1), VirtualMachineRestore waits up to 60 s: vm_maintenance_loop does not watch restores (stormvm#127)
 
