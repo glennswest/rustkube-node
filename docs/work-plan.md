@@ -24,6 +24,10 @@ No shipped service names a process after itself (rustkube-apiserver: apiserver/s
 apiserver-listening; rustkube-node: kubelet), so the name rule split nothing: 1301cb7 reads stormd's `helper` flag instead
 (filed stormd#80). sc-build 5b1411f5c7 passed (746). Held `--after stormd#80`. Resume: file on stormcos to mark
 stormcert-renew `helper = true`, hold `--after-install` of that; proof `api:` the rustkube-apiserver mirror's containers.
+2026-11-20: stormd#80 done (stormd 5bc5380, `"helper"` in /api/v1/processes, the field 1301cb7 parses). Filed
+stormcos#1483 (mark `stormcert-renew` `helper = true` in build-goldens.sh). Held `--after stormcos#1483`. Resume: take
+stormcos's commit, hold `--after-install stormcos>=<commit>`, then `shipped` with proof
+`api:` the mirror pod of the service running stormcert-renew lists a container `"name":"stormcert-renew"`.
 
 ### Blocked: #429 (P3), attach to a tty/stdin container after a kubelet restart
 2026-11-20. Needs the engine to keep a deposited fd across the client's detach and hand it back: none exists (ABI.md,
