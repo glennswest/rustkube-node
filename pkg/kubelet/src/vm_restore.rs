@@ -10,7 +10,8 @@
 //! restored claims):
 //!
 //! 1. waits for the snapshot to be `Succeeded`, and for the VM to be stopped
-//!    (no VMI): a running guest's disks are not swapped under it;
+//!    (no VMI: the apiserver answered 404, #444; a lookup that failed waits
+//!    for the next pass): a running guest's disks are not swapped under it;
 //! 2. for every disk in the snapshot's disk map (`storm.io/snapshot-disks`,
 //!    written when it was taken) except a cloud-init one, makes a **new**
 //!    volume from that disk's member, `<ns>.<vm>-<disk>-restore-<restore>`:
@@ -341,9 +342,19 @@ impl Snapshots {
                 req.snapshot
             )));
         }
-        // Stopped: a running guest's disks are not swapped under it.
-        if self.api_object(&format!("/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{}", req.vm)).await.is_some() {
-            return Err(Step::Wait(format!("VirtualMachine {} is running: stop it to restore", req.vm)));
+        // Stopped: a running guest's disks are not swapped under it. Only a
+        // confirmed 404 says there is no VMI (#444, f948ce2ee55f): a lookup
+        // that failed or answered something unreadable proves nothing, and
+        // the restore waits for the next pass.
+        match self.api_lookup(&format!("/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{}", req.vm)).await {
+            Ok(None) => {}
+            Ok(Some(_)) => return Err(Step::Wait(format!("VirtualMachine {} is running: stop it to restore", req.vm))),
+            Err(e) => {
+                return Err(Step::Wait(format!(
+                    "cannot tell whether VirtualMachine {} is stopped ({e}): retrying",
+                    req.vm
+                )))
+            }
         }
         let vm_path = format!("/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{}", req.vm);
         let Some(vm) = self.api_object(&vm_path).await else {
@@ -625,6 +636,21 @@ impl Snapshots {
         Ok(pvc["metadata"]["uid"].as_str().unwrap_or("").to_string())
     }
 
+    /// An object, `None` only when the apiserver said 404, and an error for
+    /// anything else that is not the object: a refused or failed call, another
+    /// status, a body that is not JSON (#444).
+    async fn api_lookup(&self, path: &str) -> Result<Option<Value>, String> {
+        let (api, url, _) = self.api();
+        let r = api.get(format!("{url}{path}")).send_retrying(retry::Policy::API).await.map_err(|e| format!("GET {path}: {e}"))?;
+        if r.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !r.status().is_success() {
+            return Err(format!("GET {path}: {}", r.status()));
+        }
+        r.json().await.map(Some).map_err(|e| format!("GET {path}: not an object: {e}"))
+    }
+
     async fn api_object(&self, path: &str) -> Option<Value> {
         let (api, url, _) = self.api();
         match api.get(format!("{url}{path}")).send_retrying(retry::Policy::API).await {
@@ -682,9 +708,22 @@ pub(crate) mod tests {
                 async move {
                     use axum::http::StatusCode;
                     let path = uri.path().to_string();
+                    use axum::response::IntoResponse;
                     let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                     let mut s = s.lock().unwrap();
-                    match method.as_str() {
+                    // A stored failure (#444): `__status` answers that status,
+                    // `__raw` that text with 200.
+                    if method == axum::http::Method::GET {
+                        if let Some(v) = s.get(&path) {
+                            if let Some(code) = v["__status"].as_u64() {
+                                return (StatusCode::from_u16(code as u16).unwrap(), "{}").into_response();
+                            }
+                            if let Some(raw) = v["__raw"].as_str() {
+                                return (StatusCode::OK, raw.to_string()).into_response();
+                            }
+                        }
+                    }
+                    let answer = match method.as_str() {
                         "GET" if path.ends_with("/virtualmachinerestores") => {
                             let items: Vec<Value> = s.iter().filter(|(k, _)| k.contains("/virtualmachinerestores/")).map(|(_, v)| v.clone()).collect();
                             (StatusCode::OK, axum::Json(json!({ "items": items })))
@@ -735,7 +774,8 @@ pub(crate) mod tests {
                             (StatusCode::OK, axum::Json(json!({})))
                         }
                         _ => (StatusCode::NOT_FOUND, axum::Json(json!({}))),
-                    }
+                    };
+                    answer.into_response()
                 }
             },
         );
@@ -1021,6 +1061,32 @@ pub(crate) mod tests {
         snapshots(&url, engine.clone()).restores().await;
         assert!(writes.lock().unwrap().is_empty());
         assert!(store.lock().unwrap()[RESTORE].get("status").is_none());
+    }
+
+    /// #444 (f948ce2ee55f): a VMI lookup that failed, or answered something
+    /// that is not JSON, is not a stopped VM: nothing is made, the VM is not
+    /// rewired, the restore is not complete and says why; once the VMI is
+    /// confirmed absent (404) the next pass restores it.
+    #[tokio::test]
+    async fn a_failed_vmi_lookup_is_not_a_stopped_vm() {
+        for failure in [json!({ "__status": 500 }), json!({ "__status": 403 }), json!({ "__raw": "<html>proxy</html>" })] {
+            let (url, store, _) = api(vec![(SNAP, snapshot("n1", Some(DISKS))), (RESTORE, restore()), (VM, vm()), (VMI, failure.clone())]).await;
+            let engine = Arc::new(Engine::default());
+            snapshots(&url, engine.clone()).restores().await;
+            assert!(engine.made.lock().unwrap().is_empty(), "{failure}: nothing made");
+            let s = store.lock().unwrap().clone();
+            assert!(!s.keys().any(|k| k.contains("/persistentvolumeclaims/")), "{failure}: no claim");
+            assert_eq!(s[VM], vm(), "{failure}: the VM is not rewired");
+            let st = &s[RESTORE]["status"];
+            assert_eq!(st["complete"], false, "{failure}");
+            assert!(st["conditions"][0]["reason"].as_str().unwrap().contains("cannot tell whether"), "{failure}: {st}");
+
+            // The lookup answers 404 now: restored.
+            store.lock().unwrap().remove(VMI);
+            snapshots(&url, engine.clone()).restores().await;
+            assert_eq!(engine.made.lock().unwrap().len(), 2, "{failure}: restored once absent");
+            assert_eq!(store.lock().unwrap()[RESTORE]["status"]["complete"], true);
+        }
     }
 
     #[tokio::test]
