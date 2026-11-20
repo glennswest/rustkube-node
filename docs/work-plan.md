@@ -4,6 +4,16 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #448 (P1), review: fsGroup walk (volume_ownership.rs)
+
+5bcb74c7d170: the root was fixed before its children, so an interrupted walk satisfied OnRootMismatch. 9db8782b9019: the walk
+went by path (set_permissions follows symlinks; ancestors re-resolved), so a pod sharing the claim could swap in a symlink.
+Plan: walk by descriptor from the opened root, iterative post-order (each directory, root last, after its entries);
+each entry `openat(parent, name, O_NOFOLLOW)` (O_PATH first to see a symlink, which is skipped; directories reopened
+O_DIRECTORY|O_NOFOLLOW); chown/chmod on the entry's own descriptor (`fchown`/`fchmod`; a non-directory through
+`/proc/self/fd/N`). Tests: an unreadable subdirectory fails the walk and leaves the root mismatched, the retry finishes;
+a symlinked directory is not entered.
+
 ### Done: #444 (P1), review: VM restore takes a failed VMI lookup as a stopped VM
 
 Fixed in e397beb; sc-build passed (VM sc-build-90ac5631d2: 780 kubelet tests ok, `a_failed_vmi_lookup_is_not_a_stopped_vm`
