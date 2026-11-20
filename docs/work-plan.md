@@ -4,6 +4,23 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #449 (P1), review: 4 findings in vm_manager.rs
+
+- 5dba1ccb44f2 (resume annotation names any volume): `prepare_resume` verifies before it attaches or deletes anything:
+  the restore is `<VMI ns>/<name>`, exists, targets the VMI's owner VM and still says memory `pending`; the volume is
+  exactly `vm_restore::state_name(ns, vm, restore)`; the engine's record of it is owned by that VM (kind, ns, name, uid
+  from the VMI's ownerReference), or has no owner only when the VM retains its disks. Unverified: cold, nothing
+  attached, deleted or reported to any restore.
+- ec3bbd2a528a (failed unpause drops the resume): a failed unpause keeps the resume and retries until RESUME_WAIT; past
+  it (and on the timeout) the machine is stopped first, and only once stopped is the resume finished (state detached,
+  restore told cold-boot) and the VM removed for a cold start; a refused stop keeps everything and retries.
+- 0eccd916ccf5 (migration id lost on a failed record write): the record is kept in memory even when the VMI patch fails,
+  and marked unwritten so the next pass writes it again; `start_disk_move` first asks stormstorage for a live migration
+  of the source (`live_for`): one to the same node is carried, a failed one aborted first, one elsewhere refused.
+- e2198b663261 (move marked done with the guest paused): `Move.resume` (resume pending) set at the switch and by restart
+  recovery of SWITCHING-on-copy; each pass makes the guest run (new `Hotplug::paused`, from the machine's status) before
+  retiring the source; MOVED only once it runs; the failure stays in `message` until then.
+
 ### Done: #448 (P1), review: fsGroup walk (volume_ownership.rs)
 
 Fixed in bebfebb (+ 8f59e72 README); sc-build passed (VM sc-build-17d7969c14: 783 kubelet tests ok, 3 new). Closed.
