@@ -86,12 +86,16 @@ fn probe_headers(http: &Value) -> Result<Vec<(HeaderName, HeaderValue)>, String>
             .map_err(|e| format!("httpGet: header {name} value: {e}"))?;
         out.push((n, v));
     }
-    let has = |n: &HeaderName| out.iter().any(|(k, _)| k == n);
-    if !has(&reqwest::header::USER_AGENT) {
+    let has = |out: &[(HeaderName, HeaderValue)], n: &HeaderName| out.iter().any(|(k, _)| k == n);
+    let (has_ua, has_accept) = (
+        has(&out, &reqwest::header::USER_AGENT),
+        has(&out, &reqwest::header::ACCEPT),
+    );
+    if !has_ua {
         let ua = HeaderValue::from_str(&probe_user_agent()).map_err(|e| e.to_string())?;
         out.push((reqwest::header::USER_AGENT, ua));
     }
-    if !has(&reqwest::header::ACCEPT) {
+    if !has_accept {
         out.push((reqwest::header::ACCEPT, HeaderValue::from_static("*/*")));
     }
     Ok(out)
