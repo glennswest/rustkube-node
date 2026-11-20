@@ -106,7 +106,7 @@ pub fn problems(node: &str, pvcs: &[Value], pvs: &[Value]) -> Vec<String> {
 
 async fn lists(api: &Api) -> Result<(Vec<Value>, Vec<Value>), String> {
     let pvcs = api
-        .list(&format!("/api/v1/persistentvolumeclaims?labelSelector=storm.io%2Fsystem-volume%3Dtrue"))
+        .list("/api/v1/persistentvolumeclaims?labelSelector=storm.io%2Fsystem-volume%3Dtrue")
         .await?
         .ok_or("claims are not served")?;
     let pvs = api.list(k8s::PVS).await?.ok_or("PVs are not served")?;
