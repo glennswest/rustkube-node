@@ -4,6 +4,13 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #318 (P2), --stormblock-ca for stormvm's engine clients
+2026-11-20. stormvm 319333d already has 59dc498 (`STORMBLOCK_CA_FILE` in stormvm-block, no CA argument on the console's
+`snapshot::take*`/`Config`). The flag never reached those clients. df261de: main is sync, puts `--stormblock-ca` in
+`STORMBLOCK_CA_FILE` before the tokio runtime starts, then runs `run(cli)`. Test: vm_restore's Stormblock reaches an
+https engine from the CA, another CA's is refused with nothing sent. sc-build at df261de running (tmp/sc-build-318.log).
+Then stage; the node half (a VMSnapshot + restore against an https engine) needs a node whose stormblock serves TLS.
+
 ### In progress: #334 (P1), a kubelet restart adopts no pods on stormpump
 2026-11-20. Cause (issue): StormpumpRuntime's sandbox/container maps are memory only; the engine keeps the workloads and
 their handles across a reattach with the same TOKEN and hands back exits held while away (stormpump DESIGN "That gap is
