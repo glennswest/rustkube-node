@@ -25,6 +25,7 @@ kubelet clippy names nothing in the changed lines (#386's remain). Stage build 9
 Not live yet: stormcos gives the kubelet `--stormstorage` (STORMSTORAGE_URL in env.d) only once stormcos#354 lands, and a mirror needs
 two storage nodes. Held `--after stormcos#354`. Resume: `stormcentral test run rustkube-node golden` on a multi-node machine whose kubelet
 has stormstorage; `vmi-mirrored-root` passing → shipped/close #404.
+2026-11-20: handed back with stormcos#354 still open; nothing to do until it lands. Held `--after stormcos#354` again.
 
 ### Shipped (proof pending): #418 (P0), mirror pods in each service's project (stormcos#1020)
 2026-11-19. Plan: `mirror_namespaces.rs`: `--mirror-namespaces` (env `MIRROR_NAMESPACES`, default
