@@ -2,6 +2,7 @@
 
 ## 2026-11-20
 
+- **test:** the `golden` suite's probe pods (`vmi-agent-answers`, `vmi-pod-network`) say what the workload printed (#405, #426). They read only the termination message, which the kubelet reports only when the runtime gives one (#162), so run a31775e9fc on pvetest2 got `the probe said: ` and an empty connect result. Now the message, else the last line of the pod's log, else its phase.
 - **feat:** A pod-network VMI whose guest never took its pod address is said, not hidden (#426). A VMI's status reports the pod IP from the start, so a Running VMI looked reachable when no pod could reach it (stormcos_qa medium 2a7f7e5065 on pvetest2, flowsdn: EHOSTUNREACH). The tap of a bridge-binding NIC is now watched, as host-bridge NICs' are. If the guest has not been seen with its pod IP (no lease, no traffic) 60 s after the start, the VMI gets a Warning event `PodAddressNotTaken` naming the address, the MAC and the interface, once per machine.
 - **test:** the `golden` suite's `vmi-pod-network` (#426, #88). A VMI on `pod: {}` prints its IPv4 addresses on its console, then a pod on the node connects to the pod IP its status reports, port 22. A failure says whether the guest got its lease, how the connect failed, and the VMI's events. New workload: `/test tcp-connect <ip:port> <secs>`.
 - **test:** the `golden` suite no longer stops when vmimages' VirtualMachineGolden CRD is not served (run 6986230043 on pvetest2 ran nothing). Only the golden requests need it; the VMI cases (#404, #405, #421, #426) run, and `golden-crd` says the requests were left out.

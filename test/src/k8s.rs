@@ -208,6 +208,23 @@ pub struct Done {
     pub message: String,
 }
 
+/// What a finished workload pod said: its termination message, else the
+/// last line of its log (the kubelet reports a message only when the runtime
+/// gives one, #162), else its phase. Never empty.
+pub async fn said(env: &Env, api: &Api, name: &str, done: &Done) -> String {
+    if !done.message.trim().is_empty() {
+        return done.message.trim().to_string();
+    }
+    let log = match log(env, api, name, false).await {
+        Ok(l) => l,
+        Err(e) => return format!("pod {name} ended {} with no message and no log ({e})", done.phase),
+    };
+    match log.lines().rev().map(str::trim).find(|l| !l.is_empty()) {
+        Some(line) => line.to_string(),
+        None => format!("pod {name} ended {} with no message and an empty log", done.phase),
+    }
+}
+
 /// Wait for pod `name` to reach Succeeded or Failed.
 pub async fn pod_done(env: &Env, api: &Api, name: &str, within: Duration) -> Result<Done, String> {
     let path = format!("{}/{name}", pods(env));

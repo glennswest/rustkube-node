@@ -341,8 +341,11 @@ impl Suite {
         if let Err(e) = self.api.create(&pods, &k8s::pod(&self.env, PODNET_CLIENT, &["tcp-connect", &target, "120"])).await {
             return Outcome::Infra(e);
         }
-        let connect = k8s::pod_done(&self.env, &self.api, PODNET_CLIENT, Duration::from_secs(180)).await;
-        judge_pod_network(&ip, booted.as_ref().err(), held.as_deref(), connect.map(|d| d.message), &events)
+        let connect = match k8s::pod_done(&self.env, &self.api, PODNET_CLIENT, Duration::from_secs(180)).await {
+            Ok(d) => Ok(k8s::said(&self.env, &self.api, PODNET_CLIENT, &d).await),
+            Err(e) => Err(e),
+        };
+        judge_pod_network(&ip, booted.as_ref().err(), held.as_deref(), connect, &events)
     }
 
     /// The VMI for #405: a key for root through the guest agent.
@@ -366,7 +369,7 @@ impl Suite {
             return Outcome::Infra(e);
         }
         match k8s::pod_done(&self.env, &self.api, AGENT_PROBE, Duration::from_secs(120)).await {
-            Ok(done) => judge_agent_probe(&done.message),
+            Ok(done) => judge_agent_probe(&k8s::said(&self.env, &self.api, AGENT_PROBE, &done).await),
             Err(e) => Outcome::Infra(e),
         }
     }

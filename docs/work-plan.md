@@ -40,6 +40,9 @@ Golden run 6986230043 on pvetest2 ran nothing (vmimages' CRD missing, the suite 
 `vmi-agent-answers`: ping answered + guest-network-get-interfaces enabled/answered → why the old kubelet never saw it is
 elsewhere; ping answered but interfaces refused/disabled → the fix is the cause, close once vmi-agent-keys passes on an install
 with c45ec96f6c7b's commit; ping not answered → the node's channel (stormvm/stormpump), file there with the probe's words.
+Run a31775e9fc: `vmi-agent-answers` "the probe said: " (pod done in 3 s, empty): the golden suite read only the termination
+message, which the kubelet reports only when the runtime gives one (#162); vmi-pod-network's connect was blank the same way.
+Fix: `k8s::said` (message, else the log's last line, else the phase) for both probes. Then sc-build, golden rerun on pvetest2.
 
 ### Waiting on an install: #421 (P2), direct kernel boot from the golden's kernel (vmcloud-image-operator#62, stormvm#111)
 2026-11-20. Finding: no mount is needed. stormvm's machine spec is `root: Root::Inherit`, which stormpump documents as "the
