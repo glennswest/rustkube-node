@@ -20,6 +20,10 @@ Done: 4792022 (stormd_api Golden/parse_goldens/split, Process.goldens read in st
 container_from_stormd, with_volumes keeps golden volumes, volumes_current/status_current over every container; kubelet.rs
 apply_stormd returns the helpers). sc-build running (tmp/sc-build-378.log). Next: pass → stage; proof on a node: a service
 with a helper process (which one runs one? check the release's stormd configs) shows a second container.
+No shipped service names a process after itself (rustkube-apiserver: apiserver/stormcert/stormcert-renew/
+apiserver-listening; rustkube-node: kubelet), so the name rule split nothing: 1301cb7 reads stormd's `helper` flag instead
+(filed stormd#80). sc-build 5b1411f5c7 passed (746). Held `--after stormd#80`. Resume: file on stormcos to mark
+stormcert-renew `helper = true`, hold `--after-install` of that; proof `api:` the rustkube-apiserver mirror's containers.
 
 ### Blocked: #429 (P3), attach to a tty/stdin container after a kubelet restart
 2026-11-20. Needs the engine to keep a deposited fd across the client's detach and hand it back: none exists (ABI.md,
