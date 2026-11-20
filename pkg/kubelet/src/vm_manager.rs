@@ -7836,7 +7836,7 @@ mod tests {
             Some(Err("waiting for the guest agent to answer".into()))
         );
         let a = Access { agent: Some(vec![]), ..Access::default() };
-        assert_eq!(access_outcome(&[agent.clone()], &a), Some(Ok(())));
+        assert_eq!(access_outcome(std::slice::from_ref(&agent), &a), Some(Ok(())));
         // Why the agent did not answer is said (#405).
         let a = Access { agent_said: Some("guest-ping: no answer within 2 s".into()), ..Access::default() };
         assert_eq!(
