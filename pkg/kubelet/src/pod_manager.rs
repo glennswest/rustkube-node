@@ -4231,7 +4231,11 @@ impl PodManager {
             let image_ref = self.startup_image(pod,image, spec).await?;
             let mut envs = self.resolve_env(pod, spec, pod_ip).await?;
             merge_env(&mut envs, self.service_account_env());
-            let mut mounts = resolve_mounts(spec, volumes);
+            let mut mounts = resolve_mounts(spec, volumes, &envs).map_err(|message| CriError::Container {
+                container: cname.to_string(),
+                reason: "CreateContainerConfigError".into(),
+                message,
+            })?;
             push_mount(&mut mounts, sa_mount.clone());
             push_mount(&mut mounts, dns_mount.clone());
             let mut config = build_container_config(spec, &image_ref, envs, mounts);
@@ -4718,7 +4722,11 @@ impl PodManager {
                 .resolve_env(pod, container_spec, pod_ip.as_deref())
                 .await?;
             merge_env(&mut envs, self.service_account_env());
-            let mut mounts = resolve_mounts(container_spec, &volumes);
+            let mut mounts = resolve_mounts(container_spec, &volumes, &envs).map_err(|message| CriError::Container {
+                container: container_name.to_string(),
+                reason: "CreateContainerConfigError".into(),
+                message,
+            })?;
             push_mount(&mut mounts, sa_mount.clone());
             push_mount(&mut mounts, dns_mount.clone());
             let mut container_config =
@@ -5620,7 +5628,14 @@ impl PodManager {
             }
         };
         merge_env(&mut envs, self.service_account_env());
-        let mut mounts = resolve_mounts(spec, &volumes);
+        let mut mounts = match resolve_mounts(spec, &volumes, &envs) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("Container {}/{}/{name}: {e}", state.namespace, state.name);
+                self.due_in(&state.uid, deadlines::RECHECK);
+                return false;
+            }
+        };
         match self.service_account_mount(&state.pod).await {
             Ok(m) => push_mount(&mut mounts, m),
             Err(e) => {
@@ -7368,10 +7383,154 @@ fn refresh_at(
 /// Resolve a container's `volumeMounts` (and `volumeDevices`, #67) to CRI
 /// mounts using the pod's resolved volumes. Mounts whose volume didn't
 /// resolve are dropped.
-fn resolve_mounts(spec: &Value, volumes: &HashMap<String, ResolvedVolume>) -> Vec<Mount> {
-    let mut mounts = resolve_volume_mounts(spec, volumes);
+/// A container's mounts and devices. `env` is the container's resolved env,
+/// which a `subPathExpr` expands. `Err` is why a mount cannot be made as
+/// asked (a `subPath` that leaves its volume, goes through a symlink, or is
+/// on a volume this node cannot take a subpath of): the container is not
+/// created, as upstream's `CreateContainerConfigError`.
+fn resolve_mounts(
+    spec: &Value,
+    volumes: &HashMap<String, ResolvedVolume>,
+    env: &[(String, String)],
+) -> Result<Vec<Mount>, String> {
+    let mut mounts = resolve_volume_mounts(spec, volumes, env)?;
     mounts.extend(resolve_volume_devices(spec, volumes));
-    mounts
+    Ok(mounts)
+}
+
+/// Expand `$(NAME)` in a `subPathExpr` from the container's env, as
+/// upstream does: `$$` is a literal `$`, and a name the env does not set is
+/// left as written.
+fn expand_env_refs(s: &str, env: &[(String, String)]) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find('$') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        if let Some(r) = after.strip_prefix('$') {
+            out.push('$');
+            rest = r;
+        } else if let Some(body) = after.strip_prefix('(') {
+            match body.find(')') {
+                Some(end) => {
+                    let name = &body[..end];
+                    match env.iter().rev().find(|(k, _)| k == name) {
+                        Some((_, v)) => out.push_str(v),
+                        None => {
+                            out.push_str("$(");
+                            out.push_str(name);
+                            out.push(')');
+                        }
+                    }
+                    rest = &body[end + 1..];
+                }
+                None => {
+                    out.push_str(&rest[i..]);
+                    rest = "";
+                }
+            }
+        } else {
+            out.push('$');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The host path of `sub` inside the directory volume at `base` (#437,
+/// 0f6ec9a72d6c), checked where the host sees it (`on_host`).
+///
+/// `sub` is relative and plain (no `..`, no absolute path), and nothing on
+/// the way from `base` to it may be a symlink: a container that can write
+/// the volume could otherwise point a subpath anywhere on the node. Each
+/// directory on the way that is not there is made (as upstream does) with
+/// the volume's own mode when `create`; the last component may be a file,
+/// which binds that one file (a ConfigMap key at `/etc/app.conf`).
+fn subpath_on_host(base: &str, sub: &str, create: bool) -> Result<String, String> {
+    let rel = crate::api_files::contained(sub)
+        .ok_or_else(|| format!("subPath {sub:?} is not a path inside the volume"))?;
+    let base_view = on_host(base);
+    let base_meta = std::fs::metadata(&base_view)
+        .map_err(|e| format!("subPath {sub:?}: volume directory {base}: {e}"))?;
+    if !base_meta.is_dir() {
+        return Err(format!("subPath {sub:?}: volume {base} is not a directory"));
+    }
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        base_meta.permissions().mode() & 0o7777
+    };
+    let parts: Vec<_> = rel.components().collect();
+    let mut cur = base_view;
+    for (i, part) in parts.iter().enumerate() {
+        cur.push(part);
+        let last = i + 1 == parts.len();
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(format!(
+                    "subPath {sub:?}: {} is a symlink; a subpath may not go through one",
+                    cur.display()
+                ))
+            }
+            Ok(m) if m.is_dir() || last => {}
+            Ok(_) => return Err(format!("subPath {sub:?}: {} is not a directory", cur.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && create => {
+                match std::fs::create_dir(&cur) {
+                    Ok(()) => {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(&cur, std::fs::Permissions::from_mode(mode))
+                            .map_err(|e| format!("subPath {sub:?}: {}: {e}", cur.display()))?;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(format!("subPath {sub:?}: cannot make {}: {e}", cur.display())),
+                }
+                // Made by us or by someone at the same moment: either way
+                // it must be a real directory now.
+                let m = std::fs::symlink_metadata(&cur)
+                    .map_err(|e| format!("subPath {sub:?}: {}: {e}", cur.display()))?;
+                if !m.is_dir() {
+                    return Err(format!("subPath {sub:?}: {} is not a directory", cur.display()));
+                }
+            }
+            Err(e) => return Err(format!("subPath {sub:?}: {}: {e}", cur.display())),
+        }
+    }
+    Ok(format!("{}/{}", base.trim_end_matches('/'), rel.display()))
+}
+
+/// Where a volume mount binds from: the volume, or its `subPath` /
+/// `subPathExpr` inside it (#437, 0f6ec9a72d6c). Never the volume's root
+/// for a mount that asked for a path inside it.
+fn mount_source(
+    m: &Value,
+    resolved: &ResolvedVolume,
+    env: &[(String, String)],
+) -> Result<String, String> {
+    let vol = m["name"].as_str().unwrap_or("");
+    let sub = match (
+        m["subPath"].as_str().filter(|s| !s.is_empty()),
+        m["subPathExpr"].as_str().filter(|s| !s.is_empty()),
+    ) {
+        (None, None) => return Ok(resolved.path.clone()),
+        (Some(_), Some(_)) => {
+            return Err(format!("volume {vol}: subPath and subPathExpr are mutually exclusive"))
+        }
+        (Some(s), None) => s.to_string(),
+        (None, Some(e)) => expand_env_refs(e, env),
+    };
+    if resolved.fstype.is_some() || resolved.block {
+        // The engine mounts a claim's filesystem from its device inside the
+        // container, whole; it has no way to bind a directory of it yet
+        // (stormpump#274). Binding the whole volume would expose what the
+        // mount meant to keep out.
+        return Err(format!(
+            "volume {vol}: subPath {sub:?} on a claim this node mounts from its device is not \
+             available (stormpump#274)"
+        ));
+    }
+    // The kubelet's API volumes are written whole on every pass; a subpath
+    // in one must name what is there, never make a directory in it.
+    subpath_on_host(&resolved.path, &sub, !resolved.api).map_err(|e| format!("volume {vol}: {e}"))
 }
 
 /// A container's `volumeDevices`: a raw block claim's device, bound as it is
@@ -7401,7 +7560,11 @@ fn resolve_volume_devices(spec: &Value, volumes: &HashMap<String, ResolvedVolume
         .unwrap_or_default()
 }
 
-fn resolve_volume_mounts(spec: &Value, volumes: &HashMap<String, ResolvedVolume>) -> Vec<Mount> {
+fn resolve_volume_mounts(
+    spec: &Value,
+    volumes: &HashMap<String, ResolvedVolume>,
+    env: &[(String, String)],
+) -> Result<Vec<Mount>, String> {
     spec["volumeMounts"]
         .as_array()
         .map(|a| {
@@ -7409,7 +7572,10 @@ fn resolve_volume_mounts(spec: &Value, volumes: &HashMap<String, ResolvedVolume>
                 .filter_map(|m| {
                     let vol_name = m["name"].as_str().unwrap_or("");
                     let resolved = volumes.get(vol_name)?;
-                    let host_path = resolved.path.clone();
+                    let host_path = match mount_source(m, resolved, env) {
+                        Ok(p) => p,
+                        Err(e) => return Some(Err(e)),
+                    };
                     // Relabel kubelet-materialized volumes (configMap/secret/
                     // projected/emptyDir live under .../volumes/kubernetes.io~*)
                     // so the container can read them under enforcing SELinux;
@@ -7420,7 +7586,7 @@ fn resolve_volume_mounts(spec: &Value, volumes: &HashMap<String, ResolvedVolume>
                     // volume that is shared with other pods is not ours to do.
                     let selinux_relabel = host_path.contains("/volumes/kubernetes.io~")
                         && !host_path.contains("/volumes/kubernetes.io~csi/");
-                    Some(Mount {
+                    Some(Ok(Mount {
                         container_path: m["mountPath"].as_str().unwrap_or("").to_string(),
                         host_path,
                         readonly: resolved.api || m["readOnly"].as_bool().unwrap_or(false),
@@ -7450,11 +7616,11 @@ fn resolve_volume_mounts(spec: &Value, volumes: &HashMap<String, ResolvedVolume>
                         },
                         selinux_relabel,
                         fstype: resolved.fstype.clone(),
-                    })
+                    }))
                 })
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_else(|| Ok(Vec::new()))
 }
 
 fn probe_initial_delay(probe: &Value) -> u64 {
@@ -9592,7 +9758,7 @@ pub(crate) mod tests {
             "volumeMounts": [{"name": "fs", "mountPath": "/data"}],
             "volumeDevices": [{"name": "raw", "devicePath": "/dev/xvda"}, {"name": "fs", "devicePath": "/dev/no"}],
         });
-        let m = resolve_mounts(&spec, &vols);
+        let m = resolve_mounts(&spec, &vols, &[]).unwrap();
         assert_eq!(m.len(), 2, "a filesystem volume is never bound as a device");
         assert_eq!((m[0].container_path.as_str(), m[0].fstype.as_deref()), ("/data", Some("ext4")));
         assert_eq!((m[1].container_path.as_str(), m[1].host_path.as_str()), ("/dev/xvda", "/dev/ublkb7"));
@@ -10305,7 +10471,7 @@ pub(crate) mod tests {
             {"name": "scratch", "mountPath": "/scratch"}
         ]});
         let ro: Vec<(String, bool)> =
-            resolve_mounts(&spec, &v).into_iter().map(|m| (m.container_path, m.readonly)).collect();
+            resolve_mounts(&spec, &v, &[]).unwrap().into_iter().map(|m| (m.container_path, m.readonly)).collect();
         assert_eq!(
             ro,
             vec![("/cm".into(), true), ("/sec".into(), true), ("/proj".into(), true), ("/scratch".into(), false)]
@@ -10364,7 +10530,7 @@ pub(crate) mod tests {
                 {"name": "missing", "mountPath": "/nope"}
             ]
         });
-        let mounts = resolve_mounts(&spec, &volumes);
+        let mounts = resolve_mounts(&spec, &volumes, &[]).unwrap();
         let c = build_container_config(&spec, "cilium@sha", vec![], mounts);
         assert!(c.privileged);
         assert!(c.readonly_rootfs);
@@ -10406,11 +10572,11 @@ pub(crate) mod tests {
             })
         };
         assert_eq!(
-            resolve_mounts(&spec(true), &volumes)[0].propagation,
+            resolve_mounts(&spec(true), &volumes, &[]).unwrap()[0].propagation,
             MountPropagation::Bidirectional
         );
         assert_eq!(
-            resolve_mounts(&spec(false), &volumes)[0].propagation,
+            resolve_mounts(&spec(false), &volumes, &[]).unwrap()[0].propagation,
             MountPropagation::Private
         );
     }
@@ -12033,5 +12199,88 @@ pub(crate) mod tests {
                 other => panic!("{c}: expected a config error, got {other:?}"),
             }
         }
+    }
+
+    // ---- #437 0f6ec9a72d6c: subPath ----
+
+    fn dir_volume(path: &std::path::Path, api: bool) -> ResolvedVolume {
+        ResolvedVolume { path: path.to_string_lossy().into_owned(), fstype: None, block: false, api }
+    }
+
+    /// A subPath binds the path inside the volume: one file of a ConfigMap
+    /// volume, or a directory of an emptyDir made on the way; never the root.
+    #[test]
+    fn sub_path_binds_inside_the_volume() {
+        let cm = tempfile::tempdir().unwrap();
+        std::fs::write(cm.path().join("app.conf"), "x").unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let vols = HashMap::from([
+            ("cfg".to_string(), dir_volume(cm.path(), true)),
+            ("data".to_string(), dir_volume(scratch.path(), false)),
+        ]);
+        let spec = json!({"name": "app", "volumeMounts": [
+            {"name": "cfg", "mountPath": "/etc/app.conf", "subPath": "app.conf"},
+            {"name": "data", "mountPath": "/var/lib/a", "subPath": "a/db"},
+            {"name": "data", "mountPath": "/var/lib/p", "subPathExpr": "pods/$(POD_NAME)"}
+        ]});
+        let env = vec![("POD_NAME".to_string(), "web-0".to_string())];
+        let m = resolve_mounts(&spec, &vols, &env).unwrap();
+        let src: Vec<&str> = m.iter().map(|m| m.host_path.as_str()).collect();
+        let cmp = cm.path().display().to_string();
+        let sp = scratch.path().display().to_string();
+        assert_eq!(src, vec![format!("{cmp}/app.conf"), format!("{sp}/a/db"), format!("{sp}/pods/web-0")]);
+        assert!(scratch.path().join("a/db").is_dir() && scratch.path().join("pods/web-0").is_dir());
+    }
+
+    /// A subPath that leaves the volume, goes through a symlink, is missing
+    /// from an API volume, or is on a claim filesystem is refused, and the
+    /// volume's root is never bound in its place.
+    #[test]
+    fn sub_path_refusals() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
+        let vols = HashMap::from([
+            ("v".to_string(), dir_volume(root.path(), false)),
+            ("api".to_string(), dir_volume(root.path(), true)),
+            ("claim".to_string(), ResolvedVolume { path: "/dev/ublkb9".into(), fstype: Some("ext4".into()), block: false, api: false }),
+        ]);
+        for (mount, want) in [
+            (json!({"name": "v", "mountPath": "/m", "subPath": "../up"}), "not a path inside the volume"),
+            (json!({"name": "v", "mountPath": "/m", "subPath": "/abs"}), "not a path inside the volume"),
+            (json!({"name": "v", "mountPath": "/m", "subPath": "link/x"}), "is a symlink"),
+            (json!({"name": "v", "mountPath": "/m", "subPathExpr": "$(UNSET)/../x"}), "not a path inside the volume"),
+            (json!({"name": "api", "mountPath": "/m", "subPath": "absent"}), "No such file"),
+            (json!({"name": "claim", "mountPath": "/m", "subPath": "pgdata"}), "stormpump#274"),
+            (json!({"name": "v", "mountPath": "/m", "subPath": "a", "subPathExpr": "b"}), "mutually exclusive"),
+        ] {
+            let spec = json!({"name": "app", "volumeMounts": [mount.clone()]});
+            let e = resolve_mounts(&spec, &vols, &[]).unwrap_err();
+            assert!(e.contains(want), "{mount}: {e}");
+        }
+        assert!(!outside.path().join("x").exists());
+    }
+
+    #[test]
+    fn sub_path_expr_expands_like_upstream() {
+        let env = vec![("A".to_string(), "1".to_string()), ("B".to_string(), "two".to_string())];
+        assert_eq!(expand_env_refs("$(A)/x-$(B)", &env), "1/x-two");
+        assert_eq!(expand_env_refs("$$(A)/$(NOPE)", &env), "$(A)/$(NOPE)");
+        assert_eq!(expand_env_refs("cost$5/$(A", &env), "cost$5/$(A");
+    }
+
+    /// A subPath mount on the start path: a refusal is
+    /// CreateContainerConfigError, and no container is created.
+    #[tokio::test]
+    async fn a_refused_sub_path_creates_no_container() {
+        let (rt, mgr) = manager();
+        let mut c = simple_container();
+        c["volumeMounts"] = json!([{"name": "scratch", "mountPath": "/m", "subPath": "../up"}]);
+        let mut p = pod("uid-437-sub", "web", "Always", c);
+        p["spec"]["volumes"] = json!([{"name": "scratch", "emptyDir": {}}]);
+        let u = mgr.sync_pods(&[p]).await.updates.remove(0);
+        assert_eq!(u.phase, "Pending");
+        assert_eq!(u.container_statuses[0].reason, "CreateContainerConfigError");
+        assert!(rt.last_container_config.lock().unwrap().is_none());
     }
 }

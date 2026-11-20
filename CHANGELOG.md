@@ -2,6 +2,7 @@
 
 ## 2026-11-20
 
+- **fix:** `volumeMounts[].subPath` and `subPathExpr` bind the path inside the volume, not the whole volume (#437, 0f6ec9a72d6c). A ConfigMap key at `/etc/app.conf` binds that one file, and a directory of an emptyDir or hostPath is made if it is not there. A subpath that leaves its volume or goes through a symlink is refused with `CreateContainerConfigError`, and so is one missing from a ConfigMap/Secret/projected volume. `subPathExpr` expands `$(VAR)` from the container's env. A subPath on a claim filesystem the engine mounts from its device is refused until stormpump can bind a directory of one (stormpump#274).
 - **fix:** ConfigMaps and Secrets reach a container as they are in the API (#437).
   - A Secret's value is written byte for byte (dc6872a9854f). It went through a lossy UTF-8 conversion, so a keystore's 0xff became U+FFFD.
   - A configMap or secret volume's `items` select and rename keys, with their `mode` and the volume's `defaultMode` (1f318a543243). A key no longer selected is removed at the next write. Before, every key was written under its own name.
