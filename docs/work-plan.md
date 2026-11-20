@@ -4,6 +4,17 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #428 (P0), four critical review findings
+2026-11-20. From stormcentral's Findings (`/api/v1/findings?project=rustkube-node`). Plan, one commit per finding:
+1. 547a888e434e cni invoker: plugin type must be a plain file name; the resolved binary must sit in a CNI bin dir.
+2. 551d194231b5 pod_manager: ConfigMap/Secret/projected/downwardAPI mounts forced read-only; materialized files written by a
+   symlink-safe atomic writer (temp file + rename, no following an existing entry).
+3. dbdab3f85f46 vm_golden: the final Sealed status write retried and reported; restart cleanup checks the copy is sealed and
+   finalizes instead of deleting it.
+4. e4aaa109678b claim move cutover: on a cutover error GET the migration, abort only if still pre-cutover; cut_over/completed
+   go on to retirement and PV rebinding.
+Then sc-build (workspace + clippy), stage build, close #428.
+
 ### In progress: #426 (P2), a pod-network VMI reports its pod IP but nothing reaches it (pvetest2 flowsdn)
 2026-11-20. First live run of #88's path (never run on a node before). Read: stormvm's bridge binding moves the pod IP and
 MAC off the CNI's interface onto vmbr0 with the tap; the guest NIC, the lease and the status all carry the pod's MAC; the
