@@ -17,6 +17,11 @@ closed"). Plan:
    exec base kept, an exit held while away claimed; recover_state on the rebuilt runtime creates nothing new.
 4. A tty/stdin container's console (a PTY the kubelet held) does not survive: attach to it is refused saying so; gap filed.
 Then sc-build, stage, `csi` suite's `csi-kubelet-restart` enabled (KUBELET_RESTART_ADOPTS in test/src/csi.rs).
+Done: 6b9e6b9 (stormpump_runtime/state.rs; with_state/adopt/save/keep_state; Changed guard on every changing call;
+main loads STATE_FILE, adopts, keeps it; attach to a lost terminal refused with the reason; 5 tests on a rebuilt runtime incl.
+PodManager::recover_state + sync starting nothing). KUBELET_RESTART_ADOPTS stays false until a test machine runs it (a node
+with the old kubelet would loop). sc-build at 6b9e6b9 running (tmp/sc-build-334.log). Next: pass → stage, hold
+`--after-install rustkube-node>=6b9e6b9@any:pve`, then flip KUBELET_RESTART_ADOPTS and run `csi`.
 
 ### Done: #428 (P0), four critical review findings
 2026-11-20. From stormcentral's Findings (`/api/v1/findings?project=rustkube-node`). Plan, one commit per finding:
