@@ -4,7 +4,7 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #404 (P0), a VM root on a stormstorage mirrored volume filled from its golden (stormstorage#113 B')
+### Waiting on stormcos#354: #404 (P0), a VM root on a stormstorage mirrored volume filled from its golden (stormstorage#113 B')
 2026-11-20. The owner chose B' on stormstorage#113 (built there: 2ef4b37, `from_golden`). Plan (`vm_mirrored_root.rs`):
 - Asked for by the VMI annotation `storm.io/mirrored-disks: {"<disk>": <copies ≥ 2>}` (the VM template's annotations reach the
   VMI). Only a golden disk; anything else, or no `--stormstorage`, fails the start saying why.
@@ -17,6 +17,14 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 - Stop: the host is withdrawn (`DELETE …/export/hosts/{nqn}`, best effort). Sweep: a `.mirrored` volume whose owner is gone
   and that serves no host is deleted through stormstorage; the engine sweep skips `.mirrored` parts.
 Then tests (fake stormstorage + engine), docs (configuration/api/status, README), CHANGELOG, sc-build, stage, shipped.
+Done: 5a55c4a (code, unit tests, docs), faf8881 (test fixes, build-failure #422 closed by the passing rerun), and the
+`status.volumes[]` entry `mirrored {volume, copies}` + golden suite case `vmi-mirrored-root` (skip with no stormstorage).
+sc-build-f8374642e9: `cargo build/test --locked` (709 kubelet unit incl. a_mirrored_root_is_made_from_its_golden_and_attached_once_copied,
+a_mirror_request_needs_stormstorage_and_a_goldens_disk, vm_mirrored_root::tests) and the test crate's test + clippy -D warnings passed;
+kubelet clippy names nothing in the changed lines (#386's remain). Stage build 9e18b0b5f57e.
+Not live yet: stormcos gives the kubelet `--stormstorage` (STORMSTORAGE_URL in env.d) only once stormcos#354 lands, and a mirror needs
+two storage nodes. Held `--after stormcos#354`. Resume: `stormcentral test run rustkube-node golden` on a multi-node machine whose kubelet
+has stormstorage; `vmi-mirrored-root` passing → shipped/close #404.
 
 ### Shipped (proof pending): #418 (P0), mirror pods in each service's project (stormcos#1020)
 2026-11-19. Plan: `mirror_namespaces.rs`: `--mirror-namespaces` (env `MIRROR_NAMESPACES`, default
