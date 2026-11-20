@@ -16,6 +16,7 @@ never says why. Plan:
    guest-info's enabled commands, guest-network-get-interfaces) on the source VMI: runs on any current release and says which end
    it is; `vmi-agent-keys` (a VMI with a qemuGuestAgent key reaches AccessCredentialsSynchronized True).
 Then sc-build, run golden on a pve machine now (the probe needs no new kubelet), stage, and the keys case once installed.
+Written: kubelet (agent_ping, Access.agent_said), test (qga-probe workload, golden vmi-agent-answers/vmi-agent-keys).
 
 ### Waiting on an install: #421 (P2), direct kernel boot from the golden's kernel (vmcloud-image-operator#62, stormvm#111)
 2026-11-20. Finding: no mount is needed. stormvm's machine spec is `root: Root::Inherit`, which stormpump documents as "the

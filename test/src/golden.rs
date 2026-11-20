@@ -48,6 +48,16 @@
 //!   shows the firmware or the boot loader. A skip while vmimages publishes
 //!   no kernel for the golden on this node.
 //!
+//! - `vmi-agent-answers` (#405): a third VMI (`gold-agent`) boots with an
+//!   agent-propagated key. A privileged pod with the VMI's run directory
+//!   (`/run/stormvm/<ns>/gold-agent`) as a hostPath asks its agent socket
+//!   what the kubelet asks: `guest-ping`, `guest-info` (the agent's version
+//!   and whether the commands the kubelet uses are enabled) and
+//!   `guest-network-get-interfaces`. Passes when the agent answers the ping,
+//!   and says the rest.
+//! - `vmi-agent-keys` (#405, #92): that VMI's `AccessCredentialsSynchronized`
+//!   is True within 180 s of its boot (its key set through the agent).
+//!
 //! The VMIs and requests are deleted after. **The sealed golden `G` is not**:
 //! a test gets no stormblock admin token, and a storage user deletes only
 //! what it made itself (stormcentral docs/test-standard.md); the kubelet
@@ -77,6 +87,11 @@ pub const CLONE: &str = "gold-clone";
 pub const MIRRORED: &str = "gold-mirror";
 pub const DIRECT: &str = "gold-direct";
 pub const OUTSIDE: &str = "gold-outside";
+pub const AGENT: &str = "gold-agent";
+pub const AGENT_PROBE: &str = "gold-agent-probe";
+pub const AGENT_SECRET: &str = "gold-agent-key";
+/// A well-formed ed25519 public key nobody holds the private half of.
+pub const AGENT_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f rkn-test@golden";
 pub const ASK_FAIL: &str = "gold-fail";
 pub const ASK_SEAL: &str = "gold-seal";
 
@@ -294,6 +309,52 @@ impl Suite {
         .await
     }
 
+    /// The VMI for #405: a key for root through the guest agent.
+    async fn boot_agent_vm(&self, root: &str, says_id: &str) -> Result<String, String> {
+        let secrets = format!("/api/v1/namespaces/{}/secrets", self.env.namespace);
+        let secret = json!({
+            "apiVersion": "v1", "kind": "Secret",
+            "metadata": { "name": AGENT_SECRET, "namespace": self.env.namespace, "labels": k8s::labels(&self.env) },
+            "stringData": { "key": AGENT_KEY },
+        });
+        self.api.create(&secrets, &secret).await?;
+        let mut obj = vmi(&self.env, AGENT, root, says_id);
+        obj["spec"]["accessCredentials"] = agent_credentials();
+        self.boot_vmi(AGENT, obj, BOOT, |c| machine_id(c).is_some()).await
+    }
+
+    /// `vmi-agent-answers` (#405).
+    async fn agent_probe(&self) -> Outcome {
+        let pods = k8s::pods(&self.env);
+        if let Err(e) = self.api.create(&pods, &agent_probe_pod(&self.env)).await {
+            return Outcome::Infra(e);
+        }
+        match k8s::pod_done(&self.env, &self.api, AGENT_PROBE, Duration::from_secs(120)).await {
+            Ok(done) => judge_agent_probe(&done.message),
+            Err(e) => Outcome::Infra(e),
+        }
+    }
+
+    /// `vmi-agent-keys` (#405).
+    async fn agent_keys(&self) -> Outcome {
+        let path = format!("{}/{AGENT}", vmis(&self.env));
+        let path = path.as_str();
+        let within = Duration::from_secs(180);
+        let got = k8s::until(within, || async move {
+            let v = self.api.get(path).await?.ok_or_else(|| format!("VMI {AGENT} is gone"))?;
+            match access_condition(&v) {
+                Some((true, m)) => Ok(m),
+                Some((false, m)) => Err(format!("AccessCredentialsSynchronized False after {} s: {m}", within.as_secs())),
+                None => Err(format!("no AccessCredentialsSynchronized after {} s", within.as_secs())),
+            }
+        })
+        .await;
+        match got {
+            Ok(m) => Outcome::Pass(format!("AccessCredentialsSynchronized True: {m}")),
+            Err(e) => Outcome::Fail(e),
+        }
+    }
+
     /// `vmi-kernel-outside-refused` (#421).
     async fn kernel_outside(&self, root: &str) -> Outcome {
         let mut obj = vmi(&self.env, OUTSIDE, root, "#cloud-config\n");
@@ -364,10 +425,11 @@ impl Suite {
         for r in [ASK_FAIL, ASK_SEAL] {
             self.api.delete(&format!("{}/{r}", requests(&self.env))).await?;
         }
-        for v in [SOURCE, NO_AGENT, CLONE, MIRRORED, DIRECT, OUTSIDE] {
+        self.api.delete(&format!("{}/{AGENT_PROBE}", k8s::pods(&self.env))).await?;
+        for v in [SOURCE, NO_AGENT, CLONE, MIRRORED, DIRECT, OUTSIDE, AGENT] {
             self.api.delete(&format!("{}/{v}", vmis(&self.env))).await?;
         }
-        for v in [SOURCE, NO_AGENT, CLONE, MIRRORED, DIRECT, OUTSIDE] {
+        for v in [SOURCE, NO_AGENT, CLONE, MIRRORED, DIRECT, OUTSIDE, AGENT] {
             k8s::gone(&self.api, &format!("{}/{v}", vmis(&self.env)), Duration::from_secs(120)).await?;
         }
         Ok(())
@@ -394,10 +456,25 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
     }
 
     let (says_id, no_agent) = (says_its_id(), has_no_agent());
-    let (src, noagent) = tokio::join!(
+    let (src, noagent, agent_vm) = tokio::join!(
         suite.boot(SOURCE, &root, &says_id, |c| machine_id(c).is_some()),
         suite.boot(NO_AGENT, &root, &no_agent, |c| c.contains(NO_AGENT_MARKER)),
+        suite.boot_agent_vm(&root, &says_id),
     );
+
+    // The guest agent as the node reaches it, and keys through it (#405).
+    let t = Instant::now();
+    let o = match &agent_vm {
+        Err(e) => Outcome::Infra(format!("VMI {AGENT} did not boot: {e}")),
+        Ok(_) => suite.agent_probe().await,
+    };
+    r.record("vmi-agent-answers", o, t.elapsed().as_millis(), None);
+    let t = Instant::now();
+    let o = match &agent_vm {
+        Err(_) => Outcome::Skip(format!("VMI {AGENT} did not boot")),
+        Ok(_) => suite.agent_keys().await,
+    };
+    r.record("vmi-agent-keys", o, t.elapsed().as_millis(), None);
     let source_id = src.as_deref().ok().and_then(machine_id);
     r.record(
         "golden-sources-boot",
@@ -496,6 +573,50 @@ pub fn judge_status_volumes(vmi: &Value, golden: &str) -> Outcome {
         return Outcome::Fail(format!("the root entry is not complete (volumeID, golden {golden}, owned): {root}"));
     }
     Outcome::Pass(format!("{} volume(s); root: {root}", vols.len()))
+}
+
+/// `accessCredentials` for root's key through the guest agent.
+pub fn agent_credentials() -> Value {
+    json!([{ "sshPublicKey": {
+        "source": { "secret": { "secretName": AGENT_SECRET } },
+        "propagationMethod": { "qemuGuestAgent": { "users": ["root"] } },
+    } }])
+}
+
+/// The probe of [`AGENT`]'s agent socket: privileged (a node path), the
+/// VMI's run directory as a hostPath.
+pub fn agent_probe_pod(env: &Env) -> Value {
+    let dir = format!("/run/stormvm/{}/{AGENT}", env.namespace);
+    let mut p = k8s::pod(env, AGENT_PROBE, &["qga-probe", "/agent/agent.sock"]);
+    let c = &mut p["spec"]["containers"][0];
+    c["securityContext"] = json!({ "privileged": true, "runAsUser": 0 });
+    c["volumeMounts"] = json!([{ "name": "run", "mountPath": "/agent" }]);
+    p["spec"]["volumes"] = json!([{ "name": "run", "hostPath": { "path": dir, "type": "Directory" } }]);
+    p
+}
+
+/// `vmi-agent-answers`, from the probe's termination message (its workload
+/// line).
+pub fn judge_agent_probe(message: &str) -> Outcome {
+    let line: Value = match serde_json::from_str(message) {
+        Ok(v) => v,
+        Err(_) => return Outcome::Fail(format!("the probe said: {message}")),
+    };
+    let detail = line["detail"].as_str().unwrap_or_default();
+    if line["ok"] != json!(true) {
+        return Outcome::Fail(format!("the probe could not reach the agent socket: {detail}"));
+    }
+    let said: Value = serde_json::from_str(detail).unwrap_or(Value::Null);
+    if said["ping"].get("ok").is_none() {
+        return Outcome::Fail(format!("the agent did not answer guest-ping on the node's socket: {detail}"));
+    }
+    Outcome::Pass(format!("the agent answers on the node's socket: {detail}"))
+}
+
+/// A VMI's `AccessCredentialsSynchronized`: (True?, message).
+pub fn access_condition(vmi: &Value) -> Option<(bool, String)> {
+    let c = vmi["status"]["conditions"].as_array()?.iter().find(|c| c["type"] == "AccessCredentialsSynchronized")?;
+    Some((c["status"] == "True", format!("{} {}", s(c, "/reason"), s(c, "/message")).trim().to_string()))
 }
 
 /// stormvm's direct-kernel annotations (`stormvm_spec::kube`).
@@ -697,6 +818,24 @@ mod tests {
         assert!(matches!(judge_direct(&format!("[ 0.0] Linux\n{id}\n"), &b), Outcome::Pass(_)));
         assert!(matches!(judge_direct(&format!("BdsDxe: loading\n{id}\n"), &b), Outcome::Fail(_)));
         assert!(matches!(judge_direct("nothing", &b), Outcome::Fail(_)));
+    }
+
+    #[test]
+    fn the_agent_probe_and_keys_are_judged() {
+        let line = |ok: bool, detail: &str| serde_json::json!({"workload": "qga-probe /agent/agent.sock", "ok": ok, "detail": detail}).to_string();
+        let up = r#"{"ping":{"ok":{}},"version":"10.2.2","enabled":{"guest-ping":true},"interfaces":{"ok":2}}"#;
+        assert!(matches!(judge_agent_probe(&line(true, up)), Outcome::Pass(_)));
+        let down = r#"{"ping":{"error":"guest-sync-delimited: no answer: Resource temporarily unavailable"}}"#;
+        assert!(matches!(judge_agent_probe(&line(true, down)), Outcome::Fail(_)));
+        assert!(matches!(judge_agent_probe(&line(false, "connect: No such file")), Outcome::Fail(_)));
+        assert!(matches!(judge_agent_probe("not json"), Outcome::Fail(_)));
+        let v = |st: &str| serde_json::json!({"status": {"conditions": [{"type": "AccessCredentialsSynchronized", "status": st, "reason": "R", "message": "m"}]}});
+        assert_eq!(access_condition(&v("True")), Some((true, "R m".into())));
+        assert_eq!(access_condition(&v("False")), Some((false, "R m".into())));
+        assert_eq!(access_condition(&serde_json::json!({"status": {}})), None);
+        assert_eq!(agent_credentials()[0]["sshPublicKey"]["propagationMethod"]["qemuGuestAgent"]["users"][0], "root");
+        let p = agent_probe_pod(&crate::k8s::tests::env());
+        assert_eq!(p["spec"]["containers"][0]["securityContext"]["privileged"], true);
     }
 
     #[test]

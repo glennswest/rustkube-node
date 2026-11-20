@@ -67,7 +67,7 @@ pub fn is_workload(args: &[String]) -> bool {
         Some(
             "fill" | "verify" | "size-at-least" | "sized" | "echo" | "exit" | "sleep" | "fail-once"
                 | "write-file" | "expect-file" | "expect-env" | "expect-nics" | "read-file" | "vm-instance" | "rdma-view"
-                | "member" | "grows"
+                | "member" | "grows" | "qga-probe"
         )
     )
 }
@@ -104,6 +104,98 @@ pub fn main(args: &[String]) -> i32 {
         std::thread::sleep(std::time::Duration::from_secs(secs));
     }
     code
+}
+
+/// The guest agent on its node socket (#405), asked as the kubelet asks it:
+/// `guest-ping`, then `guest-info` (the agent's version and which commands
+/// it has enabled) and `guest-network-get-interfaces`. The answer is a JSON
+/// object of what each said; `Err` only when the socket cannot be opened.
+fn qga_probe(sock: &str) -> Result<String, String> {
+    use std::os::unix::net::UnixStream;
+    let mut out = serde_json::Map::new();
+    let ask = |cmd: &str| -> Result<serde_json::Value, String> {
+        let mut c = UnixStream::connect(sock).map_err(|e| format!("connect {sock}: {e}"))?;
+        c.set_read_timeout(Some(std::time::Duration::from_secs(5))).map_err(|e| e.to_string())?;
+        qga_exchange(&mut c, cmd)
+    };
+    let said = |r: Result<serde_json::Value, String>| match r {
+        Ok(v) => serde_json::json!({ "ok": v }),
+        Err(e) => serde_json::json!({ "error": e }),
+    };
+    if let Err(e) = UnixStream::connect(sock) {
+        return Err(format!("connect {sock}: {e}"));
+    }
+    out.insert("ping".into(), said(ask("guest-ping")));
+    let info = ask("guest-info");
+    if let Ok(i) = &info {
+        let enabled: serde_json::Map<String, serde_json::Value> = i["supported_commands"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| Some((c["name"].as_str()?.to_string(), c["enabled"].clone())))
+            .filter(|(n, _)| QGA_WATCHED.contains(&n.as_str()))
+            .collect();
+        out.insert("version".into(), i["version"].clone());
+        out.insert("enabled".into(), serde_json::Value::Object(enabled));
+    } else {
+        out.insert("info".into(), said(info));
+    }
+    let ifs = ask("guest-network-get-interfaces").map(|v| serde_json::json!(v.as_array().map_or(0, Vec::len)));
+    out.insert("interfaces".into(), said(ifs));
+    Ok(serde_json::Value::Object(out).to_string())
+}
+
+/// The commands the kubelet uses, whose `enabled` the probe reports.
+pub const QGA_WATCHED: [&str; 4] =
+    ["guest-ping", "guest-network-get-interfaces", "guest-ssh-add-authorized-keys", "guest-fsfreeze-freeze"];
+
+/// One command on an open agent channel, with `guest-sync-delimited` in
+/// front (the agent answers it after a 0xFF, which ends anything older).
+fn qga_exchange(c: &mut std::os::unix::net::UnixStream, cmd: &str) -> Result<serde_json::Value, String> {
+    let id = std::process::id() as u64 * 1000 + (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_millis()) as u64);
+    let mut req = vec![0xFFu8];
+    req.extend(format!("{{\"execute\":\"guest-sync-delimited\",\"arguments\":{{\"id\":{id}}}}}\n").bytes());
+    c.write_all(&req).map_err(|e| format!("{cmd}: write: {e}"))?;
+    // Up to the agent's 0xFF, then lines until the one echoing `id`.
+    let mut seen_ff = false;
+    loop {
+        let line = qga_line(c, &mut seen_ff).map_err(|e| format!("guest-sync-delimited: {e}"))?;
+        if serde_json::from_str::<serde_json::Value>(&line).ok().and_then(|v| v["return"].as_u64()) == Some(id) {
+            break;
+        }
+    }
+    c.write_all(format!("{{\"execute\":\"{cmd}\"}}\n").as_bytes()).map_err(|e| format!("{cmd}: write: {e}"))?;
+    let mut ff = true;
+    let line = qga_line(c, &mut ff).map_err(|e| format!("{cmd}: {e}"))?;
+    let v: serde_json::Value = serde_json::from_str(&line).map_err(|e| format!("{cmd}: {e}: {line}"))?;
+    if let Some(err) = v.get("error") {
+        return Err(format!("{cmd}: the agent answered an error: {err}"));
+    }
+    Ok(v["return"].clone())
+}
+
+/// One newline-ended line; bytes before the first 0xFF are dropped while
+/// `seen_ff` is false.
+fn qga_line(c: &mut std::os::unix::net::UnixStream, seen_ff: &mut bool) -> Result<String, String> {
+    let mut line = Vec::new();
+    let mut b = [0u8; 1];
+    loop {
+        match c.read(&mut b) {
+            Ok(0) => return Err("the channel closed".into()),
+            Ok(_) => {}
+            Err(e) => return Err(format!("no answer: {e}")),
+        }
+        if !*seen_ff {
+            *seen_ff = b[0] == 0xFF;
+            continue;
+        }
+        match b[0] {
+            0xFF => line.clear(),
+            b'\n' if !line.is_empty() => return Ok(String::from_utf8_lossy(&line).into_owned()),
+            b'\n' => {}
+            x => line.push(x),
+        }
+    }
 }
 
 /// What a container sees of RDMA (#348): its `/dev/infiniband` character
@@ -273,6 +365,7 @@ fn run(args: &[String]) -> Result<String, String> {
     let num = |i: usize, what: &str| arg(i, what)?.parse::<u64>().map_err(|e| format!("{what}: {e}"));
     match args[0].as_str() {
         "rdma-view" => Ok(rdma_view()),
+        "qga-probe" => qga_probe(&arg(1, "agent socket")?),
         "vm-instance" => {
             let address = arg(1, "address")?;
             let workload = args.get(2).map(String::as_str) != Some("no-workload-token");

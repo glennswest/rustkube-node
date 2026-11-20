@@ -530,6 +530,9 @@ pub struct Access {
     /// Why the agent's keys did not all arrive, as of the last try. `None`:
     /// the agent has not answered yet.
     pub agent: Option<Vec<String>>,
+    /// Why the agent did not answer `guest-ping` the last time it was
+    /// asked (#405): named in the condition while `agent` is `None`.
+    pub agent_said: Option<String>,
     /// The condition as last reported.
     pub condition: Option<Value>,
 }
@@ -546,7 +549,10 @@ fn access_outcome(
     let mut problems = access.boot.clone();
     if creds.iter().any(|c| !c.at_boot()) {
         match &access.agent {
-            None => problems.push("waiting for the guest agent to answer".to_string()),
+            None => problems.push(match &access.agent_said {
+                Some(why) => format!("waiting for the guest agent to answer: {why}"),
+                None => "waiting for the guest agent to answer".to_string(),
+            }),
             Some(p) => problems.extend(p.iter().cloned()),
         }
     }
@@ -639,6 +645,23 @@ fn neighbour_addresses(vm: &Vm) -> Option<Vec<Vec<String>>> {
 /// `None` when there is no agent, no answer, or the guest has not got that
 /// far — all of which are ordinary and none of which are worth logging on
 /// every sync of every machine.
+/// Whether the guest's agent answers `guest-ping` (#405): every agent
+/// takes it, so it is what says the agent is up. `guest-network-get-interfaces`
+/// used to, and an agent that refused that one command (a guest's qemu-ga
+/// allow list) read as no agent at all, for ever. `Err`: why not, in the
+/// agent client's words.
+async fn agent_ping(vm: &Vm) -> Result<(), String> {
+    let sock = format!("{RUN_ROOT}/{}/{}/agent.sock", vm.namespace, vm.name);
+    if !std::path::Path::new(&sock).exists() {
+        return Err(format!("no agent channel at {sock}"));
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(2), stormvm_control::qga::ping(&sock)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("guest-ping: no answer within 2 s".into()),
+    }
+}
+
 async fn guest_addresses(vm: &Vm) -> Option<Vec<Vec<String>>> {
     let sock = format!("{RUN_ROOT}/{}/{}/agent.sock", vm.namespace, vm.name);
     if !std::path::Path::new(&sock).exists() {
@@ -1782,12 +1805,15 @@ impl VmManager {
     /// guest. A Secret that is missing, or holds no keys, is reported and
     /// leaves the guest's keys as they are: emptying a machine's
     /// `authorized_keys` because a Secret went missing is a lock-out.
-    async fn sync_access(&self, uid: &str, agent_up: bool) {
+    /// `agent_down`: why the agent did not answer this time (`None`: it did).
+    async fn sync_access(&self, uid: &str, agent_down: Option<String>) {
+        let agent_up = agent_down.is_none();
         let Some(obj) = self.desired.lock().await.get(uid).cloned() else { return };
         // Refused credentials refused the machine at start.
         let Ok(creds) = stormvm_spec::access::from_kube(&obj["spec"]) else { return };
         let Some(vm) = self.vms.lock().await.get(uid).cloned() else { return };
         let mut access = vm.access.clone();
+        access.agent_said = agent_down;
 
         let agent_creds: Vec<(&str, &[String])> = creds
             .iter()
@@ -2804,10 +2830,11 @@ impl VmManager {
             // the neighbour table with the address it took. Second, not
             // first: the agent knows every address on every interface, and
             // the neighbour table knows only what has been seen from here.
-            let agent = guest_addresses(&vm).await;
-            // An answer, even one with no addresses, is an agent that can
-            // take keys (#92).
-            let agent_up = agent.is_some();
+            // The agent is up when it answers `guest-ping` (#405), whatever
+            // it says to the address query after.
+            let pinged = agent_ping(&vm).await;
+            let agent_up = pinged.is_ok();
+            let agent = if agent_up { guest_addresses(&vm).await } else { None };
             let addrs = match agent {
                 Some(a) if a.iter().any(|v| !v.is_empty()) => Some(a),
                 other => neighbour_addresses(&vm).or(other),
@@ -2845,7 +2872,7 @@ impl VmManager {
                 }
             }
             // Its SSH keys through the agent, and the condition (#92).
-            self.sync_access(&vm.uid, agent_up).await;
+            self.sync_access(&vm.uid, pinged.err()).await;
             // The next time the guest is asked (#101). Its exit is an event on
             // the ring; its addresses, its agent coming up and a changed key
             // Secret are not. Sooner while it boots, backing off to the
@@ -7809,7 +7836,13 @@ mod tests {
             Some(Err("waiting for the guest agent to answer".into()))
         );
         let a = Access { agent: Some(vec![]), ..Access::default() };
-        assert_eq!(access_outcome(&[agent], &a), Some(Ok(())));
+        assert_eq!(access_outcome(&[agent.clone()], &a), Some(Ok(())));
+        // Why the agent did not answer is said (#405).
+        let a = Access { agent_said: Some("guest-ping: no answer within 2 s".into()), ..Access::default() };
+        assert_eq!(
+            access_outcome(&[agent], &a),
+            Some(Err("waiting for the guest agent to answer: guest-ping: no answer within 2 s".into()))
+        );
 
         let t0 = access_condition(None, &Err("x".into()), "2026-09-28T10:00:00Z");
         assert_eq!(t0["status"], "False");
