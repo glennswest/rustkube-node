@@ -22,6 +22,11 @@ main loads STATE_FILE, adopts, keeps it; attach to a lost terminal refused with 
 PodManager::recover_state + sync starting nothing). KUBELET_RESTART_ADOPTS stays false until a test machine runs it (a node
 with the old kubelet would loop). sc-build at 6b9e6b9 running (tmp/sc-build-334.log). Next: pass → stage, hold
 `--after-install rustkube-node>=6b9e6b9@any:pve`, then flip KUBELET_RESTART_ADOPTS and run `csi`.
+sc-build 2959f5d07d passed (kubelet 732 tests, the 5 new ones; no new warning: forget_containers_of and the test's
+drop(usize) predate it, #227). Stage build 56351dab1575. Gap #429 (attach to an adopted tty) filed, proposed. Held
+`--after-install rustkube-node>=6b9e6b9@any:pve`. Resume: flip KUBELET_RESTART_ADOPTS in test/src/csi.rs (README line),
+push, `stormcentral test run rustkube-node csi --tag <that machine>`; pass (holder keeps its container id, restartCount 0,
+static pods not started again) → close #334.
 
 ### Done: #428 (P0), four critical review findings
 2026-11-20. From stormcentral's Findings (`/api/v1/findings?project=rustkube-node`). Plan, one commit per finding:
