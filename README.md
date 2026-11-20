@@ -289,7 +289,9 @@ gets the same). A claim's filesystem is given to `fsGroup` before the container 
 PID 1 mounts it at `/run/stormpump/pvc/<dev>` (the kubelet sees that mount), and the tree's group becomes `fsGroup`,
 files gain group read-write (read-only `0440` on a read-only mount), directories group execute and setgid, and
 symlinks are left alone. `fsGroupChangePolicy: OnRootMismatch` walks nothing when the root's group and mode are
-already right. A change that fails fails the start, naming the path. emptyDir is 0777 and configMap/secret files
+already right; the root is changed last, so a walk that failed is walked again (#448). The walk never follows a
+path inside the volume: each entry is opened from its parent's descriptor with `O_NOFOLLOW` and changed through its
+own descriptor, so a pod swapping in a symlink cannot point it at the node's files (#448). A change that fails fails the start, naming the path. emptyDir is 0777 and configMap/secret files
 keep their own modes, as upstream. The CRI gRPC path sends fsGroup and supplementalGroups as the container's
 `supplemental_groups`.
 
