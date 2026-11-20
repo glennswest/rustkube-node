@@ -14,8 +14,8 @@
 //!
 //! **That is why the paths are checked.** In the host's view, a VMI naming
 //! `/data/stormcert/…` as its initramfs would have the hypervisor read the
-//! node's key into guest memory. A path must be absolute, plain (no `.` or
-//! `..` component) and under one of the kernel directories
+//! node's key into guest memory. A path must be absolute, plain (no `..`
+//! component) and under one of the kernel directories
 //! (`--vm-kernel-dirs`, default [`DEFAULT_DIR`]); otherwise the start fails
 //! and says why.
 
@@ -100,7 +100,8 @@ mod tests {
         let k = |kernel: &str| refusal(&vm(json!({"storm.io/kernel": kernel})), &dirs());
         assert!(k("/data/stormcert/node.key.pem").unwrap().contains("not a file under the kernel directories"));
         assert!(k("/data/vmimages/boot/../../stormcert/node.key.pem").is_some(), "no ..");
-        assert!(k("/data/vmimages/boot/./g/vmlinuz").is_some(), "no .");
+        // An interior `.` is dropped by the path's own reading and stays inside.
+        assert!(k("/data/vmimages/boot/./g/vmlinuz").is_none(), "an interior . stays inside");
         assert!(k("data/vmimages/boot/g/vmlinuz").is_some(), "absolute only");
         assert!(k("/data/vmimages/boot").is_some(), "the directory itself is no kernel");
         assert!(k("/data/vmimages/bootleg/vmlinuz").is_some(), "by component, not by prefix");

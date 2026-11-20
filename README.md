@@ -1196,7 +1196,7 @@ the machine's stormpump spec runs in the node's mount view
 (`Root::Inherit`), where `/data/vmimages` is mounted, so the hypervisor
 opens the paths as named. Because it reads them in the node's view, the
 kubelet allows only files under `--vm-kernel-dirs` (default
-`/data/vmimages/boot`): each path must be absolute, with no `.` or `..`
+`/data/vmimages/boot`): each path must be absolute, with no `..`
 component. Anything else (`/data/stormcert/…` as an initramfs would put the
 node's key in guest memory) fails the start, saying why. Every start of a
 machine is checked: a VMI's, a live migration's target, a restore's.

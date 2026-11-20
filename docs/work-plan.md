@@ -4,7 +4,7 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #421 (P2), direct kernel boot from the golden's kernel (vmcloud-image-operator#62, stormvm#111)
+### Paused (P0 #379 first): #421 (P2), direct kernel boot from the golden's kernel (vmcloud-image-operator#62, stormvm#111)
 2026-11-20. Finding: no mount is needed. stormvm's machine spec is `root: Root::Inherit`, which stormpump documents as "the
 host's mount view", and `/data/vmimages` is a pallet volume mounted on the host (stormcos boot.d `volume vmidata /data/vmimages`);
 the hypervisor already opens other host paths (the qemu pallet's firmware) with no mount. The ENOENT in the issue was predicted,
@@ -12,9 +12,13 @@ not seen. What the kubelet does need:
 - stormvm → a84d915 (`storm.io/initrd`; no Cargo changes since ac884c7, so a rev swap in Cargo.toml/Cargo.lock).
 - The allowed-directory check: the hypervisor reads `storm.io/kernel`/`storm.io/initrd` in the host's view, so any path a VMI
   names (`/data/stormcert/…`) would land in guest memory. `--vm-kernel-dirs` (env `VM_KERNEL_DIRS`, comma list, default
-  `/data/vmimages/boot`): each path must be absolute, plain (no `.`/`..`) and under one; else the start fails, saying why.
+  `/data/vmimages/boot`): each path must be absolute, plain (no `..`) and under one; else the start fails, saying why.
 Then tests, docs (configuration, README, status), CHANGELOG, sc-build, stage. Live: a VMI with the CloudImage's `status.boot`
 annotations Running (needs vmimages `data_size` 1G, the master's), checked by stormvm's `boot` suite `direct-*`.
+Done: 986253b (code, docs, stormvm a84d915). First sc-build (sc-build-f4b60a80fa) compiled and ran 712 kubelet tests; one assertion
+was wrong (an interior `.` is dropped by `Path::components` and stays inside the directory, so it is allowed; only `..` refused),
+fixed in the next commit. PAUSED here for the P0 #379 (stormcentral). Resume: sc-build that commit, stage, then the live check
+(stormvm `boot` suite `direct-*` on a node with vmimages `data_size` 1G) → close #421.
 
 ### Waiting on stormcos#354: #404 (P0), a VM root on a stormstorage mirrored volume filled from its golden (stormstorage#113 B')
 2026-11-20. The owner chose B' on stormstorage#113 (built there: 2ef4b37, `from_golden`). Plan (`vm_mirrored_root.rs`):
