@@ -2,6 +2,7 @@
 
 ## 2026-11-20
 
+- **docs:** `docs/status.md` and CLAUDE.md audited against main ff31f8f and `git log --since=2026-11-13`: rows for PVC growth and snapshots (#379), lifecycle hooks (#374, #393), helper containers (#378), mirror namespaces (#418), real-time pods (#430), the guest agent and pod-address checks (#405, #426), the #428 hardening, `--stormblock-ca` for stormvm (#318) and the VM maintenance loop (#381, #383); #429 listed as a limitation. Every flag and environment variable in the code is in README or `docs/configuration.md`.
 - **feat:** A node service's mirror pod has one container per stormd helper process (#378, stormd#75). Every process stormd marks `helper` (a log shipper, a renewing cert client; stormd#80 reports the flag) is a container after the service's. Each has its own status, `storm.io/instance.<process>`, and `volumeMounts` for the goldens stormd presents to it (read from stormd's `GET /api/v1/volumes`; inline read-only volumes of the built-in driver). The pod is Ready when every container is. Until a process is marked, every service keeps one container.
 - **docs:** Real-time nodes carry no `stormpump.io/realtime:NoSchedule` taint (#430, option A, decided 2026-11-20): the isolated cores are guarded by the `stormpump.io/isolated-cores` resource and the engine. A taint would stop a single-node cluster from scheduling its own pods.
 - **feat:** Real-time pods on stormpump (#430, stormpump#252), and `runtimeClassName` honoured (#204).
