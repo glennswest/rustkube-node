@@ -302,6 +302,11 @@ c2b13f8de1 (pvetest2, 595766e test, the node's older kubelet): ready, localhost,
 netns, every container gets its own IPC ns and /dev/shm → filed stormpump#244. Part 3 → #378, proposed `--after stormd#75`.
 Open: the proof pod `default/multi-<node>` (owner's question, posted on the issue). Then: medium on a pve machine with a release carrying
 595766e (hooks + order); `pod-multi-ipc` after stormpump#244.
+2026-11-19: owner answered the proof question: B ("#12 medium is our test case"): no demo pod; medium's `pod-multi-*` passing is the proof.
+b5770e2238 (pvetest3, 12.96, carries hooks): ready, localhost, logs, exec, restart pass; `pod-multi-ipc` fails (stormpump#244, open);
+`pod-multi-stop-order` fails: a's preStop file written, the sidecar's absent. pvetest3's syslog ends 17:35, before the run: no kubelet log.
+Next: the test says why (exec -c sidecar in `pod-multi-exec`; the stop-order failure lists the files and PreStop/Killing events), sc-build,
+medium again, then fix the kubelet side. Close when every `pod-multi-*` passes (ipc after stormpump#244).
 
 ### Shipped (waits for the proof on a node): #372 (P0), traceability: root clones owned by their Pod, pods carry instance/golden/digest/volume ids, mirror pods declare the service's volumes
 

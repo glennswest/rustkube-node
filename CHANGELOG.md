@@ -2,6 +2,7 @@
 
 ## 2026-11-19
 
+- **test:** medium's multi-container cases (#374): `pod-multi-exec` also execs into the sidecar, and a failed `pod-multi-stop-order` names every file the reader read and the pod's PreStop/Killing events. Run b5770e2238 (pvetest3, 12.96) saw a's preStop file but not the sidecar's, with nothing to say why.
 - **test:** the `golden` suite's `golden-no-agent-fails` (#399) shuts both ways a copy is de-identified: besides masking qemu-guest-agent, its guest masks systemd-debug-generator (which installs `stormvm-seal.service` from SMBIOS credentials) and the unit. Since b515348 an agentless fedora-44 copy seals itself by the unit, so run 7ffb659a57 (pvetest3, 12.96) saw it end `Sealed` under the run's golden name, and `golden-sealed` was then refused that name. README and `vm_golden`'s docs now say a guest with the unit but no agent seals.
 - **docs:** #416 verified on a node: medium b5770e2238 on pvetest3 (12.96, rustkube-node 6682813) passed `pod-logs-follow-ends` — a Succeeded pod's followed log ended in 47 ms, a running pod's 5.5 s after it exited, both with their log.
 - **test:** medium's `pod-logs-follow-ends` (#416): a Succeeded pod's `log?follow=true` must end within 20 s with its log, and a running pod's followed log must end within 20 s of its exit. sc's `logs-follow-ends` covered this only from sc's suite, which this project's session cannot start; the kubelet's own suite now checks it.

@@ -22,7 +22,8 @@
 //!   127.0.0.1 (one network namespace).
 //! - `pod-multi-logs`: `log?container=` of each says that container's own lines.
 //! - `pod-multi-exec`: `exec -c b` finds the init container's file in the
-//!   shared emptyDir; `exec -c a` finds its postStart hook's file.
+//!   shared emptyDir; `exec -c a` finds its postStart hook's file; `exec -c
+//!   sidecar` runs (a sidecar's preStop is an exec in it).
 //! - `pod-multi-ipc`: `exec -c b` reads `/dev/shm/multi-a`, written by `a`
 //!   (one IPC namespace and `/dev/shm`, as upstream's pod sandbox shares).
 //! - `pod-multi-restart`: `a` crashes once (a marker `b` writes): `a`'s
@@ -30,7 +31,8 @@
 //!   again; `b` and the sidecar keep their container ids and count 0.
 //! - `pod-multi-stop-order` (needs the built-in class): the pod deleted, a
 //!   reader pod mounts the claim: both preStop hooks wrote their files, and the
-//!   sidecar's SIGTERM came after `a`'s and `b`'s (sidecars stop last).
+//!   sidecar's SIGTERM came after `a`'s and `b`'s (sidecars stop last). A
+//!   failure names every file read and the pod's PreStop/Killing events.
 
 use std::time::{Duration, Instant};
 
@@ -336,15 +338,17 @@ pub async fn run(env: &Env, api: &Api) -> Vec<(String, Outcome, u128)> {
     let o = match (
         exec(env, api, "b", &["expect-file", "/scratch/from-init", "init ran"]).await,
         exec(env, api, "a", &["read-file", "/scratch/poststart-a"]).await,
+        exec(env, api, "sidecar", &["expect-file", "/scratch/from-init", "init ran"]).await,
     ) {
-        (Ok(init), Ok(hook)) if init.ok() && detail(&hook.stdout).as_deref() == Some("a") => {
-            Outcome::Pass("exec -c b found init's file in the shared emptyDir; exec -c a found its postStart hook's file".into())
-        }
-        (Ok(init), Ok(hook)) => Outcome::Fail(format!(
-            "exec -c b expect-file: status {} stdout {}; exec -c a read-file poststart-a: {}",
-            init.status, init.stdout.trim(), hook.stdout.trim()
+        (Ok(init), Ok(hook), Ok(sc)) if init.ok() && detail(&hook.stdout).as_deref() == Some("a") && sc.ok() => Outcome::Pass(
+            "exec -c b found init's file in the shared emptyDir; exec -c a found its postStart hook's file; exec -c sidecar ran".into(),
+        ),
+        (Ok(init), Ok(hook), Ok(sc)) => Outcome::Fail(format!(
+            "exec -c b expect-file: status {} stdout {}; exec -c a read-file poststart-a: {}; exec -c sidecar expect-file: status {} stdout {}",
+            init.status, init.stdout.trim(), hook.stdout.trim(), sc.status, sc.stdout.trim()
         )),
-        (Err(e), _) | (_, Err(e)) => Outcome::Fail(e),
+        (Err(e), _, _) | (_, Err(e), _) => Outcome::Fail(e),
+        (_, _, Err(e)) => Outcome::Fail(format!("exec -c sidecar: {e}")),
     };
     put(&mut out, "pod-multi-exec", o, &mut t);
 
@@ -418,7 +422,16 @@ async fn stop_order(env: &Env, api: &Api, path: &str) -> Outcome {
     }
     match stop_order_check(&read) {
         Ok(d) => Outcome::Pass(d),
-        Err(e) => Outcome::Fail(e),
+        Err(e) => {
+            // What would say why: every file the reader read, and the
+            // kubelet's hook and stop events for the pod.
+            let files: Vec<String> = read.iter().map(|(k, v)| format!("{k}={v:?}")).collect();
+            let events = match k8s::events_for(env, api, "Pod", POD).await {
+                Ok(ev) => ev.into_iter().filter(|e| e.contains("PreStop") || e.starts_with("Killing")).collect::<Vec<_>>().join(" | "),
+                Err(e) => format!("(events: {e})"),
+            };
+            Outcome::Fail(format!("{e}; read: {}; events: {}", files.join(", "), if events.is_empty() { "none" } else { &events }))
+        }
     }
 }
 
