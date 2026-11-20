@@ -21,6 +21,10 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
    unschedulable (asked on #430, recommendation: no taint).
 7. Test crate: suite case (2 isolated cores, FIFO 80: cpuset.cpus/mems and SCHED_FIFO 80 read back; hard refused) —
    runs once stormcos#1477 gives a test machine an isolated set.
+Done: e6943f8 (all of 1-5 and 7; realtime.rs, node_status with_realtime, pod_manager runtime_handler/realtime_admission/
+realtime_of, stormpump cpu_for/sched_for and handler refusal, CriError::Refused, test suite `realtime` + `rt-view`).
+Taint question posted on #430 (recommended A: no taint). sc-build at e6943f8 running (tmp/sc-build-430.log). Next: pass →
+stage; `wait-owner` on the taint; the node run after stormcos#1477.
 
 ### In progress: #318 (P2), --stormblock-ca for stormvm's engine clients
 2026-11-20. stormvm 319333d already has 59dc498 (`STORMBLOCK_CA_FILE` in stormvm-block, no CA argument on the console's
