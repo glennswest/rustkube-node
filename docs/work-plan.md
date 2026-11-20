@@ -10,6 +10,9 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 `STORMBLOCK_CA_FILE` before the tokio runtime starts, then runs `run(cli)`. Test: vm_restore's Stormblock reaches an
 https engine from the CA, another CA's is refused with nothing sent. sc-build at df261de running (tmp/sc-build-318.log).
 Then stage; the node half (a VMSnapshot + restore against an https engine) needs a node whose stormblock serves TLS.
+sc-build 08ee2681ea passed (733 kubelet tests, the TLS one included; no warning in main.rs/vm_restore.rs). Stage build
+83d6c11ed85e. Held `--after stormcos#374` (no node's stormblock serves TLS yet). Resume: on a node with an https engine,
+a VirtualMachineSnapshot and a VirtualMachineRestore succeed → close #318.
 
 ### In progress: #334 (P1), a kubelet restart adopts no pods on stormpump
 2026-11-20. Cause (issue): StormpumpRuntime's sandbox/container maps are memory only; the engine keeps the workloads and
