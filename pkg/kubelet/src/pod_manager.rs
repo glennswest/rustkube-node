@@ -2177,17 +2177,55 @@ impl PodManager {
             return refuse(format!("this node's storage has no volume {handle}")).await;
         };
         let ss = self.stormstorage.as_ref().expect("refused above without one");
+        // A copy already under way for this volume is this move's, started by
+        // a pass whose PVC write was lost (or before a kubelet restart): it is
+        // recorded, never started twice (#437, 0417958a2e64). Not knowing is
+        // asked again next pass, rather than a second start.
+        let recorded = |mig: crate::vm_migration::DiskMigration| async move {
+            let progress = cm::progress(mig.bytes_total, mig.bytes_remaining);
+            // Until this is written, every pass finds the copy here again.
+            if !self.mark_claim(pvc, &[
+                (cm::STATE, Some(cm::COPYING)), (cm::REASON, None), (cm::PROGRESS, Some(&progress)),
+                (cm::MIGRATION, Some(&mig.id)), (cm::TARGET, Some(to)), (cm::FROM, Some(here)),
+            ]).await {
+                warn!("PVC {ns}/{claim}: migration {} not recorded on the claim yet; it is found again next pass", mig.id);
+            }
+            true
+        };
+        match crate::vm_migration::Stormstorage(ss).live_for(here, &id).await {
+            // A copy that failed still holds the volume in stormstorage, and
+            // nothing will carry it: aborted (its target deleted, the source
+            // as it was), then a new one starts.
+            Ok(Some(mig)) if mig.state == "failed" => {
+                if let Err(e) = crate::vm_migration::Stormstorage(ss).step(&mig.id, "abort").await {
+                    warn!("PVC {ns}/{claim}: failed migration {} of {handle} not aborted, asked again: {e}", mig.id);
+                    return true;
+                }
+                info!("PVC {ns}/{claim}: aborted failed migration {} of {handle} before a new one", mig.id);
+            }
+            Ok(Some(mig)) if mig.target_node == to => {
+                info!("PVC {ns}/{claim}: migration {} of {handle} to {to} is already under way: recorded", mig.id);
+                return recorded(mig).await;
+            }
+            Ok(Some(mig)) => {
+                return refuse(format!(
+                    "{handle} is already being copied to {} by migration {} ({}); abort it in stormstorage first",
+                    mig.target_node, mig.id, mig.state
+                ))
+                .await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!("PVC {ns}/{claim}: could not ask stormstorage for {handle}'s migrations, asked again: {e}");
+                return true;
+            }
+        }
         let placement = set.map(|s| serde_json::json!({ "array": s }));
         match crate::vm_migration::Stormstorage(ss).start_on(here, &id, to, placement).await {
             Ok(mig) => {
                 info!("PVC {ns}/{claim}: moving {handle} to {to}: migration {}", mig.id);
                 self.claim_event(pvc, "Normal", "Moving", &format!("copying {handle} to {to}")).await;
-                let progress = cm::progress(mig.bytes_total, mig.bytes_remaining);
-                self.mark_claim(pvc, &[
-                    (cm::STATE, Some(cm::COPYING)), (cm::REASON, None), (cm::PROGRESS, Some(&progress)),
-                    (cm::MIGRATION, Some(&mig.id)), (cm::TARGET, Some(to)), (cm::FROM, Some(here)),
-                ]).await;
-                true
+                recorded(mig).await
             }
             Err(e) => {
                 self.claim_event(pvc, "Warning", "MoveFailed", &e).await;
@@ -11837,6 +11875,13 @@ pub(crate) mod tests {
                     s.migrations.insert("m-1".into(), "copying".into());
                     axum::Json(json!({"id": "m-1", "state": "starting", "bytes_total": 1024, "bytes_remaining": 1024}))
                 }))
+            .route("/api/v1/migrations", http_get(|State(s): State<S>| async move {
+                let all: Vec<Value> = s.lock().unwrap().migrations.iter().map(|(id, st)| json!({
+                    "id": id, "state": st, "source_node": NODE, "source_volume_id": "v-1",
+                    "target": {"node": "b"}, "bytes_total": 1024, "bytes_remaining": 512
+                })).collect();
+                axum::Json(json!({"migrations": all}))
+            }))
             .route("/api/v1/migrations/{id}", http_get(|State(s): State<S>, Path(id): Path<String>| async move {
                 match s.lock().unwrap().migrations.get(&id) {
                     Some(st) => axum::Json(json!({"id": id, "state": st, "bytes_total": 1024, "bytes_remaining": 256})).into_response(),
@@ -12568,5 +12613,29 @@ pub(crate) mod tests {
         );
         p["spec"]["hostNetwork"] = json!(true);
         assert!(build_sandbox_config(&p).port_mappings.is_empty());
+    }
+
+    /// #437 0417958a2e64: a copy started by a pass whose PVC write was lost
+    /// (or before a kubelet restart) is found and recorded, never started a
+    /// second time; a failed one is aborted before a new one starts.
+    #[tokio::test]
+    async fn a_claim_move_whose_record_was_lost_adopts_its_copy() {
+        use crate::claim_move as cm;
+        let (mgr, s) = move_fake(json!({cm::MOVE_TO: "b"})).await;
+        mgr.move_claims().await;
+        assert_eq!(annotation(&s, cm::MIGRATION), "m-1");
+        // The write is lost: the PVC says nothing of the copy.
+        for k in [cm::MIGRATION, cm::STATE, cm::TARGET, cm::FROM, cm::PROGRESS] {
+            s.lock().unwrap().pvc["metadata"]["annotations"][k] = Value::Null;
+        }
+        assert_eq!(mgr.move_claims().await, Some(cm::POLL));
+        assert_eq!(asked(&s).iter().filter(|a| a.starts_with("start ")).count(), 1, "{:?}", asked(&s));
+        assert_eq!((annotation(&s, cm::MIGRATION), annotation(&s, cm::STATE)), ("m-1".into(), cm::COPYING.into()));
+
+        let (mgr, s) = move_fake(json!({cm::MOVE_TO: "b"})).await;
+        s.lock().unwrap().migrations.insert("m-0".into(), "failed".into());
+        mgr.move_claims().await;
+        assert_eq!(asked(&s), ["abort m-0", "start test-node/v-1→b null"]);
+        assert_eq!(annotation(&s, cm::MIGRATION), "m-1");
     }
 }

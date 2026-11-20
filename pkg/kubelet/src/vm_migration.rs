@@ -440,6 +440,8 @@ pub struct DiskMigration {
     pub message: String,
     /// T's engine-local volume id: what the target attaches.
     pub target_id: Option<String>,
+    /// T, the node the copy goes to.
+    pub target_node: String,
     pub bytes_remaining: u64,
     pub bytes_total: u64,
 }
@@ -451,10 +453,23 @@ impl DiskMigration {
             state: v["state"].as_str().unwrap_or_default().to_string(),
             message: v["message"].as_str().unwrap_or_default().to_string(),
             target_id: v["target"]["id"].as_str().or(v["target_local_id"].as_str()).map(str::to_string),
+            target_node: v["target"]["node"].as_str().or(v["target_node"].as_str()).unwrap_or_default().to_string(),
             bytes_remaining: v["bytes_remaining"].as_u64().unwrap_or(0),
             bytes_total: v["bytes_total"].as_u64().unwrap_or(0),
         }
     }
+}
+
+/// In a `GET /api/v1/migrations` answer, the live migration of `source`'s
+/// `volume`: `completed` and `aborted` are over; any other state (`failed`
+/// included, which can be retried) still holds the source.
+pub fn live_of(list: &Value, source: &str, volume: &str) -> Option<DiskMigration> {
+    list["migrations"]
+        .as_array()?
+        .iter()
+        .filter(|m| m["source_node"].as_str() == Some(source) && m["source_volume_id"].as_str() == Some(volume))
+        .map(DiskMigration::of)
+        .find(|m| !matches!(m.state.as_str(), "completed" | "aborted"))
 }
 
 /// stormstorage's VM-disk migration verbs (stormstorage#44).
@@ -494,6 +509,15 @@ impl Stormstorage<'_> {
             return Err(format!("stormstorage answered no migration id: {v}"));
         }
         Ok(m)
+    }
+
+    /// The live (not completed, not aborted) migration of `source`'s
+    /// `volume`, if stormstorage has one (rustkube-node#437, 0417958a2e64).
+    /// stormstorage holds at most one per source volume and refuses to start
+    /// another, so a start whose id was never recorded is found here.
+    pub async fn live_for(&self, source: &str, volume: &str) -> Result<Option<DiskMigration>, String> {
+        let v = Self::answer(self.0.get(&self.url("migrations")).await).await?;
+        Ok(live_of(&v, source, volume))
     }
 
     pub async fn get(&self, id: &str) -> Result<DiskMigration, String> {
