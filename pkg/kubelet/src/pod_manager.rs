@@ -593,6 +593,9 @@ pub struct PodManager {
     /// config yet (woken by the config directory changing), `Some(at)` for a
     /// config whose ADD has failed since `at` (retried on a backoff from then).
     network_waits: std::sync::Mutex<HashMap<String, Option<Instant>>>,
+    /// RuntimeClass name → handler (#204). Upstream's `handler` is immutable,
+    /// so an answer is kept for the kubelet's life.
+    runtime_handlers: std::sync::Mutex<HashMap<String, String>>,
     /// Each starting pod's phases (by uid), from seen to `Running`
     /// acknowledged (#132).
     timings: std::sync::Mutex<HashMap<String, crate::start_timing::StartTiming>>,
@@ -736,6 +739,7 @@ impl PodManager {
             csi_mountinfo: "/proc/1/mountinfo".to_string(),
             first_seen: std::sync::Mutex::new(HashMap::new()),
             network_waits: Default::default(),
+            runtime_handlers: Default::default(),
             timings: Default::default(),
             deadlines: Default::default(),
             event_waits: Default::default(),
@@ -972,6 +976,40 @@ impl PodManager {
     /// GET an object, telling "not there" (`Ok(None)`, a 404) apart from "not
     /// answered" (`Err`): what decides a claim's policy must not read an
     /// unreachable StorageClass as one that names nothing (#71).
+    /// The handler of the pod's RuntimeClass (#204): empty without one. A
+    /// RuntimeClass that is not there is a wait with the reason, as upstream
+    /// (the pod is never run on the default runtime instead); an apiserver
+    /// that does not answer is a wait too.
+    async fn runtime_handler(&self, pod: &Value) -> Result<String, CriError> {
+        let Some(class) = pod["spec"]["runtimeClassName"].as_str().filter(|c| !c.is_empty()) else {
+            return Ok(String::new());
+        };
+        if let Some(h) = self.runtime_handlers.lock().unwrap_or_else(|e| e.into_inner()).get(class) {
+            return Ok(h.clone());
+        }
+        let not_found = || CriError::Refused {
+            reason: "FailedCreatePodSandBox".into(),
+            message: format!("RuntimeClass \"{class}\" not found"),
+        };
+        if self.api_url.is_empty() {
+            return Err(not_found());
+        }
+        let rc = self
+            .api_get_checked(&format!("/apis/node.k8s.io/v1/runtimeclasses/{class}"))
+            .await
+            .map_err(|e| CriError::Pending(format!("RuntimeClass {class}: {e}")))?
+            .ok_or_else(not_found)?;
+        let handler = rc["handler"].as_str().unwrap_or("").to_string();
+        if handler.is_empty() {
+            return Err(CriError::Refused {
+                reason: "FailedCreatePodSandBox".into(),
+                message: format!("RuntimeClass \"{class}\" has no handler"),
+            });
+        }
+        self.runtime_handlers.lock().unwrap_or_else(|e| e.into_inner()).insert(class.to_string(), handler.clone());
+        Ok(handler)
+    }
+
     async fn api_get_checked(&self, path: &str) -> Result<Option<Value>, String> {
         if self.api_url.is_empty() {
             return Ok(None);
@@ -3859,6 +3897,14 @@ impl PodManager {
                         self.event(pod, "Warning", "Failed", &what).await;
                         outcome.updates.push(self.waiting_pod(pod, what));
                     }
+                    // Not run as asked (#204, #430): waiting, with the reason
+                    // as the Event's, retried on the wait's backoff.
+                    Err(CriError::Refused { reason, message }) => {
+                        warn!("Pod {namespace}/{name} refused ({reason}): {message}");
+                        self.retry_wait(uid, seen.elapsed());
+                        self.event(pod, "Warning", &reason, &message).await;
+                        outcome.updates.push(self.waiting_pod(pod, message));
+                    }
                     Err(CriError::VolumeNotReady(what)) => {
                         warn!("Pod {namespace}/{name} waiting on volumes: {what}");
                         self.retry_wait(uid, seen.elapsed());
@@ -4110,6 +4156,7 @@ impl PodManager {
             push_mount(&mut mounts, dns_mount.clone());
             let mut config = build_container_config(spec, &image_ref, envs, mounts);
             apply_pod_namespaces(&mut config, pod);
+            config.realtime = realtime_of(pod, &sandbox_config.runtime_handler, &config.name);
             ensure_container_log_dir(&sandbox_config.log_directory, &config.name);
             let cid = if let Some(cid)=existing {cid} else {
             // A retried init or a restarted sidecar is a new run with its own
@@ -4387,7 +4434,11 @@ impl PodManager {
         attempt.queue(self.load.as_ref().map(|l| l.text()), pending);
         if self.admission.is_some() {self.ready_images(pod).await?;}
 
-        let sandbox_config = build_sandbox_config(pod);
+        let mut sandbox_config = build_sandbox_config(pod);
+        // The pod's RuntimeClass (#204) and its real time (#430), checked
+        // before anything is made: a refusal leaves nothing to undo.
+        sandbox_config.runtime_handler = self.runtime_handler(pod).await?;
+        realtime_admission(pod, &sandbox_config.runtime_handler, crate::realtime::Preempt::read())?;
         let step = Instant::now();
         let mut volume_times = Vec::new();
         let mut claim_steps = Vec::new();
@@ -4593,6 +4644,7 @@ impl PodManager {
             let mut container_config =
                 build_container_config(container_spec, &image_ref, envs, mounts);
             apply_pod_namespaces(&mut container_config, pod);
+            container_config.realtime = realtime_of(pod, &sandbox_config.runtime_handler, &container_config.name);
             ensure_container_log_dir(&sandbox_config.log_directory, &container_config.name);
             new_log_run(&mut container_config, &sandbox_config.log_directory, 0);
 
@@ -5498,8 +5550,13 @@ impl PodManager {
         let pod_ip_for_hook = state.pod_ip.clone();
         let result = async move {
             let image_ref = self.ensure_image(image, spec).await?;
+            // Its RuntimeClass again (#430): a real-time container restarts on
+            // its isolated cores, never on the shared pool. Not known now is
+            // a failed restart, retried.
+            let handler = self.runtime_handler(&pod_for_ns).await?;
             let mut config = build_container_config(spec, &image_ref, envs, mounts);
             apply_pod_namespaces(&mut config, &pod_for_ns);
+            config.realtime = realtime_of(&pod_for_ns, &handler, &config.name);
             config.attempt = restart_count;
             ensure_container_log_dir(&sandbox_config.log_directory, &config.name);
             // After every run on disk, not only the restart count, which a
@@ -6722,6 +6779,22 @@ pub fn declared_init_containers(pod: &Value) -> usize {
 }
 
 /// Build the sandbox config for a pod object.
+/// The real-time admission (#430), before anything is made: `realtime-hard`
+/// without `PREEMPT_RT`, and any mistake in what the pod asked (the field
+/// named), refused with a Warning `RealtimeRefused` and a waiting reason.
+fn realtime_admission(pod: &Value, handler: &str, preempt: crate::realtime::Preempt) -> Result<(), CriError> {
+    let refused = |message: String| CriError::Refused { reason: crate::realtime::REFUSED.into(), message };
+    if let Some(why) = crate::realtime::hard_refusal(handler, preempt) {
+        return Err(refused(why));
+    }
+    crate::realtime::for_pod(pod, handler).map(|_| ()).map_err(refused)
+}
+
+/// One container's real time (#430), as the admission checked it.
+fn realtime_of(pod: &Value, handler: &str, container: &str) -> Option<crate::realtime::Realtime> {
+    crate::realtime::for_pod(pod, handler).ok()?.into_iter().find(|(n, _)| n == container).map(|(_, rt)| rt)
+}
+
 fn build_sandbox_config(pod: &Value) -> PodSandboxConfig {
     let name = pod["metadata"]["name"].as_str().unwrap_or("");
     let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default");
@@ -6777,6 +6850,8 @@ fn build_sandbox_config(pod: &Value) -> PodSandboxConfig {
         // Resolved against the apiserver before the sandbox (#233).
         networks: Vec::new(),
         default_network: None,
+        // From the pod's RuntimeClass, before the sandbox (#204).
+        runtime_handler: String::new(),
     }
 }
 
@@ -11432,5 +11507,86 @@ pub(crate) mod tests {
         assert!(matches!(cutover_outcome(no, at("synced")), Cutover::Refused(_)));
         assert!(matches!(cutover_outcome(lost, at("failed")), Cutover::Ended(_)));
         assert_eq!(cutover_outcome(lost, Err("stormstorage: connection refused".into())), Cutover::Ask);
+    }
+
+    /// #204: `runtimeClassName` resolves to the RuntimeClass's handler, asked
+    /// once; a RuntimeClass that is not there refuses the pod with upstream's
+    /// words; no class is the default runtime.
+    #[tokio::test]
+    async fn a_runtime_class_resolves_to_its_handler_and_a_missing_one_waits() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let asked = Arc::new(AtomicUsize::new(0));
+        let n = asked.clone();
+        let app = axum::Router::new().route(
+            "/apis/node.k8s.io/v1/runtimeclasses/{name}",
+            axum::routing::get(move |axum::extract::Path(name): axum::extract::Path<String>| {
+                let n = n.clone();
+                async move {
+                    use axum::response::IntoResponse as _;
+                    n.fetch_add(1, Ordering::SeqCst);
+                    if name == "rt" {
+                        axum::Json(json!({"metadata": {"name": "rt"}, "handler": "realtime-soft"})).into_response()
+                    } else {
+                        axum::http::StatusCode::NOT_FOUND.into_response()
+                    }
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let rt = Arc::new(FakeRuntime::default());
+        let mgr = PodManager::with_api(rt.clone(), rt, NODE, &url, "127.0.0.1", reqwest::Client::new());
+        let with = |class: Option<&str>| {
+            let mut p = pod("u", "p", "Always", simple_container());
+            if let Some(c) = class {
+                p["spec"]["runtimeClassName"] = json!(c);
+            }
+            p
+        };
+        assert_eq!(mgr.runtime_handler(&with(None)).await.unwrap(), "");
+        assert_eq!(mgr.runtime_handler(&with(Some("rt"))).await.unwrap(), "realtime-soft");
+        assert_eq!(mgr.runtime_handler(&with(Some("rt"))).await.unwrap(), "realtime-soft");
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "asked once: a handler never changes");
+        match mgr.runtime_handler(&with(Some("gvisor"))).await {
+            Err(CriError::Refused { reason, message }) => {
+                assert_eq!((reason.as_str(), message.as_str()), ("FailedCreatePodSandBox", "RuntimeClass \"gvisor\" not found"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// #430: `realtime-hard` without PREEMPT_RT is refused, never run as
+    /// soft; `realtime-soft` is admitted; a mistake in the annotation is a
+    /// refusal naming the field; each container gets its own real time.
+    #[test]
+    fn real_time_admission_refuses_hard_without_preempt_rt() {
+        use crate::realtime::{Preempt, HANDLER_HARD, HANDLER_SOFT, REFUSED, RESOURCE};
+        let mut c = json!({"name": "loop", "image": "i"});
+        c["resources"]["requests"][RESOURCE] = json!("2");
+        c["resources"]["limits"][RESOURCE] = json!("2");
+        let mut p = pod("u", "rt", "Always", c);
+        p["metadata"]["annotations"] = json!({"stormpump.io/realtime": "policy=fifo,priority=80"});
+        match realtime_admission(&p, HANDLER_HARD, Preempt::Dynamic) {
+            Err(CriError::Refused { reason, message }) => {
+                assert_eq!(reason, REFUSED);
+                assert!(message.contains("PREEMPT_RT") && message.contains("not run as soft"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(realtime_admission(&p, HANDLER_HARD, Preempt::Rt).is_ok());
+        assert!(realtime_admission(&p, HANDLER_SOFT, Preempt::Dynamic).is_ok());
+        let rt = realtime_of(&p, HANDLER_SOFT, "loop").expect("real time");
+        assert_eq!((rt.cores, rt.shape.priority), (2, 80));
+        assert_eq!(realtime_of(&p, HANDLER_SOFT, "other"), None);
+        p["metadata"]["annotations"]["stormpump.io/realtime"] = json!("policy=fifo,priority=200");
+        match realtime_admission(&p, HANDLER_SOFT, Preempt::Dynamic) {
+            Err(CriError::Refused { message, .. }) => assert!(message.contains("priority=\"200\""), "{message}"),
+            other => panic!("{other:?}"),
+        }
+        // Neither asked: admitted, nothing real time.
+        let plain = pod("u", "p", "Always", simple_container());
+        assert!(realtime_admission(&plain, "", Preempt::Dynamic).is_ok());
+        assert_eq!(realtime_of(&plain, "", "app"), None);
     }
 }

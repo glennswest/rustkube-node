@@ -67,7 +67,7 @@ pub fn is_workload(args: &[String]) -> bool {
         Some(
             "fill" | "verify" | "size-at-least" | "sized" | "echo" | "exit" | "sleep" | "fail-once"
                 | "write-file" | "expect-file" | "expect-env" | "expect-nics" | "read-file" | "vm-instance" | "rdma-view"
-                | "member" | "grows" | "qga-probe" | "tcp-connect"
+                | "member" | "grows" | "qga-probe" | "tcp-connect" | "rt-view"
         )
     )
 }
@@ -239,6 +239,62 @@ fn rdma_view() -> String {
     )
 }
 
+/// What the kernel gives this process (#430), read here rather than taken
+/// from the spec: `cpus=<list> mems=<list> cores=<n> nodes=<list> policy=<n>
+/// priority=<n>`. `cpus`/`mems` are the allowed lists from
+/// `/proc/self/status` (the cgroup's effective cpuset); `cores` the whole
+/// physical cores among `cpus` (SMT siblings once); `nodes` the NUMA nodes
+/// those CPUs are on; `policy` `sched_getscheduler` (1 FIFO, 2 RR, 0 OTHER).
+pub fn rt_view() -> String {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |k: &str| status.lines().find_map(|l| l.strip_prefix(k).map(|v| v.trim().to_string())).unwrap_or_default();
+    let cpus = field("Cpus_allowed_list:");
+    let mems = field("Mems_allowed_list:");
+    let list = expand_cpu_list(&cpus);
+    let topo = |c: u32, f: &str| {
+        std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{c}/topology/{f}")).ok().map(|s| s.trim().to_string())
+    };
+    let cores: std::collections::BTreeSet<(String, String)> = list
+        .iter()
+        .map(|&c| (topo(c, "physical_package_id").unwrap_or_default(), topo(c, "core_id").unwrap_or_else(|| c.to_string())))
+        .collect();
+    let mut nodes: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    for &c in &list {
+        if let Ok(dir) = std::fs::read_dir(format!("/sys/devices/system/cpu/cpu{c}")) {
+            for e in dir.flatten() {
+                if let Some(n) = e.file_name().to_str().and_then(|n| n.strip_prefix("node")).and_then(|n| n.parse().ok()) {
+                    nodes.insert(n);
+                }
+            }
+        }
+    }
+    // SAFETY: plain syscalls on this process, writing only `param`.
+    let (policy, priority) = unsafe {
+        let mut param: libc::sched_param = std::mem::zeroed();
+        let policy = libc::sched_getscheduler(0);
+        libc::sched_getparam(0, &mut param);
+        (policy, param.sched_priority)
+    };
+    let nodes: Vec<String> = nodes.iter().map(u32::to_string).collect();
+    format!(
+        "cpus={cpus} mems={mems} cores={} nodes={} policy={policy} priority={priority}",
+        cores.len(),
+        if nodes.is_empty() { "-".to_string() } else { nodes.join(",") }
+    )
+}
+
+/// A kernel CPU list (`2-5,8`), what parses of it.
+pub fn expand_cpu_list(list: &str) -> Vec<u32> {
+    let mut out = Vec::new();
+    for part in list.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (a, b) = part.split_once('-').unwrap_or((part, part));
+        if let (Ok(a), Ok(b)) = (a.trim().parse::<u32>(), b.trim().parse::<u32>()) {
+            out.extend(a..=b);
+        }
+    }
+    out
+}
+
 /// Where a pod's ServiceAccount token is mounted.
 pub const SA_TOKEN: &str = "/var/run/secrets/kubernetes.io/serviceaccount/token";
 
@@ -382,6 +438,7 @@ fn run(args: &[String]) -> Result<String, String> {
     let num = |i: usize, what: &str| arg(i, what)?.parse::<u64>().map_err(|e| format!("{what}: {e}"));
     match args[0].as_str() {
         "rdma-view" => Ok(rdma_view()),
+        "rt-view" => Ok(rt_view()),
         "qga-probe" => qga_probe(&arg(1, "agent socket")?),
         "tcp-connect" => tcp_connect(&arg(1, "address:port")?, num(2, "seconds")?),
         "vm-instance" => {

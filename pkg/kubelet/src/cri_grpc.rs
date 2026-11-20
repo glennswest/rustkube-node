@@ -461,7 +461,9 @@ impl RuntimeService for CriGrpcClient {
             .clone()
             .run_pod_sandbox(proto::RunPodSandboxRequest {
                 config: Some(self.sandbox_config(config)),
-                runtime_handler: String::new(),
+                // The pod's RuntimeClass handler (#204); the runtime refuses
+                // one it does not know, as upstream's do.
+                runtime_handler: config.runtime_handler.clone(),
             })
             .await
             .map_err(rpc_err)?

@@ -422,6 +422,9 @@ impl Kubelet {
                     // RDMA verbs (#348): the stormpump runtime is what binds
                     // them into a container, and VMs run only on it.
                     reporter = reporter.with_rdma(Arc::new(crate::rdma::units_now));
+                    // Real time (#430): isolated cores and the kernel, on
+                    // stormpump, the runtime that places them.
+                    reporter = reporter.with_realtime(Arc::new(crate::realtime::NodeFacts::read));
                 }
                 let mut backoff = Duration::from_secs(1);
                 loop {
@@ -499,6 +502,7 @@ impl Kubelet {
             if hb_vms.is_some() {
                 reporter = reporter.with_kvm(Arc::new(crate::node_status::kvm_available));
                 reporter = reporter.with_rdma(Arc::new(crate::rdma::units_now));
+                reporter = reporter.with_realtime(Arc::new(crate::realtime::NodeFacts::read));
             }
             let mut interval = time::interval(heartbeat_interval);
             loop {

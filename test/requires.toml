@@ -106,3 +106,16 @@ cluster_read = [
   { apiGroup = "snapshot.storage.k8s.io", resource = "volumesnapshotclasses" },
   { apiGroup = "snapshot.storage.k8s.io", resource = "volumesnapshotcontents" },
 ]
+
+[realtime]
+# Real-time pods on stormpump (#430): a realtime-soft pod on two isolated
+# cores at SCHED_FIFO 80, read back from inside it (cpuset and policy), and a
+# realtime-hard pod refused on a kernel without PREEMPT_RT. Reads which Node
+# STORM_NODE is (its stormpump.io/realtime labels and isolated cores) and the
+# RuntimeClasses (stormcos#1477 ships them). Pods are made in the run's
+# namespace. On request (`stormcentral test run rustkube-node realtime`).
+budget_secs = 300
+cluster_read = [
+  { apiGroup = "", resource = "nodes" },
+  { apiGroup = "node.k8s.io", resource = "runtimeclasses" },
+]

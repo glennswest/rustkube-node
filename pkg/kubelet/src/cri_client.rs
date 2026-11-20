@@ -107,7 +107,12 @@ impl RuntimeService for CriClient {
             .map_err(|e| CriError::Runtime(format!("write config: {e}")))?;
 
         let path_str = tmp.path().to_string_lossy().to_string();
-        let output = self.crictl(&["runp", &path_str])?;
+        // The pod's RuntimeClass handler (#204), as crictl names it.
+        let output = if config.runtime_handler.is_empty() {
+            self.crictl(&["runp", &path_str])?
+        } else {
+            self.crictl(&["runp", "--runtime", &config.runtime_handler, &path_str])?
+        };
         let sandbox_id = output.trim().to_string();
         info!("Created sandbox: {sandbox_id}");
         Ok(sandbox_id)

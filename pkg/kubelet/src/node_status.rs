@@ -120,8 +120,17 @@ pub struct NodeReporter {
     /// How many RDMA verbs devices this node has (#348), asked each status
     /// pass. `None` on a node whose runtime cannot give them to a container.
     rdma: Option<RdmaProbe>,
+    /// What this node can give real-time pods (#430), asked each status
+    /// pass. `None` on a node whose runtime is not stormpump.
+    realtime: Option<RealtimeProbe>,
+    /// The real-time labels last written, so they are patched on change only.
+    realtime_labelled: std::sync::Mutex<Option<serde_json::Map<String, Value>>>,
     client: reqwest::Client,
 }
+
+/// Asks what the node can give real-time pods; [`crate::realtime::NodeFacts::read`]
+/// outside tests.
+pub type RealtimeProbe = std::sync::Arc<dyn Fn() -> crate::realtime::NodeFacts + Send + Sync>;
 
 /// Asks how many RDMA verbs units the node has now; [`crate::rdma::units_now`]
 /// outside tests.
@@ -185,6 +194,8 @@ impl NodeReporter {
             kvm: None,
             kvm_labelled: std::sync::Mutex::new(None),
             rdma: None,
+            realtime: None,
+            realtime_labelled: std::sync::Mutex::new(None),
             client: reqwest::Client::new(),
         }
     }
@@ -238,6 +249,13 @@ impl NodeReporter {
         self
     }
 
+    /// This node's runtime runs real-time pods (#430): advertise its isolated
+    /// cores as `stormpump.io/isolated-cores` and label what it can give.
+    pub fn with_realtime(mut self, probe: RealtimeProbe) -> Self {
+        self.realtime = Some(probe);
+        self
+    }
+
     pub fn with_kubelet_port(mut self, port: u16) -> Self {
         self.kubelet_port = port;
         self
@@ -262,6 +280,9 @@ impl NodeReporter {
                 if let Some(l) = kvm_labels_patch(probe())["metadata"]["labels"].as_object() {
                     m.extend(l.iter().filter(|(_, v)| !v.is_null()).map(|(k, v)| (k.clone(), v.clone())));
                 }
+            }
+            if let Some(probe) = &self.realtime {
+                m.extend(probe().labels());
             }
             for (k, v) in &self.labels {
                 m.insert(k.clone(), Value::String(v.clone()));
@@ -499,6 +520,7 @@ impl NodeReporter {
             Err(e) => tracing::warn!("Heartbeat: node status update failed: {e}"),
         }
         self.sync_kvm_labels().await;
+        self.sync_realtime_labels().await;
 
         Ok(renewed)
     }
@@ -528,6 +550,32 @@ impl NodeReporter {
             }
             Ok(r) => tracing::warn!(status = %r.status(), "node KVM labels not written"),
             Err(e) => tracing::warn!("node KVM labels not written: {e}"),
+        }
+    }
+
+    /// Write the real-time labels (#430) when they differ from what was last
+    /// written, as the KVM ones. A failed patch is tried at the next heartbeat.
+    async fn sync_realtime_labels(&self) {
+        let Some(probe) = &self.realtime else { return };
+        let labels = probe().labels();
+        if self.realtime_labelled.lock().unwrap().as_ref() == Some(&labels) {
+            return;
+        }
+        let url = format!("{}/api/v1/nodes/{}", self.api_url, self.node_name);
+        match self
+            .client
+            .patch(&url)
+            .header("content-type", "application/merge-patch+json")
+            .json(&json!({ "metadata": { "labels": labels } }))
+            .send_retrying(retry::Policy::API)
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                info!(?labels, "node real-time labels written");
+                *self.realtime_labelled.lock().unwrap() = Some(labels);
+            }
+            Ok(r) => tracing::warn!(status = %r.status(), "node real-time labels not written"),
+            Err(e) => tracing::warn!("node real-time labels not written: {e}"),
         }
     }
 
@@ -616,6 +664,13 @@ impl NodeReporter {
         if let Some(units) = self.rdma.as_ref().map(|probe| probe()).filter(|n| *n > 0) {
             for side in ["capacity", "allocatable"] {
                 status[side][crate::rdma::RESOURCE] = json!(units.to_string());
+            }
+        }
+        // Isolated cores (#430): the scheduler's resource fit counts them,
+        // so a node never has more real-time pods than cores to give.
+        if let Some(cores) = self.realtime.as_ref().map(|probe| probe().isolated).filter(|n| *n > 0) {
+            for side in ["capacity", "allocatable"] {
+                status[side][crate::realtime::RESOURCE] = json!(cores.to_string());
             }
         }
         status
@@ -1110,6 +1165,29 @@ mod tests {
         assert!(none["capacity"].get(crate::rdma::RESOURCE).is_none());
         let no_probe = NodeReporter::new("http://x", "n1").build_status(&[]);
         assert!(no_probe["allocatable"].get(crate::rdma::RESOURCE).is_none());
+    }
+
+    /// #430: the isolated set as `stormpump.io/isolated-cores` (whole cores),
+    /// and the labels saying what the node can give; none isolated reports
+    /// no resource and `stormpump.io/realtime=none`.
+    #[test]
+    fn a_node_with_isolated_cores_advertises_them_and_labels_its_kernel() {
+        use crate::realtime::{NodeFacts, Preempt, LABEL_PREEMPT, LABEL_REALTIME, RESOURCE};
+        let facts = |isolated: u16, preempt: Preempt| -> RealtimeProbe {
+            std::sync::Arc::new(move || NodeFacts { isolated, preempt })
+        };
+        let r = NodeReporter::new("http://x", "n1").with_realtime(facts(4, Preempt::Dynamic));
+        let st = r.build_status(&[]);
+        assert_eq!((st["capacity"][RESOURCE].as_str(), st["allocatable"][RESOURCE].as_str()), (Some("4"), Some("4")));
+        let meta = r.node_metadata();
+        assert_eq!((meta["labels"][LABEL_REALTIME].as_str(), meta["labels"][LABEL_PREEMPT].as_str()), (Some("soft"), Some("dynamic")));
+        let hard = NodeReporter::new("http://x", "n1").with_realtime(facts(2, Preempt::Rt));
+        assert_eq!(hard.node_metadata()["labels"][LABEL_REALTIME], "hard");
+        let none = NodeReporter::new("http://x", "n1").with_realtime(facts(0, Preempt::Dynamic));
+        assert!(none.build_status(&[])["allocatable"].get(RESOURCE).is_none());
+        assert_eq!(none.node_metadata()["labels"][LABEL_REALTIME], "none");
+        let no_probe = NodeReporter::new("http://x", "n1");
+        assert!(no_probe.node_metadata()["labels"].get(LABEL_REALTIME).is_none());
     }
 
     /// #165: capacity and allocatable `pods` are `--max-pods`, 110 unless set.

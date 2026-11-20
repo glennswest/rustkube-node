@@ -189,6 +189,15 @@ explicitly selects **`--runtime stormpump`**, connecting to the engine ring at
 is retired (#13, the owner's choice): microVM Pods are stormvisor's, picked per Pod by
 `runtimeClassName` (#204), beside stormpump Pods and stormvm VMIs on one node.
 
+**`runtimeClassName`** (#204) is resolved to its RuntimeClass's `handler` before
+the sandbox. A RuntimeClass that does not exist is a wait (`RuntimeClass "x" not
+found`, a `FailedCreatePodSandBox` Event), as upstream; the pod is never run on
+the default runtime instead. `--runtime cri` passes the handler as CRI's
+`runtime_handler` (and crictl's `--runtime`). `--runtime native` serves none.
+stormpump serves its default and `realtime-soft`/`realtime-hard` (below), and
+refuses any other handler with the reason: stormvisor's dispatch is not built,
+so a stormvisor Pod waits saying so rather than running as a container.
+
 For stormpump Pods, CNI configuration is checked per sandbox: the kubelet
 passes the sandbox network namespace to CNI ADD and invokes DEL when the
 sandbox stops. A Pod that finishes (`restartPolicy` Never or OnFailure, every
@@ -747,6 +756,45 @@ so a Pod wanting a claim a VM here holds is not started. It waits Pending, its
 containers `ContainerCreating` with "claim ns/c is a disk of
 VirtualMachineInstance ns/vm on this node" and a FailedMount Event, and
 starts once the VM lets the claim go (#80).
+
+### Real-time pods (stormpump, #430)
+
+A pod asks for real time with three things together:
+
+- `runtimeClassName` naming a RuntimeClass whose handler is `realtime-soft` or
+  `realtime-hard` (stormcos#1477 ships them);
+- in each container that runs real time, `stormpump.io/isolated-cores: <n>`:
+  whole physical cores from the node's isolated set, request equal to limit;
+- the pod annotation `stormpump.io/realtime: "policy=fifo,priority=80,numa=0,same-cache=true,kind=p"`.
+  `priority` (1 to 99) is required; `policy` is `fifo` (default) or `rr`;
+  `numa` a NUMA node; `same-cache` `true`/`l3` (one last-level cache) or `l2`;
+  `kind` `p` or `e` (core kind on a hybrid part).
+
+That container's stormpump spec gets `Demand::Exclusive` (the cores, in that
+shape; `cpuset.mems` follows them) and `Sched::Fifo`/`RoundRobin` at that
+priority, which the engine applies before `execve`. Everything is checked before
+the sandbox; a mistake is a wait with a `RealtimeRefused` Event naming the field,
+never a start that fails after the fork.
+
+**Real time is never inherited.** A container without isolated cores runs
+`SCHED_OTHER` on the shared pool. A real-time handler with no container holding
+isolated cores is refused, because FIFO on shared cores can starve the node,
+the engine included. So is the annotation, or `stormpump.io/isolated-cores`,
+without a real-time handler. A restarted container resolves its RuntimeClass
+again, so it never comes back on the shared pool.
+
+**`realtime-hard` needs a `PREEMPT_RT` kernel** (`/sys/kernel/realtime` is `1`).
+Without one the pod is refused with the reason and a `RealtimeRefused` Event, and
+is never run as soft. `realtime-soft` runs on today's `PREEMPT_DYNAMIC` kernel.
+
+The Node says what it can give: allocatable `stormpump.io/isolated-cores` is the
+number of whole cores in PID 1's `--isolate` set (SMT siblings once), so the
+scheduler's resource fit counts them. The labels are `stormpump.io/realtime=hard|soft|none`
+and `kernel.stormpump.io/preempt=rt|dynamic|full|none` (from the kernel's version
+and `/sys/kernel/realtime`), patched when they change. No taint is set: whether a
+node with isolated cores should carry `stormpump.io/realtime:NoSchedule` is the
+owner's open question on #430. Unit-tested; not run on a node, which needs an
+isolated set (stormcos#1477).
 
 ### RDMA verbs for a pod that asks
 
@@ -1596,6 +1644,17 @@ kubelet is under test, not the scheduler.
     FailedCreatePodSandBox Event names it.
   - `multus-release`: a NAD whose range holds one address, used by two pods in
     turn: the second gets it only if the first's delete DELed its attachment.
+- **realtime** (< 5 min, declared in `test/requires.toml`, run on request, #430):
+  - `realtime-node`: the Node's `stormpump.io/realtime` and
+    `kernel.stormpump.io/preempt` labels agree with its allocatable
+    `stormpump.io/isolated-cores`.
+  - `realtime-soft-fifo`: a `realtime-soft` pod with two isolated cores and
+    `policy=fifo,priority=80` reports, from inside, what the kernel gives it
+    (`rt-view`): `SCHED_FIFO` 80, two whole cores, memory on their NUMA nodes.
+  - `realtime-hard-refused`: on a kernel without PREEMPT_RT, a `realtime-hard`
+    pod is not run and its `RealtimeRefused` Event names PREEMPT_RT.
+  The pod cases skip, saying why, without an isolated set or the RuntimeClasses
+  (stormcos#1477).
 - **metadata** (< 5 min, declared in `test/requires.toml` with `host_network`,
   run on request, #342): a host-network pod asks its node's kubelet
   (`https://127.0.0.1:10250/vmInstance/<address>`) for its own instance

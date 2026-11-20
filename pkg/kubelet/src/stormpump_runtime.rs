@@ -1127,7 +1127,48 @@ fn spec_for(
         limits: limits_for(config),
         caps: caps_for(config),
         groups: groups_for(config),
+        // Real time (#430): whole isolated cores, then the policy, applied
+        // by the engine before execve. Neither unless the container holds
+        // isolated cores in a real-time pod (`crate::realtime`).
+        cpu: cpu_for(config),
+        sched: sched_for(config),
         ..Spec::default()
+    }
+}
+
+/// A real-time container's cores (#430): `Demand::Exclusive`, whole physical
+/// cores from the isolated set, in the shape the pod asked; anything else the
+/// engine's default (the shared pool).
+fn cpu_for(config: &ContainerConfig) -> stormpump::cpu::Demand {
+    use crate::realtime::{Cache, Kind};
+    use stormpump::cpu::{CacheLevel, CoreKind, Demand, Exclusive};
+    match &config.realtime {
+        Some(rt) => Demand::Exclusive(Exclusive {
+            cores: rt.cores,
+            numa: rt.shape.numa,
+            same_cache: rt.shape.same_cache.map(|c| match c {
+                Cache::L2 => CacheLevel::L2,
+                Cache::L3 => CacheLevel::L3,
+            }),
+            kind: rt.shape.kind.map(|k| match k {
+                Kind::Performance => CoreKind::Performance,
+                Kind::Efficiency => CoreKind::Efficiency,
+            }),
+        }),
+        None => Demand::default(),
+    }
+}
+
+/// A real-time container's policy (#430); `Sched::Other` otherwise.
+fn sched_for(config: &ContainerConfig) -> stormpump::spec::Sched {
+    use crate::realtime::Policy;
+    use stormpump::spec::Sched;
+    match &config.realtime {
+        Some(rt) => match rt.shape.policy {
+            Policy::Fifo => Sched::Fifo(rt.shape.priority),
+            Policy::RoundRobin => Sched::RoundRobin(rt.shape.priority),
+        },
+        None => Sched::Other,
     }
 }
 
@@ -1263,6 +1304,12 @@ impl RuntimeService for StormpumpRuntime {
 
     async fn run_pod_sandbox(&self, config: &PodSandboxConfig) -> Result<String, CriError> {
         let _changed = self.changes();
+        // The handlers stormpump serves (#204): its default and the real-time
+        // ones (#430). Any other (stormvisor's microVMs, a handler of
+        // another runtime) is refused, never run here as a plain container.
+        if !(config.runtime_handler.is_empty() || crate::realtime::is_realtime_handler(&config.runtime_handler)) {
+            return Err(crate::cri::handler_not_served(&config.runtime_handler, "stormpump"));
+        }
         self.probe()?;
         self.retry_failed_networks().await;
         let id = self.mint_id("sb");
@@ -4715,5 +4762,52 @@ mod tests {
         let io = crate::exec::ExecIo { stdin: true, stdout: true, stderr: false, tty: true };
         let err = back.attach_process("ct-1", io).await.err().expect("refused");
         assert!(err.to_string().contains("closed with it") && err.to_string().contains("#334"), "{err}");
+    }
+
+    /// #430: a real-time container's spec carries `Demand::Exclusive` in the
+    /// shape asked and its FIFO/RR priority; any other the shared pool and
+    /// `SCHED_OTHER`.
+    #[test]
+    fn a_real_time_container_gets_exclusive_cores_and_its_priority() {
+        use crate::realtime::{Cache, Kind, Policy, Realtime, Shape};
+        use stormpump::cpu::{CacheLevel, CoreKind, Demand, Exclusive};
+        use stormpump::spec::Sched;
+        let mut cc = ContainerConfig { name: "loop".into(), command: vec!["/bin/loop".into()], ..Default::default() };
+        let plain = spec_of(&cc, &PodSandboxConfig::default());
+        assert_eq!((plain.cpu, plain.sched), (Demand::Shared, Sched::Other));
+        cc.realtime = Some(Realtime {
+            cores: 2,
+            shape: Shape { policy: Policy::Fifo, priority: 80, numa: Some(0), same_cache: Some(Cache::L3), kind: Some(Kind::Performance) },
+        });
+        let rt = spec_of(&cc, &PodSandboxConfig::default());
+        assert_eq!(rt.cpu, Demand::Exclusive(Exclusive {
+            cores: 2, numa: Some(0), same_cache: Some(CacheLevel::L3), kind: Some(CoreKind::Performance),
+        }));
+        assert_eq!(rt.sched, Sched::Fifo(80));
+        cc.realtime.as_mut().unwrap().shape.policy = Policy::RoundRobin;
+        assert_eq!(spec_of(&cc, &PodSandboxConfig::default()).sched, Sched::RoundRobin(80));
+        // It reaches the wire: the encoded spec reads back the same.
+        let enc = spec_of(&cc, &PodSandboxConfig::default()).encode();
+        let back = stormpump::spec::Spec::decode(&enc).expect("decodes");
+        assert_eq!((back.cpu.clone(), back.sched), (rt.cpu.clone(), Sched::RoundRobin(80)));
+    }
+
+    /// #204: stormpump serves its default and the real-time handlers, and
+    /// refuses any other before anything is made, naming it.
+    #[tokio::test]
+    async fn a_handler_stormpump_does_not_serve_is_refused() {
+        let r = rt();
+        let cfg = |h: &str| PodSandboxConfig { name: "p".into(), uid: "u".into(), runtime_handler: h.into(), ..Default::default() };
+        match r.run_pod_sandbox(&cfg("stormvisor")).await {
+            Err(CriError::Refused { reason, message }) => {
+                assert_eq!(reason, "FailedCreatePodSandBox");
+                assert!(message.contains("\"stormvisor\"") && message.contains("stormpump"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // The served ones get as far as the engine (absent here).
+        for h in ["", crate::realtime::HANDLER_SOFT, crate::realtime::HANDLER_HARD] {
+            assert!(!matches!(r.run_pod_sandbox(&cfg(h)).await, Err(CriError::Refused { .. })), "{h:?}");
+        }
     }
 }

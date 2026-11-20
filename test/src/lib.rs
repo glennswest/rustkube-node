@@ -27,6 +27,11 @@
 //!   restored into a larger claim (`pvc.rs`). Needs stormcos#1032's classes.
 //!   And a claim of `stormblock-fast` says its clone writes to tier fast
 //!   (#400; a skip without stormcos#1039's class).
+//! - `realtime` (< 5 min, #430, on request only): a real-time pod on
+//!   stormpump read back from the node (SCHED_FIFO 80, two whole isolated
+//!   cores, memory on their NUMA nodes), and `realtime-hard` refused on a
+//!   kernel without PREEMPT_RT (`realtime.rs`). Skips without an isolated set
+//!   and the RuntimeClasses (stormcos#1477).
 //! - `long` (the night): waves of pods sized from the node's capacity,
 //!   measuring start latency and what each wave leaves behind (`long.rs`).
 //!
@@ -49,6 +54,7 @@ pub mod multus;
 pub mod node_volumes;
 pub mod pods;
 pub mod pvc;
+pub mod realtime;
 pub mod report;
 pub mod short;
 pub mod workload;
@@ -107,8 +113,9 @@ pub async fn run(env: Arc<Env>, r: &mut Report) {
         "metadata" => Box::pin(metadata::run(env, api, r)).await,
         "golden" => Box::pin(golden::run(env, api, r)).await,
         "pvc" => Box::pin(pvc::run(env, api, r)).await,
+        "realtime" => Box::pin(realtime::run(env, api, r)).await,
         other => {
-            r.record("suite", Outcome::Infra(format!("STORM_SUITE {other:?} is not short, medium, long, csi, multus, metadata, golden or pvc")), 0, None);
+            r.record("suite", Outcome::Infra(format!("STORM_SUITE {other:?} is not short, medium, long, csi, multus, metadata, golden, pvc or realtime")), 0, None);
         }
     }
 }

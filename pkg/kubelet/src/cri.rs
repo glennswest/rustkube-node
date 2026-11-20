@@ -79,6 +79,10 @@ pub struct PodSandboxConfig {
     pub networks: Vec<NetworkAttachment>,
     /// The pod's default network, replaced (`v1.multus-cni.io/default-network`).
     pub default_network: Option<NetworkAttachment>,
+    /// The handler of the pod's RuntimeClass (#204), resolved from
+    /// `spec.runtimeClassName` before the sandbox; empty: the runtime's
+    /// default. A runtime that does not serve it refuses the sandbox.
+    pub runtime_handler: String,
 }
 
 /// One network a pod attaches to (#233), resolved from its
@@ -97,6 +101,18 @@ pub struct NetworkAttachment {
     pub ips: Vec<String>,
     /// A MAC address the pod asked for, likewise.
     pub mac: Option<String>,
+}
+
+/// A RuntimeClass handler a runtime does not serve (#204), as upstream's
+/// kubelet says it: the sandbox is refused and the pod waits with the reason.
+pub fn handler_not_served(handler: &str, runtime: &str) -> CriError {
+    CriError::Refused {
+        reason: "FailedCreatePodSandBox".into(),
+        message: format!(
+            "RuntimeClass handler {handler:?} is not served by {runtime} on this node; \
+             the pod is not run without the runtime it asked for"
+        ),
+    }
 }
 
 /// Port mapping for a pod sandbox.
@@ -184,6 +200,11 @@ pub struct ContainerConfig {
     /// (`rdma.storm.io/hca` in its resources, #348): the stormpump runtime
     /// binds them in and adds `CAP_IPC_LOCK` (`crate::rdma`).
     pub rdma: bool,
+    /// Real time (#430): whole isolated cores and a FIFO/RR priority, for a
+    /// container that holds `stormpump.io/isolated-cores` in a pod whose
+    /// RuntimeClass is `realtime-soft`/`realtime-hard` (`crate::realtime`).
+    /// `None`: `SCHED_OTHER` on the shared pool.
+    pub realtime: Option<crate::realtime::Realtime>,
 }
 
 /// SELinux label parts (user/role/type/level) for a container.
@@ -692,6 +713,14 @@ pub enum CriError {
     /// controller into the same full disk, burning its backoff.
     #[error("node storage: {0}")]
     NodeStorage(String),
+    /// The pod asks for something this node will not give it as asked (#204,
+    /// #430): a RuntimeClass that does not exist or a handler it does not
+    /// serve, a real-time request it cannot honour. The pod waits with the
+    /// reason and a Warning Event named `reason`, and is never run without
+    /// what it asked for. Retried: a RuntimeClass may be created, a node
+    /// relabelled or rebooted into another kernel.
+    #[error("{reason}: {message}")]
+    Refused { reason: String, message: String },
 
     #[error("timeout")]
     Timeout,

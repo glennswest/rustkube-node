@@ -269,6 +269,11 @@ mod linux {
         }
 
         async fn run_pod_sandbox(&self, config: &PodSandboxConfig) -> Result<String, CriError> {
+            // One runtime, no handlers (#204): a pod asking for another is
+            // refused, never run here as an ordinary container.
+            if !config.runtime_handler.is_empty() {
+                return Err(crate::cri::handler_not_served(&config.runtime_handler, "the native runtime"));
+            }
             let sandbox_id = format!(
                 "sb-{}-{}",
                 &config.uid[..8.min(config.uid.len())],
