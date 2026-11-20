@@ -4,7 +4,7 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### Paused (P0 #379 first): #421 (P2), direct kernel boot from the golden's kernel (vmcloud-image-operator#62, stormvm#111)
+### Waiting on an install: #421 (P2), direct kernel boot from the golden's kernel (vmcloud-image-operator#62, stormvm#111)
 2026-11-20. Finding: no mount is needed. stormvm's machine spec is `root: Root::Inherit`, which stormpump documents as "the
 host's mount view", and `/data/vmimages` is a pallet volume mounted on the host (stormcos boot.d `volume vmidata /data/vmimages`);
 the hypervisor already opens other host paths (the qemu pallet's firmware) with no mount. The ENOENT in the issue was predicted,
@@ -19,6 +19,13 @@ Done: 986253b (code, docs, stormvm a84d915). First sc-build (sc-build-f4b60a80fa
 was wrong (an interior `.` is dropped by `Path::components` and stays inside the directory, so it is allowed; only `..` refused),
 fixed in the next commit. PAUSED here for the P0 #379 (stormcentral). Resume: sc-build that commit, stage, then the live check
 (stormvm `boot` suite `direct-*` on a node with vmimages `data_size` 1G) → close #421.
+2026-11-20, resumed: sc-build on 77f69cf passed (712+ kubelet unit incl. vm_kernel_boot's 4; closed build-failure #424); kubelet
+clippy names nothing in the changed lines. Stage build ba205e3fc67a. Live check in this repo's own `golden` suite (cf87f2f):
+`vmi-kernel-outside-refused` (kernel /data/stormcert/ca.crt: never runs, status says why) and `vmi-direct-kernel` (from the
+CloudImage's `status.boot`: machine-id, no OVMF/grub on the console; skip with no kernel published); `cloudimages` cluster read.
+Test crate test + clippy -D warnings passed. Held `--after-install rustkube-node>=cf87f2f@any:pve`. Resume: `stormcentral test run
+rustkube-node golden` there; outside-refused must pass; direct-kernel passes once vmimages' `data_size` is 1G (else its skip says
+why) → close #421.
 
 ### Waiting on stormcos#354: #404 (P0), a VM root on a stormstorage mirrored volume filled from its golden (stormstorage#113 B')
 2026-11-20. The owner chose B' on stormstorage#113 (built there: 2ef4b37, `from_golden`). Plan (`vm_mirrored_root.rs`):
