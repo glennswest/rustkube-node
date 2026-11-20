@@ -351,6 +351,8 @@ ae8d98f50f/8d25602ce0 queued then cancelled). No code change. Held `--after-inst
 Resume: `stormcentral test run rustkube-node pvc` on that machine; `pvc-classes` must pass first (else the install lacks #1032).
 Runs 369f7f9253 (pvetest1) and 3cc92c9f01 (pvetest2) at 0802be2, queued behind the nightly and release-gate runs. Held `--after-run 369f7f9253`.
 Resume: `stormcentral test show 369f7f9253` / `3cc92c9f01`; pass → shipped with proof / close #379; fail → the claim's events.
+2026-11-20 13:05Z: pvetest1 (12:55Z) and pvetest2 (12:56Z) now run passed 12.97 installs. Runs e9a275c4bd (pvetest1) and 81332b9b95
+(pvetest2) of `pvc` at 6648315. Resume: `stormcentral test show <id>`; pass → close #379; fail → the claim's events.
 
 ### Shipped (proof pending): #383 (P0), a template listed `broken` is waited on forever (server8 12.92, pvc-ext4j-64m)
 
