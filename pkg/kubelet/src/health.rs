@@ -13,7 +13,7 @@
 //!   unless the probe sets them;
 //! - a `grpc` probe calls `grpc.health.v1.Health/Check` with its `service`
 //!   (empty when unset) and passes only on `SERVING`. Any other status, an RPC
-//!   error (the health service not implemented) or a listener that does not
+//!   error (`UNIMPLEMENTED`: no health service) or a listener that does not
 //!   speak gRPC is a failure.
 
 use crate::cri::RuntimeService;
