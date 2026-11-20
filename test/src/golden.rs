@@ -913,14 +913,14 @@ mod tests {
         let ok = |d: &str| Ok(serde_json::json!({"workload": "tcp-connect", "ok": true, "detail": d}).to_string());
         let no = |d: &str| Ok(serde_json::json!({"workload": "tcp-connect", "ok": false, "detail": d}).to_string());
         assert!(matches!(judge_pod_network("10.1.2.3", None, Some("10.1.2.3/16"), ok("connected"), &[]), Outcome::Pass(_)));
-        match judge_pod_network("10.1.2.3", None, Some(""), no("Host is unreachable (os error 113)"), &["PodAddressNotTaken x".into()]) {
-            Outcome::Fail(m) => assert!(m.contains("no lease") && m.contains("unreachable") && m.contains("PodAddressNotTaken"), "{m}"),
-            o => panic!("{o:?}"),
-        }
-        match judge_pod_network("10.1.2.3", None, Some("10.1.2.3/16"), no("timed out"), &[]) {
-            Outcome::Fail(m) => assert!(m.contains("the guest holds 10.1.2.3/16"), "{m}"),
-            o => panic!("{o:?}"),
-        }
+        assert!(matches!(
+            judge_pod_network("10.1.2.3", None, Some(""), no("Host is unreachable (os error 113)"), &["PodAddressNotTaken x".into()]),
+            Outcome::Fail(m) if m.contains("no lease") && m.contains("unreachable") && m.contains("PodAddressNotTaken")
+        ));
+        assert!(matches!(
+            judge_pod_network("10.1.2.3", None, Some("10.1.2.3/16"), no("timed out"), &[]),
+            Outcome::Fail(m) if m.contains("the guest holds 10.1.2.3/16")
+        ));
         assert_eq!(podnet_addresses("x RKN-PODNET-2 10.1.2.3/16 \nmore"), Some("10.1.2.3/16".into()));
         assert_eq!(podnet_addresses("RKN-PODNET-2 \n"), Some(String::new()));
         assert_eq!(podnet_addresses("nothing"), None);
