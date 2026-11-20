@@ -4,6 +4,24 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #430 (P2), real-time pods on stormpump (and #204's resolution, which it needs)
+2026-11-20. stormpump 9877a97 has `Sched` and `Demand::Exclusive` already. Plan, one commit each:
+1. #204: `spec.runtimeClassName` → GET RuntimeClass → handler (cached by name; upstream's handler is immutable). Missing
+   RuntimeClass: a wait with the reason (FailedCreatePodSandBox). `PodSandboxConfig.runtime_handler`; the CRI path sends it;
+   stormpump serves "", realtime-soft, realtime-hard and refuses any other handler naming it (no unconfined run).
+2. `realtime.rs`: `stormpump.io/realtime` parse (policy fifo|rr, priority 1..=99 required, numa, same-cache true|l2|l3,
+   kind p|e), `stormpump.io/isolated-cores` request == limit, whole. Validated for every container before the sandbox (a
+   wait naming the field). Sched only on containers holding isolated cores; an RT handler with none is refused (FIFO on
+   the shared pool is the hazard docs/realtime.md names). No handler + annotation: refused (never inherited).
+3. Admission: realtime-hard without PREEMPT_RT (`/sys/kernel/realtime` != 1): Warning `RealtimeRefused` + waiting reason.
+4. stormpump spec_for: `sched` and `cpu: Demand::Exclusive{..}` from ContainerConfig.realtime.
+5. Node: allocatable `stormpump.io/isolated-cores` (physical cores of PID 1's `--isolate`), labels
+   `stormpump.io/realtime=hard|soft|none`, `kernel.stormpump.io/preempt=rt|dynamic|full|none` (uname -v).
+6. The taint `stormpump.io/realtime:NoSchedule` is the owner's question: on an SNO it makes every ordinary pod
+   unschedulable (asked on #430, recommendation: no taint).
+7. Test crate: suite case (2 isolated cores, FIFO 80: cpuset.cpus/mems and SCHED_FIFO 80 read back; hard refused) —
+   runs once stormcos#1477 gives a test machine an isolated set.
+
 ### In progress: #318 (P2), --stormblock-ca for stormvm's engine clients
 2026-11-20. stormvm 319333d already has 59dc498 (`STORMBLOCK_CA_FILE` in stormvm-block, no CA argument on the console's
 `snapshot::take*`/`Config`). The flag never reached those clients. df261de: main is sync, puts `--stormblock-ca` in
