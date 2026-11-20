@@ -211,6 +211,10 @@ pub struct Process {
     pub one_shot: bool,
     /// Why the container is not ready, when [`representative`] knows.
     pub reason: Option<String>,
+    /// stormd says this process is a helper (`helper` in `GET
+    /// /api/v1/processes`, from `[[process]] helper = true`, #378): a log
+    /// shipper, a renewing cert client. Its own container on the mirror pod.
+    pub helper: bool,
     /// The goldens stormd presents to this process (#378, stormd#75), from
     /// its `GET /api/v1/volumes`: the one volume fact that is a process's own
     /// (a service's processes share one mount namespace).
@@ -254,18 +258,19 @@ pub fn parse_goldens(v: &Value) -> Vec<(String, Golden)> {
     out
 }
 
-/// A service's mirror containers (#378): with a process named after the
-/// service, that is the main container, and every other process that is not
-/// a one-shot is a helper (a log shipper, a cert client) with a container of
-/// its own; the main one stands for the rest ([`representative`]: one-shots
-/// stay init-like). With no process of that name nothing is told apart: one
-/// container, as before.
+/// A service's mirror containers (#378): every process stormd marks a
+/// helper (and that is not a one-shot) has a container of its own; the
+/// service's container stands for the rest ([`representative`]: one-shots
+/// stay init-like). Which processes are helpers is stormd's to say: a name
+/// does not tell (rustkube-apiserver's main process is `apiserver`, beside a
+/// long-running `stormcert` signer). Nothing marked: one container, as before.
+/// A service whose every long-running process is marked keeps them all in
+/// its own container: it is never left standing for nothing.
 pub fn split(asset: &str, procs: &[Process]) -> (Option<Process>, Vec<Process>) {
-    if !procs.iter().any(|p| p.name == asset && !p.one_shot) {
+    let (helpers, rest): (Vec<Process>, Vec<Process>) = procs.iter().cloned().partition(|p| p.helper && !p.one_shot);
+    if helpers.is_empty() || !rest.iter().any(|p| !p.one_shot) {
         return (representative(asset, procs), Vec::new());
     }
-    let (helpers, rest): (Vec<Process>, Vec<Process>) =
-        procs.iter().cloned().partition(|p| p.name != asset && !p.one_shot);
     (representative(asset, &rest), helpers)
 }
 
@@ -284,6 +289,7 @@ pub fn parse_processes(v: &Value) -> Vec<Process> {
             stopped_at: p["stopped_at"].as_str().map(str::to_string),
             one_shot: false,
             reason: None,
+            helper: p["helper"].as_bool().unwrap_or(false),
             goldens: Vec::new(),
         })
         .filter(|p| !p.name.is_empty())
@@ -603,26 +609,33 @@ restart_policy = "Always"
         assert_eq!((g[1].0.as_str(), g[1].1.state.as_str(), g[1].1.mounts.len(), g[1].1.volume_id.clone()), ("stormlb", "missing", 0, None));
     }
 
-    /// #378: with a process named after the service, the other long-running
-    /// processes are helpers and the main container stands for itself and
-    /// the one-shots; without one, nothing is split.
+    /// #378: the processes stormd marks `helper` are split out; the service's
+    /// container stands for the rest; nothing marked, nothing split.
     #[test]
-    fn helpers_are_split_from_the_service_process() {
-        let p = |name: &str, state: &str, ready: bool, one_shot: bool| Process {
-            name: name.into(), state: state.into(), ready, one_shot, ..Default::default()
+    fn helpers_are_the_processes_stormd_marks() {
+        let p = |name: &str, state: &str, ready: bool, one_shot: bool, helper: bool| Process {
+            name: name.into(), state: state.into(), ready, one_shot, helper, ..Default::default()
         };
         let procs = vec![
-            p("stormcert-client-lb", "stopped", false, true),
-            p("stormlb", "running", true, false),
-            p("log-shipper", "running", false, false),
+            p("stormcert-init", "stopped", false, true, false),
+            p("stormcert", "running", true, false, false),
+            p("apiserver", "running", true, false, false),
+            p("stormcert-renew", "running", false, false, true),
         ];
-        let (main, helpers) = split("stormlb", &procs);
-        let main = main.unwrap();
-        assert_eq!((main.name.as_str(), main.ready), ("stormlb", true), "a helper's unreadiness is its own now");
-        assert_eq!(helpers.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["log-shipper"]);
-        // No process named after the service: one container, as before.
-        let (main, helpers) = split("kubelet", &procs);
+        let (main, helpers) = split("rustkube-apiserver", &procs);
+        assert!(main.unwrap().ready, "a helper's unreadiness is its own now");
+        assert_eq!(helpers.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["stormcert-renew"]);
+        // Nothing marked: one container, every long-running process in it.
+        let unmarked: Vec<Process> = procs.iter().cloned().map(|p| Process { helper: false, ..p }).collect();
+        let (main, helpers) = split("rustkube-apiserver", &unmarked);
         assert!(helpers.is_empty());
         assert!(!main.unwrap().ready, "every long-running process counts");
+        // Every long-running one marked: still one container.
+        let all: Vec<Process> = procs.iter().cloned().map(|p| Process { helper: !p.one_shot, ..p }).collect();
+        assert!(split("rustkube-apiserver", &all).1.is_empty());
+        // stormd's word, read.
+        let v = serde_json::json!([{"name": "stormcert-renew", "state": "running", "helper": true}, {"name": "apiserver", "state": "running"}]);
+        let parsed = parse_processes(&v);
+        assert_eq!((parsed[0].helper, parsed[1].helper), (true, false));
     }
 }
