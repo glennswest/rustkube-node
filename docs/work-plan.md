@@ -42,6 +42,9 @@ the gateway MAC must survive a kubelet restart), sc-build, stage, golden rerun o
 stormvm#138 landed (15e5a37; main 319333d adds a log line). Bump stormvm a84d915 → 319333d (also brings #131's NIC
 bandwidth caps: `NicPlan.bandwidth`, `Interface.bandwidth`, no Cargo changes in stormvm, so Cargo.lock is a rev swap);
 `LeaseRecord.gateway_mac` (serde default) so an adopted guest's ARP is still answered. Then sc-build, stage, golden on pvetest2.
+Done e045c84; sc-build passed (716 kubelet tests incl. the_gateway_mac_round_trips_through_the_record; warnings only the
+pre-existing #385/#386 ones, none in vm_network.rs). Stage build 6013038fad70. Held `--after-install rustkube-node>=e045c84@pvetest2`.
+Resume: `stormcentral test run rustkube-node golden --tag pvetest2`; vmi-pod-network passing closes #426 (and stormvm#138: say so there).
 
 ### In progress: #405 (P2), AccessCredentialsSynchronized stuck at "waiting for the guest agent to answer"
 2026-11-20. Ruled out (stormcos_qa#52 on the issue): the golden runs qemu-guest-agent and the guest has org.qemu.guest_agent.0.
