@@ -80,10 +80,13 @@ cluster_read = [
 # made it and a test's storage user may not delete it, so `cleanup` names it
 # as a skip. Not in `required`, and 30 min so no night lane picks it up: it
 # runs on request (`stormcentral test run rustkube-node golden`).
+# vmimages' CloudImages (cluster-scoped) for the golden's kernel, initramfs
+# and command line (`status.boot`, #421).
 budget_secs = 1800
 requires = ["kvm"]
 cluster_read = [
   { apiGroup = "", resource = "nodes" },
+  { apiGroup = "storm.io", resource = "cloudimages" },
 ]
 
 [pvc]

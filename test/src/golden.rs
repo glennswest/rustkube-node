@@ -38,6 +38,16 @@
 //!   attached. A skip where the node's kubelet has no stormstorage (its
 //!   start says so); the volume is the VMI's and goes with it (the sweep).
 //!
+//! - `vmi-kernel-outside-refused` (#421): a VMI naming a kernel outside the
+//!   kernel directories (`/data/stormcert/ca.crt`) never runs, and its status
+//!   says why ("not a file under the kernel directories"): the hypervisor
+//!   reads it in the node's view, so the kubelet refuses it.
+//! - `vmi-direct-kernel` (#421, stormvm#111): a VMI booted straight into its
+//!   golden's own kernel, from the `CloudImage`'s `status.boot` (vmimages
+//!   reads it out of the golden), prints a machine-id, and its console never
+//!   shows the firmware or the boot loader. A skip while vmimages publishes
+//!   no kernel for the golden on this node.
+//!
 //! The VMIs and requests are deleted after. **The sealed golden `G` is not**:
 //! a test gets no stormblock admin token, and a storage user deletes only
 //! what it made itself (stormcentral docs/test-standard.md); the kubelet
@@ -65,6 +75,8 @@ pub const SOURCE: &str = "gold-src";
 pub const NO_AGENT: &str = "gold-noagent";
 pub const CLONE: &str = "gold-clone";
 pub const MIRRORED: &str = "gold-mirror";
+pub const DIRECT: &str = "gold-direct";
+pub const OUTSIDE: &str = "gold-outside";
 pub const ASK_FAIL: &str = "gold-fail";
 pub const ASK_SEAL: &str = "gold-seal";
 
@@ -282,6 +294,52 @@ impl Suite {
         .await
     }
 
+    /// `vmi-kernel-outside-refused` (#421).
+    async fn kernel_outside(&self, root: &str) -> Outcome {
+        let mut obj = vmi(&self.env, OUTSIDE, root, "#cloud-config\n");
+        obj["metadata"]["annotations"] = json!({ KERNEL: "/data/stormcert/ca.crt" });
+        if let Err(e) = self.api.create(&vmis(&self.env), &obj).await {
+            return Outcome::Infra(e);
+        }
+        let path = format!("{}/{OUTSIDE}", vmis(&self.env));
+        let path = path.as_str();
+        let within = self.env.budget(Duration::from_secs(120), MARGIN);
+        let seen = k8s::until(within, || async move {
+            let v = self.api.get(path).await?.ok_or_else(|| format!("VMI {OUTSIDE} is gone"))?;
+            judge_outside(&v).map(|_| v.clone()).map_err(|e| format!("{e} after {} s", within.as_secs()))
+        })
+        .await;
+        match seen {
+            Ok(v) => match judge_outside(&v) {
+                Ok(why) => Outcome::Pass(why),
+                Err(e) => Outcome::Fail(e),
+            },
+            Err(e) => Outcome::Fail(e),
+        }
+    }
+
+    /// `vmi-direct-kernel` (#421).
+    async fn direct_kernel(&self, root: &str, says_id: &str) -> Outcome {
+        let images = match self.api.list(CLOUDIMAGES).await {
+            Ok(Some(v)) => v,
+            Ok(None) => return Outcome::Skip("vmimages' CloudImage is not served here".into()),
+            Err(e) => return Outcome::Infra(e),
+        };
+        let boot = match boot_for(&images, root, &self.env.node_name) {
+            Ok(b) => b,
+            Err(why) => return Outcome::Skip(why),
+        };
+        let mut obj = vmi(&self.env, DIRECT, root, says_id);
+        obj["metadata"]["annotations"] = boot.annotations();
+        match self.boot_vmi(DIRECT, obj, BOOT, |c| machine_id(c).is_some()).await {
+            Ok(console) => judge_direct(&console, &boot),
+            Err(e) => {
+                let now = self.api.get(&format!("{}/{DIRECT}", vmis(&self.env))).await.ok().flatten();
+                Outcome::Fail(format!("{e}; status: {}", now.map(|v| short(&v["status"])).unwrap_or_default()))
+            }
+        }
+    }
+
     /// `vmi-mirrored-root` (#404).
     async fn mirrored_root(&self, root: &str, says_id: &str) -> Outcome {
         let mut obj = vmi(&self.env, MIRRORED, root, says_id);
@@ -306,10 +364,10 @@ impl Suite {
         for r in [ASK_FAIL, ASK_SEAL] {
             self.api.delete(&format!("{}/{r}", requests(&self.env))).await?;
         }
-        for v in [SOURCE, NO_AGENT, CLONE, MIRRORED] {
+        for v in [SOURCE, NO_AGENT, CLONE, MIRRORED, DIRECT, OUTSIDE] {
             self.api.delete(&format!("{}/{v}", vmis(&self.env))).await?;
         }
-        for v in [SOURCE, NO_AGENT, CLONE, MIRRORED] {
+        for v in [SOURCE, NO_AGENT, CLONE, MIRRORED, DIRECT, OUTSIDE] {
             k8s::gone(&self.api, &format!("{}/{v}", vmis(&self.env)), Duration::from_secs(120)).await?;
         }
         Ok(())
@@ -395,6 +453,16 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
         r.record("golden-clone-new-identity", o, t.elapsed().as_millis(), None);
     }
 
+    // A kernel outside the kernel directories is refused (#421).
+    let t = Instant::now();
+    let o = suite.kernel_outside(&root).await;
+    r.record("vmi-kernel-outside-refused", o, t.elapsed().as_millis(), None);
+
+    // The golden's own kernel, booted directly (#421).
+    let t = Instant::now();
+    let o = suite.direct_kernel(&root, &says_id).await;
+    r.record("vmi-direct-kernel", o, t.elapsed().as_millis(), None);
+
     // A root mirrored across nodes from the golden (#404).
     let t = Instant::now();
     let o = suite.mirrored_root(&root, &says_id).await;
@@ -428,6 +496,86 @@ pub fn judge_status_volumes(vmi: &Value, golden: &str) -> Outcome {
         return Outcome::Fail(format!("the root entry is not complete (volumeID, golden {golden}, owned): {root}"));
     }
     Outcome::Pass(format!("{} volume(s); root: {root}", vols.len()))
+}
+
+/// stormvm's direct-kernel annotations (`stormvm_spec::kube`).
+pub const KERNEL: &str = "storm.io/kernel";
+pub const INITRD: &str = "storm.io/initrd";
+pub const CMDLINE: &str = "storm.io/cmdline";
+/// vmimages' CloudImages: cluster-scoped.
+pub const CLOUDIMAGES: &str = "/apis/storm.io/v1alpha1/cloudimages";
+
+/// A golden's kernel, initramfs and command line, from `status.boot`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Boot {
+    pub kernel: String,
+    pub initrd: Option<String>,
+    pub cmdline: Option<String>,
+}
+
+impl Boot {
+    pub fn annotations(&self) -> Value {
+        let mut a = json!({ KERNEL: self.kernel });
+        if let Some(i) = &self.initrd {
+            a[INITRD] = json!(i);
+        }
+        if let Some(c) = &self.cmdline {
+            a[CMDLINE] = json!(c);
+        }
+        a
+    }
+}
+
+/// The boot of the CloudImage whose golden is `golden`, when it is on
+/// `node`; else why there is none (a skip).
+pub fn boot_for(images: &[Value], golden: &str, node: &str) -> Result<Boot, String> {
+    let Some(img) = images.iter().find(|i| i["status"]["golden"] == golden) else {
+        return Err(format!("no CloudImage has golden {golden}"));
+    };
+    let b = &img["status"]["boot"];
+    let Some(kernel) = b["kernel"].as_str().filter(|k| !k.is_empty()) else {
+        let why = b["message"].as_str().unwrap_or("no status.boot.kernel yet");
+        return Err(format!("CloudImage {}: {why}", s(img, "/metadata/name")));
+    };
+    if let Some(nodes) = b["nodes"].as_array() {
+        if !nodes.iter().any(|n| n == node) {
+            return Err(format!("the golden's kernel is on {nodes:?}, not on {node}"));
+        }
+    }
+    Ok(Boot {
+        kernel: kernel.to_string(),
+        initrd: b["initrd"].as_str().map(str::to_string),
+        cmdline: b["cmdline"].as_str().map(str::to_string),
+    })
+}
+
+/// What a firmware boot prints on the serial console and a direct one does
+/// not: OVMF's and grub's own lines.
+pub const FIRMWARE_MARKERS: [&str; 4] = ["BdsDxe", "UEFI Interactive Shell", "GNU GRUB", "Booting `"];
+
+/// `vmi-direct-kernel`: a machine-id, and no firmware or boot loader on the
+/// console before it.
+pub fn judge_direct(console: &str, boot: &Boot) -> Outcome {
+    let Some(id) = machine_id(console) else { return Outcome::Fail("Running, but its console printed no machine-id".into()) };
+    if let Some(m) = FIRMWARE_MARKERS.iter().find(|m| console.contains(*m)) {
+        return Outcome::Fail(format!("the console shows {m:?}: it went through the firmware, not straight into {}", boot.kernel));
+    }
+    Outcome::Pass(format!("booted straight into {} (initrd {}), machine-id {id}, no firmware or boot loader on the console",
+        boot.kernel, boot.initrd.as_deref().unwrap_or("-")))
+}
+
+/// `vmi-kernel-outside-refused`: never Running, and the status says why.
+pub fn judge_outside(vmi: &Value) -> Result<String, String> {
+    let phase = s(vmi, "/status/phase");
+    if phase == "Running" || phase == "Succeeded" {
+        return Err(format!("a kernel outside the kernel directories ran: {phase}"));
+    }
+    let text = vmi["status"].to_string();
+    if text.contains("not a file under the kernel directories") {
+        Ok(format!("{phase}: refused, its status says the kernel is not under the kernel directories"))
+    } else {
+        Err(format!("not refused yet ({phase}): {}", short(&vmi["status"])))
+    }
 }
 
 /// The VMI annotation that asks for a mirrored disk (the kubelet's
@@ -533,6 +681,30 @@ mod tests {
         assert!(matches!(judge_identity("a", Some("b")), Outcome::Pass(_)));
         assert!(matches!(judge_identity("a", Some("a")), Outcome::Fail(_)));
         assert!(matches!(judge_identity("a", None), Outcome::Fail(_)));
+    }
+
+    #[test]
+    fn the_goldens_boot_is_found_and_judged() {
+        let imgs = vec![serde_json::json!({"metadata": {"name": "fedora-44"}, "status": {"golden": "g", "boot": {
+            "kernel": "/data/vmimages/boot/g/vmlinuz", "initrd": "/data/vmimages/boot/g/initrd", "cmdline": "ro", "nodes": ["n1"]}}})];
+        let b = boot_for(&imgs, "g", "n1").unwrap();
+        assert_eq!(b.annotations(), serde_json::json!({KERNEL: "/data/vmimages/boot/g/vmlinuz", INITRD: "/data/vmimages/boot/g/initrd", CMDLINE: "ro"}));
+        assert!(boot_for(&imgs, "g", "n2").unwrap_err().contains("not on n2"));
+        assert!(boot_for(&imgs, "other", "n1").is_err());
+        let none = vec![serde_json::json!({"metadata": {"name": "f"}, "status": {"golden": "g", "boot": {"message": "reading the kernel"}}})];
+        assert!(boot_for(&none, "g", "n1").unwrap_err().contains("reading the kernel"));
+        let id = format!("{ID_MARKER}{}", "a".repeat(32));
+        assert!(matches!(judge_direct(&format!("[ 0.0] Linux\n{id}\n"), &b), Outcome::Pass(_)));
+        assert!(matches!(judge_direct(&format!("BdsDxe: loading\n{id}\n"), &b), Outcome::Fail(_)));
+        assert!(matches!(judge_direct("nothing", &b), Outcome::Fail(_)));
+    }
+
+    #[test]
+    fn a_kernel_outside_is_judged() {
+        let v = |phase: &str, msg: &str| serde_json::json!({"status": {"phase": phase, "conditions": [{"message": msg}]}});
+        assert!(judge_outside(&v("Pending", "storm.io/kernel \"/x\" is not a file under the kernel directories (…)")).is_ok());
+        assert!(judge_outside(&v("Running", "")).is_err());
+        assert!(judge_outside(&v("Pending", "scheduling")).is_err());
     }
 
     #[test]
