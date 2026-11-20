@@ -4,6 +4,11 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #439 (P1), review: mount lists cut to 16 on stormpump
+2026-11-20. 15b9a83130c8: `mounts_fit` refuses a container past `stormpump::spec::MAX_MOUNTS` (now read from the engine,
+not copied) before its root is made (CreateContainerConfigError, count and paths); every `take(MAX_MOUNTS)` removed.
+Filed stormpump#278 (raise the limit). Next: sc-build, close.
+
 ### Done: #438 (P1), review: 2 findings in cri_grpc.rs
 2026-11-20. 1435d062f12a: runAsNonRoot checked in CriGrpcClient::create_container (runAsUser, else ImageStatus uid/username;
 upstream's verifyRunAsNonRoot), CreateContainerConfigError. b5b60b0a92c0: already fixed by #118 (pod_manager

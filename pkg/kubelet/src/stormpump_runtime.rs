@@ -73,8 +73,31 @@ use crate::cri::{
 /// Where stormpump listens for clients on a stormcos node.
 pub const DEFAULT_SOCKET: &str = "/run/stormpump.sock";
 
-/// What one spec can carry, from `stormpump::spec::MAX_MOUNTS`.
-const MAX_MOUNTS: usize = 16;
+/// What one spec can carry: the engine's own limit.
+const MAX_MOUNTS: usize = stormpump::spec::MAX_MOUNTS;
+
+/// A container whose mounts do not fit in one spec is refused, whole, before
+/// anything is made for it (#439, 15b9a83130c8). The lists were cut to the
+/// limit, both at once, so the engine saw a consistent spec and the
+/// container started without its last mounts. Those are the ServiceAccount
+/// token and resolv.conf, and a claim's writes then landed in the
+/// disposable root.
+fn mounts_fit(config: &ContainerConfig) -> Result<(), CriError> {
+    let n = config.mounts.len();
+    if n <= MAX_MOUNTS {
+        return Ok(());
+    }
+    let paths: Vec<&str> = config.mounts.iter().map(|m| m.container_path.as_str()).collect();
+    Err(CriError::Container {
+        container: config.name.clone(),
+        reason: "CreateContainerConfigError".into(),
+        message: format!(
+            "{n} mounts (volumes, devices, the ServiceAccount token, resolv.conf), and stormpump takes at most \
+             {MAX_MOUNTS} per container (stormpump#278): {}",
+            paths.join(", ")
+        ),
+    })
+}
 
 /// `sandbox::Profile::Isolated` — a network namespace with nothing in it but
 /// loopback.
@@ -1089,13 +1112,11 @@ fn spec_for(
         // order and that order are the same order, and the engine refuses a
         // count that does not match.
         //
-        // Capped at what a spec can carry. A pod past the cap is refused at
-        // define time with the count in the message, rather than starting with
-        // some of its volumes.
+        // A container past what a spec can carry was refused before this
+        // (`mounts_fit`); nothing is cut here.
         mounts: config
             .mounts
             .iter()
-            .take(MAX_MOUNTS)
             .map(|m| stormpump::spec::Mount {
                 dst: m.container_path.clone(),
                 readonly: m.readonly,
@@ -1712,6 +1733,7 @@ impl RuntimeService for StormpumpRuntime {
         } else {
             config
         };
+        mounts_fit(config)?;
         let (namespace, pod, pod_uid) = {
             let sandboxes = self.sandboxes.lock().await;
             sandboxes
@@ -1877,7 +1899,6 @@ impl RuntimeService for StormpumpRuntime {
             mount_sources: config
                 .mounts
                 .iter()
-                .take(MAX_MOUNTS)
                 .map(|m| (m.host_path.clone(), m.fstype.clone()))
                 .collect(),
             log_dir: log_dir.clone(),
@@ -1922,7 +1943,7 @@ impl RuntimeService for StormpumpRuntime {
             ownership: config.fs_group.map(|gid| Ownership {
                 gid,
                 policy: crate::volume_ownership::ChangePolicy::parse(config.fs_group_change_policy.as_deref()),
-                readonly: config.mounts.iter().take(MAX_MOUNTS).map(|m| m.readonly).collect(),
+                readonly: config.mounts.iter().map(|m| m.readonly).collect(),
             }),
         };
         let qualified = format!("{}/{}/{}", c.namespace, c.pod, c.name);
@@ -3936,7 +3957,7 @@ mod tests {
 
         // And the sources this records are in that same order.
         let sources: Vec<String> =
-            cc.mounts.iter().take(MAX_MOUNTS).map(|m| m.host_path.clone()).collect();
+            cc.mounts.iter().map(|m| m.host_path.clone()).collect();
         assert_eq!(sources, vec!["/host/a".to_string(), "/host/b".to_string()]);
     }
 
@@ -4851,5 +4872,33 @@ mod tests {
         assert!(!attachment_pod(&p, &a).runtime_config.contains_key("portMappings"));
         let none = default_pod("sb-1", "/proc/1/ns/net", &PodSandboxConfig::default());
         assert!(none.runtime_config.is_empty());
+    }
+
+    /// #439 (15b9a83130c8): a container past the engine's mount limit is
+    /// refused whole, naming the count and every path; one at the limit
+    /// keeps all its mounts, its last ones included, in order.
+    #[test]
+    fn mounts_past_the_engine_limit_are_refused_not_cut() {
+        let with = |n: usize| ContainerConfig {
+            name: "app".into(),
+            mounts: (0..n)
+                .map(|i| Mount { container_path: format!("/m{i}"), host_path: format!("/host/{i}"), ..Default::default() })
+                .collect(),
+            ..Default::default()
+        };
+        let full = with(MAX_MOUNTS);
+        assert!(mounts_fit(&full).is_ok());
+        let spec = spec_of(&full, &PodSandboxConfig::default());
+        assert_eq!(spec.mounts.len(), MAX_MOUNTS);
+        assert_eq!(spec.mounts.last().unwrap().dst, format!("/m{}", MAX_MOUNTS - 1), "the last mount is kept");
+
+        match mounts_fit(&with(MAX_MOUNTS + 1)) {
+            Err(CriError::Container { container, reason, message }) => {
+                assert_eq!((container.as_str(), reason.as_str()), ("app", "CreateContainerConfigError"));
+                assert!(message.starts_with(&format!("{} mounts", MAX_MOUNTS + 1)), "{message}");
+                assert!(message.contains(&format!("/m{MAX_MOUNTS}")), "names the one past the limit: {message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 }
