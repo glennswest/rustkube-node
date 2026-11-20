@@ -16,6 +16,10 @@ per-process volume fact (one mount namespace). Plan:
    over every container. Applied last (resets earlier helpers), so the engine's volumes and stormd's compose.
    volumes_current/status_current compare every container.
 3. Tests: split, golden parsing, a pod with a helper (spec, statuses, conditions), a change in a helper rewrites.
+Done: 4792022 (stormd_api Golden/parse_goldens/split, Process.goldens read in stormd_poll; mirror with_helpers,
+container_from_stormd, with_volumes keeps golden volumes, volumes_current/status_current over every container; kubelet.rs
+apply_stormd returns the helpers). sc-build running (tmp/sc-build-378.log). Next: pass → stage; proof on a node: a service
+with a helper process (which one runs one? check the release's stormd configs) shows a second container.
 
 ### Blocked: #429 (P3), attach to a tty/stdin container after a kubelet restart
 2026-11-20. Needs the engine to keep a deposited fd across the client's detach and hand it back: none exists (ABI.md,
