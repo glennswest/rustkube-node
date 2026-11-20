@@ -1327,98 +1327,167 @@ impl PodManager {
         })
     }
 
-    async fn fetch_configmap(&self, namespace: &str, name: &str) -> Option<Value> {
-        if self.api_url.is_empty() {
-            return None;
-        }
-        let url = format!(
-            "{}/api/v1/namespaces/{namespace}/configmaps/{name}",
-            self.api_url
-        );
-        let resp = self.api_client.get(&url).send_retrying(retry::Policy::API).await.ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        resp.json::<Value>().await.ok()
-    }
-
-    /// Fetch a Secret and return its `data` with values base64-decoded to strings.
-    async fn fetch_secret_decoded(
+    /// A ConfigMap's or Secret's keys and their values, as bytes
+    /// (#437, dc6872a9854f: a Secret's value is any bytes, and a lossy UTF-8
+    /// conversion changed a keystore's 0xff into U+FFFD).
+    ///
+    /// `Ok(None)`: the object does not exist (404), or there is no apiserver
+    /// to hold it. `Err`: it could not be read (refused, unreachable, not
+    /// decodable), which is never read as "absent" (#437, e635cb20b82e): a
+    /// required credential that could not be fetched is a pod that waits,
+    /// not a pod that starts without it.
+    async fn fetch_keyed(
         &self,
+        kind: KeyedKind,
         namespace: &str,
         name: &str,
-    ) -> Option<HashMap<String, String>> {
+    ) -> Result<Option<KeyedData>, String> {
         if self.api_url.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let url = format!(
-            "{}/api/v1/namespaces/{namespace}/secrets/{name}",
-            self.api_url
-        );
-        let resp = self.api_client.get(&url).send_retrying(retry::Policy::API).await.ok()?;
-        if !resp.status().is_success() {
-            return None;
+        let what = kind.describe(namespace, name);
+        let url = format!("{}/api/v1/namespaces/{namespace}/{}/{name}", self.api_url, kind.resource());
+        let resp = self
+            .api_client
+            .get(&url)
+            .send_retrying(retry::Policy::API)
+            .await
+            .map_err(|e| format!("{what}: the apiserver did not answer: {e}"))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
         }
-        let obj: Value = resp.json().await.ok()?;
-        let data = obj["data"].as_object()?;
-        let mut out = HashMap::new();
-        for (k, v) in data {
-            if let Some(b64) = v.as_str() {
-                if let Ok(bytes) = base64_decode(b64) {
-                    out.insert(k.clone(), String::from_utf8_lossy(&bytes).into_owned());
-                }
-            }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("{what}: the apiserver answered {status}: {}", excerpt(&body)));
         }
-        Some(out)
+        let obj: Value = resp.json().await.map_err(|e| format!("{what}: not JSON: {e}"))?;
+        keyed_data(kind, &obj).map(Some).map_err(|e| format!("{what}: {e}"))
     }
 
-    /// Resolve a container's env: literal `value` plus `valueFrom`
-    /// (fieldRef downward API, configMapKeyRef, secretKeyRef).
+    /// Resolve a container's env (#437, 699efd7029fe and e635cb20b82e):
+    /// `envFrom` first, each source's keys under its `prefix`, a later
+    /// source over an earlier one; then `env`, whose entries override what
+    /// `envFrom` imported, a later one over an earlier one of the same name.
+    /// `env` is a literal `value` or a `valueFrom` (downward `fieldRef`,
+    /// `configMapKeyRef`, `secretKeyRef`).
+    ///
+    /// A ConfigMap, Secret or key that does not exist is skipped only when
+    /// its reference is `optional`; otherwise, and whenever the object could
+    /// not be read, the container is not created: `Err` is upstream's
+    /// `CreateContainerConfigError`, which waits and is tried again.
     async fn resolve_env(
         &self,
         pod: &Value,
         container_spec: &Value,
         pod_ip: Option<&str>,
-    ) -> Vec<(String, String)> {
+    ) -> Result<Vec<(String, String)>, CriError> {
         let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default");
-        let mut out = Vec::new();
-        let env = match container_spec["env"].as_array() {
-            Some(e) => e,
-            None => return out,
+        let container = container_spec["name"].as_str().unwrap_or("");
+        let config_error = |message: String| CriError::Container {
+            container: container.to_string(),
+            reason: "CreateContainerConfigError".into(),
+            message,
         };
-        for e in env {
+        let mut cache: HashMap<(KeyedKind, String), Option<KeyedData>> = HashMap::new();
+        let mut out: Vec<(String, String)> = Vec::new();
+        for src in container_spec["envFrom"].as_array().into_iter().flatten() {
+            let prefix = src["prefix"].as_str().unwrap_or("");
+            let (kind, r) = if src["configMapRef"].is_object() {
+                (KeyedKind::ConfigMap, &src["configMapRef"])
+            } else if src["secretRef"].is_object() {
+                (KeyedKind::Secret, &src["secretRef"])
+            } else {
+                continue;
+            };
+            let name = r["name"].as_str().unwrap_or("");
+            let optional = r["optional"].as_bool().unwrap_or(false);
+            let data = self.fetch_cached(&mut cache, kind, namespace, name).await.map_err(config_error)?;
+            let Some(data) = data else {
+                if optional {
+                    continue;
+                }
+                return Err(config_error(format!("{} not found", kind.describe(namespace, name))));
+            };
+            for (k, v) in data {
+                let var = format!("{prefix}{k}");
+                if !valid_env_name(&var) {
+                    warn!(
+                        "container {container}: envFrom {}: {var:?} is not a valid variable name; skipped",
+                        kind.describe(namespace, name)
+                    );
+                    continue;
+                }
+                set_env(&mut out, var, String::from_utf8_lossy(&v).into_owned());
+            }
+        }
+        for e in container_spec["env"].as_array().into_iter().flatten() {
             let name = match e["name"].as_str() {
                 Some(n) => n.to_string(),
                 None => continue,
             };
             if let Some(v) = e["value"].as_str() {
-                out.push((name, v.to_string()));
+                set_env(&mut out, name, v.to_string());
                 continue;
             }
             let vf = &e["valueFrom"];
             if let Some(path) = vf["fieldRef"]["fieldPath"].as_str() {
                 if let Some(v) = self.downward_field(pod, path, pod_ip) {
-                    out.push((name, v));
+                    set_env(&mut out, name, v);
                 }
-            } else if !vf["configMapKeyRef"].is_null() {
-                let cm = vf["configMapKeyRef"]["name"].as_str().unwrap_or("");
-                let key = vf["configMapKeyRef"]["key"].as_str().unwrap_or("");
-                if let Some(obj) = self.fetch_configmap(namespace, cm).await {
-                    if let Some(v) = obj["data"][key].as_str() {
-                        out.push((name, v.to_string()));
-                    }
+                continue;
+            }
+            let (kind, r) = if vf["configMapKeyRef"].is_object() {
+                (KeyedKind::ConfigMap, &vf["configMapKeyRef"])
+            } else if vf["secretKeyRef"].is_object() {
+                (KeyedKind::Secret, &vf["secretKeyRef"])
+            } else if vf.is_null() {
+                // Neither `value` nor `valueFrom`: the variable is set, empty.
+                set_env(&mut out, name, String::new());
+                continue;
+            } else {
+                // resourceFieldRef is #329.
+                continue;
+            };
+            let obj = r["name"].as_str().unwrap_or("");
+            let key = r["key"].as_str().unwrap_or("");
+            let optional = r["optional"].as_bool().unwrap_or(false);
+            let data = self.fetch_cached(&mut cache, kind, namespace, obj).await.map_err(config_error)?;
+            match data.as_ref().map(|d| d.get(key)) {
+                Some(Some(v)) => set_env(&mut out, name, String::from_utf8_lossy(v).into_owned()),
+                _ if optional => {}
+                None => {
+                    return Err(config_error(format!(
+                        "env {name}: {} not found",
+                        kind.describe(namespace, obj)
+                    )))
                 }
-            } else if !vf["secretKeyRef"].is_null() {
-                let sec = vf["secretKeyRef"]["name"].as_str().unwrap_or("");
-                let key = vf["secretKeyRef"]["key"].as_str().unwrap_or("");
-                if let Some(data) = self.fetch_secret_decoded(namespace, sec).await {
-                    if let Some(v) = data.get(key) {
-                        out.push((name, v.clone()));
-                    }
+                Some(None) => {
+                    return Err(config_error(format!(
+                        "env {name}: {} has no key {key:?}",
+                        kind.describe(namespace, obj)
+                    )))
                 }
             }
         }
-        out
+        Ok(out)
+    }
+
+    /// [`fetch_keyed`](Self::fetch_keyed) once per object for one container.
+    async fn fetch_cached(
+        &self,
+        cache: &mut HashMap<(KeyedKind, String), Option<KeyedData>>,
+        kind: KeyedKind,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Option<KeyedData>, String> {
+        let k = (kind, name.to_string());
+        if let Some(d) = cache.get(&k) {
+            return Ok(d.clone());
+        }
+        let d = self.fetch_keyed(kind, namespace, name).await?;
+        cache.insert(k, d.clone());
+        Ok(d)
     }
 
     /// Resolve a downward-API `fieldRef.fieldPath` against the pod + node context.
@@ -1503,30 +1572,31 @@ impl PodManager {
             let host_path = if let Some(hp) = vol["hostPath"]["path"].as_str() {
                 ensure_host_path(hp, vol["hostPath"]["type"].as_str().unwrap_or(""));
                 hp.to_string()
-            } else if !vol["configMap"].is_null() {
-                let cm = vol["configMap"]["name"].as_str().unwrap_or("");
-                let dir = pod_volume_dir(&self.state_root, uid, "configmap", &name);
+            } else if vol["configMap"].is_object() || vol["secret"].is_object() {
+                // #437: the object's bytes, only the `items` it selects, and
+                // a missing required object or key is a pod that waits.
+                let (kind, src, obj, sub) = if vol["configMap"].is_object() {
+                    let src = &vol["configMap"];
+                    (KeyedKind::ConfigMap, src, src["name"].as_str().unwrap_or(""), "configmap")
+                } else {
+                    let src = &vol["secret"];
+                    (KeyedKind::Secret, src, src["secretName"].as_str().unwrap_or(""), "secret")
+                };
+                let what = kind.describe(namespace, obj);
+                let dir = pod_volume_dir(&self.state_root, uid, sub, &name);
                 let data = self
-                    .fetch_configmap(namespace, cm)
+                    .fetch_keyed(kind, namespace, obj)
                     .await
-                    .and_then(|o| o["data"].as_object().cloned());
-                materialize_files(&dir, data.as_ref(), false)
-                    .map_err(|e| pod_dir_error(&name, &dir, e))?;
-                dir
-            } else if !vol["secret"].is_null() {
-                let sec = vol["secret"]["secretName"].as_str().unwrap_or("");
-                let dir = pod_volume_dir(&self.state_root, uid, "secret", &name);
-                let decoded = self.fetch_secret_decoded(namespace, sec).await;
-                materialize_secret_files(&dir, decoded.as_ref())
-                    .map_err(|e| pod_dir_error(&name, &dir, e))?;
+                    .map_err(|e| CriError::VolumeNotReady(format!("volume {name}: {e}")))?;
+                let files = keyed_files(&what, data.as_ref(), src, kind.default_mode())
+                    .map_err(|e| CriError::VolumeNotReady(format!("volume {name}: {e}")))?;
+                write_keyed(&dir, &files, true).map_err(|e| pod_dir_error(&name, &dir, e))?;
                 dir
             } else if let Some(sources) = vol["projected"]["sources"].as_array() {
                 // Projected volume (e.g. kube-api-access: SA token + CA + downward API).
                 let dir = pod_volume_dir(&self.state_root, uid, "projected", &name);
                 std::fs::create_dir_all(&dir).map_err(|e| pod_dir_error(&name, &dir, e))?;
-                self.materialize_projected(pod, namespace, &dir, sources)
-                    .await
-                    .map_err(|e| pod_dir_error(&name, &dir, e))?;
+                self.materialize_projected(pod, namespace, &name, &dir, sources).await?;
                 // Ensure the SA volume has a usable ca.crt even if the cluster
                 // has no kube-root-ca.crt configMap to source it from.
                 if let Some(ca) = &self.ca_pem {
@@ -3284,55 +3354,65 @@ impl PodManager {
         &self,
         pod: &Value,
         namespace: &str,
+        volume: &str,
         dir: &str,
         sources: &[Value],
-    ) -> std::io::Result<()> {
+    ) -> Result<(), CriError> {
         futures::future::try_join_all(
-            sources.iter().map(|src| self.materialize_projected_source(pod, namespace, dir, src)),
+            sources.iter().map(|src| self.materialize_projected_source(pod, namespace, volume, dir, src)),
         )
         .await?;
         Ok(())
     }
 
-    /// One source of a projected volume (see `materialize_projected`).
+    /// One source of a projected volume (see `materialize_projected`). A
+    /// configMap or secret source follows the volume's rules (#437,
+    /// `keyed_files`): its bytes, its `items`, and a missing required object
+    /// or key is a pod that waits.
     async fn materialize_projected_source(
         &self,
         pod: &Value,
         namespace: &str,
+        volume: &str,
         dir: &str,
         src: &Value,
-    ) -> std::io::Result<()> {
+    ) -> Result<(), CriError> {
+        let io = |e| pod_dir_error(volume, dir, e);
         if let Some(sat) = src.get("serviceAccountToken").filter(|v| !v.is_null()) {
             let path = sat["path"].as_str().unwrap_or("token");
             let aud = sat["audience"].as_str();
             // Bound to the pod, for the projection's own lifetime
             // (upstream's default 3600 s), refreshed at 80% (#122).
             let secs = sat["expirationSeconds"].as_i64().unwrap_or(3600).max(600);
-            self.write_bound_token(pod, dir, path, aud, secs).await?;
-        } else if let Some(cm) = src.get("configMap").filter(|v| !v.is_null()) {
-            let name = cm["name"].as_str().unwrap_or("");
-            let data = self
-                .fetch_configmap(namespace, name)
-                .await
-                .and_then(|o| o["data"].as_object().cloned());
-            write_projected_items(dir, cm["items"].as_array(), data.as_ref())?;
-        } else if let Some(sec) = src.get("secret").filter(|v| !v.is_null()) {
-            let name = sec["name"].as_str().unwrap_or("");
-            let decoded = self.fetch_secret_decoded(namespace, name).await;
-            if let Some(data) = decoded {
-                let asmap: serde_json::Map<String, Value> = data
-                    .into_iter()
-                    .map(|(k, v)| (k, Value::String(v)))
-                    .collect();
-                write_projected_items(dir, sec["items"].as_array(), Some(&asmap))?;
+            self.write_bound_token(pod, dir, path, aud, secs).await.map_err(io)?;
+        } else if src["configMap"].is_object() || src["secret"].is_object() {
+            let (kind, s) = if src["configMap"].is_object() {
+                (KeyedKind::ConfigMap, &src["configMap"])
+            } else {
+                (KeyedKind::Secret, &src["secret"])
+            };
+            let obj = s["name"].as_str().unwrap_or("");
+            let what = kind.describe(namespace, obj);
+            let not_ready = |e: String| CriError::VolumeNotReady(format!("volume {volume}: {e}"));
+            let mut data = self.fetch_keyed(kind, namespace, obj).await.map_err(not_ready)?;
+            // kube-api-access names kube-root-ca.crt, which a cluster may not
+            // have published yet: the kubelet's own CA is that ConfigMap's
+            // content, so a pod does not wait for it.
+            if data.is_none() && kind == KeyedKind::ConfigMap && obj == "kube-root-ca.crt" {
+                if let Some(ca) = &self.ca_pem {
+                    data = Some(KeyedData::from([("ca.crt".to_string(), ca.to_vec())]));
+                }
             }
+            // A projected volume's mode is the volume's defaultMode, 0644.
+            let files = keyed_files(&what, data.as_ref(), s, 0o644).map_err(not_ready)?;
+            write_keyed(dir, &files, false).map_err(io)?;
         } else if let Some(dw) = src.get("downwardAPI").filter(|v| !v.is_null()) {
             if let Some(items) = dw["items"].as_array() {
                 for it in items {
                     let path = it["path"].as_str().unwrap_or("");
                     if let Some(fp) = it["fieldRef"]["fieldPath"].as_str() {
                         if let Some(val) = self.downward_field(pod, fp, None) {
-                            crate::api_files::write_in(dir, path, val.as_bytes(), 0o644)?;
+                            crate::api_files::write_in(dir, path, val.as_bytes(), 0o644).map_err(io)?;
                         }
                     }
                 }
@@ -4149,7 +4229,7 @@ impl PodManager {
             let image = spec["image"].as_str().unwrap_or("");
             info!("Init container {ns}/{name}/{cname}: ensuring image {image}");
             let image_ref = self.startup_image(pod,image, spec).await?;
-            let mut envs = self.resolve_env(pod, spec, pod_ip).await;
+            let mut envs = self.resolve_env(pod, spec, pod_ip).await?;
             merge_env(&mut envs, self.service_account_env());
             let mut mounts = resolve_mounts(spec, volumes);
             push_mount(&mut mounts, sa_mount.clone());
@@ -4636,7 +4716,7 @@ impl PodManager {
             // inject the SA credential mount + KUBERNETES_SERVICE_* env).
             let mut envs = self
                 .resolve_env(pod, container_spec, pod_ip.as_deref())
-                .await;
+                .await?;
             merge_env(&mut envs, self.service_account_env());
             let mut mounts = resolve_mounts(container_spec, &volumes);
             push_mount(&mut mounts, sa_mount.clone());
@@ -5531,9 +5611,14 @@ impl PodManager {
                 return false;
             }
         };
-        let mut envs = self
-            .resolve_env(&state.pod, spec, state.pod_ip.as_deref())
-            .await;
+        let mut envs = match self.resolve_env(&state.pod, spec, state.pod_ip.as_deref()).await {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("Container {}/{}/{name}: {e}", state.namespace, state.name);
+                self.due_in(&state.uid, deadlines::RECHECK);
+                return false;
+            }
+        };
         merge_env(&mut envs, self.service_account_env());
         let mut mounts = resolve_mounts(spec, &volumes);
         match self.service_account_mount(&state.pod).await {
@@ -6969,65 +7054,190 @@ fn push_mount(mounts: &mut Vec<Mount>, mount: Option<Mount>) {
     }
 }
 
-/// Write projected configMap/secret source data into `dir`. With `items`,
-/// only the listed keys are written at their `path`; without, every key is
-/// written at its own name.
-fn write_projected_items(
-    dir: &str,
-    items: Option<&Vec<Value>>,
-    data: Option<&serde_json::Map<String, Value>>,
-) -> std::io::Result<()> {
-    let data = match data {
-        Some(d) => d,
-        None => return Ok(()),
+/// The two API objects whose keys the kubelet writes as files or env.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum KeyedKind {
+    ConfigMap,
+    Secret,
+}
+
+impl KeyedKind {
+    fn resource(self) -> &'static str {
+        match self {
+            KeyedKind::ConfigMap => "configmaps",
+            KeyedKind::Secret => "secrets",
+        }
+    }
+
+    fn describe(self, namespace: &str, name: &str) -> String {
+        match self {
+            KeyedKind::ConfigMap => format!("configmap {namespace}/{name}"),
+            KeyedKind::Secret => format!("secret {namespace}/{name}"),
+        }
+    }
+
+    /// The mode a key's file gets when neither the item nor the volume says.
+    fn default_mode(self) -> u32 {
+        match self {
+            KeyedKind::ConfigMap => 0o644,
+            KeyedKind::Secret => 0o600,
+        }
+    }
+}
+
+/// A ConfigMap's or Secret's keys and their values as bytes (#437).
+type KeyedData = std::collections::BTreeMap<String, Vec<u8>>;
+
+/// The keys of a fetched ConfigMap (`data` as text, `binaryData` base64) or
+/// Secret (`data` base64), byte for byte.
+fn keyed_data(kind: KeyedKind, obj: &Value) -> Result<KeyedData, String> {
+    let mut out = KeyedData::new();
+    let decode = |field: &str, out: &mut KeyedData| -> Result<(), String> {
+        for (k, v) in obj[field].as_object().into_iter().flatten() {
+            let b64 = v.as_str().unwrap_or("");
+            let bytes = base64_decode(b64).map_err(|()| format!("{field}.{k} is not base64"))?;
+            out.insert(k.clone(), bytes);
+        }
+        Ok(())
     };
-    match items {
+    match kind {
+        KeyedKind::ConfigMap => {
+            for (k, v) in obj["data"].as_object().into_iter().flatten() {
+                out.insert(k.clone(), v.as_str().unwrap_or("").as_bytes().to_vec());
+            }
+            decode("binaryData", &mut out)?;
+        }
+        KeyedKind::Secret => decode("data", &mut out)?,
+    }
+    Ok(out)
+}
+
+/// One file a configMap or secret source writes: its path in the volume,
+/// its bytes and its mode.
+#[derive(Debug, PartialEq)]
+struct KeyedFile {
+    path: String,
+    bytes: Vec<u8>,
+    mode: u32,
+}
+
+/// The files a configMap or secret source (a volume, or a projected
+/// volume's source) writes (#437, 1f318a543243 and e635cb20b82e).
+///
+/// With `items`, only the listed keys, each at its `path` (its own name when
+/// the item has none) and its `mode`; without, every key at its own name.
+/// The volume's `defaultMode`, else `default_mode`, for the rest.
+///
+/// `data` is `None` when the object does not exist. A missing object, or a
+/// listed key it does not have, is skipped only when the source is
+/// `optional`; otherwise `Err` says which, and the pod waits for it.
+fn keyed_files(
+    what: &str,
+    data: Option<&KeyedData>,
+    src: &Value,
+    default_mode: u32,
+) -> Result<Vec<KeyedFile>, String> {
+    let optional = src["optional"].as_bool().unwrap_or(false);
+    let Some(data) = data else {
+        return if optional { Ok(Vec::new()) } else { Err(format!("{what} not found")) };
+    };
+    let mode_of = |v: &Value, or: u32| v.as_u64().map(|m| m as u32 & 0o777).unwrap_or(or);
+    let default_mode = mode_of(&src["defaultMode"], default_mode);
+    let mut out = Vec::new();
+    match src["items"].as_array() {
         Some(items) => {
             for it in items {
                 let key = it["key"].as_str().unwrap_or("");
-                let path = it["path"].as_str().unwrap_or(key);
-                if let Some(s) = data.get(key).and_then(|v| v.as_str()) {
-                    crate::api_files::write_in(dir, path, s.as_bytes(), 0o644)?;
+                let Some(bytes) = data.get(key) else {
+                    if optional {
+                        continue;
+                    }
+                    return Err(format!("{what} has no key {key:?}"));
+                };
+                let path = it["path"].as_str().filter(|p| !p.is_empty()).unwrap_or(key);
+                if crate::api_files::contained(path).is_none() {
+                    return Err(format!("{what}: item path {path:?} is not a path inside the volume"));
                 }
+                out.push(KeyedFile {
+                    path: path.to_string(),
+                    bytes: bytes.clone(),
+                    mode: mode_of(&it["mode"], default_mode),
+                });
             }
         }
         None => {
-            for (key, val) in data {
-                if let Some(s) = val.as_str() {
-                    crate::api_files::write_in(dir, key, s.as_bytes(), 0o644)?;
-                }
+            for (k, bytes) in data {
+                out.push(KeyedFile { path: k.clone(), bytes: bytes.clone(), mode: default_mode });
             }
         }
+    }
+    Ok(out)
+}
+
+/// Write `files` into `dir` (symlink-safe, `api_files`). With `prune`, also
+/// remove what `dir` holds that `files` does not name, so a key dropped from
+/// the object or the `items` list is gone at the next write (#437,
+/// 1f318a543243). A projected volume shares its directory between sources
+/// (and its token), so it does not prune.
+fn write_keyed(dir: &str, files: &[KeyedFile], prune: bool) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    for f in files {
+        crate::api_files::write_in(dir, &f.path, &f.bytes, f.mode)?;
+    }
+    if prune {
+        let keep: std::collections::HashSet<std::path::PathBuf> = files
+            .iter()
+            .filter_map(|f| crate::api_files::contained(&f.path))
+            .collect();
+        let parents: std::collections::HashSet<std::path::PathBuf> = keep
+            .iter()
+            .flat_map(|p| p.ancestors().skip(1).map(std::path::Path::to_path_buf))
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect();
+        prune_dir(std::path::Path::new(dir), std::path::Path::new(""), &keep, &parents)?;
     }
     Ok(())
 }
 
-/// Write each ConfigMap data entry as a file `<dir>/<key>` (0644).
-fn materialize_files(
-    dir: &str,
-    data: Option<&serde_json::Map<String, Value>>,
-    _binary: bool,
+/// Remove everything under `root/rel` that is neither in `keep` nor a
+/// directory on the way to something in it. Symlinks are removed, never followed.
+fn prune_dir(
+    root: &std::path::Path,
+    rel: &std::path::Path,
+    keep: &std::collections::HashSet<std::path::PathBuf>,
+    parents: &std::collections::HashSet<std::path::PathBuf>,
 ) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    if let Some(data) = data {
-        for (key, val) in data {
-            if let Some(s) = val.as_str() {
-                crate::api_files::write_in(dir, key, s.as_bytes(), 0o644)?;
-            }
+    for entry in std::fs::read_dir(root.join(rel))? {
+        let entry = entry?;
+        let r = rel.join(entry.file_name());
+        if keep.contains(&r) {
+            continue;
+        }
+        let ft = entry.file_type()?;
+        if ft.is_dir() && parents.contains(&r) {
+            prune_dir(root, &r, keep, parents)?;
+        } else if ft.is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            std::fs::remove_file(entry.path())?;
         }
     }
     Ok(())
 }
 
-/// Write decoded Secret entries as files `<dir>/<key>` (0600), symlink-safe (`api_files`).
-fn materialize_secret_files(dir: &str, data: Option<&HashMap<String, String>>) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    if let Some(data) = data {
-        for (key, val) in data {
-            crate::api_files::write_in(dir, key, val.as_bytes(), 0o600)?;
-        }
+/// A name `envFrom` may set: not empty, no `=`, printable ASCII (what
+/// upstream accepts since RelaxedEnvironmentVariableValidation).
+fn valid_env_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|b| (0x20..0x7f).contains(&b) && b != b'=')
+}
+
+/// Set `name` to `value`, replacing an earlier value of the same name in
+/// place (a later env entry, or `env` over `envFrom`, wins).
+fn set_env(env: &mut Vec<(String, String)>, name: String, value: String) {
+    match env.iter_mut().find(|(k, _)| *k == name) {
+        Some(e) => e.1 = value,
+        None => env.push((name, value)),
     }
-    Ok(())
 }
 
 /// Minimal standard base64 decode (Secret data is standard-alphabet base64).
@@ -10080,8 +10290,8 @@ pub(crate) mod tests {
         let p = json!({
             "metadata": {"uid": "uid-428", "namespace": "default"},
             "spec": {"volumes": [
-                {"name": "cm", "configMap": {"name": "c"}},
-                {"name": "sec", "secret": {"secretName": "s"}},
+                {"name": "cm", "configMap": {"name": "c", "optional": true}},
+                {"name": "sec", "secret": {"secretName": "s", "optional": true}},
                 {"name": "proj", "projected": {"sources": []}},
                 {"name": "scratch", "emptyDir": {}}
             ]}
@@ -10446,7 +10656,7 @@ pub(crate) mod tests {
                 {"name": "TIER", "valueFrom": {"fieldRef": {"fieldPath": "metadata.labels['tier']"}}}
             ]
         });
-        let env = mgr.resolve_env(&p, &container, Some("10.1.2.3")).await;
+        let env = mgr.resolve_env(&p, &container, Some("10.1.2.3")).await.unwrap();
         let m: HashMap<_, _> = env.into_iter().collect();
         assert_eq!(m.get("LITERAL").map(String::as_str), Some("hi"));
         assert_eq!(m.get("NODE").map(String::as_str), Some(NODE));
@@ -11590,5 +11800,238 @@ pub(crate) mod tests {
         let plain = pod("u", "p", "Always", simple_container());
         assert!(realtime_admission(&plain, "", Preempt::Dynamic).is_ok());
         assert_eq!(realtime_of(&plain, "", "app"), None);
+    }
+
+    // ---- #437: ConfigMaps and Secrets as volumes and env ----
+
+    fn b64(bytes: &[u8]) -> String {
+        const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+            let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(A[(n >> (18 - 6 * i)) as usize & 63] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    /// A Secret's binary value: what `keyed_data` and the volume write.
+    const KEYSTORE: &[u8] = &[0xff, 0xfe, 0x00, 0x80, b'k'];
+
+    /// An apiserver with configmap `app`, secret `creds` and a secret
+    /// `broken` that answers 500; everything else is 404.
+    async fn keyed_api() -> (Arc<FakeRuntime>, PodManager) {
+        use axum::routing::get as http_get;
+        let app = axum::Router::new().route(
+            "/api/v1/namespaces/{ns}/{res}/{name}",
+            http_get(|axum::extract::Path((_ns, res, name)): axum::extract::Path<(String, String, String)>| async move {
+                match (res.as_str(), name.as_str()) {
+                    ("configmaps", "app") => Ok(axum::Json(json!({
+                        "data": {"a.conf": "alpha", "b": "beta"},
+                        "binaryData": {"bin": b64(&[0, 255])}
+                    }))),
+                    ("secrets", "creds") => Ok(axum::Json(json!({
+                        "data": {"user": b64(b"admin"), "key": b64(KEYSTORE)}
+                    }))),
+                    ("secrets", "broken") => Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
+                    _ => Err(axum::http::StatusCode::NOT_FOUND),
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let rt = Arc::new(FakeRuntime::default());
+        let mut mgr = PodManager::with_api(rt.clone(), rt.clone(), NODE, &url, "127.0.0.1", reqwest::Client::new());
+        let tmp = std::env::temp_dir().join(format!("rk-kubelet-437-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        mgr.state_root = tmp.to_string_lossy().into_owned();
+        (rt, mgr)
+    }
+
+    fn volume_pod(uid: &str, volumes: Value) -> Value {
+        let mut p = pod(uid, "web", "Always", simple_container());
+        p["spec"]["volumes"] = volumes;
+        p
+    }
+
+    fn listing(dir: &str) -> Vec<String> {
+        fn walk(root: &std::path::Path, rel: &std::path::Path, out: &mut Vec<String>) {
+            for e in std::fs::read_dir(root.join(rel)).unwrap() {
+                let e = e.unwrap();
+                let r = rel.join(e.file_name());
+                if e.file_type().unwrap().is_dir() {
+                    walk(root, &r, out);
+                } else {
+                    out.push(r.to_string_lossy().into_owned());
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(std::path::Path::new(dir), std::path::Path::new(""), &mut out);
+        out.sort();
+        out
+    }
+
+    /// #437 dc6872a9854f: a Secret's value is bytes, not lossy UTF-8.
+    #[test]
+    fn secret_data_is_kept_as_bytes() {
+        let obj = json!({"data": {"key": b64(KEYSTORE)}});
+        assert_eq!(keyed_data(KeyedKind::Secret, &obj).unwrap()["key"], KEYSTORE);
+        let bad = json!({"data": {"key": "not base64!"}});
+        assert!(keyed_data(KeyedKind::Secret, &bad).is_err());
+        let cm = json!({"data": {"t": "text"}, "binaryData": {"b": b64(&[0, 255])}});
+        let d = keyed_data(KeyedKind::ConfigMap, &cm).unwrap();
+        assert_eq!((d["t"].as_slice(), d["b"].as_slice()), (&b"text"[..], &[0u8, 255][..]));
+    }
+
+    /// #437 dc6872a9854f and 1f318a543243: a secret volume writes the
+    /// selected key's exact bytes at its item path and nothing else; a
+    /// changed selection removes the file it no longer names.
+    #[tokio::test]
+    async fn secret_volume_writes_selected_items_byte_for_byte() {
+        let (_rt, mgr) = keyed_api().await;
+        let p = volume_pod("uid-437-sec", json!([{"name": "s", "secret": {
+            "secretName": "creds", "items": [{"key": "key", "path": "keystore/ks.bin", "mode": 0o400}]
+        }}]));
+        let v = mgr.resolve_volumes(&p).await.unwrap();
+        let dir = v["s"].path.clone();
+        assert_eq!(listing(&dir), vec!["keystore/ks.bin"]);
+        assert_eq!(std::fs::read(format!("{dir}/keystore/ks.bin")).unwrap(), KEYSTORE);
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(format!("{dir}/keystore/ks.bin")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o400);
+
+        let p = volume_pod("uid-437-sec", json!([{"name": "s", "secret": {
+            "secretName": "creds", "items": [{"key": "user"}]
+        }}]));
+        mgr.resolve_volumes(&p).await.unwrap();
+        assert_eq!(listing(&dir), vec!["user"]);
+        assert_eq!(std::fs::read(format!("{dir}/user")).unwrap(), b"admin");
+    }
+
+    /// #437 1f318a543243: a configMap volume's items rename and select;
+    /// without items every key is written, binaryData included.
+    #[tokio::test]
+    async fn configmap_volume_applies_items() {
+        let (_rt, mgr) = keyed_api().await;
+        let p = volume_pod("uid-437-cm", json!([
+            {"name": "one", "configMap": {"name": "app", "items": [{"key": "a.conf", "path": "app.conf"}]}},
+            {"name": "all", "configMap": {"name": "app"}}
+        ]));
+        let v = mgr.resolve_volumes(&p).await.unwrap();
+        assert_eq!(listing(&v["one"].path), vec!["app.conf"]);
+        assert_eq!(std::fs::read(format!("{}/app.conf", v["one"].path)).unwrap(), b"alpha");
+        assert_eq!(listing(&v["all"].path), vec!["a.conf", "b", "bin"]);
+        assert_eq!(std::fs::read(format!("{}/bin", v["all"].path)).unwrap(), [0, 255]);
+        // An item path that leaves the volume is refused.
+        let p = volume_pod("uid-437-cm2", json!([
+            {"name": "x", "configMap": {"name": "app", "items": [{"key": "b", "path": "../escape"}]}}
+        ]));
+        assert!(matches!(mgr.resolve_volumes(&p).await, Err(CriError::VolumeNotReady(_))));
+    }
+
+    /// #437 e635cb20b82e: a missing required object or key, or one the
+    /// apiserver would not give, is a pod that waits; optional is empty.
+    #[tokio::test]
+    async fn missing_required_keyed_volumes_wait() {
+        let (_rt, mgr) = keyed_api().await;
+        let waits = |vols: Value| {
+            let p = volume_pod("uid-437-miss", vols);
+            let mgr = &mgr;
+            async move {
+                match mgr.resolve_volumes(&p).await {
+                    Err(CriError::VolumeNotReady(m)) => m,
+                    other => panic!("expected VolumeNotReady, got {:?}", other.map(|m| m.len())),
+                }
+            }
+        };
+        let m = waits(json!([{"name": "c", "configMap": {"name": "nope"}}])).await;
+        assert!(m.contains("configmap default/nope not found"), "{m}");
+        let m = waits(json!([{"name": "s", "secret": {"secretName": "creds", "items": [{"key": "gone"}]}}])).await;
+        assert!(m.contains("has no key \"gone\""), "{m}");
+        // An API failure is never read as "absent", optional or not.
+        let m = waits(json!([{"name": "s", "secret": {"secretName": "broken", "optional": true}}])).await;
+        assert!(m.contains("500"), "{m}");
+        let m = waits(json!([{"name": "p", "projected": {"sources": [{"secret": {"name": "nope"}}]}}])).await;
+        assert!(m.contains("secret default/nope not found"), "{m}");
+
+        let p = volume_pod("uid-437-opt", json!([
+            {"name": "c", "configMap": {"name": "nope", "optional": true}},
+            {"name": "s", "secret": {"secretName": "creds", "optional": true, "items": [{"key": "gone"}, {"key": "user"}]}}
+        ]));
+        let v = mgr.resolve_volumes(&p).await.unwrap();
+        assert!(listing(&v["c"].path).is_empty());
+        assert_eq!(listing(&v["s"].path), vec!["user"]);
+    }
+
+    /// kube-api-access names kube-root-ca.crt; where the cluster has not
+    /// published it, the kubelet's CA stands in, and the pod does not wait.
+    #[tokio::test]
+    async fn kube_root_ca_falls_back_to_the_kubelets_ca() {
+        let (_rt, mut mgr) = keyed_api().await;
+        mgr.ca_pem = Some(b"CA PEM".to_vec());
+        let p = volume_pod("uid-437-ca", json!([{"name": "kube-api-access", "projected": {"sources": [
+            {"configMap": {"name": "kube-root-ca.crt", "items": [{"key": "ca.crt", "path": "ca.crt"}]}}
+        ]}}]));
+        let v = mgr.resolve_volumes(&p).await.unwrap();
+        assert_eq!(std::fs::read(format!("{}/ca.crt", v["kube-api-access"].path)).unwrap(), b"CA PEM");
+    }
+
+    /// #437 699efd7029fe: envFrom imports every key under its prefix, and
+    /// env overrides it; a later entry of one name wins.
+    #[tokio::test]
+    async fn env_from_imports_keys_and_env_overrides() {
+        let (_rt, mgr) = keyed_api().await;
+        let p = pod("uid-437-env", "web", "Always", simple_container());
+        let c = json!({"name": "app",
+            "envFrom": [
+                {"configMapRef": {"name": "app"}, "prefix": "CM_"},
+                {"secretRef": {"name": "creds"}},
+                {"secretRef": {"name": "nope", "optional": true}}
+            ],
+            "env": [
+                {"name": "user", "value": "root"},
+                {"name": "PASS", "valueFrom": {"secretKeyRef": {"name": "creds", "key": "user"}}},
+                {"name": "MAYBE", "valueFrom": {"configMapKeyRef": {"name": "app", "key": "zz", "optional": true}}},
+                {"name": "EMPTY"}
+            ]});
+        let env = mgr.resolve_env(&p, &c, None).await.unwrap();
+        let names: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names, vec!["CM_a.conf", "CM_b", "CM_bin", "key", "user", "PASS", "EMPTY"]);
+        let m: HashMap<_, _> = env.into_iter().collect();
+        assert_eq!(m["CM_a.conf"], "alpha");
+        assert_eq!(m["user"], "root");
+        assert_eq!(m["PASS"], "admin");
+        assert_eq!(m["EMPTY"], "");
+    }
+
+    /// #437 e635cb20b82e: a missing required env source is
+    /// CreateContainerConfigError, never a container without the variable.
+    #[tokio::test]
+    async fn missing_required_env_is_a_config_error() {
+        let (_rt, mgr) = keyed_api().await;
+        let p = pod("uid-437-enverr", "web", "Always", simple_container());
+        for (c, want) in [
+            (json!({"name": "app", "envFrom": [{"configMapRef": {"name": "nope"}}]}), "configmap default/nope not found"),
+            (json!({"name": "app", "env": [{"name": "X", "valueFrom": {"secretKeyRef": {"name": "creds", "key": "gone"}}}]}),
+             "has no key \"gone\""),
+            (json!({"name": "app", "env": [{"name": "X", "valueFrom": {"secretKeyRef": {"name": "broken", "key": "k", "optional": true}}}]}),
+             "500"),
+        ] {
+            match mgr.resolve_env(&p, &c, None).await {
+                Err(CriError::Container { container, reason, message }) => {
+                    assert_eq!((container.as_str(), reason.as_str()), ("app", "CreateContainerConfigError"));
+                    assert!(message.contains(want), "{message}");
+                }
+                other => panic!("{c}: expected a config error, got {other:?}"),
+            }
+        }
     }
 }
