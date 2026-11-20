@@ -49,6 +49,12 @@ Run a31775e9fc: `vmi-agent-answers` "the probe said: " (pod done in 3 s, empty):
 message, which the kubelet reports only when the runtime gives one (#162); vmi-pod-network's connect was blank the same way.
 Fix: `k8s::said` (message, else the log's last line, else the phase) for both probes. Then sc-build, golden rerun on pvetest2.
 Done 701679d; sc-build (test crate test + clippy -D warnings) passed. Golden run 2aa5de7dc7 on pvetest2. Held `--after-run 2aa5de7dc7`.
+Run 2aa5de7dc7: `vmi-agent-answers` passed (ping ok, qemu-ga 10.2.2, guest-ssh-add-authorized-keys and
+guest-network-get-interfaces enabled, interfaces answered), `vmi-agent-keys` still the bare start-time text. So the old kubelet
+would have seen the agent too: it never asked. Cause: on stormpump a VMI's worker waits for an event or a deadline (#101); the
+pass that starts a machine sets none (`absorb_ends_for` runs before the start; the finalizer patch is not an intent change), so the
+guest is never polled. Fix: `first_look`: the start pass sets the look at AGENT_FIRST. Then sc-build, stage, golden on an install
+carrying it (`vmi-agent-keys` True).
 
 ### Waiting on an install: #421 (P2), direct kernel boot from the golden's kernel (vmcloud-image-operator#62, stormvm#111)
 2026-11-20. Finding: no mount is needed. stormvm's machine spec is `root: Root::Inherit`, which stormpump documents as "the

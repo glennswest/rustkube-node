@@ -1246,6 +1246,20 @@ const AGENT_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 /// Until the agent first answers (the guest is booting), and while keys are
 /// still to be delivered, it is asked sooner.
 const AGENT_FIRST: std::time::Duration = std::time::Duration::from_secs(2);
+/// When a machine this pass started is next looked at (#405). The pass that
+/// starts it asks its guest nothing: `absorb_ends_for` ran before the start
+/// and did not see it. Every later pass sets its own next look, but on an
+/// engine that reports exits a VMI's worker waits for an event or a
+/// deadline (#101), and nothing about a booting guest is an event (the
+/// finalizer patch is not a change of intent). So without this the guest
+/// was never asked again: no agent ping, no keys through the agent, and
+/// `AccessCredentialsSynchronized` stayed at the start's "waiting for the
+/// guest agent to answer" for good. `None`: it was running already, and
+/// `absorb_ends_for` set the next look.
+fn first_look(was_running: bool, running: bool) -> Option<std::time::Duration> {
+    (!was_running && running).then_some(AGENT_FIRST)
+}
+
 /// A machine adopted without an engine handle: the control socket is the
 /// only sign of life, so it is checked on this period.
 const HANDLELESS_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
@@ -2082,7 +2096,8 @@ impl VmManager {
             return Ok(false);
         }
         self.absorb_ends_for(Some(uid)).await;
-        if !self.vms.lock().await.contains_key(uid)
+        let was_running = self.vms.lock().await.contains_key(uid);
+        if !was_running
             && !self.forced.lock().unwrap_or_else(|e| e.into_inner()).contains_key(uid)
             && !crate::vm_migration::moved_away(object, &self.node_name)
         {
@@ -2090,6 +2105,9 @@ impl VmManager {
         }
         let running = self.vms.lock().await.get(uid).is_some_and(|vm| !vm.phase.terminal());
         if !running { return Ok(false); }
+        if let Some(after) = first_look(was_running, running) {
+            self.due_in(uid, after);
+        }
         if !self.set_finalizer(object, true).await {
             self.due_in(uid, AGENT_FIRST);
         }
@@ -7878,6 +7896,16 @@ mod tests {
         assert_eq!(pod_address_not_taken(&[nic("bridge")], &[vec!["10.173.204.73".into()]], 600), None, "taken");
         assert_eq!(pod_address_not_taken(&[nic("host-bridge")], &[vec![]], 600), None, "not the pod's address");
         assert_eq!(pod_address_not_taken(&[nic("masquerade")], &[vec![]], 600), None);
+    }
+
+    /// #405: the pass that starts a machine sets its next look, so its guest
+    /// is asked (agent, keys) with no event; a machine already running has
+    /// its look set by `absorb_ends_for`, and one that did not start none.
+    #[test]
+    fn a_machine_started_this_pass_is_looked_at_again() {
+        assert_eq!(first_look(false, true), Some(AGENT_FIRST));
+        assert_eq!(first_look(true, true), None);
+        assert_eq!(first_look(false, false), None);
     }
 
     /// `AccessCredentialsSynchronized`: every problem named, an agent not yet
