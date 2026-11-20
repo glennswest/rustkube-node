@@ -424,7 +424,20 @@ impl CniInvoker {
     }
 
     /// Locate a plugin binary in the configured bin dirs (CNI_PATH order).
+    ///
+    /// The type comes from a network config, which for a pod's extra
+    /// networks is a NetworkAttachmentDefinition's `spec.config`, written by
+    /// whoever may create one. It must name a file directly in a bin dir: an
+    /// absolute path, a separator or a `.`/`..` component would let it pick
+    /// any executable the kubelet can see (rustkube-node#428, finding
+    /// 547a888e434e), so those are refused before any lookup.
     fn find_plugin_binary(&self, plugin_type: &str) -> Result<PathBuf, CniError> {
+        if !is_plain_plugin_name(plugin_type) {
+            return Err(CniError::NetworkNotFound(format!(
+                "CNI plugin type {plugin_type:?} is not a plain file name; a type names a binary in {:?}",
+                self.bin_dirs
+            )));
+        }
         for dir in &self.bin_dirs {
             let candidate = dir.join(plugin_type);
             if candidate.is_file() {
@@ -436,6 +449,15 @@ impl CniInvoker {
             self.bin_dirs
         )))
     }
+}
+
+/// A plugin type CNI may look up: one non-empty path component that is
+/// neither `.` nor `..`, with no separator and no NUL.
+fn is_plain_plugin_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\', '\0'])
 }
 
 #[cfg(all(test, unix))]
@@ -734,5 +756,32 @@ exit 1
         assert_eq!(one.plugins.len(), 1);
         assert!(NetworkConfigList::from_json(r#"{"name":"nothing"}"#, "x").is_err());
         assert!(NetworkConfigList::from_json("not json", "x").is_err());
+    }
+
+    /// rustkube-node#428 (finding 547a888e434e): a NAD's plugin type names a
+    /// binary in a bin dir and nothing else. An absolute path, `..` or a
+    /// sub-path is refused and the executable it points at never runs.
+    #[tokio::test]
+    async fn a_plugin_type_outside_the_bin_dirs_never_runs() {
+        let conf = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        // Executables a pod author might point at: one beside the bin dir,
+        // one in a directory below it.
+        write_fake_plugin(outside.path(), "evil", r#"{"cniVersion":"1.0.0"}"#);
+        std::fs::create_dir_all(bin.path().join("sub")).unwrap();
+        write_fake_plugin(&bin.path().join("sub"), "evil", r#"{"cniVersion":"1.0.0"}"#);
+        let abs = outside.path().join("evil");
+        let rel = format!("../{}/evil", outside.path().file_name().unwrap().to_str().unwrap());
+        let invoker = CniInvoker::new(conf.path(), vec![bin.path().to_path_buf()]);
+        for ty in [abs.to_str().unwrap(), rel.as_str(), "sub/evil", "..", ".", ""] {
+            let nad = json!({"cniVersion":"1.0.0","name":"lan","type": ty}).to_string();
+            let config = NetworkConfigList::from_json(&nad, "default/lan").unwrap();
+            let err = invoker.add_network(&config, &pod().on_interface("net1")).await.unwrap_err();
+            assert!(err.to_string().contains("not a plain file name"), "{ty:?}: {err}");
+        }
+        assert!(!outside.path().join("out").read_dir().unwrap().any(|_| true), "nothing ran outside");
+        assert!(!bin.path().join("sub/out").read_dir().unwrap().any(|_| true), "nothing ran below");
+        assert!(is_plain_plugin_name("macvlan") && is_plain_plugin_name("host-local"));
     }
 }
