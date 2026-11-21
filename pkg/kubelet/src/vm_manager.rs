@@ -4121,7 +4121,7 @@ impl VmManager {
             Ok("paused") | Ok("postmigrate") => Some(machine.unpause().await.map_err(|e| e.to_string())),
             _ => None,
         };
-        match resume_step(state.as_deref(), unpaused, since.elapsed()) {
+        match resume_step(state.as_deref().map_err(String::as_str), unpaused, since.elapsed()) {
             ResumeStep::Resumed => self.finish_resume(uid, Ok(())).await,
             ResumeStep::Wait(said) => {
                 if let Some(e) = said {
