@@ -173,7 +173,7 @@ in the pod netns the socket is connected on a setns thread and handed to tonic. 
 Full `sc-build` passed on 78e9317 (VM sc-build-5af0b51f5f: 774 kubelet tests ok). HTTPS probes in the pod netns are
 still a connect only: gap #452, proposed. Stage golden requested.
 
-### In progress: #442 (P1), review: the native runtime never provides the image rootfs
+### Done: #442 (P1), review: the native runtime never provides the image rootfs
 
 The finding (`runtime.rs:136`, 3d780a09c92c) is real but is one of several gaps in `--runtime native`: no image
 unpack, no `linux.namespaces` (it never joins the sandbox netns), no image config, and `pull_image` is `Ok` on
@@ -183,6 +183,10 @@ remove `native` from `--runtime` (default `stormpump`), delete `NativeRuntime`/`
 libcontainer/oci-spec deps. The CRIU `MigrationService` stormpump borrowed from a fresh `NativeRuntime` can never
 checkpoint either (it looks the sandbox up in its own, always empty, map), so it goes too (`checkpoint.rs`), and
 `StormpumpRuntime` implements `MigrationService` as evacuate with refusals, like `CriGrpcClient`. Tests for both.
+Built in 04a2091 (code), 500e414 (Cargo.lock), 8d9ecfe (docs); sc-build passed (VM sc-build-15784c754a: 811 kubelet tests ok,
+`cri::tests::evacuate_only_refuses_every_verb_with_the_runtime_name` and
+`tests::runtime_defaults_to_stormpump_and_native_is_gone` new); check-stubs clean; clippy: nothing in the changed lines
+(the rest is #385/#386). Stage build ee7e390b3bfa requested. Closed; shipped with a node log proof.
 
 ### Done: #441 (P1), review: ClientIP affinity in kube-proxy's iptables rules
 2026-11-20. 3394445b5e43: `ServiceInfo.session_affinity: Option<u32>` (timeout, default 10800); SEP DNAT `-m recent --set`,
