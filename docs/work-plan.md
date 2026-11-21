@@ -173,13 +173,15 @@ in the pod netns the socket is connected on a setns thread and handed to tonic. 
 Full `sc-build` passed on 78e9317 (VM sc-build-5af0b51f5f: 774 kubelet tests ok). HTTPS probes in the pod netns are
 still a connect only: gap #452, proposed. Stage golden requested.
 
-### In progress: #456, `kubelet_volume_stats_*` on `/metrics` (sc#151)
+### Done: #456, `kubelet_volume_stats_*` on `/metrics` (sc#151)
 
 `oc adm top persistentvolumeclaims` divides `kubelet_volume_stats_used_bytes` by `_capacity_bytes`, both labelled
 `namespace`, `persistentvolumeclaim`. The plan is to render both per claim at scrape time from `pod_volume_stats` (the
 summary's `volume[]`, #372: engine virtual size and allocated bytes), one series per claim. `_available_bytes` and
 `_inodes*` need a statvfs inside the container's mount namespace (a stormblock claim is mounted by the container,
-not the kubelet). They are left out, and that gap is filed. Third-party CSI sizes are #223.
+not the kubelet). They are left out: gap #469, proposed. Third-party CSI sizes are #223. Code 353ac78
+(`metrics::render_volume_stats`, test `volume_stats_are_per_claim`). Full `sc-build` passed on 353ac78 (VM
+sc-build-82771970c1). Stage golden requested.
 
 ### Done: #442 (P1), review: the native runtime never provides the image rootfs
 
