@@ -51,7 +51,15 @@ pub fn volume_stats(
     listing: &Value,
 ) -> Vec<Value> {
     let items = listing["items"].as_array();
+    // A hostPath's volume (#395) is the volume it is on, not the pod's: its
+    // sizes are the whole volume's, so it has no stats of its own.
+    let host_path = |name: &str| {
+        spec_volumes.as_array().is_some_and(|vs| {
+            vs.iter().any(|v| v["name"].as_str() == Some(name) && v["hostPath"].is_object())
+        })
+    };
     ids.iter()
+        .filter(|(name, _)| !host_path(name))
         .map(|(name, id)| {
             let mut v = serde_json::json!({ "name": name, "volumeId": id });
             let claim = spec_volumes.as_array().and_then(|vs| {
@@ -251,6 +259,30 @@ pub const CONFIG_SOURCE: &str = "kubernetes.io/config.source";
 /// A pod from this node's manifest directory (#262).
 pub fn is_static(pod: &Value) -> bool {
     pod["metadata"]["annotations"][CONFIG_SOURCE].as_str() == Some("file")
+}
+
+/// The engine volume a static pod's `hostPath` lives on (#395), from the
+/// engine's volume listing (`items`): the one mounted at `path` or at the
+/// deepest directory above it (by path component), its own mount point or one
+/// of its attachments'. A volume mounted at `/` names nothing, and a path on no
+/// listed volume has none: never a guess.
+pub fn host_path_volume<'a>(items: &'a [Value], path: &str) -> Option<&'a str> {
+    let path = path.trim_end_matches('/');
+    let under = |at: &str| {
+        let at = at.trim_end_matches('/');
+        !at.is_empty() && (path == at || path.strip_prefix(at).is_some_and(|rest| rest.starts_with('/')))
+    };
+    items
+        .iter()
+        .filter_map(|v| {
+            let id = v["id"].as_str().filter(|i| !i.is_empty())?;
+            let own = v["mounted_at"].as_str().into_iter();
+            let attached = v["attachments"].as_array().into_iter().flatten().filter_map(|a| a["mounted_at"].as_str());
+            let depth = own.chain(attached).filter(|at| under(at)).map(|at| at.trim_end_matches('/').len()).max()?;
+            Some((depth, id))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, id)| id)
 }
 
 /// Make a `hostPath` source exist, if its declared type says the kubelet
@@ -1559,6 +1591,8 @@ impl PodManager {
         let namespace = pod["metadata"]["namespace"].as_str().unwrap_or("default");
         let mut map = HashMap::new();
         let mut current: Option<(String, Instant)> = None;
+        // The engine's volumes, read once, for a static pod's hostPaths (#395).
+        let mut engine_volumes: Option<Value> = None;
         let volumes = match pod["spec"]["volumes"].as_array() {
             Some(v) => v,
             None => return Ok(map),
@@ -1576,6 +1610,18 @@ impl PodManager {
             current = Some((name.clone(), Instant::now()));
             let host_path = if let Some(hp) = vol["hostPath"]["path"].as_str() {
                 ensure_host_path(hp, vol["hostPath"]["type"].as_str().unwrap_or(""));
+                // A static pod's data is a hostPath (etcd's `/data/fastetcd`):
+                // its mirror names the engine volume it is on (#395), as a
+                // claim's pod names its claim's (#372).
+                if is_static(pod) {
+                    if engine_volumes.is_none() {
+                        engine_volumes = Some(self.storage_get("/api/v1/volumes").await.unwrap_or(Value::Null));
+                    }
+                    let items = engine_volumes.as_ref().and_then(|l| l["items"].as_array());
+                    if let Some(id) = items.and_then(|i| host_path_volume(i, hp)) {
+                        self.record_pod_volume(uid, &name, id);
+                    }
+                }
                 hp.to_string()
             } else if vol["configMap"].is_object() || vol["secret"].is_object() {
                 // #437: the object's bytes, only the `items` it selects, and
@@ -6067,16 +6113,20 @@ impl PodManager {
         self.annotations_for(uid, ids).await
     }
 
+    /// A pod's volumes as `storm.io/volume.<name>` (#372), what a static
+    /// pod's mirror carries (#395). A key past 63 characters is left out.
+    pub fn volume_annotations(&self, uid: &str) -> serde_json::Map<String, Value> {
+        self.pod_volume_ids(uid)
+            .into_iter()
+            .filter(|(name, _)| format!("volume.{name}").len() <= 63)
+            .map(|(name, id)| (format!("storm.io/volume.{name}"), serde_json::json!(id)))
+            .collect()
+    }
+
     /// [`Self::container_annotations`] for these containers (name → id), and
     /// the pod's claims as `storm.io/volume.<name>` (#372).
     async fn annotations_for(&self, uid: &str, ids: HashMap<String, String>) -> serde_json::Map<String, Value> {
-        let mut out = serde_json::Map::new();
-        for (name, id) in self.pod_volume_ids(uid) {
-            let key = format!("volume.{name}");
-            if key.len() <= 63 {
-                out.insert(format!("storm.io/{key}"), serde_json::json!(id));
-            }
-        }
+        let mut out = self.volume_annotations(uid);
         for (name, cid) in ids {
             let Some(info) = self.runtime.container_image_info(&cid).await else { continue };
             let mut put = |what: &str, v: Value| {
@@ -11621,6 +11671,61 @@ pub(crate) mod tests {
         assert!(!mgr.timings.lock().unwrap().contains_key("uid-timed"));
         // A later Running report (a check, not a start) publishes nothing.
         mgr.start_reported(&p, std::time::Duration::ZERO).await;
+    }
+
+    /// #395: a hostPath names the volume mounted at it or at the deepest
+    /// directory above it, by component; `/` and an unlisted path name none.
+    #[test]
+    fn a_host_path_names_the_volume_it_is_on() {
+        let items = vec![
+            json!({"id": "root", "name": "node", "mounted_at": "/"}),
+            json!({"id": "data", "name": "data", "mounted_at": "/data"}),
+            json!({"id": "etcd", "name": "fastetcd-data", "attachments": [{"mounted_at": "/data/fastetcd/"}]}),
+            json!({"id": "", "name": "no-id", "mounted_at": "/data/fastetcd/member"}),
+        ];
+        assert_eq!(host_path_volume(&items, "/data/fastetcd"), Some("etcd"));
+        assert_eq!(host_path_volume(&items, "/data/fastetcd/member/wal"), Some("etcd"));
+        assert_eq!(host_path_volume(&items, "/data/fastetcd2"), Some("data"), "by component, not by prefix");
+        assert_eq!(host_path_volume(&items, "/data/"), Some("data"));
+        assert_eq!(host_path_volume(&items, "/etc/kubernetes"), None, "`/` names nothing");
+        assert_eq!(host_path_volume(&[], "/data"), None);
+    }
+
+    /// #395: a static pod's hostPaths are recorded as the engine volumes
+    /// they are on, as `storm.io/volume.<name>`; an API pod's are not, and
+    /// a hostPath has no `VolumeStats` (its sizes are the whole volume's).
+    #[tokio::test]
+    async fn a_static_pods_host_paths_are_its_volumes() {
+        let app = axum::Router::new().route(
+            "/api/v1/volumes",
+            axum::routing::get(|| async {
+                axum::Json(json!({"items": [
+                    {"id": "vol-data", "name": "data", "mounted_at": "/data", "virtual_size_bytes": 9},
+                ]}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (_rt, mgr) = manager();
+        let mgr = with_stormblock(mgr, &url);
+        let volumes = json!([
+            {"name": "etcd-data", "hostPath": {"path": "/data/fastetcd"}},
+            {"name": "certs", "hostPath": {"path": "/etc/kubernetes/pki"}},
+        ]);
+        let mut api = pod("uid-api", "api", "Always", simple_container());
+        api["spec"]["volumes"] = volumes.clone();
+        mgr.resolve_volumes(&api).await.unwrap();
+        assert!(mgr.volume_annotations("uid-api").is_empty(), "an API pod's hostPaths are not looked up");
+        let mut st = pod("uid-etcd", "etcd-n1", "Always", simple_container());
+        st["metadata"]["annotations"] = json!({CONFIG_SOURCE: "file"});
+        st["spec"]["volumes"] = volumes.clone();
+        mgr.resolve_volumes(&st).await.unwrap();
+        let a = mgr.volume_annotations("uid-etcd");
+        assert_eq!(a.len(), 1, "a path on no volume is not named: {a:?}");
+        assert_eq!(a["storm.io/volume.etcd-data"], "vol-data");
+        let listing = json!({"items": [{"id": "vol-data", "virtual_size_bytes": 9}]});
+        assert!(volume_stats("kube-system", "etcd-n1", &volumes, &mgr.pod_volume_ids("uid-etcd"), &listing).is_empty());
     }
 
     /// #130: each container's image and its own clone, as annotations; a

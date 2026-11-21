@@ -1559,6 +1559,40 @@ impl Kubelet {
         Ok(())
     }
 
+    /// Put `want` on a static pod's mirror (#395) when it does not carry it
+    /// yet: one merge patch, preconditioned on the mirror's uid. The mirror as
+    /// the apiserver now has it (kept in `mirrors` until the next list), or as
+    /// it was when the write did not go through (tried again next pass).
+    async fn annotate_mirror(&self, mirror: Value, want: serde_json::Map<String, Value>) -> Value {
+        if !mirror_lacks(&mirror, &want) {
+            return mirror;
+        }
+        let meta = &mirror["metadata"];
+        let (ns, name) = (meta["namespace"].as_str().unwrap_or(""), meta["name"].as_str().unwrap_or(""));
+        let written = self
+            .api_client
+            .patch(format!("{}/api/v1/namespaces/{ns}/pods/{name}", self.config.api_server_url))
+            .header("content-type", "application/merge-patch+json")
+            .json(&serde_json::json!({"metadata": {"uid": meta["uid"], "annotations": want}}))
+            .send_retrying(retry::Policy::API)
+            .await
+            .and_then(|r| r.error_for_status());
+        let updated = match written {
+            Ok(r) => r.json::<Value>().await.ok(),
+            Err(error) => {
+                warn!(%error, "mirror pod {ns}/{name}: volume annotations not written; retried");
+                None
+            }
+        };
+        let Some(updated) = updated else { return mirror };
+        info!(pod = %name, namespace = %ns, "mirror pod: volumes annotated");
+        self.mirrors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(crate::static_mirror::key(&updated), updated.clone());
+        updated
+    }
+
     async fn report_pod_status(
         &self,
         update: &crate::pod_manager::PodStatusUpdate,
@@ -1577,7 +1611,9 @@ impl Kubelet {
             let found = self.mirrors.lock().unwrap_or_else(|e| e.into_inner()).get(&crate::static_mirror::key(source)).cloned();
             match found {
                 Some(m) => {
-                    mirror = m;
+                    // Its volumes (#395): the engine volume each hostPath is on.
+                    let want = self.pod_manager.volume_annotations(source["metadata"]["uid"].as_str().unwrap_or(""));
+                    mirror = self.annotate_mirror(m, want).await;
                     &mirror
                 }
                 None => return Ok(()),
@@ -2515,6 +2551,11 @@ fn system_hostname() -> Option<String> {
     } else {
         Some(h)
     }
+}
+
+/// Whether `mirror` lacks any of the annotations `want` (#395).
+fn mirror_lacks(mirror: &Value, want: &serde_json::Map<String, Value>) -> bool {
+    want.iter().any(|(k, v)| mirror["metadata"]["annotations"][k] != *v)
 }
 
 /// Make the API's mirror pods match the static pods (#258): create the missing
@@ -3594,6 +3635,17 @@ mod init_condition_tests {
 mod stormd_event_tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    /// #395: a mirror is patched only for an annotation it does not carry.
+    #[test]
+    fn a_mirror_is_annotated_only_when_it_lacks_one() {
+        let mirror = serde_json::json!({"metadata": {"annotations": {"storm.io/volume.data": "v-1"}}});
+        let want = |id: &str| serde_json::Map::from_iter([("storm.io/volume.data".to_string(), serde_json::json!(id))]);
+        assert!(!mirror_lacks(&mirror, &want("v-1")));
+        assert!(mirror_lacks(&mirror, &want("v-2")));
+        assert!(!mirror_lacks(&mirror, &serde_json::Map::new()));
+        assert!(mirror_lacks(&serde_json::json!({"metadata": {}}), &want("v-1")));
+    }
 
     /// #215: a stormd event is created once; read again (a kubelet restart,
     /// stormd bumping its count) the existing Event is patched, not doubled.

@@ -335,8 +335,10 @@ container → image → root clone → golden is on the object. A node service's
 says the service runs on: its root clone as volume `root` (a hostPath of its mount), its `<svc>-data`/`-state`/`-logs`
 as volumes of those names (its node claims), `volumeMounts` where they are mounted, and
 `storm.io/instance.<svc>`, `storm.io/golden.<svc>` and `storm.io/volume.<name>`. An existing mirror pod is patched
-when these differ, and made again if the apiserver will not patch its spec. `/stats/summary` lists each pod's
-`volume[]` with the same ids.
+when these differ, and made again if the apiserver will not patch its spec. A static pod's mirror (etcd's) carries
+`storm.io/volume.<name>` for each hostPath: the engine volume mounted at that path or the deepest directory above
+it (#395; a volume at `/` names nothing). `/stats/summary` lists each pod's `volume[]` with the same ids, hostPaths
+left out.
 
 **Node allocatable and cgroups** (#24): allocatable is upstream's, capacity less `--system-reserved`,
 `--kube-reserved` and the hard-eviction line (memory 100Mi, nodefs 10%); it was a fixed capacity − 256 MiB. With
