@@ -4,6 +4,13 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #460, review cd264eea6874: readiness ignores successThreshold/failureThreshold (pod_manager.rs)
+
+Each readiness result was assigned to `state.ready` directly. Now `PodState::readiness_run` keeps each container's
+last result and how many times in a row it came (`ReadinessRun::after`), as upstream's worker does. Ready changes only
+at `successThreshold` (default 1, at least 1) or `failureThreshold` (default 3). The run is removed on each restart
+(`restart_container`, a sidecar's restart).
+
 ### Done: #414, attach: the client's stdin end closes a stdinOnce container's stdin (stormpump_runtime.rs)
 
 `attach_to`'s stdin copier returned on EOF and left `console.stdin` open, and the engine also keeps a copy of the

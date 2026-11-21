@@ -103,6 +103,11 @@ pub struct PodState {
     pub ready: HashMap<String, bool>,
     /// Consecutive liveness probe failures per container name.
     pub liveness_failures: HashMap<String, u32>,
+    /// The readiness probe's last result per container name and how many
+    /// times in a row it has given it (#460, cd264eea6874): readiness changes
+    /// only at `successThreshold` / `failureThreshold`. Forgotten with each
+    /// new run of the container.
+    pub readiness_run: HashMap<String, ReadinessRun>,
     /// Per-container: has the startupProbe passed yet? Until it does (or when
     /// there is no startupProbe), liveness/readiness are suppressed so a slow-
     /// starting container (e.g. cilium-agent) isn't killed before it's up.
@@ -3864,7 +3869,7 @@ impl PodManager {
                     pod_ip,
                     restart_counts: HashMap::new(),
                     ready: HashMap::new(),
-                    liveness_failures: HashMap::new(),
+                    liveness_failures: HashMap::new(), readiness_run: HashMap::new(),
                     startup_passed: HashMap::new(),
                     started: HashMap::new(),
                     terminated: HashMap::new(),
@@ -4544,6 +4549,7 @@ impl PodManager {
                             st.container_ids.remove(cname);
                             st.started.remove(cname);
                             st.startup_passed.remove(cname);
+                            st.readiness_run.remove(cname);
                             let c = st.restart_counts.entry(cname.to_string()).or_insert(0);
                             *c += 1;
                             *c
@@ -4712,7 +4718,7 @@ impl PodManager {
             namespace:namespace.into(),name:name.into(),uid:uid.into(),
             sandbox_id:Some(sandbox_id.clone()),container_ids:HashMap::new(),
             phase:"Starting".into(),pod:pod.clone(),pod_ip:None,
-            restart_counts:HashMap::new(),ready:HashMap::new(),liveness_failures:HashMap::new(),
+            restart_counts:HashMap::new(),ready:HashMap::new(),liveness_failures:HashMap::new(),readiness_run:HashMap::new(),
             startup_passed:HashMap::new(),started:HashMap::new(),terminated:HashMap::new(),init_statuses:Vec::new(),sandbox_stopped:false,unstarted:Default::default(),
         });
         sandbox_id
@@ -4986,7 +4992,7 @@ impl PodManager {
                     pod_ip: pod_ip.clone(),
                     restart_counts,
                     ready: ready_map,
-                    liveness_failures: HashMap::new(),
+                    liveness_failures: HashMap::new(), readiness_run: HashMap::new(),
                     startup_passed,
                     started: started_map,
                     terminated: HashMap::new(),
@@ -5372,7 +5378,25 @@ impl PodManager {
                             ProbeResult::Success
                         );
                         self.probed(uid, &name, deadlines::READINESS, readiness, started);
-                        ok
+                        // Only a run of the threshold's length changes it (#460).
+                        let was = state.ready.get(&name).copied().unwrap_or(false);
+                        let ready = state.readiness_run.entry(name.clone()).or_default().after(
+                            was,
+                            ok,
+                            probe_success_threshold(readiness),
+                            probe_failure_threshold(readiness),
+                        );
+                        if ready != was {
+                            info!(
+                                "Readiness of {}/{}/{name}: {} after {} {} in a row",
+                                state.namespace,
+                                state.name,
+                                if ready { "ready" } else { "not ready" },
+                                state.readiness_run[&name].count,
+                                if ok { "successes" } else { "failures" },
+                            );
+                        }
+                        ready
                     };
                     state.ready.insert(name.clone(), ready);
                     // Up, and forgiven once it has been up long enough.
@@ -5812,6 +5836,7 @@ impl PodManager {
         // A new run: every probe outcome of the last one is forgotten.
         state.liveness_failures.insert(name.to_string(), 0);
         state.startup_passed.remove(name);
+        state.readiness_run.remove(name);
         state.started.remove(name);
         state.ready.insert(name.to_string(), false);
 
@@ -6476,7 +6501,7 @@ impl PodManager {
                 .filter_map(|c| c["name"].as_str())
                 .map(|n| (n.to_string(), format!("ctr-{n}"))).collect(),
             phase: "Running".into(), pod: pod.clone(), pod_ip: None,
-            restart_counts: HashMap::new(), ready: HashMap::new(), liveness_failures: HashMap::new(),
+            restart_counts: HashMap::new(), ready: HashMap::new(), liveness_failures: HashMap::new(), readiness_run: HashMap::new(),
             startup_passed: HashMap::new(), started: HashMap::new(), terminated: HashMap::new(),
             init_statuses: Vec::new(), sandbox_stopped: false, unstarted: Default::default(),
         });
@@ -6594,7 +6619,7 @@ impl PodManager {
                 pod_ip: None,
                 restart_counts: HashMap::new(),
                 ready: HashMap::new(),
-                liveness_failures: HashMap::new(),
+                liveness_failures: HashMap::new(), readiness_run: HashMap::new(),
                 startup_passed: HashMap::new(),
                 started: HashMap::new(),
                 terminated: HashMap::new(),
@@ -7915,6 +7940,39 @@ fn probe_failure_threshold(probe: &Value) -> u32 {
     probe["failureThreshold"].as_u64().unwrap_or(3) as u32
 }
 
+/// A probe's `successThreshold` (default 1, at least 1, as the API's).
+fn probe_success_threshold(probe: &Value) -> u32 {
+    u32::try_from(probe["successThreshold"].as_u64().unwrap_or(1)).unwrap_or(u32::MAX).max(1)
+}
+
+/// A readiness probe's last result and how many times in a row it has given
+/// it (#460, cd264eea6874).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadinessRun {
+    /// The last result: passed.
+    pub ok: bool,
+    /// How many times in a row; 0 before the first.
+    pub count: u32,
+}
+
+impl ReadinessRun {
+    /// The readiness after one more result, from `was`: it changes only once
+    /// `successThreshold` successes (to ready) or `failureThreshold` failures
+    /// (to not ready) have come in a row, as upstream's prober worker. A
+    /// container starts not ready, so a first success with
+    /// `successThreshold: 3` is not yet ready, and one failure of a ready
+    /// container with `failureThreshold: 3` leaves it ready.
+    pub fn after(&mut self, was: bool, ok: bool, success_threshold: u32, failure_threshold: u32) -> bool {
+        if self.count > 0 && self.ok == ok {
+            self.count = self.count.saturating_add(1);
+        } else {
+            *self = ReadinessRun { ok, count: 1 };
+        }
+        let threshold = if ok { success_threshold } else { failure_threshold }.max(1);
+        if self.count >= threshold { ok } else { was }
+    }
+}
+
 fn extract_labels(pod: &Value) -> HashMap<String, String> {
     pod["metadata"]["labels"]
         .as_object()
@@ -8710,7 +8768,7 @@ pub(crate) mod tests {
             pod_ip: None,
             restart_counts: HashMap::new(),
             ready: HashMap::new(),
-            liveness_failures: HashMap::new(),
+            liveness_failures: HashMap::new(), readiness_run: HashMap::new(),
             startup_passed: HashMap::new(),
             started: HashMap::new(),
             terminated: HashMap::new(),
@@ -10006,7 +10064,7 @@ pub(crate) mod tests {
             namespace: "default".into(), name: "web-1".into(), uid: "u-1".into(),
             sandbox_id: None, container_ids: HashMap::new(), phase: "Running".into(), pod: p.clone(),
             pod_ip: None, restart_counts: HashMap::new(), ready: HashMap::new(),
-            liveness_failures: HashMap::new(), startup_passed: HashMap::new(), started: HashMap::new(),
+            liveness_failures: HashMap::new(), readiness_run: HashMap::new(), startup_passed: HashMap::new(), started: HashMap::new(),
             terminated: HashMap::new(), init_statuses: Vec::new(), sandbox_stopped: false, unstarted: Default::default(),
         });
         let next = mgr.refresh_tokens().await.unwrap();
@@ -11585,6 +11643,84 @@ pub(crate) mod tests {
         mgr.expire_probes();
         let outcome = mgr.sync_pods(&[p]).await;
         assert!(outcome.updates[0].container_statuses[0].ready);
+    }
+
+    /// #460 (cd264eea6874): readiness changes only after `successThreshold`
+    /// successes or `failureThreshold` failures in a row; a different result
+    /// starts the run again.
+    #[test]
+    fn readiness_changes_only_at_its_thresholds() {
+        let mut run = ReadinessRun::default();
+        // successThreshold 3: two successes are not enough, the third is.
+        assert!(!run.after(false, true, 3, 3));
+        assert!(!run.after(false, true, 3, 3));
+        assert!(run.after(false, true, 3, 3));
+        // failureThreshold 3: a ready container stays ready through two.
+        assert!(run.after(true, false, 3, 3));
+        assert!(run.after(true, false, 3, 3));
+        // A success between breaks the run of failures.
+        assert!(run.after(true, true, 3, 3));
+        assert!(run.after(true, false, 3, 3));
+        assert!(run.after(true, false, 3, 3));
+        assert!(!run.after(true, false, 3, 3));
+        assert_eq!(run, ReadinessRun { ok: false, count: 3 });
+        // Thresholds of 1 (and a 0, taken as 1) follow every result.
+        let mut run = ReadinessRun::default();
+        assert!(run.after(false, true, 1, 1));
+        assert!(!run.after(true, false, 0, 1));
+        assert_eq!(probe_success_threshold(&json!({})), 1);
+        assert_eq!(probe_success_threshold(&json!({"successThreshold": 0})), 1);
+        assert_eq!(probe_success_threshold(&json!({"successThreshold": 4})), 4);
+    }
+
+    /// #460 through the pod loop: `successThreshold: 2` needs two passing
+    /// runs to be ready, `failureThreshold: 3` three failing ones to stop
+    /// being ready, and a restart starts the count again.
+    #[tokio::test]
+    async fn readiness_probe_honours_its_thresholds() {
+        let (rt, mgr) = manager();
+        let container = json!({
+            "name": "app",
+            "image": "busybox:latest",
+            "readinessProbe": {"exec": {"command": ["check"]}, "successThreshold": 2, "failureThreshold": 3}
+        });
+        let p = pod("uid-1", "web", "Always", container);
+        let ready = |o: &SyncOutcome| o.updates[0].container_statuses[0].ready;
+        // Each sync after the first, a period on, probes once.
+        async fn probed(mgr: &PodManager, p: &Value) -> SyncOutcome {
+            mgr.expire_probes();
+            mgr.sync_pods(std::slice::from_ref(p)).await
+        }
+        rt.set_exec_exit_code(0);
+        mgr.sync_pods(&[p.clone()]).await;
+        let probe = || probed(&mgr, &p);
+        let o = probe().await;
+        assert!(!ready(&o), "one success of two");
+        let o = probe().await;
+        assert!(ready(&o), "two successes");
+        rt.set_exec_exit_code(1);
+        let o = probe().await;
+        assert!(ready(&o), "one failure of three");
+        let o = probe().await;
+        assert!(ready(&o), "two failures of three");
+        rt.set_exec_exit_code(0);
+        let o = probe().await;
+        assert!(ready(&o), "a success between");
+        rt.set_exec_exit_code(1);
+        for _ in 0..2 {
+            assert!(ready(&probe().await), "the failures start again");
+        }
+        let o = probe().await;
+        assert!(!ready(&o), "three failures in a row");
+        rt.set_exec_exit_code(0);
+        let o = probe().await;
+        assert!(!ready(&o), "one success of two again");
+        // A new run of the container forgets the old one's count.
+        let cid = rt.container_ids().pop().unwrap();
+        rt.set_container_state(&cid, ContainerState::Exited, 1);
+        let o = mgr.sync_pods(&[p.clone()]).await;
+        assert_eq!(o.updates[0].container_statuses[0].restart_count, 1, "restarted");
+        assert_eq!(tracked(&mgr, "uid-1").await.readiness_run.get("app"), None);
     }
 
     /// A running pod with no probes and nothing pending asks for no timed
