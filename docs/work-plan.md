@@ -12,6 +12,9 @@ moved from A to B, the transfer into B was a diff against A's point, whose uncha
 the same store's, a first backup to a store is a full copy, and `settle` releases only that store's older groups:
 each store's newest stays on the node as its base until a later backup to that store is done.
 
+Built in b13fcbf; sc-build passed (VM sc-build-8301d9d91f: 804 kubelet tests ok, 2 new); clippy: nothing in the changed
+lines. Stage requested; closed.
+
 ### Done: #457, review 571e7c23b8e4: a claim not read strands its grow (pvc_resize.rs)
 
 `pvc_resize::pass` skipped a claim whose GET failed after its retries without marking the pass pending, so the
