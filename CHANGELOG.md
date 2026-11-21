@@ -2,6 +2,7 @@
 
 ## 2026-11-20
 
+- **fix:** A claim's grow is not stranded by a failed read (#457, 571e7c23b8e4). When a built-in claim's GET failed after its retries (a 500, a timeout, a body that did not decode), the resize pass skipped the claim without asking to run again. With no other claim to work on, nothing came back to it until an unrelated Pod or PVC event. Only a 404 (the claim is gone) is skipped now. Any other failure runs the pass again in 10 s. So does a claim whose engine volume is missing from the engine's listing, while the claim still asks for a grow or a filesystem resize.
 - **fix:** A VMI whose disk move ended `unknown`, or was left half switched, is not started cold on its source (#454, 15521beacabe). Such a record was left out of the disks a start attaches by their copy, so after a node restart with no machine to adopt, the start attached the original volume by name. The guest may have written the copy after the cutover, so booting the source could expose stale data and give the disk two histories. A start now waits, saying why:
   - `unknown`: until a person sets the disk's `state` in `storm.io/disk-moves` to `moved` (the copy) or `failed` (the source);
   - `switching`: stormstorage is asked. A migration still `synced` or `copying` was never cut over, so the start goes on with the source. Any other state is treated as `unknown`, and one that cannot be read is asked again;

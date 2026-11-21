@@ -247,17 +247,48 @@ pub async fn pass(
         list["items"].as_array().into_iter().flatten().filter_map(|v| Some((v["name"].as_str()?, v))).collect();
     let mut pending = false;
     for (pv, volume) in ours {
-        let Some(vol) = by_name.get(volume.as_str()) else { continue };
         let (Some(ns), Some(claim)) = (pv["spec"]["claimRef"]["namespace"].as_str(), pv["spec"]["claimRef"]["name"].as_str())
         else {
             continue;
         };
-        let Some(pvc) = get(format!("{api_url}/api/v1/namespaces/{ns}/persistentvolumeclaims/{claim}")).await else {
-            continue;
+        // A claim that is gone (404) is nothing to do; one that could not be
+        // read is tried again (#457, 571e7c23b8e4): the event that asked for
+        // the grow has been taken, and no other may come.
+        let url = format!("{api_url}/api/v1/namespaces/{ns}/persistentvolumeclaims/{claim}");
+        let pvc = match client.get(&url).send_retrying(retry::Policy::API).await {
+            Ok(r) if r.status().is_success() => match r.json::<Value>().await {
+                Ok(v) => v,
+                Err(e) => {
+                    debug!("claim {ns}/{claim}: not read ({e}); tried again");
+                    pending = true;
+                    continue;
+                }
+            },
+            Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => continue,
+            Ok(r) => {
+                debug!("claim {ns}/{claim}: not read ({}); tried again", r.status());
+                pending = true;
+                continue;
+            }
+            Err(e) => {
+                debug!("claim {ns}/{claim}: not read ({e}); tried again");
+                pending = true;
+                continue;
+            }
         };
         if pvc["spec"]["volumeName"].as_str() != pv["metadata"]["name"].as_str() {
             continue;
         }
+        let Some(vol) = by_name.get(volume.as_str()) else {
+            // Not in the engine's listing: tried again while the claim asks
+            // for work (#457), decided on the PV's own capacity.
+            let pv_bytes = pv["spec"]["capacity"]["storage"].as_str().and_then(crate::storage::parse_quantity).unwrap_or(0);
+            if decide(pv, &pvc, pv_bytes) != Step::Nothing {
+                debug!("claim {ns}/{claim}: volume {volume} is not in the engine's listing; tried again");
+                pending = true;
+            }
+            continue;
+        };
         let bytes = vol["virtual_size_bytes"].as_u64().unwrap_or(0);
         let step = decide(pv, &pvc, bytes);
         if step == Step::Nothing {
@@ -725,6 +756,12 @@ mod tests {
     type Calls = std::sync::Arc<std::sync::Mutex<Vec<(String, String, Value)>>>;
 
     async fn world(claim: Value, grow: (u16, Value)) -> (String, Calls) {
+        world_with((200, claim), true, grow).await
+    }
+
+    /// [`world`], the claim's GET answering `claim` and the engine listing
+    /// the volume only when `listed`.
+    async fn world_with(claim: (u16, Value), listed: bool, grow: (u16, Value)) -> (String, Calls) {
         let calls: Calls = Calls::default();
         let log = calls.clone();
         let app = axum::Router::new().fallback(move |method: axum::http::Method, uri: axum::http::Uri, body: axum::body::Bytes| {
@@ -742,10 +779,13 @@ mod tests {
                                   "capacity": { "storage": "1Gi" },
                                   "claimRef": { "namespace": "web", "name": "data" } },
                     } ] })),
-                    ("GET", "/api/v1/namespaces/web/persistentvolumeclaims/data") => ok(claim),
-                    ("GET", "/api/v1/volumes") => ok(json!({ "items": [
+                    ("GET", "/api/v1/namespaces/web/persistentvolumeclaims/data") => {
+                        (StatusCode::from_u16(claim.0).unwrap(), axum::Json(claim.1))
+                    }
+                    ("GET", "/api/v1/volumes") if listed => ok(json!({ "items": [
                         { "id": "u-1", "name": "pvc-web-data", "virtual_size_bytes": GI },
                     ] })),
+                    ("GET", "/api/v1/volumes") => ok(json!({ "items": [] })),
                     ("PATCH", "/apis/storage.storm.io/v1/volumes/u-1") => (StatusCode::from_u16(grow.0).unwrap(), axum::Json(grow.1)),
                     ("PATCH", _) | ("POST", _) => ok(json!({})),
                     _ => (StatusCode::NOT_FOUND, axum::Json(json!({}))),
@@ -787,6 +827,42 @@ mod tests {
             .filter_map(|c| c.2["reason"].as_str().map(str::to_string))
             .collect();
         assert_eq!(reasons, vec!["Resizing", "FileSystemResizeRequired"]);
+    }
+
+    /// #457 (571e7c23b8e4): a claim that could not be read, or whose volume
+    /// is missing from the engine's listing while it asks for a grow, is
+    /// tried again; one that is gone, or asks nothing, is not.
+    #[tokio::test]
+    async fn a_claim_not_read_or_a_volume_not_listed_is_tried_again() {
+        let engine_of = |url: &str| crate::engine::EngineClient::new(url, crate::engine::TokenSource::none());
+        let run = |claim: (u16, Value), listed: bool| async move {
+            let (url, calls) = world_with(claim, listed, (200, json!({}))).await;
+            let pending = pass(&reqwest::Client::new(), &url, &engine_of(&url), "n1", None).await;
+            let wrote = calls.lock().unwrap().iter().any(|c| c.0 == "PATCH");
+            (pending, wrote)
+        };
+        assert_eq!(run((500, json!({"message": "etcd timeout"})), true).await, (true, false), "a 500: tried again");
+        assert_eq!(run((404, json!({})), true).await, (false, false), "a claim that is gone: nothing to do");
+        assert_eq!(run((200, pvc("3Gi", "1Gi")), false).await, (true, false), "asks for a grow, volume not listed: again");
+        assert_eq!(run((200, pvc("1Gi", "1Gi")), false).await, (false, false), "asks nothing: not retried");
+    }
+
+    /// #457: a body that is not JSON is a claim not read.
+    #[tokio::test]
+    async fn a_claim_that_does_not_decode_is_tried_again() {
+        let app = axum::Router::new()
+            .route("/api/v1/persistentvolumes", axum::routing::get(|| async { axum::Json(json!({ "items": [ {
+                "metadata": { "name": "pvc-web-data", "annotations": { "storm.io/node": "n1" } },
+                "spec": { "csi": { "driver": "stormblock.storm.io", "volumeHandle": "pvc-web-data" },
+                          "capacity": { "storage": "1Gi" }, "claimRef": { "namespace": "web", "name": "data" } },
+            } ] })) }))
+            .route("/api/v1/volumes", axum::routing::get(|| async { axum::Json(json!({ "items": [] })) }))
+            .route("/api/v1/namespaces/web/persistentvolumeclaims/data", axum::routing::get(|| async { "<html>proxy error</html>" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let engine = crate::engine::EngineClient::new(&url, crate::engine::TokenSource::none());
+        assert!(pass(&reqwest::Client::new(), &url, &engine, "n1", None).await);
     }
 
     #[tokio::test]

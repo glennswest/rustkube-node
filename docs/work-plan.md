@@ -4,6 +4,14 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### Done: #457, review 571e7c23b8e4: a claim not read strands its grow (pvc_resize.rs)
+
+`pvc_resize::pass` skipped a claim whose GET failed after its retries without marking the pass pending, so the
+sweep loop did not requeue it, and the Pod/PVC event that asked for the grow was already taken. Now a 404 (claim gone)
+is skipped, while any other status, a send error or a body that does not decode sets `pending` (requeued at
+`CSI_TEARDOWN_PENDING`, 10 s). The claim is read before the engine volume is looked up. A volume missing from the
+engine's listing sets `pending` while `decide` on the PV's own capacity still finds work.
+
 ### Done: #454, review 15521beacabe: no cold start while a disk move's outcome is unknown (vm_disk_move.rs)
 
 A VMI whose disk move (#302) ended `unknown`, or was left `switching`, could start cold after a node restart: the
