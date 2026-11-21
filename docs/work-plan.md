@@ -4,12 +4,16 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #460, review cd264eea6874: readiness ignores successThreshold/failureThreshold (pod_manager.rs)
+### Done: #460, review cd264eea6874: readiness ignores successThreshold/failureThreshold (pod_manager.rs)
 
 Each readiness result was assigned to `state.ready` directly. Now `PodState::readiness_run` keeps each container's
 last result and how many times in a row it came (`ReadinessRun::after`), as upstream's worker does. Ready changes only
 at `successThreshold` (default 1, at least 1) or `failureThreshold` (default 3). The run is removed on each restart
 (`restart_container`, a sidecar's restart).
+
+Built in bfe388e; sc-build passed (no new build-failure; the warnings are #385/#386), and the new tests passed
+(sc-build-308006741a: `readiness_changes_only_at_its_thresholds`, `readiness_probe_honours_its_thresholds`, the old
+`readiness_probe_drives_ready_flag`). Stage requested; shipped with the kubelet's readiness log line as the proof.
 
 ### Done: #414, attach: the client's stdin end closes a stdinOnce container's stdin (stormpump_runtime.rs)
 
