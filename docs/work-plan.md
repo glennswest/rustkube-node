@@ -4,7 +4,9 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #450 (P1), review: CSI consumers outlive the test driver (test/src/csi.rs)
+### Done: #450 (P1), review: CSI consumers outlive the test driver (test/src/csi.rs)
+
+Fixed in ce45548; sc-build of test/ passed (VM sc-build-c7366a4bbd: clippy -D warnings, 80 tests ok, 1 new). Closed.
 
 - 0815c3f20819: `csi-deregistered` deleted the driver while csi-reader / csi-reader2 (finished, still published) were
   present, so cleanup could not unpublish them. Fix: `release_consumers` (delete every consumer in `CONSUMERS`, wait
