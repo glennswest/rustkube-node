@@ -4,6 +4,15 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #414, attach: the client's stdin end closes a stdinOnce container's stdin (stormpump_runtime.rs)
+
+`attach_to`'s stdin copier returned on EOF and left `console.stdin` open, and the engine also keeps a copy of the
+stdin's write end (#429), so the container never read EOF. Plan: carry `stdin_once` from the pod spec
+(`ContainerConfig`, `StdioWanted`, its record, CRI-O/containerd's `stdin_once`). When an attach's stdin ends on a
+`stdinOnce` container, drop the kubelet's writer and, without a terminal, withdraw the kept `console/<id>` deposit. A
+persisted `stdin_closed` stops a restarted kubelet calling that stdin "lost with the old kubelet". With a terminal,
+only the writer goes: closing the master would hang the terminal up. Without `stdinOnce`, it stays open, as upstream.
+
 ### Done: #458, review 59fb97c4517b: an incremental backup's base from another store (vm_backup.rs)
 
 `older_done` picked the newest done backup of the VM on the node whatever its store. After `storm.io/backup-to`
