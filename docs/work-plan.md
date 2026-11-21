@@ -4,6 +4,17 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #451, review: static mirror publication (kubelet.rs)
+
+- 0fe4626f9a31 (no retry when mirrors cannot be published): a missing Node, a failed POST or a failed/unconfirmed
+  DELETE now mark the pod worker's pass failed (`reactor::failed()`: bounded 100 ms→30 s backoff, no Pod event
+  needed); and Node registration notifies the pod loop (`node_registered`), which enqueues a pass at once.
+- b964ad47dae7 (static pod woken before its mirror is known): mirror publication moves to a free fn
+  `publish_mirrors` that installs each created mirror in the shared map before waking its static pod, and wakes a
+  static pod whose mirror first appears (or changes uid) in the API list. Tests on a fake apiserver: a missing Node
+  is retried by the worker and the mirror made once the Node exists; a second POST held pending sees the first
+  mirror installed and its pod woken.
+
 ### Done: #450 (P1), review: CSI consumers outlive the test driver (test/src/csi.rs)
 
 Fixed in ce45548; sc-build of test/ passed (VM sc-build-c7366a4bbd: clippy -D warnings, 80 tests ok, 1 new). Closed.
