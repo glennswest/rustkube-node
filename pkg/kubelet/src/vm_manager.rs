@@ -2189,14 +2189,7 @@ impl VmManager {
         let object = object.unwrap();
         // Disks a move (#302) put on another volume: a start attaches those.
         {
-            let mut moved = crate::vm_disk_move::moved_volumes(object);
-            if let Some(mine) = self.disk_moves.lock().unwrap_or_else(|e| e.into_inner()).get(uid) {
-                moved = mine
-                    .iter()
-                    .filter(|(_, m)| matches!(m.state.as_str(), crate::vm_disk_move::SWITCHED | crate::vm_disk_move::MOVED))
-                    .map(|(d, m)| (d.clone(), m.volume.clone()))
-                    .collect();
-            }
+            let moved = crate::vm_disk_move::volumes_of(self.disk_move_records(uid, object));
             let mut all = self.moved_disks.lock().unwrap_or_else(|e| e.into_inner());
             if moved.is_empty() {
                 all.remove(uid);
@@ -2538,6 +2531,9 @@ impl VmManager {
     /// EBUSY.
     async fn start(&self, uid: &str, obj: &Value) -> Result<(), StartFail> {
         if let Some(why) = self.stopped_move_hold(obj).await {
+            return Err(StartFail::Waiting(why));
+        }
+        if let Some(why) = self.disk_move_hold(uid, obj).await {
             return Err(StartFail::Waiting(why));
         }
         let mut steps = crate::vm_start_timing::Steps::begin();
@@ -6466,11 +6462,31 @@ impl VmManager {
 
     /// The disk-move record (#302): what this kubelet last wrote, else the
     /// VMI's.
+    /// A person's `moved` or `failed` on the VMI ends a disk this kubelet
+    /// holds unknown or half switched (#454).
     fn disk_move_records(&self, uid: &str, object: &Value) -> std::collections::BTreeMap<String, crate::vm_disk_move::Move> {
-        if let Some(r) = self.disk_moves.lock().unwrap_or_else(|e| e.into_inner()).get(uid) {
-            return r.clone();
+        let on_vmi = crate::vm_disk_move::records(object);
+        let kept = self.disk_moves.lock().unwrap_or_else(|e| e.into_inner()).get(uid).cloned();
+        match kept {
+            Some(r) => crate::vm_disk_move::with_verdicts(r, &on_vmi),
+            None => on_vmi,
         }
-        crate::vm_disk_move::records(object)
+    }
+
+    /// Why this VMI must not start cold because of a running disk move
+    /// (#454, 15521beacabe): see [`crate::vm_disk_move::cold_start_hold`].
+    /// Each half-switched disk's migration is asked of stormstorage.
+    async fn disk_move_hold(&self, uid: &str, obj: &Value) -> Option<String> {
+        use crate::vm_disk_move as dm;
+        let records = self.disk_move_records(uid, obj);
+        let mut cutover = std::collections::BTreeMap::new();
+        if let Some(ss) = self.migration.stormstorage.as_ref() {
+            for m in records.values().filter(|m| m.state == dm::SWITCHING) {
+                let state = crate::vm_migration::Stormstorage(ss).get(&m.migration).await.map(|g| g.state);
+                cutover.insert(m.migration.clone(), state);
+            }
+        }
+        dm::cold_start_hold(&records, &cutover)
     }
 
     /// Write the disk-move record onto the VMI, and keep it here.
@@ -10069,6 +10085,37 @@ mod tests {
         assert!(!m.resuming.lock().unwrap().contains_key("u-2"));
         assert!(m.vms.lock().await.get("u-2").is_none(), "started cold by the next pass");
         assert_eq!(*e.deleted.lock().unwrap(), ["vol-s"]);
+    }
+
+    /// #454 (15521beacabe): a VMI whose disk move ended unknown is not
+    /// started cold on the source by name; a person's `moved` on the VMI
+    /// ends the kubelet's own unknown record, and the copy is what it attaches.
+    #[tokio::test]
+    async fn an_unknown_disk_move_holds_a_cold_start() {
+        use crate::vm_disk_move as dm;
+        let e = disk_engine(vec![], vec![]).await;
+        let m = disk_manager(&e, "");
+        let r = dm::Move { to: "b".into(), node: "a".into(), from: "v-src".into(), migration: "mig-1".into(),
+            state: dm::UNKNOWN.into(), volume: "v-copy".into(), ..Default::default() };
+        let mut vmi = vm_owned_vmi("vmi-1");
+        let records = std::collections::BTreeMap::from([("root".to_string(), r.clone())]);
+        vmi["metadata"]["annotations"][dm::RECORD] = json!(serde_json::to_string(&records).unwrap());
+        let uid = vmi["metadata"]["uid"].as_str().unwrap_or("u-test").to_string();
+        match m.start(&uid, &vmi).await {
+            Err(StartFail::Waiting(why)) => assert!(why.contains("ended unknown"), "{why}"),
+            other => panic!("a cold start went on: {:?}", other.err().map(|e| e.message().to_string())),
+        }
+        assert!(e.cloned.lock().unwrap().is_empty(), "nothing made by name");
+        assert!(m.vms.lock().await.is_empty());
+        // Kept here unknown; the VMI says moved: the verdict is taken.
+        m.disk_moves.lock().unwrap().insert(uid.clone(), records);
+        let mut said = r.clone();
+        said.state = dm::MOVED.into();
+        let decided = std::collections::BTreeMap::from([("root".to_string(), said)]);
+        vmi["metadata"]["annotations"][dm::RECORD] = json!(serde_json::to_string(&decided).unwrap());
+        assert_eq!(m.disk_move_records(&uid, &vmi)["root"].state, dm::MOVED);
+        assert_eq!(m.disk_move_hold(&uid, &vmi).await, None);
+        assert_eq!(dm::volumes_of(m.disk_move_records(&uid, &vmi))["root"], "v-copy");
     }
 
     /// #302: a start attaches a moved disk's copy by its id, not a clone

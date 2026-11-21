@@ -4,6 +4,17 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### Done: #454, review 15521beacabe: no cold start while a disk move's outcome is unknown (vm_disk_move.rs)
+
+A VMI whose disk move (#302) ended `unknown`, or was left `switching`, could start cold after a node restart: the
+record was left out of `moved_volumes`, so the start attached the source by name, though the guest may have written
+the copy after the cutover. Now `start()` asks `cold_start_hold` first: `unknown` holds (Waiting, a person sets the
+disk's state to `moved` or `failed`); `switching` asks stormstorage. A migration still `synced`/`copying` never cut
+over, so the start goes on with the source; any other state holds; an unreadable one is asked again. A
+`switched`/`moved` record with no copy holds too. `with_verdicts` lets a person's `moved`/`failed` on the VMI replace
+the kubelet's own kept `unknown`/`switching` record for the same migration, so the hold can be lifted without a
+kubelet restart.
+
 ### Done: #395, static pods' mirrors name the engine volume each hostPath is on
 
 Built in 521c886 + 6be1ef4 (symlinks); sc-build passed (VM sc-build-e1f665f40d: 797 kubelet tests ok, 4 new);

@@ -144,13 +144,100 @@ pub fn record_patch(vmi_uid: &str, records: &BTreeMap<String, Move>) -> Value {
 }
 
 /// The disks a start attaches by their recorded volume, not by name: each
-/// that sits on a volume a move made (disk → volume id).
+/// that sits on a volume a move made (disk → volume id). A disk left out is
+/// attached by name, so a start first refuses the records whose disk is not
+/// known for sure ([`cold_start_hold`]).
 pub fn moved_volumes(vmi: &Value) -> BTreeMap<String, String> {
-    records(vmi)
+    volumes_of(records(vmi))
+}
+
+/// [`moved_volumes`] of these records.
+pub fn volumes_of(records: BTreeMap<String, Move>) -> BTreeMap<String, String> {
+    records
         .into_iter()
         .filter(|(_, m)| matches!(m.state.as_str(), SWITCHED | MOVED) && !m.volume.is_empty())
         .map(|(d, m)| (d, m.volume))
         .collect()
+}
+
+/// Why a machine must not start cold because of a running disk move (#454,
+/// 15521beacabe), from the records it starts with. A start attaches each
+/// disk by name unless [`moved_volumes`] names its copy, so a disk whose
+/// volume is not known for sure must not start at all: the guest may have
+/// written the copy after the cutover, and booting the source would give the
+/// disk two histories.
+///
+/// - [`UNKNOWN`]: a person decides, by setting the disk's `state` in
+///   [`RECORD`] to [`MOVED`] (the copy) or [`FAILED`] (the source).
+/// - [`SWITCHING`] (the kubelet or the machine stopped during the switch):
+///   `cutover` has each such record's stormstorage migration state, by
+///   migration id. Still `synced` or `copying`: never cut over, the source is
+///   the disk, and the start goes on. Any other state: as [`UNKNOWN`]. Not
+///   read: held, and asked again.
+/// - [`SWITCHED`] or [`MOVED`] with no copy recorded: nothing to attach.
+pub fn cold_start_hold(records: &BTreeMap<String, Move>, cutover: &BTreeMap<String, Result<String, String>>) -> Option<String> {
+    let decide = |d: &str, m: &Move| {
+        format!(
+            "a person decides: set disk {d}'s state in {RECORD} to `{MOVED}` (the copy {} on {}) or `{FAILED}` (the source {} on {})",
+            if m.volume.is_empty() { "?" } else { m.volume.as_str() },
+            m.to,
+            m.from,
+            m.node
+        )
+    };
+    records.iter().find_map(|(d, m)| match m.state.as_str() {
+        UNKNOWN => Some(format!(
+            "disk {d}'s move to {}'s storage ended unknown (#302): the guest may have written the copy after the \
+             cutover, so it does not start on either volume; {}",
+            m.to,
+            decide(d, m)
+        )),
+        SWITCHING => match cutover.get(&m.migration) {
+            Some(Ok(s)) if matches!(s.as_str(), "synced" | "copying") => None,
+            Some(Ok(s)) => Some(format!(
+                "disk {d}'s switch to {}'s storage was left half way and migration {} is {s}: which volume holds \
+                 the guest's writes is not known (#302); {}",
+                m.to,
+                m.migration,
+                decide(d, m)
+            )),
+            Some(Err(e)) => Some(format!(
+                "disk {d}'s switch to {}'s storage was left half way; migration {} could not be read ({e}): asked again",
+                m.to, m.migration
+            )),
+            None => Some(format!(
+                "disk {d}'s switch to {}'s storage was left half way, and this node has no stormstorage to ask \
+                 whether migration {} was cut over (#302); {}",
+                m.to,
+                m.migration,
+                decide(d, m)
+            )),
+        },
+        SWITCHED | MOVED if m.volume.is_empty() => Some(format!(
+            "disk {d} is recorded {} on {}'s storage with no volume: there is nothing to attach (#302); {}",
+            m.state,
+            m.to,
+            decide(d, m)
+        )),
+        _ => None,
+    })
+}
+
+/// The records a kubelet keeps (`kept`), with a person's verdict on the VMI
+/// (`on_vmi`) taken over them (#454): a disk this kubelet holds [`UNKNOWN`]
+/// or [`SWITCHING`] that the VMI says is [`MOVED`] or [`FAILED`], for the
+/// same migration. The kubelet never writes either after those states for
+/// one migration, so that is a person's answer, not a stale write of its own.
+pub fn with_verdicts(mut kept: BTreeMap<String, Move>, on_vmi: &BTreeMap<String, Move>) -> BTreeMap<String, Move> {
+    for (d, m) in kept.iter_mut() {
+        if !matches!(m.state.as_str(), UNKNOWN | SWITCHING) {
+            continue;
+        }
+        if let Some(v) = on_vmi.get(d).filter(|v| v.migration == m.migration && matches!(v.state.as_str(), MOVED | FAILED)) {
+            *m = v.clone();
+        }
+    }
+    kept
 }
 
 /// Is any disk of `vmi` on another node than `node`, or not known to be
@@ -333,6 +420,55 @@ pub fn refusal(disk: &str, kind: &str, volume: Option<&str>, owned: bool, seed: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rec(state: &str, volume: &str) -> Move {
+        Move { to: "b".into(), node: "a".into(), from: "v-src".into(), migration: "mig-1".into(), state: state.into(), volume: volume.into(), ..Default::default() }
+    }
+
+    /// #454 (15521beacabe): no cold start while a disk's volume is not known
+    /// for sure; a switch left before the cutover starts on the source.
+    #[test]
+    fn a_cold_start_waits_for_the_disks_known_volume() {
+        let one = |m: Move| BTreeMap::from([("root".to_string(), m)]);
+        let none = BTreeMap::new();
+        let why = cold_start_hold(&one(rec(UNKNOWN, "v-copy")), &none).unwrap();
+        assert!(why.contains("ended unknown") && why.contains("`moved` (the copy v-copy on b)") && why.contains("`failed` (the source v-src on a)"), "{why}");
+        let cut = |s: Result<&str, &str>| BTreeMap::from([("mig-1".to_string(), s.map(String::from).map_err(String::from))]);
+        let switching = one(rec(SWITCHING, "v-copy"));
+        assert_eq!(cold_start_hold(&switching, &cut(Ok("synced"))), None, "never cut over: the source is the disk");
+        assert_eq!(cold_start_hold(&switching, &cut(Ok("copying"))), None);
+        assert!(cold_start_hold(&switching, &cut(Ok("cutover"))).unwrap().contains("migration mig-1 is cutover"));
+        assert!(cold_start_hold(&switching, &cut(Err("503"))).unwrap().contains("asked again"));
+        assert!(cold_start_hold(&switching, &none).unwrap().contains("no stormstorage"));
+        assert!(cold_start_hold(&one(rec(SWITCHED, "")), &none).unwrap().contains("nothing to attach"));
+        for ok in [rec(SWITCHED, "v-copy"), rec(MOVED, "v-copy"), rec(COPYING, ""), rec(FAILED, "")] {
+            assert_eq!(cold_start_hold(&one(ok.clone()), &none), None, "{ok:?}");
+        }
+        assert_eq!(cold_start_hold(&none, &none), None);
+        // What is not held starts on a known volume: the copy, or by name.
+        assert_eq!(volumes_of(one(rec(MOVED, "v-copy"))), BTreeMap::from([("root".to_string(), "v-copy".to_string())]));
+        assert!(volumes_of(one(rec(COPYING, ""))).is_empty());
+    }
+
+    /// #454: a person's `moved` or `failed` on the VMI ends the kubelet's
+    /// own unknown or half-switched record, for the same migration only.
+    #[test]
+    fn a_persons_verdict_replaces_an_unknown_record() {
+        let kept = BTreeMap::from([("root".to_string(), rec(UNKNOWN, "v-copy")), ("data".to_string(), rec(SWITCHING, "v-c2"))]);
+        let mut said = rec(MOVED, "v-copy");
+        said.message = "decided".into();
+        let vmi = BTreeMap::from([("root".to_string(), said.clone()), ("data".to_string(), rec(FAILED, ""))]);
+        let out = with_verdicts(kept.clone(), &vmi);
+        assert_eq!(out["root"], said);
+        assert_eq!(out["data"].state, FAILED);
+        let other = BTreeMap::from([("root".to_string(), Move { migration: "mig-0".into(), ..said.clone() })]);
+        assert_eq!(with_verdicts(kept.clone(), &other)["root"].state, UNKNOWN, "another migration's record");
+        let stale = BTreeMap::from([("root".to_string(), rec(SWITCHING, "v-copy"))]);
+        assert_eq!(with_verdicts(kept.clone(), &stale)["root"].state, UNKNOWN, "only moved or failed is a verdict");
+        let mut done = kept.clone();
+        done.insert("root".into(), rec(SWITCHED, "v-copy"));
+        assert_eq!(with_verdicts(done, &vmi)["root"].state, SWITCHED, "a record not unknown is the kubelet's");
+    }
 
     fn vmi(request: Option<Value>, record: Option<&BTreeMap<String, Move>>) -> Value {
         let mut a = serde_json::Map::new();
