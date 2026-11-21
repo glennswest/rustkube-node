@@ -238,6 +238,7 @@ impl RuntimeService for CriClient {
             "annotations": config.annotations,
             "log_path": config.log_path,
             "stdin": config.stdin,
+            "stdin_once": config.stdin_once,
             "tty": config.tty,
             "linux": {
                 "resources": {

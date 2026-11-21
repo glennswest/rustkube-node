@@ -89,6 +89,10 @@ PINGs and does no flow control (client-go's spdystream does none either).
 channel as a `metav1.Status`: `Success`, or `Failure` / `NonZeroExitCode` with the exit code as the `ExitCode`
 cause (kubectl exits with it); v1–v3 write only an error's text. Resizes are `{"Width":…,"Height":…}`, applied to
 the pty (`TIOCSWINSZ`). The client going away stops an exec (an attach only detaches).
+An attach's stdin ending (v5's close, or the client gone) ends a `stdinOnce` container's stdin on stormpump (#414): the
+kubelet drops its end and withdraws the engine's kept copy (#429), so the process reads EOF, and later attaches send
+nothing. With a terminal only the kubelet's input end goes (the master stays, or the terminal would hang up). Without
+`stdinOnce` the stdin stays open for the next attach, as upstream.
 The console router's control verbs are served at `/vmVerb` (#94); the
 apiserver's proxy to them is rustkube#141.
 

@@ -140,6 +140,9 @@ pub struct ContainerConfig {
     pub annotations: HashMap<String, String>,
     pub log_path: String,
     pub stdin: bool,
+    /// `stdinOnce` (#414): the container's stdin closes when the first attach
+    /// that sent stdin ends it.
+    pub stdin_once: bool,
     pub tty: bool,
     pub cpu_period: i64,
     pub cpu_quota: i64,

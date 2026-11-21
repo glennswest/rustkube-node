@@ -343,6 +343,7 @@ fn to_proto_container_config(config: &ContainerConfig) -> proto::ContainerConfig
         annotations: config.annotations.clone().into_iter().collect(),
         log_path: config.log_path.clone(),
         stdin: config.stdin,
+        stdin_once: config.stdin_once,
         tty: config.tty,
         linux: Some(proto::LinuxContainerConfig {
             resources: Some(proto::LinuxContainerResources {

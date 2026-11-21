@@ -8139,6 +8139,7 @@ fn build_container_config(
         annotations: HashMap::new(),
         log_path,
         stdin: spec["stdin"].as_bool().unwrap_or(false),
+        stdin_once: spec["stdinOnce"].as_bool().unwrap_or(false),
         tty: spec["tty"].as_bool().unwrap_or(false),
         cpu_period: 100_000,
         cpu_quota: parse_cpu_quota(cpu_limit),
@@ -11085,6 +11086,15 @@ pub(crate) mod tests {
         let c2 = build_container_config(&spec2, "x", vec![], vec![]);
         assert_eq!(c2.cpu_quota, 0);
         assert_eq!(c2.memory_limit_bytes, 0);
+    }
+
+    /// #414: `stdinOnce` reaches the runtime, off by default.
+    #[test]
+    fn container_config_carries_stdin_once() {
+        assert!(!build_container_config(&simple_container(), "img", vec![], vec![]).stdin_once);
+        let spec = json!({"name": "app", "image": "busybox", "stdin": true, "stdinOnce": true});
+        let c = build_container_config(&spec, "img", vec![], vec![]);
+        assert!(c.stdin && c.stdin_once);
     }
 
     #[test]

@@ -89,9 +89,29 @@ pub struct Console {
     pub pty: Option<Pty>,
     /// The container's log file.
     pub log_file: std::path::PathBuf,
+    /// Its stdin was closed by [`Console::close_stdin`] (#414): a `stdinOnce`
+    /// container's first attach ended it. Recorded, so a restarted kubelet
+    /// knows the stdin was closed on purpose and not lost with the old one.
+    stdin_closed: std::sync::atomic::AtomicBool,
 }
 
 impl Console {
+    /// Close the container's stdin for good (#414, `stdinOnce`): the
+    /// kubelet's writer is dropped, and later attaches send nothing. `true`
+    /// when this call closed it; `false` when it was closed already or never
+    /// open. The engine's kept copy of the write end (#429) is the caller's
+    /// to withdraw: the container reads EOF only once both are gone.
+    pub async fn close_stdin(&self) -> bool {
+        let was_open = self.stdin.lock().await.take().is_some();
+        let first = !self.stdin_closed.swap(true, std::sync::atomic::Ordering::SeqCst);
+        was_open && first
+    }
+
+    /// Was its stdin closed by [`Console::close_stdin`]?
+    pub fn stdin_closed(&self) -> bool {
+        self.stdin_closed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Make one for a container (`stdin`, `tty` as its spec says): the console,
     /// the descriptors to deposit for its 0 (and 1, 2 with a terminal), and a
     /// copy of the console's own end (the pty master, or stdin's write end)
@@ -123,7 +143,13 @@ impl Console {
 
     fn of_stdin(w: OwnedFd, log_file: std::path::PathBuf) -> io::Result<Console> {
         let stdin: Writer = Box::pin(tokio::net::unix::pipe::Sender::from_owned_fd(w)?);
-        Ok(Console { stdin: tokio::sync::Mutex::new(Some(stdin)), output: None, pty: None, log_file })
+        Ok(Console {
+            stdin: tokio::sync::Mutex::new(Some(stdin)),
+            output: None,
+            pty: None,
+            log_file,
+            stdin_closed: Default::default(),
+        })
     }
 
     /// A terminal's console: its output read here, into the log file and to
@@ -143,6 +169,7 @@ impl Console {
             output: Some(output.clone()),
             pty: Some(Pty(master)),
             log_file: log_file.clone(),
+            stdin_closed: Default::default(),
         };
         let mut out = tokio::fs::File::from_std(read);
         tokio::spawn(async move {

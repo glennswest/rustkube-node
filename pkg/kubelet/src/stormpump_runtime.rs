@@ -215,6 +215,11 @@ struct Container {
 #[derive(Clone, Debug)]
 struct StdioWanted {
     stdin: bool,
+    /// `stdinOnce` (#414): the first attach that ends its stdin closes it.
+    stdin_once: bool,
+    /// That happened (#414), as recorded: a restarted kubelet finds no kept
+    /// stdin end, and must not call that one lost with the old kubelet.
+    stdin_closed: bool,
     tty: bool,
     /// The deposits' names and the fd each becomes.
     slots: Vec<(String, i32)>,
@@ -232,7 +237,14 @@ fn stdio_wanted(id: &str, config: &ContainerConfig, log_dir: &str) -> Option<Std
     } else {
         vec![(format!("cin-{id}"), 0)]
     };
-    Some(StdioWanted { stdin: config.stdin, tty: config.tty, slots, log_file: log_file_of(config, log_dir) })
+    Some(StdioWanted {
+        stdin: config.stdin,
+        stdin_once: config.stdin_once,
+        stdin_closed: false,
+        tty: config.tty,
+        slots,
+        log_file: log_file_of(config, log_dir),
+    })
 }
 
 /// The name a container's console end is kept under in the engine (#429).
@@ -649,6 +661,9 @@ impl StormpumpRuntime {
             .values()
             .filter(|c| c.state == ContainerState::Running && c.console.is_none())
             .filter_map(|c| c.stdio.clone().map(|s| (c.id.clone(), s)))
+            // A stdin closed by its first attach (#414) was withdrawn: no
+            // console without a terminal is left to take back.
+            .filter(|(_, s)| s.tty || !s.stdin_closed)
             .collect();
         for (id, stdio) in wanted {
             let (r, name) = (ring.clone(), console_deposit(&id));
@@ -664,7 +679,8 @@ impl StormpumpRuntime {
                 tracing::info!(container = %id, "stormpump: no console kept for it; attach says the terminal closed");
                 continue;
             };
-            match crate::exec::Console::restore(stdio.stdin, stdio.tty, stdio.log_file.clone(), fd) {
+            let stdin = stdio.stdin && !stdio.stdin_closed;
+            match crate::exec::Console::restore(stdin, stdio.tty, stdio.log_file.clone(), fd) {
                 Ok(console) => {
                     if let Some(c) = self.containers.lock().await.get_mut(&id) {
                         c.console = Some(Arc::new(console));
@@ -2584,9 +2600,9 @@ async fn attach_to(
     container_id: &str,
     io: crate::exec::ExecIo,
 ) -> Result<crate::cri::ExecSession, CriError> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     runtime.absorb_exits().await;
-    let (workload, console, log_file, qualified, lost) = {
+    let (workload, console, log_file, qualified, lost, stdin_once) = {
         let containers = runtime.containers.lock().await;
         let c = containers
             .get(container_id)
@@ -2600,8 +2616,9 @@ async fn attach_to(
         // A terminal the kubelet held before it restarted (#334), and the
         // engine kept no copy of (older than stormpump#260, or started
         // before #429): it closed with that process.
-        let lost = c.console.is_none() && c.stdio.as_ref().is_some_and(|s| s.tty || s.stdin);
-        (workload, c.console.clone(), c.log_file.clone(), qualified, lost)
+        let lost = c.console.is_none() && c.stdio.as_ref().is_some_and(|s| s.tty || (s.stdin && !s.stdin_closed));
+        let stdin_once = c.stdio.as_ref().is_some_and(|s| s.stdin_once);
+        (workload, c.console.clone(), c.log_file.clone(), qualified, lost, stdin_once)
     };
     if lost && (io.tty || io.stdin) {
         return Err(CriError::Runtime(format!(
@@ -2647,26 +2664,31 @@ async fn attach_to(
 
     let mut stdio = crate::exec::Stdio::default();
     if io.stdin {
-        let (w, mut r) = tokio::io::duplex(16 * 1024);
+        let (w, r) = tokio::io::duplex(16 * 1024);
         stdio.stdin = Some(Box::pin(w));
-        let console = console.clone();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 16 * 1024];
-            loop {
-                let n = match r.read(&mut buf).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => n,
-                };
-                // A container without an open stdin takes nothing (upstream).
-                let Some(console) = &console else { continue };
-                let mut stdin = console.stdin.lock().await;
-                if let Some(to) = stdin.as_mut() {
-                    if to.write_all(&buf[..n]).await.is_err() || to.flush().await.is_err() {
-                        *stdin = None;
+        // `stdinOnce` (#414): the end of this attach's stdin is the end of the
+        // container's. Without a terminal the engine's kept copy of the write
+        // end (#429) goes too, or the container would never read EOF. A
+        // terminal's master stays: closing it hangs the terminal up.
+        let closed: Option<StdinClosed> = match (&console, stdin_once) {
+            (Some(_), true) => {
+                let (ring, name, tty, dirty) =
+                    (ring.clone(), console_deposit(container_id), terminal.is_some(), runtime.dirty.clone());
+                Some(Box::new(move || {
+                    if !tty {
+                        std::thread::spawn(move || {
+                            if let Err(e) = ring.deposit_withdraw(&name) {
+                                tracing::warn!(deposit = %name, "stormpump: a stdinOnce stdin's kept end not withdrawn: {e}");
+                            }
+                        });
                     }
-                }
+                    // The record says it is closed (#334).
+                    dirty.notify_one();
+                }))
             }
-        });
+            _ => None,
+        };
+        tokio::spawn(copy_attach_stdin(r, console.clone(), closed, qualified.clone()));
     }
     if io.stdout || io.stderr {
         let out: crate::exec::Reader = match terminal.and_then(|c| c.output.as_ref()) {
@@ -2707,6 +2729,43 @@ async fn attach_to(
         let _ = stop_tx.send(true);
     });
     Ok(crate::cri::ExecSession { stdio, exit, kill })
+}
+
+/// What closing a `stdinOnce` container's stdin does past dropping the
+/// kubelet's writer (#414): the engine's kept end withdrawn, the record told.
+type StdinClosed = Box<dyn FnOnce() + Send>;
+
+/// An attach's stdin into the container's (#56). A container without an open
+/// stdin takes nothing (upstream). When it ends (the client's v5 close of
+/// channel 0, or the client gone) and `closed` is given (`stdinOnce`, #414),
+/// the container's stdin is closed: its process reads EOF.
+async fn copy_attach_stdin(
+    mut from: impl tokio::io::AsyncRead + Unpin,
+    console: Option<Arc<crate::exec::Console>>,
+    closed: Option<StdinClosed>,
+    qualified: String,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let n = match from.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        let Some(console) = &console else { continue };
+        let mut stdin = console.stdin.lock().await;
+        if let Some(to) = stdin.as_mut() {
+            if to.write_all(&buf[..n]).await.is_err() || to.flush().await.is_err() {
+                *stdin = None;
+            }
+        }
+    }
+    if let (Some(console), Some(closed)) = (&console, closed) {
+        if console.close_stdin().await {
+            tracing::info!(container = %qualified, "stormpump: attach's stdin ended; closed the stdinOnce container's stdin");
+            closed();
+        }
+    }
 }
 
 /// The most of each stream an `exec_sync` keeps; the rest is read and dropped
@@ -4859,6 +4918,8 @@ mod tests {
         let r = recorded_runtime(&path).await;
         r.containers.lock().await.get_mut("ct-1").unwrap().stdio = Some(StdioWanted {
             stdin: true,
+            stdin_once: false,
+            stdin_closed: false,
             tty: true,
             slots: vec![("ct-1.tty".into(), 0)],
             log_file: Default::default(),
@@ -4868,6 +4929,106 @@ mod tests {
         let io = crate::exec::ExecIo { stdin: true, stdout: true, stderr: false, tty: true };
         let err = back.attach_process("ct-1", io).await.err().expect("refused");
         assert!(err.to_string().contains("closed with it") && err.to_string().contains("#429"), "{err}");
+    }
+
+    /// A `stdin: true` container's console, its stdin's read end (the
+    /// container's fd 0, made non-blocking for tokio) and the engine's kept
+    /// copy of the write end.
+    fn stdin_console() -> (Arc<crate::exec::Console>, tokio::net::unix::pipe::Receiver, std::os::fd::OwnedFd) {
+        let (console, ends, kept) = crate::exec::Console::make(true, false, Default::default()).unwrap();
+        let fd0 = ends.0.into_iter().find(|(fd, _)| *fd == 0).unwrap().1;
+        (Arc::new(console), tokio::net::unix::pipe::Receiver::from_owned_fd(fd0).unwrap(), kept)
+    }
+
+    /// #414: a `stdinOnce` container's stdin closes when the attach's stdin
+    /// ends. The container reads what was sent and then EOF, once the engine's
+    /// kept end is withdrawn too (what `closed` does; dropped here).
+    #[tokio::test]
+    async fn an_attach_ending_stdin_closes_a_stdin_once_containers_stdin() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (console, mut fd0, kept) = stdin_console();
+        let withdrawn = Arc::new(std::sync::Mutex::new(Some(kept)));
+        let w = withdrawn.clone();
+        let closed: StdinClosed = Box::new(move || drop(w.lock().unwrap().take()));
+        let (mut client, from) = tokio::io::duplex(1024);
+        let copier = tokio::spawn(copy_attach_stdin(from, Some(console.clone()), Some(closed), "default/p/c".into()));
+        client.write_all(b"hello\n").await.unwrap();
+        drop(client); // the client's v5 close of channel 0
+        copier.await.unwrap();
+        assert!(withdrawn.lock().unwrap().is_none(), "the kept end is withdrawn");
+        assert!(console.stdin.lock().await.is_none() && console.stdin_closed());
+        let mut got = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), fd0.read_to_end(&mut got))
+            .await
+            .expect("the container reads EOF")
+            .unwrap();
+        assert_eq!(got, b"hello\n");
+        // Closed once: a later attach's end does not close it again.
+        assert!(!console.close_stdin().await);
+    }
+
+    /// #414: without `stdinOnce` the container's stdin stays open for the
+    /// next attach, as upstream.
+    #[tokio::test]
+    async fn an_attach_ending_stdin_leaves_a_plain_stdin_open() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (console, mut fd0, _kept) = stdin_console();
+        let (mut client, from) = tokio::io::duplex(1024);
+        let copier = tokio::spawn(copy_attach_stdin(from, Some(console.clone()), None, "default/p/c".into()));
+        client.write_all(b"one\n").await.unwrap();
+        drop(client);
+        copier.await.unwrap();
+        assert!(console.stdin.lock().await.is_some() && !console.stdin_closed());
+        let mut buf = [0u8; 16];
+        let n = fd0.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"one\n");
+        // No EOF: nothing more, and still open.
+        let more = tokio::time::timeout(std::time::Duration::from_millis(200), fd0.read(&mut buf)).await;
+        assert!(more.is_err(), "stdin stays open: {more:?}");
+        // The next attach still reaches it.
+        let (mut client, from) = tokio::io::duplex(1024);
+        let copier = tokio::spawn(copy_attach_stdin(from, Some(console.clone()), None, "default/p/c".into()));
+        client.write_all(b"two\n").await.unwrap();
+        drop(client);
+        copier.await.unwrap();
+        let n = fd0.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"two\n");
+    }
+
+    /// #414: a stdin closed by its first attach is recorded, so the kubelet
+    /// restarted after it (finding no kept end, withdrawn) does not refuse an
+    /// attach as if the stdin were lost with it; `stdinOnce` itself is kept.
+    #[tokio::test]
+    async fn a_closed_stdin_once_stdin_is_recorded_and_not_called_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stormpump-runtime.json");
+        let r = recorded_runtime(&path).await;
+        let (console, _fd0, _kept) = stdin_console();
+        assert!(console.close_stdin().await);
+        {
+            let mut containers = r.containers.lock().await;
+            let c = containers.get_mut("ct-1").unwrap();
+            c.stdio = Some(StdioWanted {
+                stdin: true,
+                stdin_once: true,
+                stdin_closed: false,
+                tty: false,
+                slots: vec![("cin-ct-1".into(), 0)],
+                log_file: Default::default(),
+            });
+            c.console = Some(console);
+        }
+        r.save().await;
+        let back = StormpumpRuntime::new("/nonexistent/stormpump.sock").with_state(&path);
+        {
+            let containers = back.containers.lock().await;
+            let s = containers["ct-1"].stdio.as_ref().unwrap();
+            assert!(s.stdin_once && s.stdin_closed, "{s:?}");
+        }
+        let io = crate::exec::ExecIo { stdin: true, stdout: true, stderr: false, tty: false };
+        let err = back.attach_process("ct-1", io).await.err().expect("no engine here");
+        // Past the lost-console check, to the engine this test has none of.
+        assert!(!err.to_string().contains("#429") && err.to_string().contains("not attached to stormpump"), "{err}");
     }
 
     /// #430: a real-time container's spec carries `Demand::Exclusive` in the

@@ -77,6 +77,10 @@ struct ExecRecord {
 #[serde(default)]
 struct StdioRecord {
     stdin: bool,
+    /// `stdinOnce` (#414); absent in a record older than it: false.
+    stdin_once: bool,
+    /// Its stdin was closed by its first attach (#414).
+    stdin_closed: bool,
     tty: bool,
     slots: Vec<(String, i32)>,
     log_file: std::path::PathBuf,
@@ -193,6 +197,9 @@ impl ContainerRecord {
             }),
             stdio: c.stdio.as_ref().map(|s| StdioRecord {
                 stdin: s.stdin,
+                stdin_once: s.stdin_once,
+                // Closed by an attach since it was recorded: its console says.
+                stdin_closed: s.stdin_closed || c.console.as_ref().is_some_and(|k| k.stdin_closed()),
                 tty: s.tty,
                 slots: s.slots.clone(),
                 log_file: s.log_file.clone(),
@@ -251,7 +258,14 @@ impl ContainerRecord {
                 },
                 groups: e.groups,
             }),
-            stdio: self.stdio.map(|s| StdioWanted { stdin: s.stdin, tty: s.tty, slots: s.slots, log_file: s.log_file }),
+            stdio: self.stdio.map(|s| StdioWanted {
+                stdin: s.stdin,
+                stdin_once: s.stdin_once,
+                stdin_closed: s.stdin_closed,
+                tty: s.tty,
+                slots: s.slots,
+                log_file: s.log_file,
+            }),
             // A PTY this process never held (see the module comment).
             console: None,
             log_file: self.log_file,
