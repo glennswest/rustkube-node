@@ -12,6 +12,9 @@ is skipped, while any other status, a send error or a body that does not decode 
 `CSI_TEARDOWN_PENDING`, 10 s). The claim is read before the engine volume is looked up. A volume missing from the
 engine's listing sets `pending` while `decide` on the PV's own capacity still finds work.
 
+Built in 91b246c; sc-build passed (VM sc-build-5b39c4b6a9: 802 kubelet tests ok, 2 new); clippy: nothing in the changed
+lines. Stage requested; closed.
+
 ### Done: #454, review 15521beacabe: no cold start while a disk move's outcome is unknown (vm_disk_move.rs)
 
 A VMI whose disk move (#302) ended `unknown`, or was left `switching`, could start cold after a node restart: the
