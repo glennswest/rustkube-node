@@ -4,6 +4,14 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #450 (P1), review: CSI consumers outlive the test driver (test/src/csi.rs)
+
+- 0815c3f20819: `csi-deregistered` deleted the driver while csi-reader / csi-reader2 (finished, still published) were
+  present, so cleanup could not unpublish them. Fix: `release_consumers` (delete every consumer in `CONSUMERS`, wait
+  each gone, i.e. unpublished) runs before `case_deregistered` and at the start of `cleanup` (failure path too), and the
+  driver is deleted only after it succeeds; a consumer that does not go fails `csi-deregistered` and leaves the driver.
+  Test: `every_consumer_is_released_before_the_driver`. Then sc-build of test/ (cargo test + clippy -D warnings).
+
 ### Done: #449 (P1), review: 4 findings in vm_manager.rs
 
 Fixed in f9d7314 (+ ff3f20a type fix); sc-build passed (VM sc-build-a98ee8beff: 789 kubelet tests ok, 6 new). Closed.

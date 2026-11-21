@@ -34,6 +34,10 @@ const FILE: &str = "/data/rknt-csi";
 /// restart pod included, and the restart pod signals the new kubelet in turn,
 /// so the case puts the node in a restart loop. Set it when that is fixed.
 const KUBELET_RESTART_ADOPTS: bool = false;
+/// Every pod the suite makes that uses the claim (or, the restart pod, runs
+/// beside it). Their unpublish needs the driver serving, so they are all
+/// deleted, and gone, before the driver is (#450).
+pub const CONSUMERS: [&str; 5] = ["csi-writer", "csi-reader", "csi-holder", "csi-reader2", "csi-restart-kubelet"];
 
 /// The run's driver name: a DNS subdomain, unique to the run so a leftover
 /// from an earlier run is never mistaken for this one.
@@ -342,16 +346,29 @@ impl Suite {
         }
     }
 
-    /// Consumers first (their unpublish needs the driver), then the driver,
-    /// then the claim, the PV and the CSIDriver.
-    async fn cleanup(&self) -> Result<(), String> {
+    /// Delete every consumer and wait until each is gone, while the driver
+    /// still serves: a pod is gone only once the kubelet unpublished its
+    /// volume, which it cannot do for a driver no longer registered (#450).
+    /// A finished consumer (csi-reader, csi-reader2) still holds its
+    /// publication until it is deleted.
+    async fn release_consumers(&self) -> Result<(), String> {
         let pods = k8s::pods(&self.env);
-        for p in ["csi-writer", "csi-reader", "csi-holder", "csi-reader2", "csi-restart-kubelet"] {
+        for p in CONSUMERS {
             self.api.delete(&format!("{pods}/{p}")).await?;
         }
-        for p in ["csi-writer", "csi-reader", "csi-holder", "csi-reader2", "csi-restart-kubelet"] {
-            k8s::gone(&self.api, &format!("{pods}/{p}"), Duration::from_secs(60)).await?;
+        for p in CONSUMERS {
+            k8s::gone(&self.api, &format!("{pods}/{p}"), Duration::from_secs(90))
+                .await
+                .map_err(|e| format!("consumer {p}: {e}"))?;
         }
+        Ok(())
+    }
+
+    /// Consumers first (their unpublish needs the driver), then the driver,
+    /// then the claim, the PV and the CSIDriver. Also the failure path: the
+    /// driver is deleted only once every consumer is gone.
+    async fn cleanup(&self) -> Result<(), String> {
+        self.release_consumers().await?;
         k8s::drain(&self.env, &self.api, Duration::from_secs(5)).await?;
         self.api.delete(&format!("{}/{}", k8s::PVS, pv_name(&self.env))).await?;
         self.api.delete(&format!("{CSIDRIVERS}/{}", self.driver)).await
@@ -382,7 +399,18 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
                 }
             }
         }
-        r.run("csi-deregistered", s.case_deregistered()).await;
+        // Every consumer unpublished while the driver serves, then the
+        // driver goes (#450). If a consumer does not go, the driver stays for
+        // cleanup to try again.
+        match s.release_consumers().await {
+            Ok(()) => {
+                r.run("csi-deregistered", s.case_deregistered()).await;
+            }
+            Err(e) => {
+                let why = format!("a consumer was not released while the driver served: {e}");
+                r.record("csi-deregistered", Outcome::Fail(why), 0, None);
+            }
+        }
     }
     if let Err(e) = s.cleanup().await {
         r.record("cleanup", Outcome::Infra(e), 0, None);
@@ -438,6 +466,21 @@ mod tests {
         assert!(called(log, "NodePublishVolume", "u1"));
         assert!(!called(log, "NodePublishVolume", "u2"));
         assert!(!called(log, "NodeUnpublishVolume", "u2"), "a failed call is not the call");
+    }
+
+    #[test]
+    fn every_consumer_is_released_before_the_driver() {
+        for p in ["csi-writer", "csi-reader", "csi-holder", "csi-reader2", "csi-restart-kubelet"] {
+            assert!(CONSUMERS.contains(&p), "{p} is not released before the driver");
+        }
+        assert!(!CONSUMERS.contains(&DRIVER_POD), "the driver is not a consumer");
+        let src = include_str!("csi.rs");
+        let run = &src[src.find("pub async fn run(").unwrap()..];
+        let release = run.find("s.release_consumers()").unwrap();
+        let dereg = run.find("s.case_deregistered()").unwrap();
+        assert!(release < dereg, "consumers are released before the driver is deregistered");
+        let clean = &src[src.find("async fn cleanup(").unwrap()..];
+        assert!(clean.find("self.release_consumers()").unwrap() < clean.find("k8s::drain(").unwrap());
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 ## 2026-11-20
 
+- **fix(test):** The `csi` suite deletes every consumer pod, and waits for each to be gone, before it deletes the test driver (#450, 0815c3f20819). `csi-deregistered` ran while `csi-reader` (and, after a passing restart case, `csi-reader2`) still existed: a finished pod keeps its CSI publication until it is deleted, and once the driver was gone the kubelet could not unpublish it, so cleanup timed out with terminating pods and mounts left behind, and the PV and CSIDriver were never deleted. Cleanup on a failed run follows the same order. A consumer that does not go fails `csi-deregistered` and the driver is left for cleanup.
 - **fix:** A VMI's `storm.io/resume-state` can no longer name a volume that is not its own restore's saved memory (#449, 5dba1ccb44f2). The kubelet took the annotation's volume and restore as written: it looked the volume up on the node's engine by name, attached it with its own credentials, and deleted it after the resume or on a failed attach. It also wrote the outcome to whatever restore was named. Anyone who could create a VMI could have another workload's volume detached and deleted. Now, before anything is attached:
   - the restore must be in the VMI's namespace, exist, restore the VMI's own VirtualMachine and still say `storm.io/memory: pending`;
   - the volume must be exactly that restore's state name;
