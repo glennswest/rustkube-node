@@ -94,7 +94,7 @@ stormcentral's relationships: **rustkube-node → rustkube, stormpump, stormvm**
 From the code (`pkg/kubelet/src/pod_manager.rs`, `stormpump_runtime.rs`):
 
 - **Runtimes:** `--runtime stormpump` on stormcos (the ring at `/hostrun/stormpump.sock`); `cri` for
-  CRI-O/containerd; `native` is the CLI default
+  CRI-O/containerd; stormpump is the CLI default (`native` retired, #442)
 - **Network:** a stormpump sandbox per Pod, CNI ADD into it; a Pod waits, with no sandbox, until the CNI
   config appears (inotify on `--cni-conf-dir`, #148); a finished Pod gives its IP back at once (#137)
 - **Images and roots:** every container gets its own CoW clone of the image's sealed golden, mounted by

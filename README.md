@@ -182,19 +182,26 @@ before it (an Event POST took 0.5–0.7 s on a busy apiserver).
 | `kube-proxy` | `cmd/kube-proxy`, `pkg/proxy` | iptables Services/Endpoints (polled every 5 s), TLS + ServiceAccount token to the apiserver (#145). No stormcos edition starts it: Cilium owns Services in the Cilium edition, flowsdn in the flowsdn edition (owner, #145; stormcos#265, flowsdn#292). It stays in the golden for anything that runs it later |
 | CNI library | `pkg/cni` | Standard plugin invocation and networking helpers |
 
-The executable defaults to **`--runtime native`**. The stormcos stage recipe
-explicitly selects **`--runtime stormpump`**, connecting to the engine ring at
-`/hostrun/stormpump.sock`. `--runtime cri` selects an external CRI v1 runtime
-(CRI-O or containerd); it is optional. The node-wide microVM runtime (`--runtime vm`, `--vmm`)
+The executable defaults to **`--runtime stormpump`**, PID 1's engine over its
+ring (the stormcos stage recipe gives it at `/hostrun/stormpump.sock`).
+`--runtime cri` selects an external CRI v1 runtime (CRI-O or containerd); it is
+optional. These are the only two. The node-wide microVM runtime (`--runtime vm`, `--vmm`)
 is retired (#13, the owner's choice): microVM Pods are stormvisor's, picked per Pod by
-`runtimeClassName` (#204), beside stormpump Pods and stormvm VMIs on one node.
+`runtimeClassName` (#204), beside stormpump Pods and stormvm VMIs on one node. The
+libcontainer runtime (`--runtime native`) is retired too (#442): it never unpacked
+the pulled image, set no namespaces and read no image config, so it could not
+run a container.
+
+Pods on both runtimes move by evacuation (deleted and rescheduled). A
+`rustkube.io/migrate-action` annotation on a Pod ends as `checkpoint-failed`
+with the runtime's reason in `rustkube.io/migrate-error`; there is no
+checkpoint/restore of a Pod's processes. stormvm VMIs live-migrate (#40).
 
 **`runtimeClassName`** (#204) is resolved to its RuntimeClass's `handler` before
 the sandbox. A RuntimeClass that does not exist is a wait (`RuntimeClass "x" not
 found`, a `FailedCreatePodSandBox` Event), as upstream; the pod is never run on
 the default runtime instead. `--runtime cri` passes the handler as CRI's
-`runtime_handler` (and crictl's `--runtime`). `--runtime native` serves none.
-stormpump serves its default and `realtime-soft`/`realtime-hard` (below), and
+`runtime_handler` (and crictl's `--runtime`). stormpump serves its default and `realtime-soft`/`realtime-hard` (below), and
 refuses any other handler with the reason: stormvisor's dispatch is not built,
 so a stormvisor Pod waits saying so rather than running as a container.
 
@@ -850,8 +857,8 @@ with `CAP_IPC_LOCK` effective. A pod that doesn't ask must see neither.
   `devices.kubevirt.io/kvm: 1k` in capacity and allocatable (KubeVirt's device
   plugin's resource) and the labels `storm.io/kvm=true` and
   `kubevirt.io/schedulable=true`. Without it the resource is gone, `storm.io/kvm`
-  is removed and `kubevirt.io/schedulable` is `false`. A node with the native
-  runtime reports none of these. A test that `requires: [kvm]` checks
+  is removed and `kubevirt.io/schedulable` is `false`. A node on `--runtime cri`
+  reports none of these. A test that `requires: [kvm]` checks
   `kubectl get nodes -l storm.io/kvm=true`.
 - **A VMI being deleted stops its machine.** While a machine runs, its VMI
   carries the finalizer `storm.io/vm`, so the deletion completes only once the

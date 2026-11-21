@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-11-21
+
+- **BREAKING:** `--runtime native` is retired and the kubelet's default runtime is `stormpump` (#442, 3d780a09c92c). The libcontainer runtime never gave a container its image: its OCI spec named a rootfs (`<pod-uid>-<name>/rootfs`) that `create_container` never made (it made an empty one under a `ct-…` directory), no layer was unpacked, the spec had no namespaces (so a container never joined the sandbox's netns), the image's Entrypoint/Cmd/Env were never read, and its pull returned `Ok` when skopeo failed. It was only the CLI's default; stormcos passes `--runtime stormpump`. `native` is now an unknown value, as `vm` has been since #13. `NativeRuntime`, `NativeImageService`, the CRIU checkpointer and the libcontainer/oci-spec dependencies are removed.
+- **fix:** stormpump's migration service is evacuation (#442). It was a fresh `NativeRuntime`, which looked each pod up in its own sandbox map, always empty under stormpump, so a checkpoint could never be made. A `rustkube.io/migrate-action` on a stormpump pod now ends `checkpoint-failed` with `stormpump pods move by evacuation: no checkpoint`.
+
 ## 2026-11-20
 
 - **fix:** A readiness probe changes a container's Ready only after `successThreshold` successes or `failureThreshold` failures in a row (#460, cd264eea6874). Each readiness result was taken at once, so with `failureThreshold: 3` one failed probe took the pod out of its Services' endpoints, and with `successThreshold: 3` one pass put a recovering container back in. Now the last result and how many times in a row it came are kept per container, as upstream's prober does. A result of the other kind starts the count again. The count is forgotten with each new run of the container. Defaults are upstream's: 1 success, 3 failures.

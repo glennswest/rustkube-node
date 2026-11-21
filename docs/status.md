@@ -88,6 +88,10 @@ a row says so.
 | [#216](https://github.com/glennswest/rustkube-node/issues/216) `--previous` on a mirror pod | The newest finished run, failed or exited | Done |
 | stormimds#12 guest metadata | stormimds asks `/vmInstance` on every request (single source) | Built in stormimds; node credential is stormcos#330 / #180 |
 
+Retired 2026-11-21: `--runtime native` (libcontainer, [#442](https://github.com/glennswest/rustkube-node/issues/442)):
+it never unpacked an image, so it could not run a container. `--runtime` is `stormpump` (the default) or `cri`;
+Pods on either move by evacuation (`rustkube.io/migrate-action` ends `checkpoint-failed` with the reason).
+
 Decided 2026-10-09: microVM Pods are stormvisor's ([#13](https://github.com/glennswest/rustkube-node/issues/13), `--runtime vm` retired;
 dispatch by RuntimeClass is [#204](https://github.com/glennswest/rustkube-node/issues/204)), and versioned goldens are copied on demand
 ([#86](https://github.com/glennswest/rustkube-node/issues/86), the fetch is built in stormblock-registry#116 / v0.45.0; deployed with stormcentral#542; the nodes' forge peer, stormcos#271, is closed).
