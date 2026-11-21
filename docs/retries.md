@@ -98,6 +98,14 @@ rules say. `R` = POST marked repeatable (named create or review).
 | `pv_placement.rs` | 373, 393 (PVs) |
 | `events.rs` | 233 (event patch), 252 R (event create, fixed name) |
 | `server.rs` | `token_review` R (inbound bearer tokens, #244: its own policy, 2 tries × 3 s, then 503; answers cached 2 min / refusals 10 s) |
+
+Static pods' mirror pods (`kubelet.rs`, `publish_mirrors`, #258): the Node
+GET, each mirror POST and each stale mirror's DELETE are retried as above.
+What is still not done after that (the Node not registered yet, a creation
+or deletion refused or unanswered, a 409 on a name another pod holds) marks
+the pod loop's pass failed (#451), so it runs again on the worker's backoff
+(100 ms doubling to 30 s) with no Pod event needed. The Node's registration
+also starts a pass at once.
 | `pkg/proxy/src/client.rs` | 126 (kube-proxy's lists) |
 | `test/src/api.rs` | 40 (every test call; POST not repeated unless it never left) |
 

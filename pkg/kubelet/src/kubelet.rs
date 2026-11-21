@@ -176,6 +176,9 @@ pub struct Kubelet {
     /// The mirror pod of each static pod (#258), by `<namespace>/<name>`, as
     /// the API last showed it: where the static pod's status is written.
     mirrors: std::sync::Mutex<std::collections::HashMap<String, Value>>,
+    /// Told once this Node is registered: the pod loop's next pass makes the
+    /// mirrors that waited for it (#451).
+    node_registered: Arc<tokio::sync::Notify>,
     /// The external CSI drivers on this node, shared with the pod manager
     /// and kept current by the registration loop (#52).
     csi: Arc<crate::csi_plugins::CsiPlugins>,
@@ -268,6 +271,7 @@ impl Kubelet {
             node_ip,
             said_no_static_dir: std::sync::atomic::AtomicBool::new(false),
             mirrors: Default::default(),
+            node_registered: Default::default(),
             watches: Default::default(),
             last_claims: Default::default(),
             static_read_complete: std::sync::atomic::AtomicBool::new(true),
@@ -404,6 +408,7 @@ impl Kubelet {
             let annotations = self.config.node_annotations.clone();
             let taints = self.config.register_with_taints.clone();
             let runs_vms = self.vms.is_some();
+            let registered = self.node_registered.clone();
             tokio::spawn(async move {
                 let mut reporter = NodeReporter::with_pod_cidr(&url, &node_name, pod_cidr)
                     .with_runtime_version(rv)
@@ -431,6 +436,7 @@ impl Kubelet {
                     match reporter.register().await {
                         Ok(()) => {
                             info!("node registered");
+                            registered.notify_one();
                             break;
                         }
                         Err(e) => {
@@ -738,6 +744,8 @@ impl Kubelet {
         loop {
             let work = tokio::select! {
                 work = worker.next() => work,
+                // The Node registered (#451): mirrors that waited for it.
+                _ = self.node_registered.notified() => { worker.enqueue(); continue; },
                 _ = cni_changed.notified() => {
                     let waiting = self.pod_manager.waiting_for_network_config();
                     if !waiting.is_empty() {
@@ -1236,71 +1244,13 @@ impl Kubelet {
         Ok(())
     }
 
-    /// Make the API's mirror pods match the static pods (#258): create the
-    /// missing ones (owned by this Node), delete orphaned and stale ones
-    /// (stale: recreated once gone), and remember the current ones for status.
+    /// Make the API's mirror pods match the static pods (#258), see
+    /// [`publish_mirrors`]; a static pod is woken by its mirror's appearance.
     async fn sync_mirrors(&self, statics: &[Value], api: &[Value]) {
-        let plan = crate::static_mirror::plan(statics, api, &self.config.node_name);
-        for (ns, name, uid) in &plan.delete {
-            let body = serde_json::json!({"apiVersion":"v1","kind":"DeleteOptions","gracePeriodSeconds":0,
-                "preconditions":{"uid":uid}});
-            match self.api_client.delete(format!("{}/api/v1/namespaces/{ns}/pods/{name}", self.config.api_server_url))
-                .json(&body).send_retrying(retry::Policy::API).await
-            {
-                Ok(r) if r.status().is_success() || matches!(r.status().as_u16(), 404 | 409) => {
-                    info!(pod = %name, namespace = %ns, "mirror pod deleted: its manifest is gone or changed")
-                }
-                Ok(r) => debug!(pod = %name, "mirror pod deletion not confirmed: {}", r.status()),
-                Err(e) => debug!(pod = %name, "mirror pod deletion not confirmed: {e}"),
-            }
-        }
-        let made = if plan.create.is_empty() { Vec::new() } else { self.create_mirrors(statics, &plan.create).await };
-        let mut mirrors = self.mirrors.lock().unwrap_or_else(|e| e.into_inner());
-        *mirrors = plan.current;
-        for (k, m) in made {
-            mirrors.insert(k, m);
-        }
-    }
-
-    /// Create the mirrors named in `create`; the ones made, by key. Each made
-    /// one's static pod is woken, so its status is written to it.
-    async fn create_mirrors(&self, statics: &[Value], create: &[String]) -> Vec<(String, Value)> {
-        // Owned by the Node, as upstream's are: none until it is registered.
-        let node_url = format!("{}/api/v1/nodes/{}", self.config.api_server_url, self.config.node_name);
-        let node_uid = match self.api_client.get(&node_url).send_retrying(retry::Policy::API).await {
-            Ok(r) if r.status().is_success() => r.json::<Value>().await.ok()
-                .and_then(|n| n["metadata"]["uid"].as_str().map(str::to_string)),
-            _ => None,
-        };
-        let Some(node_uid) = node_uid else {
-            debug!("mirror pods wait for this Node to be registered");
-            return Vec::new();
-        };
-        let mut made = Vec::new();
-        for s in statics.iter().filter(|s| create.contains(&crate::static_mirror::key(s))) {
-            let body = crate::static_mirror::mirror_of(s, &self.config.node_name, &node_uid);
-            let ns = s["metadata"]["namespace"].as_str().unwrap_or("kube-system");
-            let name = s["metadata"]["name"].as_str().unwrap_or("");
-            let url = format!("{}/api/v1/namespaces/{ns}/pods", self.config.api_server_url);
-            match self.api_client.post(&url).json(&body).send_retrying(retry::Policy::API).await {
-                Ok(r) if r.status().is_success() => {
-                    info!(pod = %name, namespace = %ns, "mirror pod created");
-                    if let Ok(m) = r.json::<Value>().await {
-                        made.push((crate::static_mirror::key(s), m));
-                    }
-                    let uid = s["metadata"]["uid"].as_str().unwrap_or("").to_string();
-                    self.workloads.wake_where(Kind::Pod, |k| k.uid == uid);
-                }
-                Ok(r) if r.status().as_u16() == 409 => debug!(pod = %name, "mirror pod already there"),
-                Ok(r) => {
-                    let status = r.status();
-                    let text = r.text().await.unwrap_or_default();
-                    warn!(pod = %name, namespace = %ns, "mirror pod not created: {status}: {}", text.chars().take(300).collect::<String>());
-                }
-                Err(e) => warn!(pod = %name, namespace = %ns, "mirror pod not created: {e}"),
-            }
-        }
-        made
+        let workloads = self.workloads.clone();
+        let wake = move |uid: &str| workloads.wake_where(Kind::Pod, |k| k.uid == uid);
+        publish_mirrors(&self.api_client, &self.config.api_server_url, &self.config.node_name,
+            statics, api, &self.mirrors, &wake).await;
     }
 
     /// This node's launcher Pods (#88, rustkube#203).
@@ -2567,6 +2517,115 @@ fn system_hostname() -> Option<String> {
     }
 }
 
+/// Make the API's mirror pods match the static pods (#258): create the missing
+/// ones (owned by this Node), delete orphaned and stale ones (stale: recreated
+/// once gone), and keep `mirrors` (by key, where status is written) current.
+///
+/// `wake` is called with a static pod's uid once its mirror is in `mirrors`
+/// (#451): when it is made here, and when it first appears in the API's list
+/// or comes back with another uid. A created mirror goes into `mirrors` before
+/// its pod is woken, so a worker running during the next creation finds it.
+///
+/// Work this pass could not do (no Node yet, a creation or deletion the API
+/// refused or did not answer) marks the pass failed: the worker comes back on
+/// its bounded backoff with no Pod event needed (#451).
+async fn publish_mirrors(
+    client: &reqwest::Client,
+    api_url: &str,
+    node: &str,
+    statics: &[Value],
+    api: &[Value],
+    mirrors: &std::sync::Mutex<std::collections::HashMap<String, Value>>,
+    wake: &(dyn Fn(&str) + Send + Sync),
+) {
+    let plan = crate::static_mirror::plan(statics, api, node);
+    let uid_of = |key: &str| {
+        statics.iter().find(|s| crate::static_mirror::key(s) == key)
+            .and_then(|s| s["metadata"]["uid"].as_str()).unwrap_or("").to_string()
+    };
+    // The current mirrors first, so a static pod woken below finds its own.
+    let appeared: Vec<String> = {
+        let mut held = mirrors.lock().unwrap_or_else(|e| e.into_inner());
+        let appeared = plan.current.iter()
+            .filter(|(k, m)| held.get(*k).map(|o| &o["metadata"]["uid"]) != Some(&m["metadata"]["uid"]))
+            .map(|(k, _)| k.clone()).collect();
+        *held = plan.current.clone();
+        appeared
+    };
+    for k in &appeared {
+        wake(&uid_of(k));
+    }
+    for (ns, name, uid) in &plan.delete {
+        let body = serde_json::json!({"apiVersion":"v1","kind":"DeleteOptions","gracePeriodSeconds":0,
+            "preconditions":{"uid":uid}});
+        match client.delete(format!("{api_url}/api/v1/namespaces/{ns}/pods/{name}"))
+            .json(&body).send_retrying(retry::Policy::API).await
+        {
+            Ok(r) if r.status().is_success() || matches!(r.status().as_u16(), 404 | 409) => {
+                info!(pod = %name, namespace = %ns, "mirror pod deleted: its manifest is gone or changed")
+            }
+            Ok(r) => {
+                apimachinery::reactor::failed();
+                warn!(pod = %name, namespace = %ns, "mirror pod not deleted: {}; retried", r.status());
+            }
+            Err(e) => {
+                apimachinery::reactor::failed();
+                warn!(pod = %name, namespace = %ns, "mirror pod not deleted: {e}; retried");
+            }
+        }
+    }
+    if plan.create.is_empty() {
+        return;
+    }
+    // Owned by the Node, as upstream's are: none until it is registered. Its
+    // registration also enqueues the pod loop (`node_registered`).
+    let node_uid = match client.get(format!("{api_url}/api/v1/nodes/{node}")).send_retrying(retry::Policy::API).await {
+        Ok(r) if r.status().is_success() => r.json::<Value>().await.ok()
+            .and_then(|n| n["metadata"]["uid"].as_str().map(str::to_string))
+            .filter(|u| !u.is_empty()),
+        _ => None,
+    };
+    let Some(node_uid) = node_uid else {
+        apimachinery::reactor::failed();
+        debug!("mirror pods wait for this Node to be registered; retried");
+        return;
+    };
+    for s in statics.iter().filter(|s| plan.create.contains(&crate::static_mirror::key(s))) {
+        let body = crate::static_mirror::mirror_of(s, node, &node_uid);
+        let ns = s["metadata"]["namespace"].as_str().unwrap_or("kube-system");
+        let name = s["metadata"]["name"].as_str().unwrap_or("");
+        let url = format!("{api_url}/api/v1/namespaces/{ns}/pods");
+        match client.post(&url).json(&body).send_retrying(retry::Policy::API).await {
+            Ok(r) if r.status().is_success() => {
+                info!(pod = %name, namespace = %ns, "mirror pod created");
+                match r.json::<Value>().await {
+                    Ok(m) => {
+                        let key = crate::static_mirror::key(s);
+                        mirrors.lock().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), m);
+                        wake(&uid_of(&key));
+                    }
+                    // Made, but not read: the list after its watch event has it.
+                    Err(e) => {
+                        apimachinery::reactor::failed();
+                        warn!(pod = %name, namespace = %ns, "mirror pod created, its answer not read: {e}");
+                    }
+                }
+            }
+            Ok(r) => {
+                // A 409 too: a pod of that name that is not this mirror holds it.
+                apimachinery::reactor::failed();
+                let status = r.status();
+                let text = r.text().await.unwrap_or_default();
+                warn!(pod = %name, namespace = %ns, "mirror pod not created: {status}: {}; retried", text.chars().take(300).collect::<String>());
+            }
+            Err(e) => {
+                apimachinery::reactor::failed();
+                warn!(pod = %name, namespace = %ns, "mirror pod not created: {e}; retried");
+            }
+        }
+    }
+}
+
 /// Publish a mirror pod for each service PID 1 supervises.
 ///
 /// Reads what stormpump wrote and reflects it. **Nothing is invented**: an
@@ -3707,5 +3766,182 @@ mod status_conflict_tests {
         for kind in ["virtualmachinesnapshots", "virtualmachinerestores", "virtualmachinegoldens", "virtualmachines", "virtualmachineinstances"] {
             assert!(super::VM_MAINTENANCE_WATCHES.iter().any(|p| p.ends_with(&format!("/{kind}"))), "{kind} is not watched");
         }
+    }
+}
+
+#[cfg(test)]
+mod mirror_publication_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
+
+    fn static_pod(name: &str) -> Value {
+        serde_json::json!({
+            "metadata": {"name": format!("{name}-n1"), "namespace": "kube-system", "uid": format!("static-{name}-n1"),
+                "annotations": {crate::static_mirror::CONFIG_HASH: "h1"}},
+            "spec": {"nodeName": "n1", "containers": [{"name": name, "image": format!("/pallets/{name}")}]},
+        })
+    }
+
+    fn mirror(name: &str, uid: &str) -> Value {
+        serde_json::json!({
+            "metadata": {"name": format!("{name}-n1"), "namespace": "kube-system", "uid": uid,
+                "annotations": {crate::static_mirror::CONFIG_MIRROR: "h1"}},
+            "spec": {"nodeName": "n1"},
+        })
+    }
+
+    struct Api {
+        url: String,
+        node: Arc<AtomicBool>,
+        posts: Arc<AtomicUsize>,
+        /// Answers the second and later POSTs; the first is answered at once.
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    /// A fake apiserver: the Node `n1` once `node` is set, and pod creation
+    /// answering the created pod with a uid.
+    async fn apiserver() -> Api {
+        let node = Arc::new(AtomicBool::new(false));
+        let posts = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (n, p, r) = (node.clone(), posts.clone(), release.clone());
+        let app = axum::Router::new()
+            .route("/api/v1/nodes/n1", axum::routing::get(move || {
+                let n = n.clone();
+                async move {
+                    if n.load(Ordering::SeqCst) {
+                        (axum::http::StatusCode::OK, axum::Json(serde_json::json!({"metadata": {"name": "n1", "uid": "node-uid"}})))
+                    } else {
+                        (axum::http::StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"reason": "NotFound"})))
+                    }
+                }
+            }))
+            .route("/api/v1/namespaces/kube-system/pods", axum::routing::post(move |axum::Json(mut b): axum::Json<Value>| {
+                let (p, r) = (p.clone(), r.clone());
+                async move {
+                    if p.fetch_add(1, Ordering::SeqCst) > 0 {
+                        r.acquire().await.unwrap().forget();
+                    }
+                    b["metadata"]["uid"] = serde_json::json!(format!("uid-{}", b["metadata"]["name"].as_str().unwrap()));
+                    (axum::http::StatusCode::CREATED, axum::Json(b))
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Api { url, node, posts, release }
+    }
+
+    fn recorder() -> (Arc<Mutex<Vec<String>>>, impl Fn(&str) + Send + Sync) {
+        let woken: Arc<Mutex<Vec<String>>> = Arc::default();
+        let w = woken.clone();
+        (woken, move |uid: &str| w.lock().unwrap().push(uid.to_string()))
+    }
+
+    /// #451 (0fe4626f9a31): mirrors waiting for a Node not yet registered make
+    /// the pass a failure, so the worker comes back by itself; once the Node
+    /// exists the retried pass makes the mirror. No Pod event in between.
+    #[tokio::test]
+    async fn a_missing_node_is_retried_until_it_registers() {
+        let api = apiserver().await;
+        api.release.add_permits(10);
+        let (client, statics) = (reqwest::Client::new(), vec![static_pod("etcd")]);
+        let mirrors = Mutex::new(HashMap::new());
+        let (woken, wake) = recorder();
+        let hub = apimachinery::reactor::WatchHub::default();
+        let worker = hub.worker("test-mirrors");
+        drop(worker.next().await); // the worker's first pass
+        worker.run(publish_mirrors(&client, &api.url, "n1", &statics, &[], &mirrors, &wake)).await;
+        assert_eq!(api.posts.load(Ordering::SeqCst), 0, "no mirror without its Node");
+        let retried = tokio::time::timeout(Duration::from_secs(2), worker.next()).await.expect("the pass is retried");
+        api.node.store(true, Ordering::SeqCst);
+        worker.run(publish_mirrors(&client, &api.url, "n1", &statics, &[], &mirrors, &wake)).await;
+        drop(retried);
+        assert_eq!(api.posts.load(Ordering::SeqCst), 1);
+        assert_eq!(mirrors.lock().unwrap()["kube-system/etcd-n1"]["metadata"]["uid"], "uid-etcd-n1");
+        assert_eq!(*woken.lock().unwrap(), ["static-etcd-n1"]);
+        // Done: nothing more comes back on its own.
+        assert!(tokio::time::timeout(Duration::from_millis(400), worker.next()).await.is_err(), "a finished pass is not retried");
+    }
+
+    /// #451: a creation the API refuses is retried the same way.
+    #[tokio::test]
+    async fn a_refused_creation_is_retried() {
+        let app = axum::Router::new()
+            .route("/api/v1/nodes/n1", axum::routing::get(|| async { axum::Json(serde_json::json!({"metadata": {"uid": "node-uid"}})) }))
+            .route("/api/v1/namespaces/kube-system/pods", axum::routing::post(|| async { axum::http::StatusCode::FORBIDDEN }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mirrors = Mutex::new(HashMap::new());
+        let (woken, wake) = recorder();
+        let hub = apimachinery::reactor::WatchHub::default();
+        let worker = hub.worker("test-mirrors");
+        drop(worker.next().await);
+        worker.run(publish_mirrors(&reqwest::Client::new(), &url, "n1", &[static_pod("etcd")], &[], &mirrors, &wake)).await;
+        assert!(mirrors.lock().unwrap().is_empty());
+        assert!(woken.lock().unwrap().is_empty());
+        assert!(tokio::time::timeout(Duration::from_secs(2), worker.next()).await.is_ok(), "the pass is retried");
+    }
+
+    /// #451 (b964ad47dae7): with a second mirror's POST held pending, the
+    /// first mirror is already where status is written when its static pod
+    /// is woken.
+    #[tokio::test]
+    async fn a_made_mirror_is_installed_before_its_pod_is_woken() {
+        let api = apiserver().await;
+        api.node.store(true, Ordering::SeqCst);
+        let client = reqwest::Client::new();
+        let statics = vec![static_pod("etcd"), static_pod("kube-apiserver")];
+        let mirrors = Arc::new(Mutex::new(HashMap::new()));
+        let found: Arc<Mutex<Vec<(String, bool)>>> = Arc::default();
+        let (m, f) = (mirrors.clone(), found.clone());
+        let first_woken = Arc::new(tokio::sync::Notify::new());
+        let fw = first_woken.clone();
+        // What a static pod's worker would see when woken.
+        let wake = move |uid: &str| {
+            let key = format!("kube-system/{}", uid.trim_start_matches("static-"));
+            let has: bool = m.lock().unwrap().contains_key(&key);
+            f.lock().unwrap().push((uid.to_string(), has));
+            fw.notify_one();
+        };
+        let run = {
+            let (client, url, statics, mirrors) = (client.clone(), api.url.clone(), statics.clone(), mirrors.clone());
+            tokio::spawn(async move { publish_mirrors(&client, &url, "n1", &statics, &[], &mirrors, &wake).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), first_woken.notified()).await.expect("the first pod is woken");
+        // The second POST is still held.
+        assert!(!run.is_finished());
+        assert_eq!(api.posts.load(Ordering::SeqCst), 2);
+        assert_eq!(*found.lock().unwrap(), [("static-etcd-n1".to_string(), true)]);
+        assert!(mirrors.lock().unwrap().contains_key("kube-system/etcd-n1"));
+        api.release.add_permits(1);
+        run.await.unwrap();
+        assert_eq!(
+            *found.lock().unwrap(),
+            [("static-etcd-n1".to_string(), true), ("static-kube-apiserver-n1".to_string(), true)]
+        );
+    }
+
+    /// #451: a mirror that first appears in the API's list (made elsewhere, or
+    /// by a pass whose answer was lost) wakes its static pod, as does one back
+    /// with another uid; an unchanged one does not.
+    #[tokio::test]
+    async fn a_mirror_appearing_in_the_list_wakes_its_pod() {
+        let client = reqwest::Client::new();
+        let statics = vec![static_pod("etcd")];
+        let mirrors = Mutex::new(HashMap::new());
+        let (woken, wake) = recorder();
+        // Nothing to create or delete: no request is made.
+        let url = "http://127.0.0.1:1";
+        publish_mirrors(&client, url, "n1", &statics, &[mirror("etcd", "m-1")], &mirrors, &wake).await;
+        assert_eq!(*woken.lock().unwrap(), ["static-etcd-n1"]);
+        publish_mirrors(&client, url, "n1", &statics, &[mirror("etcd", "m-1")], &mirrors, &wake).await;
+        assert_eq!(woken.lock().unwrap().len(), 1, "an unchanged mirror wakes nothing");
+        publish_mirrors(&client, url, "n1", &statics, &[mirror("etcd", "m-2")], &mirrors, &wake).await;
+        assert_eq!(*woken.lock().unwrap(), ["static-etcd-n1", "static-etcd-n1"]);
+        assert_eq!(mirrors.lock().unwrap()["kube-system/etcd-n1"]["metadata"]["uid"], "m-2");
     }
 }
