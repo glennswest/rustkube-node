@@ -3912,9 +3912,15 @@ mod mirror_publication_tests {
             tokio::spawn(async move { publish_mirrors(&client, &url, "n1", &statics, &[], &mirrors, &wake).await })
         };
         tokio::time::timeout(Duration::from_secs(5), first_woken.notified()).await.expect("the first pod is woken");
-        // The second POST is still held.
+        // The second POST reaches the API and is held there.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while api.posts.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the second POST is sent");
         assert!(!run.is_finished());
-        assert_eq!(api.posts.load(Ordering::SeqCst), 2);
         assert_eq!(*found.lock().unwrap(), [("static-etcd-n1".to_string(), true)]);
         assert!(mirrors.lock().unwrap().contains_key("kube-system/etcd-n1"));
         api.release.add_permits(1);
