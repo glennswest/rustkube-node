@@ -2322,7 +2322,7 @@ fn exit_wake(pod: Option<String>, vm: Option<String>) -> ExitWake {
 /// A container runtime the 1.36 posture no longer supports (#23): containerd
 /// before 2.0, which Kubernetes 1.36 dropped. The kubelet refuses to start on
 /// it rather than run against a runtime nothing tests it with. Anything else
-/// (CRI-O, stormpump, the native runtime, a version that does not parse) is
+/// (CRI-O, stormpump, a version that does not parse) is
 /// accepted.
 fn unsupported_runtime(name: &str, version: &str) -> Option<String> {
     if !name.eq_ignore_ascii_case("containerd") {

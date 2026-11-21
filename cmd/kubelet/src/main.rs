@@ -1,15 +1,15 @@
 //! kubelet — Kubernetes node agent: registers the node, runs the pod lifecycle
 //! against a container runtime, and reports status/heartbeats.
 //!
-//! The runtime is `--runtime`: `native` (the default), `stormpump` (what
-//! stormcos selects: PID 1's engine over its ring, plus stormvm VMIs and
-//! snapshots), `cri` (an external CRI v1 runtime) or `vm` (the legacy microVM
-//! path). What is implemented and what is not is in the repo's
+//! The runtime is `--runtime`: `stormpump` (the default, and what stormcos
+//! runs: PID 1's engine over its ring, plus stormvm VMIs and snapshots) or
+//! `cri` (an external CRI v1 runtime). `native` (libcontainer) and `vm` (the
+//! legacy microVM path) are retired (#442, #13). What is implemented and what is not is in the repo's
 //! `docs/status.md`; every flag and default is in `docs/configuration.md`.
 
 use clap::Parser;
 use kubelet::{
-    detect_cri_socket, CriGrpcClient, Kubelet, KubeletConfig, NativeImageService, NativeRuntime,
+    detect_cri_socket, CriGrpcClient, Kubelet, KubeletConfig,
 };
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
@@ -94,10 +94,11 @@ struct Cli {
     #[arg(long, env = "CRI_SOCKET")]
     cri_socket: Option<String>,
 
-    /// Container runtime: native (libcontainer), cri (external CRI), stormpump.
+    /// Container runtime: stormpump (the engine's ring) or cri (external CRI).
     /// (`vm`, a node-wide microVM runtime, is retired: microVM Pods are
-    /// stormvisor's, chosen per Pod by RuntimeClass, #13, #204.)
-    #[arg(long, default_value = "native", value_parser = ["native", "cri", "stormpump"])]
+    /// stormvisor's, chosen per Pod by RuntimeClass, #13, #204. `native`, a
+    /// libcontainer runtime that never unpacked an image, is retired too, #442.)
+    #[arg(long, default_value = "stormpump", value_parser = ["stormpump", "cri"])]
     runtime: String,
 
     /// CNI network config directory (Cilium writes 05-cilium.conflist here).
@@ -435,57 +436,26 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     );
     kubelet::startup::mark("hello");
 
-    // Standard CNI for the native/VM-fallback runtimes. Cilium is the expected
-    // default plugin; anything spec-compliant in the conf dir works.
+    // Standard CNI: Cilium is the expected default plugin; anything
+    // spec-compliant in the conf dir works.
     //
-    // Runtimes that do their own networking are exempt, and that exemption has
-    // to be real rather than a comment. `cri` hands the job to the external
-    // runtime; `stormpump` does it in the engine, which owns the network
-    // namespace and attaches each workload by profile (routed, private,
-    // macvlan, host, isolated) with no plugin involved.
+    // Both runtimes (`stormpump`, `cri`) do their own networking until a CNI
+    // network is configured, and then CNI is used, because someone installed a
+    // plugin and means it: Cilium *is* a CNI plugin and something has to
+    // invoke it. Without the fallback the kubelet gated sandbox creation on a
+    // CNI config it would never use, and an empty /etc/cni/net.d made every
+    // pod fail as `No such file or directory`, an ENOENT that points at the
+    // image, the volume or the log path, none of which are the cause.
     //
-    // Without this the kubelet gates sandbox creation on a CNI config it will
-    // never use, and an empty /etc/cni/net.d makes every pod fail as
-    // `No such file or directory` — an ENOENT that points at the container
-    // image, the volume, or the log path, none of which are the cause. That
-    // cost a day here.
-    // A runtime that does its own networking is exempt — **unless a CNI
-    // network is actually configured**, because then someone has installed a
-    // plugin and means it.
-    //
-    // The first version of this exempted by runtime alone, which is wrong the
-    // moment Cilium is the plan: Cilium *is* a CNI plugin, something has to
-    // invoke it, and a blanket exemption means nothing ever does. The runtime
-    // owning networking is the *default*, not a veto over a network config
-    // that exists on disk.
-    let runtime_owns_networking = matches!(cli.runtime.as_str(), "cri" | "stormpump");
-    let cni_configured = cni::CniInvoker::new(
-        cli.cni_conf_dir.clone(),
-        vec![std::path::PathBuf::from(&cli.cni_bin_dir)],
-    )
-    .network_ready()
-    .is_ok();
-    // **A runtime that re-checks per pod must not be gated on a one-time
-    // look.** Cilium writes its conflist when its agent comes up, which is
-    // minutes after this line runs, and the answer here used to be permanent
-    // for the life of the process: the node logged "no network config is
-    // present", never looked again, and every pod got an empty namespace while
-    // a healthy Cilium sat beside it. `CniInvoker` reloads its config on every
-    // call precisely so this decision does not have to be final.
+    // **The runtime re-checks per pod; this is not a one-time look.** Cilium
+    // writes its conflist when its agent comes up, minutes after this line
+    // runs. The answer here used to be permanent for the life of the process,
+    // and every pod got an empty namespace while a healthy Cilium sat beside
+    // it. `CniInvoker` reloads its config on every call, so the invoker is
+    // given to the runtime whether or not a network is configured yet.
     let cni_invoker = if cli.no_cni {
         tracing::warn!("CNI disabled (--no-cni) — pods get an isolated namespace with loopback only and no address");
         None
-    } else if runtime_owns_networking && !cni_configured {
-        tracing::info!(
-            "no CNI network in {} yet; the {} runtime will use its own networking until \
-             one appears",
-            cli.cni_conf_dir,
-            cli.runtime
-        );
-        Some(cni::CniInvoker::new(
-            cli.cni_conf_dir.clone(),
-            vec![std::path::PathBuf::from(&cli.cni_bin_dir)],
-        ))
     } else {
         let invoker = cni::CniInvoker::new(
             cli.cni_conf_dir.clone(),
@@ -493,10 +463,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         );
         match invoker.network_ready() {
             Ok(name) => tracing::info!("CNI network '{name}' configured ({})", cli.cni_conf_dir),
-            Err(e) => tracing::warn!(
-                "CNI not ready yet ({e}) — pod sandbox creation will fail until a \
-                 network config appears in {} (e.g. install Cilium)",
-                cli.cni_conf_dir
+            Err(_) => tracing::info!(
+                "no CNI network in {} yet; the {} runtime will use its own networking until \
+                 one appears",
+                cli.cni_conf_dir,
+                cli.runtime
             ),
         }
         Some(invoker)
@@ -579,7 +550,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                         // Goldens carried and not mounted are found there (#294).
                         .with_roots(roots),
                     );
-                    let mig = Arc::new(NativeRuntime::new())
+                    // stormpump pods move by evacuation (#442).
+                    let mig = Arc::new(kubelet::cri::EvacuateOnly::new("stormpump"))
                         as Arc<dyn kubelet::cri::MigrationService>;
                     (rt as _, img as _, mig)
                 }
@@ -592,7 +564,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 }
             }
         }
-        "cri" => {
+        _ => {
+            // `--runtime`'s value_parser admits only stormpump and cri.
             let socket = cli.cri_socket.clone().unwrap_or_else(detect_cri_socket);
             tracing::info!("kubelet using CRI runtime via gRPC ({})", socket);
             let rt = Arc::new(CriGrpcClient::new(&socket));
@@ -601,13 +574,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 .await;
             let mig = rt.clone() as Arc<dyn kubelet::cri::MigrationService>;
             (rt.clone() as _, rt as _, mig)
-        }
-        _ => {
-            tracing::info!("kubelet using native runtime (libcontainer)");
-            let rt = Arc::new(NativeRuntime::new().with_cni(cni_invoker));
-            let img = Arc::new(NativeImageService::new());
-            let mig = rt.clone() as Arc<dyn kubelet::cri::MigrationService>;
-            (rt as _, img as _, mig)
         }
     };
 
@@ -978,6 +944,18 @@ mod tests {
     #[test]
     fn a_token_file_is_trimmed() {
         assert_eq!(token_text(b"abc.def\n".to_vec()).unwrap(), "abc.def");
+    }
+
+    /// #442: the runtime defaults to stormpump, and the retired `native` (like
+    /// `vm`, #13) is an unknown value, not a runtime that cannot run an image.
+    #[test]
+    fn runtime_defaults_to_stormpump_and_native_is_gone() {
+        assert_eq!(Cli::try_parse_from(["kubelet"]).unwrap().runtime, "stormpump");
+        assert_eq!(Cli::try_parse_from(["kubelet", "--runtime", "cri"]).unwrap().runtime, "cri");
+        for retired in ["native", "vm"] {
+            let e = Cli::try_parse_from(["kubelet", "--runtime", retired]).err().expect(retired);
+            assert_eq!(e.kind(), clap::error::ErrorKind::InvalidValue, "{retired}");
+        }
     }
 
     /// #216: upstream's defaults, and what upstream refuses.

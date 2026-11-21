@@ -110,10 +110,6 @@ rtnetlink = { version = "0.14" }
 socket2 = { version = "0.5" }
 ipnet = { version = "2" }
 
-# OCI container runtime (youki libcontainer)
-libcontainer = { version = "0.6", default-features = false, features = ["v2"] }
-oci-spec = { version = "0.9" }
-
 # HTTP client
 # `stream` for the watch: a Kubernetes watch is a response body that never
 # ends, delivered as newline-delimited JSON, so it has to be read as it

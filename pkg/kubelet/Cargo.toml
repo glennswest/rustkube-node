@@ -108,8 +108,6 @@ tracing-subscriber = { workspace = true }
 
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libcontainer = { workspace = true }
-oci-spec = { workspace = true }
 nix = { workspace = true }
 libc = "0.2"
 

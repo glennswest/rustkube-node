@@ -570,7 +570,8 @@ pub trait ImageService: Send + Sync + 'static {
 /// Migration strategy for a pod sandbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MigrationStrategy {
-    /// CRIU checkpoint/restore for native containers.
+    /// Checkpoint/restore of a pod's processes (no runtime here uses it since
+    /// the native runtime was retired, #442).
     Checkpoint,
     /// VM live migration (cloud-hypervisor/QEMU).
     LiveMigrate,
@@ -630,6 +631,53 @@ pub trait MigrationService: Send + Sync + 'static {
 
     /// Query migration progress.
     async fn migration_progress(&self, sandbox_id: &str) -> Result<MigrationProgress, CriError>;
+}
+
+/// The migration service of a runtime whose pods move by evacuation (#442):
+/// stormpump. Its pods are killed and rescheduled, never checkpointed or
+/// live-migrated (a stormvm VMI moves by its own live migration, #40, which
+/// does not go through this trait). Each verb refuses with the runtime's name,
+/// so a `rustkube.io/migrate-action` on such a pod ends as `checkpoint-failed`
+/// with that reason rather than in a checkpoint that cannot be restored.
+pub struct EvacuateOnly {
+    runtime: &'static str,
+}
+
+impl EvacuateOnly {
+    pub fn new(runtime: &'static str) -> Self {
+        Self { runtime }
+    }
+
+    fn refuse(&self, what: &str) -> CriError {
+        CriError::Migration(format!("{} pods move by evacuation: no {what}", self.runtime))
+    }
+}
+
+#[async_trait]
+impl MigrationService for EvacuateOnly {
+    fn migration_strategy(&self, _sandbox_id: &str) -> MigrationStrategy {
+        MigrationStrategy::Evacuate
+    }
+
+    async fn checkpoint_pod(&self, _sandbox_id: &str) -> Result<CheckpointRef, CriError> {
+        Err(self.refuse("checkpoint"))
+    }
+
+    async fn restore_pod(&self, _checkpoint: &CheckpointRef, _config: &PodSandboxConfig) -> Result<String, CriError> {
+        Err(self.refuse("restore from a checkpoint"))
+    }
+
+    async fn prepare_migration_target(&self, _config: &PodSandboxConfig) -> Result<String, CriError> {
+        Err(self.refuse("live migration target"))
+    }
+
+    async fn live_migrate(&self, _sandbox_id: &str, _target_endpoint: &str) -> Result<(), CriError> {
+        Err(self.refuse("live migration"))
+    }
+
+    async fn migration_progress(&self, _sandbox_id: &str) -> Result<MigrationProgress, CriError> {
+        Err(self.refuse("migration in progress"))
+    }
 }
 
 /// CRI error type.
@@ -730,4 +778,33 @@ pub enum CriError {
 
     #[error("migration error: {0}")]
     Migration(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #442: stormpump's migration service is evacuation. Every verb refuses
+    /// with the runtime's name, so a migrate-action ends in `checkpoint-failed`
+    /// with the reason instead of a checkpoint nothing can restore.
+    #[tokio::test]
+    async fn evacuate_only_refuses_every_verb_with_the_runtime_name() {
+        let m = EvacuateOnly::new("stormpump");
+        assert!(matches!(m.migration_strategy("s"), MigrationStrategy::Evacuate));
+        let cfg = PodSandboxConfig::default();
+        let cref = CheckpointRef { path: "/x".into(), size: 0, is_stream: false, stream_endpoint: None };
+        let errs = [
+            m.checkpoint_pod("s").await.unwrap_err(),
+            m.restore_pod(&cref, &cfg).await.unwrap_err(),
+            m.prepare_migration_target(&cfg).await.unwrap_err(),
+            m.live_migrate("s", "10.0.0.1:1").await.unwrap_err(),
+            m.migration_progress("s").await.unwrap_err(),
+        ];
+        for e in errs {
+            match e {
+                CriError::Migration(msg) => assert!(msg.starts_with("stormpump pods move by evacuation: no "), "{msg}"),
+                other => panic!("not a migration refusal: {other:?}"),
+            }
+        }
+    }
 }

@@ -6953,7 +6953,7 @@ pub const APPARMOR_REASON: &str = "AppArmor";
 /// deprecated `container.apparmor.security.beta.kubernetes.io/<container>`
 /// annotation, which 1.34 deprecated for the field) is refused on a node that
 /// cannot enforce it. No runtime here applies one (stormpump has no LSM
-/// profile, the native runtime none, and the CRI path does not forward it), so
+/// profile and the CRI path does not forward it), so
 /// such a pod is refused rather than run unconfined in silence.
 pub fn apparmor_refusal(pod: &Value) -> Option<String> {
     let asks = |sc: &Value| {

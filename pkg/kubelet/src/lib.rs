@@ -31,7 +31,6 @@ pub mod system_claims;
 pub mod stormpump_ring;
 pub mod stormd_api;
 pub mod stormpump_runtime;
-pub mod checkpoint;
 pub mod client;
 pub mod crashloop;
 pub mod cri;
@@ -51,7 +50,6 @@ pub mod pvc_resize;
 pub mod pvc_snapshot;
 pub mod portforward;
 pub mod remotecommand;
-pub mod runtime;
 pub mod server;
 pub mod spdy;
 pub mod vm_disk_move;
@@ -69,11 +67,9 @@ pub mod vm_kernel_boot;
 pub mod vm_mirrored_root;
 pub mod vm_snapshot;
 
-pub use checkpoint::CriuCheckpointer;
 pub use cri_client::{CriClient, detect_cri_socket};
 pub use cri_grpc::CriGrpcClient;
 pub use kubelet::{detect_node_name, Kubelet, KubeletConfig};
-pub use runtime::{NativeRuntime, NativeImageService};
 
 mod fs_watch;
 
