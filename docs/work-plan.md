@@ -4,7 +4,10 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #451, review: static mirror publication (kubelet.rs)
+### Done: #451, review: static mirror publication (kubelet.rs)
+
+Fixed in c981c3d (+ 8fa8be5 test race, #461); sc-build passed (VM sc-build-1eb5cf6002: 793 kubelet tests ok, 4 new);
+clippy -D warnings shows only #386's existing lints, none in the changed lines. Closed.
 
 - 0fe4626f9a31 (no retry when mirrors cannot be published): a missing Node, a failed POST or a failed/unconfirmed
   DELETE now mark the pod worker's pass failed (`reactor::failed()`: bounded 100 ms→30 s backoff, no Pod event
