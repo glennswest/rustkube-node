@@ -1085,13 +1085,13 @@ with `CAP_IPC_LOCK` effective. A pod that doesn't ask must see neither.
   memory state the VirtualMachine (none with `storm.io/retain-disks`).
 - **Backups off the node** (#380, stormvm#31, the owner's decision A): a `VirtualMachineSnapshot` with
   `storm.io/backup-to: <store>` is also a backup. Once it reads `Succeeded` on the node that took it, its
-  group's disks are shipped to the store (changed extents only, against the last backup's group still on
-  the node) by stormvm's `Transfer`, kept in `status["storm.io/backup-transfer"]` and stepped once per
+  group's disks are shipped to the store (changed extents only, against the last backup to the same store
+  whose group is still on the node; the first backup to a store is a full copy, #458) by stormvm's `Transfer`, kept in `status["storm.io/backup-transfer"]` and stepped once per
   pass. `status["storm.io/backup"]` says `phase` (`preparing`, `copying`, `sealing`, `done`,
   `waitingEngine`, `failed`), `store`, `point`, `incremental` and the bytes. `waitingEngine` (an engine
   without stormblock#399/#400, or a store this node is not given) is asked again, never failed. Once
-  done: the older backups' groups leave the node (`storm.io/backupBaseReleased`; only the newest stays,
-  as the next base), the store keeps the VM's `storm.io/backup-keep` newest points, and a scheduled
+  done: the older backups' groups in the same store leave the node (`storm.io/backupBaseReleased`;
+  each store's newest stays, as that store's next base), the store keeps the VM's `storm.io/backup-keep` newest points, and a scheduled
   snapshot whose point was pruned is deleted (`storm.io/backupSettled` when all of it went through).
   - **Schedule:** a VirtualMachine running here with `storm.io/backup-every: 6h` (1h at least;
     `storm.io/backup-keep`, `storm.io/backup-to`) gets `<vm>-backup-<ms>` snapshots, labelled

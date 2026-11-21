@@ -4,6 +4,14 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### Done: #458, review 59fb97c4517b: an incremental backup's base from another store (vm_backup.rs)
+
+`older_done` picked the newest done backup of the VM on the node whatever its store. After `storm.io/backup-to`
+moved from A to B, the transfer into B was a diff against A's point, whose unchanged blocks B never had. Now
+`older_done` takes the store and matches each backup's (its status's `store`, else its `backup-to`). So the base is
+the same store's, a first backup to a store is a full copy, and `settle` releases only that store's older groups:
+each store's newest stays on the node as its base until a later backup to that store is done.
+
 ### Done: #457, review 571e7c23b8e4: a claim not read strands its grow (pvc_resize.rs)
 
 `pvc_resize::pass` skipped a claim whose GET failed after its retries without marking the pass pending, so the

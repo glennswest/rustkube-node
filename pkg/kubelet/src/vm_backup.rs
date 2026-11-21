@@ -5,15 +5,17 @@
 //! It is taken as any snapshot is (`vm_snapshot.rs`, #28). Once it reads
 //! `Succeeded` on the node that took it, its group's members are shipped to
 //! the store by stormvm's [`Transfer`] (changed extents only, against the last
-//! backup's group still on the node), which is plain data kept in the
+//! backup to the same store whose group is still on the node; a first backup
+//! to a store is a full copy, #458), which is plain data kept in the
 //! snapshot's `status["storm.io/backup-transfer"]` and stepped one round of
 //! engine calls per pass, off the async threads. `status["storm.io/backup"]`
 //! says where it is (`stormvm_spec::backup::backup_status`). `waitingEngine`
 //! (an engine without stormblock#399/#400) is asked again, never failed.
 //!
-//! **Once it is `done`:** the older backups' groups on the node are deleted
-//! (only the newest is kept, as the next base: `storm.io/backupBaseReleased`
-//! on each), the store keeps the VM's newest `storm.io/backup-keep` points,
+//! **Once it is `done`:** the older backups' groups on the node in the same
+//! store are deleted (only each store's newest is kept, as that store's next
+//! base: `storm.io/backupBaseReleased` on each; a base is never taken from
+//! another store, #458), the store keeps the VM's newest `storm.io/backup-keep` points,
 //! and a scheduled VirtualMachineSnapshot whose point was pruned is deleted.
 //!
 //! **Schedule:** a VirtualMachine registered on this node with
@@ -164,9 +166,25 @@ fn backup_phase(obj: &Value) -> &str {
     obj["status"][BACKUP_STATUS]["phase"].as_str().unwrap_or("")
 }
 
-/// The backups of the same VM as `obj`, taken by `node`, done, whose group is
-/// still on the node, older than `obj`: newest first.
-pub fn older_done<'a>(items: &'a [Value], obj: &Value, node: &str) -> Vec<&'a Value> {
+/// The store a backup went to: its status's `store` (where the copy was
+/// made), else the `storm.io/backup-to` it asks for.
+fn store_of(obj: &Value) -> Option<String> {
+    obj["status"][BACKUP_STATUS]["store"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| policy::backup_to(obj).map(|s| s.to_string()))
+}
+
+/// The backups of the same VM as `obj`, taken by `node`, to `store`, done,
+/// whose group is still on the node, older than `obj`: newest first.
+///
+/// **Per store** (#458, 59fb97c4517b): a base is only a base in the store that
+/// holds its point. Another store's newest backup would be a diff whose
+/// unchanged blocks were never copied here, so the first backup to a store is
+/// a full copy, and each store's newest group stays on the node as its base
+/// until a later backup to that store is done.
+pub fn older_done<'a>(items: &'a [Value], obj: &Value, node: &str, store: &str) -> Vec<&'a Value> {
     let (ns, name) = ns_name(obj);
     let vm = source_vm(obj);
     let at = created_ms(obj);
@@ -179,6 +197,7 @@ pub fn older_done<'a>(items: &'a [Value], obj: &Value, node: &str) -> Vec<&'a Va
                 && source_vm(o) == vm
                 && o["metadata"]["annotations"][NODE_ANNOTATION].as_str() == Some(node)
                 && backup_phase(o) == "done"
+                && store_of(o).as_deref() == Some(store)
                 && o["status"][BASE_RELEASED] != json!(true)
                 && o["status"]["virtualMachineSnapshotContentName"].as_str().is_some_and(|g| !g.is_empty())
                 && created_ms(o) <= at
@@ -398,7 +417,7 @@ impl Backups {
         if group_id.is_empty() {
             return Err("the snapshot names no group".into());
         }
-        let base_id = older_done(items, obj, &self.node)
+        let base_id = older_done(items, obj, &self.node, &store.name)
             .first()
             .and_then(|o| o["status"]["virtualMachineSnapshotContentName"].as_str().map(str::to_string));
         let (engine, local) = (self.engine.clone(), self.local.clone());
@@ -419,14 +438,15 @@ impl Backups {
         Transfer::backup(ns, vm, name, &group, &disks, base.as_ref(), &self.node, &store.node)
     }
 
-    /// After a backup is done: the older backups' node groups go (this one is
-    /// the next base), the store keeps the VM's newest `keep` points, and a
+    /// After a backup is done: the older backups' node groups in the same
+    /// store go (this one is that store's next base; another store's stays,
+    /// #458), the store keeps the VM's newest `keep` points, and a
     /// scheduled snapshot whose point went is deleted. All through: settled.
     async fn settle(&self, obj: &Value, items: &[Value], store: &Store) {
         let (ns, name) = ns_name(obj);
         let vm = source_vm(obj).to_string();
         let mut ok = true;
-        for old in older_done(items, obj, &self.node) {
+        for old in older_done(items, obj, &self.node, &store.name) {
             let (ons, oname) = ns_name(old);
             let g = old["status"]["virtualMachineSnapshotContentName"].as_str().unwrap_or("").to_string();
             let (engine, local) = (self.engine.clone(), self.local.clone());
@@ -729,9 +749,9 @@ pub(crate) mod tests {
         other["status"][BACKUP_STATUS] = json!({"phase": "done"});
         let b2 = backup("b2", "g-2", "2026-11-18T02:00:00Z");
         let items = vec![b0.clone(), b1.clone(), released, other, b2.clone()];
-        let older: Vec<&str> = older_done(&items, &b2, "n1").iter().map(|o| o["metadata"]["name"].as_str().unwrap()).collect();
+        let older: Vec<&str> = older_done(&items, &b2, "n1", "forge").iter().map(|o| o["metadata"]["name"].as_str().unwrap()).collect();
         assert_eq!(older, ["b1", "b0"], "newest first; never a released one, another VM's, or itself");
-        assert!(older_done(&items, &b2, "n2").is_empty(), "another node's");
+        assert!(older_done(&items, &b2, "n2", "forge").is_empty(), "another node's");
         assert_eq!(last_backup_ms(&items, "web", "web-1"), Some(created_ms(&b2)));
         assert_eq!(last_backup_ms(&items, "web", "nobody"), None);
         let g = group("g-2", &["v-root", "v-data"]);
@@ -773,6 +793,66 @@ pub(crate) mod tests {
         let s = store.lock().unwrap().clone();
         assert_eq!(s[&format!("{SNAPS}/b1")]["status"][BASE_RELEASED], true);
         assert_eq!(s[&format!("{SNAPS}/b2")]["status"][BACKUP_STATUS]["incremental"], true);
+    }
+
+    /// #458 (59fb97c4517b): a base is only taken from the same store, by
+    /// the store its status records, else the one it asks for.
+    #[test]
+    fn the_base_is_taken_from_the_same_store_only() {
+        let mut a = backup("a1", "g-a", "2026-11-18T01:00:00Z");
+        a["status"][BACKUP_STATUS] = json!({"phase": "done", "store": "forge"});
+        let mut t = backup("t1", "g-t", "2026-11-18T01:30:00Z");
+        t["metadata"]["annotations"]["storm.io/backup-to"] = json!("forge");
+        t["status"][BACKUP_STATUS] = json!({"phase": "done", "store": "tape"});
+        let mut asked = backup("t0", "g-t0", "2026-11-18T00:30:00Z");
+        asked["metadata"]["annotations"]["storm.io/backup-to"] = json!("tape");
+        asked["status"][BACKUP_STATUS] = json!({"phase": "done"});
+        let now = backup("n", "g-n", "2026-11-18T02:00:00Z");
+        let items = vec![a, t, asked, now.clone()];
+        let names = |store: &str| -> Vec<String> {
+            older_done(&items, &now, "n1", store).iter().map(|o| o["metadata"]["name"].as_str().unwrap().to_string()).collect()
+        };
+        assert_eq!(names("forge"), ["a1"], "the status's store wins over the annotation");
+        assert_eq!(names("tape"), ["t1", "t0"]);
+        assert!(names("s3").is_empty(), "a first backup to a store has no base");
+    }
+
+    /// #458: a VM whose `backup-to` moves from forge to tape: the first
+    /// backup to tape is a full copy and releases nothing; the next to forge
+    /// is diffed against forge's base, and releases forge's only.
+    #[tokio::test]
+    async fn a_new_store_gets_a_full_copy_and_each_store_keeps_its_base() {
+        let b1 = backup("b1", "g-1", "2026-11-18T01:00:00Z");
+        let (url, store, _) = crate::vm_restore::tests::api(vec![(&format!("{SNAPS}/b1"), b1)]).await;
+        let fake = Arc::new(Fake::default());
+        let tape = parse_store("tape=https://tape1.g16.lo:9090@tape1").unwrap();
+        let b = backups(&url, fake.clone(), vec![forge(), tape]);
+        let get = |n: &str| store.lock().unwrap()[&format!("{SNAPS}/{n}")].clone();
+        b.pass(&[get("b1")]).await;
+        assert_eq!(get("b1")["status"][BACKUP_STATUS]["phase"], "done");
+
+        let mut b2 = backup("b2", "g-2", "2026-11-18T02:00:00Z");
+        b2["metadata"]["annotations"]["storm.io/backup-to"] = json!("tape");
+        store.lock().unwrap().insert(format!("{SNAPS}/b2"), b2);
+        fake.calls.lock().unwrap().clear();
+        b.pass(&[get("b1"), get("b2")]).await;
+        let calls = fake.calls.lock().unwrap().clone();
+        assert!(calls.contains(&"step http://node->https://tape1.g16.lo:9090 bases ,".to_string()), "a full copy to tape: {calls:?}");
+        assert!(!calls.iter().any(|c| c.starts_with("delete")), "forge's base stays: {calls:?}");
+        assert_eq!(get("b2")["status"][BACKUP_STATUS]["incremental"], false);
+        assert_eq!(get("b2")["status"][BACKUP_STATUS]["store"], "tape");
+        assert!(get("b1")["status"][BASE_RELEASED].is_null());
+
+        let b3 = backup("b3", "g-3", "2026-11-18T03:00:00Z");
+        store.lock().unwrap().insert(format!("{SNAPS}/b3"), b3);
+        fake.calls.lock().unwrap().clear();
+        b.pass(&[get("b1"), get("b2"), get("b3")]).await;
+        let calls = fake.calls.lock().unwrap().clone();
+        assert!(calls.contains(&"step http://node->https://forge1.g16.lo:9090 bases s-g-1-v-data,s-g-1-v-root".to_string()), "{calls:?}");
+        assert!(calls.contains(&"delete http://node g-1".to_string()), "{calls:?}");
+        assert!(!calls.contains(&"delete http://node g-2".to_string()), "tape's base stays: {calls:?}");
+        assert_eq!(get("b3")["status"][BACKUP_STATUS]["incremental"], true);
+        assert!(get("b2")["status"][BASE_RELEASED].is_null());
     }
 
     /// A store the kubelet does not know is waited for with why, never failed.
