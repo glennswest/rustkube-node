@@ -15,6 +15,9 @@ over, so the start goes on with the source; any other state holds; an unreadable
 the kubelet's own kept `unknown`/`switching` record for the same migration, so the hold can be lifted without a
 kubelet restart.
 
+Built in 7d8dfe3 (+ test fixes, 869269c); sc-build of 869269c passed (VM sc-build-8b3d789ba5; 3 new tests), clippy: nothing
+in the changed lines. Stage requested; closed.
+
 ### Done: #395, static pods' mirrors name the engine volume each hostPath is on
 
 Built in 521c886 + 6be1ef4 (symlinks); sc-build passed (VM sc-build-e1f665f40d: 797 kubelet tests ok, 4 new);
