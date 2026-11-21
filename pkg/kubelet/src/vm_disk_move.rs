@@ -444,7 +444,7 @@ mod tests {
         for ok in [held(SWITCHED, "v-copy"), held(MOVED, "v-copy"), held(COPYING, ""), held(FAILED, "")] {
             assert_eq!(cold_start_hold(&one(ok.clone()), &none), None, "{ok:?}");
         }
-        assert_eq!(cold_start_hold(&none, &none), None);
+        assert_eq!(cold_start_hold(&BTreeMap::new(), &none), None);
         // What is not held starts on a known volume: the copy, or by name.
         assert_eq!(volumes_of(one(held(MOVED, "v-copy"))), BTreeMap::from([("root".to_string(), "v-copy".to_string())]));
         assert!(volumes_of(one(held(COPYING, ""))).is_empty());
