@@ -4,7 +4,10 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #395, static pods' mirrors name the engine volume each hostPath is on
+### Done: #395, static pods' mirrors name the engine volume each hostPath is on
+
+Built in 521c886 + 6be1ef4 (symlinks); sc-build passed (VM sc-build-e1f665f40d: 797 kubelet tests ok, 4 new);
+clippy: no finding in the changed lines. Stage requested; shipped with proof `storm.io/volume.data` on `kube-system/etcd-{name}`.
 
 etcd (stormcos `deploy/static-pods/etcd.yaml`) keeps its data at `hostPath: /data/fastetcd`; its mirror pod named
 no engine volume (#372 covered claims and stormpump services only). Plan: when a static pod's hostPath volume is
