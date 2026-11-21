@@ -4,7 +4,10 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #449 (P1), review: 4 findings in vm_manager.rs
+### Done: #449 (P1), review: 4 findings in vm_manager.rs
+
+Fixed in f9d7314 (+ ff3f20a type fix); sc-build passed (VM sc-build-a98ee8beff: 789 kubelet tests ok, 6 new). Closed.
+
 
 - 5dba1ccb44f2 (resume annotation names any volume): `prepare_resume` verifies before it attaches or deletes anything:
   the restore is `<VMI ns>/<name>`, exists, targets the VMI's owner VM and still says memory `pending`; the volume is
