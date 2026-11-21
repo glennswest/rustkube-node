@@ -421,7 +421,7 @@ pub fn refusal(disk: &str, kind: &str, volume: Option<&str>, owned: bool, seed: 
 mod tests {
     use super::*;
 
-    fn rec(state: &str, volume: &str) -> Move {
+    fn held(state: &str, volume: &str) -> Move {
         Move { to: "b".into(), node: "a".into(), from: "v-src".into(), migration: "mig-1".into(), state: state.into(), volume: volume.into(), ..Default::default() }
     }
 
@@ -431,42 +431,42 @@ mod tests {
     fn a_cold_start_waits_for_the_disks_known_volume() {
         let one = |m: Move| BTreeMap::from([("root".to_string(), m)]);
         let none = BTreeMap::new();
-        let why = cold_start_hold(&one(rec(UNKNOWN, "v-copy")), &none).unwrap();
+        let why = cold_start_hold(&one(held(UNKNOWN, "v-copy")), &none).unwrap();
         assert!(why.contains("ended unknown") && why.contains("`moved` (the copy v-copy on b)") && why.contains("`failed` (the source v-src on a)"), "{why}");
         let cut = |s: Result<&str, &str>| BTreeMap::from([("mig-1".to_string(), s.map(String::from).map_err(String::from))]);
-        let switching = one(rec(SWITCHING, "v-copy"));
+        let switching = one(held(SWITCHING, "v-copy"));
         assert_eq!(cold_start_hold(&switching, &cut(Ok("synced"))), None, "never cut over: the source is the disk");
         assert_eq!(cold_start_hold(&switching, &cut(Ok("copying"))), None);
         assert!(cold_start_hold(&switching, &cut(Ok("cutover"))).unwrap().contains("migration mig-1 is cutover"));
         assert!(cold_start_hold(&switching, &cut(Err("503"))).unwrap().contains("asked again"));
         assert!(cold_start_hold(&switching, &none).unwrap().contains("no stormstorage"));
-        assert!(cold_start_hold(&one(rec(SWITCHED, "")), &none).unwrap().contains("nothing to attach"));
-        for ok in [rec(SWITCHED, "v-copy"), rec(MOVED, "v-copy"), rec(COPYING, ""), rec(FAILED, "")] {
+        assert!(cold_start_hold(&one(held(SWITCHED, "")), &none).unwrap().contains("nothing to attach"));
+        for ok in [held(SWITCHED, "v-copy"), held(MOVED, "v-copy"), held(COPYING, ""), held(FAILED, "")] {
             assert_eq!(cold_start_hold(&one(ok.clone()), &none), None, "{ok:?}");
         }
         assert_eq!(cold_start_hold(&none, &none), None);
         // What is not held starts on a known volume: the copy, or by name.
-        assert_eq!(volumes_of(one(rec(MOVED, "v-copy"))), BTreeMap::from([("root".to_string(), "v-copy".to_string())]));
-        assert!(volumes_of(one(rec(COPYING, ""))).is_empty());
+        assert_eq!(volumes_of(one(held(MOVED, "v-copy"))), BTreeMap::from([("root".to_string(), "v-copy".to_string())]));
+        assert!(volumes_of(one(held(COPYING, ""))).is_empty());
     }
 
     /// #454: a person's `moved` or `failed` on the VMI ends the kubelet's
     /// own unknown or half-switched record, for the same migration only.
     #[test]
     fn a_persons_verdict_replaces_an_unknown_record() {
-        let kept = BTreeMap::from([("root".to_string(), rec(UNKNOWN, "v-copy")), ("data".to_string(), rec(SWITCHING, "v-c2"))]);
-        let mut said = rec(MOVED, "v-copy");
+        let kept = BTreeMap::from([("root".to_string(), held(UNKNOWN, "v-copy")), ("data".to_string(), held(SWITCHING, "v-c2"))]);
+        let mut said = held(MOVED, "v-copy");
         said.message = "decided".into();
-        let vmi = BTreeMap::from([("root".to_string(), said.clone()), ("data".to_string(), rec(FAILED, ""))]);
+        let vmi = BTreeMap::from([("root".to_string(), said.clone()), ("data".to_string(), held(FAILED, ""))]);
         let out = with_verdicts(kept.clone(), &vmi);
         assert_eq!(out["root"], said);
         assert_eq!(out["data"].state, FAILED);
         let other = BTreeMap::from([("root".to_string(), Move { migration: "mig-0".into(), ..said.clone() })]);
         assert_eq!(with_verdicts(kept.clone(), &other)["root"].state, UNKNOWN, "another migration's record");
-        let stale = BTreeMap::from([("root".to_string(), rec(SWITCHING, "v-copy"))]);
+        let stale = BTreeMap::from([("root".to_string(), held(SWITCHING, "v-copy"))]);
         assert_eq!(with_verdicts(kept.clone(), &stale)["root"].state, UNKNOWN, "only moved or failed is a verdict");
         let mut done = kept.clone();
-        done.insert("root".into(), rec(SWITCHED, "v-copy"));
+        done.insert("root".into(), held(SWITCHED, "v-copy"));
         assert_eq!(with_verdicts(done, &vmi)["root"].state, SWITCHED, "a record not unknown is the kubelet's");
     }
 
