@@ -329,6 +329,50 @@ fn on_host(path: &str) -> std::path::PathBuf {
     }
 }
 
+/// `path` as the host resolves it, every symlink followed (#395): stormcos's
+/// `/data` is a link to `/d`, so etcd's `/data/fastetcd` is on the volume
+/// mounted at `/d/fastetcd`. Links are read under `root` (the host's root as
+/// this process sees it), an absolute target starting again at the host's `/`.
+/// What does not exist is kept as written; past 40 links the path is as given.
+fn host_real_path(root: &std::path::Path, path: &str) -> String {
+    let mut rest: std::collections::VecDeque<String> =
+        path.split('/').filter(|c| !c.is_empty()).map(String::from).collect();
+    let mut done: Vec<String> = Vec::new();
+    let mut links = 0;
+    while let Some(c) = rest.pop_front() {
+        match c.as_str() {
+            "." => continue,
+            ".." => {
+                done.pop();
+                continue;
+            }
+            _ => {}
+        }
+        done.push(c);
+        let here = root.join(done.join("/"));
+        let Ok(target) = std::fs::read_link(&here) else {
+            if std::fs::symlink_metadata(&here).is_err() {
+                // Absent: the rest as written.
+                done.extend(rest.drain(..));
+            }
+            continue;
+        };
+        links += 1;
+        if links > 40 {
+            return path.to_string();
+        }
+        done.pop();
+        let target = target.to_string_lossy().into_owned();
+        if target.starts_with('/') {
+            done.clear();
+        }
+        for t in target.split('/').filter(|c| !c.is_empty()).rev() {
+            rest.push_front(t.to_string());
+        }
+    }
+    format!("/{}", done.join("/"))
+}
+
 fn ensure_host_path(path: &str, typ: &str) {
     match typ {
         "DirectoryOrCreate" => {
@@ -1618,7 +1662,9 @@ impl PodManager {
                         engine_volumes = Some(self.storage_get("/api/v1/volumes").await.unwrap_or(Value::Null));
                     }
                     let items = engine_volumes.as_ref().and_then(|l| l["items"].as_array());
-                    if let Some(id) = items.and_then(|i| host_path_volume(i, hp)) {
+                    let root = std::path::Path::new(HOST_ROOT);
+                    let real = host_real_path(if root.is_dir() { root } else { std::path::Path::new("/") }, hp);
+                    if let Some(id) = items.and_then(|i| host_path_volume(i, &real)) {
                         self.record_pod_volume(uid, &name, id);
                     }
                 }
@@ -11689,6 +11735,27 @@ pub(crate) mod tests {
         assert_eq!(host_path_volume(&items, "/data/"), Some("data"));
         assert_eq!(host_path_volume(&items, "/etc/kubernetes"), None, "`/` names nothing");
         assert_eq!(host_path_volume(&[], "/data"), None);
+    }
+
+    /// #395: a hostPath is matched where the host resolves it: `/data` a
+    /// link to `/d` (stormcos), relative links, `..`, and a missing tail.
+    #[test]
+    fn a_host_path_is_resolved_through_the_hosts_links() {
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        std::fs::create_dir_all(r.join("d/fastetcd")).unwrap();
+        std::os::unix::fs::symlink("/d", r.join("data")).unwrap();
+        std::fs::create_dir_all(r.join("etc")).unwrap();
+        std::os::unix::fs::symlink("../d/fastetcd", r.join("etc/etcd")).unwrap();
+        std::os::unix::fs::symlink("loop", r.join("loop")).unwrap();
+        assert_eq!(host_real_path(r, "/data/fastetcd"), "/d/fastetcd");
+        assert_eq!(host_real_path(r, "/data/fastetcd/member/"), "/d/fastetcd/member");
+        assert_eq!(host_real_path(r, "/etc/etcd"), "/d/fastetcd");
+        assert_eq!(host_real_path(r, "/data/../etc"), "/etc");
+        assert_eq!(host_real_path(r, "/nowhere/x"), "/nowhere/x");
+        assert_eq!(host_real_path(r, "/loop"), "/loop", "a loop is left as given");
+        let items = vec![json!({"id": "etcd", "mounted_at": "/d/fastetcd"})];
+        assert_eq!(host_path_volume(&items, &host_real_path(r, "/data/fastetcd")), Some("etcd"));
     }
 
     /// #395: a static pod's hostPaths are recorded as the engine volumes

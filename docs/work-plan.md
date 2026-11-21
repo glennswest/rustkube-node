@@ -9,7 +9,7 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 etcd (stormcos `deploy/static-pods/etcd.yaml`) keeps its data at `hostPath: /data/fastetcd`; its mirror pod named
 no engine volume (#372 covered claims and stormpump services only). Plan: when a static pod's hostPath volume is
 resolved, read the engine listing once and record the volume mounted at the path or the deepest directory above it
-(by component; `/` names nothing) as the pod's volume (`host_path_volume`). `report_pod_status` patches the
+(by component; `/` names nothing), after following the host's symlinks (`/data` → `/d`, `host_real_path`), as the pod's volume (`host_path_volume`). `report_pod_status` patches the
 mirror with `storm.io/volume.<name>` (merge patch, mirror uid precondition) when it lacks them. `spec.volumes`
 already carries the hostPath (the mirror is the manifest). A hostPath gets no `/stats/summary` `volume[]` entry:
 its sizes would be the whole volume's.

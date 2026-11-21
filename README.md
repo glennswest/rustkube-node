@@ -336,8 +336,8 @@ says the service runs on: its root clone as volume `root` (a hostPath of its mou
 as volumes of those names (its node claims), `volumeMounts` where they are mounted, and
 `storm.io/instance.<svc>`, `storm.io/golden.<svc>` and `storm.io/volume.<name>`. An existing mirror pod is patched
 when these differ, and made again if the apiserver will not patch its spec. A static pod's mirror (etcd's) carries
-`storm.io/volume.<name>` for each hostPath: the engine volume mounted at that path or the deepest directory above
-it (#395; a volume at `/` names nothing). `/stats/summary` lists each pod's `volume[]` with the same ids, hostPaths
+`storm.io/volume.<name>` for each hostPath: the engine volume mounted at that path, the host's symlinks followed
+(`/data` → `/d`), or at the deepest directory above it (#395; a volume at `/` names nothing). `/stats/summary` lists each pod's `volume[]` with the same ids, hostPaths
 left out.
 
 **Node allocatable and cgroups** (#24): allocatable is upstream's, capacity less `--system-reserved`,
