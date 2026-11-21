@@ -173,13 +173,16 @@ in the pod netns the socket is connected on a setns thread and handed to tonic. 
 Full `sc-build` passed on 78e9317 (VM sc-build-5af0b51f5f: 774 kubelet tests ok). HTTPS probes in the pod netns are
 still a connect only: gap #452, proposed. Stage golden requested.
 
-### Waiting on the owner: #442 (P1), review: the native runtime never provides the image rootfs
+### In progress: #442 (P1), review: the native runtime never provides the image rootfs
 
 The finding (`runtime.rs:136`, 3d780a09c92c) is real but is one of several gaps in `--runtime native`: no image
 unpack, no `linux.namespaces` (it never joins the sandbox netns), no image config, and `pull_image` is `Ok` on
-failure. Nothing deploys it; it is only the CLI default. Asked on the issue: A retire `native` (default `stormpump`,
-keep the CRIU `MigrationService` stormpump uses; recommended, matching #13 and no-stubs), B build it out, C require
-`--runtime` (not a fix). `wait-owner` run 2026-11-20. No code changed yet. The owner took `needs-owner` off at 21:21:55 with no answer; asked again (A/B/C, A recommended) and `wait-owner` re-run.
+failure. Asked A/B/C on the issue; the owner took `needs-owner` off three times with no answer and the master rejected
+the wait-owner item ("not an owner decision — session applies the no-stubs rule"). So A, by the no-stubs rule:
+remove `native` from `--runtime` (default `stormpump`), delete `NativeRuntime`/`NativeImageService` and the
+libcontainer/oci-spec deps. The CRIU `MigrationService` stormpump borrowed from a fresh `NativeRuntime` can never
+checkpoint either (it looks the sandbox up in its own, always empty, map), so it goes too (`checkpoint.rs`), and
+`StormpumpRuntime` implements `MigrationService` as evacuate with refusals, like `CriGrpcClient`. Tests for both.
 
 ### Done: #441 (P1), review: ClientIP affinity in kube-proxy's iptables rules
 2026-11-20. 3394445b5e43: `ServiceInfo.session_affinity: Option<u32>` (timeout, default 10800); SEP DNAT `-m recent --set`,
