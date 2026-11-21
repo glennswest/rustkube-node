@@ -4,7 +4,7 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #414, attach: the client's stdin end closes a stdinOnce container's stdin (stormpump_runtime.rs)
+### Done: #414, attach: the client's stdin end closes a stdinOnce container's stdin (stormpump_runtime.rs)
 
 `attach_to`'s stdin copier returned on EOF and left `console.stdin` open, and the engine also keeps a copy of the
 stdin's write end (#429), so the container never read EOF. Plan: carry `stdin_once` from the pod spec
@@ -12,6 +12,11 @@ stdin's write end (#429), so the container never read EOF. Plan: carry `stdin_on
 `stdinOnce` container, drop the kubelet's writer and, without a terminal, withdraw the kept `console/<id>` deposit. A
 persisted `stdin_closed` stops a restarted kubelet calling that stdin "lost with the old kubelet". With a terminal,
 only the writer goes: closing the master would hang the terminal up. Without `stdinOnce`, it stays open, as upstream.
+
+Built in 30b0230; sc-build passed (VM sc-build-a90d865b91), and the 4 new tests passed (sc-build-45355cfa7c: EOF after
+the data and the kept end withdrawn; a plain stdin left open for the next attach; the closing recorded and not called
+lost after a restart; `stdinOnce` parsed). Clippy reported nothing in the changed lines. Stage requested; shipped with
+the kubelet's log line as the proof (sc's medium suite, sc#77, runs `attach -i` to a stdinOnce pod).
 
 ### Done: #458, review 59fb97c4517b: an incremental backup's base from another store (vm_backup.rs)
 
