@@ -8,7 +8,10 @@
 //!   `kubelet_pod_start_phase_duration_seconds{phase}` (#132),
 //!   `kubelet_pleg_relist_duration_seconds`, the `process_*` family and
 //!   `kubernetes_build_info`. Rendered by the Prometheus recorder, which this
-//!   module installs once for the process.
+//!   module installs once for the process. Also
+//!   `kubelet_volume_stats_capacity_bytes` and `kubelet_volume_stats_used_bytes`
+//!   per claim (#456), rendered at scrape time from `/stats/summary`'s
+//!   volumes ([`render_volume_stats`]), so a claim gone from the node drops out.
 //! - **`/metrics/cadvisor`**: what the node's workloads consume, in cAdvisor's
 //!   shape: `container_cpu_usage_seconds_total`,
 //!   `container_memory_working_set_bytes`, `container_fs_usage_bytes`,
@@ -338,6 +341,42 @@ fn network_labels(p: &PodNetworkStats, iface: &str) -> String {
     )
 }
 
+/// `kubelet_volume_stats_*` (#456) from the summary's per-pod volumes
+/// (`PodManager::pod_volume_stats`): one series per claim, labelled
+/// `namespace` and `persistentvolumeclaim` as upstream labels them. Only a
+/// volume with a `pvcRef` has one, as upstream; a claim two pods on the node
+/// mount is reported once. A size the summary does not carry has no series
+/// (absent is not zero), and a family with no series is left out whole.
+pub fn render_volume_stats(pods: &[((String, String), Vec<serde_json::Value>)]) -> String {
+    let mut claims: std::collections::BTreeMap<(String, String), &serde_json::Value> = Default::default();
+    for (_, volumes) in pods {
+        for v in volumes {
+            let (Some(ns), Some(name)) = (v["pvcRef"]["namespace"].as_str(), v["pvcRef"]["name"].as_str()) else {
+                continue;
+            };
+            claims.entry((ns.to_string(), name.to_string())).or_insert(v);
+        }
+    }
+    let mut out = String::new();
+    for (metric, field, help) in [
+        ("kubelet_volume_stats_capacity_bytes", "capacityBytes", "Capacity in bytes of the volume"),
+        ("kubelet_volume_stats_used_bytes", "usedBytes", "Number of used bytes in the volume"),
+    ] {
+        let series: Vec<(String, f64)> = claims
+            .iter()
+            .filter_map(|((ns, name), v)| {
+                v[field].as_u64().map(|b| {
+                    (format!("namespace=\"{}\",persistentvolumeclaim=\"{}\"", escape(ns), escape(name)), b as f64)
+                })
+            })
+            .collect();
+        if !series.is_empty() {
+            family(&mut out, metric, "gauge", help, series.into_iter());
+        }
+    }
+    out
+}
+
 /// A label value in the text format: backslash, quote and newline escaped.
 fn escape(v: &str) -> String {
     v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
@@ -458,6 +497,32 @@ mod tests {
         let i = &got[0];
         assert_eq!((i.rx_packets, i.rx_errors, i.rx_dropped), (40, 2, 3));
         assert_eq!((i.tx_packets, i.tx_errors, i.tx_dropped), (50, 4, 5));
+    }
+
+    /// #456: one series per claim, upstream's labels, a claim two pods
+    /// mount once, a volume with no claim or no size absent.
+    #[test]
+    fn volume_stats_are_per_claim() {
+        use serde_json::json;
+        let pods = vec![
+            (("db".to_string(), "pg-0".to_string()), vec![
+                json!({"name": "data", "volumeId": "v-1", "pvcRef": {"name": "data-pg-0", "namespace": "db"},
+                    "capacityBytes": 1073741824u64, "usedBytes": 104857600u64}),
+                json!({"name": "x", "volumeId": "h-2"}),
+                json!({"name": "other", "volumeId": "h-3", "pvcRef": {"name": "csi", "namespace": "db"}}),
+            ]),
+            (("db".to_string(), "backup".to_string()), vec![
+                json!({"name": "src", "volumeId": "v-1", "pvcRef": {"name": "data-pg-0", "namespace": "db"},
+                    "capacityBytes": 1073741824u64, "usedBytes": 104857600u64}),
+            ]),
+        ];
+        let out = render_volume_stats(&pods);
+        assert!(out.contains("# TYPE kubelet_volume_stats_capacity_bytes gauge"), "{out}");
+        assert!(out.contains(r#"kubelet_volume_stats_capacity_bytes{namespace="db",persistentvolumeclaim="data-pg-0"} 1073741824"#), "{out}");
+        assert!(out.contains(r#"kubelet_volume_stats_used_bytes{namespace="db",persistentvolumeclaim="data-pg-0"} 104857600"#), "{out}");
+        assert_eq!(out.matches("persistentvolumeclaim=").count(), 2, "once per claim and family: {out}");
+        assert!(!out.contains(r#"persistentvolumeclaim="csi""#), "no sizes, no series: {out}");
+        assert_eq!(render_volume_stats(&[]), "", "no claims, no families");
     }
 
     #[test]

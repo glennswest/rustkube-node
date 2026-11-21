@@ -2,6 +2,8 @@
 
 ## 2026-11-21
 
+- **feat:** `/metrics` serves `kubelet_volume_stats_capacity_bytes` and `kubelet_volume_stats_used_bytes`, labelled `namespace` and `persistentvolumeclaim`, for each claim a pod on the node mounts (#456, sc#151). These are the series `oc adm top persistentvolumeclaims` reads. They are rendered at scrape time from the same engine sizes as `/stats/summary`'s `volume[]` (#372): the volume's virtual size (the claim's bound capacity) and the bytes it holds. There is one series per claim, and a claim no longer mounted drops out. A claim with no sizes (another CSI driver's, #223) has no series.
+
 - **BREAKING:** `--runtime native` is retired and the kubelet's default runtime is `stormpump` (#442, 3d780a09c92c). The libcontainer runtime never gave a container its image: its OCI spec named a rootfs (`<pod-uid>-<name>/rootfs`) that `create_container` never made (it made an empty one under a `ct-…` directory), no layer was unpacked, the spec had no namespaces (so a container never joined the sandbox's netns), the image's Entrypoint/Cmd/Env were never read, and its pull returned `Ok` when skopeo failed. It was only the CLI's default; stormcos passes `--runtime stormpump`. `native` is now an unknown value, as `vm` has been since #13. `NativeRuntime`, `NativeImageService`, the CRIU checkpointer and the libcontainer/oci-spec dependencies are removed.
 - **fix:** stormpump's migration service is evacuation (#442). It was a fresh `NativeRuntime`, which looked each pod up in its own sandbox map, always empty under stormpump, so a checkpoint could never be made. A `rustkube.io/migrate-action` on a stormpump pod now ends `checkpoint-failed` with `stormpump pods move by evacuation: no checkpoint`.
 

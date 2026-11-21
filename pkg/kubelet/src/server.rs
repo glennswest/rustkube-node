@@ -475,7 +475,10 @@ async fn healthz() -> impl IntoResponse {
 /// The kubelet's own metrics, under upstream's names (#36; `metrics.rs`).
 async fn metrics(State(pm): State<Arc<PodManager>>) -> impl IntoResponse {
     let snap = pm.metrics_snapshot().await;
-    ([("content-type", "text/plain; version=0.0.4")], crate::metrics::render_kubelet(&snap))
+    let mut out = crate::metrics::render_kubelet(&snap);
+    // Each claim's sizes (#456), the numbers `/stats/summary` reports.
+    out.push_str(&crate::metrics::render_volume_stats(&pm.pod_volume_stats().await));
+    ([("content-type", "text/plain; version=0.0.4")], out)
 }
 
 /// The header a metadata service forwards a host-network workload's
