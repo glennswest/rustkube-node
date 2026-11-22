@@ -95,11 +95,17 @@ pub fn parse_unit(
 /// `None` when no boot unit mounts a volume at the asset's `/var/log/stormd`:
 /// a service not run by stormd, or no such asset.
 pub fn log_dir(root: &Path, asset: &str) -> Option<PathBuf> {
-    let mut units: Vec<PathBuf> = std::fs::read_dir(root.join(BOOT_D))
-        .ok()?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.is_file())
-        .collect();
+    log_dirs(root).remove(asset)
+}
+
+/// Every spec's stormd log directory, as the kubelet sees it, by spec name:
+/// what `/logs/` lists and the journal reads (#198). Empty when there is no
+/// boot.d.
+pub fn log_dirs(root: &Path) -> std::collections::BTreeMap<String, PathBuf> {
+    let mut units: Vec<PathBuf> = match std::fs::read_dir(root.join(BOOT_D)) {
+        Ok(rd) => rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_file()).collect(),
+        Err(_) => return Default::default(),
+    };
     units.sort();
     let (mut volumes, mut dirs) = (HashMap::new(), HashMap::new());
     for u in units {
@@ -107,8 +113,7 @@ pub fn log_dir(root: &Path, asset: &str) -> Option<PathBuf> {
             parse_unit(&text, &mut volumes, &mut dirs);
         }
     }
-    let host = dirs.remove(asset)?;
-    Some(root.join(host.trim_start_matches('/')))
+    dirs.into_iter().map(|(spec, host)| (spec, root.join(host.trim_start_matches('/')))).collect()
 }
 
 /// What a log file in a stormd log directory is.
@@ -183,6 +188,36 @@ pub fn live_files(dir: &Path) -> Vec<(String, PathBuf)> {
             let last = files.last()?;
             (classify(last.file_name()?.to_str()?) == Some((p.clone(), Kind::Live)))
                 .then(|| (p, last.clone()))
+        })
+        .collect()
+}
+
+/// Every log file in a stormd log directory, per process, oldest first: its
+/// finished runs by run id, then the run in progress (rotations oldest first,
+/// then the live file). Processes in name order. What the node's journal
+/// reads (#198).
+pub fn all_files(dir: &Path) -> Vec<(String, Vec<PathBuf>)> {
+    let mut finished: HashMap<String, Vec<(String, PathBuf)>> = HashMap::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let Some(name) = e.file_name().to_str().map(str::to_owned) else { continue };
+            if let Some((p, Kind::Failed(run) | Kind::Exited(run))) = classify(&name) {
+                finished.entry(p).or_default().push((run, e.path()));
+            }
+        }
+    }
+    let mut current: HashMap<String, Vec<PathBuf>> = current_files(dir).into_iter().collect();
+    let mut procs: Vec<String> = finished.keys().chain(current.keys()).cloned().collect();
+    procs.sort();
+    procs.dedup();
+    procs
+        .into_iter()
+        .map(|p| {
+            let mut runs = finished.remove(&p).unwrap_or_default();
+            runs.sort();
+            let mut files: Vec<PathBuf> = runs.into_iter().map(|(_, f)| f).collect();
+            files.extend(current.remove(&p).unwrap_or_default());
+            (p, files)
         })
         .collect()
 }
@@ -352,8 +387,30 @@ pub fn read_run(files: &[PathBuf]) -> Vec<String> {
 pub fn record(assets_json: &str, asset: &str) -> Option<Record> {
     let v: serde_json::Value = serde_json::from_str(assets_json).ok()?;
     let a = v["assets"].as_array()?.iter().find(|a| a["name"] == asset)?;
+    Some(record_of(a))
+}
+
+/// Every named asset in the table, in its order (#198); empty when it does
+/// not parse.
+pub fn records(assets_json: &str) -> Vec<(String, Record)> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(assets_json) else {
+        return Vec::new();
+    };
+    v["assets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|a| {
+            let name = a["name"].as_str().filter(|n| !n.is_empty())?;
+            Some((name.to_string(), record_of(a)))
+        })
+        .collect()
+}
+
+/// One asset's entry, read.
+fn record_of(a: &serde_json::Value) -> Record {
     let text = |k: &str| a[k].as_str().filter(|s| !s.is_empty()).map(str::to_string);
-    Some(Record {
+    Record {
         running: a["running"].as_bool().unwrap_or(false),
         last_exit: text("last_exit"),
         last_error: text("last_error"),
@@ -381,7 +438,7 @@ pub fn record(assets_json: &str, asset: &str) -> Option<Record> {
                 }
             })
             .collect(),
-    })
+    }
 }
 
 #[cfg(test)]
@@ -477,6 +534,54 @@ spec    rustkube-node
              2026-09-28T10:00:01.000Z stdout info [kube-proxy] p1\n\
              2026-09-28T10:00:02.000Z stderr warn [kubelet] k2\n"
         );
+    }
+
+    /// #198: the journal reads a process's whole history, oldest first.
+    #[test]
+    fn all_files_are_finished_runs_then_rotations_then_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        for f in [
+            "etcd.log",
+            "etcd.1.log",
+            "etcd.2.log",
+            "etcd.20260828T000000.exited.log",
+            "etcd.20260827T000000.failed.log",
+            "proxy.20260801T000000.failed.log",
+            "notes.txt",
+        ] {
+            std::fs::write(d.join(f), "").unwrap();
+        }
+        let all = all_files(d);
+        let names: Vec<(String, Vec<String>)> = all
+            .into_iter()
+            .map(|(p, fs)| (p, fs.iter().map(|f| f.file_name().unwrap().to_str().unwrap().to_string()).collect()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                (
+                    "etcd".to_string(),
+                    vec![
+                        "etcd.20260827T000000.failed.log".to_string(),
+                        "etcd.20260828T000000.exited.log".into(),
+                        "etcd.2.log".into(),
+                        "etcd.1.log".into(),
+                        "etcd.log".into(),
+                    ]
+                ),
+                ("proxy".to_string(), vec!["proxy.20260801T000000.failed.log".to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn records_lists_every_named_asset() {
+        let r = records(r#"{"assets":[{"name":"stormblock","running":true},{"running":false},{"name":"registry"}]}"#);
+        let names: Vec<&str> = r.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["stormblock", "registry"]);
+        assert!(r[0].1.running);
+        assert!(records("{").is_empty());
     }
 
     #[test]

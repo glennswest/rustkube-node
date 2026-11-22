@@ -223,7 +223,7 @@ registration uses filesystem notifications with retry deadlines. Snapshots
 follow their watch and take completions.
 
 Fixed paths include `/var/lib/kubelet` for volume records,
-`/var/log/pods` for container logs, `/run/stormvm/<namespace>/<name>/vm.json`
+`/var/log/pods` for container logs, the host's `/var/log` (`/hostroot/var/log`, else the kubelet's own `/var/log` when there is no `/hostroot`) for `/logs/` (#198), `/run/stormvm/<namespace>/<name>/vm.json`
 for VM registration, `/run/stormpump/assets.json` for service mirrors,
 `/pallets` for shipped images (read for user names and argv[0]), and
 `/run/stormpump/roots/<container>` where PID 1 mounts each container's own root: engine volume

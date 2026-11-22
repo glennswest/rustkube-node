@@ -982,6 +982,24 @@ impl PodManager {
         self
     }
 
+    /// Where this node's logs are, for `/logs/` (#198).
+    pub fn host_logs(&self) -> crate::host_logs::Node {
+        crate::host_logs::Node {
+            host_root: self.host_root.clone(),
+            assets_json: self.assets_json.clone(),
+            runs_dir: self.runs_dir(),
+            name: self.node_name.clone(),
+        }
+    }
+
+    /// PID 1's per-run output files: beside its asset table.
+    fn runs_dir(&self) -> std::path::PathBuf {
+        std::path::Path::new(&self.assets_json)
+            .parent()
+            .map(|d| d.join("logs"))
+            .unwrap_or_else(crate::node_logs::engine_log_dir)
+    }
+
     /// The node service behind a mirror pod (#72, #124):
     /// `kube-system/<asset>-<node>`, container `<asset>`, and either a boot
     /// unit that mounts a volume at the asset's `/var/log/stormd` or an entry
@@ -1002,11 +1020,7 @@ impl PodManager {
         if log_dir.is_none() && record.is_none() {
             return None;
         }
-        let runs_dir = std::path::Path::new(&self.assets_json)
-            .parent()
-            .map(|d| d.join("logs"))
-            .unwrap_or_else(crate::node_logs::engine_log_dir);
-        Some(NodeService { log_dir, record, runs_dir })
+        Some(NodeService { log_dir, record, runs_dir: self.runs_dir() })
     }
 
     /// Use this registry of CSI drivers: the one the kubelet's registration

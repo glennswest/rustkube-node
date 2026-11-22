@@ -1355,6 +1355,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rcgen",
+ "regex",
  "reqwest",
  "retry",
  "rustls",

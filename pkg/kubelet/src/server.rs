@@ -183,6 +183,12 @@ fn router_with_console(
         .route("/pods", get(pods))
         // What `kubectl logs` reads, by way of the apiserver proxy.
         .route("/containerLogs/{namespace}/{pod}/{container}", get(container_logs))
+        // What `oc adm node-logs` reads, by way of nodes/proxy (#198): the
+        // node services' journal at `/logs/journal`, the host's log files
+        // under the rest.
+        .route("/logs", get(node_logs_root))
+        .route("/logs/", get(node_logs_root))
+        .route("/logs/{*path}", get(node_logs_path))
         // A VM's console — what the apiserver's subresources.kubevirt.io
         // handler proxies to (rustkube#61), answered by stormvm's own router
         // mounted below (rustkube-node#43).
@@ -1881,6 +1887,82 @@ mod tests {
         let (_, body) = get("/containerLogs/kube-system/stormcluster-n2/stormcluster").await;
         assert!(body.contains("not found on this node"), "{body}");
     }
+
+    /// #198: what `oc adm node-logs` asks through nodes/proxy, as it asks it.
+    #[tokio::test]
+    async fn logs_serves_the_journal_and_the_hosts_log_files() {
+        let root = tempfile::tempdir().unwrap();
+        let bd = root.path().join("etc/stormpump/boot.d");
+        std::fs::create_dir_all(&bd).unwrap();
+        std::fs::write(bd.join("30-kube"), "volume nl /logs/rustkube-node\nspec rustkube-node\n  mount nl /var/log/stormd\n")
+            .unwrap();
+        let logs = root.path().join("logs/rustkube-node");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("kubelet.log"),
+            "2026-11-22T10:00:00.000Z stdout info kubelet started\n2026-11-22T10:00:02.000Z stderr warn Node not ready\n",
+        )
+        .unwrap();
+        std::fs::write(logs.join("kube-proxy.log"), "2026-11-22T10:00:01.000Z stdout info proxy up\n").unwrap();
+        let var_log = root.path().join("var/log");
+        std::fs::create_dir_all(var_log.join("pods")).unwrap();
+        std::fs::write(var_log.join("cron"), "cron ran\n").unwrap();
+
+        let rt = Arc::new(NoopRt);
+        let pm = Arc::new(
+            PodManager::new(rt.clone(), rt, "n1")
+                .with_host_root(root.path())
+                .with_assets_json(root.path().join("run/stormpump/assets.json")),
+        );
+        let get = |uri: &str| {
+            let app = router(pm.clone());
+            let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            async move {
+                let resp = app.oneshot(req).await.unwrap();
+                let status = resp.status();
+                let ctype = resp.headers().get("content-type").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+                let body = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+                (status, ctype, String::from_utf8_lossy(&body).into_owned())
+            }
+        };
+
+        // `oc adm node-logs n1`
+        let (st, _, body) = get("/logs/journal").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            body,
+            "Nov 22 10:00:00.000000 n1 rustkube-node[kubelet]: kubelet started\n\
+             Nov 22 10:00:01.000000 n1 rustkube-node[kube-proxy]: proxy up\n\
+             Nov 22 10:00:02.000000 n1 rustkube-node[kubelet]: Node not ready\n"
+        );
+        // `oc adm node-logs n1 -u kubelet --tail 1`
+        let (_, _, body) = get("/logs/journal?unit=kubelet&query=kubelet&tail=1&tailLines=1").await;
+        assert_eq!(body, "Nov 22 10:00:02.000000 n1 rustkube-node[kubelet]: Node not ready\n");
+        // Upstream's NodeLogQuery spelling.
+        let (_, _, body) = get("/logs/?query=kube-proxy&output=cat").await;
+        assert_eq!(body, "proxy up\n");
+        let (st, _, body) = get("/logs/journal?unit=sshd").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert!(body.contains("its services: rustkube-node"), "{body}");
+        let (st, _, _) = get("/logs/journal?boot=-1").await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        // `oc adm node-logs n1 --path=/`: oc prints each href.
+        let (st, ctype, body) = get("/logs/").await;
+        assert_eq!((st, ctype.as_str()), (StatusCode::OK, "text/html; charset=utf-8"));
+        assert!(body.starts_with("<!doctype html>"), "{body}");
+        for e in ["href=\"cron\"", "href=\"pods/\"", "href=\"rustkube-node/\""] {
+            assert!(body.contains(e), "{e}: {body}");
+        }
+        // `--path=cron`, `--path=rustkube-node/kubelet.log`
+        assert_eq!(get("/logs/cron").await.2, "cron ran\n");
+        let (_, _, body) = get("/logs/rustkube-node/kube-proxy.log").await;
+        assert_eq!(body, "2026-11-22T10:00:01.000Z stdout info proxy up\n");
+        let (_, _, body) = get("/logs/rustkube-node").await;
+        assert!(body.contains("href=\"kubelet.log\""), "{body}");
+        assert_eq!(get("/logs/nothing").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(get("/logs/rustkube-node/%2E%2E/%2E%2E/etc/stormpump/boot.d/30-kube").await.0, StatusCode::BAD_REQUEST);
+    }
 }
 
 
@@ -2039,6 +2121,117 @@ fn newer_run_on_disk(path: &str) -> bool {
     std::fs::read_dir(dir)
         .map(|rd| rd.filter_map(|e| e.ok()).any(|e| run(&e.path()).is_some_and(|r| r > this)))
         .unwrap_or(false)
+}
+
+/// `GET /logs` and `/logs/`: the listing of the node's log files, or, with
+/// upstream NodeLogQuery's `query=`, the services' journal (#198).
+async fn node_logs_root(
+    State(pm): State<Arc<PodManager>>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Response {
+    if pairs.iter().any(|(k, _)| k == "query") {
+        return node_journal(pm, pairs).await;
+    }
+    node_log_file(pm, String::new()).await
+}
+
+/// `GET /logs/<path>`: `journal` is the services' journal, anything else a
+/// file or directory under the node's log directories (#198).
+async fn node_logs_path(
+    State(pm): State<Arc<PodManager>>,
+    Path(path): Path<String>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Response {
+    if path.trim_end_matches('/') == "journal" {
+        return node_journal(pm, pairs).await;
+    }
+    node_log_file(pm, path).await
+}
+
+/// The node services' journal ([`crate::host_logs`]), streamed as it is
+/// merged: a read thread sends chunks into a bounded channel, so a slow
+/// reader slows the read rather than growing a buffer.
+async fn node_journal(pm: Arc<PodManager>, pairs: Vec<(String, String)>) -> Response {
+    use crate::host_logs;
+    let q = match host_logs::Query::parse(&pairs, chrono::Utc::now(), host_logs::boot_time) {
+        Ok(q) => q,
+        Err(why) => return (StatusCode::BAD_REQUEST, why).into_response(),
+    };
+    let node = pm.host_logs();
+    let read = tokio::task::spawn_blocking(move || {
+        let services = node.services();
+        host_logs::chains(&node, &services, &q.units).map(|chains| (node, q, chains))
+    })
+    .await;
+    let (node, q, chains) = match read {
+        Ok(Ok(found)) => found,
+        Ok(Err(why)) => return (StatusCode::NOT_FOUND, why).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("reading the journal: {e}\n")).into_response(),
+    };
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(16);
+    tokio::task::spawn_blocking(move || {
+        host_logs::write_journal(chains, &q, &node.name, |chunk| tx.blocking_send(Ok(chunk)).is_ok());
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        .unwrap_or_else(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response())
+}
+
+/// A file under the node's log directories, streamed, or a directory's
+/// listing in Go's `http.FileServer` form, which oc reads (#198).
+async fn node_log_file(pm: Arc<PodManager>, path: String) -> Response {
+    use crate::host_logs::{self, Found, Refused};
+    let node = pm.host_logs();
+    let found = match tokio::task::spawn_blocking(move || host_logs::resolve(&node, &path)).await {
+        Ok(f) => f,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response(),
+    };
+    let file = match found {
+        Ok(Found::Dir(entries)) => {
+            return (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                host_logs::listing_html(&entries),
+            )
+                .into_response()
+        }
+        Ok(Found::File(f)) => f,
+        Err(Refused(code, why)) => {
+            return (StatusCode::from_u16(code).unwrap_or(StatusCode::NOT_FOUND), why).into_response()
+        }
+    };
+    let f = match std::fs::File::open(&file) {
+        Ok(f) => f,
+        Err(e) => return (StatusCode::NOT_FOUND, format!("{}: {e}\n", file.display())).into_response(),
+    };
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(16);
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut f = f;
+        loop {
+            let mut buf = vec![0u8; 64 * 1024];
+            match f.read(&mut buf) {
+                Ok(0) => return,
+                Ok(n) => {
+                    buf.truncate(n);
+                    if tx.blocking_send(Ok(buf)).is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    return;
+                }
+            }
+        }
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        .unwrap_or_else(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response())
 }
 
 /// `containerLogs` for a node service's mirror pod: its stormd log volume
