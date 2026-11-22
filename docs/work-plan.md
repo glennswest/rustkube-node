@@ -4,7 +4,7 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### Doing: #198, the kubelet serves `/logs/` (`oc adm node-logs` through nodes/proxy, rustkube#108)
+### Built, node run pending: #198, the kubelet serves `/logs/` (`oc adm node-logs` through nodes/proxy, rustkube#108)
 
 2026-11-22. `oc adm node-logs` (openshift/oc `pkg/cli/admin/node/logs.go`) asks `GET …/proxy/logs/journal` by default
 (`-u X` adds `unit=X&query=X`; `--since`/`--until`/`--boot`/`--tail`/`--grep`/`--case-sensitive`/`-o` become `since`,
@@ -23,6 +23,11 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 3. Routes `/logs`, `/logs/`, `/logs/{*path}` (`journal` and `/logs/?query=` → the journal); tests; docs/api.md,
    README, CHANGELOG. Same bearer auth as every route; authorization per subresource is #180.
 4. sc-build; stage; ship with a proof on a node.
+
+Built in d16cb54 (`host_logs.rs`, routes in server.rs); sc-build passed (VM sc-build-c195e72113: 824 kubelet tests ok,
+12 new: 9 in host_logs, 2 in node_logs, `logs_serves_the_journal_and_the_hosts_log_files` through the router as oc asks).
+No new warnings. Stage requested; shipped with `api:/api/v1/nodes/{node}/proxy/logs/journal` as the proof. Not seen
+on a node yet: whether `/hostroot/var/log` exists on stormcos is unchecked. rustkube's oc-adm.sh flip is filed there.
 
 ### Done: #460, review cd264eea6874: readiness ignores successThreshold/failureThreshold (pod_manager.rs)
 
