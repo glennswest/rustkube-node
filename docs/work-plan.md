@@ -4,6 +4,26 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### Doing: #198, the kubelet serves `/logs/` (`oc adm node-logs` through nodes/proxy, rustkube#108)
+
+2026-11-22. `oc adm node-logs` (openshift/oc `pkg/cli/admin/node/logs.go`) asks `GET …/proxy/logs/journal` by default
+(`-u X` adds `unit=X&query=X`; `--since`/`--until`/`--boot`/`--tail`/`--grep`/`--case-sensitive`/`-o` become `since`,
+`until`, `boot`, `tail`+`tailLines`, `grep`+`pattern`, `case-sensitive`, `output`), and `--path=P` asks `…/logs/P`
+(a directory listing is parsed from `<pre>`/`<!doctype html>` hrefs, upstream FileServer's format). Plan:
+1. `host_logs.rs`: the node's services = every boot.d spec with a stormd log volume + every asset in assets.json; one
+   journal per service from all its files (finished runs, rotations, live; or PID 1's runs for a service stormd does
+   not run, their lines at their run's start, they carry no time), k-way merged by time; filters unit/query, since/
+   sinceTime, until/untilTime (journalctl's forms: RFC 3339, `YYYY-MM-DD[ HH:MM[:SS]]`, now/today/yesterday/tomorrow,
+   `-1h`, `2 days ago`), boot (0 = since the host's btime; an older boot is answered as journalctl does: not
+   available), grep/pattern + case-sensitive, tail/tailLines (≤ 100000), output short, short-precise (default, as
+   upstream's NodeLogQuery), short-iso, short-unix, cat, json.
+2. File side: `/logs/` lists the host's `/var/log` (`/hostroot/var/log`) and each service's log directory by service
+   name (a host entry wins a clash); `/logs/<path>` serves a file or lists a directory, confined to those roots
+   (no `..`, symlinks may not leave the root).
+3. Routes `/logs`, `/logs/`, `/logs/{*path}` (`journal` and `/logs/?query=` → the journal); tests; docs/api.md,
+   README, CHANGELOG. Same bearer auth as every route; authorization per subresource is #180.
+4. sc-build; stage; ship with a proof on a node.
+
 ### Done: #460, review cd264eea6874: readiness ignores successThreshold/failureThreshold (pod_manager.rs)
 
 Each readiness result was assigned to `state.ready` directly. Now `PodState::readiness_run` keeps each container's
