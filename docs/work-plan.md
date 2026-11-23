@@ -4,6 +4,22 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #465, the node's stormd bound read-only at `/.stormd` (stormcos#822 phase 2, one stormd per release)
+
+2026-11-22. Contract: stormcos `docs/STORMD-SHARED.md`; stormcos 6db1d05 (#1551) makes `stormd` a system1 member
+mounted `stormd:/p/stormd` (optional) and binds it `ro` at `/.stormd` in its boot.d units. Plan:
+1. `shared_stormd.rs`: the source is the node mount list's (`/etc/stormblock/mounts`, else the command line's
+   `rd.stormblock.mount=`) entry for the volume `stormd`, as `/pallets/<path>`; none listed, `/pallets/stormd`. A
+   container wants it when its own root has `/.stormd` as a real directory (not a link, not a file). The source is
+   usable when `<source>/bin/stormd` is a file.
+2. stormpump `create_container`, after the root is mounted: wanted and usable → a read-only bind `/.stormd` appended
+   to the container's mounts (a pod volume already at `/.stormd` wins), then `mounts_fit`; wanted and not usable → a
+   warning naming the path, no bind, the container starts as today (phase 1 images carry `/stormd`). Not wanted → no
+   bind. Every container of the pod (init, sidecars, ephemeral) passes through `create_container`.
+3. The CRI runtime is untouched: the kubelet cannot see a CRI image's root (stated in docs/status.md).
+4. Tests (a root with `/.stormd` gets a ro bind, one without gets none, a missing source gets none, a link is not a
+   mount point), docs, CHANGELOG; sc-build; stage.
+
 ### Built, node run pending: #198, the kubelet serves `/logs/` (`oc adm node-logs` through nodes/proxy, rustkube#108)
 
 2026-11-22. `oc adm node-logs` (openshift/oc `pkg/cli/admin/node/logs.go`) asks `GET …/proxy/logs/journal` by default
