@@ -4,7 +4,7 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #465, the node's stormd bound read-only at `/.stormd` (stormcos#822 phase 2, one stormd per release)
+### Built, node run pending: #465, the node's stormd bound read-only at `/.stormd` (stormcos#822 phase 2, one stormd per release)
 
 2026-11-22. Contract: stormcos `docs/STORMD-SHARED.md`; stormcos 6db1d05 (#1551) makes `stormd` a system1 member
 mounted `stormd:/p/stormd` (optional) and binds it `ro` at `/.stormd` in its boot.d units. Plan:
@@ -19,6 +19,13 @@ mounted `stormd:/p/stormd` (optional) and binds it `ro` at `/.stormd` in its boo
 3. The CRI runtime is untouched: the kubelet cannot see a CRI image's root (stated in docs/status.md).
 4. Tests (a root with `/.stormd` gets a ro bind, one without gets none, a missing source gets none, a link is not a
    mount point), docs, CHANGELOG; sc-build; stage.
+
+Built in d0a1a64 (`shared_stormd.rs`, the hook in stormpump `create_container`), and the bind is logged
+(`the node's stormd image bound read-only at /.stormd`). sc-build passed (VM sc-build-69b3c16537: the whole
+workspace; VM sc-build-a30e1856f4: the 6 new `shared_stormd` tests ok, clippy nothing in the changed files; the 4
+rustc warnings are main's, #385/#386). Not seen on a node: it needs a release with stormcos#1551 (6db1d05, the
+`stormd` member at `/p/stormd`) and a phase 1 image (fastetcd, rustkube-apiserver, stormcos#822). Shipped with
+the kubelet's journal line (#198's `/logs/journal`) as the proof.
 
 ### Built, node run pending: #198, the kubelet serves `/logs/` (`oc adm node-logs` through nodes/proxy, rustkube#108)
 

@@ -1902,6 +1902,10 @@ impl RuntimeService for StormpumpRuntime {
                     self.discard_root(Some(root), &made.volume_id).await;
                     return Err(e);
                 }
+                tracing::info!(
+                    container = %config.name, pod = %pod, image = %config.image,
+                    "the node's stormd image bound read-only at {}", crate::shared_stormd::MOUNT_POINT
+                );
                 stormd_config = c;
                 &stormd_config
             }
