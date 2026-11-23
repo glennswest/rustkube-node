@@ -281,6 +281,14 @@ container's private writable clone, so what the image has there is kept and it g
 never follows a symlink, and one on the path (or a file) leaves it unmade with a warning. With
 `readOnlyRootFilesystem` it is writable only while the root is (stormpump#108).
 
+**The release's one stormd** (#465, stormcos#822, stormcos `docs/STORMD-SHARED.md`): on stormpump, a container
+whose own root has a `/.stormd` directory (a real directory, not a link) gets the node's stormd image bound there
+read-only, so it sees `/.stormd/bin/stormd` and cannot write it. The image is where the node's mount list mounts
+the engine volume `stormd` (`stormd:/p/stormd` → `/pallets/stormd`), else `/pallets/stormd`. Each container of a pod
+is decided by its own root. A pod volume at `/.stormd` wins. A root without `/.stormd` gets no bind. A node with no
+`bin/stormd` there gets no bind and a warning naming the path, and the container runs as before on the image's own
+`/stormd`. The CRI runtime gets no bind: the kubelet cannot see a CRI image's root.
+
 **Capabilities** (#118, stormpump#47's `Spec.caps`): a container gets the runtime's standard 14 (Docker's,
 containerd's and CRI-O's: CHOWN, DAC_OVERRIDE, FSETID, FOWNER, MKNOD, NET_RAW, SETGID, SETUID, SETFCAP, SETPCAP,
 NET_BIND_SERVICE, SYS_CHROOT, KILL, AUDIT_WRITE), minus `capabilities.drop`, plus `capabilities.add` (drop first, so

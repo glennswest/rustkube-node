@@ -247,7 +247,7 @@ pub enum MountPropagation {
 }
 
 /// Mount specification.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Mount {
     pub container_path: String,
     pub host_path: String,

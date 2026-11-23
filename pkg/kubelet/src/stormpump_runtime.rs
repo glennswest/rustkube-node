@@ -1886,6 +1886,36 @@ impl RuntimeService for StormpumpRuntime {
             }
         };
         steps.mount = mounting.elapsed();
+        // The release's one stormd (#465, stormcos#822): a root with a
+        // `/.stormd` directory gets the node's stormd image there, read-only.
+        // Read from this container's own root, which is its image's content.
+        let stormd_config;
+        let config = match crate::shared_stormd::bind_for(
+            std::path::Path::new(&mount),
+            &config.mounts,
+            &crate::shared_stormd::node_source(),
+        ) {
+            crate::shared_stormd::Bind::Add(m) => {
+                let mut c = config.clone();
+                c.mounts.push(m);
+                if let Err(e) = mounts_fit(&c) {
+                    self.discard_root(Some(root), &made.volume_id).await;
+                    return Err(e);
+                }
+                stormd_config = c;
+                &stormd_config
+            }
+            crate::shared_stormd::Bind::Missing { source } => {
+                tracing::warn!(
+                    container = %config.name, pod = %pod, image = %config.image, %source,
+                    "the image has /.stormd and this node has no stormd image at {source} (no {}): \
+                     not bound; the container runs the image's own /stormd",
+                    crate::shared_stormd::BINARY
+                );
+                config
+            }
+            crate::shared_stormd::Bind::NotWanted | crate::shared_stormd::Bind::PodOwns => config,
+        };
         let defining = std::time::Instant::now();
         if config.readonly_rootfs {
             tracing::warn!(

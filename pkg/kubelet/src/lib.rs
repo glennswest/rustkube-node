@@ -23,6 +23,7 @@ pub mod network_status;
 pub mod node_health;
 pub mod node_logs;
 pub mod rdma;
+pub mod shared_stormd;
 pub mod realtime;
 pub mod start_timing;
 pub mod static_mirror;
