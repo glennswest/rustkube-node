@@ -13,6 +13,8 @@ literals, so a `// notsecret` cannot go on their line. Plan: a root `.gitleaks.t
 `regexes` anchored to those two values (`={0,2}` for how the rule's capture ends); no `paths`. No code change.
 gitleaks was not run here (no local scanner; the container run was not permitted): the next nightly scan confirms
 and closes the issue.
+Built in 192177f; sc-build passed (VM sc-build-aaa5c70ea7, `cargo build --locked && cargo test --locked`, every
+suite ok, 830 kubelet unit). Issue left open for the nightly scan to close.
 
 ### Built, node run pending: #465, the node's stormd bound read-only at `/.stormd` (stormcos#822 phase 2, one stormd per release)
 
