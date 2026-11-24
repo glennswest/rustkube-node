@@ -4,7 +4,7 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### Done (scan to confirm): #473, secret scan's 6 `generic-api-key` findings at a0e44d3 (stormcentral#1679)
+### Done, verified with gitleaks 8.30.1: #473, secret scan's 6 `generic-api-key` findings at a0e44d3 (stormcentral#1679)
 
 2026-11-23. All six are WebSocket handshake nonces (`Sec-WebSocket-Key`), not credentials: RFC 6455's sample
 `dGhlIHNhbXBsZSBub25jZQ==` ("the sample nonce", server.rs:1400/1420/1483/3318, unit tests) and
@@ -15,6 +15,9 @@ gitleaks was not run here (no local scanner; the container run was not permitted
 and closes the issue.
 Built in 192177f; sc-build passed (VM sc-build-aaa5c70ea7, `cargo build --locked && cargo test --locked`, every
 suite ok, 830 kubelet unit). Issue left open for the nightly scan to close.
+2026-11-24: verified with gitleaks 8.30.1 itself (the release tarball, sha256 checked against the release's
+checksums), `gitleaks dir` on `git archive` trees: a0e44d3 gives exactly the issue's 6 findings; HEAD without its
+`.gitleaks.toml` gives the same 6; HEAD with it gives none. Issue closed.
 
 ### Built, node run pending: #465, the node's stormd bound read-only at `/.stormd` (stormcos#822 phase 2, one stormd per release)
 
