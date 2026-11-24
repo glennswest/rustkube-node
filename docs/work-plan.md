@@ -4,6 +4,16 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### Done (scan to confirm): #473, secret scan's 6 `generic-api-key` findings at a0e44d3 (stormcentral#1679)
+
+2026-11-23. All six are WebSocket handshake nonces (`Sec-WebSocket-Key`), not credentials: RFC 6455's sample
+`dGhlIHNhbXBsZSBub25jZQ==` ("the sample nonce", server.rs:1400/1420/1483/3318, unit tests) and
+`c3Rvcm12bS10ZXN0LWtleQ==` ("stormvm-test-key", test/src/api.rs:113/232). Three sit inside multi-line string
+literals, so a `// notsecret` cannot go on their line. Plan: a root `.gitleaks.toml` with only `[allowlist]`
+`regexes` anchored to those two values (`={0,2}` for how the rule's capture ends); no `paths`. No code change.
+gitleaks was not run here (no local scanner; the container run was not permitted): the next nightly scan confirms
+and closes the issue.
+
 ### Built, node run pending: #465, the node's stormd bound read-only at `/.stormd` (stormcos#822 phase 2, one stormd per release)
 
 2026-11-22. Contract: stormcos `docs/STORMD-SHARED.md`; stormcos 6db1d05 (#1551) makes `stormd` a system1 member

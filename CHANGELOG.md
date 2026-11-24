@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-23
+
+- **chore:** `.gitleaks.toml` at the repo root allowlists the two WebSocket handshake nonces the nightly secret scan read as API keys (#473, stormcentral#1679): RFC 6455's sample `Sec-WebSocket-Key` in the kubelet's upgrade tests and the test client's. They are nonces, not secrets. The allowlist is two anchored regexes for those exact values, nothing else.
+
 ## 2026-11-22
 
 - **feat:** The release's one stormd is bound read-only at `/.stormd` in every stormpump container whose image has that directory (#465, stormcos#822 phase 2, the contract in stormcos `docs/STORMD-SHARED.md`). The kubelet looks in the container's own root after PID 1 mounts it: `/.stormd` there as a directory (not a link or a file) gets a read-only bind of the node's stormd image, which is where the node's mount list (`/etc/stormblock/mounts`, else the command line) mounts the volume `stormd` (`/pallets/stormd` on stormcos 6db1d05), else `/pallets/stormd`. Images without `/.stormd` get no bind. A pod volume at `/.stormd` is kept instead. A node whose stormd image has no `bin/stormd` gets no bind and a warning naming the path, and the container starts as before on its image's own `/stormd` (phase 1 images still carry it). The bind counts toward stormpump's mount limit (#439). CRI runtimes are unchanged.

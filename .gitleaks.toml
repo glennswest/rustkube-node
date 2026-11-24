@@ -1,0 +1,14 @@
+# Secret-scan allowlist (stormcentral#1679, #473): only false positives, as
+# tight as they can be. A real secret is never listed here: rotate it and
+# report it (stormcentral deploy/sessions-CLAUDE.md, "Test secrets and secret
+# scans").
+[allowlist]
+description = "rustkube-node false positives"
+regexes = [
+  # WebSocket handshake nonces (Sec-WebSocket-Key), not credentials: a client
+  # sends any 16 bytes, base64'd. RFC 6455's sample, "the sample nonce"
+  # (pkg/kubelet/src/server.rs tests).
+  '''^dGhlIHNhbXBsZSBub25jZQ={0,2}$''',
+  # "stormvm-test-key" (test/src/api.rs, the test client's upgrades).
+  '''^c3Rvcm12bS10ZXN0LWtleQ={0,2}$''',
+]
