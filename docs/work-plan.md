@@ -4,6 +4,16 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #479, review e353605dcd69: an in-netns HTTP probe parses one read as the status line (health.rs)
+
+2026-11-25. `http_get_blocking` (plain `http` httpGet in the pod netns) makes one `read` and hands its bytes to
+`probe_status`. TCP may return part of the line (`HT`), so a healthy container's probe fails. Plan: read until the
+first CRLF, EOF or 512 bytes (the bound the https path keeps), each read's timeout the time left before the probe's
+deadline (connect included), so a server trickling bytes cannot hold the thread past the probe's timeout; then
+`probe_status`. Tests through `http_get_blocking` on loopback: the status line in two writes (`HT`, then the rest,
+apart in time, `TCP_NODELAY`) passes; a line that never ends before the deadline fails within the timeout. CHANGELOG;
+sc-build.
+
 ### Parked after install rustkube-node>=b7377a3 on a pve machine: #469, `kubelet_volume_stats_available_bytes` and `_inodes*` for built-in claims
 
 2026-11-25. The issue's second route, the kubelet itself, needs no engine op: stormpump already gives a running
