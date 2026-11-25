@@ -1222,7 +1222,7 @@ CA is fatal at start; `http://` works as before. Not the client pair (not asked;
        Done: b0657da. sc-build (VM sc-build-10a512b4c7) build + all tests pass, incl. new `connect_control_is_up_once_the_socket_listens` (a real Unix socket).
        clippy -p kubelet: nothing on the changed lines (the rest is #386). Stage requested; shipped with proof `on any:pve log:VMI .* started: .*control=([0-9]\.[0-9]|1[0-9])ms` (under 20 ms).
 
-### Waiting on stormblock#521 + stormpump#199: #311 (P1), X9 blades: container start 4-9 s in `containers`
+### Done: #311 (P1), X9 blades: container start 4-9 s in `containers`
 
 2026-11-03. From the kubelet's own lines (bootlog server7-1793752767, 12.58 warm c1/c2/c3, seconds): engine clone 1.96/2.57/3.48, mount + the rest of create
 0.64/0.56/0.30, spawn 1.44/0.20/0.51; total 4.05/3.34/4.29 (Dell 0.26-0.45, pvetest1 0.07). server1 (server1-1793278829, later in that boot): clone 10-17 s,
@@ -1234,7 +1234,11 @@ the cost: a sealed source gets no fsck (stormblock `clone_volume_impl`, "a full 
 2. [x] Findings on stormblock#521 (clone) and stormpump#199 (mount, spawn). Proposed `--after-release rustkube-node>=6a3b27a`.
 3. [x] Split confirmed live: server1 12.61 (install server1-1793831579), warm c: containers 1434/3723/5224, clone 472/1010/3725, mount 273/1009/1044, spawn 376/1504/258, lookup ~100, attach ~80;
        cold c on the same disk before the reboot: clone 183, mount 67, spawn 48. Findings on stormblock#521, stormpump#199. `lookup` filed as #326 (P3).
-4. [ ] Target since stormcos#804 (fix 7): warm container < 1.5 s on an X9. Not met, nearly all engine time. Proposed after stormblock#521 + stormpump#199. Resume: on a release with both, `warm_container_start_timing` on an X9; close on < 1.5 s, else file the step that misses.
+4. [x] Target since stormcos#804 (fix 7): warm container < 1.5 s on an X9. Not met, nearly all engine time. Proposed after stormblock#521 + stormpump#199. Resume: on a release with both, `warm_container_start_timing` on an X9; close on < 1.5 s, else file the step that misses.
+       2026-11-25: met on server8 (Supermicro X9SRD-F, ST2000DM008 SMR, as server7). 12.94 (`server8-1795036790`): warm `containers` 152/181/159 ms
+       (clone 24-30, mount 8-19, spawn 12-19, lookup 19-41, attach 58-60), runs 0.53/0.63/0.87 s from outside. 12.92 (`server8-1795014308`, failed later at warm claims, not
+       this step): `containers` 189/192/201 ms. Under the target by ~8x; the 48 s outside tail of 12.61 is gone. server7's newest (12.97) stopped at node Ready, before probes.
+       No code. Closed with the numbers. stormblock#521, stormpump#199 (teardown unmounts) and #326 stay open on their own.
 
 ### Waiting on stormcos-cilium#38 (the agent's `api-rate-limit`): #310 (P1), Dell: a claim pod's `sandbox/cni` ~7 s since 12.37
 

@@ -2,6 +2,8 @@
 
 ## 2026-11-25
 
+- **docs:** #311 closed: on an X9 (server8, the same SMR drive as server7) a warm container start's `containers` step is 152-201 ms on 12.92 and 12.94, against the < 1.5 s target (it was 1.4-5.2 s on 12.61); the engines' clone, mount and spawn are now tens of ms. No kubelet change.
+
 - **feat:** `/metrics` serves `kubelet_volume_stats_available_bytes`, `_inodes`, `_inodes_free` and `_inodes_used` per claim, and `/stats/summary`'s `volume[]` carries `availableBytes`, `inodes`, `inodesFree` and `inodesUsed` (#469). A built-in claim is mounted by its container, in the container's mount namespace, so the kubelet asks the filesystem there: the container's pid from stormpump, its `mountPath` for the claim resolved under `/proc/<pid>/root` with `openat2(RESOLVE_IN_ROOT)` (an absolute symlink in the image cannot lead to a host path), then `fstatvfs`, the numbers `df -B1` and `df -i` show. A path that is not a mount point gives nothing, so the container root's sizes are never reported as the claim's. With no running container mounting the claim, or under the CRI runtime, the four are absent. `capacityBytes` and `usedBytes` stay the engine's (#456).
 
 ## 2026-11-24
