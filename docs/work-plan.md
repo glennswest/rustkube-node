@@ -43,6 +43,8 @@ Done: b7377a3, test crate sc-build passed (20261125-110009-b7377a3d, 84 ok). The
 machine runs a known release (C2NR0Q2, pvetest1-3, server1, server7: last install failed or cancelled) and server8 was
 in its 19:00-06:00 power-off window. Parked (proposal c4ead815bddf) until a release with rustkube-node>=b7377a3 installs on
 server8. Resume: `stormcentral test run rustkube-node pvc` on server8; close #469 when `pvc-volume-stats` passes, else fix what it shows.
+2026-11-25 10:30 CST: resumed; `stormcentral test run rustkube-node pvc` placed on server8 (run e70d6ec963, test image at 4896a3c;
+every other test machine skipped: no known release). Waiting on its result.
 
 ### Done (unit-verified; not run on a node): #452, an `https` httpGet probe in the pod netns does a real HTTPS GET
 
