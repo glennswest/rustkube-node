@@ -4,7 +4,7 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### Parked after install rustkube-node>=b7377a3@server8: #469, `kubelet_volume_stats_available_bytes` and `_inodes*` for built-in claims
+### Parked after install rustkube-node>=b7377a3 on a pve machine: #469, `kubelet_volume_stats_available_bytes` and `_inodes*` for built-in claims
 
 2026-11-25. The issue's second route, the kubelet itself, needs no engine op: stormpump already gives a running
 container's pid (`query_info`, as the identity record uses, #84). Plan:
@@ -44,7 +44,9 @@ machine runs a known release (C2NR0Q2, pvetest1-3, server1, server7: last instal
 in its 19:00-06:00 power-off window. Parked (proposal c4ead815bddf) until a release with rustkube-node>=b7377a3 installs on
 server8. Resume: `stormcentral test run rustkube-node pvc` on server8; close #469 when `pvc-volume-stats` passes, else fix what it shows.
 2026-11-25 10:30 CST: resumed; `stormcentral test run rustkube-node pvc` placed on server8 (run e70d6ec963, test image at 4896a3c;
-every other test machine skipped: no known release). Waiting on its result.
+every other test machine skipped: no known release). It was skipped too: #791, `pvc` at 4896a3c has no pass on a pve
+machine (pvetest1/2), and both have failed installs; `--force-hardware` does not fit (no hardware cause). Parked again
+(c4ead815bddf), now also after `install:rustkube-node>=b7377a3@any:pve`. Resume: the pvc run on a pve machine, then server8.
 
 ### Done (unit-verified; not run on a node): #452, an `https` httpGet probe in the pod netns does a real HTTPS GET
 
