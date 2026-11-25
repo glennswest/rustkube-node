@@ -105,8 +105,6 @@ cluster_read = [
   { apiGroup = "storage.k8s.io", resource = "storageclasses" },
   { apiGroup = "snapshot.storage.k8s.io", resource = "volumesnapshotclasses" },
   { apiGroup = "snapshot.storage.k8s.io", resource = "volumesnapshotcontents" },
-  # `pvc-volume-stats` (#469): the node's /stats/summary through the apiserver.
-  { apiGroup = "", resource = "nodes/proxy" },
 ]
 
 [realtime]

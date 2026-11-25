@@ -25,8 +25,10 @@
 //!   (the kubelet sent the tier on the blank's clone). A skip where the class
 //!   is not there (a node with no SSD beside a rotating system drive).
 //! - `pvc-volume-stats` (#469): a pod holding a 64Mi claim reports its
-//!   `statvfs` (`df -B1`, `df -i`); the node's `/stats/summary` (through the
-//!   apiserver's `nodes/proxy`) gives that claim's `availableBytes`, `inodes`
+//!   `statvfs` (`df -B1`, `df -i`); the node's `/stats/summary` (asked of its
+//!   kubelet at the node's InternalIP with the run's ServiceAccount token, as
+//!   `nodes/proxy`, a subresource, may not be granted to a suite) gives that
+//!   claim's `availableBytes`, `inodes`
 //!   and `inodesFree` for the same mount: inodes equal, available bytes within
 //!   1 MiB. What `/metrics`' `kubelet_volume_stats_available_bytes` and
 //!   `_inodes*` are rendered from.
@@ -380,10 +382,13 @@ impl Suite {
             Ok(d) => d,
             Err(e) => return Outcome::Fail(format!("the pod's df: {e}")),
         };
-        let path = format!("/api/v1/nodes/{}/proxy/stats/summary", self.env.node_name);
+        let ip = match k8s::node_ip(&self.env, &self.api).await {
+            Ok(ip) => ip,
+            Err(e) => return Outcome::Infra(e),
+        };
         let ns = self.env.namespace.clone();
         let vol = k8s::until(within, || async {
-            let summary = self.api.get(&path).await?.ok_or_else(|| format!("{path}: not found"))?;
+            let summary = k8s::kubelet_get(&self.env, &ip, "/stats/summary").await?;
             summary_volume(&summary, &ns, "stats-pod", "claim")
                 .cloned()
                 .ok_or_else(|| "the summary has no availableBytes for the claim".to_string())
@@ -394,7 +399,7 @@ impl Suite {
                 Ok(said) => Outcome::Pass(said),
                 Err(e) => Outcome::Fail(e),
             },
-            Err(e) if e.contains("403") => Outcome::Infra(format!("nodes/proxy is not readable: {e}")),
+            Err(e) if e.contains("error sending request") => Outcome::Infra(format!("the kubelet is not reachable: {e}")),
             Err(e) => Outcome::Fail(format!("{e} (the pod's df: {df})")),
         }
     }

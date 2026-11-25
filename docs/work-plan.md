@@ -33,6 +33,12 @@ suite (61d7d3d): a pod's `df-hold` (statvfs of its claim after a 4 MiB write and
 Test crate sc-build passed (20261125-064209-61d7d3d0, 84 ok, `the_pods_df_is_held_against_the_summary` new).
 Stage build 6827e22574e0 requested (also carries #452). Left open: the node run
 (`stormcentral test run rustkube-node pvc` on a node with this golden) is the issue's check.
+2026-11-25, later: `stormcentral test run rustkube-node pvc --tag 6827e22574e0` was refused at dadc8c9:
+`cluster_read: ""/"nodes/proxy" — plain lowercase names: no wildcard, no subresource` (line ~2912 already said
+suites may not read nodes/proxy). Doing: the test asks the kubelet itself, `https://<node InternalIP>:10250/stats/summary`
+with the run's ServiceAccount token (the kubelet does TokenReview, no SAR; the metadata suite already asks it so);
+`node_ip` moves to `k8s.rs`; the `nodes/proxy` line leaves requires.toml. A connect error is Infra (the runner's pod
+network cannot reach the node), never a pass. Then test crate sc-build, and the pvc run again.
 
 ### Done (unit-verified; not run on a node): #452, an `https` httpGet probe in the pod netns does a real HTTPS GET
 

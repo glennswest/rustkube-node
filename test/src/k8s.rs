@@ -163,6 +163,47 @@ pub async fn node_name(api: &Api, node: &str) -> Result<String, String> {
     pick_node(&nodes, node).ok_or_else(|| format!("no Node is named {node} or has it as an address"))
 }
 
+/// The node's InternalIP, else its first address.
+pub async fn node_ip(env: &Env, api: &Api) -> Result<String, String> {
+    let n = api
+        .get(&format!("/api/v1/nodes/{}", env.node_name))
+        .await?
+        .ok_or_else(|| format!("Node {} is not there", env.node_name))?;
+    let addrs = n["status"]["addresses"].as_array().cloned().unwrap_or_default();
+    addrs
+        .iter()
+        .find(|a| a["type"] == "InternalIP")
+        .or_else(|| addrs.first())
+        .and_then(|a| a["address"].as_str())
+        .map(str::to_string)
+        .ok_or_else(|| format!("Node {} has no address", env.node_name))
+}
+
+/// `GET https://<ip>:10250<path>` on the node's kubelet with the run's
+/// ServiceAccount token (#469). The kubelet authenticates the token by a
+/// TokenReview and does no SubjectAccessReview, so no `nodes/proxy` grant is
+/// needed (a suite may not declare a subresource). Its serving pair is the
+/// node's, not one for the address: the name is not what is under test.
+pub async fn kubelet_get(env: &Env, ip: &str, path: &str) -> Result<Value, String> {
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("client: {e}"))?;
+    let url = format!("https://{ip}:10250{path}");
+    let mut req = client.get(&url);
+    if let Some(t) = &env.token {
+        req = req.bearer_auth(t.trim());
+    }
+    let r = req.send().await.map_err(|e| format!("GET {url}: {e}"))?;
+    let status = r.status().as_u16();
+    let text = r.text().await.map_err(|e| format!("GET {url}: body: {e}"))?;
+    if status != 200 {
+        return Err(format!("GET {url}: HTTP {status}: {}", text.trim()));
+    }
+    serde_json::from_str(&text).map_err(|e| format!("GET {url}: not JSON: {e}"))
+}
+
 pub fn pick_node(nodes: &[Value], node: &str) -> Option<String> {
     nodes
         .iter()

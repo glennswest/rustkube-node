@@ -115,25 +115,9 @@ impl Suite {
     }
 }
 
-/// The node's InternalIP, else its first address.
-async fn node_ip(env: &Env, api: &Api) -> Result<String, String> {
-    let n = api
-        .get(&format!("/api/v1/nodes/{}", env.node_name))
-        .await?
-        .ok_or_else(|| format!("Node {} is not there", env.node_name))?;
-    let addrs = n["status"]["addresses"].as_array().cloned().unwrap_or_default();
-    addrs
-        .iter()
-        .find(|a| a["type"] == "InternalIP")
-        .or_else(|| addrs.first())
-        .and_then(|a| a["address"].as_str())
-        .map(str::to_string)
-        .ok_or_else(|| format!("Node {} has no address", env.node_name))
-}
-
 pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
     let suite = Suite { env: env.clone(), api: api.clone() };
-    let ip = match node_ip(&env, &api).await {
+    let ip = match k8s::node_ip(&env, &api).await {
         Ok(ip) => ip,
         Err(e) => {
             r.record("node-address", Outcome::Infra(e), 0, None);
