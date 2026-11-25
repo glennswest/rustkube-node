@@ -24,6 +24,12 @@
 //!   it, and its `ProvisioningSucceeded` event says `its writes on tier fast`
 //!   (the kubelet sent the tier on the blank's clone). A skip where the class
 //!   is not there (a node with no SSD beside a rotating system drive).
+//! - `pvc-volume-stats` (#469): a pod holding a 64Mi claim reports its
+//!   `statvfs` (`df -B1`, `df -i`); the node's `/stats/summary` (through the
+//!   apiserver's `nodes/proxy`) gives that claim's `availableBytes`, `inodes`
+//!   and `inodesFree` for the same mount: inodes equal, available bytes within
+//!   1 MiB. What `/metrics`' `kubelet_volume_stats_available_bytes` and
+//!   `_inodes*` are rendered from.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -108,6 +114,44 @@ pub fn classes_missing(sc: Option<&Value>, vscs: &[Value]) -> Option<String> {
         why.push(format!("no VolumeSnapshotClass of driver {PROVISIONER} (stormcos#1032)"));
     }
     (!why.is_empty()).then(|| why.join("; "))
+}
+
+/// The pod's `df-hold` line (#469): its `statvfs` of the claim.
+pub fn df_said(log: &str) -> Option<Value> {
+    log.lines().rev().find_map(|l| {
+        let line: Value = serde_json::from_str(l.trim()).ok()?;
+        if line["ok"] != json!(true) {
+            return None;
+        }
+        serde_json::from_str(line["detail"].as_str()?).ok()
+    })
+}
+
+/// Pod `pod`'s volume `volume` in a `/stats/summary`, once it carries
+/// `availableBytes`.
+pub fn summary_volume<'a>(summary: &'a Value, namespace: &str, pod: &str, volume: &str) -> Option<&'a Value> {
+    summary["pods"].as_array()?.iter()
+        .find(|p| s(p, "/podRef/namespace") == namespace && s(p, "/podRef/name") == pod)?["volume"]
+        .as_array()?
+        .iter()
+        .find(|v| s(v, "/name") == volume && v["availableBytes"].is_u64())
+}
+
+/// The pod's `df` against the kubelet's numbers for the same mount: inodes
+/// equal, available bytes within 1 MiB (the claim is idle between the two).
+pub fn df_matches(df: &Value, vol: &Value) -> Result<String, String> {
+    let n = |v: &Value, k: &str| v[k].as_u64().ok_or_else(|| format!("no {k} in {v}"));
+    let (avail, kavail) = (n(df, "availableBytes")?, n(vol, "availableBytes")?);
+    let (inodes, kinodes) = (n(df, "inodes")?, n(vol, "inodes")?);
+    let (free, kfree) = (n(df, "inodesFree")?, n(vol, "inodesFree")?);
+    let used = n(vol, "inodesUsed")?;
+    let said = format!(
+        "df: {avail} B available, {inodes} inodes, {free} free; kubelet: {kavail} B, {kinodes} inodes, {kfree} free, {used} used"
+    );
+    if inodes != kinodes || free != kfree || used != kinodes.saturating_sub(kfree) || avail.abs_diff(kavail) > MIB {
+        return Err(format!("the kubelet's numbers are not the pod's: {said}"));
+    }
+    Ok(said)
 }
 
 struct Suite {
@@ -314,6 +358,47 @@ impl Suite {
         }
     }
 
+    async fn volume_stats(&self) -> Outcome {
+        let within = self.env.budget(Duration::from_secs(300), MARGIN);
+        if let Err(e) = self.api.create(&k8s::pvcs(&self.env), &k8s::claim(&self.env, "stats", "64Mi")).await {
+            return Outcome::Infra(e);
+        }
+        let mut pod = k8s::work(&self.env, "stats-pod", "stats", "df-hold", &["600".to_string()]);
+        pod["spec"]["nodeName"] = json!(self.env.node_name);
+        if let Err(e) = self.api.create(&k8s::pods(&self.env), &pod).await {
+            return Outcome::Infra(e);
+        }
+        if let Err(e) = k8s::pod_running(&self.env, &self.api, "stats-pod", within).await {
+            return Outcome::Fail(format!("the pod holding the claim did not start: {e}"));
+        }
+        let df = match k8s::until(within, || async {
+            let log = k8s::log(&self.env, &self.api, "stats-pod", false).await?;
+            df_said(&log).ok_or_else(|| format!("no df line yet: {}", log.trim()))
+        })
+        .await
+        {
+            Ok(d) => d,
+            Err(e) => return Outcome::Fail(format!("the pod's df: {e}")),
+        };
+        let path = format!("/api/v1/nodes/{}/proxy/stats/summary", self.env.node_name);
+        let ns = self.env.namespace.clone();
+        let vol = k8s::until(within, || async {
+            let summary = self.api.get(&path).await?.ok_or_else(|| format!("{path}: not found"))?;
+            summary_volume(&summary, &ns, "stats-pod", "claim")
+                .cloned()
+                .ok_or_else(|| "the summary has no availableBytes for the claim".to_string())
+        })
+        .await;
+        match vol {
+            Ok(v) => match df_matches(&df, &v) {
+                Ok(said) => Outcome::Pass(said),
+                Err(e) => Outcome::Fail(e),
+            },
+            Err(e) if e.contains("403") => Outcome::Infra(format!("nodes/proxy is not readable: {e}")),
+            Err(e) => Outcome::Fail(format!("{e} (the pod's df: {df})")),
+        }
+    }
+
     async fn snapshot_deleted(&self) -> Outcome {
         let path = format!("{}/grow-snap", snapshots(&self.env));
         let content = match self.api.get(&path).await {
@@ -367,6 +452,8 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
             r.run("pvc-snapshot-deleted", suite.snapshot_deleted()).await;
         }
     }
+    // Only the built-in class (#469).
+    r.run("pvc-volume-stats", suite.volume_stats()).await;
     // The fast tier needs none of #379's classes, only its own (stormcos#1039).
     r.run("pvc-tier-fast", suite.tier_fast()).await;
     if let Err(e) = k8s::drain(&env, &api, Duration::from_secs(30)).await {
@@ -399,6 +486,30 @@ mod tests {
         let c = fast_claim(&k8s::tests::env(), "fast");
         assert_eq!(c["spec"]["storageClassName"], "stormblock-fast");
         assert_eq!(c["spec"]["resources"]["requests"]["storage"], "64Mi");
+    }
+
+    #[test]
+    fn the_pods_df_is_held_against_the_summary() {
+        let line = r#"{"workload": "df-hold /data 600", "ok": true, "detail": "{\"availableBytes\":50331648,\"inodes\":16384,\"inodesFree\":16371}"}"#;
+        let df = df_said(&format!("noise\n{line}\n")).unwrap();
+        assert_eq!(df["inodes"], 16384);
+        let summary = json!({"pods": [
+            {"podRef": {"name": "other", "namespace": "ns"}, "volume": [{"name": "claim", "availableBytes": 1}]},
+            {"podRef": {"name": "stats-pod", "namespace": "ns"}, "volume": [
+                {"name": "claim", "capacityBytes": 67108864u64},
+            ]},
+        ]});
+        assert!(summary_volume(&summary, "ns", "stats-pod", "claim").is_none(), "no fs sizes yet");
+        let good = json!({"name": "claim", "availableBytes": 50331648u64 + 4096, "inodes": 16384, "inodesFree": 16371, "inodesUsed": 13});
+        let summary = json!({"pods": [{"podRef": {"name": "stats-pod", "namespace": "ns"}, "volume": [good.clone()]}]});
+        let v = summary_volume(&summary, "ns", "stats-pod", "claim").unwrap();
+        assert!(df_matches(&df, v).is_ok());
+        let mut off = good.clone();
+        off["inodesFree"] = json!(16000);
+        assert!(df_matches(&df, &off).unwrap_err().contains("not the pod's"));
+        let mut far = good;
+        far["availableBytes"] = json!(1);
+        assert!(df_matches(&df, &far).is_err());
     }
 
     #[test]

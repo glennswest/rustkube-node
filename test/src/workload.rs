@@ -6,6 +6,10 @@
 //! - `verify <path> <seed> <bytes>`: read the pattern back and compare.
 //! - `size-at-least <path> <bytes>`: the filesystem (a directory) or device
 //!   (anything else) is at least that large.
+//! - `df-hold <path> <seconds>` (#469): write 4 MiB to the filesystem at
+//!   `<path>`, sync, and report its `statvfs` as `df -B1` and `df -i` read it
+//!   (the detail is `{"availableBytes", "inodes", "inodesFree"}` as JSON), then
+//!   stay up `<seconds>` so the kubelet can be asked about the same mount.
 //! - `sized <path> <seed> <bytes> <lo> <hi>`: `fill`, then the filesystem's
 //!   size (what `df` reports) is more than `lo` and at most `hi`: the claim
 //!   got the size class it rounded to, not the one below or above.
@@ -67,7 +71,7 @@ pub fn is_workload(args: &[String]) -> bool {
         Some(
             "fill" | "verify" | "size-at-least" | "sized" | "echo" | "exit" | "sleep" | "fail-once"
                 | "write-file" | "expect-file" | "expect-env" | "expect-nics" | "read-file" | "vm-instance" | "rdma-view"
-                | "member" | "grows" | "qga-probe" | "tcp-connect" | "rt-view"
+                | "member" | "grows" | "qga-probe" | "tcp-connect" | "rt-view" | "df-hold"
         )
     )
 }
@@ -91,7 +95,12 @@ pub fn main(args: &[String]) -> i32 {
         return member(args);
     }
     let result = run(args);
-    let hold = (args[0] == "expect-nics" && result.is_ok()).then(|| args.get(1).and_then(|c| c.parse().ok()).unwrap_or(0));
+    let hold = match args[0].as_str() {
+        "expect-nics" if result.is_ok() => Some(args.get(1).and_then(|c| c.parse().ok()).unwrap_or(0)),
+        // Held whatever it said: the suite reads the line while it runs.
+        "df-hold" => Some(args.get(2).and_then(|c| c.parse().ok()).unwrap_or(0)),
+        _ => None,
+    };
     let (code, line) = match &result {
         Ok(d) => (0, format!("{{\"workload\": {}, \"ok\": true, \"detail\": {}}}", crate::report::json(&args.join(" ")), crate::report::json(d))),
         Err(e) => (1, format!("{{\"workload\": {}, \"ok\": false, \"detail\": {}}}", crate::report::json(&args.join(" ")), crate::report::json(e))),
@@ -508,6 +517,26 @@ fn run(args: &[String]) -> Result<String, String> {
                 }
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
+        }
+        "df-hold" => {
+            let dir = PathBuf::from(arg(1, "path")?);
+            num(2, "seconds")?;
+            let p = target(&arg(1, "path")?);
+            fill(&p, 469, 4 << 20)?;
+            // SAFETY: sync(2) takes nothing and cannot fail.
+            unsafe { libc::sync() };
+            let c = std::ffi::CString::new(dir.as_os_str().to_string_lossy().as_bytes()).map_err(|e| e.to_string())?;
+            let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+            // SAFETY: `c` is a valid NUL-terminated path, `st` a valid out-pointer.
+            if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+                return Err(format!("statvfs {}: {}", dir.display(), std::io::Error::last_os_error()));
+            }
+            Ok(serde_json::json!({
+                "availableBytes": st.f_bavail as u64 * st.f_frsize as u64,
+                "inodes": st.f_files as u64,
+                "inodesFree": st.f_ffree as u64,
+            })
+            .to_string())
         }
         "echo" => Ok(args[1..].join(" ")),
         "fail-once" => {
