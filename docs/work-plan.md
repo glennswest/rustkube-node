@@ -4,7 +4,7 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #479, review e353605dcd69: an in-netns HTTP probe parses one read as the status line (health.rs)
+### Done (unit-verified; not run on a node): #479, review e353605dcd69: an in-netns HTTP probe parses one read as the status line (health.rs)
 
 2026-11-25. `http_get_blocking` (plain `http` httpGet in the pod netns) makes one `read` and hands its bytes to
 `probe_status`. TCP may return part of the line (`HT`), so a healthy container's probe fails. Plan: read until the
@@ -13,6 +13,12 @@ deadline (connect included), so a server trickling bytes cannot hold the thread 
 `probe_status`. Tests through `http_get_blocking` on loopback: the status line in two writes (`HT`, then the rest,
 apart in time, `TCP_NODELAY`) passes; a line that never ends before the deadline fails within the timeout. CHANGELOG;
 sc-build.
+Built in 54fec5e (`read_status_line`). sc-build passed (20261125-192241-54fec5e9, `cargo build --locked && cargo test
+--locked`, every suite ok), and `cargo test --locked -p kubelet --lib health::` on 54fec5e listed the three new tests ok
+(29 passed): `netns_path_reads_a_status_line_sent_in_pieces`, `netns_path_fails_when_the_status_line_does_not_end_in_time`
+(fails at the 1 s timeout while bytes keep arriving every 300 ms), `netns_path_takes_the_status_line_at_eof`. Negative
+control: the same tests on the old one-read code (branch test/479-repro, 99561479, `SC_BUILD_EXPECT_FAIL=1`) failed all
+three with `bad status line: HT` / `H` / `HTTP/1.0 `. The netns is not entered in the tests (needs root). Issue closed.
 
 ### Parked after install rustkube-node>=b7377a3 on a pve machine: #469, `kubelet_volume_stats_available_bytes` and `_inodes*` for built-in claims
 
