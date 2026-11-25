@@ -2397,6 +2397,10 @@ new sbregistry work (file it); the kubelet half rides the existing pull + demand
        release's nextnfs sha12 from the manifest (hostPath pod); `nextnfs:<V>` Succeeds on `component-nextnfs-<V>`;
        `nextnfs:<R>` on the pallet; `nextnfs:<V>` again with no failed pull. 3 unit tests. sc-build `cd test`; then
        `stormcentral test run rustkube-node versions`; close #86 on its pass.
+       Done: 9284cba; sc-build (sc-build-4dee11d935) `cd test`: 83 tests pass (3 new), clippy -D warnings clean,
+       release build ok. The run was refused: no machine can take it (pvetest1-3's apiservers down: stormcluster
+       :9102 fails API health, stormcluster#123; the hardware runs no known release). Held after stormcluster#123.
+       Resume: `stormcentral test run rustkube-node versions --commit 9284cba` on a pvetest; pass -> close #86.
 
 ### (history) Waiting on the owner: #86 (P2), versioned goldens for pods
 
