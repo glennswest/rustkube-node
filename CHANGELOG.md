@@ -2,6 +2,7 @@
 
 ## 2026-11-24
 
+- **fix:** An `https` httpGet probe run in the pod's network namespace does a real HTTPS GET (#452). It only opened a TCP connection: no TLS handshake, no request (so none of its `httpHeaders`), no status, so a server answering 500, or a port with no TLS on it, passed. The connection is now made on a thread in the netns (as the gRPC probe's, #443), then TLS runs over it with any certificate accepted (upstream's prober skips verification, as the host path does; the handshake's signatures are still checked), the probe's GET goes with its headers, and 200–399 passes.
 - **test:** A `versions` suite (#86, on request: `stormcentral test run rustkube-node versions`) checks on a node that an image tag selects a golden version: a pod of `nextnfs:<sha12 not in the release>` runs on a clone of `component-nextnfs-<sha12>` fetched from forge, the release's tag runs the pallet again, and the version again starts with no fetch. The release's build is read from the node's `/etc/stormcos/release/manifest.json`; `RUSTKUBE_NODE_TEST_GOLDEN_VERSION` names the version, else the first known nextnfs build that is not the release's.
 
 ## 2026-11-23

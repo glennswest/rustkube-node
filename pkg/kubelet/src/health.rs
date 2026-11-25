@@ -15,6 +15,10 @@
 //!   (empty when unset) and passes only on `SERVING`. Any other status, an RPC
 //!   error (`UNIMPLEMENTED`: no health service) or a listener that does not
 //!   speak gRPC is a failure.
+//!
+//! An `https` httpGet probe in the pod netns (#452) is a full HTTPS GET over a
+//! connection made in the netns: TLS without certificate verification (as
+//! upstream's prober and the host path), the probe's headers, 200–399 passes.
 
 use crate::cri::RuntimeService;
 use reqwest::header::{HeaderName, HeaderValue};
@@ -203,12 +207,16 @@ async fn http_probe(
     netns_path: Option<&str>,
     timeout: Duration,
 ) -> ProbeResult {
+    // In the pod netns, HTTPS takes the gRPC probe's route: the connection is
+    // made there and TLS runs over it here (#452).
+    if scheme == "https" && netns_path.is_some() {
+        return https_get_probe(host, port, path, headers, netns_path, timeout).await;
+    }
     #[cfg(target_os = "linux")]
     if let Some(ns) = netns_path {
         return dial_in_netns(
             ns.to_string(),
             NetDial::Http {
-                scheme: scheme.to_string(),
                 host: host.to_string(),
                 port,
                 path: path.to_string(),
@@ -258,6 +266,158 @@ async fn connect_probe(
         Ok(Ok(s)) => Ok(s),
         Ok(Err(e)) => Err(format!("tcp connect {addr}: {e}")),
         Err(_) => Err(format!("tcp connect {addr}: timed out")),
+    }
+}
+
+/// An `https` httpGet probe over a connection made by `connect_probe` (in the
+/// pod netns when known, #452). The whole call, connection included, is
+/// bounded by `timeout`.
+async fn https_get_probe(
+    host: &str,
+    port: u16,
+    path: &str,
+    headers: &[(HeaderName, HeaderValue)],
+    netns_path: Option<&str>,
+    timeout: Duration,
+) -> ProbeResult {
+    debug!("HTTPS probe: {}{path}", host_port(host, port));
+    let call = async {
+        let stream = connect_probe(host, port, netns_path, timeout).await?;
+        https_get_over(stream, host, port, path, headers).await
+    };
+    match tokio::time::timeout(timeout, call).await {
+        Ok(Ok(())) => ProbeResult::Success,
+        Ok(Err(e)) => ProbeResult::Failure(e),
+        Err(_) => ProbeResult::Failure("https probe timed out".into()),
+    }
+}
+
+/// TLS over `stream`, then the probe's GET and its status line: 200–399 passes.
+async fn https_get_over(
+    stream: TcpStream,
+    host: &str,
+    port: u16,
+    path: &str,
+    headers: &[(HeaderName, HeaderValue)],
+) -> Result<(), String> {
+    use rustls::pki_types::ServerName;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // A host that is no valid DNS name or IP (the server name is only SNI here,
+    // nothing is verified against it) is named by the address it reached.
+    let name = match ServerName::try_from(host.to_string()) {
+        Ok(n) => n,
+        Err(_) => ServerName::IpAddress(
+            stream.peer_addr().map_err(|e| format!("peer address: {e}"))?.ip().into(),
+        ),
+    };
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(probe_tls_config()));
+    let mut tls = connector
+        .connect(name, stream)
+        .await
+        .map_err(|e| format!("tls handshake {}: {e}", host_port(host, port)))?;
+    tls.write_all(&probe_request(host, port, path, headers))
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+    tls.flush().await.map_err(|e| format!("write: {e}"))?;
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 512];
+    while head.len() < 512 && !head.windows(2).any(|w| w == b"\r\n") {
+        let n = tls.read(&mut chunk).await.map_err(|e| format!("read: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        head.extend_from_slice(&chunk[..n]);
+    }
+    probe_status(&head)
+}
+
+/// The TLS client of an `https` probe in the pod netns: any certificate is
+/// accepted, as upstream's prober (`InsecureSkipVerify`) and the host path
+/// (`danger_accept_invalid_certs`) do. The handshake's signatures are still
+/// checked, so the peer holds the key of the certificate it shows.
+fn probe_tls_config() -> rustls::ClientConfig {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .expect("ring's provider supports the default TLS versions")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyCertificate(provider)))
+        .with_no_client_auth()
+}
+
+#[derive(Debug)]
+struct AnyCertificate(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AnyCertificate {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// The request a probe sends in the pod netns, plain or over TLS: HTTP/1.0,
+/// the probe's own `Host` replacing the URL's, every other header as given
+/// (names and values were checked to hold no CR or LF).
+fn probe_request(host: &str, port: u16, path: &str, headers: &[(HeaderName, HeaderValue)]) -> Vec<u8> {
+    let path = if path.is_empty() { "/" } else { path };
+    let mut req = format!("GET {path} HTTP/1.0\r\n").into_bytes();
+    if !headers.iter().any(|(n, _)| n == reqwest::header::HOST) {
+        req.extend_from_slice(format!("Host: {}\r\n", host_port(host, port)).as_bytes());
+    }
+    for (n, v) in headers {
+        req.extend_from_slice(n.as_str().as_bytes());
+        req.extend_from_slice(b": ");
+        req.extend_from_slice(v.as_bytes());
+        req.extend_from_slice(b"\r\n");
+    }
+    req.extend_from_slice(b"Connection: close\r\n\r\n");
+    req
+}
+
+/// A response's first bytes: its status line decides, 200–399 passes.
+fn probe_status(head: &[u8]) -> Result<(), String> {
+    if head.is_empty() {
+        return Err("empty response".into());
+    }
+    let text = String::from_utf8_lossy(head);
+    let status_line = text.lines().next().unwrap_or("");
+    let code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse::<u16>().ok())
+        .ok_or_else(|| format!("bad status line: {status_line}"))?;
+    if (200..400).contains(&code) {
+        Ok(())
+    } else {
+        Err(format!("HTTP {code}"))
     }
 }
 
@@ -419,7 +579,6 @@ async fn exec_probe(
 #[cfg(target_os = "linux")]
 enum NetDial {
     Http {
-        scheme: String,
         host: String,
         port: u16,
         path: String,
@@ -441,12 +600,11 @@ async fn dial_in_netns(netns_path: String, dial: NetDial, timeout: Duration) -> 
     std::thread::spawn(move || {
         let res = enter_netns(&netns_path).and_then(|()| match dial {
             NetDial::Http {
-                scheme,
                 host,
                 port,
                 path,
                 headers,
-            } => http_get_blocking(&scheme, &host, port, &path, &headers, timeout),
+            } => http_get_blocking(&host, port, &path, &headers, timeout),
             NetDial::Tcp { host, port } => tcp_connect_blocking(&host, port, timeout),
         });
         let _ = tx.send(res);
@@ -497,58 +655,28 @@ fn tcp_connect_blocking(host: &str, port: u16, timeout: Duration) -> Result<(), 
         .map_err(|e| format!("tcp connect {host}:{port}: {e}"))
 }
 
+/// A plain `http` GET in the pod netns, on the thread that entered it. An
+/// `https` probe never comes here: it runs TLS over a connection made in the
+/// netns (`https_get_probe`, #452).
 #[cfg(target_os = "linux")]
 fn http_get_blocking(
-    scheme: &str,
     host: &str,
     port: u16,
     path: &str,
     headers: &[(HeaderName, HeaderValue)],
     timeout: Duration,
 ) -> Result<(), String> {
-    // No in-netns TLS client; for HTTPS a successful connect is the best signal.
-    if scheme == "https" {
-        return tcp_connect_blocking(host, port, timeout);
-    }
     use std::io::{Read, Write};
     let sa = resolve_one_addr(host, port)?;
     let mut sock = std::net::TcpStream::connect_timeout(&sa, timeout)
         .map_err(|e| format!("connect {host}:{port}: {e}"))?;
     sock.set_read_timeout(Some(timeout)).ok();
     sock.set_write_timeout(Some(timeout)).ok();
-    let path = if path.is_empty() { "/" } else { path };
-    // The probe's own `Host` replaces the URL's; every other header is sent
-    // as given (names and values were checked to hold no CR or LF).
-    let mut req = format!("GET {path} HTTP/1.0\r\n").into_bytes();
-    if !headers.iter().any(|(n, _)| n == reqwest::header::HOST) {
-        req.extend_from_slice(format!("Host: {}\r\n", host_port(host, port)).as_bytes());
-    }
-    for (n, v) in headers {
-        req.extend_from_slice(n.as_str().as_bytes());
-        req.extend_from_slice(b": ");
-        req.extend_from_slice(v.as_bytes());
-        req.extend_from_slice(b"\r\n");
-    }
-    req.extend_from_slice(b"Connection: close\r\n\r\n");
-    sock.write_all(&req)
+    sock.write_all(&probe_request(host, port, path, headers))
         .map_err(|e| format!("write: {e}"))?;
     let mut head = [0u8; 512];
     let n = sock.read(&mut head).map_err(|e| format!("read: {e}"))?;
-    if n == 0 {
-        return Err("empty response".into());
-    }
-    let text = String::from_utf8_lossy(&head[..n]);
-    let status_line = text.lines().next().unwrap_or("");
-    let code = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|c| c.parse::<u16>().ok())
-        .ok_or_else(|| format!("bad status line: {status_line}"))?;
-    if (200..400).contains(&code) {
-        Ok(())
-    } else {
-        Err(format!("HTTP {code}"))
-    }
+    probe_status(&head[..n])
 }
 
 #[cfg(test)]
@@ -708,7 +836,7 @@ mod tests {
     fn netns_path_sends_the_probes_headers_and_its_host() {
         let (port, rx) = one_shot_http(200);
         let h = probe_headers(&http_spec()).unwrap();
-        http_get_blocking("http", "127.0.0.1", port, "/healthz", &h, Duration::from_secs(5)).unwrap();
+        http_get_blocking("127.0.0.1", port, "/healthz", &h, Duration::from_secs(5)).unwrap();
         let req = rx.recv().unwrap();
         assert!(req.starts_with("GET /healthz HTTP/1.0\r\n"), "{req}");
         assert_eq!(values(&req, "authorization"), ["Bearer s3cret"], "{req}");
@@ -718,10 +846,104 @@ mod tests {
         assert_eq!(values(&req, "accept"), ["*/*"], "{req}");
 
         let (port, rx) = one_shot_http(200);
-        http_get_blocking("http", "127.0.0.1", port, "/", &probe_headers(&json!({})).unwrap(), Duration::from_secs(5))
+        http_get_blocking("127.0.0.1", port, "/", &probe_headers(&json!({})).unwrap(), Duration::from_secs(5))
             .unwrap();
         let req = rx.recv().unwrap();
         assert_eq!(values(&req, "host"), [format!("127.0.0.1:{port}")], "{req}");
+    }
+
+    // ---- #452: https in the pod netns ----
+
+    /// A TLS server on loopback with a self-signed certificate (nothing the
+    /// probe could verify): answers `status` and keeps the request headers.
+    async fn tls_http(status: u16) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<axum::http::HeaderMap>>>) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let key = rcgen::generate_simple_self_signed(vec!["probe.invalid".to_string()]).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
+            let log = log.clone();
+            async move {
+                log.lock().unwrap().push(headers);
+                axum::http::StatusCode::from_u16(status).unwrap()
+            }
+        });
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem(
+            key.cert.pem().into_bytes(),
+            key.key_pair.serialize_pem().into_bytes(),
+        )
+        .await
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(axum_server::from_tcp_rustls(listener, tls).serve(app.into_make_service()));
+        (port, seen)
+    }
+
+    fn all(h: &axum::http::HeaderMap, name: &str) -> Vec<String> {
+        h.get_all(name).iter().map(|v| v.to_str().unwrap().to_string()).collect()
+    }
+
+    /// The netns route's TLS half, over a connection `connect_probe` made (here
+    /// without a netns: entering one needs root). A 200 passes and the probe's
+    /// headers arrive; the certificate is not one anything could verify.
+    #[tokio::test]
+    async fn https_probe_does_tls_sends_the_headers_and_passes_on_200() {
+        let (port, seen) = tls_http(200).await;
+        let h = probe_headers(&http_spec()).unwrap();
+        let r = https_get_probe("127.0.0.1", port, "/healthz", &h, None, Duration::from_secs(5)).await;
+        assert_eq!(r, ProbeResult::Success);
+        let got = seen.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        let req = &got[0];
+        assert_eq!(all(req, "authorization"), ["Bearer s3cret"]);
+        assert_eq!(all(req, "host"), ["app.example"]);
+        assert_eq!(all(req, "x-twice"), ["a", "b"]);
+        assert_eq!(all(req, "user-agent"), ["kube-probe/1.36"]);
+        assert_eq!(all(req, "accept"), ["*/*"]);
+    }
+
+    #[tokio::test]
+    async fn https_probe_fails_on_a_500() {
+        let (port, seen) = tls_http(500).await;
+        let h = probe_headers(&json!({})).unwrap();
+        let r = https_get_probe("127.0.0.1", port, "/", &h, None, Duration::from_secs(5)).await;
+        assert_eq!(r, ProbeResult::Failure("HTTP 500".into()));
+        assert_eq!(seen.lock().unwrap().len(), 1, "the request reached the server");
+    }
+
+    /// A port with no TLS on it fails (it passed as a connect, #452).
+    #[tokio::test]
+    async fn https_probe_fails_on_a_port_without_tls() {
+        let (port, _rx) = one_shot_http(200);
+        let h = probe_headers(&json!({})).unwrap();
+        let r = https_get_probe("127.0.0.1", port, "/", &h, None, Duration::from_secs(5)).await;
+        match r {
+            ProbeResult::Failure(e) => assert!(e.starts_with("tls handshake"), "{e}"),
+            other => panic!("passed without TLS: {other:?}"),
+        }
+    }
+
+    /// `http_probe` with a netns sends `https` to the TLS route, not to a
+    /// connect: with a netns path that does not exist the connect itself fails
+    /// naming it (the route a netns probe takes, short of entering one).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_https_probe_with_a_netns_takes_the_tls_route() {
+        let h = probe_headers(&json!({})).unwrap();
+        let r = http_probe("https", "127.0.0.1", 1, "/", &h, Some("/nonexistent/netns"), Duration::from_secs(2)).await;
+        match r {
+            ProbeResult::Failure(e) => assert!(e.contains("open netns /nonexistent/netns"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_status_reads_the_status_line() {
+        assert_eq!(probe_status(b"HTTP/1.1 302 Found\r\n"), Ok(()));
+        assert_eq!(probe_status(b"HTTP/1.0 404 Not Found\r\n"), Err("HTTP 404".into()));
+        assert_eq!(probe_status(b""), Err("empty response".into()));
+        assert!(probe_status(b"\x16\x03\x01garbage").is_err());
     }
 
     // ---- #443: gRPC health ----
