@@ -666,17 +666,60 @@ fn http_get_blocking(
     headers: &[(HeaderName, HeaderValue)],
     timeout: Duration,
 ) -> Result<(), String> {
-    use std::io::{Read, Write};
+    use std::io::Write;
+    let deadline = std::time::Instant::now() + timeout;
     let sa = resolve_one_addr(host, port)?;
     let mut sock = std::net::TcpStream::connect_timeout(&sa, timeout)
         .map_err(|e| format!("connect {host}:{port}: {e}"))?;
-    sock.set_read_timeout(Some(timeout)).ok();
     sock.set_write_timeout(Some(timeout)).ok();
     sock.write_all(&probe_request(host, port, path, headers))
         .map_err(|e| format!("write: {e}"))?;
-    let mut head = [0u8; 512];
-    let n = sock.read(&mut head).map_err(|e| format!("read: {e}"))?;
-    probe_status(&head[..n])
+    let head = read_status_line(&mut sock, deadline)?;
+    probe_status(&head)
+}
+
+/// The longest status line a probe reads; the https path keeps the same bound.
+#[cfg(target_os = "linux")]
+const STATUS_LINE_MAX: usize = 512;
+
+/// A response's bytes up to the end of its status line (the first CRLF), EOF,
+/// or `STATUS_LINE_MAX` bytes, all before `deadline` (#479). TCP may hand the
+/// line over in pieces (`HT`, then the rest), so one read is not the line.
+/// Each read waits only the time left, so a server sending a byte at a time
+/// cannot hold the probe past its timeout.
+#[cfg(target_os = "linux")]
+fn read_status_line(
+    sock: &mut std::net::TcpStream,
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    let mut chunk = [0u8; STATUS_LINE_MAX];
+    while head.len() < STATUS_LINE_MAX && !head.windows(2).any(|w| w == b"\r\n") {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err("read: timed out before the status line ended".into());
+        }
+        sock.set_read_timeout(Some(left)).map_err(|e| format!("read: {e}"))?;
+        let n = match sock.read(&mut chunk[..STATUS_LINE_MAX - head.len()]) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err("read: timed out before the status line ended".into())
+            }
+            Err(e) => return Err(format!("read: {e}")),
+        };
+        if n == 0 {
+            break;
+        }
+        head.extend_from_slice(&chunk[..n]);
+    }
+    Ok(head)
 }
 
 #[cfg(test)]
@@ -850,6 +893,92 @@ mod tests {
             .unwrap();
         let req = rx.recv().unwrap();
         assert_eq!(values(&req, "host"), [format!("127.0.0.1:{port}")], "{req}");
+    }
+
+    /// A one-shot server on loopback that reads the request head, then sends
+    /// each of `parts` as its own TCP segment, `gap` apart, and keeps the
+    /// connection open `hold` after the last.
+    #[cfg(target_os = "linux")]
+    fn split_http(parts: Vec<&'static [u8]>, gap: Duration, hold: Duration) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            s.set_nodelay(true).unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = s.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            for (i, p) in parts.iter().enumerate() {
+                if i > 0 {
+                    std::thread::sleep(gap);
+                }
+                if s.write_all(p).is_err() {
+                    return;
+                }
+            }
+            std::thread::sleep(hold);
+        });
+        port
+    }
+
+    /// #479 (e353605dcd69): the status line in two writes is still one line.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn netns_path_reads_a_status_line_sent_in_pieces() {
+        let h = probe_headers(&json!({})).unwrap();
+        let port = split_http(
+            vec![b"HT", b"TP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"],
+            Duration::from_millis(200),
+            Duration::ZERO,
+        );
+        assert_eq!(http_get_blocking("127.0.0.1", port, "/", &h, Duration::from_secs(5)), Ok(()));
+
+        // The code comes in the second piece, and decides.
+        let port = split_http(
+            vec![b"HTTP/1.1 5", b"03 Unavailable\r\n\r\n"],
+            Duration::from_millis(200),
+            Duration::ZERO,
+        );
+        assert_eq!(
+            http_get_blocking("127.0.0.1", port, "/", &h, Duration::from_secs(5)),
+            Err("HTTP 503".into())
+        );
+    }
+
+    /// #479: a status line that never ends fails at the probe's timeout, not later.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn netns_path_fails_when_the_status_line_does_not_end_in_time() {
+        let h = probe_headers(&json!({})).unwrap();
+        // A byte every 300 ms: each read returns before its own timeout, so only
+        // the probe's deadline stops it.
+        let port = split_http(
+            vec![b"H", b"T", b"T", b"P", b"/", b"1", b".", b"1"],
+            Duration::from_millis(300),
+            Duration::from_secs(5),
+        );
+        let start = std::time::Instant::now();
+        let r = http_get_blocking("127.0.0.1", port, "/", &h, Duration::from_secs(1));
+        let took = start.elapsed();
+        assert_eq!(r, Err("read: timed out before the status line ended".into()));
+        assert!(took < Duration::from_millis(1800), "took {took:?}");
+    }
+
+    /// #479: a response that ends (EOF) after its status line without a CRLF
+    /// is read as it is.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn netns_path_takes_the_status_line_at_eof() {
+        let h = probe_headers(&json!({})).unwrap();
+        let port = split_http(vec![b"HTTP/1.0 ", b"204"], Duration::from_millis(100), Duration::ZERO);
+        assert_eq!(http_get_blocking("127.0.0.1", port, "/", &h, Duration::from_secs(5)), Ok(()));
     }
 
     // ---- #452: https in the pod netns ----

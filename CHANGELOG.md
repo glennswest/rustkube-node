@@ -2,6 +2,7 @@
 
 ## 2026-11-25
 
+- **fix:** A plain `http` httpGet probe in the pod's network namespace reads the whole status line (#479, e353605dcd69). It made one read and parsed it as the line, so a response whose status line TCP delivered in pieces (`HT`, then the rest) failed a healthy container's probe, and enough of them in a row restarted it. It now reads to the first CRLF, EOF or 512 bytes, as the https path does, each read waiting only the time left before the probe's timeout (connect included), so a server sending a byte at a time fails the probe at its timeout instead of holding it.
 - **docs:** #311 closed: on an X9 (server8, the same SMR drive as server7) a warm container start's `containers` step is 152-201 ms on 12.92 and 12.94, against the < 1.5 s target (it was 1.4-5.2 s on 12.61); the engines' clone, mount and spawn are now tens of ms. No kubelet change.
 
 - **test:** `pvc-volume-stats` (#469) reads `/stats/summary` from the node's kubelet at its InternalIP (`:10250`) with the run's ServiceAccount token, not through `nodes/proxy`: stormcentral refuses a subresource in `cluster_read`, so `stormcentral test run rustkube-node pvc` was refused at 61d7d3d. The kubelet checks the token by TokenReview and does no SubjectAccessReview. `node_ip` moved from the metadata suite to `k8s.rs` for both.
