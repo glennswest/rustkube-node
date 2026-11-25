@@ -2399,7 +2399,7 @@ new sbregistry work (file it); the kubelet half rides the existing pull + demand
        `stormcentral test run rustkube-node versions`; close #86 on its pass.
        Done: 9284cba; sc-build (sc-build-4dee11d935) `cd test`: 83 tests pass (3 new), clippy -D warnings clean,
        release build ok. The run was refused: no machine can take it (pvetest1-3's apiservers down: stormcluster
-       :9102 fails API health, stormcluster#123; the hardware runs no known release). Held after stormcluster#123.
+       :9102 fails API health, stormcluster#123; the hardware runs no known release). Held `--after-install stormcluster>=f1de3f6@any:pve` (#123's fix).
        Resume: `stormcentral test run rustkube-node versions --commit 9284cba` on a pvetest; pass -> close #86.
 
 ### (history) Waiting on the owner: #86 (P2), versioned goldens for pods
