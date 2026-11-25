@@ -915,7 +915,16 @@ mod tests {
     /// A port with no TLS on it fails (it passed as a connect, #452).
     #[tokio::test]
     async fn https_probe_fails_on_a_port_without_tls() {
-        let (port, _rx) = one_shot_http(200);
+        // A plain HTTP server that answers on accept: one that first waited for
+        // a request would wait on the ClientHello as the client waits on it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            if let Ok((mut s, _)) = listener.accept() {
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        });
         let h = probe_headers(&json!({})).unwrap();
         let r = https_get_probe("127.0.0.1", port, "/", &h, None, Duration::from_secs(5)).await;
         match r {
