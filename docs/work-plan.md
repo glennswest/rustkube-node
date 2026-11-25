@@ -4,7 +4,7 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #452, an `https` httpGet probe in the pod netns does a real HTTPS GET
+### Done (unit-verified; not run on a node): #452, an `https` httpGet probe in the pod netns does a real HTTPS GET
 
 2026-11-24. `http_get_blocking` answered an `https` probe in the pod netns with a TCP connect only: no TLS, no
 request, no headers, no status. Plan: in `http_probe`, an `https` probe with a known netns takes the gRPC probe's
@@ -15,6 +15,13 @@ netns path writes (one request writer for both), and the status line decides: 20
 bounded by the probe's timeout. Tests against a local rustls server with an rcgen certificate: 200 passes with the
 probe's headers arriving, 500 fails, a plain-TCP listener (no TLS) fails. Docs (status.md's probes row),
 CHANGELOG; sc-build.
+Built in 96e4cac; its sc-build failed (exit 101, filed as #475): the no-TLS test's plain server waited for a
+request while the TLS client waited for a ServerHello, so the probe timed out instead of failing the handshake.
+The test's server now answers on accept (a867bbc). sc-build passed on a867bbc (20261125-055833-a867bbca,
+`cargo build --locked && cargo test --locked`, every suite ok; #475 closed by sc-build), and a run of
+`cargo test --locked -p kubelet --lib health::` listed the five new tests ok (26 passed). The netns itself is not
+entered in the tests (needs root): the netns route is checked up to `connect_probe` opening the netns path. Issue
+closed.
 
 ### Done, verified with gitleaks 8.30.1: #473, secret scan's 6 `generic-api-key` findings at a0e44d3 (stormcentral#1679)
 
