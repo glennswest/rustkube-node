@@ -4,6 +4,25 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #469, `kubelet_volume_stats_available_bytes` and `_inodes*` for built-in claims
+
+2026-11-25. The issue's second route, the kubelet itself, needs no engine op: stormpump already gives a running
+container's pid (`query_info`, as the identity record uses, #84). Plan:
+1. `RuntimeService::container_pid(id) -> Option<i32>`, default `None`; stormpump answers from `query_info` for a
+   running container. The CRI runtime keeps `None` (stated in docs/status.md).
+2. `volume_fs::statfs_in(pid, mount_path)`: `/proc/<pid>/root` opened `O_PATH`, the mount path resolved under it
+   with `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)`, so an absolute symlink in the image cannot lead to a
+   host path; then `fstatvfs`. A path whose `st_dev` is its parent's is no mount (the claim is not mounted there),
+   so nothing is reported rather than the container root's sizes.
+3. `pod_volume_stats`: for each volume with stats, the first running container of the pod that mounts it (a
+   `volumeMounts` entry, not `volumeDevices`), its `mountPath`: `availableBytes` (`f_bavail * f_frsize`),
+   `inodes`, `inodesFree`, `inodesUsed`. `capacityBytes`/`usedBytes` stay the engine's (#456).
+4. `render_volume_stats`: the four families `kubelet_volume_stats_available_bytes`, `_inodes`, `_inodes_free`,
+   `_inodes_used`, absent when not known.
+5. Tests: statfs of a tempdir mount point vs. `statvfs(2)` of the same; a path that is not a mount gives nothing;
+   an absolute symlink stays inside the root; the four families render. Docs (status.md, api.md), CHANGELOG;
+   sc-build. The issue's check (`df -B1` / `df -i` in a pod) needs a node.
+
 ### Done (unit-verified; not run on a node): #452, an `https` httpGet probe in the pod netns does a real HTTPS GET
 
 2026-11-24. `http_get_blocking` answered an `https` probe in the pod netns with a TCP connect only: no TLS, no
