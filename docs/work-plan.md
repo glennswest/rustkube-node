@@ -2392,6 +2392,11 @@ new sbregistry work (file it); the kubelet half rides the existing pull + demand
        deployment: forge's sbregistry ≥ v0.45.0 (stormcentral#542) and nodes naming forge as a peer (stormcos#271).
        #86 proposed after both. Resume: on a node, a pod `image: <c>:<sha12 not in the release>` runs after one fetch
        (`storm.io/image-resolved` = registry), back to the release's tag starts on the pallet, forward again no fetch; close.
+       2026-11-24: stormcentral#542 (closed 11-25 UTC) and stormcos#271 (closed 11-06) are both done.
+5. [ ] A `versions` suite (test/src/versions.rs, requires.toml `[versions]`, on request) is the node check: read the
+       release's nextnfs sha12 from the manifest (hostPath pod); `nextnfs:<V>` Succeeds on `component-nextnfs-<V>`;
+       `nextnfs:<R>` on the pallet; `nextnfs:<V>` again with no failed pull. 3 unit tests. sc-build `cd test`; then
+       `stormcentral test run rustkube-node versions`; close #86 on its pass.
 
 ### (history) Waiting on the owner: #86 (P2), versioned goldens for pods
 

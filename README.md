@@ -1709,6 +1709,20 @@ kubelet is under test, not the scheduler.
     pod is not run and its `RealtimeRefused` Event names PREEMPT_RT.
   The pod cases skip, saying why, without an isolated set or the RuntimeClasses
   (stormcos#1477).
+- **versions** (< 15 min, declared in `test/requires.toml`, run on request, #86):
+  an image tag selects a golden version, rolled forward and back with no reboot.
+  The component is nextnfs; the release's build `R` is read from the node's
+  `/etc/stormcos/release/manifest.json`, and the version `V` is
+  `RUSTKUBE_NODE_TEST_GOLDEN_VERSION` or the first of `versions.rs`'s candidates
+  that is not `R`.
+  - `version-release`: the manifest lists `golden-nextnfs-<R>`.
+  - `version-forward`: a pod of `nextnfs:<V>` Succeeds on a clone of
+    `component-nextnfs-<V>` (`storm.io/golden.main`), fetched from a peer once.
+  - `version-back`: a pod of `nextnfs:<R>` Succeeds on the pallet.
+  - `version-forward-again`: `nextnfs:<V>` again Succeeds on the same template
+    with no failed pull (no fetch).
+  It needs forge's registry >= v0.45.0 (stormcentral#542) and the node's forge
+  peer (stormcos#271).
 - **metadata** (< 5 min, declared in `test/requires.toml` with `host_network`,
   run on request, #342): a host-network pod asks its node's kubelet
   (`https://127.0.0.1:10250/vmInstance/<address>`) for its own instance

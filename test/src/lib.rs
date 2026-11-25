@@ -32,6 +32,11 @@
 //!   cores, memory on their NUMA nodes), and `realtime-hard` refused on a
 //!   kernel without PREEMPT_RT (`realtime.rs`). Skips without an isolated set
 //!   and the RuntimeClasses (stormcos#1477).
+//! - `versions` (< 15 min, #86, on request only): an image tag selects a
+//!   golden version: a pod of `nextnfs:<sha12>` not in the release runs on
+//!   that version's template (fetched from a peer once), the release's tag
+//!   runs the pallet again, and the version again needs no fetch
+//!   (`versions.rs`).
 //! - `long` (the night): waves of pods sized from the node's capacity,
 //!   measuring start latency and what each wave leaves behind (`long.rs`).
 //!
@@ -57,6 +62,7 @@ pub mod pvc;
 pub mod realtime;
 pub mod report;
 pub mod short;
+pub mod versions;
 pub mod workload;
 
 use std::sync::Arc;
@@ -114,8 +120,9 @@ pub async fn run(env: Arc<Env>, r: &mut Report) {
         "golden" => Box::pin(golden::run(env, api, r)).await,
         "pvc" => Box::pin(pvc::run(env, api, r)).await,
         "realtime" => Box::pin(realtime::run(env, api, r)).await,
+        "versions" => Box::pin(versions::run(env, api, r)).await,
         other => {
-            r.record("suite", Outcome::Infra(format!("STORM_SUITE {other:?} is not short, medium, long, csi, multus, metadata, golden, pvc or realtime")), 0, None);
+            r.record("suite", Outcome::Infra(format!("STORM_SUITE {other:?} is not short, medium, long, csi, multus, metadata, golden, pvc, realtime or versions")), 0, None);
         }
     }
 }

@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-24
+
+- **test:** A `versions` suite (#86, on request: `stormcentral test run rustkube-node versions`) checks on a node that an image tag selects a golden version: a pod of `nextnfs:<sha12 not in the release>` runs on a clone of `component-nextnfs-<sha12>` fetched from forge, the release's tag runs the pallet again, and the version again starts with no fetch. The release's build is read from the node's `/etc/stormcos/release/manifest.json`; `RUSTKUBE_NODE_TEST_GOLDEN_VERSION` names the version, else the first known nextnfs build that is not the release's.
+
 ## 2026-11-23
 
 - **chore:** `.gitleaks.toml` at the repo root allowlists the two WebSocket handshake nonces the nightly secret scan read as API keys (#473, stormcentral#1679): RFC 6455's sample `Sec-WebSocket-Key` in the kubelet's upgrade tests and the test client's. They are nonces, not secrets. The allowlist is two anchored regexes for those exact values, nothing else.

@@ -119,3 +119,18 @@ cluster_read = [
   { apiGroup = "", resource = "nodes" },
   { apiGroup = "node.k8s.io", resource = "runtimeclasses" },
 ]
+
+[versions]
+# An image tag selects a golden version (#86): pods of `nextnfs:<sha12>` in
+# the run's namespace, one reading the node's /etc/stormcos/release (hostPath,
+# read-only) for the release's own build. The version not in the release is
+# fetched from forge by the node's sbregistry (stormblock-registry#116), so it
+# needs forge's registry >= v0.45.0 (stormcentral#542) and the node's forge
+# peer (stormcos#271). `RUSTKUBE_NODE_TEST_GOLDEN_VERSION` names the version;
+# else the first of versions.rs's candidates that is not the release's. The
+# fetched template stays on the node (the registry's cache). On request
+# (`stormcentral test run rustkube-node versions`). By day: 15 min.
+budget_secs = 900
+cluster_read = [
+  { apiGroup = "", resource = "nodes" },
+]

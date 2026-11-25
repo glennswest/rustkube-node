@@ -60,6 +60,7 @@ impl Env {
             "long" => 8 * 3600,
             "csi" => 900,
             "golden" => 1800,
+            "versions" => 900,
             _ => 120,
         };
         let secs = |k: &str, d: u64| Duration::from_secs(var(k).and_then(|v| v.parse().ok()).unwrap_or(d));
