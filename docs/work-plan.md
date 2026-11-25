@@ -4,6 +4,18 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### In progress: #452, an `https` httpGet probe in the pod netns does a real HTTPS GET
+
+2026-11-24. `http_get_blocking` answered an `https` probe in the pod netns with a TCP connect only: no TLS, no
+request, no headers, no status. Plan: in `http_probe`, an `https` probe with a known netns takes the gRPC probe's
+route (#443): `connect_probe` makes the socket on a thread in the netns, then a tokio-rustls client (ring provider,
+a verifier that accepts any certificate but still checks the handshake signatures, as upstream's prober skips
+verification and the host path's `danger_accept_invalid_certs` does) sends the same HTTP/1.0 request the plain
+netns path writes (one request writer for both), and the status line decides: 200–399 passes. The whole call is
+bounded by the probe's timeout. Tests against a local rustls server with an rcgen certificate: 200 passes with the
+probe's headers arriving, 500 fails, a plain-TCP listener (no TLS) fails. Docs (status.md's probes row),
+CHANGELOG; sc-build.
+
 ### Done, verified with gitleaks 8.30.1: #473, secret scan's 6 `generic-api-key` findings at a0e44d3 (stormcentral#1679)
 
 2026-11-23. All six are WebSocket handshake nonces (`Sec-WebSocket-Key`), not credentials: RFC 6455's sample
