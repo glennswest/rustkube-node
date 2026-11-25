@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-25
+
+- **feat:** `/metrics` serves `kubelet_volume_stats_available_bytes`, `_inodes`, `_inodes_free` and `_inodes_used` per claim, and `/stats/summary`'s `volume[]` carries `availableBytes`, `inodes`, `inodesFree` and `inodesUsed` (#469). A built-in claim is mounted by its container, in the container's mount namespace, so the kubelet asks the filesystem there: the container's pid from stormpump, its `mountPath` for the claim resolved under `/proc/<pid>/root` with `openat2(RESOLVE_IN_ROOT)` (an absolute symlink in the image cannot lead to a host path), then `fstatvfs`, the numbers `df -B1` and `df -i` show. A path that is not a mount point gives nothing, so the container root's sizes are never reported as the claim's. With no running container mounting the claim, or under the CRI runtime, the four are absent. `capacityBytes` and `usedBytes` stay the engine's (#456).
+
 ## 2026-11-24
 
 - **fix:** An `https` httpGet probe run in the pod's network namespace does a real HTTPS GET (#452). It only opened a TCP connection: no TLS handshake, no request (so none of its `httpHeaders`), no status, so a server answering 500, or a port with no TLS on it, passed. The connection is now made on a thread in the netns (as the gRPC probe's, #443), then TLS runs over it with any certificate accepted (upstream's prober skips verification, as the host path does; the handshake's signatures are still checked), the probe's GET goes with its headers, and 200–399 passes.

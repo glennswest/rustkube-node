@@ -1773,6 +1773,21 @@ impl RuntimeService for StormpumpRuntime {
         self.containers.lock().await.get(container_id).map(|c| c.steps)
     }
 
+    /// From QUERY's info block (#469), as the identity record's (#84); only a
+    /// running container has one.
+    async fn container_pid(&self, container_id: &str) -> Option<i32> {
+        let workload = {
+            let containers = self.containers.lock().await;
+            let c = containers.get(container_id)?;
+            if c.state != ContainerState::Running {
+                return None;
+            }
+            c.workload_handle?
+        };
+        let pid: i32 = self.on_ring(move |r| r.query_info(workload)).await.ok().flatten()?.pid;
+        (pid > 0).then_some(pid)
+    }
+
     async fn create_container(
         &self,
         sandbox_id: &str,

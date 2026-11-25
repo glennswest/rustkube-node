@@ -10,8 +10,10 @@
 //!   `kubernetes_build_info`. Rendered by the Prometheus recorder, which this
 //!   module installs once for the process. Also
 //!   `kubelet_volume_stats_capacity_bytes` and `kubelet_volume_stats_used_bytes`
-//!   per claim (#456), rendered at scrape time from `/stats/summary`'s
-//!   volumes ([`render_volume_stats`]), so a claim gone from the node drops out.
+//!   per claim (#456), and `_available_bytes`, `_inodes`, `_inodes_free`,
+//!   `_inodes_used` for a claim a running container mounts (#469), rendered at
+//!   scrape time from `/stats/summary`'s volumes ([`render_volume_stats`]), so
+//!   a claim gone from the node drops out.
 //! - **`/metrics/cadvisor`**: what the node's workloads consume, in cAdvisor's
 //!   shape: `container_cpu_usage_seconds_total`,
 //!   `container_memory_working_set_bytes`, `container_fs_usage_bytes`,
@@ -354,13 +356,27 @@ pub fn render_volume_stats(pods: &[((String, String), Vec<serde_json::Value>)]) 
             let (Some(ns), Some(name)) = (v["pvcRef"]["namespace"].as_str(), v["pvcRef"]["name"].as_str()) else {
                 continue;
             };
-            claims.entry((ns.to_string(), name.to_string())).or_insert(v);
+            // A pod whose container is not running has no filesystem sizes;
+            // another pod on the node mounting the claim may (#469).
+            claims
+                .entry((ns.to_string(), name.to_string()))
+                .and_modify(|e| {
+                    if e["availableBytes"].is_null() && !v["availableBytes"].is_null() {
+                        *e = v;
+                    }
+                })
+                .or_insert(v);
         }
     }
     let mut out = String::new();
     for (metric, field, help) in [
         ("kubelet_volume_stats_capacity_bytes", "capacityBytes", "Capacity in bytes of the volume"),
         ("kubelet_volume_stats_used_bytes", "usedBytes", "Number of used bytes in the volume"),
+        // From a statfs of the claim in its container's mount namespace (#469).
+        ("kubelet_volume_stats_available_bytes", "availableBytes", "Number of available bytes in the volume"),
+        ("kubelet_volume_stats_inodes", "inodes", "Maximum number of inodes in the volume"),
+        ("kubelet_volume_stats_inodes_free", "inodesFree", "Number of free inodes in the volume"),
+        ("kubelet_volume_stats_inodes_used", "inodesUsed", "Number of used inodes in the volume"),
     ] {
         let series: Vec<(String, f64)> = claims
             .iter()
@@ -523,6 +539,33 @@ mod tests {
         assert_eq!(out.matches("persistentvolumeclaim=").count(), 2, "once per claim and family: {out}");
         assert!(!out.contains(r#"persistentvolumeclaim="csi""#), "no sizes, no series: {out}");
         assert_eq!(render_volume_stats(&[]), "", "no claims, no families");
+        assert!(!out.contains("kubelet_volume_stats_available_bytes"), "not known, no family: {out}");
+    }
+
+    /// #469: the filesystem's free space and inodes, under upstream's names,
+    /// from whichever pod mounting the claim has them.
+    #[test]
+    fn volume_fs_stats_are_per_claim() {
+        use serde_json::json;
+        let pods = vec![
+            (("db".to_string(), "stopped".to_string()), vec![
+                json!({"name": "data", "volumeId": "v-1", "pvcRef": {"name": "data-pg-0", "namespace": "db"},
+                    "capacityBytes": 1073741824u64, "usedBytes": 104857600u64}),
+            ]),
+            (("db".to_string(), "pg-0".to_string()), vec![
+                json!({"name": "data", "volumeId": "v-1", "pvcRef": {"name": "data-pg-0", "namespace": "db"},
+                    "capacityBytes": 1073741824u64, "usedBytes": 104857600u64,
+                    "availableBytes": 987654321u64, "inodes": 65536u64, "inodesFree": 65000u64, "inodesUsed": 536u64}),
+            ]),
+        ];
+        let out = render_volume_stats(&pods);
+        let l = r#"{namespace="db",persistentvolumeclaim="data-pg-0"}"#;
+        assert!(out.contains("# TYPE kubelet_volume_stats_available_bytes gauge"), "{out}");
+        assert!(out.contains(&format!("kubelet_volume_stats_available_bytes{l} 987654321")), "{out}");
+        assert!(out.contains(&format!("kubelet_volume_stats_inodes{l} 65536")), "{out}");
+        assert!(out.contains(&format!("kubelet_volume_stats_inodes_free{l} 65000")), "{out}");
+        assert!(out.contains(&format!("kubelet_volume_stats_inodes_used{l} 536")), "{out}");
+        assert_eq!(out.matches("persistentvolumeclaim=").count(), 6, "once per claim and family: {out}");
     }
 
     #[test]

@@ -85,6 +85,27 @@ pub fn volume_stats(
         .collect()
 }
 
+/// Where each container of a pod mounts pod volume `volume` (#469): its
+/// `containers`, then its `initContainers` (a sidecar runs as one), as
+/// (container name, `mountPath`). A `volumeDevices` entry is a raw block
+/// device with no filesystem, so it is not one.
+pub fn volume_mount_paths(spec: &Value, volume: &str) -> Vec<(String, String)> {
+    ["containers", "initContainers"]
+        .iter()
+        .flat_map(|k| spec[*k].as_array().into_iter().flatten())
+        .flat_map(|c| {
+            let name = c["name"].as_str().unwrap_or("").to_string();
+            c["volumeMounts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(move |m| m["name"].as_str() == Some(volume))
+                .filter_map(|m| m["mountPath"].as_str().map(str::to_string))
+                .map(move |p| (name.clone(), p))
+        })
+        .collect()
+}
+
 /// State of a managed pod on this node.
 #[derive(Debug, Clone)]
 pub struct PodState {
@@ -6071,32 +6092,69 @@ impl PodManager {
     /// upstream's `VolumeStats` (`name`, `pvcRef`), sized from the engine
     /// (`capacityBytes` its virtual size, `usedBytes` the bytes it holds of
     /// its own), with `volumeId`, the id `storm.io/volume.<name>` names.
+    ///
+    /// A volume a running container mounts also has its filesystem's
+    /// `availableBytes` and `inodes*` (#469), from a statfs of its mount path
+    /// in that container's mount namespace (`volume_fs`).
     pub async fn pod_volume_stats(&self) -> Vec<((String, String), Vec<Value>)> {
-        let pods: Vec<(String, String, String, Value)> = self
+        type Held = (String, String, Value, HashMap<String, String>);
+        let pods: Vec<(String, Held)> = self
             .pods
             .read()
             .await
             .values()
-            .map(|p| (p.namespace.clone(), p.name.clone(), p.uid.clone(), p.pod["spec"]["volumes"].clone()))
+            .map(|p| {
+                (p.uid.clone(), (p.namespace.clone(), p.name.clone(), p.pod["spec"].clone(), p.container_ids.clone()))
+            })
             .collect();
         let held: Vec<_> = pods
             .into_iter()
-            .map(|(ns, name, uid, spec)| {
-                let ids = self.pod_volume_ids(&uid);
-                (ns, name, spec, ids)
-            })
-            .filter(|(_, _, _, ids)| !ids.is_empty())
+            .map(|(uid, held)| (held, self.pod_volume_ids(&uid)))
+            .filter(|(_, ids)| !ids.is_empty())
             .collect();
         if held.is_empty() {
             return Vec::new();
         }
         let listing = self.storage_get("/api/v1/volumes").await.unwrap_or(Value::Null);
-        held.into_iter()
-            .map(|(ns, name, spec, ids)| {
-                let stats = volume_stats(&ns, &name, &spec, &ids, &listing);
-                ((ns, name), stats)
-            })
-            .collect()
+        let mut out = Vec::new();
+        for ((ns, name, spec, containers), ids) in held {
+            let mut stats = volume_stats(&ns, &name, &spec["volumes"], &ids, &listing);
+            for v in stats.iter_mut() {
+                let Some(volume) = v["name"].as_str().map(str::to_string) else { continue };
+                if let Some(fs) = self.volume_fs_stats(&spec, &containers, &volume).await {
+                    fs.fill(v);
+                }
+            }
+            out.push(((ns, name), stats));
+        }
+        out
+    }
+
+    /// The filesystem of pod volume `volume` as the first running container
+    /// that mounts it sees it (#469). `None` when no running container mounts
+    /// it, the runtime cannot name its process, or nothing is mounted there.
+    async fn volume_fs_stats(
+        &self,
+        spec: &Value,
+        containers: &HashMap<String, String>,
+        volume: &str,
+    ) -> Option<crate::volume_fs::FsStats> {
+        for (container, mount_path) in volume_mount_paths(spec, volume) {
+            let Some(id) = containers.get(&container) else { continue };
+            let Some(pid) = self.runtime.container_pid(id).await else { continue };
+            #[cfg(target_os = "linux")]
+            {
+                let asked = tokio::task::spawn_blocking(move || crate::volume_fs::statfs_in(pid, &mount_path)).await;
+                match asked {
+                    Ok(Ok(fs)) => return Some(fs),
+                    Ok(Err(e)) => debug!(volume = %volume, container = %container, "volume statfs: {e}"),
+                    Err(e) => debug!(volume = %volume, container = %container, "volume statfs: {e}"),
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = (pid, mount_path);
+        }
+        None
     }
 
     pub async fn pod_network_stats(&self) -> Vec<crate::cri::PodNetworkStats> {
@@ -8398,6 +8456,28 @@ pub(crate) mod tests {
         ContainerStatusInfo, ExecSyncResult, ImageInfo, PodSandboxState, PodSandboxStatusInfo,
         PodSandboxSummary,
     };
+
+    /// #469: where each container mounts a volume, init (sidecar) ones too;
+    /// a raw block device is not a mount.
+    #[test]
+    fn volume_mount_paths_lists_each_containers_mount() {
+        let spec = serde_json::json!({
+            "containers": [
+                {"name": "app", "volumeMounts": [{"name": "data", "mountPath": "/var/lib/pg"},
+                                                  {"name": "cfg", "mountPath": "/etc/app"}]},
+                {"name": "raw", "volumeDevices": [{"name": "data", "devicePath": "/dev/xvda"}]}
+            ],
+            "initContainers": [
+                {"name": "backup", "restartPolicy": "Always",
+                 "volumeMounts": [{"name": "data", "mountPath": "/src", "readOnly": true}]}
+            ]
+        });
+        assert_eq!(
+            volume_mount_paths(&spec, "data"),
+            [("app".to_string(), "/var/lib/pg".to_string()), ("backup".to_string(), "/src".to_string())]
+        );
+        assert!(volume_mount_paths(&spec, "none").is_empty());
+    }
     use async_trait::async_trait;
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};

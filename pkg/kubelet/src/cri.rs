@@ -461,6 +461,13 @@ pub trait RuntimeService: Send + Sync + 'static {
         None
     }
 
+    /// A running container's init process on this node (#469), whose
+    /// `/proc/<pid>/root` is its mount namespace's root. Default: not known
+    /// (a CRI runtime's processes are its own).
+    async fn container_pid(&self, _container_id: &str) -> Option<i32> {
+        None
+    }
+
     /// A container's image provenance and its own root (#130). Default: not known.
     async fn container_image_info(&self, _container_id: &str) -> Option<ContainerImageInfo> {
         None
