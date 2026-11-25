@@ -4,7 +4,7 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### In progress: #469, `kubelet_volume_stats_available_bytes` and `_inodes*` for built-in claims
+### Built, node run pending: #469, `kubelet_volume_stats_available_bytes` and `_inodes*` for built-in claims
 
 2026-11-25. The issue's second route, the kubelet itself, needs no engine op: stormpump already gives a running
 container's pid (`query_info`, as the identity record uses, #84). Plan:
@@ -22,6 +22,17 @@ container's pid (`query_info`, as the identity record uses, #84). Plan:
 5. Tests: statfs of a tempdir mount point vs. `statvfs(2)` of the same; a path that is not a mount gives nothing;
    an absolute symlink stays inside the root; the four families render. Docs (status.md, api.md), CHANGELOG;
    sc-build. The issue's check (`df -B1` / `df -i` in a pod) needs a node.
+
+Built in b0cfe1d (`volume_fs.rs`, `RuntimeService::container_pid`, `pod_volume_stats`, the four families). sc-build
+passed (20261125-062522-b0cfe1db: `cargo build --locked && cargo test --locked`, every suite ok; the 10 new and
+touched tests listed ok, among them `volume_fs::tests::*` (a real mount point under `/` against `statvfs(2)`, a
+non-mount gives nothing, an absolute symlink and `..` stay inside the root), `volume_mount_paths_lists_each_containers_mount`,
+`metrics::tests::volume_fs_stats_are_per_claim`). The issue's check as a node test: `pvc-volume-stats` in the `pvc`
+suite (61d7d3d): a pod's `df-hold` (statvfs of its claim after a 4 MiB write and sync) against the node's
+`/stats/summary` through `nodes/proxy` (added to `[pvc]` in requires.toml): inodes equal, available within 1 MiB.
+Test crate sc-build passed (20261125-064209-61d7d3d0, 84 ok, `the_pods_df_is_held_against_the_summary` new).
+Stage build 6827e22574e0 requested (also carries #452). Left open: the node run
+(`stormcentral test run rustkube-node pvc` on a node with this golden) is the issue's check.
 
 ### Done (unit-verified; not run on a node): #452, an `https` httpGet probe in the pod netns does a real HTTPS GET
 
