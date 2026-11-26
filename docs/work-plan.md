@@ -1445,6 +1445,9 @@ CA is fatal at start; `http://` works as before. Not the client pair (not asked;
        17:35Z: a5f5a686ee ended error: pvetest3's apiserver no /readyz in 10 min; its stormblock has ~1390 ublk writes unanswered
        for ~9400 s (slab registry held by one write task): the machine, not this change. Queued golden again at cb257ee: cd63ed3871
        on pvetest1 (14.07-flowsdn), a6f8151cb8 on pvetest3. Parked `--after-run cd63ed3871`. `vmi-start-control` pass → close #325.
+       23:30Z: a6f8151cb8 (pvetest3) failed `vmi-start-control`: control 105/130/282/311 ms, report 13-50 ms, on the machine
+       whose stormblock stalled (stormblock#752); recorded on #325. pvetest1's last install failed, so cd63ed3871 waits. Re-parked
+       `--after-run b4c3d8fd17` (golden on pvetest2, at 591f841). Pass → close; ~100 ms again → split the bind from start-timing.
 
 ### Done: #311 (P1), X9 blades: container start 4-9 s in `containers`
 
