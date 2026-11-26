@@ -2561,6 +2561,9 @@ new sbregistry work (file it); the kubelet half rides the existing pull + demand
        release build ok. The run was refused: no machine can take it (pvetest1-3's apiservers down: stormcluster
        :9102 fails API health, stormcluster#123; the hardware runs no known release). Held `--after-install stormcluster>=f1de3f6@any:pve` (#123's fix).
        Resume: `stormcentral test run rustkube-node versions --commit 9284cba` on a pvetest; pass -> close #86.
+       2026-11-26: handed back (stormcluster f1de3f6 installed: pvetest1 runs 14.06-flowsdn). `test run rustkube-node versions`
+       refused: pvetest1/2 held at :5100 until stormcentral 78c9a8e is deployed (#1798; running 0381d7e), pvetest3 by stormrdp#70,
+       server8 on 12.94. No code change. Held `--after stormrdp#70`. Resume: the same run; pass -> close #86.
 
 ### (history) Waiting on the owner: #86 (P2), versioned goldens for pods
 
