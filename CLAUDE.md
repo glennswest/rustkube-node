@@ -56,6 +56,13 @@ owner built the stage golden for v0.12.0: golden-rustkube-node-ce66e97945ad
 (image 11.50). `scripts/build-golden.sh` (another bin-only builder) was removed
 by #51.
 
+**Moving here (#480, stormcentral#1836):** `deploy/build-image.sh rustkube-node OUT`
+(entry `deploy/build-golden.sh`, kind `tree`) builds the same tree from this
+checkout, on the `stormd` input image (`GOLDEN_INPUT_STORMD`); checked by
+`SC_TOOLS=stormd sc-build 'bash deploy/test-build-image.sh'`. Until the registry
+row flips (after stormcentral#1846; stormcos#1666 supplies the mirror-namespace
+map, which the image no longer carries), release goldens are still `component stage`.
+
 ## Work plan
 
 The work plan and its session history are **[docs/work-plan.md](docs/work-plan.md)**. That file is not loaded by default. Find your section with `grep -n '^## ' docs/work-plan.md`, then read only that section. Write intentions there before starting a task, as before. Keep this CLAUDE.md short: it is loaded into every turn.

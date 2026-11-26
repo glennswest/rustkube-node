@@ -10,6 +10,9 @@ stormcos#424). This document describes source and recorded `sc-build`
 verification (465 kubelet unit tests at 009d006), not a tested live node unless
 a row says so.
 
+The golden's recipe is moving from stormcos's stage into this repo (#480): `deploy/build-image.sh`, checked
+by `deploy/test-build-image.sh`. Until stormcentral#1846 and the registry row's flip, release goldens are still staged.
+
 ## Changes since October 2
 
 | Area | Current code and issues |
