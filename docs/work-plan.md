@@ -4,6 +4,13 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### Parked after run 720e32489a: #482 (P2), medium's requires.toml asks no cluster read of pods (`node-services-namespaces` 403)
+2026-11-26. Seen in b03b7929eb (pvetest1): `node-services-namespaces` (#418) got 403 listing
+`/api/v1/pods?labelSelector=storm.io/component=node-service` across namespaces; `[medium]`'s `cluster_read` had no `pods`.
+Fixed in e87605d (`{ apiGroup = "", resource = "pods" }`, CHANGELOG). No code: the runner reads requires.toml. Verified by
+medium 720e32489a (pvetest2, at c1129da ⊇ e87605d; the same run #414 waits on). Done when `node-services-namespaces` runs
+(no 403): its own pass or fail is #418's. Parked `--after-run 720e32489a`.
+
 ### Doing: #480 (P1), the rustkube-node golden built here: `deploy/build-image.sh` (stage mode retired, stormcentral#1836)
 
 2026-11-26. Source: stormcos f7f7ccb `deploy/build-goldens.sh` 9195-9380 (the "rustkube-node — the kubelet and kube-proxy"
