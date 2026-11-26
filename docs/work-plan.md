@@ -734,6 +734,12 @@ why) → close #421.
 2026-11-26: handed back (pvetest1 runs 14.06-flowsdn ⊇ cf87f2f). `test run rustkube-node golden` refused: pvetest1/2 held at
 :5100 until stormcentral 78c9a8e is deployed (#1798; running 0381d7e), pvetest3 by stormrdp#70. No code change. Held
 `--after stormrdp#70`. Resume: `stormcentral test run rustkube-node golden`; both #421 cases pass → close.
+2026-11-26 (23:30Z): golden a6f8151cb8 (pvetest3, 14.06, at cb257ee): `vmi-kernel-outside-refused` **pass** (Pending, refused:
+the kernel is not under the kernel directories). `vmi-direct-kernel` skip "no CloudImage has golden fedora-44-x86_64": a test
+bug. `boot_for` matched `status.golden`, which vmimages writes as `media-<sha12>`; the VM's golden is `status.localName`
+(vmimages src/crd.rs). Fixed 591f841 (localName, else golden; unit case in vmimages' shape); test crate sc-build
+20261126-232633-591f8413 posts on #421. Queued golden b4c3d8fd17 on pvetest2 at 591f841. Parked `--after-run b4c3d8fd17`.
+Next: its `vmi-direct-kernel`. A pass → close. A skip on `status.boot.message` (vmimages' data_size, the master's) → ask there.
 ### Parked after stormcentral#1271 (a two-node record): #404 (P0), a VM root on a stormstorage mirrored volume filled from its golden (stormstorage#113 B')
 2026-11-20. The owner chose B' on stormstorage#113 (built there: 2ef4b37, `from_golden`). Plan (`vm_mirrored_root.rs`):
 - Asked for by the VMI annotation `storm.io/mirrored-disks: {"<disk>": <copies ≥ 2>}` (the VM template's annotations reach the
