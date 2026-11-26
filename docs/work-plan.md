@@ -618,7 +618,7 @@ carrying it (`vmi-agent-keys` True).
 Done 25bc12e; sc-build passed (715 kubelet tests; no clippy finding in the changed lines). Stage build f06cb62e004e. Held
 `--after-install rustkube-node>=25bc12e`. Resume: run the golden suite on that machine; `vmi-agent-keys` True → close #405.
 
-### Waiting on an install: #421 (P2), direct kernel boot from the golden's kernel (vmcloud-image-operator#62, stormvm#111)
+### Parked after stormrdp#70 (no test machine): #421 (P2), direct kernel boot from the golden's kernel (vmcloud-image-operator#62, stormvm#111)
 2026-11-20. Finding: no mount is needed. stormvm's machine spec is `root: Root::Inherit`, which stormpump documents as "the
 host's mount view", and `/data/vmimages` is a pallet volume mounted on the host (stormcos boot.d `volume vmidata /data/vmimages`);
 the hypervisor already opens other host paths (the qemu pallet's firmware) with no mount. The ENOENT in the issue was predicted,
@@ -641,6 +641,9 @@ Test crate test + clippy -D warnings passed. Held `--after-install rustkube-node
 rustkube-node golden` there; outside-refused must pass; direct-kernel passes once vmimages' `data_size` is 1G (else its skip says
 why) → close #421.
 
+2026-11-26: handed back (pvetest1 runs 14.06-flowsdn ⊇ cf87f2f). `test run rustkube-node golden` refused: pvetest1/2 held at
+:5100 until stormcentral 78c9a8e is deployed (#1798; running 0381d7e), pvetest3 by stormrdp#70. No code change. Held
+`--after stormrdp#70`. Resume: `stormcentral test run rustkube-node golden`; both #421 cases pass → close.
 ### Parked after stormcentral#1271 (a two-node record): #404 (P0), a VM root on a stormstorage mirrored volume filled from its golden (stormstorage#113 B')
 2026-11-20. The owner chose B' on stormstorage#113 (built there: 2ef4b37, `from_golden`). Plan (`vm_mirrored_root.rs`):
 - Asked for by the VMI annotation `storm.io/mirrored-disks: {"<disk>": <copies ≥ 2>}` (the VM template's annotations reach the
