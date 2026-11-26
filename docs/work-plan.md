@@ -4,6 +4,34 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### Doing: #480 (P1), the rustkube-node golden built here: `deploy/build-image.sh` (stage mode retired, stormcentral#1836)
+
+2026-11-26. Source: stormcos f7f7ccb `deploy/build-goldens.sh` 9195-9380 (the "rustkube-node — the kubelet and kube-proxy"
+section) plus its helpers `stormdbase_stage`, `stormd_applets`, `golden_stormd`/`stormd_log_limits`, `env_default_flag`,
+`stormd_api_tls`. Shape: the master's ruling on rustkube#403 (option A, 2026-11-26 3:55 pm CT): the golden carries the
+binaries, stormd from the `stormd` input image and its default config, nothing of another component's. So the one stormcos
+piece, `etc/kubernetes/mirror-namespaces.json` (stormcos `deploy/node/projects.py map`), leaves the image: stormcos supplies
+it (its content golden, or `MIRROR_NAMESPACES`, which the kubelet already reads and watches, #418). `etc/kubernetes/` stays
+as the mount point. Plan:
+1. `deploy/build-image.sh rustkube-node OUT` (+ `deploy/build-golden.sh`, the `tree` contract stormcentral runs, as
+   stormblock-registry#273): `cargo build --release --locked --target x86_64-unknown-linux-musl` (kubelet, kube-proxy;
+   no `dist` profile here, the stage's own path); the stormdbase root (bin sbin usr/bin usr/sbin etc/stormd data dev proc
+   sys run tmp var/log/stormd .stormd, `/stormd` and every `--list-commands` applet linked as `bin/<a> -> ../stormd`,
+   `usr/bin/<a> -> ../../stormd`); the mount points; `var/run -> ../run`; the config as the stage writes it after
+   `env_default_flag` (`--apiserver` → `env_default = { APISERVER_URL = "https://${NODE_IP}:6443" }`), `STORMD_API_TLS=1`
+   adding the `[api]` TLS lines (default off, as the stage), the log limits; the two `@@SHIPS_WITH` lines echoed.
+   stormd from `GOLDEN_INPUT_STORMD` (the input's directory, `bin/stormd`) or `STORMD_STATIC` (a file); none → exit 1.
+   x86_64 only; another name exits 2.
+2. `deploy/test-build-image.sh`: runs the recipe into a temp dir and checks the tree (binaries static and as built, the
+   applet links, the config parses and holds the stage's lines, env_default, no mirror map). sc-build with
+   `SC_TOOLS=stormd` for a real stormd.
+3. Gaps on stormcentral (filed): a `tree` build mounts no `inputs` (only `media` and `service` do), and a component build
+   records no recipe `@@SHIPS_WITH`. On stormcos (filed): the mirror map from stormcos for the rustkube-node unit before the
+   flip; then delete the stage section.
+4. CHANGELOG, CLAUDE.md's "Release goldens", docs/status.md. Comment on #480 and stormcentral#1836 with the flip.
+Close #480 when the row is flipped and a `component build rustkube-node` golden runs on a node; until then parked after the
+stormcentral issue.
+
 ### Done (unit-verified; not run on a node): #479, review e353605dcd69: an in-netns HTTP probe parses one read as the status line (health.rs)
 
 2026-11-25. `http_get_blocking` (plain `http` httpGet in the pod netns) makes one `read` and hands its bytes to
