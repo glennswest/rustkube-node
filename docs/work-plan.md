@@ -1308,7 +1308,7 @@ CA is fatal at start; `http://` works as before. Not the client pair (not asked;
        (#227's elsewhere). Live: not run on a node or a real engine; stormcos sets `--stormblock https://127.0.0.1:9090 --stormblock-ca /data/stormcert/ca.crt`.
 2. [x] stormvm-block (snapshot, restore, console `snapshot`) gets the same URL and has no CA: follow-up #318, proposed after stormvm#110; said on stormcos#374.
 
-### Doing: #325 (P2), VM start: `control` a flat ~102 ms, `report` grew (stormcos#804, fix 17)
+### Parked after stormrdp#70 (no test machine): #325 (P2), VM start: `control` a flat ~102 ms, `report` grew (stormcos#804, fix 17)
 
 2026-11-06. `control`: stormvm's `status_when_up` sleeps a fixed 100 ms after a refused connect, so a socket bound within that costs 100 ms. Target: under 20 ms on a VM, VM Running ~150 ms warm.
 `report`: one merge PATCH. pvetest1 12.61 VMIs 3.7-139 ms, pvetest2 12.61-flowsdn 2.8-118 ms, while pods in the same boots stay 2.5-5.8 ms (12.58.4 VMIs 3.7-22 ms). Not explained yet. Doing:
@@ -1334,6 +1334,10 @@ CA is fatal at start; `http://` works as before. Not the client pair (not asked;
        gets `vmi-start-control`: before cleanup, every VMI of the run's `storm.io/start-timing`; pass when one has `control` under
        20 ms (the first VM of a pass is qemu's own bind, stormvm#123), listing every `control` and `report`; fail when none is;
        Infra when no VMI says. Tests on the parser/verdict; README; CHANGELOG; test crate sc-build; the run when a machine is free.
+       Built in ac80be0 (`timing_ms`, `judge_start_control`, the case before golden's cleanup). Test crate sc-build passed
+       (sc-build-7e209c50d2: build, clippy `-D warnings`, 88 ok incl. `the_fastest_control_is_judged`). `test run rustkube-node golden`
+       refused: no machine (pvetest1/2 until stormcentral 78c9a8e is deployed, pvetest3 by stormrdp#70). Held `--after stormrdp#70`.
+       Resume: `stormcentral test run rustkube-node golden`; `vmi-start-control` pass → close #325.
 
 ### Done: #311 (P1), X9 blades: container start 4-9 s in `containers`
 
