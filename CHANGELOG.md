@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-26
+
+- **test:** `vmi-mirrored-root` (#404) moved from the `golden` suite to a `mirrored` suite of its own, declared `topology = "two-node"` (stormcentral#1271). `golden` runs on one single-node machine, which has one storage node, so a two-copy mirror could only ever be skipped there. stormcentral now forms a two-node cluster record for the run: `stormcentral test run rustkube-node mirrored --tag <record>`. A cluster with fewer than two Ready nodes is `Infra`, never a pass, and the case deletes only its own VMI. No kubelet change.
+
 ## 2026-11-25
 
 - **fix:** A plain `http` httpGet probe in the pod's network namespace reads the whole status line (#479, e353605dcd69). It made one read and parsed it as the line, so a response whose status line TCP delivered in pieces (`HT`, then the rest) failed a healthy container's probe, and enough of them in a row restarted it. It now reads to the first CRLF, EOF or 512 bytes, as the https path does, each read waiting only the time left before the probe's timeout (connect included), so a server sending a byte at a time fails the probe at its timeout instead of holding it.

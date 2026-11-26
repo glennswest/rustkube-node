@@ -30,7 +30,9 @@
 //! - `golden-clone-new-identity`: a VMI booted from `G` prints a machine-id,
 //!   and it is not the source's: the copy was de-identified.
 //!
-//! - `vmi-mirrored-root` (#404): a VMI whose root asks
+//! - `vmi-mirrored-root` (#404), the `mirrored` suite of its own
+//!   (`topology = "two-node"`: a mirror needs two storage nodes, so it
+//!   runs on a cluster record, never on one SNO machine): a VMI whose root asks
 //!   `storm.io/mirrored-disks: {"root": 2}` boots from a stormstorage
 //!   mirrored volume filled from the golden: Running, its console prints a
 //!   machine-id, and `status.volumes[]` names `mirrored.volume`
@@ -484,10 +486,10 @@ impl Suite {
         for p in [AGENT_PROBE, PODNET_CLIENT] {
             self.api.delete(&format!("{}/{p}", k8s::pods(&self.env))).await?;
         }
-        for v in [SOURCE, NO_AGENT, CLONE, MIRRORED, DIRECT, OUTSIDE, AGENT, PODNET] {
+        for v in [SOURCE, NO_AGENT, CLONE, DIRECT, OUTSIDE, AGENT, PODNET] {
             self.api.delete(&format!("{}/{v}", vmis(&self.env))).await?;
         }
-        for v in [SOURCE, NO_AGENT, CLONE, MIRRORED, DIRECT, OUTSIDE, AGENT, PODNET] {
+        for v in [SOURCE, NO_AGENT, CLONE, DIRECT, OUTSIDE, AGENT, PODNET] {
             k8s::gone(&self.api, &format!("{}/{v}", vmis(&self.env)), Duration::from_secs(120)).await?;
         }
         Ok(())
@@ -605,11 +607,6 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
     let o = suite.direct_kernel(&root, &says_id).await;
     r.record("vmi-direct-kernel", o, t.elapsed().as_millis(), None);
 
-    // A root mirrored across nodes from the golden (#404).
-    let t = Instant::now();
-    let o = suite.mirrored_root(&root, &says_id).await;
-    r.record("vmi-mirrored-root", o, t.elapsed().as_millis(), None);
-
     let t = Instant::now();
     let o = match suite.cleanup().await {
         Err(e) => Outcome::Infra(e),
@@ -620,6 +617,63 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
         Ok(()) => Outcome::Pass("VMIs and requests deleted".into()),
     };
     r.record("cleanup", o, t.elapsed().as_millis(), None);
+}
+
+/// The `mirrored` suite (#404): `vmi-mirrored-root` alone, on a two-node
+/// cluster (`topology = "two-node"`, stormcentral#1271). A mirror needs two
+/// storage nodes, so on one SNO machine it could only skip; a cluster with
+/// fewer than two Ready nodes is Infra, never a pass.
+pub async fn run_mirrored(env: Arc<Env>, api: Api, r: &mut Report) {
+    let t = Instant::now();
+    let nodes = match api.list("/api/v1/nodes").await {
+        Ok(Some(n)) => n,
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            r.record("mirrored-nodes", Outcome::Infra(e), 0, None);
+            return;
+        }
+    };
+    if let Err(why) = enough_nodes(&nodes) {
+        r.record("mirrored-nodes", Outcome::Infra(why), t.elapsed().as_millis(), None);
+        return;
+    }
+    let suite = Suite { env: env.clone(), api: api.clone() };
+    let t = Instant::now();
+    let o = suite.mirrored_root(&source_golden(), &says_its_id()).await;
+    r.record("vmi-mirrored-root", o, t.elapsed().as_millis(), None);
+
+    let t = Instant::now();
+    let path = format!("{}/{MIRRORED}", vmis(&env));
+    let o = match api.delete(&path).await {
+        Err(e) => Outcome::Infra(e),
+        Ok(_) => match k8s::gone(&api, &path, Duration::from_secs(120)).await {
+            Err(e) => Outcome::Infra(e),
+            Ok(()) => Outcome::Pass(format!("VMI {MIRRORED} deleted; its mirrored volume goes with it (the kubelet's sweep)")),
+        },
+    };
+    r.record("cleanup", o, t.elapsed().as_millis(), None);
+}
+
+/// Two Ready nodes at least: what a two-copy mirror is placed on.
+pub fn enough_nodes(nodes: &[Value]) -> Result<(), String> {
+    let ready: Vec<&str> = nodes
+        .iter()
+        .filter(|n| {
+            n["status"]["conditions"]
+                .as_array()
+                .is_some_and(|c| c.iter().any(|c| c["type"] == "Ready" && c["status"] == "True"))
+        })
+        .filter_map(|n| n["metadata"]["name"].as_str())
+        .collect();
+    if ready.len() < 2 {
+        return Err(format!(
+            "a mirrored root needs two storage nodes; this cluster has {} node(s), {} Ready ({}): run it on a two-node record (topology two-node)",
+            nodes.len(),
+            ready.len(),
+            ready.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 /// A VMI's `status.volumes[]` (#373): its root disk is there with role
@@ -889,6 +943,15 @@ mod tests {
         assert!(matches!(judge_status_volumes(&ok, "fedora-44-x86_64"), Outcome::Pass(_)));
         assert!(matches!(judge_status_volumes(&ok, "other"), Outcome::Fail(_)));
         assert!(matches!(judge_status_volumes(&serde_json::json!({"status": {"phase": "Running"}}), "x"), Outcome::Fail(_)));
+    }
+
+    #[test]
+    fn a_mirror_needs_two_ready_nodes() {
+        let node = |n: &str, ready: &str| serde_json::json!({"metadata": {"name": n}, "status": {"conditions": [{"type": "Ready", "status": ready}]}});
+        assert!(enough_nodes(&[node("a", "True"), node("b", "True")]).is_ok());
+        let one = enough_nodes(&[node("a", "True"), node("b", "False")]).unwrap_err();
+        assert!(one.contains("2 node(s), 1 Ready (a)"), "{one}");
+        assert!(enough_nodes(&[]).is_err());
     }
 
     #[test]

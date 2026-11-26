@@ -89,6 +89,22 @@ cluster_read = [
   { apiGroup = "storm.io", resource = "cloudimages" },
 ]
 
+[mirrored]
+# A VM root on a stormstorage mirrored volume filled from its golden (#404,
+# stormstorage#113 B'): `vmi-mirrored-root`, once in `golden`, where one SNO
+# machine (one storage node) could only skip it. Two nodes: stormcentral forms
+# a two-node cluster record for the run (#1271), and the kubelet has
+# --stormstorage there (stormcluster writes STORMSTORAGE_URL at seed/join). A
+# VMI in the run's namespace (its Role), booted from the release's golden on
+# STORM_NODE; fewer than two Ready nodes is Infra. Not in `required`: on request,
+# `stormcentral test run rustkube-node mirrored --tag <two-node record>`.
+budget_secs = 1800
+topology = "two-node"
+requires = ["kvm"]
+cluster_read = [
+  { apiGroup = "", resource = "nodes" },
+]
+
 [pvc]
 # PVC management on the built-in class (#379): a claim grown online under its
 # pod, a VolumeSnapshot of it, the snapshot restored into a larger claim, and

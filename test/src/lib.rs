@@ -118,11 +118,12 @@ pub async fn run(env: Arc<Env>, r: &mut Report) {
         "multus" => Box::pin(multus::run(env, api, r)).await,
         "metadata" => Box::pin(metadata::run(env, api, r)).await,
         "golden" => Box::pin(golden::run(env, api, r)).await,
+        "mirrored" => Box::pin(golden::run_mirrored(env, api, r)).await,
         "pvc" => Box::pin(pvc::run(env, api, r)).await,
         "realtime" => Box::pin(realtime::run(env, api, r)).await,
         "versions" => Box::pin(versions::run(env, api, r)).await,
         other => {
-            r.record("suite", Outcome::Infra(format!("STORM_SUITE {other:?} is not short, medium, long, csi, multus, metadata, golden, pvc, realtime or versions")), 0, None);
+            r.record("suite", Outcome::Infra(format!("STORM_SUITE {other:?} is not short, medium, long, csi, multus, metadata, golden, mirrored, pvc, realtime or versions")), 0, None);
         }
     }
 }

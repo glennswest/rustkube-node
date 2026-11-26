@@ -60,6 +60,7 @@ impl Env {
             "long" => 8 * 3600,
             "csi" => 900,
             "golden" => 1800,
+            "mirrored" => 1800,
             "versions" => 900,
             _ => 120,
         };
