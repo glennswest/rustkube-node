@@ -29,11 +29,6 @@ const DRIVER_POD: &str = "csi-driver";
 const CLAIM: &str = "csi-claim";
 /// Where the consumers see the claim, and the file they write and read.
 const FILE: &str = "/data/rknt-csi";
-/// Whether a restarted kubelet adopts this node's pods. It does not yet (#334):
-/// each new kubelet starts every pod again, this suite's runner and its
-/// restart pod included, and the restart pod signals the new kubelet in turn,
-/// so the case puts the node in a restart loop. Set it when that is fixed.
-const KUBELET_RESTART_ADOPTS: bool = false;
 /// Every pod the suite makes that uses the claim (or, the restart pod, runs
 /// beside it). Their unpublish needs the driver serving, so they are all
 /// deleted, and gone, before the driver is (#450).
@@ -288,7 +283,14 @@ impl Suite {
         }
         let restarted = match k8s::pod_done(&self.env, &self.api, "csi-restart-kubelet", Duration::from_secs(300)).await {
             Ok(d) if d.phase == "Succeeded" => k8s::log(&self.env, &self.api, "csi-restart-kubelet", false).await.unwrap_or_default(),
-            Ok(d) => return Outcome::Fail(format!("the kubelet restart did not happen: {}", d.message)),
+            // An older kubelet, left alone: it would start every pod again.
+            Ok(d) => {
+                let said = k8s::said(&self.env, &self.api, "csi-restart-kubelet", &d).await;
+                if said.contains(crate::csi_driver::NOT_ADOPTING) {
+                    return Outcome::Skip(said);
+                }
+                return Outcome::Fail(format!("the kubelet restart did not happen: {said}"));
+            }
             Err(e) => return Outcome::Fail(format!("the kubelet did not come back: {e}")),
         };
         // The restarted kubelet finds the driver again and publishes for a
@@ -390,12 +392,9 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
             Ok(writer) => {
                 r.record("csi-publish", Outcome::Pass("a pod wrote through the driver's NodePublishVolume mount".into()), t.elapsed().as_millis(), None);
                 if r.run("csi-unpublish", s.case_unpublish(&writer)).await {
-                    if KUBELET_RESTART_ADOPTS {
-                        r.run("csi-kubelet-restart", s.case_restart()).await;
-                    } else {
-                        let why = "a restarted kubelet adopts no pods yet (#334): this case would loop the node's kubelet";
-                        r.record("csi-kubelet-restart", Outcome::Skip(why.into()), 0, None);
-                    }
+                    // Gated on the node (#334): the restart pod signals only a
+                    // kubelet that adopts its pods, else the case is a skip.
+                    r.run("csi-kubelet-restart", s.case_restart()).await;
                 }
             }
         }

@@ -437,11 +437,32 @@ pub fn kubelet_pids(proc: &Path) -> Vec<u32> {
     pids
 }
 
-/// SIGTERM the kubelet and wait for a new one.
+/// What a kubelet that adopts its pods on a restart writes (#334, 6b9e6b9):
+/// the stormpump runtime's record, in the kubelet's own root.
+pub const ADOPTION_STATE: &str = "var/lib/kubelet/stormpump-runtime.json";
+
+/// The start of the message when the kubelet is left alone because it would
+/// not adopt its pods: an older one starts every pod again, this one too, and
+/// a restart pod signals the new kubelet in turn (a restart loop).
+pub const NOT_ADOPTING: &str = "NOT ADOPTING";
+
+/// The kubelets in `pids` that keep the record a restart adopts from.
+pub fn adopting(proc: &Path, pids: &[u32]) -> Vec<u32> {
+    pids.iter().copied().filter(|p| proc.join(p.to_string()).join("root").join(ADOPTION_STATE).is_file()).collect()
+}
+
+/// SIGTERM the kubelet and wait for a new one. Only a kubelet that keeps
+/// [`ADOPTION_STATE`] is signalled; otherwise nothing is, and the error
+/// starts with [`NOT_ADOPTING`].
 pub fn restart_kubelet(proc: &Path, within: Duration) -> Result<String, String> {
     let old = kubelet_pids(proc);
     if old.is_empty() {
         return Err(format!("no kubelet process under {} (is the pod hostPID?)", proc.display()));
+    }
+    if adopting(proc, &old).len() != old.len() {
+        return Err(format!(
+            "{NOT_ADOPTING}: kubelet {old:?} keeps no /{ADOPTION_STATE} (older than rustkube-node 6b9e6b9, #334): not restarted, a new one would start every pod again"
+        ));
     }
     for &p in &old {
         // SAFETY: kill(2) with a pid and a signal number.
@@ -566,6 +587,14 @@ mod tests {
         }
         std::fs::create_dir_all(proc.join("self")).unwrap();
         assert_eq!(kubelet_pids(&proc), vec![10]);
+        // No record in its root: never signalled (#334).
+        let e = restart_kubelet(&proc, Duration::from_secs(1)).unwrap_err();
+        assert!(e.starts_with(NOT_ADOPTING), "{e}");
+        assert!(adopting(&proc, &[10]).is_empty());
+        let state = proc.join("10/root").join(ADOPTION_STATE);
+        std::fs::create_dir_all(state.parent().unwrap()).unwrap();
+        std::fs::write(&state, "{}").unwrap();
+        assert_eq!(adopting(&proc, &[10, 11]), vec![10]);
         std::fs::remove_dir_all(&proc).unwrap();
         assert!(restart_kubelet(&proc, Duration::from_secs(1)).is_err(), "no proc, no kubelet");
     }

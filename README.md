@@ -1682,8 +1682,10 @@ kubelet is under test, not the scheduler.
     (`restart-kubelet`) SIGTERMs the kubelet and waits for the new one. The
     holder keeps its container, the driver is registered again, a new pod reads
     the file, and the holder's delete is unpublished by the restarted kubelet.
-    Skipped until a test machine runs a kubelet that adopts its pods (#334): on an older
-    one it loops the kubelet. Turned on (`KUBELET_RESTART_ADOPTS`) once one does.
+    Only a kubelet that adopts its pods (#334) is signalled: one whose root has
+    `/var/lib/kubelet/stormpump-runtime.json` (rustkube-node 6b9e6b9 and later).
+    An older one is left alone, since its restart would start every pod again and
+    loop, and the case is a skip saying `NOT ADOPTING`.
   - `csi-deregistered`: the driver pod deleted, CSINode no longer lists it.
 - **multus** (< 10 min, declared in `test/requires.toml`, run on request, #233):
   a pod's extra networks by the Multus standard, with the standard CNI plugins
