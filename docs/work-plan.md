@@ -261,6 +261,10 @@ Resume: `stormcentral test show b03b7929eb`; `pod-attach-stdin-once` pass → cl
 the kubelet's fix works on the node). Fix: accept a JSON line with that `detail` and `ok: true`; test case from the run's log.
 The other 3: `pod-multi-ipc`, `pod-multi-stop-order` (#374); `node-services-namespaces` 403 on a cluster-wide pod list (filed).
 Next: test crate sc-build; rerun medium; pass → close #414.
+Fixed in d48cb69 (test crate sc-build 20261126-231631-d48cb694 posts on #414); #482's requires.toml (pods) in e87605d.
+`test run rustkube-node medium` refused 23:20Z: no machine runs its flavor's newest passed release (pvetest2/3 installing 14.09,
+the rest failed). Parked `--after-install rustkube-node>=30b0230@any:pve`. Resume: `stormcentral test run rustkube-node medium`;
+`pod-attach-stdin-once` pass → close #414 (and #482 if `node-services-namespaces` runs).
 ### Done: #458, review 59fb97c4517b: an incremental backup's base from another store (vm_backup.rs)
 
 `older_done` picked the newest done backup of the VM on the node whatever its store. After `storm.io/backup-to`
