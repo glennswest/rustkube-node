@@ -1390,6 +1390,9 @@ CA is fatal at start; `http://` works as before. Not the client pair (not asked;
        failed (stormipmi#121, P1). Nothing runs on it until a revert or install puts 14.06 back. pvetest1/2 (flowsdn) were not chosen for the run.
        Parked after stormipmi#121; a5f5a686ee stays queued. Resume: `stormcentral test show a5f5a686ee`; `vmi-start-control` pass → close #325.
        16:54Z resumed: unchanged. a5f5a686ee still queued on pvetest3, stormipmi#121 still open (no comment since 13:46Z). Re-parked.
+       17:35Z: a5f5a686ee ended error: pvetest3's apiserver no /readyz in 10 min; its stormblock has ~1390 ublk writes unanswered
+       for ~9400 s (slab registry held by one write task): the machine, not this change. Queued golden again at cb257ee: cd63ed3871
+       on pvetest1 (14.07-flowsdn), a6f8151cb8 on pvetest3. Parked `--after-run cd63ed3871`. `vmi-start-control` pass → close #325.
 
 ### Done: #311 (P1), X9 blades: container start 4-9 s in `containers`
 
