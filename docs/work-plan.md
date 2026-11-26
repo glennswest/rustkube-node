@@ -710,6 +710,14 @@ Done 25bc12e; sc-build passed (715 kubelet tests; no clippy finding in the chang
 2026-11-26: handed back (14.06 carries 25bc12e). `test run rustkube-node golden` refused: pvetest1/2 held at :5100 until
 stormcentral 78c9a8e is deployed (#1798), pvetest3 by stormrdp#70. No code change. Held `--after stormrdp#70`. Resume:
 `stormcentral test run rustkube-node golden`; `vmi-agent-keys` True → close #405.
+2026-11-27: handed back with the old runs (6986230043, a31775e9fc, 2aa5de7dc7: all before 25bc12e). The first run with 25bc12e
+is golden a6f8151cb8 (pvetest3, 14.06): `vmi-agent-answers` pass; `vmi-agent-keys` fail with the agent's own error, `user root
+(Secret gold-agent-key): failed to create directory '/root/.ssh': File exists`. The kubelet now asks (25bc12e works). Cause:
+qemu-ga (qga/commands-posix-ssh.c) mkdirs ~/.ssh when `g_file_test(IS_DIR)` is false; EEXIST = the dir exists but is hidden
+from it: Fedora's selinux-policy (virt_supplementary.te) lets virt_qemu_ga_t manage ssh home only under the tunable
+`virt_qemu_ga_manage_ssh`, default false. Asked the owner on #405: A the golden enables it, B the guest's cloud-init as in
+KubeVirt (recommended: + a condition message naming it, docs, the suite's VM sets it), C the kubelet via guest-exec.
+`wait-owner`. Resume on the answer: B → kubelet message + docs + test user-data, sc-build, golden run; A → vmcloud-image-operator.
 ### Parked after stormrdp#70 (no test machine): #421 (P2), direct kernel boot from the golden's kernel (vmcloud-image-operator#62, stormvm#111)
 2026-11-20. Finding: no mount is needed. stormvm's machine spec is `root: Root::Inherit`, which stormpump documents as "the
 host's mount view", and `/data/vmimages` is a pallet volume mounted on the host (stormcos boot.d `volume vmidata /data/vmimages`);
