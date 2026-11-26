@@ -34,7 +34,7 @@ T=$out
 for b in kubelet kube-proxy; do
     check "usr/bin/$b is an executable file" test -f "$T/usr/bin/$b" -a -x "$T/usr/bin/$b" -a ! -L "$T/usr/bin/$b"
     check "usr/bin/$b is static" bash -c "file '$T/usr/bin/$b' | grep -Eq 'static-pie linked|statically linked'"
-    check "usr/bin/$b is the one cargo built" cmp -s "$T/usr/bin/$b" "target/x86_64-unknown-linux-musl/release/$b"
+    check "usr/bin/$b is the one cargo built" cmp -s "$T/usr/bin/$b" "${CARGO_TARGET_DIR:-target}/x86_64-unknown-linux-musl/release/$b"
 done
 check "usr/bin/kubelet runs (--help)" bash -c "'$T/usr/bin/kubelet' --help >/dev/null 2>&1"
 check "/stormd is the given stormd" cmp -s "$T/stormd" "$STORMD"
