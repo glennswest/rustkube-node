@@ -4,9 +4,12 @@
 [medium]
 # Cluster-wide reads (get, list, watch): which Node STORM_NODE is, the
 # built-in StorageClass, PVs (reclaim checks), kube-system's mirrored node
-# volume claims (#59) and the node's CSIStorageCapacity (#62).
+# volume claims (#59) and the node's CSIStorageCapacity (#62); the node
+# services' mirror pods, each in its project's namespace (#418,
+# `node-services-namespaces`).
 cluster_read = [
   { apiGroup = "", resource = "nodes" },
+  { apiGroup = "", resource = "pods" },
   { apiGroup = "", resource = "persistentvolumes" },
   { apiGroup = "", resource = "persistentvolumeclaims" },
   { apiGroup = "storage.k8s.io", resource = "storageclasses" },
