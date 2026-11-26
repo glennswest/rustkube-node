@@ -206,7 +206,14 @@ pub fn attach_pod(env: &Env) -> Value {
 /// Whether the attached container read the line and then its stdin's end.
 pub fn attach_verdict(phase: &str, log: &str) -> Result<String, String> {
     let want = crate::workload::stdin_eof(format!("{ATTACH_LINE}\n").as_bytes());
-    match (phase, log.lines().any(|l| l.trim() == want)) {
+    // The workload reports as one JSON line (`{"detail": …, "ok": true, …}`,
+    // pvetest1 b03b7929eb); the bare line is taken too.
+    let said = |l: &str| {
+        let l = l.trim();
+        l == want
+            || serde_json::from_str::<serde_json::Value>(l).is_ok_and(|v| v["ok"] == true && v["detail"].as_str() == Some(want.as_str()))
+    };
+    match (phase, log.lines().any(said)) {
         ("Succeeded", true) => Ok(format!("the container read the line and its stdin's end: {want:?}")),
         (p, _) => Err(format!("ended {p}, log {:?}; wanted {want:?}", log.trim())),
     }
@@ -541,6 +548,11 @@ mod tests {
         assert!(attach_verdict("Succeeded", ok).is_ok());
         assert!(attach_verdict("Running", ok).is_err());
         assert!(attach_verdict("Succeeded", "stdin-eof 0: \n").is_err());
+        // As the workload writes it (pvetest1, b03b7929eb).
+        let reported = "{\"detail\":\"stdin-eof 18: hello from attach\",\"ok\":true,\"workload\":\"read-stdin\"}\n";
+        assert!(attach_verdict("Succeeded", reported).is_ok());
+        assert!(attach_verdict("Succeeded", &reported.replace("true", "false")).is_err());
+        assert!(attach_verdict("Running", reported).is_err());
     }
 
     /// #416: a follow passes only when it ended, in time, with the log.

@@ -256,6 +256,11 @@ Resume: `stormcentral test run rustkube-node medium`; `pod-attach-stdin-once` pa
 2026-11-26 (17:30Z): resumed, stormrdp#70 and stormcentral#1798 closed. Queued `test run rustkube-node medium` at 2265768:
 b03b7929eb on pvetest1 (14.07-flowsdn), b7398e38d1 on pvetest3 (held by stormipmi#121). Parked `--after-run b03b7929eb`.
 Resume: `stormcentral test show b03b7929eb`; `pod-attach-stdin-once` pass → close #414.
+2026-11-26 (23:30Z): b03b7929eb (pvetest1, 14.07-flowsdn) failed 4: `pod-attach-stdin-once` ended **Succeeded** with
+`stdin-eof 18: hello from attach` in the log, but as the workload's JSON line, which `attach_verdict` compared whole (test bug;
+the kubelet's fix works on the node). Fix: accept a JSON line with that `detail` and `ok: true`; test case from the run's log.
+The other 3: `pod-multi-ipc`, `pod-multi-stop-order` (#374); `node-services-namespaces` 403 on a cluster-wide pod list (filed).
+Next: test crate sc-build; rerun medium; pass → close #414.
 ### Done: #458, review 59fb97c4517b: an incremental backup's base from another store (vm_backup.rs)
 
 `older_done` picked the newest done backup of the VM on the node whatever its store. After `storm.io/backup-to`
