@@ -386,7 +386,7 @@ eabd981 (5; cilium-cni/flowsdn-cni count as serving hostPorts), f6db0fe (6: adop
 `GET /api/v1/migrations`, abort a failed one; no local memo needed), docs d6d6ff2. sc-build 320b18f27d at d6d6ff2: kubelet
 763/0, cni 28/0 (warnings are #386's). Stage requested; issue closed.
 
-### Shipped (proof pending): #378, node services' mirror pods: one container per stormd helper process
+### Doing: #378, node services' mirror pods: one container per stormd helper process
 2026-11-20. stormd#75 is in (d1c5966): `GET /api/v1/volumes` per container; goldens carry `goldens[].process`, the only
 per-process volume fact (one mount namespace). Plan:
 1. stormd_api: `Process.goldens` from `/api/v1/volumes` (role golden, by `goldens[].process`), read in stormd_poll.
@@ -415,6 +415,15 @@ stormcos#1483 (mark `stormcert-renew` `helper = true` in build-goldens.sh). Held
 stormcos's commit, hold `--after-install stormcos>=<commit>`, then `shipped` with proof
 `api:` the mirror pod of the service running stormcert-renew lists a container `"name":"stormcert-renew"`.
 
+2026-11-26: the proof failed on pvetest1 (14.06-flowsdn). On pvetest3 (14.06 cilium) stormd (9082) marks `stormcert-renew`
+`helper: true` and `storm-cert/stormcert-pvetest3` has containers `stormcert`, `stormcert-renew`, but the kubelet deletes and
+remakes **every** mirror pod (29 on pvetest3) every ~1.5 s: `mirror <name>: its volumes cannot be patched in; making it
+again`. Cause: rustkube-apiserver's ServiceAccount admission adds a `kube-api-access-*` projected volume and its mount to
+each mirror pod (upstream skips `kubernetes.io/config.mirror` pods; ours carry `storm.io/mirror`), so `volumes_current`
+never holds, the spec patch is 422 and the pod is made again. A proof reading at the wrong moment finds no pod. Plan:
+mirror pods are made with `automountServiceAccountToken: false` (rustkube's admission honours it; a node service's mirror
+uses no token), so an existing pod is remade once and then holds. Test: a mirror pod opts out. File the admission gap on
+rustkube. CHANGELOG; sc-build; then re-ship with the same proof (`--commit`).
 ### Blocked: #429 (P3), attach to a tty/stdin container after a kubelet restart
 2026-11-20. Needs the engine to keep a deposited fd across the client's detach and hand it back: none exists (ABI.md,
 deposits close when the client goes). Filed stormpump#260 (kept deposits + DEPOSIT_TAKE). Held `--after stormpump#260`.
