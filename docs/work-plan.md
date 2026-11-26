@@ -360,7 +360,7 @@ in the pod netns the socket is connected on a setns thread and handed to tonic. 
 Full `sc-build` passed on 78e9317 (VM sc-build-5af0b51f5f: 774 kubelet tests ok). HTTPS probes in the pod netns are
 still a connect only: gap #452, proposed. Stage golden requested.
 
-### Doing: #456, `kubelet_volume_stats_*` on `/metrics` (sc#151)
+### Parked after stormrdp#70 (no test machine): #456, `kubelet_volume_stats_*` on `/metrics` (sc#151)
 
 `oc adm top persistentvolumeclaims` divides `kubelet_volume_stats_used_bytes` by `_capacity_bytes`, both labelled
 `namespace`, `persistentvolumeclaim`. The plan is to render both per claim at scrape time from `pod_volume_stats` (the
@@ -377,6 +377,9 @@ in the `pvc` suite, after `pvc-volume-stats` while `stats-pod` still holds its 6
 /metrics (at its InternalIP with the run's token, as /stats/summary) has the claim's six families labelled
 `namespace`/`persistentvolumeclaim`: capacity ≥ 64Mi, used ≥ 4 MiB (#456), available within 1 MiB of the pod's df, inodes and
 inodes_free equal to it (#469). Parser + verdict tests; CHANGELOG; test crate sc-build; the run when a machine is free.
+Built in 5464a22 (`pvc::volume_series`/`metrics_match`/`volume_metrics`, `k8s::kubelet_text`). Test crate sc-build passed
+(sc-build-f1320c9e87: build, clippy `-D warnings`, 89 ok incl. `the_claims_series_are_read_and_held_against_its_df`). No machine
+(as #469). Held `--after stormrdp#70`. Resume: `stormcentral test run rustkube-node pvc`; `pvc-volume-metrics` pass → close #456.
 ### Done (seen on a node): #442 (P1), review: the native runtime never provides the image rootfs
 
 The finding (`runtime.rs:136`, 3d780a09c92c) is real but is one of several gaps in `--runtime native`: no image
