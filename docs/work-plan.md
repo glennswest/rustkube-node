@@ -20,7 +20,7 @@ Built in 54fec5e (`read_status_line`). sc-build passed (20261125-192241-54fec5e9
 control: the same tests on the old one-read code (branch test/479-repro, 99561479, `SC_BUILD_EXPECT_FAIL=1`) failed all
 three with `bad status line: HT` / `H` / `HTTP/1.0 `. The netns is not entered in the tests (needs root). Issue closed.
 
-### Doing: #469, `kubelet_volume_stats_available_bytes` and `_inodes*` for built-in claims
+### Parked after stormcentral#1798 (test runs on pvetest1 error at the node registry): #469, `kubelet_volume_stats_available_bytes` and `_inodes*` for built-in claims
 
 2026-11-25. The issue's second route, the kubelet itself, needs no engine op: stormpump already gives a running
 container's pid (`query_info`, as the identity record uses, #84). Plan:
@@ -65,6 +65,12 @@ machine (pvetest1/2), and both have failed installs; `--force-hardware` does not
 (c4ead815bddf), now also after `install:rustkube-node>=b7377a3@any:pve`. Resume: the pvc run on a pve machine, then server8.
 2026-11-25 evening: resumed. pvetest1's install of 14.06-flowsdn passed; 14.06 carries rustkube-node f0020e0
 (golden-rustkube-node-cd5f4d466b8f), which contains b0cfe1d and b7377a3. Doing: `stormcentral test run rustkube-node pvc`.
+Run 3ecc579ddd (pvetest1, test image at f113a7c) errored before the suite started: `pvetest1's sbregistry (:5100):
+sbregistry GET /v1/goldens/<name>: gave up after 4 attempts ... error sending request` (infrastructure). stormvm, sc and
+rustkube runs on pvetest1 errored the same way; a retry was refused (pvetest1 held after 3 such errors). :5100 answers
+https (401 without a token) but not plain http; stormcentral 0381d7e already has #1483. Filed stormcentral#1798. Parked
+(9f59d7a34636) after stormcentral#1798. Resume: `stormcentral test run rustkube-node pvc`; close #469 when
+`pvc-volume-stats` passes, else fix what it shows. No rustkube-node code change.
 
 ### Done (unit-verified; not run on a node): #452, an `https` httpGet probe in the pod netns does a real HTTPS GET
 
