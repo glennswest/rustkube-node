@@ -351,7 +351,7 @@ not the kubelet). They are left out: gap #469, proposed. Third-party CSI sizes a
 (`metrics::render_volume_stats`, test `volume_stats_are_per_claim`). Full `sc-build` passed on 353ac78 (VM
 sc-build-82771970c1). Stage golden requested.
 
-### Done: #442 (P1), review: the native runtime never provides the image rootfs
+### Done (seen on a node): #442 (P1), review: the native runtime never provides the image rootfs
 
 The finding (`runtime.rs:136`, 3d780a09c92c) is real but is one of several gaps in `--runtime native`: no image
 unpack, no `linux.namespaces` (it never joins the sandbox netns), no image config, and `pull_image` is `Ok` on
@@ -366,6 +366,10 @@ Built in 04a2091 (code), 500e414 (Cargo.lock), 8d9ecfe (docs); sc-build passed (
 `tests::runtime_defaults_to_stormpump_and_native_is_gone` new); check-stubs clean; clippy: nothing in the changed lines
 (the rest is #385/#386). Stage build ee7e390b3bfa requested. Closed; shipped with a node log proof.
 
+2026-11-26: the proof failed on pvetest1 only because `log:` reads the install's log. pvetest3 (14.06 cilium, rustkube-node
+f0020e0 ⊇ 04a2091): its kubelet journal (`nodes/pvetest3/proxy/logs/journal?query=kubelet`) has `06:00:08Z kubelet using
+stormpump runtime (ring at /hostrun/stormpump.sock)`, and the Node reports `containerRuntimeVersion: 0.1.0://stormpump`.
+No code change. Re-shipped with an `api:` proof on that journal; issue closed.
 ### Done: #441 (P1), review: ClientIP affinity in kube-proxy's iptables rules
 2026-11-20. 3394445b5e43: `ServiceInfo.session_affinity: Option<u32>` (timeout, default 10800); SEP DNAT `-m recent --set`,
 SVC chain `--rcheck --seconds N --reap` per endpoint before the statistic split (upstream's rules). af3cd57; sc-build 8431643aba passed (proxy 36). Closed.
