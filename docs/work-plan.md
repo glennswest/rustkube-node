@@ -171,7 +171,7 @@ kube-system/coredns-ae7fa61ed9-0e2be/coredns: ready after 1 successes in a row` 
 controller-manager). Thresholds above 1 are the unit tests'; no system pod sets one. No code change. Re-shipped with an `api:`
 proof on that journal path; issue closed with what was seen. Noted: that read answered without a credential (stormcos#1026).
 
-### Done: #414, attach: the client's stdin end closes a stdinOnce container's stdin (stormpump_runtime.rs)
+### Doing: #414, attach: the client's stdin end closes a stdinOnce container's stdin (stormpump_runtime.rs)
 
 `attach_to`'s stdin copier returned on EOF and left `console.stdin` open, and the engine also keeps a copy of the
 stdin's write end (#429), so the container never read EOF. Plan: carry `stdin_once` from the pod spec
@@ -185,6 +185,13 @@ the data and the kept end withdrawn; a plain stdin left open for the next attach
 lost after a restart; `stdinOnce` parsed). Clippy reported nothing in the changed lines. Stage requested; shipped with
 the kubelet's log line as the proof (sc's medium suite, sc#77, runs `attach -i` to a stdinOnce pod).
 
+2026-11-26: the proof failed on pvetest1 (14.06-flowsdn ⊇ 30b0230): `log:` reads the install's log, which never has kubelet
+output, and the line is written only when a client attaches (sc's medium, another project's run), so no install-time proof
+can hold. Plan: this repo's own node check, `pod-attach-stdin-once` in medium's pod cases: a `stdin`+`stdinOnce` pod
+(`/test read-stdin`: reads stdin to EOF, prints `stdin-eof <n>: <text>`), `Api::attach` (pods/attach WebSocket, v5, stdin
+`hello`, then channel 255 close of stdin 0, reading stdout); the pod must end Succeeded with that line. On the bug it never
+sees EOF and stays Running (Fail). Tests: the frames written, the workload. CHANGELOG; test crate sc-build; run `medium`;
+pass → close #414.
 ### Done: #458, review 59fb97c4517b: an incremental backup's base from another store (vm_backup.rs)
 
 `older_done` picked the newest done backup of the VM on the node whatever its store. After `storm.io/backup-to`
