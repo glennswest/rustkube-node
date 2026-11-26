@@ -599,7 +599,7 @@ Test crate test + clippy -D warnings passed. Held `--after-install rustkube-node
 rustkube-node golden` there; outside-refused must pass; direct-kernel passes once vmimages' `data_size` is 1G (else its skip says
 why) → close #421.
 
-### Waiting on stormcos#354: #404 (P0), a VM root on a stormstorage mirrored volume filled from its golden (stormstorage#113 B')
+### Doing: #404 (P0), a VM root on a stormstorage mirrored volume filled from its golden (stormstorage#113 B')
 2026-11-20. The owner chose B' on stormstorage#113 (built there: 2ef4b37, `from_golden`). Plan (`vm_mirrored_root.rs`):
 - Asked for by the VMI annotation `storm.io/mirrored-disks: {"<disk>": <copies ≥ 2>}` (the VM template's annotations reach the
   VMI). Only a golden disk; anything else, or no `--stormstorage`, fails the start saying why.
@@ -627,6 +627,13 @@ golden-rustkube-node-1eb8b16735d1 is 3255cce), asked the master to look; (2) a f
 written only by stormcluster seed/join (stormcluster#89, closed), and a mirror needs two storage nodes. Held
 `--after-install rustkube-node>=d0164ee`; noted the master to run `testhost cluster-test pvetest1 pvetest2 <release>` and then the
 rustkube-node `golden` suite on the formed pair. Resume: `vmi-mirrored-root` passes there → close #404.
+2026-11-26: resumed (queue: pvetest1 runs 14.06-flowsdn ⊇ d0164ee). The gate is not an install: `golden` runs on one
+SNO machine, so `vmi-mirrored-root` can only skip there (one storage node, and `cluster-test` is a fixed script that dissolves
+its pair). stormcentral#1271 runs a suite declaring `topology = "two-node"` on a `role = "cluster"` record it forms for the run
+(built; the record `pvepair` waits on the master). Plan: the case moves to its own suite `mirrored` (`topology = "two-node"`,
+`kvm`, 1800 s), `golden::run_mirrored`; a run with `STORM_NODES` < 2 is Infra, never a pass. `golden` no longer records it.
+Tests, docs (the suite list), CHANGELOG; sc-build of the test crate. Then held `--after stormcentral#1271`; resume:
+`stormcentral test run rustkube-node mirrored --tag pvepair`; pass → close #404.
 
 ### Shipped (proof pending): #418 (P0), mirror pods in each service's project (stormcos#1020)
 2026-11-19. Plan: `mirror_namespaces.rs`: `--mirror-namespaces` (env `MIRROR_NAMESPACES`, default
