@@ -31,6 +31,11 @@ as the mount point. Plan:
 4. CHANGELOG, CLAUDE.md's "Release goldens", docs/status.md. Comment on #480 and stormcentral#1836 with the flip.
 Close #480 when the row is flipped and a `component build rustkube-node` golden runs on a node; until then parked after the
 stormcentral issue.
+Built in 6f3ebb5 (`deploy/build-image.sh`, `deploy/build-golden.sh`, `deploy/test-build-image.sh`). Local check: the config's
+TOML equals the stage's heredoc after its own env_default_flag and log limits (non-comment lines identical). Filed
+stormcentral#1846 (a tree's inputs mounted as `GOLDEN_INPUT_<I>`; recipe `@@SHIPS_WITH` recorded) and stormcos#1666 (the mirror map
+for the unit before the flip; then delete the section). Docs a40ff0c. sc-build `SC_TOOLS=stormd 'bash deploy/test-build-image.sh'`
+at 6f3ebb5 running. Next: its pass → comment on #480/#1836, park `--after stormcentral#1846`.
 
 ### Done (unit-verified; not run on a node): #479, review e353605dcd69: an in-netns HTTP probe parses one read as the status line (health.rs)
 
