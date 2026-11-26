@@ -20,7 +20,7 @@ Built in 54fec5e (`read_status_line`). sc-build passed (20261125-192241-54fec5e9
 control: the same tests on the old one-read code (branch test/479-repro, 99561479, `SC_BUILD_EXPECT_FAIL=1`) failed all
 three with `bad status line: HT` / `H` / `HTTP/1.0 `. The netns is not entered in the tests (needs root). Issue closed.
 
-### Parked after stormcentral#1798 (test runs on pvetest1 error at the node registry): #469, `kubelet_volume_stats_available_bytes` and `_inodes*` for built-in claims
+### Parked after stormrdp#70 (no test machine): #469, `kubelet_volume_stats_available_bytes` and `_inodes*` for built-in claims
 
 2026-11-25. The issue's second route, the kubelet itself, needs no engine op: stormpump already gives a running
 container's pid (`query_info`, as the identity record uses, #84). Plan:
@@ -71,6 +71,9 @@ rustkube runs on pvetest1 errored the same way; a retry was refused (pvetest1 he
 https (401 without a token) but not plain http; stormcentral 0381d7e already has #1483. Filed stormcentral#1798. Parked
 (9f59d7a34636) after stormcentral#1798. Resume: `stormcentral test run rustkube-node pvc`; close #469 when
 `pvc-volume-stats` passes, else fix what it shows. No rustkube-node code change.
+2026-11-26 (later): handed back (#1798 closed) but its fix 78c9a8e is not deployed (stormcentral runs 0381d7e); `pvc` refused
+again (pvetest1/2 at :5100, pvetest3 by stormrdp#70). pvetest3's /stats/summary has no container-mounted built-in claim (only
+node services' claims, mounted by mirror pods), so nothing to read without the suite's pod. Held `--after stormrdp#70`.
 
 ### Done (unit-verified; not run on a node): #452, an `https` httpGet probe in the pod netns does a real HTTPS GET
 
