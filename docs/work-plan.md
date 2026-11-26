@@ -857,6 +857,9 @@ Handed back unchanged: stormcluster#123's fix is f1de3f6 (h2 ALPN on :9102), not
 (open, no fix). Held also `--after stormlb#30` and `--after-install stormcluster>=f1de3f6@any:pve`.
 2026-11-26: resumed. pvetest1 runs a passed 14.06-flowsdn install (rustkube-node f0020e0 ⊇ d3fab69); its API-health gate
 passed in run 3ecc579ddd (29 APIs healthy). Doing: `stormcentral test run rustkube-node pvc`.
+Refused: pvetest1 is held from runs (its last 3 runs, 3ecc579ddd among them, errored at the test-image GET to :5100:
+stormcentral#1798); pvetest2/pvetest3 have 14.06 installs still running. No code change. Held `--after stormcentral#1798`.
+Resume: `stormcentral test run rustkube-node pvc`; `pvc-classes` must pass first; pass → close #379; fail → the claim's events.
 
 ### Shipped (proof pending): #383 (P0), a template listed `broken` is waited on forever (server8 12.92, pvc-ext4j-64m)
 
