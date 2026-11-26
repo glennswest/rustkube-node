@@ -106,7 +106,7 @@ suite ok, 830 kubelet unit). Issue left open for the nightly scan to close.
 checksums), `gitleaks dir` on `git archive` trees: a0e44d3 gives exactly the issue's 6 findings; HEAD without its
 `.gitleaks.toml` gives the same 6; HEAD with it gives none. Issue closed.
 
-### Built, node run pending: #465, the node's stormd bound read-only at `/.stormd` (stormcos#822 phase 2, one stormd per release)
+### Doing: #465, the node's stormd bound read-only at `/.stormd` (stormcos#822 phase 2, one stormd per release)
 
 2026-11-22. Contract: stormcos `docs/STORMD-SHARED.md`; stormcos 6db1d05 (#1551) makes `stormd` a system1 member
 mounted `stormd:/p/stormd` (optional) and binds it `ro` at `/.stormd` in its boot.d units. Plan:
@@ -129,6 +129,13 @@ rustc warnings are main's, #385/#386). Not seen on a node: it needs a release wi
 `stormd` member at `/p/stormd`) and a phase 1 image (fastetcd, rustkube-apiserver, stormcos#822). Shipped with
 the kubelet's journal line (#198's `/logs/journal`) as the proof.
 
+2026-11-26: the proof failed on pvetest1 (14.06-flowsdn ⊇ a0e44d3, stormcos ⊇ 6db1d05): it used `{node}` (the address, so
+`nodes "192.168.31.172" not found`), not `{name}`. But the line is not in pvetest3's kubelet journal either, though its static
+pods (etcd, kube-apiserver) are phase 1 images. Cause (as #379's d3fab69): `bind_for` looks for `/.stormd` at the root's mount
+`/run/stormpump/roots/<c>`, which PID 1 mounts after the kubelet started; the kubelet's `/run` is a private bind, so it sees
+the empty directory, `NotWanted`, silently. Plan: look in the root as the kubelet can see it, the first of `/proc/1/root<m>`,
+`<m>`, `/hostroot<m>` on the root's device (`pvc_resize::dev_numbers`/`on_device`/`claim_candidates`), else `<m>` with a
+debug line. Test: the view found by device, falling back. CHANGELOG; sc-build; stage; re-ship with `{name}`.
 ### Built, node run pending: #198, the kubelet serves `/logs/` (`oc adm node-logs` through nodes/proxy, rustkube#108)
 
 2026-11-22. `oc adm node-logs` (openshift/oc `pkg/cli/admin/node/logs.go`) asks `GET …/proxy/logs/journal` by default
