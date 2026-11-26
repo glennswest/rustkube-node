@@ -265,6 +265,8 @@ Fixed in d48cb69 (test crate sc-build 20261126-231631-d48cb694 posts on #414); #
 `test run rustkube-node medium` refused 23:20Z: no machine runs its flavor's newest passed release (pvetest2/3 installing 14.09,
 the rest failed). Parked `--after-install rustkube-node>=30b0230@any:pve`. Resume: `stormcentral test run rustkube-node medium`;
 `pod-attach-stdin-once` pass → close #414 (and #482 if `node-services-namespaces` runs).
+Test crate sc-build 20261126-231631-d48cb694 passed. 23:45Z: pvetest2 has a passed install; medium 720e32489a queued there at
+c1129da (⊇ d48cb69, e87605d). Parked `--after-run 720e32489a`.
 ### Done: #458, review 59fb97c4517b: an incremental backup's base from another store (vm_backup.rs)
 
 `older_done` picked the newest done backup of the VM on the node whatever its store. After `storm.io/backup-to`
