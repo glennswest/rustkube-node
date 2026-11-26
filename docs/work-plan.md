@@ -106,7 +106,7 @@ suite ok, 830 kubelet unit). Issue left open for the nightly scan to close.
 checksums), `gitleaks dir` on `git archive` trees: a0e44d3 gives exactly the issue's 6 findings; HEAD without its
 `.gitleaks.toml` gives the same 6; HEAD with it gives none. Issue closed.
 
-### Doing: #465, the node's stormd bound read-only at `/.stormd` (stormcos#822 phase 2, one stormd per release)
+### Shipped (proof pending, re-shipped at 7fd254f): #465, the node's stormd bound read-only at `/.stormd` (stormcos#822 phase 2, one stormd per release)
 
 2026-11-22. Contract: stormcos `docs/STORMD-SHARED.md`; stormcos 6db1d05 (#1551) makes `stormd` a system1 member
 mounted `stormd:/p/stormd` (optional) and binds it `ro` at `/.stormd` in its boot.d units. Plan:
@@ -136,6 +136,9 @@ pods (etcd, kube-apiserver) are phase 1 images. Cause (as #379's d3fab69): `bind
 the empty directory, `NotWanted`, silently. Plan: look in the root as the kubelet can see it, the first of `/proc/1/root<m>`,
 `<m>`, `/hostroot<m>` on the root's device (`pvc_resize::dev_numbers`/`on_device`/`claim_candidates`), else `<m>` with a
 debug line. Test: the view found by device, falling back. CHANGELOG; sc-build; stage; re-ship with `{name}`.
+Built in 7fd254f (`shared_stormd::root_view`, used for `bind_for`; test `the_root_is_read_where_its_device_is`). sc-build passed
+(sc-build-13b9124a97: workspace build, 848 kubelet unit ok; clippy nothing in the changed lines). Stage build f106839c8b8f.
+Re-shipped `--commit 7fd254f` with `{name}` in the journal proof. Not seen on a node yet.
 ### Built, node run pending: #198, the kubelet serves `/logs/` (`oc adm node-logs` through nodes/proxy, rustkube#108)
 
 2026-11-22. `oc adm node-logs` (openshift/oc `pkg/cli/admin/node/logs.go`) asks `GET …/proxy/logs/journal` by default
