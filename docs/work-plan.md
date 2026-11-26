@@ -543,7 +543,7 @@ tmp/sc-build-428b.log or `stormcentral buildvm status`; pass → clippy check of
 sc-build 6b83cb9337 passed (kubelet 727, cni 27, 11 new); clippy 55757d4132: nothing in the changed lines. Stage build
 93d14a289c8b. #428 closed. Majors in the Findings table follow as P1 (master files them).
 
-### In progress: #426 (P2), a pod-network VMI reports its pod IP but nothing reaches it (pvetest2 flowsdn)
+### Parked after a pvetest2 install (held at :5100): #426 (P2), a pod-network VMI reports its pod IP but nothing reaches it (pvetest2 flowsdn)
 2026-11-20. First live run of #88's path (never run on a node before). Read: stormvm's bridge binding moves the pod IP and
 MAC off the CNI's interface onto vmbr0 with the tap; the guest NIC, the lease and the status all carry the pod's MAC; the
 DHCP responder answers only that MAC and says nothing. The kubelet watches no tap for a pod NIC and reports the pod IP from the
@@ -585,6 +585,11 @@ Done e045c84; sc-build passed (716 kubelet tests incl. the_gateway_mac_round_tri
 pre-existing #385/#386 ones, none in vm_network.rs). Stage build 6013038fad70. Held `--after-install rustkube-node>=e045c84@pvetest2`.
 Resume: `stormcentral test run rustkube-node golden --tag pvetest2`; vmi-pod-network passing closes #426 (and stormvm#138: say so there).
 
+2026-11-26: handed back (pvetest2 runs a passed 14.06-flowsdn, ⊇ e045c84). The runs it waited for (a31775e9fc, 2aa5de7dc7,
+343d192458, 4d7e677e89) all predate e045c84. `golden` on pvetest2 refused: held after runs errored at :5100 (stormcentral#1798;
+fix 78c9a8e not deployed, running 0381d7e). flowsdn-specific, so pvetest3 (cilium) cannot stand in. No code change. Held
+`--after-install rustkube-node>=2845af6@pvetest2` (a passed install lifts the hold). Resume: `stormcentral test run
+rustkube-node golden --tag pvetest2`; `vmi-pod-network` pass → close #426 (and stormvm#138).
 ### Parked after stormrdp#70 (no test machine): #405 (P2), AccessCredentialsSynchronized stuck at "waiting for the guest agent to answer"
 2026-11-20. Ruled out (stormcos_qa#52 on the issue): the golden runs qemu-guest-agent and the guest has org.qemu.guest_agent.0.
 Read: the socket path matches stormvm's (`<run>/<ns>/<name>/agent.sock`), qemu's chardev is a single-client server, nothing in
