@@ -555,6 +555,9 @@ Built in 6fba038 (`csi_driver::adopting`/`NOT_ADOPTING`, the case a Skip on it; 
 pvetest3 too). Resume: `stormcentral test run rustkube-node csi`; `csi-kubelet-restart` pass → close #334.
 2026-11-26 (later): handed back as stormcentral#1798 closed; its fix 78c9a8e is not deployed (stormcentral runs 0381d7e), the
 run was refused again (pvetest1/2 at :5100, pvetest3 by stormrdp#70). Held also `--after stormrdp#70`.
+2026-11-26 (17:20Z): resumed, stormcentral#1798 and stormrdp#70 closed. Queued `test run rustkube-node csi` at e4b1f57:
+38ac3dd903 on pvetest1 (14.07-flowsdn), 814e9593d0 on pvetest3 (held by stormipmi#121). Resume: `stormcentral test show <id>`;
+`csi-kubelet-restart` pass (not a NOT ADOPTING skip) → close #334.
 
 ### Done: #428 (P0), four critical review findings
 2026-11-20. From stormcentral's Findings (`/api/v1/findings?project=rustkube-node`). Plan, one commit per finding:
