@@ -908,7 +908,11 @@ impl Boot {
 /// The boot of the CloudImage whose golden is `golden`, when it is on
 /// `node`; else why there is none (a skip).
 pub fn boot_for(images: &[Value], golden: &str, node: &str) -> Result<Boot, String> {
-    let Some(img) = images.iter().find(|i| i["status"]["golden"] == golden) else {
+    // The golden a VM names is the CloudImage's `status.localName`
+    // (`<distro>-<version>-<arch>`); its `status.golden` is the registry's
+    // content name (`media-<sha12>`), taken too (vmimages src/crd.rs; a6f8151cb8
+    // skipped on pvetest3 matching `golden` alone).
+    let Some(img) = images.iter().find(|i| i["status"]["localName"] == golden || i["status"]["golden"] == golden) else {
         return Err(format!("no CloudImage has golden {golden}"));
     };
     let b = &img["status"]["boot"];
@@ -1090,6 +1094,10 @@ mod tests {
         assert_eq!(b.annotations(), serde_json::json!({KERNEL: "/data/vmimages/boot/g/vmlinuz", INITRD: "/data/vmimages/boot/g/initrd", CMDLINE: "ro"}));
         assert!(boot_for(&imgs, "g", "n2").unwrap_err().contains("not on n2"));
         assert!(boot_for(&imgs, "other", "n1").is_err());
+        // As vmimages writes it: the VM's golden is `localName`.
+        let real = vec![serde_json::json!({"metadata": {"name": "fedora-44"}, "status": {"golden": "media-0123456789ab", "localName": "fedora-44-x86_64", "boot": {
+            "kernel": "/data/vmimages/boot/fedora-44-x86_64/vmlinuz", "nodes": ["n1"]}}})];
+        assert_eq!(boot_for(&real, "fedora-44-x86_64", "n1").unwrap().kernel, "/data/vmimages/boot/fedora-44-x86_64/vmlinuz");
         let none = vec![serde_json::json!({"metadata": {"name": "f"}, "status": {"golden": "g", "boot": {"message": "reading the kernel"}}})];
         assert!(boot_for(&none, "g", "n1").unwrap_err().contains("reading the kernel"));
         let id = format!("{ID_MARKER}{}", "a".repeat(32));
