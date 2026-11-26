@@ -36,6 +36,10 @@ TOML equals the stage's heredoc after its own env_default_flag and log limits (n
 stormcentral#1846 (a tree's inputs mounted as `GOLDEN_INPUT_<I>`; recipe `@@SHIPS_WITH` recorded) and stormcos#1666 (the mirror map
 for the unit before the flip; then delete the section). Docs a40ff0c. sc-build `SC_TOOLS=stormd 'bash deploy/test-build-image.sh'`
 at 6f3ebb5 running. Next: its pass → comment on #480/#1836, park `--after stormcentral#1846`.
+sc-build-3124612579 (stormd 0.8.0, golden-stormd-b1b78114b5a6): every tree check ok but 2, both the test's own (`./target`, the VM
+sets CARGO_TARGET_DIR; the recipe's read-back passed). Fixed 7eb45b7; rerun 20261126-220913-7eb45b71 posts on #480. Commented
+#480, stormcentral#1836. Parked `--after stormcentral#1846`. Resume: the rerun's pass; #1846 done → the flip (master:
+`kind=tree`, `inputs=["stormd"]`) after stormcos#1666 → `component build rustkube-node`, node run → close #480.
 
 ### Done (unit-verified; not run on a node): #479, review e353605dcd69: an in-netns HTTP probe parses one read as the status line (health.rs)
 
