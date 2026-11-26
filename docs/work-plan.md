@@ -139,7 +139,7 @@ debug line. Test: the view found by device, falling back. CHANGELOG; sc-build; s
 Built in 7fd254f (`shared_stormd::root_view`, used for `bind_for`; test `the_root_is_read_where_its_device_is`). sc-build passed
 (sc-build-13b9124a97: workspace build, 848 kubelet unit ok; clippy nothing in the changed lines). Stage build f106839c8b8f.
 Re-shipped `--commit 7fd254f` with `{name}` in the journal proof. Not seen on a node yet.
-### Built, node run pending: #198, the kubelet serves `/logs/` (`oc adm node-logs` through nodes/proxy, rustkube#108)
+### Done (seen on a node): #198, the kubelet serves `/logs/` (`oc adm node-logs` through nodes/proxy, rustkube#108)
 
 2026-11-22. `oc adm node-logs` (openshift/oc `pkg/cli/admin/node/logs.go`) asks `GET …/proxy/logs/journal` by default
 (`-u X` adds `unit=X&query=X`; `--since`/`--until`/`--boot`/`--tail`/`--grep`/`--case-sensitive`/`-o` become `since`,
@@ -164,6 +164,12 @@ Built in d16cb54 (`host_logs.rs`, routes in server.rs); sc-build passed (VM sc-b
 No new warnings. Stage requested; shipped with `api:/api/v1/nodes/{node}/proxy/logs/journal` as the proof. Not seen
 on a node yet: whether `/hostroot/var/log` exists on stormcos is unchecked. rustkube's oc-adm.sh flip is filed there.
 
+2026-11-26: seen on a node. The proof failed on pvetest1 as `answered: null`: stormcentral's `api:` check parses every body
+as JSON (`perf::Api::call`), so a text journal reads as null (filed stormcentral#1805). On pvetest3 (14.06, rustkube-node
+f0020e0 ⊇ d16cb54), through the apiserver's `nodes/pvetest3/proxy`: `/logs/journal` answers with the services' lines all day
+(`query=`/`unit=`, `grep`, `tail`, `since`/`until`, `output=json` one object per line; an unknown unit 404), `/logs/` lists
+the service log directories in FileServer form, and `/logs/rustkube-node/.cloudid` is sent whole. No code change. Re-shipped
+with `output=json&tail=1` (one JSON object); the same correction re-shipped for #460, #442, #465's journal proofs. Closed.
 ### Done (seen on a node): #460, review cd264eea6874: readiness ignores successThreshold/failureThreshold (pod_manager.rs)
 
 Each readiness result was assigned to `state.ready` directly. Now `PodState::readiness_run` keeps each container's
