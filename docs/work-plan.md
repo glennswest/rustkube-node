@@ -585,7 +585,7 @@ Done e045c84; sc-build passed (716 kubelet tests incl. the_gateway_mac_round_tri
 pre-existing #385/#386 ones, none in vm_network.rs). Stage build 6013038fad70. Held `--after-install rustkube-node>=e045c84@pvetest2`.
 Resume: `stormcentral test run rustkube-node golden --tag pvetest2`; vmi-pod-network passing closes #426 (and stormvm#138: say so there).
 
-### In progress: #405 (P2), AccessCredentialsSynchronized stuck at "waiting for the guest agent to answer"
+### Parked after stormrdp#70 (no test machine): #405 (P2), AccessCredentialsSynchronized stuck at "waiting for the guest agent to answer"
 2026-11-20. Ruled out (stormcos_qa#52 on the issue): the golden runs qemu-guest-agent and the guest has org.qemu.guest_agent.0.
 Read: the socket path matches stormvm's (`<run>/<ns>/<name>/agent.sock`), qemu's chardev is a single-client server, nothing in
 stormvm holds it open. Kubelet flaw: `agent_up` is "guest-network-get-interfaces succeeded within 2 s", so an agent that answers
@@ -618,6 +618,9 @@ carrying it (`vmi-agent-keys` True).
 Done 25bc12e; sc-build passed (715 kubelet tests; no clippy finding in the changed lines). Stage build f06cb62e004e. Held
 `--after-install rustkube-node>=25bc12e`. Resume: run the golden suite on that machine; `vmi-agent-keys` True → close #405.
 
+2026-11-26: handed back (14.06 carries 25bc12e). `test run rustkube-node golden` refused: pvetest1/2 held at :5100 until
+stormcentral 78c9a8e is deployed (#1798), pvetest3 by stormrdp#70. No code change. Held `--after stormrdp#70`. Resume:
+`stormcentral test run rustkube-node golden`; `vmi-agent-keys` True → close #405.
 ### Parked after stormrdp#70 (no test machine): #421 (P2), direct kernel boot from the golden's kernel (vmcloud-image-operator#62, stormvm#111)
 2026-11-20. Finding: no mount is needed. stormvm's machine spec is `root: Root::Inherit`, which stormpump documents as "the
 host's mount view", and `/data/vmimages` is a pallet volume mounted on the host (stormcos boot.d `volume vmidata /data/vmimages`);
