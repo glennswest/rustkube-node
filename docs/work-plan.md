@@ -2689,6 +2689,7 @@ new sbregistry work (file it); the kubelet half rides the existing pull + demand
        2026-11-26 (23:40Z): handed back (stormrdp#70 closed). `test run rustkube-node versions` refused: no machine runs its flavor's
        newest passed release (pvetest2/3 installing 14.09; pvetest1 14.08-flowsdn, C2NR0Q2, server8 14.07-flowsdn failed). No code
        change. Held `--after-install rustkube-node>=4b96e0c@any:pve`. Resume: the same run; pass -> close #86.
+       23:50Z: pvetest2 has a passed install; `versions` 5fede12197 queued there at b32abae. Parked `--after-run 5fede12197`.
 
 ### (history) Waiting on the owner: #86 (P2), versioned goldens for pods
 
