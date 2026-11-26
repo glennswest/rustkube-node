@@ -1382,6 +1382,7 @@ CA is fatal at start; `http://` works as before. Not the client pair (not asked;
        14:10Z still queued: pvetest3 is held by the image gate (#1601) since 13:46Z, its revert of the trial image golden-stormipmi-072cfa10ef2f
        failed (stormipmi#121, P1). Nothing runs on it until a revert or install puts 14.06 back. pvetest1/2 (flowsdn) were not chosen for the run.
        Parked after stormipmi#121; a5f5a686ee stays queued. Resume: `stormcentral test show a5f5a686ee`; `vmi-start-control` pass → close #325.
+       16:54Z resumed: unchanged. a5f5a686ee still queued on pvetest3, stormipmi#121 still open (no comment since 13:46Z). Re-parked.
 
 ### Done: #311 (P1), X9 blades: container start 4-9 s in `containers`
 
