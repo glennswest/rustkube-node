@@ -474,7 +474,7 @@ sc-build 08ee2681ea passed (733 kubelet tests, the TLS one included; no warning 
 83d6c11ed85e. Held `--after stormcos#374` (no node's stormblock serves TLS yet). Resume: on a node with an https engine,
 a VirtualMachineSnapshot and a VirtualMachineRestore succeed → close #318.
 
-### In progress: #334 (P1), a kubelet restart adopts no pods on stormpump
+### Doing: #334 (P1), a kubelet restart adopts no pods on stormpump
 2026-11-20. Cause (issue): StormpumpRuntime's sandbox/container maps are memory only; the engine keeps the workloads and
 their handles across a reattach with the same TOKEN and hands back exits held while away (stormpump DESIGN "That gap is
 closed"). Plan:
@@ -497,6 +497,12 @@ drop(usize) predate it, #227). Stage build 56351dab1575. Gap #429 (attach to an 
 `--after-install rustkube-node>=6b9e6b9@any:pve`. Resume: flip KUBELET_RESTART_ADOPTS in test/src/csi.rs (README line),
 push, `stormcentral test run rustkube-node csi --tag <that machine>`; pass (holder keeps its container id, restartCount 0,
 static pods not started again) → close #334.
+2026-11-26: resumed (pvetest1/pvetest3 run 14.06, rustkube-node f0020e0 ⊇ 6b9e6b9; server8's 12.94 (8686267) lacks it).
+A constant flipped on would loop server8's kubelet, so the case gates itself on the node instead: the `restart-kubelet`
+workload signals only a kubelet whose root has `/var/lib/kubelet/stormpump-runtime.json` (`/proc/<pid>/root/...`, hostPID),
+which only 6b9e6b9+ writes; none → it exits without a signal, the termination message says `NOT ADOPTING: …`, and the case
+is a Skip naming it. `KUBELET_RESTART_ADOPTS` goes. Test: the gate on a fake /proc. CHANGELOG; test crate sc-build; then
+`stormcentral test run rustkube-node csi` on a 14.06 machine; pass → close #334.
 
 ### Done: #428 (P0), four critical review findings
 2026-11-20. From stormcentral's Findings (`/api/v1/findings?project=rustkube-node`). Plan, one commit per finding:
