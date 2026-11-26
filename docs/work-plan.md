@@ -508,6 +508,8 @@ Built in 6fba038 (`csi_driver::adopting`/`NOT_ADOPTING`, the case a Skip on it; 
 :5100 (stormcentral#1798), pvetest3 held at its API-health gate (stormrdp#70: stormrdp gateway 503), server8 on 12.94 (no
 6b9e6b9; the gate would skip there anyway). No code change needed. Held `--after stormcentral#1798` (stormrdp#70 frees
 pvetest3 too). Resume: `stormcentral test run rustkube-node csi`; `csi-kubelet-restart` pass → close #334.
+2026-11-26 (later): handed back as stormcentral#1798 closed; its fix 78c9a8e is not deployed (stormcentral runs 0381d7e), the
+run was refused again (pvetest1/2 at :5100, pvetest3 by stormrdp#70). Held also `--after stormrdp#70`.
 
 ### Done: #428 (P0), four critical review findings
 2026-11-20. From stormcentral's Findings (`/api/v1/findings?project=rustkube-node`). Plan, one commit per finding:
