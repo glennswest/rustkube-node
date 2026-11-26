@@ -285,6 +285,14 @@ pub fn mirror_pod_with(
             // can do from here.
             "priorityClassName": "system-node-critical",
             "tolerations": [{ "operator": "Exists" }],
+            // No ServiceAccount token (#378): the service never runs in this
+            // pod, so it would use none. Without the opt-out, the apiserver's
+            // ServiceAccount admission adds a `kube-api-access-*` volume and
+            // mount (rustkube's does not skip mirror pods, as upstream does
+            // for `kubernetes.io/config.mirror`), the volumes never compare
+            // equal, and every pass deleted and remade the pod (14.06: each
+            // mirror every ~1.5 s).
+            "automountServiceAccountToken": false,
             "containers": [{
                 "name": asset.name,
                 "image": format!("stormpump://{}", asset.name),
@@ -963,6 +971,23 @@ mod tests {
         assert_eq!(table_key(&[a(true, 1, 5)]), table_key(&[a(true, 1, 500)]));
         assert_ne!(table_key(&[a(true, 1, 5)]), table_key(&[a(true, 2, 5)]));
         assert_ne!(table_key(&[a(true, 1, 5)]), table_key(&[a(false, 1, 5)]));
+    }
+
+    /// A mirror pod asks for no ServiceAccount token (#378): an admission
+    /// that added one made its volumes differ on every pass, and the kubelet
+    /// remade the pod every ~1.5 s. A stored pod that already has the token
+    /// volume is not current, so it is remade once, without it.
+    #[test]
+    fn a_mirror_pod_takes_no_service_account_token() {
+        let a = Asset { name: "stormcert".into(), running: true, ..Default::default() };
+        let p = mirror_pod(&a, "n1", "u", "2026-11-26T00:00:00Z");
+        assert_eq!(p["spec"]["automountServiceAccountToken"], json!(false));
+        assert!(volumes_current(&p, &mirror_pod(&a, "n1", "u", "2026-11-26T00:00:00Z")));
+        let mut injected = p.clone();
+        injected["spec"]["volumes"] = json!([{"name": "kube-api-access-6fwj9", "projected": {"sources": []}}]);
+        injected["spec"]["containers"][0]["volumeMounts"] =
+            json!([{"name": "kube-api-access-6fwj9", "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount", "readOnly": true}]);
+        assert!(!volumes_current(&injected, &p), "made before the opt-out: remade once");
     }
 
     /// The mirror writes nothing when the pod already says it, or its own

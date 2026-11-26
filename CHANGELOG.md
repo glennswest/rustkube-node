@@ -2,6 +2,7 @@
 
 ## 2026-11-26
 
+- **fix:** Node services' mirror pods are no longer deleted and made again on every pass (#378). On 14.06 the kubelet remade each of a node's mirror pods every ~1.5 s (pvetest3: 29 of them, `mirror <name>: its volumes cannot be patched in; making it again`). rustkube-apiserver's ServiceAccount admission added a `kube-api-access-*` token volume and its mount to each one, as it does for any pod. Upstream skips mirror pods; ours carry `storm.io/mirror`, not `kubernetes.io/config.mirror`. The kubelet's spec compare then never held, and the spec patch was refused. Mirror pods are now made with `automountServiceAccountToken: false`, which that admission honours. The service never runs in its mirror pod, so it uses no token. A pod made before this is remade once, without the volume, and then stays. This is also why #378's proof missed `stormcert-renew`: a read between a delete and the next create finds no pod.
 - **test:** `vmi-mirrored-root` (#404) moved from the `golden` suite to a `mirrored` suite of its own, declared `topology = "two-node"` (stormcentral#1271). `golden` runs on one single-node machine, which has one storage node, so a two-copy mirror could only ever be skipped there. stormcentral now forms a two-node cluster record for the run: `stormcentral test run rustkube-node mirrored --tag <record>`. A cluster with fewer than two Ready nodes is `Infra`, never a pass, and the case deletes only its own VMI. No kubelet change.
 
 ## 2026-11-25
