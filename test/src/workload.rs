@@ -71,7 +71,7 @@ pub fn is_workload(args: &[String]) -> bool {
         Some(
             "fill" | "verify" | "size-at-least" | "sized" | "echo" | "exit" | "sleep" | "fail-once"
                 | "write-file" | "expect-file" | "expect-env" | "expect-nics" | "read-file" | "vm-instance" | "rdma-view"
-                | "member" | "grows" | "qga-probe" | "tcp-connect" | "rt-view" | "df-hold"
+                | "member" | "grows" | "qga-probe" | "tcp-connect" | "rt-view" | "df-hold" | "read-stdin"
         )
     )
 }
@@ -437,6 +437,14 @@ fn member(args: &[String]) -> i32 {
     }
 }
 
+/// `read-stdin`'s line: how many bytes stdin gave before its end, and what.
+pub fn stdin_eof(got: &[u8]) -> String {
+    format!("{STDIN_EOF} {}: {}", got.len(), String::from_utf8_lossy(got).trim_end())
+}
+
+/// What `read-stdin` prints once its stdin ends.
+pub const STDIN_EOF: &str = "stdin-eof";
+
 extern "C" fn on_term(_: libc::c_int) {
     // SAFETY: _exit is async-signal-safe.
     unsafe { libc::_exit(0) }
@@ -446,6 +454,14 @@ fn run(args: &[String]) -> Result<String, String> {
     let arg = |i: usize, what: &str| args.get(i).cloned().ok_or_else(|| format!("missing {what}"));
     let num = |i: usize, what: &str| arg(i, what)?.parse::<u64>().map_err(|e| format!("{what}: {e}"));
     match args[0].as_str() {
+        // Read stdin to its end (#414): what a stdinOnce container sees
+        // when its attach's stdin closes.
+        "read-stdin" => {
+            use std::io::Read;
+            let mut got = Vec::new();
+            std::io::stdin().read_to_end(&mut got).map_err(|e| format!("reading stdin: {e}"))?;
+            Ok(stdin_eof(&got))
+        }
         "rdma-view" => Ok(rdma_view()),
         "rt-view" => Ok(rt_view()),
         "qga-probe" => qga_probe(&arg(1, "agent socket")?),

@@ -23,6 +23,12 @@
 //!   finished pod's followed log is sent whole and the stream ends within
 //!   [`FOLLOW_WINDOW`]; a running pod's (`sleep 8`) is followed from the start
 //!   and ends within that window after it exits.
+//! - `pod-attach-stdin-once` (#414): a `stdin: true, stdinOnce: true` pod
+//!   (`/test read-stdin`, which reads stdin to its end) is attached with
+//!   stdin (`pods/attach`, v5): a line is sent, then stdin closed (channel
+//!   255). The container must see the end: the pod Succeeds within
+//!   [`ATTACH_EOF_WITHIN`] and its log says `stdin-eof <n>: <the line>`. A
+//!   kubelet that leaves the container's stdin open keeps it Running.
 //! - `pod-image-on-no-list` (#332): a bare image name on neither list gets the
 //!   registry's "not here" (its 404, or with peers the cluster demand's "no peer
 //!   has it", #79) and never runs.
@@ -42,7 +48,7 @@ const MARGIN: Duration = Duration::from_secs(120);
 /// Each case, run in parallel by `medium::run`: (test name, outcome, ms).
 pub async fn run(env: Arc<Env>, api: Api) -> Vec<(String, Outcome, u128)> {
     type Case = fn(Arc<Env>, Api) -> std::pin::Pin<Box<dyn std::future::Future<Output = Outcome> + Send>>;
-    let cases: [(&str, Case); 8] = [
+    let cases: [(&str, Case); 9] = [
         ("pod-restart-on-failure", |e, a| Box::pin(async move { restart_on_failure(&e, &a).await })),
         ("pod-init-first", |e, a| Box::pin(async move { init_first(&e, &a).await })),
         ("pod-config", |e, a| Box::pin(async move { config(&e, &a).await })),
@@ -51,6 +57,7 @@ pub async fn run(env: Arc<Env>, api: Api) -> Vec<(String, Outcome, u128)> {
         ("pod-image-on-no-list", |e, a| Box::pin(async move { image_on_no_list(&e, &a).await })),
         ("pod-rdma", |e, a| Box::pin(async move { rdma(&e, &a).await })),
         ("pod-logs-follow-ends", |e, a| Box::pin(async move { logs_follow_ends(&e, &a).await })),
+        ("pod-attach-stdin-once", |e, a| Box::pin(async move { attach_stdin_once(&e, &a).await })),
     ];
     // The multi-container pod's cases (#374): one pod, its cases in order.
     let multi = {
@@ -178,6 +185,59 @@ async fn logs_follow_ends(env: &Env, api: &Api) -> Outcome {
     match (first, second) {
         (Ok(a), Ok(b)) => Outcome::Pass(format!("{a}; {b}")),
         (Err(e), _) | (_, Err(e)) => Outcome::Fail(e),
+    }
+}
+
+/// How long a stdinOnce container has, once its attach's stdin closed, to
+/// see the end and exit (#414).
+pub const ATTACH_EOF_WITHIN: Duration = Duration::from_secs(60);
+/// The line `pod-attach-stdin-once` sends.
+pub const ATTACH_LINE: &str = "hello from attach";
+
+/// The pod for `pod-attach-stdin-once` (#414): stdin, stdinOnce, no tty.
+pub fn attach_pod(env: &Env) -> Value {
+    let mut p = k8s::pod(env, "medium-attach", &["read-stdin"]);
+    p["spec"]["containers"][0]["stdin"] = json!(true);
+    p["spec"]["containers"][0]["stdinOnce"] = json!(true);
+    p["spec"]["containers"][0]["tty"] = json!(false);
+    p
+}
+
+/// Whether the attached container read the line and then its stdin's end.
+pub fn attach_verdict(phase: &str, log: &str) -> Result<String, String> {
+    let want = crate::workload::stdin_eof(format!("{ATTACH_LINE}\n").as_bytes());
+    match (phase, log.lines().any(|l| l.trim() == want)) {
+        ("Succeeded", true) => Ok(format!("the container read the line and its stdin's end: {want:?}")),
+        (p, _) => Err(format!("ended {p}, log {:?}; wanted {want:?}", log.trim())),
+    }
+}
+
+/// `pod-attach-stdin-once` (#414).
+async fn attach_stdin_once(env: &Env, api: &Api) -> Outcome {
+    let pod = attach_pod(env);
+    if let Err(e) = api.create(&k8s::pods(env), &pod).await {
+        return Outcome::Infra(e);
+    }
+    if let Err(e) = k8s::pod_running(env, api, "medium-attach", within(env)).await {
+        return Outcome::Infra(e);
+    }
+    let line = format!("{ATTACH_LINE}\n");
+    let attached = match api.attach(&env.namespace, "medium-attach", "main", line.as_bytes(), Duration::from_secs(10)).await {
+        Ok(a) => a,
+        Err(e) => return Outcome::Fail(e),
+    };
+    match k8s::pod_done(env, api, "medium-attach", ATTACH_EOF_WITHIN).await {
+        Ok(d) => {
+            let log = k8s::log(env, api, "medium-attach", false).await.unwrap_or_default();
+            match attach_verdict(&d.phase, &log) {
+                Ok(v) => Outcome::Pass(v),
+                Err(e) => Outcome::Fail(e),
+            }
+        }
+        Err(e) => Outcome::Fail(format!(
+            "the container never saw its stdin end once the attach closed it (stdinOnce): {e}; the attach read {:?}",
+            attached.stdout.trim()
+        )),
     }
 }
 
@@ -469,6 +529,19 @@ async fn waits_for_image(env: &Env, api: &Api, name: &str, image: &str) -> Outco
 mod tests {
     use super::*;
     use crate::k8s::tests::env;
+
+    /// #414: the attach pod and its verdict.
+    #[test]
+    fn the_attach_pod_and_its_verdict() {
+        let p = attach_pod(&env());
+        let c = &p["spec"]["containers"][0];
+        assert_eq!((c["stdin"].clone(), c["stdinOnce"].clone(), c["tty"].clone()), (json!(true), json!(true), json!(false)));
+        assert_eq!(c["args"], json!(["read-stdin"]));
+        let ok = "stdin-eof 18: hello from attach\n";
+        assert!(attach_verdict("Succeeded", ok).is_ok());
+        assert!(attach_verdict("Running", ok).is_err());
+        assert!(attach_verdict("Succeeded", "stdin-eof 0: \n").is_err());
+    }
 
     /// #416: a follow passes only when it ended, in time, with the log.
     #[test]

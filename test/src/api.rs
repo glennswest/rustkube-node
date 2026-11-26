@@ -269,6 +269,99 @@ impl Api {
     }
 }
 
+impl Api {
+    /// `kubectl attach -i -c <container>` (#414): the apiserver's
+    /// `pods/attach` door, a WebSocket proxied to the kubelet. Only
+    /// `v5.channel.k8s.io`: it is the version whose client can end its stdin
+    /// alone (channel 255, "closed stream 0") and go on reading. Sends
+    /// `stdin` on channel 0, then that close, then reads stdout and stderr
+    /// until the server closes or `window` passes. An error is a door that
+    /// would not open, or a server that chose another version.
+    pub async fn attach(&self, ns: &str, pod: &str, container: &str, stdin: &[u8], window: Duration) -> Result<Exec, String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let path = format!(
+            "/api/v1/namespaces/{ns}/pods/{pod}/attach?container={}&stdin=true&stdout=true&stderr=true",
+            query_value(container)
+        );
+        let mut req = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .header("connection", "Upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-protocol", "v5.channel.k8s.io")
+            .header("sec-websocket-key", "c3Rvcm12bS10ZXN0LWtleQ==");
+        if let Some(t) = &self.token {
+            req = req.bearer_auth(t);
+        }
+        let resp = req.send().await.map_err(|e| format!("GET {path}: {e}"))?;
+        if resp.status().as_u16() != 101 {
+            let code = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("attach to {ns}/{pod} -c {container} answered {code}, not a WebSocket: {}", short(&Value::String(body))));
+        }
+        let proto = resp.headers().get("sec-websocket-protocol").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        if proto != "v5.channel.k8s.io" {
+            return Err(format!("attach to {ns}/{pod} chose {proto:?}, not v5.channel.k8s.io: no way to end stdin alone"));
+        }
+        let mut io = resp.upgrade().await.map_err(|e| format!("upgrading {path}: {e}"))?;
+        let mut data = vec![0u8];
+        data.extend_from_slice(stdin);
+        let mut out = ws_client_frame(2, &data);
+        out.extend(ws_client_frame(2, &[255, 0]));
+        io.write_all(&out).await.map_err(|e| format!("attach to {ns}/{pod}: writing stdin: {e}"))?;
+        let deadline = tokio::time::Instant::now() + window;
+        let (mut buf, mut got, mut chunk) = (Vec::new(), Exec::default(), vec![0u8; 16 * 1024]);
+        'read: loop {
+            let n = match tokio::time::timeout_at(deadline, io.read(&mut chunk)).await {
+                Err(_) | Ok(Ok(0)) | Ok(Err(_)) => break,
+                Ok(Ok(n)) => n,
+            };
+            buf.extend_from_slice(&chunk[..n]);
+            while let Some((op, payload, used)) = ws_frame(&buf) {
+                buf.drain(..used);
+                match op {
+                    0..=2 if !payload.is_empty() => {
+                        let text = String::from_utf8_lossy(&payload[1..]).into_owned();
+                        match payload[0] {
+                            1 => got.stdout.push_str(&text),
+                            2 => got.stderr.push_str(&text),
+                            3 => got.status.push_str(&text),
+                            _ => {}
+                        }
+                    }
+                    8 => break 'read,
+                    _ => {}
+                }
+            }
+        }
+        Ok(got)
+    }
+}
+
+/// One WebSocket frame a client sends (RFC 6455 §5.2-5.3): FIN, opcode `op`,
+/// masked, as a client's frames must be. The key is fixed: it hides nothing
+/// here, and a server only checks that the frame is masked.
+pub fn ws_client_frame(op: u8, payload: &[u8]) -> Vec<u8> {
+    const KEY: [u8; 4] = [0x37, 0xfa, 0x21, 0x3d];
+    let mut f = vec![0x80 | (op & 0x0f)];
+    match payload.len() {
+        n @ 0..=125 => f.push(0x80 | n as u8),
+        n @ 126..=0xffff => {
+            f.push(0x80 | 126);
+            f.extend_from_slice(&(n as u16).to_be_bytes());
+        }
+        n => {
+            f.push(0x80 | 127);
+            f.extend_from_slice(&(n as u64).to_be_bytes());
+        }
+    }
+    f.extend_from_slice(&KEY);
+    f.extend(payload.iter().enumerate().map(|(i, b)| b ^ KEY[i % 4]));
+    f
+}
+
 /// One WebSocket frame from the front of `buf` (RFC 6455 §5.2): its opcode,
 /// its payload (unmasked) and how many bytes it took; `None` while `buf`
 /// does not yet hold a whole frame.
@@ -391,6 +484,19 @@ mod tests {
         assert_eq!(rfc3339_secs("2026-09-26T07:18:29.123456Z"), Some(1_790_407_109));
         assert_eq!(rfc3339_secs("2000-03-01T00:00:00Z"), Some(951_868_800));
         assert_eq!(rfc3339_secs("garbage"), None);
+    }
+
+    #[test]
+    fn a_clients_frames_are_masked_and_read_back() {
+        for len in [0usize, 2, 125, 126, 70000] {
+            let payload: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let f = ws_client_frame(2, &payload);
+            assert_eq!(f[0], 0x82);
+            assert!(f[1] & 0x80 != 0, "masked");
+            assert_eq!(ws_frame(&f), Some((2, payload, f.len())));
+        }
+        // stdin's close (#414): channel 255, stream 0.
+        assert_eq!(ws_frame(&ws_client_frame(2, &[255, 0])).unwrap().1, vec![255, 0]);
     }
 
     #[test]
