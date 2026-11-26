@@ -360,7 +360,7 @@ in the pod netns the socket is connected on a setns thread and handed to tonic. 
 Full `sc-build` passed on 78e9317 (VM sc-build-5af0b51f5f: 774 kubelet tests ok). HTTPS probes in the pod netns are
 still a connect only: gap #452, proposed. Stage golden requested.
 
-### Done: #456, `kubelet_volume_stats_*` on `/metrics` (sc#151)
+### Doing: #456, `kubelet_volume_stats_*` on `/metrics` (sc#151)
 
 `oc adm top persistentvolumeclaims` divides `kubelet_volume_stats_used_bytes` by `_capacity_bytes`, both labelled
 `namespace`, `persistentvolumeclaim`. The plan is to render both per claim at scrape time from `pod_volume_stats` (the
@@ -370,6 +370,13 @@ not the kubelet). They are left out: gap #469, proposed. Third-party CSI sizes a
 (`metrics::render_volume_stats`, test `volume_stats_are_per_claim`). Full `sc-build` passed on 353ac78 (VM
 sc-build-82771970c1). Stage golden requested.
 
+2026-11-26: the proof failed on pvetest1 as `answered: null`: `api:` parses the body as JSON and /metrics is text
+(stormcentral#1805). And no install leaves a container mounting a claim: pvetest3's /metrics has no `kubelet_volume_stats_*`
+line at all (only node services' claims, mounted by mirror pods). So no install-time proof can hold. Plan: `pvc-volume-metrics`
+in the `pvc` suite, after `pvc-volume-stats` while `stats-pod` still holds its 64Mi claim (4 MiB written, synced): the kubelet's
+/metrics (at its InternalIP with the run's token, as /stats/summary) has the claim's six families labelled
+`namespace`/`persistentvolumeclaim`: capacity ≥ 64Mi, used ≥ 4 MiB (#456), available within 1 MiB of the pod's df, inodes and
+inodes_free equal to it (#469). Parser + verdict tests; CHANGELOG; test crate sc-build; the run when a machine is free.
 ### Done (seen on a node): #442 (P1), review: the native runtime never provides the image rootfs
 
 The finding (`runtime.rs:136`, 3d780a09c92c) is real but is one of several gaps in `--runtime native`: no image
