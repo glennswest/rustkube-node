@@ -902,6 +902,10 @@ passed in run 3ecc579ddd (29 APIs healthy). Doing: `stormcentral test run rustku
 Refused: pvetest1 is held from runs (its last 3 runs, 3ecc579ddd among them, errored at the test-image GET to :5100:
 stormcentral#1798); pvetest2/pvetest3 have 14.06 installs still running. No code change. Held `--after stormcentral#1798`.
 Resume: `stormcentral test run rustkube-node pvc`; `pvc-classes` must pass first; pass → close #379; fail → the claim's events.
+2026-11-26 (later): handed back as stormcentral#1798 closed, but its fix 78c9a8e is not deployed (stormcentral runs 0381d7e),
+so pvetest1/2 are still held at :5100; pvetest3 is held by stormrdp#70; the run was refused again. Re-proposed (d254d88fe431,
+needs approval again; dfc2ec9c3b85 withdrawn: a `release:stormcentral>=` gate never holds) `--after stormrdp#70`; master
+noted about the deploy. Resume: `stormcentral test run rustkube-node pvc`.
 
 ### Shipped (proof pending): #383 (P0), a template listed `broken` is waited on forever (server8 12.92, pvc-ext4j-64m)
 
