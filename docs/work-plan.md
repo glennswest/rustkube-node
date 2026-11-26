@@ -216,6 +216,9 @@ Test crate sc-build passed (sc-build-5ad7c8a9a6: build, clippy `-D warnings`, 87
 `a_clients_frames_are_masked_and_read_back`). `test run rustkube-node medium` refused: no machine (pvetest1/2 at :5100 until
 stormcentral 78c9a8e is deployed, pvetest3 by stormrdp#70, server8 on 12.94 without 30b0230). Held `--after stormrdp#70`.
 Resume: `stormcentral test run rustkube-node medium`; `pod-attach-stdin-once` pass → close #414.
+2026-11-26 (17:30Z): resumed, stormrdp#70 and stormcentral#1798 closed. Queued `test run rustkube-node medium` at 2265768:
+b03b7929eb on pvetest1 (14.07-flowsdn), b7398e38d1 on pvetest3 (held by stormipmi#121). Parked `--after-run b03b7929eb`.
+Resume: `stormcentral test show b03b7929eb`; `pod-attach-stdin-once` pass → close #414.
 ### Done: #458, review 59fb97c4517b: an incremental backup's base from another store (vm_backup.rs)
 
 `older_done` picked the newest done backup of the VM on the node whatever its store. After `storm.io/backup-to`
