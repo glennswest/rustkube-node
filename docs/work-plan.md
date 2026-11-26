@@ -386,7 +386,7 @@ eabd981 (5; cilium-cni/flowsdn-cni count as serving hostPorts), f6db0fe (6: adop
 `GET /api/v1/migrations`, abort a failed one; no local memo needed), docs d6d6ff2. sc-build 320b18f27d at d6d6ff2: kubelet
 763/0, cni 28/0 (warnings are #386's). Stage requested; issue closed.
 
-### Doing: #378, node services' mirror pods: one container per stormd helper process
+### Shipped (proof pending, re-shipped at 2845af6): #378, node services' mirror pods: one container per stormd helper process
 2026-11-20. stormd#75 is in (d1c5966): `GET /api/v1/volumes` per container; goldens carry `goldens[].process`, the only
 per-process volume fact (one mount namespace). Plan:
 1. stormd_api: `Process.goldens` from `/api/v1/volumes` (role golden, by `goldens[].process`), read in stormd_poll.
@@ -424,6 +424,10 @@ never holds, the spec patch is 422 and the pod is made again. A proof reading at
 mirror pods are made with `automountServiceAccountToken: false` (rustkube's admission honours it; a node service's mirror
 uses no token), so an existing pod is remade once and then holds. Test: a mirror pod opts out. File the admission gap on
 rustkube. CHANGELOG; sc-build; then re-ship with the same proof (`--commit`).
+Built in 2845af6 (`mirror_pod_with`: `automountServiceAccountToken: false`; test
+`a_mirror_pod_takes_no_service_account_token`). sc-build passed (sc-build-ad556c9dad: workspace build, 847 kubelet unit ok;
+clippy's note at mirror.rs:389 is older code). Stage build 248e1b6c588d. Filed rustkube#402 (admission skips no mirror pod).
+Re-shipped `--commit 2845af6`, same proof; it is checked on an install whose release carries 2845af6.
 ### Blocked: #429 (P3), attach to a tty/stdin container after a kubelet restart
 2026-11-20. Needs the engine to keep a deposited fd across the client's detach and hand it back: none exists (ABI.md,
 deposits close when the client goes). Filed stormpump#260 (kept deposits + DEPOSIT_TAKE). Held `--after stormpump#260`.
