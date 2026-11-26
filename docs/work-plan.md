@@ -118,6 +118,9 @@ https (401 without a token) but not plain http; stormcentral 0381d7e already has
 2026-11-26 (later): handed back (#1798 closed) but its fix 78c9a8e is not deployed (stormcentral runs 0381d7e); `pvc` refused
 again (pvetest1/2 at :5100, pvetest3 by stormrdp#70). pvetest3's /stats/summary has no container-mounted built-in claim (only
 node services' claims, mounted by mirror pods), so nothing to read without the suite's pod. Held `--after stormrdp#70`.
+2026-11-27: pvetest2 and pvetest3 take runs again. `test run rustkube-node pvc` at 5680c81: ff3a4f0d5d on pvetest2,
+98b285bf06 on pvetest3 (its stormblock stalled earlier, stormblock#752). Parked `--after-run ff3a4f0d5d`. Resume: its
+`pvc-volume-stats` (and #456's `pvc-volume-metrics`); pass → close #469.
 
 ### Done (unit-verified; not run on a node): #452, an `https` httpGet probe in the pod netns does a real HTTPS GET
 
