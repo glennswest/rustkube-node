@@ -1308,7 +1308,7 @@ CA is fatal at start; `http://` works as before. Not the client pair (not asked;
        (#227's elsewhere). Live: not run on a node or a real engine; stormcos sets `--stormblock https://127.0.0.1:9090 --stormblock-ca /data/stormcert/ca.crt`.
 2. [x] stormvm-block (snapshot, restore, console `snapshot`) gets the same URL and has no CA: follow-up #318, proposed after stormvm#110; said on stormcos#374.
 
-### Shipped (proof pending): #325 (P2), VM start: `control` a flat ~102 ms, `report` grew (stormcos#804, fix 17)
+### Doing: #325 (P2), VM start: `control` a flat ~102 ms, `report` grew (stormcos#804, fix 17)
 
 2026-11-06. `control`: stormvm's `status_when_up` sleeps a fixed 100 ms after a refused connect, so a socket bound within that costs 100 ms. Target: under 20 ms on a VM, VM Running ~150 ms warm.
 `report`: one merge PATCH. pvetest1 12.61 VMIs 3.7-139 ms, pvetest2 12.61-flowsdn 2.8-118 ms, while pods in the same boots stay 2.5-5.8 ms (12.58.4 VMIs 3.7-22 ms). Not explained yet. Doing:
@@ -1328,6 +1328,12 @@ CA is fatal at start; `http://` works as before. Not the client pair (not asked;
        Tests, README, status.md, vm_start_timing docs, CHANGELOG; sc-build; stage; `shipped` with the `VMI … started:` line as proof.
        Done: b0657da. sc-build (VM sc-build-10a512b4c7) build + all tests pass, incl. new `connect_control_is_up_once_the_socket_listens` (a real Unix socket).
        clippy -p kubelet: nothing on the changed lines (the rest is #386). Stage requested; shipped with proof `on any:pve log:VMI .* started: .*control=([0-9]\.[0-9]|1[0-9])ms` (under 20 ms).
+6. [ ] 2026-11-26: the proof failed on pvetest1 (14.06-flowsdn): `log:` is the install's log, never kubelet output. And on 14.06
+       pvetest3 the kubelet journal has no `VMI … started:` at all (no VMI through the kubelet since boot; the install's VM probe
+       does not make one), so no install-time proof can show it. Plan: the `golden` suite (it boots VMIs through the kubelet)
+       gets `vmi-start-control`: before cleanup, every VMI of the run's `storm.io/start-timing`; pass when one has `control` under
+       20 ms (the first VM of a pass is qemu's own bind, stormvm#123), listing every `control` and `report`; fail when none is;
+       Infra when no VMI says. Tests on the parser/verdict; README; CHANGELOG; test crate sc-build; the run when a machine is free.
 
 ### Done: #311 (P1), X9 blades: container start 4-9 s in `containers`
 
