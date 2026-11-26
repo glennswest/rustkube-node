@@ -674,6 +674,9 @@ Resume: `stormcentral test run rustkube-node golden --tag pvetest2`; vmi-pod-net
 fix 78c9a8e not deployed, running 0381d7e). flowsdn-specific, so pvetest3 (cilium) cannot stand in. No code change. Held
 `--after-install rustkube-node>=2845af6@pvetest2` (a passed install lifts the hold). Resume: `stormcentral test run
 rustkube-node golden --tag pvetest2`; `vmi-pod-network` pass → close #426 (and stormvm#138).
+2026-11-27: handed back with the old runs (a31775e9fc, 2aa5de7dc7, 343d192458, 4d7e677e89: all before e045c84). pvetest2 passed
+its install; golden b4c3d8fd17 is running there (at 591f841, queued for #421). pvetest3's a6f8151cb8 passed `vmi-pod-network`,
+but that is cilium, not this issue's flowsdn path. Parked `--after-run b4c3d8fd17`.
 ### Parked after stormrdp#70 (no test machine): #405 (P2), AccessCredentialsSynchronized stuck at "waiting for the guest agent to answer"
 2026-11-20. Ruled out (stormcos_qa#52 on the issue): the golden runs qemu-guest-agent and the guest has org.qemu.guest_agent.0.
 Read: the socket path matches stormvm's (`<run>/<ns>/<name>/agent.sock`), qemu's chardev is a single-client server, nothing in
