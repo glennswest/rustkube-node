@@ -1905,8 +1905,10 @@ impl RuntimeService for StormpumpRuntime {
         // `/.stormd` directory gets the node's stormd image there, read-only.
         // Read from this container's own root, which is its image's content.
         let stormd_config;
+        // Seen where PID 1 mounted it, not through the kubelet's own `/run`.
+        let root_view = crate::shared_stormd::root_view(&made.device, &mount);
         let config = match crate::shared_stormd::bind_for(
-            std::path::Path::new(&mount),
+            &root_view,
             &config.mounts,
             &crate::shared_stormd::node_source(),
         ) {

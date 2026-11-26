@@ -52,6 +52,27 @@ pub fn node_source() -> String {
     source_in(&crate::container_roots::with_mount_list(&cmdline, mounts.as_deref()))
 }
 
+/// Where this process can read a container root that PID 1 mounted at
+/// `mount` (`/run/stormpump/roots/<container>`) on block device `device`.
+///
+/// Not the plain path (#465, as #379 found for claims): the kubelet's `/run`
+/// is a private bind of the node's, so a root PID 1 mounts after the kubelet
+/// started is, from here, the empty directory under it, and every root read
+/// as having no `/.stormd`. The first of PID 1's view, the plain path and
+/// `/hostroot` that is on the root's device; else the plain path, said why.
+pub fn root_view(device: &str, mount: &str) -> PathBuf {
+    let found = crate::pvc_resize::dev_numbers(device)
+        .ok_or_else(|| format!("{device}: no maj:min in /sys/class/block"))
+        .and_then(|n| crate::pvc_resize::on_device(n, &crate::pvc_resize::claim_candidates(mount)));
+    match found {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(%device, %mount, "the container root is not found on its device ({e}): read at its mount");
+            PathBuf::from(mount)
+        }
+    }
+}
+
 /// Whether a container root wants the shared stormd: `/.stormd` is a
 /// directory in it, itself and not a link (a link would bind wherever it
 /// points, in the node's view).
@@ -97,6 +118,22 @@ pub fn bind_for(root: &Path, mounts: &[Mount], source: &str) -> Bind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #465: the root is read where it is on its device, never an empty
+    /// directory over it; a device that cannot be resolved reads the mount.
+    #[test]
+    fn the_root_is_read_where_its_device_is() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let m = dir.path().to_str().unwrap().to_string();
+        let st = std::fs::metadata(&m).unwrap();
+        let numbers = (libc::major(st.dev()), libc::minor(st.dev()));
+        let candidates = crate::pvc_resize::claim_candidates(&m);
+        assert_eq!(candidates[0], PathBuf::from(format!("/proc/1/root{m}")), "PID 1's view first");
+        let found = crate::pvc_resize::on_device(numbers, &candidates).unwrap();
+        assert!(found == candidates[0] || found == candidates[1], "{found:?}");
+        assert_eq!(root_view("/dev/no-such-device-465", &m), PathBuf::from(&m));
+    }
 
     fn tree() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let d = tempfile::tempdir().unwrap();
