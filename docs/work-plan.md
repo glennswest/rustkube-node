@@ -599,7 +599,7 @@ Test crate test + clippy -D warnings passed. Held `--after-install rustkube-node
 rustkube-node golden` there; outside-refused must pass; direct-kernel passes once vmimages' `data_size` is 1G (else its skip says
 why) → close #421.
 
-### Doing: #404 (P0), a VM root on a stormstorage mirrored volume filled from its golden (stormstorage#113 B')
+### Parked after stormcentral#1271 (a two-node record): #404 (P0), a VM root on a stormstorage mirrored volume filled from its golden (stormstorage#113 B')
 2026-11-20. The owner chose B' on stormstorage#113 (built there: 2ef4b37, `from_golden`). Plan (`vm_mirrored_root.rs`):
 - Asked for by the VMI annotation `storm.io/mirrored-disks: {"<disk>": <copies ≥ 2>}` (the VM template's annotations reach the
   VMI). Only a golden disk; anything else, or no `--stormstorage`, fails the start saying why.
@@ -634,6 +634,11 @@ its pair). stormcentral#1271 runs a suite declaring `topology = "two-node"` on a
 `kvm`, 1800 s), `golden::run_mirrored`; a run with `STORM_NODES` < 2 is Infra, never a pass. `golden` no longer records it.
 Tests, docs (the suite list), CHANGELOG; sc-build of the test crate. Then held `--after stormcentral#1271`; resume:
 `stormcentral test run rustkube-node mirrored --tag pvepair`; pass → close #404.
+Built in decc0e2: `[mirrored]` (`topology = "two-node"`, `kvm`, 1800 s), `golden::run_mirrored` (`mirrored-nodes` Infra below
+two Ready nodes, then `vmi-mirrored-root`, then its VMI deleted), `golden` no longer runs it. Test crate sc-build passed
+(sc-build-bf20fc7b87: build, clippy `-D warnings`, 85 ok incl. `a_mirror_needs_two_ready_nodes`). stormcentral took the suite
+(run 23bd071be2, queued on pvetest3 behind a lease; a single machine skips it on topology, so it proves nothing).
+No two-node record exists yet (`testhost list` has no `role = cluster`). Held `--after stormcentral#1271`.
 
 ### Shipped (proof pending): #418 (P0), mirror pods in each service's project (stormcos#1020)
 2026-11-19. Plan: `mirror_namespaces.rs`: `--mirror-namespaces` (env `MIRROR_NAMESPACES`, default
