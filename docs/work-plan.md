@@ -20,7 +20,7 @@ Built in 54fec5e (`read_status_line`). sc-build passed (20261125-192241-54fec5e9
 control: the same tests on the old one-read code (branch test/479-repro, 99561479, `SC_BUILD_EXPECT_FAIL=1`) failed all
 three with `bad status line: HT` / `H` / `HTTP/1.0 `. The netns is not entered in the tests (needs root). Issue closed.
 
-### Parked after install rustkube-node>=b7377a3 on a pve machine: #469, `kubelet_volume_stats_available_bytes` and `_inodes*` for built-in claims
+### Doing: #469, `kubelet_volume_stats_available_bytes` and `_inodes*` for built-in claims
 
 2026-11-25. The issue's second route, the kubelet itself, needs no engine op: stormpump already gives a running
 container's pid (`query_info`, as the identity record uses, #84). Plan:
@@ -63,6 +63,8 @@ server8. Resume: `stormcentral test run rustkube-node pvc` on server8; close #46
 every other test machine skipped: no known release). It was skipped too: #791, `pvc` at 4896a3c has no pass on a pve
 machine (pvetest1/2), and both have failed installs; `--force-hardware` does not fit (no hardware cause). Parked again
 (c4ead815bddf), now also after `install:rustkube-node>=b7377a3@any:pve`. Resume: the pvc run on a pve machine, then server8.
+2026-11-25 evening: resumed. pvetest1's install of 14.06-flowsdn passed; 14.06 carries rustkube-node f0020e0
+(golden-rustkube-node-cd5f4d466b8f), which contains b0cfe1d and b7377a3. Doing: `stormcentral test run rustkube-node pvc`.
 
 ### Done (unit-verified; not run on a node): #452, an `https` httpGet probe in the pod netns does a real HTTPS GET
 
