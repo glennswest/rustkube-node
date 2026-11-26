@@ -154,7 +154,7 @@ Built in d16cb54 (`host_logs.rs`, routes in server.rs); sc-build passed (VM sc-b
 No new warnings. Stage requested; shipped with `api:/api/v1/nodes/{node}/proxy/logs/journal` as the proof. Not seen
 on a node yet: whether `/hostroot/var/log` exists on stormcos is unchecked. rustkube's oc-adm.sh flip is filed there.
 
-### Done: #460, review cd264eea6874: readiness ignores successThreshold/failureThreshold (pod_manager.rs)
+### Done (seen on a node): #460, review cd264eea6874: readiness ignores successThreshold/failureThreshold (pod_manager.rs)
 
 Each readiness result was assigned to `state.ready` directly. Now `PodState::readiness_run` keeps each container's
 last result and how many times in a row it came (`ReadinessRun::after`), as upstream's worker does. Ready changes only
@@ -164,6 +164,12 @@ at `successThreshold` (default 1, at least 1) or `failureThreshold` (default 3).
 Built in bfe388e; sc-build passed (no new build-failure; the warnings are #385/#386), and the new tests passed
 (sc-build-308006741a: `readiness_changes_only_at_its_thresholds`, `readiness_probe_honours_its_thresholds`, the old
 `readiness_probe_drives_ready_flag`). Stage requested; shipped with the kubelet's readiness log line as the proof.
+2026-11-26: the proof failed on pvetest1-1795671725 (14.06-flowsdn, rustkube-node d473758 ⊇ bfe388e) only because `log:`
+reads the install's log, which never carries kubelet output. The kubelet journal on pvetest1, through
+`/api/v1/nodes/pvetest1/proxy/logs/journal?query=kubelet&grep=Readiness`, has the line: `Readiness of
+kube-system/coredns-ae7fa61ed9-0e2be/coredns: ready after 1 successes in a row` (05:51:17Z, and etcd, apiserver, scheduler,
+controller-manager). Thresholds above 1 are the unit tests'; no system pod sets one. No code change. Re-shipped with an `api:`
+proof on that journal path; issue closed with what was seen. Noted: that read answered without a credential (stormcos#1026).
 
 ### Done: #414, attach: the client's stdin end closes a stdinOnce container's stdin (stormpump_runtime.rs)
 
