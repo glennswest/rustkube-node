@@ -474,7 +474,7 @@ sc-build 08ee2681ea passed (733 kubelet tests, the TLS one included; no warning 
 83d6c11ed85e. Held `--after stormcos#374` (no node's stormblock serves TLS yet). Resume: on a node with an https engine,
 a VirtualMachineSnapshot and a VirtualMachineRestore succeed → close #318.
 
-### Doing: #334 (P1), a kubelet restart adopts no pods on stormpump
+### Parked after stormcentral#1798 (no test machine free): #334 (P1), a kubelet restart adopts no pods on stormpump
 2026-11-20. Cause (issue): StormpumpRuntime's sandbox/container maps are memory only; the engine keeps the workloads and
 their handles across a reattach with the same TOKEN and hands back exits held while away (stormpump DESIGN "That gap is
 closed"). Plan:
@@ -503,6 +503,11 @@ workload signals only a kubelet whose root has `/var/lib/kubelet/stormpump-runti
 which only 6b9e6b9+ writes; none → it exits without a signal, the termination message says `NOT ADOPTING: …`, and the case
 is a Skip naming it. `KUBELET_RESTART_ADOPTS` goes. Test: the gate on a fake /proc. CHANGELOG; test crate sc-build; then
 `stormcentral test run rustkube-node csi` on a 14.06 machine; pass → close #334.
+Built in 6fba038 (`csi_driver::adopting`/`NOT_ADOPTING`, the case a Skip on it; README, status.md). Test crate sc-build passed
+(sc-build-96ea999fc3: build, clippy `-D warnings`, 85 ok). `test run rustkube-node csi` refused: pvetest1/pvetest2 held at
+:5100 (stormcentral#1798), pvetest3 held at its API-health gate (stormrdp#70: stormrdp gateway 503), server8 on 12.94 (no
+6b9e6b9; the gate would skip there anyway). No code change needed. Held `--after stormcentral#1798` (stormrdp#70 frees
+pvetest3 too). Resume: `stormcentral test run rustkube-node csi`; `csi-kubelet-restart` pass → close #334.
 
 ### Done: #428 (P0), four critical review findings
 2026-11-20. From stormcentral's Findings (`/api/v1/findings?project=rustkube-node`). Plan, one commit per finding:
