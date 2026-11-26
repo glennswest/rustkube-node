@@ -32,6 +32,13 @@
 //!   and `inodesFree` for the same mount: inodes equal, available bytes within
 //!   1 MiB. What `/metrics`' `kubelet_volume_stats_available_bytes` and
 //!   `_inodes*` are rendered from.
+//! - `pvc-volume-metrics` (#456, #469): the same claim, still held, on the
+//!   kubelet's `/metrics` (asked the same way): all six
+//!   `kubelet_volume_stats_*` families labelled `namespace` and
+//!   `persistentvolumeclaim` (what `oc adm top persistentvolumeclaims`
+//!   reads): capacity at least the claim's 64Mi, used at least the 4 MiB the
+//!   pod wrote, available within 1 MiB of its `df`, inodes and inodes free
+//!   equal to it.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -152,6 +159,51 @@ pub fn df_matches(df: &Value, vol: &Value) -> Result<String, String> {
     );
     if inodes != kinodes || free != kfree || used != kinodes.saturating_sub(kfree) || avail.abs_diff(kavail) > MIB {
         return Err(format!("the kubelet's numbers are not the pod's: {said}"));
+    }
+    Ok(said)
+}
+
+/// The families `pvc-volume-metrics` reads (#456, #469).
+pub const VOLUME_FAMILIES: [&str; 6] =
+    ["capacity_bytes", "used_bytes", "available_bytes", "inodes", "inodes_free", "inodes_used"];
+
+/// Claim `claim` (in `namespace`)'s `kubelet_volume_stats_<family>` values in
+/// a Prometheus text exposition.
+pub fn volume_series(text: &str, namespace: &str, claim: &str) -> std::collections::BTreeMap<String, f64> {
+    let labels = |l: &str| {
+        let has = |k: &str, v: &str| l.split(',').any(|kv| kv.trim() == format!("{k}=\"{v}\""));
+        has("namespace", namespace) && has("persistentvolumeclaim", claim)
+    };
+    text.lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("kubelet_volume_stats_")?;
+            let (family, rest) = rest.split_once('{')?;
+            let (l, value) = rest.split_once('}')?;
+            if !labels(l) {
+                return None;
+            }
+            Some((family.to_string(), value.split_whitespace().next()?.parse().ok()?))
+        })
+        .collect()
+}
+
+/// The claim's series against the pod's `df` (#456, #469).
+pub fn metrics_match(series: &std::collections::BTreeMap<String, f64>, df: &Value, claim_bytes: u64, written: u64) -> Result<String, String> {
+    let missing: Vec<&str> = VOLUME_FAMILIES.iter().copied().filter(|f| !series.contains_key(*f)).collect();
+    if !missing.is_empty() {
+        return Err(format!("no kubelet_volume_stats_{{{}}} for the claim; it has {:?}", missing.join(","), series));
+    }
+    let v = |f: &str| series[f] as u64;
+    let n = |k: &str| df[k].as_u64().ok_or_else(|| format!("no {k} in the pod's df {df}"));
+    let said = format!("{series:?}; df {df}");
+    if v("capacity_bytes") < claim_bytes {
+        return Err(format!("capacity below the claim's {claim_bytes}: {said}"));
+    }
+    if v("used_bytes") < written {
+        return Err(format!("used below the {written} bytes the pod wrote: {said}"));
+    }
+    if v("available_bytes").abs_diff(n("availableBytes")?) > MIB || v("inodes") != n("inodes")? || v("inodes_free") != n("inodesFree")? {
+        return Err(format!("not the pod's df: {said}"));
     }
     Ok(said)
 }
@@ -404,6 +456,31 @@ impl Suite {
         }
     }
 
+    /// `pvc-volume-metrics` (#456, #469): `stats-pod`'s claim on /metrics.
+    async fn volume_metrics(&self) -> Outcome {
+        let within = self.env.budget(Duration::from_secs(120), MARGIN);
+        let df = match k8s::log(&self.env, &self.api, "stats-pod", false).await.map(|l| df_said(&l)) {
+            Ok(Some(d)) => d,
+            Ok(None) => return Outcome::Skip("stats-pod gave no df: pvc-volume-stats says why".into()),
+            Err(e) => return Outcome::Infra(e),
+        };
+        let ip = match k8s::node_ip(&self.env, &self.api).await {
+            Ok(ip) => ip,
+            Err(e) => return Outcome::Infra(e),
+        };
+        let ns = self.env.namespace.clone();
+        let got = k8s::until(within, || async {
+            let (_, text) = k8s::kubelet_text(&self.env, &ip, "/metrics").await?;
+            metrics_match(&volume_series(&text, &ns, "stats"), &df, 64 * MIB, 4 * MIB)
+        })
+        .await;
+        match got {
+            Ok(said) => Outcome::Pass(said),
+            Err(e) if e.contains("error sending request") => Outcome::Infra(format!("the kubelet is not reachable: {e}")),
+            Err(e) => Outcome::Fail(e),
+        }
+    }
+
     async fn snapshot_deleted(&self) -> Outcome {
         let path = format!("{}/grow-snap", snapshots(&self.env));
         let content = match self.api.get(&path).await {
@@ -459,6 +536,7 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
     }
     // Only the built-in class (#469).
     r.run("pvc-volume-stats", suite.volume_stats()).await;
+    r.run("pvc-volume-metrics", suite.volume_metrics()).await;
     // The fast tier needs none of #379's classes, only its own (stormcos#1039).
     r.run("pvc-tier-fast", suite.tier_fast()).await;
     if let Err(e) = k8s::drain(&env, &api, Duration::from_secs(30)).await {
@@ -469,6 +547,29 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_claims_series_are_read_and_held_against_its_df() {
+        let text = "# HELP kubelet_volume_stats_used_bytes x\n\
+kubelet_volume_stats_capacity_bytes{namespace=\"ns\",persistentvolumeclaim=\"stats\"} 67108864\n\
+kubelet_volume_stats_used_bytes{namespace=\"ns\",persistentvolumeclaim=\"stats\"} 5242880\n\
+kubelet_volume_stats_available_bytes{namespace=\"ns\",persistentvolumeclaim=\"stats\"} 55000000\n\
+kubelet_volume_stats_inodes{namespace=\"ns\",persistentvolumeclaim=\"stats\"} 16384\n\
+kubelet_volume_stats_inodes_free{namespace=\"ns\",persistentvolumeclaim=\"stats\"} 16370\n\
+kubelet_volume_stats_inodes_used{namespace=\"ns\",persistentvolumeclaim=\"stats\"} 14\n\
+kubelet_volume_stats_used_bytes{namespace=\"other\",persistentvolumeclaim=\"stats\"} 1\n";
+        let series = volume_series(text, "ns", "stats");
+        assert_eq!(series.len(), 6);
+        assert_eq!(series["used_bytes"], 5242880.0);
+        let df = json!({"availableBytes": 55100000u64, "inodes": 16384, "inodesFree": 16370});
+        assert!(metrics_match(&series, &df, 64 * MIB, 4 * MIB).is_ok());
+        assert!(metrics_match(&series, &df, 64 * MIB, 8 * MIB).unwrap_err().contains("used below"));
+        let off = json!({"availableBytes": 55100000u64, "inodes": 16384, "inodesFree": 16000});
+        assert!(metrics_match(&series, &off, 64 * MIB, 4 * MIB).unwrap_err().contains("not the pod's df"));
+        let mut part = series.clone();
+        part.remove("inodes_used");
+        assert!(metrics_match(&part, &df, 64 * MIB, 4 * MIB).unwrap_err().contains("inodes_used"));
+    }
 
     #[test]
     fn the_classes_are_judged() {

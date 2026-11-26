@@ -185,6 +185,12 @@ pub async fn node_ip(env: &Env, api: &Api) -> Result<String, String> {
 /// needed (a suite may not declare a subresource). Its serving pair is the
 /// node's, not one for the address: the name is not what is under test.
 pub async fn kubelet_get(env: &Env, ip: &str, path: &str) -> Result<Value, String> {
+    let (url, text) = kubelet_text(env, ip, path).await?;
+    serde_json::from_str(&text).map_err(|e| format!("GET {url}: not JSON: {e}"))
+}
+
+/// [`kubelet_get`] of a text answer (`/metrics`): the URL and the body.
+pub async fn kubelet_text(env: &Env, ip: &str, path: &str) -> Result<(String, String), String> {
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(Duration::from_secs(30))
@@ -201,7 +207,7 @@ pub async fn kubelet_get(env: &Env, ip: &str, path: &str) -> Result<Value, Strin
     if status != 200 {
         return Err(format!("GET {url}: HTTP {status}: {}", text.trim()));
     }
-    serde_json::from_str(&text).map_err(|e| format!("GET {url}: not JSON: {e}"))
+    Ok((url, text))
 }
 
 pub fn pick_node(nodes: &[Value], node: &str) -> Option<String> {
