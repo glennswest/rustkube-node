@@ -40,6 +40,12 @@
 //!   attached. A skip where the node's kubelet has no stormstorage (its
 //!   start says so); the volume is the VMI's and goes with it (the sweep).
 //!
+//! - `vmi-start-control` (#325): the run's VMIs, as the kubelet timed their
+//!   starts (`storm.io/start-timing`): one reads Running with `control`
+//!   (the hypervisor's control socket taking a connection) under 20 ms. The
+//!   first VM of a pass waits on qemu's own bind (stormvm#123), so it is the
+//!   fastest that counts; every `control` and `report` is listed.
+//!
 //! - `vmi-kernel-outside-refused` (#421): a VMI naming a kernel outside the
 //!   kernel directories (`/data/stormcert/ca.crt`) never runs, and its status
 //!   says why ("not a file under the kernel directories"): the hypervisor
@@ -607,6 +613,15 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
     let o = suite.direct_kernel(&root, &says_id).await;
     r.record("vmi-direct-kernel", o, t.elapsed().as_millis(), None);
 
+    // How long each VMI's control socket took to take a connection (#325).
+    let t = Instant::now();
+    let o = match api.list(&vmis(&env)).await {
+        Ok(Some(v)) => judge_start_control(&v),
+        Ok(None) => Outcome::Infra("the VMIs are not listed here".into()),
+        Err(e) => Outcome::Infra(e),
+    };
+    r.record("vmi-start-control", o, t.elapsed().as_millis(), None);
+
     let t = Instant::now();
     let o = match suite.cleanup().await {
         Err(e) => Outcome::Infra(e),
@@ -674,6 +689,46 @@ pub fn enough_nodes(nodes: &[Value]) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The kubelet's breakdown of a VMI's start (#259): `name=<ms>` pairs.
+pub const START_TIMING: &str = "storm.io/start-timing";
+/// `control`'s target (#325): a VM's control socket takes a connection
+/// within it, once qemu's own start is warm.
+pub const CONTROL_UNDER_MS: f64 = 20.0;
+
+/// A step's milliseconds from a start-timing text (`control=12ms`, `4.2ms`).
+pub fn timing_ms(text: &str, step: &str) -> Option<f64> {
+    text.split_whitespace()
+        .find_map(|kv| kv.strip_prefix(step)?.strip_prefix('='))
+        .and_then(|v| v.strip_suffix("ms"))
+        .and_then(|v| v.parse().ok())
+}
+
+/// `vmi-start-control` (#325): the fastest `control` of the run's VMIs is
+/// under [`CONTROL_UNDER_MS`]; every VMI's `control` and `report` listed.
+pub fn judge_start_control(vmis: &[Value]) -> Outcome {
+    let mut seen: Vec<(String, f64, Option<f64>)> = vmis
+        .iter()
+        .filter_map(|v| {
+            let text = v["metadata"]["annotations"][START_TIMING].as_str()?;
+            Some((v["metadata"]["name"].as_str().unwrap_or("?").to_string(), timing_ms(text, "control")?, timing_ms(text, "report")))
+        })
+        .collect();
+    if seen.is_empty() {
+        return Outcome::Infra(format!("no VMI of the run has a {START_TIMING} with control= ({} VMI(s))", vmis.len()));
+    }
+    seen.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let list = seen
+        .iter()
+        .map(|(n, c, r)| format!("{n} control={c}ms report={}", r.map_or("?".into(), |r| format!("{r}ms"))))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if seen[0].1 < CONTROL_UNDER_MS {
+        Outcome::Pass(format!("fastest control {}ms (< {CONTROL_UNDER_MS} ms): {list}", seen[0].1))
+    } else {
+        Outcome::Fail(format!("no VMI's control under {CONTROL_UNDER_MS} ms: {list}"))
+    }
 }
 
 /// A VMI's `status.volumes[]` (#373): its root disk is there with role
@@ -952,6 +1007,17 @@ mod tests {
         let one = enough_nodes(&[node("a", "True"), node("b", "False")]).unwrap_err();
         assert!(one.contains("2 node(s), 1 Ready (a)"), "{one}");
         assert!(enough_nodes(&[]).is_err());
+    }
+
+    #[test]
+    fn the_fastest_control_is_judged() {
+        assert_eq!(timing_ms("wait=0.0ms launch=40ms control=4.2ms report=5.1ms total=90ms", "control"), Some(4.2));
+        assert_eq!(timing_ms("control=12ms", "report"), None);
+        let vmi = |n: &str, t: &str| serde_json::json!({"metadata": {"name": n, "annotations": {START_TIMING: t}}});
+        let ok = judge_start_control(&[vmi("gold-src", "control=156ms report=6ms"), vmi("gold-clone", "control=12ms report=4.0ms")]);
+        assert!(matches!(&ok, Outcome::Pass(d) if d.starts_with("fastest control 12ms") && d.contains("gold-src control=156ms")));
+        assert!(matches!(judge_start_control(&[vmi("a", "control=33ms")]), Outcome::Fail(_)));
+        assert!(matches!(judge_start_control(&[serde_json::json!({"metadata": {"name": "a"}})]), Outcome::Infra(_)));
     }
 
     #[test]
