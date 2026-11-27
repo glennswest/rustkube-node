@@ -637,7 +637,7 @@ tmp/sc-build-428b.log or `stormcentral buildvm status`; pass → clippy check of
 sc-build 6b83cb9337 passed (kubelet 727, cni 27, 11 new); clippy 55757d4132: nothing in the changed lines. Stage build
 93d14a289c8b. #428 closed. Majors in the Findings table follow as P1 (master files them).
 
-### Parked after a pvetest2 install (held at :5100): #426 (P2), a pod-network VMI reports its pod IP but nothing reaches it (pvetest2 flowsdn)
+### Done (seen on a node): #426 (P2), a pod-network VMI reports its pod IP but nothing reaches it (pvetest2 flowsdn)
 2026-11-20. First live run of #88's path (never run on a node before). Read: stormvm's bridge binding moves the pod IP and
 MAC off the CNI's interface onto vmbr0 with the tap; the guest NIC, the lease and the status all carry the pod's MAC; the
 DHCP responder answers only that MAC and says nothing. The kubelet watches no tap for a pod NIC and reports the pod IP from the
@@ -687,6 +687,8 @@ rustkube-node golden --tag pvetest2`; `vmi-pod-network` pass → close #426 (and
 2026-11-27: handed back with the old runs (a31775e9fc, 2aa5de7dc7, 343d192458, 4d7e677e89: all before e045c84). pvetest2 passed
 its install; golden b4c3d8fd17 is running there (at 591f841, queued for #421). pvetest3's a6f8151cb8 passed `vmi-pod-network`,
 but that is cilium, not this issue's flowsdn path. Parked `--after-run b4c3d8fd17`.
+b4c3d8fd17 (pvetest2, flowsdn): `vmi-pod-network` pass, connected to 10.173.65.216:22 after 1056 ms, the guest holds its /32.
+Closed #426; stormvm#138 told (its done-when).
 ### Parked after stormrdp#70 (no test machine): #405 (P2), AccessCredentialsSynchronized stuck at "waiting for the guest agent to answer"
 2026-11-20. Ruled out (stormcos_qa#52 on the issue): the golden runs qemu-guest-agent and the guest has org.qemu.guest_agent.0.
 Read: the socket path matches stormvm's (`<run>/<ns>/<name>/agent.sock`), qemu's chardev is a single-client server, nothing in
@@ -1437,7 +1439,7 @@ CA is fatal at start; `http://` works as before. Not the client pair (not asked;
        (#227's elsewhere). Live: not run on a node or a real engine; stormcos sets `--stormblock https://127.0.0.1:9090 --stormblock-ca /data/stormcert/ca.crt`.
 2. [x] stormvm-block (snapshot, restore, console `snapshot`) gets the same URL and has no CA: follow-up #318, proposed after stormvm#110; said on stormcos#374.
 
-### Parked after stormipmi#121 (pvetest3 image gate): #325 (P2), VM start: `control` a flat ~102 ms, `report` grew (stormcos#804, fix 17)
+### Done (seen on a node): #325 (P2), VM start: `control` a flat ~102 ms, `report` grew (stormcos#804, fix 17)
 
 2026-11-06. `control`: stormvm's `status_when_up` sleeps a fixed 100 ms after a refused connect, so a socket bound within that costs 100 ms. Target: under 20 ms on a VM, VM Running ~150 ms warm.
 `report`: one merge PATCH. pvetest1 12.61 VMIs 3.7-139 ms, pvetest2 12.61-flowsdn 2.8-118 ms, while pods in the same boots stay 2.5-5.8 ms (12.58.4 VMIs 3.7-22 ms). Not explained yet. Doing:
@@ -1478,6 +1480,8 @@ CA is fatal at start; `http://` works as before. Not the client pair (not asked;
        23:30Z: a6f8151cb8 (pvetest3) failed `vmi-start-control`: control 105/130/282/311 ms, report 13-50 ms, on the machine
        whose stormblock stalled (stormblock#752); recorded on #325. pvetest1's last install failed, so cd63ed3871 waits. Re-parked
        `--after-run b4c3d8fd17` (golden on pvetest2, at 591f841). Pass → close; ~100 ms again → split the bind from start-timing.
+       2026-11-27: b4c3d8fd17 (pvetest2) `vmi-start-control` pass: fastest control 5.5 ms (gold-src 5.5, podnet 20, agent 22,
+       noagent 37; report 12-69 ms). Closed #325.
 
 ### Done: #311 (P1), X9 blades: container start 4-9 s in `containers`
 
