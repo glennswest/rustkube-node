@@ -763,6 +763,13 @@ bug. `boot_for` matched `status.golden`, which vmimages writes as `media-<sha12>
 (vmimages src/crd.rs). Fixed 591f841 (localName, else golden; unit case in vmimages' shape); test crate sc-build
 20261126-232633-591f8413 posts on #421. Queued golden b4c3d8fd17 on pvetest2 at 591f841. Parked `--after-run b4c3d8fd17`.
 Next: its `vmi-direct-kernel`. A pass → close. A skip on `status.boot.message` (vmimages' data_size, the master's) → ask there.
+2026-11-27: b4c3d8fd17 (pvetest2): `vmi-direct-kernel` skip `CloudImage fedora-44: no status.boot.kernel yet` (the localName
+lookup works; vmimages published no boot and no message: filed vmcloud-image-operator#102). `vmi-kernel-outside-refused` fail:
+Unschedulable, `pvetest2: Insufficient memory` (never reached the kubelet; it passed on pvetest3 a6f8151cb8), as was
+`golden-clone-new-identity` (Pending 600 s): the suite held all five VMIs until cleanup. Fixed 00fb5fd (`retire` after each
+VMI's cases, kept for `vmi-start-control`; `with_retired` test); sc-build 20261127-000108-00fb5fd2. Same run: `vmi-start-control`
+pass (#325), `vmi-pod-network` pass on flowsdn (#426). Parked `--after vmcloud-image-operator#102`. Resume: golden on pvetest2;
+both #421 cases pass → close.
 ### Parked after stormcentral#1271 (a two-node record): #404 (P0), a VM root on a stormstorage mirrored volume filled from its golden (stormstorage#113 B')
 2026-11-20. The owner chose B' on stormstorage#113 (built there: 2ef4b37, `from_golden`). Plan (`vm_mirrored_root.rs`):
 - Asked for by the VMI annotation `storm.io/mirrored-disks: {"<disk>": <copies ≥ 2>}` (the VM template's annotations reach the
