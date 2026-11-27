@@ -485,6 +485,23 @@ impl Suite {
         }
     }
 
+    /// A VMI whose cases are done: kept as it was for `vmi-start-control`,
+    /// then deleted and waited out, so the later cases have the node's
+    /// memory. Holding every VMI until `cleanup` left pvetest2 (b4c3d8fd17)
+    /// with `Insufficient memory` for gold-clone and the kernel cases.
+    async fn retire(&self, names: &[&str], kept: &mut Vec<Value>) {
+        for v in names {
+            let path = format!("{}/{v}", vmis(&self.env));
+            if let Ok(Some(obj)) = self.api.get(&path).await {
+                kept.push(obj);
+            }
+            let _ = self.api.delete(&path).await;
+        }
+        for v in names {
+            let _ = k8s::gone(&self.api, &format!("{}/{v}", vmis(&self.env)), Duration::from_secs(120)).await;
+        }
+    }
+
     async fn cleanup(&self) -> Result<(), String> {
         for r in [ASK_FAIL, ASK_SEAL] {
             self.api.delete(&format!("{}/{r}", requests(&self.env))).await?;
@@ -548,6 +565,8 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
         Ok(_) => suite.agent_keys().await,
     };
     r.record("vmi-agent-keys", o, ta.elapsed().as_millis(), None);
+    let mut retired: Vec<Value> = vec![];
+    suite.retire(&[PODNET, AGENT], &mut retired).await;
     let source_id = src.as_deref().ok().and_then(machine_id);
     r.record(
         "golden-sources-boot",
@@ -580,6 +599,7 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
         };
         r.record("golden-no-agent-fails", o, t.elapsed().as_millis(), None);
     }
+    suite.retire(&[NO_AGENT], &mut retired).await;
 
     let mut sealed = false;
     if let Some(src_id) = source_id.as_ref().filter(|_| crd) {
@@ -590,6 +610,7 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
         };
         sealed = matches!(o, Outcome::Pass(_));
         r.record("golden-sealed", o, t.elapsed().as_millis(), None);
+        suite.retire(&[SOURCE], &mut retired).await;
 
         let t = Instant::now();
         let o = if !sealed {
@@ -616,7 +637,7 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
     // How long each VMI's control socket took to take a connection (#325).
     let t = Instant::now();
     let o = match api.list(&vmis(&env)).await {
-        Ok(Some(v)) => judge_start_control(&v),
+        Ok(Some(v)) => judge_start_control(&with_retired(retired, v)),
         Ok(None) => Outcome::Infra("the VMIs are not listed here".into()),
         Err(e) => Outcome::Infra(e),
     };
@@ -707,6 +728,16 @@ pub fn timing_ms(text: &str, step: &str) -> Option<f64> {
 
 /// `vmi-start-control` (#325): the fastest `control` of the run's VMIs is
 /// under [`CONTROL_UNDER_MS`]; every VMI's `control` and `report` listed.
+/// The VMIs listed now, with those retired earlier that are no longer
+/// there (by name; the one listed now wins).
+pub fn with_retired(retired: Vec<Value>, now: Vec<Value>) -> Vec<Value> {
+    let name = |v: &Value| v["metadata"]["name"].as_str().unwrap_or("").to_string();
+    let listed: std::collections::HashSet<String> = now.iter().map(name).collect();
+    let mut all = now;
+    all.extend(retired.into_iter().filter(|v| !listed.contains(&name(v))));
+    all
+}
+
 pub fn judge_start_control(vmis: &[Value]) -> Outcome {
     let mut seen: Vec<(String, f64, Option<f64>)> = vmis
         .iter()
@@ -1084,6 +1115,17 @@ mod tests {
         assert!(matches!(judge_identity("a", Some("b")), Outcome::Pass(_)));
         assert!(matches!(judge_identity("a", Some("a")), Outcome::Fail(_)));
         assert!(matches!(judge_identity("a", None), Outcome::Fail(_)));
+    }
+
+    #[test]
+    fn retired_vmis_still_count_for_start_control() {
+        let vmi = |n: &str, ann: &str| serde_json::json!({"metadata": {"name": n, "annotations": {START_TIMING: ann}}});
+        let now = vec![vmi("gold-clone", "control=40ms report=10ms")];
+        let retired = vec![vmi("gold-src", "control=5.5ms report=69ms"), vmi("gold-clone", "control=99ms report=1ms")];
+        let all = with_retired(retired, now);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all.iter().filter(|v| v["metadata"]["name"] == "gold-clone").count(), 1);
+        assert!(matches!(judge_start_control(&all), Outcome::Pass(_)));
     }
 
     #[test]
