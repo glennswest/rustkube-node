@@ -4,6 +4,22 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### Doing: #436 (P2) + #474 + #468 + #472, stormvm 319333d → 83a3f9a (60 commits, 17 fixes), with the disk-name change
+2026-11-27. The pin is 319333d (the issue's ac884c7 text is stale). stormvm main changes VM disk names `<ns>.<vm>-<disk>` →
+`<ns>.<vm>.<disk>` (stormvm#143, owner's decision A), so #474 lands with the bump. Plan:
+1. Cargo.toml/Cargo.lock: every stormvm crate at 83a3f9a; compile fixes (sc-build shows them).
+2. #472: `serial_log_from: None` in the two test `Registration` literals.
+3. #474: `reuse`: new name first; else the legacy name only when its owner record names this VM (kubelet predicate: kind,
+   ns, name, uid when both have one), else a `DiskOwnerRefused` Warning + StartFail::Failed, nothing cloned, and never
+   `set_volume_owner` on an unowned legacy volume. `seed_volume`: never delete an old-named seed not owned by this VM.
+   `vm_mirrored_root::name_of` → the new format, legacy under the rule. The rediscovery after a restart tries the legacy
+   name under the rule. Every other `volume_name` site through `reuse` or the legacy lookup. A dotted disk name: said in
+   the condition. Tests as listed on #474.
+4. #468: `built.write_files()` after `create_dir_all(run_dir)` (deregister + Err on failure); `remove_files()` where an
+   abandoned start is cleaned up. Test: an inline Ignition config writes `config.ign` 0600 before the spawn.
+5. CHANGELOG, docs/status.md stormvm pin row, README's VM disk names; sc-build (workspace build/test/clippy -D warnings);
+   stage. Node check: golden + a VM made before the bump comes back on its old disk (#474's live run).
+
 ### Parked after install of 6a6ec76: #401 (P2), crash-loop backoff not saved: `/var/lib/kubelet/` missing when crashloop.json is first written
 2026-11-27. `CrashLoopBackoff::save` wrote `crashloop.json.tmp` straight into the state root, which on forge1 (12.95) did not
 exist yet at `recover_state`; the failure was DEBUG, so #112 was silently off. Fix: `create_dir_all` the parent before the
