@@ -263,7 +263,7 @@ kube-system/coredns-ae7fa61ed9-0e2be/coredns: ready after 1 successes in a row` 
 controller-manager). Thresholds above 1 are the unit tests'; no system pod sets one. No code change. Re-shipped with an `api:`
 proof on that journal path; issue closed with what was seen. Noted: that read answered without a credential (stormcos#1026).
 
-### Parked after run 86c892cf3d: #414, attach: the client's stdin end closes a stdinOnce container's stdin (stormpump_runtime.rs)
+### Parked after a passed pve install: #414, attach: the client's stdin end closes a stdinOnce container's stdin (stormpump_runtime.rs)
 
 `attach_to`'s stdin copier returned on EOF and left `console.stdin` open, and the engine also keeps a copy of the
 stdin's write end (#429), so the container never read EOF. Plan: carry `stdin_once` from the pod spec
@@ -307,6 +307,8 @@ c1129da (⊇ d48cb69, e87605d). Parked `--after-run 720e32489a`.
 86c892cf3d on pvetest2 at 8292aa7 (⊇ d48cb69, e87605d); pvetest1 runs 12.97 (not the flavor's newest), pvetest3 held at its
 apiserver, server1/7/8 last installs failed. Parked `--after-run 86c892cf3d`. Resume: `pod-attach-stdin-once` pass → close #414
 (and #482 if `node-services-namespaces` runs); `error` again on pvetest2's apiserver → say so on #414, park after an install passes.
+35 min on: 86c892cf3d still queued; golden 1362272fcc (#405) errored on pvetest2's apiserver. Said on #414/#405. Parked
+`--after-install rustkube-node>=d48cb69@any:pve` (passed). Resume: medium there; pod-attach-stdin-once pass → close.
 ### Done: #458, review 59fb97c4517b: an incremental backup's base from another store (vm_backup.rs)
 
 `older_done` picked the newest done backup of the VM on the node whatever its store. After `storm.io/backup-to`
@@ -730,7 +732,7 @@ its install; golden b4c3d8fd17 is running there (at 591f841, queued for #421). p
 but that is cilium, not this issue's flowsdn path. Parked `--after-run b4c3d8fd17`.
 b4c3d8fd17 (pvetest2, flowsdn): `vmi-pod-network` pass, connected to 10.173.65.216:22 after 1056 ms, the guest holds its /32.
 Closed #426; stormvm#138 told (its done-when).
-### Parked after run 1362272fcc: #405 (P2), AccessCredentialsSynchronized stuck at "waiting for the guest agent to answer"
+### Parked after a passed pve install: #405 (P2), AccessCredentialsSynchronized stuck at "waiting for the guest agent to answer"
 2026-11-20. Ruled out (stormcos_qa#52 on the issue): the golden runs qemu-guest-agent and the guest has org.qemu.guest_agent.0.
 Read: the socket path matches stormvm's (`<run>/<ns>/<name>/agent.sock`), qemu's chardev is a single-client server, nothing in
 stormvm holds it open. Kubelet flaw: `agent_up` is "guest-network-get-interfaces succeeded within 2 s", so an agent that answers
@@ -785,6 +787,7 @@ kubelet tests (incl. `a_guest_policy_refusal_names_the_switch`), test crate 91 +
 still refused with the switch on → read the guest's AVC (`ausearch -m avc -c qemu-ga`) and report on #405.
 b7fa47aa20 errored (pvetest3's apiserver no /readyz in 10 min: the machine). 1362272fcc still queued. Reported on #405; parked
 `--after-run 1362272fcc`.
+1362272fcc errored too (pvetest2's apiserver). Parked `--after-install` a passed pve install; then golden; vmi-agent-keys True → close.
 ### Parked after stormrdp#70 (no test machine): #421 (P2), direct kernel boot from the golden's kernel (vmcloud-image-operator#62, stormvm#111)
 2026-11-20. Finding: no mount is needed. stormvm's machine spec is `root: Root::Inherit`, which stormpump documents as "the
 host's mount view", and `/data/vmimages` is a pallet volume mounted on the host (stormcos boot.d `volume vmidata /data/vmimages`);
