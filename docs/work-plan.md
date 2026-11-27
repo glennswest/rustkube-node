@@ -394,7 +394,7 @@ f948ce2ee55f (`vm_restore.rs:280` at a354e09e690a): the stop-before-restore chec
 the check proceeds only on a confirmed 404, and waits (retried next pass) on an error or a body that is not JSON.
 Tests: the fake apiserver answers a stored `__status`/`__raw` marker; a 500 and a malformed VMI make nothing.
 
-### Built, node run pending: #429 (P3), attach to a tty/stdin container after a kubelet restart on stormpump
+### Parked after csi run 9e5cd6e67e: #429 (P3), attach to a tty/stdin container after a kubelet restart on stormpump
 
 Built in 66838de; sc-build passed (VM sc-build-a4fc712f82, build + every test); clippy on the touched files shows only
 older findings (#386). New tests: `stormpump_ring::tests::a_kept_deposit_is_tagged_kept_and_its_copy_reads_back`,
@@ -412,6 +412,13 @@ console's own end (the pty master, or stdin's write end) is deposited kept as `c
 is taken back and the `Console` rebuilt from it; at removal it is withdrawn. An engine older than #260 closes the
 unknown deposit and answers the take EINVAL, so attach is refused as before (6b9e6b9).
 
+2026-11-27: #334 closed (csi 38ac3dd903 on pvetest1: `csi-kubelet-restart` pass). Node check for this: `kubelet-restart-attach`
+in `csi`, run after `csi-kubelet-restart` passes. Two `read-stdin` pods (tty+stdin; stdin+stdinOnce) are made before the signal.
+After it, each must be Running with restartCount 0 (a tty whose master only the old kubelet held would SIGHUP), then an attach
+through the restarted kubelet sends the line (tty: + ^D, canonical EOF; pipe: + the client's stdin end, #414) and the pod must
+Succeed with `stdin-eof 18: hello from attach` (`attach_verdict`). Built 697a3ff (+ README, docs/csi.md, CHANGELOG); test crate
+sc-build 20261127-001407-697a3ff9. csi queued: 9e5cd6e67e (pvetest2), bd6c2f3818 (pvetest3); 14.06+ kubelet ⊇ 66838de.
+Parked `--after-run 9e5cd6e67e`. Pass → close #429 (the kubelet's `console taken back` line is in its journal there).
 ### Done: #443 (P1), review: probes drop httpHeaders; gRPC probes are a TCP connect
 
 bb0746994c84 and ff200a3eb18a fixed in e85741a (+ bec01fc borrow fix, 78e9317 doc wording the stub sweep caught).
