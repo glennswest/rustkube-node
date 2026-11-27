@@ -4,6 +4,18 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### Doing: #402 (P1), a postStart hook that ended code=0 timed out after 120 s (cilium-agent killed, 137)
+2026-11-27. Read: `stormpump: exec ended code=0` is logged in exec_process's waiter right before `exit_tx.send`, so the exit
+reached `exec_sync`. But `exec_sync` waits on `join!(read stdout, read stderr, exit)`: it returns only at EOF on both pipes,
+i.e. when *every* holder of a write end has closed it. The kubelet's pipes are O_CLOEXEC and stormpump receives deposits with
+MSG_CMSG_CLOEXEC, so who held it in that 1-in-8 miss is not shown (a process spawned at the same moment, or a grandchild
+of the hook keeping stdout). Either way the hook had ended. Fix (the kubelet half, as the issue asks: never time out an exec
+that reported its code): `collect_exec`: read both streams while waiting for the exit; once the code is in, give the output
+`EXEC_DRAIN` (2 s) to reach EOF, then return the code with what was read, saying in a warn that the output was cut. The
+timeout still covers an exec that never ends. Upstream (CRI-O/conmon, dockershim) also ends an exec at the process's exit.
+Unit test: a pipe whose write end outlives the exit. Then sc-build, stage; on a node: no `PostStartHook failed … timed out`
+for a hook whose exec ended (boot-log review). If the leak is the engine's, file it on stormpump with this.
+
 ### Done: #385 + #386 (P1), workspace clippy `-D warnings` fails on main (the `ebpf` cfg, unused imports and dead code)
 2026-11-27. Every build note since 2026-11-18 says "the rest is #385/#386". Plan: (1) sc-build `cargo clippy --locked
 --all-targets -- -D warnings` for the full list at main; (2) the `ebpf` cfg: declare it (`[features] ebpf = []` in pkg/proxy,
