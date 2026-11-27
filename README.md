@@ -751,8 +751,18 @@ Each volume of a VMI becomes a stormblock volume attached here:
 |---|---|---|
 | `dataVolume` / `containerDisk` | `<ns>.<vmi>-<disk>`, a clone of the named golden made on the first start and reattached on every later one | yes |
 | `cloudInitNoCloud` | `<ns>.<vmi>-<disk>`, a generated seed, made again on each start (the old one is replaced): NoCloud's files under `CIDATA`, or, on a VMI with `storm.io/combustion`, combustion's volume (label `combustion`, case kept, `/combustion/script`; stormblock#326 on the node). Which one is `stormvm_cloudinit::medium` (#245); an `ignition`/`storm` VM's seed disk is refused before anything is made | yes |
-| `emptyDisk: {capacity}` | a blank volume `<ns>.<vmi>-<disk>`, reused if it already exists | yes |
+| `emptyDisk: {capacity}` | a blank volume `<ns>.<vmi>.<disk>`, reused if it already exists (see *VM disk names* below) | yes |
 | `persistentVolumeClaim: {claimName}` | the claim's volume, resolved exactly as for a pod (a bound claim uses its volume, an unbound `stormblock` claim is provisioned) | no, it belongs to the claim |
+
+**VM disk names (#474, stormvm#143, the owner's decision A).** A machine's own disks (a golden's clone, an
+`emptyDisk`, the seed) are `<ns>.<vm>.<disk>`. Until stormvm#143 they were `<ns>.<vm>-<disk>`, which collided:
+VM `web-data`'s `root` and VM `web`'s `data-root` were both `default.web-data-root`. A disk's name may not hold a
+dot, and a VMI whose does is refused before anything is made. A start looks for the new name first. A volume under
+the old name is used only when its owner record names this machine (kind, namespace and name, and the uid when both
+have one). Otherwise the start fails with a `DiskOwnerRefused` Warning naming the disk, the volume and its owner, and
+nothing is made in its place. An old-named volume with **no** owner record (made before #129, or a
+`storm.io/retain` machine's, which writes none) is never adopted automatically: an operator records its owner
+(`PUT /api/v1/volumes/{id}/owner` on stormblock) and the next start takes it.
 
 **A stop only detaches (#75).** A VirtualMachine restart is a new VMI, and it
 finds its disks by name: the root is what the guest wrote, and the golden is
@@ -1348,7 +1358,9 @@ stormstorage#113 option B', stormstorage#116):
         storm.io/mirrored-disks: '{"root": 2}'
 
 1. The kubelet starting the machine asks stormstorage for
-   `<namespace>.<vm>-<disk>.mirrored` once: `POST /api/v1/volumes {name,
+   `<namespace>.<vm>.<disk>.mirrored` once (one made before stormvm#143 as
+   `<namespace>.<vm>-<disk>.mirrored` is used only when its owner record
+   names the machine, #474): `POST /api/v1/volumes {name,
    size_bytes, raid: "mirror", replicas, from_golden, prefer_node: <this
    node>, owner}`. `size_bytes` is the golden's size on this node, or the
    disk's `size` when larger. A 409 (no placed node holds the golden) waits.
@@ -1496,7 +1508,7 @@ so its next start is there (#339, stormcos#806 test 3). Ask on the VM:
     kubectl annotate vm web-1 storm.io/move-to=node-b
 
 The kubelet whose stormblock holds the disks (by their record, else a volume
-`<ns>.<vm>-<disk>` owned by the VM) moves each disk the VM owns (a golden's
+`<ns>.<vm>.<disk>`, or its name before stormvm#143, `<ns>.<vm>-<disk>`, owned by the VM) moves each disk the VM owns (a golden's
 clone, an emptyDisk) with stormstorage's migrate, as above but with no guest
 to pause: `copying` → (in sync, nothing attached) cutover → `switched` →
 complete → `moved`. The record is the same `storm.io/disk-moves`, each entry
