@@ -700,7 +700,7 @@ its install; golden b4c3d8fd17 is running there (at 591f841, queued for #421). p
 but that is cilium, not this issue's flowsdn path. Parked `--after-run b4c3d8fd17`.
 b4c3d8fd17 (pvetest2, flowsdn): `vmi-pod-network` pass, connected to 10.173.65.216:22 after 1056 ms, the guest holds its /32.
 Closed #426; stormvm#138 told (its done-when).
-### Parked after run b7fa47aa20: #405 (P2), AccessCredentialsSynchronized stuck at "waiting for the guest agent to answer"
+### Parked after run 1362272fcc: #405 (P2), AccessCredentialsSynchronized stuck at "waiting for the guest agent to answer"
 2026-11-20. Ruled out (stormcos_qa#52 on the issue): the golden runs qemu-guest-agent and the guest has org.qemu.guest_agent.0.
 Read: the socket path matches stormvm's (`<run>/<ns>/<name>/agent.sock`), qemu's chardev is a single-client server, nothing in
 stormvm holds it open. Kubelet flaw: `agent_up` is "guest-network-get-interfaces succeeded within 2 s", so an agent that answers
@@ -753,6 +753,8 @@ Done 99ab59e (`ssh_policy_hint`, `agent_may_write_keys`, README/status/CHANGELOG
 kubelet tests (incl. `a_guest_policy_refusal_names_the_switch`), test crate 91 + clippy -D warnings. Golden runs 1362272fcc
 (pvetest2) and b7fa47aa20 (pvetest3) at 99ab59e. Held `--after-run b7fa47aa20`. Resume: `vmi-agent-keys` True → close #405;
 still refused with the switch on → read the guest's AVC (`ausearch -m avc -c qemu-ga`) and report on #405.
+b7fa47aa20 errored (pvetest3's apiserver no /readyz in 10 min: the machine). 1362272fcc still queued. Reported on #405; parked
+`--after-run 1362272fcc`.
 ### Parked after stormrdp#70 (no test machine): #421 (P2), direct kernel boot from the golden's kernel (vmcloud-image-operator#62, stormvm#111)
 2026-11-20. Finding: no mount is needed. stormvm's machine spec is `root: Root::Inherit`, which stormpump documents as "the
 host's mount view", and `/data/vmimages` is a pallet volume mounted on the host (stormcos boot.d `volume vmidata /data/vmimages`);
