@@ -70,9 +70,22 @@ pub fn refusal(requests: &BTreeMap<String, u32>, spec: &stormvm_spec::VmSpec) ->
     None
 }
 
-/// The stormstorage volume of `disk` of the machine `namespace/vm`.
+/// The stormstorage volume of `disk` of the machine `namespace/vm`:
+/// stormvm's `<ns>.<vm>.<disk>` (stormvm#143) with [`SUFFIX`].
 pub fn name_of(namespace: &str, vm: &str, disk: &str) -> String {
+    format!("{namespace}.{vm}.{disk}{SUFFIX}")
+}
+
+/// [`name_of`] before stormvm#143 (`<ns>.<vm>-<disk>`). Read, never made:
+/// such a volume is taken only when its owner record names the machine
+/// (#474).
+pub fn legacy_name_of(namespace: &str, vm: &str, disk: &str) -> String {
     format!("{namespace}.{vm}-{disk}{SUFFIX}")
+}
+
+/// [`legacy_name_of`] for a spec.
+pub fn legacy_volume_name(spec: &stormvm_spec::VmSpec, disk: &str) -> String {
+    format!("{}{SUFFIX}", stormvm_node::start::legacy_volume_name(spec, disk))
 }
 
 /// [`name_of`] for a spec: stormvm's own disk name with [`SUFFIX`].
@@ -178,6 +191,16 @@ async fn answer(r: reqwest::Result<reqwest::Response>) -> Result<Value, (u16, St
         return Err((status, text.trim().to_string()));
     }
     Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+/// `name` as stormstorage has it, or `None` when it has no such volume.
+pub async fn lookup(ss: &EngineClient, name: &str) -> Result<Option<Value>, NotYet> {
+    match answer(ss.get(&format!("{}/api/v1/volumes/{name}", ss.url())).await).await {
+        Ok(v) => Ok(Some(v)),
+        Err((404, _)) => Ok(None),
+        Err((0, e)) => Err(NotYet::Wait(format!("stormstorage did not answer for {name}: {e}"))),
+        Err((s, e)) => Err(NotYet::Wait(format!("stormstorage {s} for {name}: {e}"))),
+    }
 }
 
 /// The disk's volume as stormstorage has it, made when it has none.

@@ -112,6 +112,28 @@ fn left_by_another(found: &Value, owner: &Value) -> bool {
     !theirs.is_empty() && !ours.is_empty() && theirs != ours
 }
 
+/// Does a volume's owner record `o` name the machine whose disks this
+/// kubelet owns as `ours` ([`disk_owner`])? The kind, namespace and name,
+/// and the uid when both have one (#474, stormvm#143). `ours` is `Null` for a
+/// retained machine, which writes no owner: nothing proves a volume its own.
+fn owner_is(o: &stormvm_block::Owner, ours: &Value) -> bool {
+    let s = |k: &str| ours[k].as_str().unwrap_or("").to_string();
+    let uids = (o.uid.as_deref().filter(|u| !u.is_empty()), Some(s("uid")).filter(|u| !u.is_empty()));
+    !s("kind").is_empty()
+        && o.kind == s("kind")
+        && o.namespace == s("namespace")
+        && o.name == s("name")
+        && match uids {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        }
+}
+
+/// A volume's owner record, as stormvm reads it. `None`: it has none.
+fn recorded_owner(v: &Value) -> Option<stormvm_block::Owner> {
+    serde_json::from_value(v["owner"].clone()).ok()
+}
+
 /// The apiserver path of a disk owner, for the sweep. `None` for an owner
 /// this kubelet did not write.
 fn owner_path(owner: &Value) -> Option<String> {
@@ -2604,6 +2626,14 @@ impl VmManager {
         let obj = &self.with_seed(obj).await;
         let t = steps.since("seed", t);
         let vm: VmSpec = stormvm_spec::kube::from_kube(obj).map_err(|e| e.to_string())?;
+        // A dot in a disk's name makes its volume's name ambiguous (#474,
+        // stormvm#143): refused before anything is made, saying so.
+        if let Some(dot) = stormvm_spec::validate::check(&vm)
+            .into_iter()
+            .find(|i| matches!(i, stormvm_spec::validate::Invalid::DotInDiskName(_)))
+        {
+            return Err(StartFail::Failed(dot.to_string()));
+        }
         let ns = obj["metadata"]["namespace"].as_str().unwrap_or("default").to_string();
         let ring = self.ring.clone().ok_or_else(|| {
             "no ring to stormpump: only the engine starts a machine".to_string()
@@ -2915,6 +2945,13 @@ impl VmManager {
             deregister(&vm.namespace, &vm.name);
             return Err(format!("could not make {}: {e}", built.run_dir));
         }
+        // The files qemu is pointed at (#468, stormvm#141): an inline
+        // Ignition config is `<run_dir>/config.ign`, given by `-fw_cfg`. Not
+        // written, qemu is handed a path that does not exist.
+        if let Err(e) = built.write_files() {
+            deregister(&vm.namespace, &vm.name);
+            return Err(format!("{}: {e}", vm.name));
+        }
 
         // The ring is blocking and owns its own thread; the async side reaches
         // it through `spawn_blocking`, as the container path does.
@@ -2968,10 +3005,12 @@ impl VmManager {
             Ok(Ok(handle)) => Ok((handle, made, registration)),
             Ok(Err(e)) => {
                 deregister(&vm.namespace, &vm.name);
+                built.remove_files();
                 Err(refusal_message(&e, hypervisor_said_since(dir, log_mark)))
             }
             Err(e) => {
                 deregister(&vm.namespace, &vm.name);
+                built.remove_files();
                 Err(format!("ring task: {e}"))
             }
         }
@@ -3327,7 +3366,7 @@ impl VmManager {
                     // first.
                     let name = stormvm_node::start::volume_name(vm, &d.name);
                     let moved = self.moved_volume(uid, &d.name);
-                    match match moved { Some(id) => Ok(Some(self.adopt_moved(id, owner).await)), None => self.reuse(&d.name, &name, owner).await } {
+                    match match moved { Some(id) => Ok(Some(self.adopt_moved(id, owner).await)), None => self.reuse(uid, vm, &d.name, owner).await } {
                         Ok(Some(id)) => id,
                         Ok(None) => {
                     let mut body = json!({
@@ -3421,9 +3460,8 @@ impl VmManager {
                 // standalone path does: a data disk that came back blank after
                 // a restart would lose everything the guest wrote to it.
                 DiskSource::Empty => {
-                    let name = stormvm_node::start::volume_name(vm, &d.name);
                     let moved = self.moved_volume(uid, &d.name);
-                    let found = match match moved { Some(id) => Ok(Some(self.adopt_moved(id, owner).await)), None => self.reuse(&d.name, &name, owner).await } {
+                    let found = match match moved { Some(id) => Ok(Some(self.adopt_moved(id, owner).await)), None => self.reuse(uid, vm, &d.name, owner).await } {
                         Ok(found) => found,
                         Err(e) => {
                             self.give_back_disks(uid, &done, hot.then_some(vm)).await;
@@ -4800,6 +4838,16 @@ impl VmManager {
                 self.delete_volumes(&vm.name, &[id.to_string()]).await;
             }
         }
+        // The seed under its name before stormvm#143 (#474) goes only when
+        // its owner record says it is this machine's: under the old names
+        // `ns.web-cloud` + `init` was `ns.web` + `cloud-init`, another
+        // machine's disk. One that is not is left alone, read or written.
+        let legacy = stormvm_node::start::legacy_volume_name(vm, disk);
+        if let Some(old) = self.volume_named(&legacy).await? {
+            if let (Some(id), true) = (old["id"].as_str(), recorded_owner(&old).is_some_and(|o| owner_is(&o, owner))) {
+                self.delete_volumes(&vm.name, &[id.to_string()]).await;
+            }
+        }
         let mut body = json!({
             "name": name,
             "size": "16M",
@@ -4917,7 +4965,29 @@ impl VmManager {
             mr::NotYet::Wait(w) => StartFail::Waiting(format!("disk {disk}: {w}")),
             mr::NotYet::Fail(f) => StartFail::Failed(format!("disk {disk}: {f}")),
         };
-        let name = mr::volume_name(vm, disk);
+        let mut name = mr::volume_name(vm, disk);
+        // Made before stormvm#143 (#474): the old name, when its owner record
+        // says it is this machine's; refused, loudly, when it is not.
+        if mr::lookup(ss, &name).await.map_err(not_yet)?.is_none() {
+            let legacy = mr::legacy_volume_name(vm, disk);
+            if let Some(old) = mr::lookup(ss, &legacy).await.map_err(not_yet)? {
+                let theirs = recorded_owner(&old);
+                if !theirs.as_ref().is_some_and(|o| owner_is(o, owner)) {
+                    let why = format!(
+                        "disk {disk}: mirrored volume {legacy} (its name before stormvm#143) {}; it is not taken. \
+                         If it is this machine's, record its owner on stormstorage",
+                        match &theirs {
+                            Some(o) => format!("belongs to {} {}/{}", o.kind, o.namespace, o.name),
+                            None => "has no owner record".to_string(),
+                        }
+                    );
+                    let obj = json!({ "metadata": { "namespace": vm.namespace, "name": vm.name } });
+                    self.event(&obj, "Warning", "DiskOwnerRefused", &why).await;
+                    return Err(StartFail::Failed(why));
+                }
+                name = legacy;
+            }
+        }
         let v = mr::find_or_create(ss, &self.engine, &self.storage, &name, g, size, copies, &self.node_name, owner)
             .await
             .map_err(not_yet)?;
@@ -4937,29 +5007,61 @@ impl VmManager {
         Ok(id)
     }
 
-    /// The volume a previous start made for disk `disk` (named `name`), if
-    /// there is one, with its owner brought up to `owner` (#75).
+    /// The volume a previous start made for disk `disk` of `vm`, if there is
+    /// one, with its owner brought up to `owner` (#75).
+    ///
+    /// Under stormvm's name (`<ns>.<vm>.<disk>`) first. Else under the name
+    /// before stormvm#143 (`<ns>.<vm>-<disk>`), **only when that volume's
+    /// owner record names this machine** (#474, the owner's decision A): the
+    /// old names collided (`web-data`+`root`, `web`+`data-root`), so an
+    /// old-named volume may be another machine's. A refusal is a Warning
+    /// (`DiskOwnerRefused`) and a failed start, and nothing is made in its
+    /// place. An unowned old-named volume is never given an owner here:
+    /// adopting it is an operator's act (`PUT /api/v1/volumes/{id}/owner`).
     ///
     /// A listing that fails is a failed start, not "make a new one": that
     /// would give a restarted guest a fresh root and leave its own beside it.
     /// One left by an earlier object of the same name waits for the sweep.
-    async fn reuse(&self, disk: &str, name: &str, owner: &Value) -> Result<Option<String>, StartFail> {
-        let found = self
-            .volume_named(name)
-            .await
-            .map_err(|e| StartFail::Failed(format!("disk {disk}: {e}")))?;
-        let Some(v) = found else { return Ok(None) };
-        let Some(id) = v["id"].as_str().map(String::from) else { return Ok(None) };
-        if left_by_another(&v, owner) {
-            return Err(StartFail::Waiting(format!(
+    async fn reuse(&self, uid: &str, vm: &VmSpec, disk: &str, owner: &Value) -> Result<Option<String>, StartFail> {
+        let name = stormvm_node::start::volume_name(vm, disk);
+        let volumes = self.volumes().await.map_err(|e| StartFail::Failed(format!("disk {disk}: {e}")))?;
+        let named = |n: &str| volumes.iter().find(|v| v["name"].as_str() == Some(n)).cloned();
+        let left = |v: &Value, name: &str| {
+            StartFail::Waiting(format!(
                 "disk {disk}: volume {name} was left by an earlier {} of this name; waiting for it to be removed",
                 v["owner"]["kind"].as_str().unwrap_or("owner")
-            )));
+            ))
+        };
+        if let Some(v) = named(&name) {
+            let Some(id) = v["id"].as_str().map(String::from) else { return Ok(None) };
+            if left_by_another(&v, owner) {
+                return Err(left(&v, &name));
+            }
+            if v["owner"] != *owner {
+                self.set_volume_owner(&id, owner).await;
+            }
+            info!(volume = %id, "reusing {name} for disk {disk}");
+            return Ok(Some(id));
         }
-        if v["owner"] != *owner {
+        let legacy = stormvm_node::start::legacy_volume_name(vm, disk);
+        let Some(v) = named(&legacy) else { return Ok(None) };
+        let Some(id) = v["id"].as_str().map(String::from) else { return Ok(None) };
+        if left_by_another(&v, owner) {
+            return Err(left(&v, &legacy));
+        }
+        let theirs = recorded_owner(&v);
+        if let Err(refused) = stormvm_node::start::legacy_reuse(vm, disk, &id, theirs.as_ref(), |o| owner_is(o, owner)) {
+            let why = refused.to_string();
+            warn!(vm = %vm.id(), volume = %legacy, "{why}");
+            let obj = json!({ "metadata": { "namespace": vm.namespace, "name": vm.name, "uid": uid } });
+            self.event(&obj, "Warning", "DiskOwnerRefused", &why).await;
+            return Err(StartFail::Failed(why));
+        }
+        // Its own, by its record: only the uid can be behind (#474).
+        if v["owner"] != *owner && !owner.is_null() {
             self.set_volume_owner(&id, owner).await;
         }
-        info!(volume = %id, "reusing {name} for disk {disk}");
+        info!(volume = %id, "reusing {legacy} (its name before stormvm#143) for disk {disk}");
         Ok(Some(id))
     }
 
@@ -5118,9 +5220,20 @@ impl VmManager {
         let Some(ss) = self.migration.stormstorage.as_ref() else { return };
         let host = mr::host_nqn(&self.node_name);
         for d in &vm.disks {
-            let name = mr::name_of(&vm.namespace, &vm.name, &d.name);
-            if let Err(e) = mr::withdraw(ss, &name, &host).await {
-                warn!(vm = %vm.name, volume = %name, "this node is still served {name}: {e}");
+            let mut names = vec![mr::name_of(&vm.namespace, &vm.name, &d.name)];
+            // A machine started before stormvm#143 runs on the old name
+            // (#474). Withdrawn only when that volume is this machine's by its
+            // record: under the old names it may be another machine's.
+            let legacy = mr::legacy_name_of(&vm.namespace, &vm.name, &d.name);
+            if let Ok(Some(v)) = mr::lookup(ss, &legacy).await {
+                if recorded_owner(&v).is_some_and(|o| o.namespace == vm.namespace && o.name == vm.name) {
+                    names.push(legacy);
+                }
+            }
+            for name in names {
+                if let Err(e) = mr::withdraw(ss, &name, &host).await {
+                    warn!(vm = %vm.name, volume = %name, "this node is still served {name}: {e}");
+                }
             }
         }
     }
@@ -7159,9 +7272,17 @@ impl VmManager {
                     }
                 }
                 None => {
-                    let vname = stormvm_node::start::volume_name(&spec, d);
-                    let found = volumes.iter().find(|v| {
-                        v["name"].as_str() == Some(vname.as_str()) && v["owner"]["uid"].as_str() == Some(uid.as_str())
+                    // Its name, else its name before stormvm#143 (#474): a VM
+                    // running across the kubelet that ships the change still
+                    // has its disks. Either only with this machine's uid on it.
+                    let names = [
+                        stormvm_node::start::volume_name(&spec, d),
+                        stormvm_node::start::legacy_volume_name(&spec, d),
+                    ];
+                    let found = names.iter().find_map(|vname| {
+                        volumes.iter().find(|v| {
+                            v["name"].as_str() == Some(vname.as_str()) && v["owner"]["uid"].as_str() == Some(uid.as_str())
+                        })
                     });
                     if let Some(id) = found.and_then(|v| v["id"].as_str()) {
                         mine.push((d.clone(), Some(id.to_string())));
@@ -11649,6 +11770,10 @@ mod tests {
         created: Arc<std::sync::Mutex<Vec<Value>>>,
         pods: Arc<std::sync::Mutex<Value>>,
         list_fails: Arc<std::sync::atomic::AtomicBool>,
+        /// Volume id → its owner record, as listed (#474).
+        owners: Arc<std::sync::Mutex<HashMap<String, Value>>>,
+        /// Every `PUT …/owner` and `DELETE /api/v1/volumes/{id}`, as `owner <id>` / `delete <id>`.
+        writes: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     async fn fake() -> Fake {
@@ -11659,23 +11784,30 @@ mod tests {
         let created: Shared<Vec<Value>> = Arc::default();
         let pods: Shared<Value> = Arc::new(std::sync::Mutex::new(json!({"items": []})));
         let list_fails = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let owners: Shared<HashMap<String, Value>> = Arc::default();
+        let writes: Shared<Vec<String>> = Arc::default();
 
         let (v1, v2, c1, p1, f1) =
             (vols.clone(), vols.clone(), created.clone(), pods.clone(), list_fails.clone());
+        let (o1, w1, w2) = (owners.clone(), writes.clone(), writes.clone());
         let app = axum::Router::new()
             .route(
                 "/api/v1/volumes",
                 get(move || {
-                    let (v, f) = (v1.clone(), f1.clone());
+                    let (v, f, o) = (v1.clone(), f1.clone(), o1.clone());
                     async move {
                         if f.load(std::sync::atomic::Ordering::SeqCst) {
                             return (axum::http::StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({})));
                         }
+                        let owners = o.lock().unwrap().clone();
                         let items: Vec<Value> = v
                             .lock()
                             .unwrap()
                             .iter()
-                            .map(|(id, name)| json!({"id": id, "name": name}))
+                            .map(|(id, name)| match owners.get(id) {
+                                Some(owner) => json!({"id": id, "name": name, "owner": owner}),
+                                None => json!({"id": id, "name": name}),
+                            })
                             .collect();
                         (axum::http::StatusCode::OK, axum::Json(json!({ "items": items })))
                     }
@@ -11687,6 +11819,26 @@ mod tests {
                         v.lock().unwrap().push((id.clone(), body["name"].as_str().unwrap().into()));
                         c.lock().unwrap().push(body);
                         axum::Json(json!({ "id": id }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/volumes/{id}/owner",
+                axum::routing::put(move |axum::extract::Path(id): axum::extract::Path<String>| {
+                    let w = w1.clone();
+                    async move {
+                        w.lock().unwrap().push(format!("owner {id}"));
+                        axum::Json(json!({}))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/volumes/{id}",
+                axum::routing::delete(move |axum::extract::Path(id): axum::extract::Path<String>| {
+                    let w = w2.clone();
+                    async move {
+                        w.lock().unwrap().push(format!("delete {id}"));
+                        axum::Json(json!({}))
                     }
                 }),
             )
@@ -11729,7 +11881,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        Fake { url, vols, created, pods, list_fails }
+        Fake { url, vols, created, pods, list_fails, owners, writes }
     }
 
     fn manager_for(f: &Fake, with_claims: bool) -> VmManager {
@@ -11930,6 +12082,145 @@ mod tests {
         v["name"] = json!("data");
         obj["spec"]["volumes"] = json!([v]);
         stormvm_spec::kube::from_kube(&obj).unwrap()
+    }
+
+    /// A VMI `name` with one emptyDisk `disk` (#474).
+    fn vm_named(name: &str, disk: &str) -> VmSpec {
+        let mut obj = vmi("n1");
+        obj["metadata"]["name"] = json!(name);
+        obj["spec"]["domain"]["devices"] = json!({ "disks": [{ "name": disk, "disk": { "bus": "virtio" } }] });
+        obj["spec"]["volumes"] = json!([{ "name": disk, "emptyDisk": { "capacity": "1Gi" } }]);
+        stormvm_spec::kube::from_kube(&obj).unwrap()
+    }
+
+    fn vm_owner(name: &str, uid: &str) -> Value {
+        json!({ "kind": "VirtualMachine", "namespace": "default", "name": name, "uid": uid })
+    }
+
+    /// #474 (stormvm#143, the owner's A): disks are `<ns>.<vm>.<disk>`; a
+    /// volume under the old `<ns>.<vm>-<disk>` is taken only when its owner
+    /// record names this machine, else refused with nothing made.
+    #[tokio::test]
+    async fn an_old_named_disk_is_taken_only_when_its_owner_record_names_this_machine() {
+        let f = fake().await;
+        let m = manager_for(&f, false);
+        // The finding's case: `default.web-data-root` is VM web-data's root.
+        f.vols.lock().unwrap().push(("v-old".into(), "default.web-data-root".into()));
+        f.owners.lock().unwrap().insert("v-old".into(), vm_owner("web-data", "u-wd"));
+
+        // VMI `web`'s disk `data-root` had the same old name: refused, nothing made.
+        let web = vm_named("web", "data-root");
+        assert_eq!(stormvm_node::start::volume_name(&web, "data-root"), "default.web.data-root");
+        match m.reuse("u-w", &web, "data-root", &vm_owner("web", "u-web")).await {
+            Err(StartFail::Failed(why)) => {
+                assert!(why.contains("default.web-data-root") && why.contains("web-data"), "{why}")
+            }
+            other => panic!("{other:?}"),
+        }
+        let mut fresh = Vec::new();
+        let got = m.resolve_disks_with_keys("u-w", &web, &[], &vm_owner("web", "u-web"), &mut fresh).await;
+        assert!(matches!(got, Err(StartFail::Failed(_))), "the start fails");
+        assert!(f.created.lock().unwrap().is_empty(), "nothing cloned or made in its place");
+        assert!(f.writes.lock().unwrap().is_empty(), "no owner written");
+
+        // web-data's own `root`: reused.
+        let wd = vm_named("web-data", "root");
+        let id = m.reuse("u-wd", &wd, "root", &vm_owner("web-data", "u-wd")).await.unwrap();
+        assert_eq!(id.as_deref(), Some("v-old"));
+        assert!(f.writes.lock().unwrap().is_empty(), "already its owner: nothing to write");
+
+        // Under the new name too: the new one is preferred.
+        f.vols.lock().unwrap().push(("v-new".into(), "default.web-data.root".into()));
+        let id = m.reuse("u-wd", &wd, "root", &vm_owner("web-data", "u-wd")).await.unwrap();
+        assert_eq!(id.as_deref(), Some("v-new"));
+    }
+
+    /// #474: an old-named disk with no owner record (made before #129) is
+    /// refused, and its owner is not written: adopting it is an operator's.
+    /// Nor does a retained machine (no owner of its own) take one.
+    #[tokio::test]
+    async fn an_unowned_old_named_disk_is_refused_and_left_unowned() {
+        let f = fake().await;
+        let m = manager_for(&f, false);
+        f.vols.lock().unwrap().push(("v-bare".into(), "default.web-1-data".into()));
+        let vm = vm_named("web-1", "data");
+        match m.reuse("u-1", &vm, "data", &vm_owner("web-1", "u-1")).await {
+            Err(StartFail::Failed(why)) => assert!(why.contains("no owner record"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(f.writes.lock().unwrap().is_empty(), "never adopted automatically");
+        f.owners.lock().unwrap().insert("v-bare".into(), vm_owner("web-1", "u-1"));
+        assert!(
+            matches!(m.reuse("u-1", &vm, "data", &Value::Null).await, Err(StartFail::Failed(_))),
+            "retained: nothing proves it its own"
+        );
+        // Its own name with another uid (an earlier VM of this name): waits for the sweep.
+        assert!(matches!(
+            m.reuse("u-1", &vm, "data", &vm_owner("web-1", "u-2")).await,
+            Err(StartFail::Waiting(_))
+        ));
+        // Its own, uid and all: taken.
+        let id = m.reuse("u-1", &vm, "data", &vm_owner("web-1", "u-1")).await.unwrap();
+        assert_eq!(id.as_deref(), Some("v-bare"));
+    }
+
+    /// #474: the owner predicate: kind, namespace, name, and the uid when
+    /// both have one. A dotted disk name is refused by stormvm's check, which
+    /// the start runs first. Mirrored roots follow the new name.
+    #[test]
+    fn a_volumes_owner_record_names_the_machine_by_kind_namespace_name_and_uid() {
+        let o = |kind: &str, name: &str, uid: Option<&str>| stormvm_block::Owner {
+            kind: kind.into(),
+            namespace: "default".into(),
+            name: name.into(),
+            uid: uid.map(String::from),
+        };
+        let ours = vm_owner("web", "u-1");
+        assert!(owner_is(&o("VirtualMachine", "web", Some("u-1")), &ours));
+        assert!(owner_is(&o("VirtualMachine", "web", None), &ours), "no uid recorded: by name");
+        assert!(!owner_is(&o("VirtualMachine", "web", Some("u-2")), &ours));
+        assert!(!owner_is(&o("VirtualMachine", "web-data", Some("u-1")), &ours));
+        assert!(!owner_is(&o("VirtualMachineInstance", "web", Some("u-1")), &ours));
+        assert!(!owner_is(&o("VirtualMachine", "web", None), &Value::Null), "retained: nothing proves it");
+
+        let mut obj = vmi("n1");
+        obj["spec"]["domain"]["devices"] = json!({ "disks": [{ "name": "data.root", "disk": { "bus": "virtio" } }] });
+        obj["spec"]["volumes"] = json!([{ "name": "data.root", "emptyDisk": { "capacity": "1Gi" } }]);
+        if let Ok(spec) = stormvm_spec::kube::from_kube(&obj) {
+            assert!(stormvm_spec::validate::check(&spec)
+                .iter()
+                .any(|i| matches!(i, stormvm_spec::validate::Invalid::DotInDiskName(_))));
+        }
+
+        assert_eq!(crate::vm_mirrored_root::name_of("default", "web", "root"), "default.web.root.mirrored");
+        assert_eq!(crate::vm_mirrored_root::legacy_name_of("default", "web", "root"), "default.web-root.mirrored");
+    }
+
+    /// #474: the seed's old-named volume goes only when it is this
+    /// machine's; another machine's is left alone.
+    #[tokio::test]
+    async fn an_old_named_seed_is_removed_only_when_it_is_this_machines() {
+        let f = fake().await;
+        let m = manager_for(&f, false);
+        let mut obj = vmi("n1");
+        obj["metadata"]["name"] = json!("web");
+        obj["spec"]["domain"]["devices"] = json!({ "disks": [
+            { "name": "root", "disk": { "bus": "virtio" } },
+            { "name": "cloud-init", "disk": { "bus": "virtio" } }
+        ] });
+        obj["spec"]["volumes"] = json!([
+            { "name": "root", "emptyDisk": { "capacity": "1Gi" } },
+            { "name": "cloud-init", "cloudInitNoCloud": { "userData": "#cloud-config\n" } }
+        ]);
+        let vm: VmSpec = stormvm_spec::kube::from_kube(&obj).unwrap();
+        // `default.web-cloud-init` is also VM web-cloud's disk `init` under the old names.
+        f.vols.lock().unwrap().push(("v-theirs".into(), "default.web-cloud-init".into()));
+        f.owners.lock().unwrap().insert("v-theirs".into(), vm_owner("web-cloud", "u-wc"));
+        let _ = m.seed_volume(&vm, "cloud-init", &[], &vm_owner("web", "u-web")).await;
+        assert!(!f.writes.lock().unwrap().iter().any(|w| w == "delete v-theirs"), "another's: left alone");
+        f.owners.lock().unwrap().insert("v-theirs".into(), vm_owner("web", "u-web"));
+        let _ = m.seed_volume(&vm, "cloud-init", &[], &vm_owner("web", "u-web")).await;
+        assert!(f.writes.lock().unwrap().iter().any(|w| w == "delete v-theirs"), "its own old seed: gone");
     }
 
     /// An emptyDisk is made blank once, owned by the VM, and found again on
