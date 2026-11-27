@@ -162,8 +162,9 @@ pinning csi-driver-host-path in stormcos, would add it).
 
 - NodeStage and `attachRequired: true` on a node: the suite's driver has neither, so
   they are covered by unit tests against a mock driver only. No third-party driver has been run.
-- A kubelet restart with a CSI volume in use: a restarted kubelet adopts no pods
-  on stormpump yet (#334), so `csi-kubelet-restart` is skipped.
+- A kubelet restart with a CSI volume in use: seen on pvetest1 (csi 38ac3dd903,
+  #334). `csi-kubelet-restart` passed: the holder kept its container, and the
+  restarted kubelet published and unpublished.
 - Generic ephemeral volumes: the kubelet resolves them to the claim
   `<pod>-<volume>` and waits for it. rustkube has no controller that creates
   that claim (rustkube#94).

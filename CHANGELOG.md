@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-27
+
+- **test:** `kubelet-restart-attach` in the `csi` suite (#429), after `csi-kubelet-restart` passes. Before the kubelet is signalled, two `read-stdin` pods are made and Running: a terminal (`stdin`, `tty`) and a stdinOnce pipe. After the restart each must still be its first container (restarts 0), since a tty whose master only the old kubelet held would have hung up. Each is attached to through the restarted kubelet, whose console was taken back from the engine (66838de, stormpump#260). The tty gets `hello from attach` then `^D`, which a canonical-mode terminal turns into EOF; the pipe gets the line and then the client's stdin end. Each must Succeed saying `stdin-eof 18: hello from attach`. docs/csi.md: the kubelet restart with a CSI volume in use is now seen on a node (#334).
+
 ## 2026-11-26
 
 - **test:** The `golden` suite deletes each VMI once its last case has run, instead of keeping all of them until `cleanup`. It first keeps a copy of the VMI for `vmi-start-control`, which judges those copies together with the VMIs still listed. The pod-network and agent VMIs go after the agent cases, the no-agent VMI after `golden-no-agent-fails`, and the source after `golden-sealed`. On pvetest2 (b4c3d8fd17) five VMIs held the node's memory, so `golden-clone-new-identity` stayed Pending and `vmi-kernel-outside-refused` was Unschedulable (`Insufficient memory`) instead of refused by the kubelet (#421).

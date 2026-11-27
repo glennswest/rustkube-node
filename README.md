@@ -1690,6 +1690,12 @@ kubelet is under test, not the scheduler.
     `/var/lib/kubelet/stormpump-runtime.json` (rustkube-node 6b9e6b9 and later).
     An older one is left alone, since its restart would start every pod again and
     loop, and the case is a skip saying `NOT ADOPTING`.
+  - `kubelet-restart-attach` (#429), after `csi-kubelet-restart` passes: a tty pod
+    (`stdin`, `tty`) and a stdinOnce pod, both `read-stdin` and made before the
+    restart, are still their first container (restarts 0). Each is attached to
+    through the restarted kubelet. The tty gets `hello from attach` and `^D`, the
+    pipe gets the line and the client's stdin end. Each must Succeed with
+    `stdin-eof 18: hello from attach`.
   - `csi-deregistered`: the driver pod deleted, CSINode no longer lists it.
 - **multus** (< 10 min, declared in `test/requires.toml`, run on request, #233):
   a pod's extra networks by the Multus standard, with the standard CNI plugins

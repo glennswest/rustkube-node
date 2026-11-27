@@ -111,6 +111,35 @@ pub fn consumer(env: &Env, name: &str, args: &[&str]) -> Value {
     p
 }
 
+/// The console pods of `kubelet-restart-attach` (#429).
+pub const ATTACH_TTY: &str = "csi-attach-tty";
+pub const ATTACH_STDIN: &str = "csi-attach-stdin";
+
+/// A terminal with stdin, and a stdinOnce pipe without one, each reading
+/// stdin to its end (`read-stdin`).
+pub fn attach_pods(env: &Env) -> Vec<Value> {
+    let mut tty = k8s::pod(env, ATTACH_TTY, &["read-stdin"]);
+    tty["spec"]["containers"][0]["stdin"] = json!(true);
+    tty["spec"]["containers"][0]["tty"] = json!(true);
+    let mut pipe = k8s::pod(env, ATTACH_STDIN, &["read-stdin"]);
+    pipe["spec"]["containers"][0]["stdin"] = json!(true);
+    pipe["spec"]["containers"][0]["stdinOnce"] = json!(true);
+    pipe["spec"]["containers"][0]["tty"] = json!(false);
+    vec![tty, pipe]
+}
+
+/// A console pod through the restart: still Running, its first container
+/// never restarted. A tty whose master the old kubelet alone held would have
+/// hung up (SIGHUP) when that kubelet exited (#429).
+pub fn adopted_console(pod: &Value) -> Result<(), String> {
+    let phase = s(pod, "/status/phase");
+    let restarts = pod.pointer("/status/containerStatuses/0/restartCount").and_then(Value::as_u64).unwrap_or(0);
+    if phase != "Running" || restarts != 0 {
+        return Err(format!("not the container from before the restart: phase {phase:?}, restarts {restarts}"));
+    }
+    Ok(())
+}
+
 /// The pod that restarts the kubelet: privileged, in the host's PID namespace.
 pub fn restart_pod(env: &Env) -> Value {
     let mut p = k8s::pod(env, "csi-restart-kubelet", &["restart-kubelet"]);
@@ -278,6 +307,15 @@ impl Suite {
             Err(e) => return Outcome::Fail(format!("the holder never ran: {e}")),
         };
         let cid = s(&before, "/status/containerStatuses/0/containerID").to_string();
+        // The consoles a restart must keep (#429): made and Running before
+        // the signal, attached to after it by `kubelet-restart-attach`. A
+        // failure here is that case's to report, not this one's.
+        for p in attach_pods(&self.env) {
+            let name = s(&p, "/metadata/name").to_string();
+            if self.create_pod(&p).await.is_ok() {
+                let _ = k8s::pod_running(&self.env, &self.api, &name, Duration::from_secs(180)).await;
+            }
+        }
         if let Err(e) = self.create_pod(&restart_pod(&self.env)).await {
             return Outcome::Infra(e);
         }
@@ -325,6 +363,39 @@ impl Suite {
             "{}; the holder kept its container, a new pod read the data, the holder's delete unpublished",
             restarted.trim().trim_start_matches("restart-kubelet: ")
         ))
+    }
+
+    /// `kubelet-restart-attach` (#429): after `csi-kubelet-restart`, each
+    /// console pod made before the restart is still the same container, and
+    /// an attach through the restarted kubelet reaches its stdin: the line,
+    /// then its end (the tty by ^D in canonical mode, the stdinOnce pipe by
+    /// the client's stdin closing, #414). Each must Succeed saying so.
+    async fn case_restart_attach(&self) -> Outcome {
+        let mut said = vec![];
+        for (name, input) in [(ATTACH_TTY, format!("{}\n\u{4}", crate::pods::ATTACH_LINE)), (ATTACH_STDIN, format!("{}\n", crate::pods::ATTACH_LINE))] {
+            let pod = match self.api.get(&format!("{}/{name}", k8s::pods(&self.env))).await {
+                Ok(Some(p)) => p,
+                Ok(None) => return Outcome::Infra(format!("{name} was not made before the restart")),
+                Err(e) => return Outcome::Infra(e),
+            };
+            if let Err(e) = adopted_console(&pod) {
+                return Outcome::Fail(format!("{name}: {e}"));
+            }
+            if let Err(e) = self.api.attach(&self.env.namespace, name, "main", input.as_bytes(), Duration::from_secs(10)).await {
+                return Outcome::Fail(format!("{name}: attach after the restart: {e}"));
+            }
+            match k8s::pod_done(&self.env, &self.api, name, crate::pods::ATTACH_EOF_WITHIN).await {
+                Ok(d) => {
+                    let log = k8s::log(&self.env, &self.api, name, false).await.unwrap_or_default();
+                    match crate::pods::attach_verdict(&d.phase, &log) {
+                        Ok(_) => said.push(format!("{name} read the line and its end")),
+                        Err(e) => return Outcome::Fail(format!("{name}: {e}")),
+                    }
+                }
+                Err(e) => return Outcome::Fail(format!("{name}: the attached line and its end never reached it: {e}")),
+            }
+        }
+        Outcome::Pass(format!("through the restarted kubelet: {}; both the same container as before it, restarts 0", said.join(", ")))
     }
 
     async fn case_deregistered(&self) -> Outcome {
@@ -394,7 +465,10 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
                 if r.run("csi-unpublish", s.case_unpublish(&writer)).await {
                     // Gated on the node (#334): the restart pod signals only a
                     // kubelet that adopts its pods, else the case is a skip.
-                    r.run("csi-kubelet-restart", s.case_restart()).await;
+                    if r.run("csi-kubelet-restart", s.case_restart()).await {
+                        // The consoles the old kubelet held (#429).
+                        r.run("kubelet-restart-attach", s.case_restart_attach()).await;
+                    }
                 }
             }
         }
@@ -418,6 +492,21 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
 
 #[cfg(test)]
 mod tests {
+
+    /// #429: the console pods, and what counts as one that came through.
+    #[test]
+    fn the_console_pods_and_their_restart() {
+        let e = env();
+        let pods = attach_pods(&e);
+        let c = |i: usize| pods[i]["spec"]["containers"][0].clone();
+        assert_eq!((c(0)["stdin"].clone(), c(0)["tty"].clone()), (json!(true), json!(true)));
+        assert_eq!((c(1)["stdin"].clone(), c(1)["stdinOnce"].clone(), c(1)["tty"].clone()), (json!(true), json!(true), json!(false)));
+        assert_eq!(c(0)["args"], json!(["read-stdin"]));
+        let pod = |phase: &str, restarts: u64| json!({"status": {"phase": phase, "containerStatuses": [{"restartCount": restarts}]}});
+        assert!(adopted_console(&pod("Running", 0)).is_ok());
+        assert!(adopted_console(&pod("Running", 1)).is_err());
+        assert!(adopted_console(&pod("Succeeded", 0)).is_err());
+    }
     use super::*;
     use crate::k8s::tests::env;
 
