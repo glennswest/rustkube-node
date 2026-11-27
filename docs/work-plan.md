@@ -30,7 +30,7 @@ or `[lints.rust] unexpected_cfgs`), whichever matches how ebpf.rs is meant to be
 Done 20660e9 + 7d1a210 (~130 lints; csi.v1.rs's 30 were prost's generated docs). sc-build: workspace clippy -D warnings rc 0,
 `-p proxy --features ebpf` rc 0, cargo test rc 0 (849 kubelet), test crate test + clippy rc 0, check-stubs rc 0. Closed both.
 
-### Parked after run 720e32489a: #482 (P2), medium's requires.toml asks no cluster read of pods (`node-services-namespaces` 403)
+### Parked after run 86c892cf3d: #482 (P2), medium's requires.toml asks no cluster read of pods (`node-services-namespaces` 403)
 2026-11-26. Seen in b03b7929eb (pvetest1): `node-services-namespaces` (#418) got 403 listing
 `/api/v1/pods?labelSelector=storm.io/component=node-service` across namespaces; `[medium]`'s `cluster_read` had no `pods`.
 Fixed in e87605d (`{ apiGroup = "", resource = "pods" }`, CHANGELOG). No code: the runner reads requires.toml. Verified by
@@ -263,7 +263,7 @@ kube-system/coredns-ae7fa61ed9-0e2be/coredns: ready after 1 successes in a row` 
 controller-manager). Thresholds above 1 are the unit tests'; no system pod sets one. No code change. Re-shipped with an `api:`
 proof on that journal path; issue closed with what was seen. Noted: that read answered without a credential (stormcos#1026).
 
-### Parked after stormrdp#70 (no test machine): #414, attach: the client's stdin end closes a stdinOnce container's stdin (stormpump_runtime.rs)
+### Parked after run 86c892cf3d: #414, attach: the client's stdin end closes a stdinOnce container's stdin (stormpump_runtime.rs)
 
 `attach_to`'s stdin copier returned on EOF and left `console.stdin` open, and the engine also keeps a copy of the
 stdin's write end (#429), so the container never read EOF. Plan: carry `stdin_once` from the pod spec
@@ -303,6 +303,10 @@ the rest failed). Parked `--after-install rustkube-node>=30b0230@any:pve`. Resum
 `pod-attach-stdin-once` pass → close #414 (and #482 if `node-services-namespaces` runs).
 Test crate sc-build 20261126-231631-d48cb694 passed. 23:45Z: pvetest2 has a passed install; medium 720e32489a queued there at
 c1129da (⊇ d48cb69, e87605d). Parked `--after-run 720e32489a`.
+2026-11-27: 720e32489a ended `error` (pvetest2's apiserver no /readyz in 10 min: the machine, nothing ran). Requeued medium
+86c892cf3d on pvetest2 at 8292aa7 (⊇ d48cb69, e87605d); pvetest1 runs 12.97 (not the flavor's newest), pvetest3 held at its
+apiserver, server1/7/8 last installs failed. Parked `--after-run 86c892cf3d`. Resume: `pod-attach-stdin-once` pass → close #414
+(and #482 if `node-services-namespaces` runs); `error` again on pvetest2's apiserver → say so on #414, park after an install passes.
 ### Done: #458, review 59fb97c4517b: an incremental backup's base from another store (vm_backup.rs)
 
 `older_done` picked the newest done backup of the VM on the node whatever its store. After `storm.io/backup-to`
