@@ -34,6 +34,7 @@ use tonic::transport::{Channel, Endpoint, Uri};
 
 /// The generated CSI v1 messages and services.
 pub mod proto {
+    #![allow(clippy::all)]
     tonic::include_proto!("csi.v1");
 }
 

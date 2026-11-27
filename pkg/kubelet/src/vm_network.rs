@@ -374,6 +374,7 @@ pub fn wants_sandbox(plans: &[stormvm_net::NicPlan]) -> bool {
 
 /// A plan's multus networks: the one replacing the pod network (if any),
 /// and the secondary ones in order, each as `(network, ifname)`.
+#[allow(clippy::type_complexity)]
 pub fn multus_networks(plans: &[stormvm_net::NicPlan]) -> (Option<(String, String)>, Vec<(String, String)>) {
     let mut default = None;
     let mut secondary = Vec::new();
