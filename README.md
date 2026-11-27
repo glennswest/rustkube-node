@@ -447,7 +447,9 @@ kubelet deposits on the engine's socket and keeps the other ends of: a pipe per 
 (`kubectl exec -t`) on all three, resized from the session's resize stream. No stream data goes through the
 ring. The process's exit reaches the session alone (not the node's exit queue, so an exec probe wakes nothing
 else), and its exit code becomes kubectl's. Exec probes (`exec_sync`) are the same op: stdout and stderr kept to
-1 MiB each, past `timeoutSeconds` it is stopped and the probe fails.
+1 MiB each, past `timeoutSeconds` it is stopped and the probe fails. The exit code ends it, as upstream (#402).
+Once the code is in, the output has 2 s to reach its end, then what was read goes back with the code. So a probe or
+hook whose stdout is still held open elsewhere (a grandchild left running) is not timed out after it ended.
 
 `kubectl attach` reaches the container's own stdio. A container with `stdin: true` gets a pipe on its fd 0,
 deposited at start, whose writer the kubelet keeps for its life; its output still goes to its log, and an attach

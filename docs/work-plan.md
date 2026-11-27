@@ -15,6 +15,9 @@ that reported its code): `collect_exec`: read both streams while waiting for the
 timeout still covers an exec that never ends. Upstream (CRI-O/conmon, dockershim) also ends an exec at the process's exit.
 Unit test: a pipe whose write end outlives the exit. Then sc-build, stage; on a node: no `PostStartHook failed … timed out`
 for a hook whose exec ended (boot-log review). If the leak is the engine's, file it on stormpump with this.
+Done bdeaa99 (`collect_exec`, `EXEC_DRAIN`; README, status, CHANGELOG). sc-build passed: 850 kubelet tests incl.
+`an_exec_that_ended_is_not_held_for_its_pipes`; workspace clippy -D warnings rc 0. Next: stage build, then a boot-log review on an
+install carrying it (no `PostStartHook failed … timed out` after `exec ended code=0`; a `still open after` warn names a holder).
 
 ### Done: #385 + #386 (P1), workspace clippy `-D warnings` fails on main (the `ebpf` cfg, unused imports and dead code)
 2026-11-27. Every build note since 2026-11-18 says "the rest is #385/#386". Plan: (1) sc-build `cargo clippy --locked
