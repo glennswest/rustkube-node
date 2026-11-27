@@ -11,7 +11,7 @@ Fixed in e87605d (`{ apiGroup = "", resource = "pods" }`, CHANGELOG). No code: t
 medium 720e32489a (pvetest2, at c1129da ⊇ e87605d; the same run #414 waits on). Done when `node-services-namespaces` runs
 (no 403): its own pass or fail is #418's. Parked `--after-run 720e32489a`.
 
-### Doing: #480 (P1), the rustkube-node golden built here: `deploy/build-image.sh` (stage mode retired, stormcentral#1836)
+### Parked after stormcentral#1846: #480 (P1), the rustkube-node golden built here: `deploy/build-image.sh` (stage mode retired, stormcentral#1836)
 
 2026-11-26. Source: stormcos f7f7ccb `deploy/build-goldens.sh` 9195-9380 (the "rustkube-node — the kubelet and kube-proxy"
 section) plus its helpers `stormdbase_stage`, `stormd_applets`, `golden_stormd`/`stormd_log_limits`, `env_default_flag`,
