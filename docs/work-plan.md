@@ -4,7 +4,7 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### Doing: #436 (P2) + #474 + #468 + #472, stormvm 319333d → 83a3f9a (60 commits, 17 fixes), with the disk-name change
+### Parked after a passed pve install: #436 (P2) + #474 + #468 (#472 closed), stormvm 319333d → 83a3f9a (60 commits, 17 fixes), with the disk-name change
 2026-11-27. The pin is 319333d (the issue's ac884c7 text is stale). stormvm main changes VM disk names `<ns>.<vm>-<disk>` →
 `<ns>.<vm>.<disk>` (stormvm#143, owner's decision A), so #474 lands with the bump. Plan:
 1. Cargo.toml/Cargo.lock: every stormvm crate at 83a3f9a; compile fixes (sc-build shows them).
@@ -19,6 +19,13 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
    abandoned start is cleaned up. Test: an inline Ignition config writes `config.ign` 0600 before the spawn.
 5. CHANGELOG, docs/status.md stormvm pin row, README's VM disk names; sc-build (workspace build/test/clippy -D warnings);
    stage. Node check: golden + a VM made before the bump comes back on its old disk (#474's live run).
+Done on main 6a87149 (branch stormvm-83a3f9a merged ff): lock + #472 (fields), #474 (owner_is, reuse/seed/mirrored/rediscovery,
+dotted names), #468 (write_files/remove_files). First test run: 4 failures, 3 at old names in tests and 1 real (an old-named disk
+of another machine read as left_by_another → Waiting; now only this machine's name waits); fixed. sc-build: clippy -D warnings
+rc 0, cargo test rc 0 (855), check-stubs rc 0. Stage 48dd6d63a146. #472 closed; #436/#474/#468 commented (#468 has no unit test:
+no ring fake). Note on #474: a storm.io/retain VM's old disks (no owner record) are refused until adopted (decision A; CHANGELOG
+upgrade note). Parked `--after-install rustkube-node>=6a87149@any:pve` (passed). Resume: golden suite; #474's live run (a VM made
+before the bump comes back on its old disks); an Ignition VMI boots (#468) → close #436/#474/#468.
 
 ### Parked after install of 6a6ec76: #401 (P2), crash-loop backoff not saved: `/var/lib/kubelet/` missing when crashloop.json is first written
 2026-11-27. `CrashLoopBackoff::save` wrote `crashloop.json.tmp` straight into the state root, which on forge1 (12.95) did not
