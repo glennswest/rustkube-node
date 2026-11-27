@@ -334,7 +334,8 @@ mod tests {
         assert_eq!(refusal(&ask("root"), &spec), None);
         assert!(refusal(&ask("data"), &spec).unwrap().contains("not made from a golden"));
         assert!(refusal(&ask("nope"), &spec).unwrap().contains("no disk nope"));
-        assert_eq!(volume_name(&spec, "root"), "default.web-root.mirrored");
+        assert_eq!(volume_name(&spec, "root"), "default.web.root.mirrored");
+        assert_eq!(legacy_volume_name(&spec, "root"), "default.web-root.mirrored");
         assert_eq!(volume_name(&spec, "root"), name_of("default", "web", "root"));
     }
 

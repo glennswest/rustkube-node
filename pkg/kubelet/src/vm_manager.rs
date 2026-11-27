@@ -5046,10 +5046,16 @@ impl VmManager {
         let legacy = stormvm_node::start::legacy_volume_name(vm, disk);
         let Some(v) = named(&legacy) else { return Ok(None) };
         let Some(id) = v["id"].as_str().map(String::from) else { return Ok(None) };
-        if left_by_another(&v, owner) {
+        let theirs = recorded_owner(&v);
+        // This machine's name on it with another uid: an earlier object of
+        // this name, which the sweep removes. Another machine's: refused below.
+        let mut by_name = owner.clone();
+        if let Some(o) = by_name.as_object_mut() {
+            o.remove("uid");
+        }
+        if theirs.as_ref().is_some_and(|o| owner_is(o, &by_name)) && left_by_another(&v, owner) {
             return Err(left(&v, &legacy));
         }
-        let theirs = recorded_owner(&v);
         if let Err(refused) = stormvm_node::start::legacy_reuse(vm, disk, &id, theirs.as_ref(), |o| owner_is(o, owner)) {
             let why = refused.to_string();
             warn!(vm = %vm.id(), volume = %legacy, "{why}");
@@ -11587,7 +11593,7 @@ mod tests {
         assert_eq!(owned, vec![root.clone(), seed.clone()]);
         assert_eq!(e.cloned.lock().unwrap().len(), 1);
         assert_eq!(e.cloned.lock().unwrap()[0]["owner"], owner);
-        assert_eq!(e.cloned.lock().unwrap()[0]["name"], json!("default.web-1-root"));
+        assert_eq!(e.cloned.lock().unwrap()[0]["name"], json!("default.web-1.root"));
 
         // Stopped: detached, nothing deleted.
         let vm = Vm {
@@ -11622,7 +11628,7 @@ mod tests {
         assert_eq!(*e.deleted.lock().unwrap(), vec![seed.clone()], "only the old seed goes");
         assert_ne!(again[1].volume_id.as_deref(), Some(seed.as_str()));
         let names: Vec<Value> = e.vols.lock().unwrap().iter().map(|v| v["name"].clone()).collect();
-        assert_eq!(names.iter().filter(|n| **n == json!("default.web-1-cloudinit")).count(), 1);
+        assert_eq!(names.iter().filter(|n| **n == json!("default.web-1.cloudinit")).count(), 1);
     }
 
     /// #245: the seed disk is written as the guest reads it. A plain VMI's is
@@ -11679,11 +11685,12 @@ mod tests {
         assert!(e.cloned.lock().unwrap().is_empty());
     }
 
-    /// A disk made before owners existed gets one when it is found, so the
-    /// sweep can find it later.
+    /// A disk made before owners existed gets one when it is found under its
+    /// own name, so the sweep can find it later. (Under the name before
+    /// stormvm#143 it is refused instead, #474.)
     #[tokio::test]
     async fn a_found_disk_is_given_its_owner() {
-        let e = disk_engine(vec![json!({"id": "r", "name": "default.web-1-root"})], vec![]).await;
+        let e = disk_engine(vec![json!({"id": "r", "name": "default.web-1.root"})], vec![]).await;
         let m = disk_manager(&e, "");
         let obj = vm_owned_vmi("vmi-1");
         let spec: VmSpec = stormvm_spec::kube::from_kube(&obj).unwrap();
