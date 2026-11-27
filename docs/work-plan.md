@@ -4,6 +4,13 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
+### Doing: #385 + #386 (P1), workspace clippy `-D warnings` fails on main (the `ebpf` cfg, unused imports and dead code)
+2026-11-27. Every build note since 2026-11-18 says "the rest is #385/#386". Plan: (1) sc-build `cargo clippy --locked
+--all-targets -- -D warnings` for the full list at main; (2) the `ebpf` cfg: declare it (`[features] ebpf = []` in pkg/proxy,
+or `[lints.rust] unexpected_cfgs`), whichever matches how ebpf.rs is meant to be built; dead code: remove it if unused, or
+`cfg(test)`; unused imports removed; (3) sc-build `cargo build --locked && cargo test --locked && cargo clippy --locked
+--all-targets -- -D warnings` (and the test crate) green → close both. Code-only: no node run.
+
 ### Parked after run 720e32489a: #482 (P2), medium's requires.toml asks no cluster read of pods (`node-services-namespaces` 403)
 2026-11-26. Seen in b03b7929eb (pvetest1): `node-services-namespaces` (#418) got 403 listing
 `/api/v1/pods?labelSelector=storm.io/component=node-service` across namespaces; `[medium]`'s `cluster_read` had no `pods`.
