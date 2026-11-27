@@ -2474,10 +2474,7 @@ impl RuntimeService for StormpumpRuntime {
         let io = crate::exec::ExecIo { stdin: false, stdout: true, stderr: true, tty: false };
         let crate::cri::ExecSession { mut stdio, exit, kill } = self.exec_process(container_id, cmd, io).await?;
         let (out, err) = (stdio.stdout.take(), stdio.stderr.take());
-        let run = async {
-            let (stdout, stderr, code) = tokio::join!(read_capped(out), read_capped(err), exit);
-            (stdout, stderr, code)
-        };
+        let run = collect_exec(out, err, exit, EXEC_DRAIN, container_id);
         let ran = if timeout > 0 {
             match tokio::time::timeout(std::time::Duration::from_secs(timeout as u64), run).await {
                 Ok(r) => r,
@@ -2810,19 +2807,68 @@ async fn copy_attach_stdin(
 /// so the process is never blocked on a full pipe.
 const EXEC_SYNC_OUTPUT: usize = 1 << 20;
 
-async fn read_capped(r: Option<crate::exec::Reader>) -> Vec<u8> {
+/// How long an exec's output may take to reach its end once the exec has
+/// reported its exit code (#402).
+const EXEC_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Read `r` to its end into `kept`, keeping at most [`EXEC_SYNC_OUTPUT`].
+/// What it read so far stays in `kept` if it is given up on.
+async fn read_capped(r: Option<crate::exec::Reader>, kept: Arc<std::sync::Mutex<Vec<u8>>>) {
     use tokio::io::AsyncReadExt;
-    let Some(mut r) = r else { return Vec::new() };
-    let (mut kept, mut buf) = (Vec::new(), vec![0u8; 16 * 1024]);
+    let Some(mut r) = r else { return };
+    let mut buf = vec![0u8; 16 * 1024];
     loop {
         match r.read(&mut buf).await {
-            Ok(0) | Err(_) => return kept,
+            Ok(0) | Err(_) => return,
             Ok(n) => {
+                let mut kept = kept.lock().unwrap_or_else(|e| e.into_inner());
                 let room = EXEC_SYNC_OUTPUT.saturating_sub(kept.len());
                 kept.extend_from_slice(&buf[..n.min(room)]);
             }
         }
     }
+}
+
+/// An exec's stdout, stderr and exit code (#402). Both streams are read while
+/// it runs, so a full pipe never stalls it. **The exit code ends it**: once the
+/// code is in, the output gets `drain` to reach its end, then what was read is
+/// returned with the code. Before, the call waited for both pipes' EOF, which
+/// comes only when every holder of a write end has closed it, so a hook that
+/// had ended with 0 timed out (cilium-agent's postStart, 12.95) when anything
+/// else still held its stdout: a grandchild left running, or a process that
+/// inherited it. Upstream ends an exec at its exit too.
+async fn collect_exec(
+    out: Option<crate::exec::Reader>,
+    err: Option<crate::exec::Reader>,
+    mut exit: tokio::sync::oneshot::Receiver<i32>,
+    drain: std::time::Duration,
+    container_id: &str,
+) -> (Vec<u8>, Vec<u8>, Result<i32, tokio::sync::oneshot::error::RecvError>) {
+    let (o, e) = (Arc::new(std::sync::Mutex::new(Vec::new())), Arc::new(std::sync::Mutex::new(Vec::new())));
+    let mut reads = Box::pin({
+        let (o, e) = (o.clone(), e.clone());
+        async move {
+            tokio::join!(read_capped(out, o), read_capped(err, e));
+        }
+    });
+    // `Some`: the exit came first; `None`: the output ended first.
+    let first = tokio::select! {
+        _ = &mut reads => None,
+        code = &mut exit => Some(code),
+    };
+    let code = match first {
+        None => exit.await,
+        Some(code) => {
+            if tokio::time::timeout(drain, &mut reads).await.is_err() {
+                tracing::warn!(container = %container_id, ?code,
+                    "exec ended but its output is still open after {drain:?} (something else holds it): taking what was read");
+            }
+            code
+        }
+    };
+    drop(reads);
+    let take = |b: &Arc<std::sync::Mutex<Vec<u8>>>| std::mem::take(&mut *b.lock().unwrap_or_else(|e| e.into_inner()));
+    (take(&o), take(&e), code)
 }
 
 /// The spec of a process run inside a container (#56): its own argv, the
@@ -4621,6 +4667,56 @@ mod tests {
     /// #104: a pull makes sure the image's sealed golden is here and answers
     /// its reference. It clones nothing: the registry mints no clone, and a
     /// second container of the image asks nothing again.
+    /// An exec that reported its code is not held for its output's end
+    /// (#402): with a write end still open elsewhere, the code and what was
+    /// written come back after the drain, not at the caller's timeout. A
+    /// clean exec's output is whole.
+    #[tokio::test]
+    async fn an_exec_that_ended_is_not_held_for_its_pipes() {
+        use std::io::Write;
+        let reader = |r: std::os::fd::OwnedFd| -> crate::exec::Reader {
+            Box::pin(tokio::net::unix::pipe::Receiver::from_owned_fd(r).unwrap())
+        };
+        // Something else still holds stdout's write end.
+        let (r, w) = crate::exec::pipe().unwrap();
+        let mut held = std::fs::File::from(w);
+        held.write_all(b"ok\n").unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(0).unwrap();
+        let t = std::time::Instant::now();
+        let (out, err, code) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            collect_exec(Some(reader(r)), None, rx, std::time::Duration::from_millis(200), "ct"),
+        )
+        .await
+        .expect("returned after the drain, not held for EOF");
+        assert_eq!((out.as_slice(), err.as_slice(), code.unwrap()), (&b"ok\n"[..], &b""[..], 0));
+        assert!(t.elapsed() >= std::time::Duration::from_millis(200), "the drain was given");
+        drop(held);
+
+        // Closed before the exit: everything, at once.
+        let (r, w) = crate::exec::pipe().unwrap();
+        let (r2, w2) = crate::exec::pipe().unwrap();
+        std::fs::File::from(w).write_all(b"out").unwrap();
+        std::fs::File::from(w2).write_all(b"err").unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(3).unwrap();
+        let (out, err, code) =
+            collect_exec(Some(reader(r)), Some(reader(r2)), rx, std::time::Duration::from_secs(60), "ct").await;
+        assert_eq!((out.as_slice(), err.as_slice(), code.unwrap()), (&b"out"[..], &b"err"[..], 3));
+
+        // Output closed, exit still to come: waits for the exit.
+        let (r, w) = crate::exec::pipe().unwrap();
+        drop(w);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = tx.send(7);
+        });
+        let (_, _, code) = collect_exec(Some(reader(r)), None, rx, std::time::Duration::from_secs(60), "ct").await;
+        assert_eq!(code.unwrap(), 7);
+    }
+
     #[tokio::test]
     async fn a_pull_finds_the_golden_and_clones_nothing() {
         let (url, reg) = fake_registry().await;
