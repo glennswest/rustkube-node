@@ -122,7 +122,7 @@ impl ServiceProxy {
         if !due {
             return;
         }
-        if applied.as_ref().map_or(true, |(last, _)| *last != rules) {
+        if applied.as_ref().is_none_or(|(last, _)| *last != rules) {
             info!(
                 "Service map changed: {} service ports, {} rules",
                 self.service_map.get_all().len(),

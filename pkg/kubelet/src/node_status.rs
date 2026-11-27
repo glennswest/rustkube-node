@@ -683,14 +683,6 @@ impl NodeReporter {
 const KUBELET_OWNED_CONDITIONS: [&str; 4] =
     ["Ready", "MemoryPressure", "DiskPressure", "PIDPressure"];
 
-/// Merge the kubelet-owned conditions into `existing`, keyed by `type`
-/// (rustkube-node#29):
-///   * foreign conditions (not in `KUBELET_OWNED_CONDITIONS`) are carried
-///     through verbatim, so a heartbeat never clobbers them;
-///   * each owned condition's `lastTransitionTime` is carried forward from the
-///     previous value when its `status` is unchanged, and only stamped `now` on
-///     an actual flip — `lastHeartbeatTime` always advances.
-
 /// The Kubernetes version this kubelet reports, matching the control plane's
 /// posture (rustkube#37): 1.36 since #23.
 pub const KUBERNETES_POSTURE: &str = "v1.36.0";
@@ -855,6 +847,13 @@ fn os_image() -> String {
 }
 
 
+/// Merge the kubelet-owned conditions into `existing`, keyed by `type`
+/// (rustkube-node#29):
+/// - foreign conditions (not in `KUBELET_OWNED_CONDITIONS`) are carried
+///   through verbatim, so a heartbeat never clobbers them;
+/// - each owned condition's `lastTransitionTime` is carried forward from the
+///   previous value when its `status` is unchanged, and only stamped `now` on
+///   an actual flip — `lastHeartbeatTime` always advances.
 fn merge_owned_conditions(
     existing: &[Value],
     mem_pressure: bool,

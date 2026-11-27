@@ -685,8 +685,8 @@ mod tests {
         e.reservations.release(&old);
         assert!(e.reservations.acquire(&new,&[]));
         let claim=(Resource::Claim("ns".into(),"data".into()),Access::SharedFilesystem);
-        let held=e.reservations.try_operations(&[claim.clone()]).unwrap();
-        assert!(e.reservations.try_operations(&[claim.clone()]).is_none());
+        let held=e.reservations.try_operations(std::slice::from_ref(&claim)).unwrap();
+        assert!(e.reservations.try_operations(std::slice::from_ref(&claim)).is_none());
         drop(held);
         assert!(e.reservations.try_operations(&[claim]).is_some());
     }

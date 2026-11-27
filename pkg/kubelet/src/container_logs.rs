@@ -95,10 +95,10 @@ pub fn prune_runs(dir: &Path, keep_previous: usize) -> Vec<PathBuf> {
     let mut gone = Vec::new();
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        if old.iter().any(|o| name == *o || name.starts_with(&format!("{o}."))) {
-            if std::fs::remove_file(e.path()).is_ok() {
-                gone.push(e.path());
-            }
+        if old.iter().any(|o| name == *o || name.starts_with(&format!("{o}.")))
+            && std::fs::remove_file(e.path()).is_ok()
+        {
+            gone.push(e.path());
         }
     }
     gone

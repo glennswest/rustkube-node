@@ -115,6 +115,7 @@ pub const MISS_TTL: Duration = Duration::from_secs(300);
 #[derive(Debug, Default)]
 pub struct ImageConfigs {
     /// root → (config, when asked, the image reference it was asked for).
+    #[allow(clippy::type_complexity)]
     by_root: std::sync::Mutex<HashMap<String, (Option<ImageConfig>, Instant, String)>>,
     /// root → where the image came from (#130), from the registry's record.
     provenance: std::sync::Mutex<HashMap<String, Provenance>>,

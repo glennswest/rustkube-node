@@ -444,6 +444,12 @@ pub mod client {
         pub inflater: HeaderInflater,
     }
 
+    impl Default for Client {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl Client {
         pub fn new() -> Self {
             Client { deflater: HeaderDeflater::default(), inflater: HeaderInflater::new() }

@@ -330,7 +330,7 @@ pub trait RuleApplier: Send + Sync {
 pub fn default_applier() -> Box<dyn RuleApplier> {
     #[cfg(target_os = "linux")]
     {
-        Box::new(IptablesRestoreApplier::default())
+        Box::new(IptablesRestoreApplier)
     }
     #[cfg(not(target_os = "linux"))]
     {

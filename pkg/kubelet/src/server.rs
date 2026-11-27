@@ -69,6 +69,7 @@ struct AuthState {
     api_url: String,
     anonymous: bool,
     /// TokenReview answers, by the token's SHA-256 (#244).
+    #[allow(clippy::type_complexity)]
     reviews: Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], (bool, std::time::Instant)>>>,
 }
 
@@ -661,11 +662,8 @@ where
     tokio::spawn(async move {
         while let Some(Ok(m)) = stream.next().await {
             match m {
-                Message::Binary(d) => {
-                    if to_spdy.write_all(&d).await.is_err() {
-                        break;
-                    }
-                }
+                // A failed write ends the copy; a good one falls to `_`.
+                Message::Binary(d) if to_spdy.write_all(&d).await.is_err() => break,
                 Message::Close(_) => break,
                 _ => {}
             }

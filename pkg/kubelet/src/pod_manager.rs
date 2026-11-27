@@ -733,6 +733,7 @@ pub struct PodManager {
     image_inflight: Arc<std::sync::Mutex<HashMap<ImageKey,ImageResult>>>,
     image_slots: Arc<tokio::sync::Semaphore>,
     image_changes: tokio::sync::broadcast::Sender<String>,
+    #[allow(clippy::type_complexity)]
     csi_operations: std::sync::Mutex<HashMap<(String,String),Arc<tokio::sync::Mutex<()>>>>,
     /// Probe runs and each pod's next event-less look (#101).
     deadlines: std::sync::Mutex<deadlines::Deadlines>,
@@ -1324,44 +1325,6 @@ impl PodManager {
         if let Some(r) = &self.events {
             r.pod_event_later(pod, "Normal", reason, message).await;
         }
-    }
-
-    /// POST an object to the apiserver. `None` on any failure, including a
-    /// 409 — an object that already exists is not a failure to the callers
-    /// here, which are all idempotent.
-    async fn api_post(&self, path: &str, body: &Value) -> Option<Value> {
-        if self.api_url.is_empty() {
-            return None;
-        }
-        let resp = self
-            .api_client
-            .post(format!("{}{path}", self.api_url))
-            .json(body)
-            .send_repeatable(retry::Policy::API)
-            .await
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        resp.json::<Value>().await.ok()
-    }
-
-    /// PUT an object back to the apiserver.
-    async fn api_put(&self, path: &str, body: &Value) -> Option<Value> {
-        if self.api_url.is_empty() {
-            return None;
-        }
-        let resp = self
-            .api_client
-            .put(format!("{}{path}", self.api_url))
-            .json(body)
-            .send_retrying(retry::Policy::API)
-            .await
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        resp.json::<Value>().await.ok()
     }
 
     /// Publish the PersistentVolume behind a provisioned claim, and bind it.
@@ -2829,7 +2792,7 @@ impl PodManager {
             .as_ref()
             .filter(|pv| pv["spec"]["csi"]["driver"].as_str() == Some("stormblock.storm.io"))
             .and_then(|pv| pv["spec"]["csi"]["volumeHandle"].as_str())
-            .and_then(|handle| volume_id(handle));
+            .and_then(&volume_id);
         let existing = bound.or_else(|| volume_id(&name));
         // Whether the engine already says this claim owns it (#372): read
         // here, from the listing in hand, so a claim owned once costs no
@@ -7180,10 +7143,6 @@ fn container_error(e: CriError, container: &str, reason: &str) -> CriError {
     }
 }
 
-fn creating_statuses(pod: &Value, message: &str) -> Vec<ContainerStatusReport> {
-    creating_statuses_as(pod, "ContainerCreating", message)
-}
-
 /// A pod that did not start, as upstream reports it (#133): `failed` (every
 /// app container when empty) terminated `StartError`, exit 128, with why; the
 /// others never ran and say so.
@@ -8363,7 +8322,7 @@ pub fn qos_class(pod: &Value) -> &'static str {
     let guaranteed = !containers.is_empty()
         && containers.iter().all(|c| {
             ["cpu", "memory"].iter().all(|r| match res(c, "limits", r) {
-                Some(limit) => res(c, "requests", r).map_or(true, |req| {
+                Some(limit) => res(c, "requests", r).is_none_or(|req| {
                     if *r == "cpu" {
                         parse_cpu_shares(&req) == parse_cpu_shares(&limit)
                     } else {
@@ -10481,8 +10440,8 @@ pub(crate) mod tests {
             let r = u.init_container_statuses.iter().find(|r| r.name == n).unwrap();
             assert_eq!((r.state.as_str(), r.ready), ("terminated", false), "{n}");
         }
-        let containers = rt.containers.lock().unwrap();
         let ids = mgr.pods.read().await["uid-sc-never"].container_ids.clone();
+        let containers = rt.containers.lock().unwrap();
         assert!(matches!(containers[&ids["proxy"]].state, ContainerState::Exited));
         assert!(matches!(containers[&ids["logs"]].state, ContainerState::Exited));
     }
@@ -10648,7 +10607,7 @@ pub(crate) mod tests {
         let (rt, mgr) = manager();
         rt.missing_images.lock().unwrap().insert("nope:1".into());
         let p = pod("uid-img", "img", "Never", json!({"name": "app", "image": "nope:1"}));
-        let u = mgr.sync_pods(&[p.clone()]).await.updates.remove(0);
+        let u = mgr.sync_pods(std::slice::from_ref(&p)).await.updates.remove(0);
         assert_eq!(u.phase, "Pending");
         let cs = &u.container_statuses[0];
         assert_eq!((cs.state.as_str(), cs.reason.as_str()), ("waiting", "ErrImagePull"));
@@ -10657,7 +10616,7 @@ pub(crate) mod tests {
 
         // Woken early: held off, and the partial start is gone.
         let pulls = rt.image_pulls.load(Ordering::SeqCst);
-        let again = mgr.sync_pods(&[p.clone()]).await;
+        let again = mgr.sync_pods(std::slice::from_ref(&p)).await;
         assert!(again.updates.is_empty(), "not tried before its back-off");
         assert_eq!(rt.image_pulls.load(Ordering::SeqCst), pulls);
         assert!(rt.sandboxes.lock().unwrap().is_empty(), "the partial start was torn down");
@@ -10691,13 +10650,13 @@ pub(crate) mod tests {
         let holdoff = |mgr: &PodManager| {
             mgr.start_holdoff.lock().unwrap()["uid-cr"].saturating_duration_since(Instant::now())
         };
-        let u = mgr.sync_pods(&[p.clone()]).await.updates.remove(0);
+        let u = mgr.sync_pods(std::slice::from_ref(&p)).await.updates.remove(0);
         assert_eq!(u.container_statuses[0].reason, "CreateContainerError");
         let first = holdoff(&mgr);
         assert!(first <= Duration::from_millis(500) && first > Duration::from_millis(300), "{first:?}");
 
         mgr.start_holdoff.lock().unwrap().clear();
-        mgr.sync_pods(&[p.clone()]).await;
+        mgr.sync_pods(std::slice::from_ref(&p)).await;
         let second = holdoff(&mgr);
         assert!(second <= Duration::from_secs(1) && second > Duration::from_millis(800), "{second:?}");
 
@@ -11325,7 +11284,7 @@ pub(crate) mod tests {
         let (rt, mgr) = manager();
         let p = pod("uid-1", "web", "Always", simple_container());
         // First "boot": start the pod — one sandbox created.
-        mgr.sync_pods(&[p.clone()]).await;
+        mgr.sync_pods(std::slice::from_ref(&p)).await;
         assert_eq!(rt.live_sandbox_count(), 1);
 
         // Simulate a kubelet restart: fresh manager, same runtime with the
@@ -11371,7 +11330,7 @@ pub(crate) mod tests {
     async fn stops_terminating_pod() {
         let (rt, mgr) = manager();
         let p = pod("uid-1", "web", "Always", simple_container());
-        mgr.sync_pods(&[p.clone()]).await;
+        mgr.sync_pods(std::slice::from_ref(&p)).await;
 
         let mut deleting = p;
         deleting["metadata"]["deletionTimestamp"] = json!("2026-07-15T00:00:00Z");
@@ -11475,7 +11434,7 @@ pub(crate) mod tests {
     async fn restarts_exited_container_policy_always() {
         let (rt, mgr) = manager();
         let p = pod("uid-1", "web", "Always", simple_container());
-        mgr.sync_pods(&[p.clone()]).await;
+        mgr.sync_pods(std::slice::from_ref(&p)).await;
 
         let old_cid = rt.container_ids().pop().unwrap();
         rt.set_container_state(&old_cid, ContainerState::Exited, 1);
@@ -11497,7 +11456,7 @@ pub(crate) mod tests {
     async fn the_previous_run_is_kept_for_last_state() {
         let (rt, mgr) = manager();
         let p = pod("uid-1", "web", "Always", simple_container());
-        mgr.sync_pods(&[p.clone()]).await;
+        mgr.sync_pods(std::slice::from_ref(&p)).await;
         assert!(mgr.last_terminated("uid-1").is_empty());
         let old_cid = rt.container_ids().pop().unwrap();
         rt.set_container_state(&old_cid, ContainerState::Exited, 137);
@@ -11509,7 +11468,7 @@ pub(crate) mod tests {
 
         let (rt, mgr) = manager();
         let job = pod("uid-2", "job", "Never", simple_container());
-        mgr.sync_pods(&[job.clone()]).await;
+        mgr.sync_pods(std::slice::from_ref(&job)).await;
         let cid = rt.container_ids().pop().unwrap();
         rt.set_container_state(&cid, ContainerState::Exited, 0);
         let u = &mgr.sync_pods(&[job]).await.updates[0];
@@ -11522,12 +11481,12 @@ pub(crate) mod tests {
     async fn pod_succeeds_policy_never_exit_zero() {
         let (rt, mgr) = manager();
         let p = pod("uid-1", "job", "Never", simple_container());
-        mgr.sync_pods(&[p.clone()]).await;
+        mgr.sync_pods(std::slice::from_ref(&p)).await;
 
         let cid = rt.container_ids().pop().unwrap();
         rt.set_container_state(&cid, ContainerState::Exited, 0);
 
-        let outcome = mgr.sync_pods(&[p.clone()]).await;
+        let outcome = mgr.sync_pods(std::slice::from_ref(&p)).await;
         let u = &outcome.updates[0];
         assert_eq!(u.phase, "Succeeded");
         assert_eq!(u.container_statuses[0].state, "terminated");
@@ -11544,7 +11503,7 @@ pub(crate) mod tests {
     async fn an_always_pod_is_not_failed_by_a_crashing_container() {
         let (rt, mgr) = manager();
         let p = pod("uid-1", "agent", "Always", simple_container());
-        mgr.sync_pods(&[p.clone()]).await;
+        mgr.sync_pods(std::slice::from_ref(&p)).await;
 
         let cid = rt.container_ids().pop().unwrap();
         rt.set_container_state(&cid, ContainerState::Exited, 1);
@@ -11591,12 +11550,12 @@ pub(crate) mod tests {
     async fn a_second_crash_backs_off_rather_than_restarting_now() {
         let (rt, mgr) = manager();
         let p = pod("uid-1", "agent", "Always", simple_container());
-        mgr.sync_pods(&[p.clone()]).await;
+        mgr.sync_pods(std::slice::from_ref(&p)).await;
 
         // First crash: restarted immediately — most exits are not a loop.
         let cid = rt.container_ids().pop().unwrap();
         rt.set_container_state(&cid, ContainerState::Exited, 1);
-        let u = &mgr.sync_pods(&[p.clone()]).await.updates[0];
+        let u = &mgr.sync_pods(std::slice::from_ref(&p)).await.updates[0];
         assert_eq!(
             u.container_statuses[0].restart_count, 1,
             "the first restart is immediate"
@@ -11619,7 +11578,7 @@ pub(crate) mod tests {
     async fn pod_fails_policy_never_nonzero_exit() {
         let (rt, mgr) = manager();
         let p = pod("uid-1", "job", "Never", simple_container());
-        mgr.sync_pods(&[p.clone()]).await;
+        mgr.sync_pods(std::slice::from_ref(&p)).await;
 
         let cid = rt.container_ids().pop().unwrap();
         rt.set_container_state(&cid, ContainerState::Exited, 2);
@@ -11637,13 +11596,13 @@ pub(crate) mod tests {
     async fn finished_never_pod_stops_its_sandbox_and_keeps_its_containers() {
         let (rt, mgr) = manager();
         let p = pod("uid-1", "job", "Never", simple_container());
-        mgr.sync_pods(&[p.clone()]).await;
+        mgr.sync_pods(std::slice::from_ref(&p)).await;
         let sandbox = mgr.get_sandbox_id("uid-1").await.unwrap();
         assert!(rt.stopped_sandboxes.lock().unwrap().is_empty(), "running: not stopped");
 
         let cid = rt.container_ids().pop().unwrap();
         rt.set_container_state(&cid, ContainerState::Exited, 0);
-        let outcome = mgr.sync_pods(&[p.clone()]).await;
+        let outcome = mgr.sync_pods(std::slice::from_ref(&p)).await;
         assert_eq!(outcome.updates[0].phase, "Succeeded");
         assert_eq!(*rt.stopped_sandboxes.lock().unwrap(), vec![sandbox.clone()]);
         assert_eq!(rt.sandboxes.lock().unwrap()[&sandbox].0, PodSandboxState::NotReady);
@@ -11665,11 +11624,11 @@ pub(crate) mod tests {
     async fn a_failed_sandbox_stop_of_a_finished_pod_is_retried() {
         let (rt, mgr) = manager();
         let p = pod("uid-1", "job", "Never", simple_container());
-        mgr.sync_pods(&[p.clone()]).await;
+        mgr.sync_pods(std::slice::from_ref(&p)).await;
         let cid = rt.container_ids().pop().unwrap();
         rt.set_container_state(&cid, ContainerState::Exited, 2);
         rt.fail_sandbox_stop.store(true, Ordering::SeqCst);
-        let outcome = mgr.sync_pods(&[p.clone()]).await;
+        let outcome = mgr.sync_pods(std::slice::from_ref(&p)).await;
         assert_eq!(outcome.updates[0].phase, "Failed", "status still reported");
         assert!(rt.stopped_sandboxes.lock().unwrap().is_empty());
         assert!(mgr.take_due("uid-1").is_some_and(|d| d <= deadlines::RECHECK), "retried");
@@ -11689,12 +11648,12 @@ pub(crate) mod tests {
     async fn policy_onfailure_restarts_only_on_failure() {
         let (rt, mgr) = manager();
         let p = pod("uid-1", "job", "OnFailure", simple_container());
-        mgr.sync_pods(&[p.clone()]).await;
+        mgr.sync_pods(std::slice::from_ref(&p)).await;
 
         // Exit 1 → restart
         let cid = rt.container_ids().pop().unwrap();
         rt.set_container_state(&cid, ContainerState::Exited, 1);
-        let outcome = mgr.sync_pods(&[p.clone()]).await;
+        let outcome = mgr.sync_pods(std::slice::from_ref(&p)).await;
         assert_eq!(outcome.updates[0].container_statuses[0].restart_count, 1);
         assert_eq!(outcome.updates[0].phase, "Running");
 
@@ -11716,19 +11675,19 @@ pub(crate) mod tests {
         let p = pod("uid-1", "web", "Always", container);
 
         // With a readiness probe the container starts not-ready.
-        let outcome = mgr.sync_pods(&[p.clone()]).await;
+        let outcome = mgr.sync_pods(std::slice::from_ref(&p)).await;
         assert!(!outcome.updates[0].container_statuses[0].ready);
 
         // Probe failing → still not ready.
         rt.set_exec_exit_code(1);
-        let outcome = mgr.sync_pods(&[p.clone()]).await;
+        let outcome = mgr.sync_pods(std::slice::from_ref(&p)).await;
         assert!(!outcome.updates[0].container_statuses[0].ready);
 
         // Inside its period the probe is not run again: what it said stands,
         // and the pod asks to be looked at when the period is up (#101).
         rt.set_exec_exit_code(0);
         mgr.take_due("uid-1");
-        let outcome = mgr.sync_pods(&[p.clone()]).await;
+        let outcome = mgr.sync_pods(std::slice::from_ref(&p)).await;
         assert!(!outcome.updates[0].container_statuses[0].ready);
         let due = mgr.take_due("uid-1").expect("the probe's next run");
         assert!(due <= std::time::Duration::from_secs(10) && due > std::time::Duration::from_secs(8), "{due:?}");
@@ -11786,7 +11745,7 @@ pub(crate) mod tests {
             mgr.sync_pods(std::slice::from_ref(p)).await
         }
         rt.set_exec_exit_code(0);
-        mgr.sync_pods(&[p.clone()]).await;
+        mgr.sync_pods(std::slice::from_ref(&p)).await;
         let probe = || probed(&mgr, &p);
         let o = probe().await;
         assert!(!ready(&o), "one success of two");
@@ -11812,7 +11771,7 @@ pub(crate) mod tests {
         // A new run of the container forgets the old one's count.
         let cid = rt.container_ids().pop().unwrap();
         rt.set_container_state(&cid, ContainerState::Exited, 1);
-        let o = mgr.sync_pods(&[p.clone()]).await;
+        let o = mgr.sync_pods(std::slice::from_ref(&p)).await;
         assert_eq!(o.updates[0].container_statuses[0].restart_count, 1, "restarted");
         assert_eq!(tracked(&mgr, "uid-1").await.readiness_run.get("app"), None);
     }
@@ -11823,7 +11782,7 @@ pub(crate) mod tests {
     async fn a_settled_pod_without_probes_waits_only_for_events() {
         let (_rt, mgr) = manager();
         let p = pod("uid-1", "web", "Always", simple_container());
-        mgr.sync_pods(&[p.clone()]).await;
+        mgr.sync_pods(std::slice::from_ref(&p)).await;
         assert!(mgr.take_due("uid-1").is_some(), "one look after the start");
         let outcome = mgr.sync_pods(&[p]).await;
         assert_eq!(outcome.updates[0].container_statuses[0].state, "running");
@@ -11836,7 +11795,7 @@ pub(crate) mod tests {
     async fn a_backoff_sets_the_pods_next_look() {
         let (rt, mgr) = manager();
         let p = pod("uid-1", "web", "Always", simple_container());
-        mgr.sync_pods(&[p.clone()]).await;
+        mgr.sync_pods(std::slice::from_ref(&p)).await;
         let key = crate::crashloop::CrashLoopBackoff::key("uid-1", "app");
         mgr.backoff.restarted(&key);
         let cid = rt.container_ids().pop().unwrap();
@@ -11857,13 +11816,13 @@ pub(crate) mod tests {
             "livenessProbe": {"exec": {"command": ["check"]}, "failureThreshold": 2}
         });
         let p = pod("uid-1", "web", "Always", container);
-        mgr.sync_pods(&[p.clone()]).await;
+        mgr.sync_pods(std::slice::from_ref(&p)).await;
         let old_cid = rt.container_ids().pop().unwrap();
 
         rt.set_exec_exit_code(1);
 
         // First failure — under threshold, no restart.
-        let outcome = mgr.sync_pods(&[p.clone()]).await;
+        let outcome = mgr.sync_pods(std::slice::from_ref(&p)).await;
         assert_eq!(outcome.updates[0].container_statuses[0].restart_count, 0);
 
         // Second failure, a period later — threshold reached, restart.
@@ -12124,10 +12083,10 @@ pub(crate) mod tests {
         let (rt, mgr) = manager();
         let p = pod("uid-net", "coredns", "Always", simple_container());
         rt.network.store(1, Ordering::SeqCst);
-        mgr.note_seen(&[p.clone()]).await;
+        mgr.note_seen(std::slice::from_ref(&p)).await;
         // As if it had been waiting a minute: the old backoff would be 10 s.
         mgr.first_seen.lock().unwrap().insert("uid-net".into(), Instant::now() - std::time::Duration::from_secs(60));
-        let out = mgr.sync_pods(&[p.clone()]).await;
+        let out = mgr.sync_pods(std::slice::from_ref(&p)).await;
         assert_eq!(out.updates[0].phase, "Pending");
         assert!(out.updates[0].message.contains("network is not ready"), "{}", out.updates[0].message);
         assert!(mgr.waiting_for_network_config().contains("uid-net"));
@@ -12136,13 +12095,13 @@ pub(crate) mod tests {
 
         // The config appears; the agent is not serving yet.
         rt.network.store(2, Ordering::SeqCst);
-        assert_eq!(mgr.sync_pods(&[p.clone()]).await.updates[0].phase, "Pending");
+        assert_eq!(mgr.sync_pods(std::slice::from_ref(&p)).await.updates[0].phase, "Pending");
         assert!(mgr.waiting_for_network_config().is_empty(), "no longer waiting on the file");
         let due = mgr.take_due("uid-net").unwrap();
         assert!(due <= std::time::Duration::from_secs(1), "ADD retried at once: {due:?}");
 
         rt.network.store(0, Ordering::SeqCst);
-        assert_eq!(mgr.sync_pods(&[p.clone()]).await.updates[0].phase, "Running");
+        assert_eq!(mgr.sync_pods(std::slice::from_ref(&p)).await.updates[0].phase, "Running");
         assert!(mgr.network_waits.lock().unwrap().is_empty());
     }
 
@@ -12171,12 +12130,12 @@ pub(crate) mod tests {
         let reasons = || events.lock().unwrap().iter().map(|e| (e["type"].as_str().unwrap_or("").to_string(), e["reason"].as_str().unwrap_or("").to_string(), e["message"].as_str().unwrap_or("").to_string())).collect::<Vec<_>>();
 
         rt.network.store(1, Ordering::SeqCst);
-        mgr.sync_pods(&[p.clone()]).await;
+        mgr.sync_pods(std::slice::from_ref(&p)).await;
         let r = reasons();
         assert!(r.iter().any(|(t, why, m)| t == "Warning" && why == "NetworkNotReady" && m.contains("no CNI network configured yet")), "{r:?}");
 
         rt.network.store(2, Ordering::SeqCst);
-        mgr.sync_pods(&[p.clone()]).await;
+        mgr.sync_pods(std::slice::from_ref(&p)).await;
         let r = reasons();
         assert!(r.iter().any(|(t, why, m)| t == "Warning" && why == "FailedCreatePodSandBox" && m.contains("CNI ADD failed: agent not serving")), "{r:?}");
     }
@@ -12187,7 +12146,7 @@ pub(crate) mod tests {
         let (rt, mgr) = manager();
         let p = pod("uid-gone", "gone", "Always", simple_container());
         rt.network.store(1, Ordering::SeqCst);
-        mgr.sync_pods(&[p.clone()]).await;
+        mgr.sync_pods(std::slice::from_ref(&p)).await;
         assert!(mgr.waiting_for_network_config().contains("uid-gone"));
         mgr.sync_pods(&[]).await;
         assert!(mgr.waiting_for_network_config().is_empty());
@@ -12901,7 +12860,7 @@ pub(crate) mod tests {
     async fn a_restart_waits_until_the_old_container_is_gone() {
         let (rt, mgr) = manager();
         let p = pod("uid-437-r1", "web", "Always", simple_container());
-        mgr.sync_pods(&[p.clone()]).await;
+        mgr.sync_pods(std::slice::from_ref(&p)).await;
         let old = rt.container_ids().pop().unwrap();
         rt.set_container_state(&old, ContainerState::Exited, 1);
         rt.fail_stop.store(true, Ordering::SeqCst);
@@ -12921,14 +12880,14 @@ pub(crate) mod tests {
     async fn a_failed_restart_start_keeps_track_of_the_new_container() {
         let (rt, mgr) = manager();
         let p = pod("uid-437-r2", "web", "Always", simple_container());
-        mgr.sync_pods(&[p.clone()]).await;
+        mgr.sync_pods(std::slice::from_ref(&p)).await;
         let old = rt.container_ids().pop().unwrap();
         rt.set_container_state(&old, ContainerState::Exited, 1);
         rt.fail_start.lock().unwrap().insert("app".into());
         let new = format!("c-app-{}", rt.next_id.load(Ordering::SeqCst));
         rt.fail_remove.lock().unwrap().insert(new.clone());
 
-        let u = mgr.sync_pods(&[p.clone()]).await.updates.remove(0);
+        let u = mgr.sync_pods(std::slice::from_ref(&p)).await.updates.remove(0);
         let st = tracked(&mgr, "uid-437-r2").await;
         assert_eq!(st.container_ids["app"], new, "recorded though its start failed");
         assert!(st.unstarted.contains("app"));
@@ -12958,12 +12917,12 @@ pub(crate) mod tests {
             "startupProbe": {"exec": {"command": ["up"]}, "failureThreshold": 30}
         });
         let p = pod("uid-437-r3", "web", "Always", c);
-        mgr.sync_pods(&[p.clone()]).await;
+        mgr.sync_pods(std::slice::from_ref(&p)).await;
         let has_resolv = |cfg: &ContainerConfig| cfg.mounts.iter().any(|m| m.container_path == "/etc/resolv.conf");
         assert!(has_resolv(&rt.last_container_config().unwrap()));
         rt.set_exec_exit_code(0);
         mgr.expire_probes();
-        let u = mgr.sync_pods(&[p.clone()]).await.updates.remove(0);
+        let u = mgr.sync_pods(std::slice::from_ref(&p)).await.updates.remove(0);
         assert!(u.container_statuses[0].ready, "startup probe passed");
         assert_eq!(tracked(&mgr, "uid-437-r3").await.startup_passed.get("app"), Some(&true));
 
@@ -12988,7 +12947,7 @@ pub(crate) mod tests {
             "livenessProbe": {"exec": {"command": ["check"]}, "failureThreshold": 1}
         });
         let p = pod("uid-437-r4", "job", "Never", c);
-        mgr.sync_pods(&[p.clone()]).await;
+        mgr.sync_pods(std::slice::from_ref(&p)).await;
         let cid = rt.container_ids().pop().unwrap();
         rt.set_exec_exit_code(1);
         mgr.expire_probes();

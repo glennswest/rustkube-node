@@ -1875,7 +1875,7 @@ impl Kubelet {
 impl workload::Adapter for Kubelet {
     async fn reconcile(&self,key:&Key,desired:Option<Value>) -> anyhow::Result<Next> {
         let retry=self.config.sync_interval.max(Duration::from_millis(100));
-        let deleting=desired.as_ref().map_or(true,|o| !o["metadata"]["deletionTimestamp"].is_null());
+        let deleting=desired.as_ref().is_none_or(|o| !o["metadata"]["deletionTimestamp"].is_null());
         if deleting {
             let claims=self.workloads.reservations.claims(key);
             let Some(_operations)=self.workloads.reservations.try_operations(&claims) else {return Ok(Next::After(Duration::from_millis(100)))};
@@ -1935,7 +1935,7 @@ impl workload::Adapter for Kubelet {
             Kind::Pod=> {
                 // Incomplete collection semantics deliberately suppress orphan
                 // sweeping: absence is handled by the deleted UID's own worker.
-                let outcome=self.pod_manager.sync_pods_observed(&[object.clone()],false).await;
+                let outcome=self.pod_manager.sync_pods_observed(std::slice::from_ref(&object),false).await;
                 for update in &outcome.updates {
                     let sent=std::time::Instant::now();
                     self.report_pod_status(update,&object).await?;
@@ -2084,7 +2084,7 @@ impl Kubelet {
                 let mut said: std::collections::HashSet<String> = std::collections::HashSet::new();
                 loop {
                     tokio::time::sleep(crate::node_health::TICK).await;
-                    if !read_at.is_some_and(|t| t.elapsed() < crate::node_health::PERIOD) {
+                    if read_at.is_none_or(|t| t.elapsed() >= crate::node_health::PERIOD) {
                         table = crate::node_health::health_probes(std::path::Path::new(crate::node_logs::HOST_ROOT));
                         read_at = Some(std::time::Instant::now());
                     }
@@ -2950,7 +2950,6 @@ async fn mirror_node_services(
                 {
                     r.pod_event(existing, "Warning", "Unhealthy", &format!("Readiness probe failed: {}", h.reason)).await;
                 }
-                let mut pod = pod;
                 pod["metadata"] = existing["metadata"].clone();
                 let put = client.put(format!("{base}/{name}/status")).json(&pod).send_retrying(retry::Policy::API).await;
                 if !matches!(put, Ok(ref r) if r.status().is_success() || r.status() == 409) {

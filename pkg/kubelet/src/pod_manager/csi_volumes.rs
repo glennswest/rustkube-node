@@ -820,6 +820,7 @@ fn csi_records_checked(state_root: &str) -> std::io::Result<Vec<(String, VolData
     Ok(out)
 }
 
+#[cfg(test)]
 pub(super) fn csi_records(state_root: &str) -> Vec<(String, VolData)> {
     csi_records_checked(state_root).unwrap_or_default()
 }

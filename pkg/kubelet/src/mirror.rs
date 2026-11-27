@@ -386,10 +386,11 @@ fn container_from_stormd(cs: &mut Value, pod_name: &str, container: &str, p: &cr
     cs["ready"] = json!(ready);
     cs["started"] = json!(matches!(p.state.as_str(), "running" | "stopping"));
     cs["restartCount"] = json!(p.restarts + pid1_restarts);
-    if p.restarts > 0 && !matches!(p.state.as_str(), "stopped" | "failed") {
-        if p.exit_code.is_some() || p.stopped_at.is_some() {
-            cs["lastState"] = json!({ "terminated": terminated(p.stopped_at.as_deref()) });
-        }
+    if p.restarts > 0
+        && !matches!(p.state.as_str(), "stopped" | "failed")
+        && (p.exit_code.is_some() || p.stopped_at.is_some())
+    {
+        cs["lastState"] = json!({ "terminated": terminated(p.stopped_at.as_deref()) });
     }
     ready
 }
@@ -945,7 +946,7 @@ mod tests {
         plain["metadata"]["labels"] = json!({"app": "x"});
         let list = json!({"items": [listed, old, other_node, plain]});
 
-        let stale = stale_mirrors(&list, "n1", &[running.clone()]);
+        let stale = stale_mirrors(&list, "n1", std::slice::from_ref(&running));
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0]["metadata"]["name"], "registry-n1");
 

@@ -153,6 +153,7 @@ fn classify(name: &str) -> Option<(String, Kind)> {
 
 /// The files of the run in progress, per process: rotations oldest first,
 /// then the live file. Processes in name order.
+#[allow(clippy::type_complexity)]
 pub fn current_files(dir: &Path) -> Vec<(String, Vec<PathBuf>)> {
     let mut by_proc: HashMap<String, (Vec<(u32, PathBuf)>, Option<PathBuf>)> = HashMap::new();
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -170,7 +171,7 @@ pub fn current_files(dir: &Path) -> Vec<(String, Vec<PathBuf>)> {
         .into_iter()
         .map(|(p, (mut rot, live))| {
             // 1 is the newest rotation, so the oldest is the highest number.
-            rot.sort_by(|a, b| b.0.cmp(&a.0));
+            rot.sort_by_key(|r| std::cmp::Reverse(r.0));
             let mut files: Vec<PathBuf> = rot.into_iter().map(|(_, f)| f).collect();
             files.extend(live);
             (p, files)
@@ -272,7 +273,7 @@ pub fn merge(per_proc: &[(String, String)]) -> String {
         }
     }
     if mark {
-        lines.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+        lines.sort_by_key(|a| (a.0, a.1, a.2));
     }
     lines.into_iter().map(|l| l.3 + "\n").collect()
 }

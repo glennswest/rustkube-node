@@ -693,7 +693,7 @@ mod tests {
         };
         let host = nic(stormvm_net::Attach::Bridge("stormbr0".into()));
         let pod = nic(stormvm_net::Attach::Pod(stormvm_spec::PodBinding::Bridge));
-        assert!(!wants_sandbox(&[host.clone()]));
+        assert!(!wants_sandbox(std::slice::from_ref(&host)));
         assert!(wants_sandbox(&[host, pod]));
         assert!(on_pod_network("bridge") && on_pod_network("masquerade") && on_pod_network("passt"));
         assert!(!on_pod_network("host-bridge"));

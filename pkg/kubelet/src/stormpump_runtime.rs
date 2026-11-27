@@ -850,19 +850,6 @@ impl StormpumpRuntime {
             .map_err(|e| CriError::Runtime(e.to_string()))
     }
 
-    /// Everything else about a sandbox going away.
-    ///
-    /// Split out from the ring call so the invariant it carries can be tested
-    /// on a box with no engine: a container whose sandbox is gone has no
-    /// namespaces to live in, and leaving it listed has the kubelet trying to
-    /// reconcile something that cannot exist.
-    async fn forget_containers_of(&self, sandbox_id: &str) {
-        self.containers
-            .lock()
-            .await
-            .retain(|_, c| c.sandbox_id != sandbox_id);
-    }
-
     /// Take note of anything the engine says has ended.
     ///
     /// An exit arrives unsolicited, so this is how a crashed container stops
@@ -1508,7 +1495,7 @@ impl RuntimeService for StormpumpRuntime {
             };
             match ready {
                 Ok(_) => {
-                    let pod = default_pod(&id, ns, &config);
+                    let pod = default_pod(&id, ns, config);
                     let adding = std::time::Instant::now();
                     let added = match &config.default_network {
                         Some(d) => match cni::NetworkConfigList::from_json(&d.config, &d.name) {
@@ -1519,7 +1506,7 @@ impl RuntimeService for StormpumpRuntime {
                     };
                     // Then each extra network, in order (#233).
                     let added = match added {
-                        Ok(result) => match self.add_attachments(invoker, &pod, &config).await {
+                        Ok(result) => match self.add_attachments(invoker, &pod, config).await {
                             Ok(extra) => Ok((result, extra)),
                             Err(e) => Err(cni::CniError::Attachment(e)),
                         },
@@ -4052,7 +4039,6 @@ mod tests {
         // Both are called `app`; both must exist, distinctly.
         let containers = r.containers.lock().await.len();
         assert_eq!(containers, 0);
-        drop(containers);
 
         let mut ids = Vec::new();
         for sb in ["sb-a", "sb-b"] {
@@ -4366,8 +4352,8 @@ mod tests {
                         Ok(Json(serde_json::Value::Array(
                             r.clones
                                 .iter()
-                                .filter(|c| q.get("consumer").map_or(true, |w| c["consumer"] == **w))
-                                .filter(|c| q.get("state").map_or(true, |w| c["state"] == **w))
+                                .filter(|c| q.get("consumer").is_none_or(|w| c["consumer"] == **w))
+                                .filter(|c| q.get("state").is_none_or(|w| c["state"] == **w))
                                 .cloned()
                                 .collect(),
                         )))
@@ -4644,10 +4630,11 @@ mod tests {
         let reference = img.pull_image(coredns).await.unwrap();
         assert_eq!(reference, "template:sbr-coredns-1");
         assert_eq!(img.pull_image(coredns).await.unwrap(), reference);
-        let r = reg.lock().unwrap();
-        assert_eq!(r.minted, 0, "no clone at pull time: the container's root is its own clone");
-        assert_eq!(r.golden_lookups, vec![coredns.to_string()], "asked once");
-        drop(r);
+        {
+            let r = reg.lock().unwrap();
+            assert_eq!(r.minted, 0, "no clone at pull time: the container's root is its own clone");
+            assert_eq!(r.golden_lookups, vec![coredns.to_string()], "asked once");
+        }
         // The config came with the record, keyed by the reference.
         assert_eq!(configs.get(&reference).unwrap().entrypoint, vec!["/coredns".to_string()]);
         assert_eq!(configs.image_of(&reference).as_deref(), Some(coredns));

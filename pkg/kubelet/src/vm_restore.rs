@@ -78,6 +78,7 @@ pub trait RestoreEngine: Send + Sync {
     fn group(&self, id: &str) -> Result<Option<stormvm_block::GroupSnapshot>, String>;
     /// A new volume named `name` holding `member`; asking again under the
     /// same name answers the one already made.
+    #[allow(clippy::wrong_self_convention)] // the engine's verb: a volume made from a snapshot
     fn from_snapshot(&self, name: &str, member: &stormvm_block::Snapshot) -> Result<String, String>;
     /// Delete a group snapshot (#251: a VirtualMachineSnapshot deleted). Gone
     /// already is done.

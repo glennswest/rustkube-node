@@ -2,6 +2,9 @@
 //! side of the same generated protocol) listens on a real Unix socket in a
 //! temp dir, and `CriGrpcClient` talks to it exactly as it would to CRI-O.
 
+// tonic's own `Status` is the error every handler returns, large or not.
+#![allow(clippy::result_large_err)]
+
 use kubelet::cri::{
     ContainerConfig, ContainerState, ImageService, PodSandboxConfig, RuntimeService,
 };

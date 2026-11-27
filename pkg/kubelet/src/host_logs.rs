@@ -131,6 +131,7 @@ pub struct Chain {
     service: String,
     process: Option<String>,
     pieces: VecDeque<Piece>,
+    #[allow(clippy::type_complexity)]
     open: Option<(std::io::BufReader<std::fs::File>, Option<DateTime<Utc>>, DateTime<Utc>)>,
     last: Option<DateTime<Utc>>,
 }

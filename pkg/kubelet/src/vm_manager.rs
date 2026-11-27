@@ -2179,7 +2179,7 @@ impl VmManager {
                 None => { desired.remove(uid); }
             }
         }
-        if object.map_or(true, terminating) {
+        if object.is_none_or(terminating) {
             // A disk's copy in flight (#302) is for nothing now.
             if let Some(object) = object {
                 self.abort_disk_moves(object).await;
@@ -2830,6 +2830,7 @@ impl VmManager {
     /// deposit to the engine's answer (#100). Called only inside the deposit
     /// window; on `Err` the caller unwinds what the ledger says before leaving
     /// it, and gives the disks back.
+    #[allow(clippy::too_many_arguments)]
     async fn launch(
         &self,
         uid: &str,
@@ -2990,7 +2991,7 @@ impl VmManager {
         let Some(ring) = self.ring.clone() else { return };
         let live: Vec<Vm> = {
             let vms = self.vms.lock().await;
-            vms.values().filter(|v| !v.phase.terminal() && uid.map_or(true, |uid| uid == v.uid)).cloned().collect()
+            vms.values().filter(|v| !v.phase.terminal() && uid.is_none_or(|uid| uid == v.uid)).cloned().collect()
         };
         for vm in live {
             // Ask the guest what address it has, and report it when it
@@ -3047,7 +3048,7 @@ impl VmManager {
                     if first_answer {
                         with.ready_unix = Some(now_unix());
                     }
-                    for (n, a) in with.nics.iter_mut().zip(addrs.into_iter()) {
+                    for (n, a) in with.nics.iter_mut().zip(addrs) {
                         n.addresses = a;
                     }
                     self.vms.lock().await.insert(with.uid.clone(), with.clone());
@@ -3076,7 +3077,7 @@ impl VmManager {
             } else if vm.handle.is_none() {
                 HANDLELESS_PERIOD
             } else {
-                let age = std::time::Duration::from_secs(now_unix().saturating_sub(vm.started_unix) as u64);
+                let age = std::time::Duration::from_secs(now_unix().saturating_sub(vm.started_unix));
                 wait_backoff(age).min(AGENT_PERIOD)
             };
             self.due_in(&vm.uid, next);
@@ -6625,10 +6626,8 @@ impl VmManager {
             }
         }
         let unwritten = self.disk_moves_unwritten.lock().unwrap_or_else(|e| e.into_inner()).contains(uid);
-        if records != before || unwritten {
-            if !self.write_disk_moves(uid, object, &records).await {
-                self.due_in(uid, dm::POLL);
-            }
+        if (records != before || unwritten) && !self.write_disk_moves(uid, object, &records).await {
+            self.due_in(uid, dm::POLL);
         }
         if records.values().any(dm::Move::active) {
             self.due_in(uid, dm::POLL);
@@ -8254,9 +8253,9 @@ mod tests {
             propagation: Propagation::GuestAgent { users: vec!["root".into()] },
         };
         assert_eq!(access_outcome(&[], &Access::default()), None);
-        assert_eq!(access_outcome(&[boot.clone()], &Access::default()), Some(Ok(())));
+        assert_eq!(access_outcome(std::slice::from_ref(&boot), &Access::default()), Some(Ok(())));
         let a = Access { boot: vec!["Secret ns/k not found".into()], ..Access::default() };
-        assert_eq!(access_outcome(&[boot.clone()], &a), Some(Err("Secret ns/k not found".into())));
+        assert_eq!(access_outcome(std::slice::from_ref(&boot), &a), Some(Err("Secret ns/k not found".into())));
         assert_eq!(
             access_outcome(&[boot.clone(), agent.clone()], &Access::default()),
             Some(Err("waiting for the guest agent to answer".into()))
@@ -10732,7 +10731,7 @@ mod tests {
         assert_eq!(run(ShutDown::PoweredOff, true).await, ("the guest powered off", false));
         assert_eq!(run(ShutDown::AlreadyGone, true).await, ("the guest powered off", false));
         assert_eq!(run(ShutDown::StillRunning("grace ran out".into()), false).await, ("the engine stopped it", true));
-        assert_eq!(run(ShutDown::PoweredOff, false).await.1, true, "said off, still running: forced");
+        assert!(run(ShutDown::PoweredOff, false).await.1, "said off, still running: forced");
 
         assert_eq!(grace_from(None), std::time::Duration::from_secs(30));
         assert_eq!(grace_from(Some(&json!({"spec": {"terminationGracePeriodSeconds": 120}}))), std::time::Duration::from_secs(120));
@@ -10825,7 +10824,7 @@ mod tests {
         assert_eq!(decode(0), None, "still running");
         assert_eq!(decode(1), None, "parked is not ended");
         // exit(0) is wait status 0; exit(3) is 3 << 8.
-        assert_eq!(decode(2 | (0 << 8)), Some(0));
+        assert_eq!(decode(2), Some(0));
         assert_eq!(decode(2 | ((3 << 8) << 8)), Some(3));
         // SIGKILL is 9 in the low seven bits.
         assert_eq!(decode(2 | (9 << 8)), Some(137));
@@ -12038,12 +12037,12 @@ fn seed_text(secret: &Value) -> Option<String> {
             .or_else(|| if obj.len() == 1 { obj.iter().next() } else { None })?;
         Some((k.clone(), v.as_str()?.to_string()))
     };
-    if let Some((_, raw)) = secret.get("stringData").and_then(|m| pick(m)) {
+    if let Some((_, raw)) = secret.get("stringData").and_then(&pick) {
         if !raw.trim().is_empty() {
             return Some(raw);
         }
     }
-    if let Some((_, b64)) = secret.get("data").and_then(|m| pick(m)) {
+    if let Some((_, b64)) = secret.get("data").and_then(pick) {
         let bytes = base64::engine::general_purpose::STANDARD.decode(b64.trim()).ok()?;
         let text = String::from_utf8(bytes).ok()?;
         if !text.trim().is_empty() {

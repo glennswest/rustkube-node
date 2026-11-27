@@ -1044,6 +1044,7 @@ fn undo_late(op: u8, cqe: &Cqe) -> Option<Sqe> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     mut mapping: Mapping,
     rx: mpsc::Receiver<Request>,

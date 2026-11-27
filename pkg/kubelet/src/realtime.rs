@@ -458,7 +458,7 @@ mod tests {
 
     #[test]
     fn the_isolated_set_is_counted_in_physical_cores() {
-        let cmdline = b"/stormpump\0--init\0--isolate\02-5,8\0--infra\00-1\0";
+        let cmdline = b"/stormpump\0--init\0--isolate\x002-5,8\0--infra\x000-1\0";
         assert_eq!(isolate_arg(cmdline).as_deref(), Some("2-5,8"));
         assert_eq!(isolate_arg(b"/stormpump\0--isolate=4-7\0").as_deref(), Some("4-7"));
         assert_eq!(isolate_arg(b"/stormpump\0--init\0"), None);

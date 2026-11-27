@@ -206,7 +206,7 @@ pub fn orphans(listing: &Value, known: &HashSet<String>, own: &str) -> Vec<(Stri
         .filter(|(name, _, _)| own.is_empty() || !name.starts_with(own))
         .filter(|(_, _, v)| {
             v["in_use"].as_bool() != Some(true)
-                && v["attachments"].as_array().map_or(true, |a| a.is_empty())
+                && v["attachments"].as_array().is_none_or(|a| a.is_empty())
         })
         .map(|(name, id, _)| (name.to_string(), id.to_string()))
         .collect()
