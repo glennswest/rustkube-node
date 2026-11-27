@@ -700,7 +700,7 @@ its install; golden b4c3d8fd17 is running there (at 591f841, queued for #421). p
 but that is cilium, not this issue's flowsdn path. Parked `--after-run b4c3d8fd17`.
 b4c3d8fd17 (pvetest2, flowsdn): `vmi-pod-network` pass, connected to 10.173.65.216:22 after 1056 ms, the guest holds its /32.
 Closed #426; stormvm#138 told (its done-when).
-### Parked after stormrdp#70 (no test machine): #405 (P2), AccessCredentialsSynchronized stuck at "waiting for the guest agent to answer"
+### Doing: #405 (P2), AccessCredentialsSynchronized stuck at "waiting for the guest agent to answer"
 2026-11-20. Ruled out (stormcos_qa#52 on the issue): the golden runs qemu-guest-agent and the guest has org.qemu.guest_agent.0.
 Read: the socket path matches stormvm's (`<run>/<ns>/<name>/agent.sock`), qemu's chardev is a single-client server, nothing in
 stormvm holds it open. Kubelet flaw: `agent_up` is "guest-network-get-interfaces succeeded within 2 s", so an agent that answers
@@ -744,6 +744,11 @@ from it: Fedora's selinux-policy (virt_supplementary.te) lets virt_qemu_ga_t man
 `virt_qemu_ga_manage_ssh`, default false. Asked the owner on #405: A the golden enables it, B the guest's cloud-init as in
 KubeVirt (recommended: + a condition message naming it, docs, the suite's VM sets it), C the kubelet via guest-exec.
 `wait-owner`. Resume on the answer: B → kubelet message + docs + test user-data, sc-build, golden run; A → vmcloud-image-operator.
+2026-11-26: the master decided B (6:30 pm CT, on #405). Plan: (1) kubelet: an agent key error that is qemu-ga's
+`failed to create directory '<home>/.ssh': File exists` or a permission denial gets a hint naming the guest's switch
+(`setsebool -P virt_qemu_ga_manage_ssh on` in cloud-init); (2) golden suite: `gold-agent`'s user-data sets it in `bootcmd`;
+(3) docs/status.md, docs/api.md or wherever accessCredentials are documented, CHANGELOG; stormvm docs/kube.md told on stormvm.
+Then sc-build, golden run; `vmi-agent-keys` True → close #405.
 ### Parked after stormrdp#70 (no test machine): #421 (P2), direct kernel boot from the golden's kernel (vmcloud-image-operator#62, stormvm#111)
 2026-11-20. Finding: no mount is needed. stormvm's machine spec is `root: Root::Inherit`, which stormpump documents as "the
 host's mount view", and `/data/vmimages` is a pallet volume mounted on the host (stormcos boot.d `volume vmidata /data/vmimages`);
