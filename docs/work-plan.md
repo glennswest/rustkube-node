@@ -4,7 +4,7 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### Doing: #402 (P1), a postStart hook that ended code=0 timed out after 120 s (cilium-agent killed, 137)
+### Parked after install of bdeaa99: #402 (P1), a postStart hook that ended code=0 timed out after 120 s (cilium-agent killed, 137)
 2026-11-27. Read: `stormpump: exec ended code=0` is logged in exec_process's waiter right before `exit_tx.send`, so the exit
 reached `exec_sync`. But `exec_sync` waits on `join!(read stdout, read stderr, exit)`: it returns only at EOF on both pipes,
 i.e. when *every* holder of a write end has closed it. The kubelet's pipes are O_CLOEXEC and stormpump receives deposits with
@@ -18,6 +18,8 @@ for a hook whose exec ended (boot-log review). If the leak is the engine's, file
 Done bdeaa99 (`collect_exec`, `EXEC_DRAIN`; README, status, CHANGELOG). sc-build passed: 850 kubelet tests incl.
 `an_exec_that_ended_is_not_held_for_its_pipes`; workspace clippy -D warnings rc 0. Next: stage build, then a boot-log review on an
 install carrying it (no `PostStartHook failed … timed out` after `exec ended code=0`; a `still open after` warn names a holder).
+Stage build d9d1e1ac4ec4 requested; commented #402. Held `--after-install rustkube-node>=bdeaa99`. Resume: the boot log of an install
+carrying it; clean → close #402; the warn seen → find the holder (stormpump), file there.
 
 ### Done: #385 + #386 (P1), workspace clippy `-D warnings` fails on main (the `ebpf` cfg, unused imports and dead code)
 2026-11-27. Every build note since 2026-11-18 says "the rest is #385/#386". Plan: (1) sc-build `cargo clippy --locked
