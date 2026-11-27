@@ -4,11 +4,13 @@ Moved out of CLAUDE.md on 2026-11-12: at 273 KB it filled the session's context 
 
 ## Work plan
 
-### Doing: #401 (P2), crash-loop backoff not saved: `/var/lib/kubelet/` missing when crashloop.json is first written
+### Parked after install of 6a6ec76: #401 (P2), crash-loop backoff not saved: `/var/lib/kubelet/` missing when crashloop.json is first written
 2026-11-27. `CrashLoopBackoff::save` wrote `crashloop.json.tmp` straight into the state root, which on forge1 (12.95) did not
 exist yet at `recover_state`; the failure was DEBUG, so #112 was silently off. Fix: `create_dir_all` the parent before the
 write; the first failure at WARN (then DEBUG, so a lasting failure does not flood). Unit test: a path under directories not
 made yet is written and carried over. CHANGELOG. sc-build; then a boot-log review on an install carrying it (no `not saved`).
+Done 6a6ec76; sc-build passed (8 crashloop tests incl. the new one; workspace clippy -D warnings rc 0). Stage requested, #401
+commented. Parked `--after-install rustkube-node>=6a6ec76`. Resume: its boot log has no `crash-loop backoff not saved` → close.
 
 ### Parked after install of bdeaa99: #402 (P1), a postStart hook that ended code=0 timed out after 120 s (cilium-agent killed, 137)
 2026-11-27. Read: `stormpump: exec ended code=0` is logged in exec_process's waiter right before `exit_tx.send`, so the exit
