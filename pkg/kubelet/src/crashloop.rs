@@ -55,6 +55,8 @@ pub struct CrashLoopBackoff {
     entries: Mutex<HashMap<String, Entry>>,
     /// Where the entries are kept across a kubelet restart (#112).
     file: Mutex<Option<PathBuf>>,
+    /// A failed save has been logged at WARN (#401): once, then DEBUG.
+    warned: std::sync::atomic::AtomicBool,
 }
 
 /// One entry as written: wall-clock seconds, which survive the process.
@@ -127,8 +129,10 @@ impl CrashLoopBackoff {
         self.save();
     }
 
-    /// Write the entries, when there is a file (tmp + rename). A failure is
-    /// logged, never fatal: the backoff still works, only in memory.
+    /// Write the entries, when there is a file (tmp + rename), making its
+    /// directory first: the state root may not exist yet on a fresh node
+    /// (#401). A failure is logged, never fatal: the backoff still works,
+    /// only in memory, so it is said at WARN the first time.
     fn save(&self) {
         let Some(path) = self.file.lock().ok().and_then(|f| f.clone()) else { return };
         let now = Instant::now();
@@ -149,10 +153,19 @@ impl CrashLoopBackoff {
         let tmp = path.with_extension("json.tmp");
         let written = serde_json::to_vec(&saved)
             .map_err(std::io::Error::other)
+            .and_then(|b| match path.parent().filter(|d| !d.as_os_str().is_empty()) {
+                Some(dir) => std::fs::create_dir_all(dir).map(|()| b),
+                None => Ok(b),
+            })
             .and_then(|b| std::fs::write(&tmp, b))
             .and_then(|()| std::fs::rename(&tmp, &path));
         if let Err(e) = written {
-            tracing::debug!(path = %path.display(), "crash-loop backoff not saved: {e}");
+            if self.warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::debug!(path = %path.display(), "crash-loop backoff not saved: {e}");
+            } else {
+                tracing::warn!(path = %path.display(),
+                    "crash-loop backoff not saved: {e}; it is kept in memory only, so a kubelet restart forgets it");
+            }
         }
     }
 
@@ -239,6 +252,22 @@ mod tests {
         b.restarted(&k);
         let second = b.wait(&k).expect("still waiting");
         assert!(second > BASE, "the wait must grow: {second:?}");
+    }
+
+    /// #401: the state root not made yet is made, and the backoff carried.
+    #[test]
+    fn the_file_is_saved_when_its_directory_is_not_there_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("var/lib/kubelet/crashloop.json");
+        let k = CrashLoopBackoff::key("u-1", "app");
+        let first = CrashLoopBackoff::new();
+        first.persist_to(path.clone());
+        first.restarted(&k);
+        first.restarted(&k);
+        assert!(path.is_file(), "written, its directory made");
+        let second = CrashLoopBackoff::new();
+        second.persist_to(path);
+        assert!(second.wait(&k).is_some(), "carried over");
     }
 
     /// #112: a restarted kubelet keeps a crash-looping container's delay, a
