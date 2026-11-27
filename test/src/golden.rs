@@ -62,7 +62,9 @@
 //!   what the kubelet asks: `guest-ping`, `guest-info` (the agent's version
 //!   and whether the commands the kubelet uses are enabled) and
 //!   `guest-network-get-interfaces`. Passes when the agent answers the ping,
-//!   and says the rest.
+//!   and says the rest. Its cloud-init turns on the guest's SELinux switch
+//!   `virt_qemu_ga_manage_ssh` (`bootcmd`), as a user of agent keys must on
+//!   Fedora (#405, option B).
 //! - `vmi-agent-keys` (#405, #92): that VMI's `AccessCredentialsSynchronized`
 //!   is True within 180 s of its boot (its key set through the agent).
 //!
@@ -156,6 +158,16 @@ pub fn golden_name(run_id: &str) -> String {
 /// Cloud-init that prints the machine-id once the guest is up.
 pub fn says_its_id() -> String {
     format!("#cloud-config\nruncmd:\n  - [ sh, -c, \"sync; echo {}$(cat /etc/machine-id) > /dev/console\" ]\n", ID_MARKER)
+}
+
+/// The agent VMI's cloud-init (#405): [`says_its_id`], with the guest's
+/// SELinux switch that lets qemu-ga write ssh keys turned on first, as a user
+/// of agent-propagated keys does (as in KubeVirt). Fedora ships it off.
+/// `bootcmd` runs early on every boot; `|| true` for a guest without SELinux.
+pub fn agent_may_write_keys() -> String {
+    let id = says_its_id();
+    let rest = id.strip_prefix("#cloud-config\n").unwrap_or(&id);
+    format!("#cloud-config\nbootcmd:\n  - [ sh, -c, \"setsebool -P virt_qemu_ga_manage_ssh on || true\" ]\n{rest}")
 }
 
 /// Cloud-init that takes the guest agent away for good, then says so.
@@ -374,7 +386,7 @@ impl Suite {
     }
 
     /// The VMI for #405: a key for root through the guest agent.
-    async fn boot_agent_vm(&self, root: &str, says_id: &str) -> Result<String, String> {
+    async fn boot_agent_vm(&self, root: &str) -> Result<String, String> {
         let secrets = format!("/api/v1/namespaces/{}/secrets", self.env.namespace);
         let secret = json!({
             "apiVersion": "v1", "kind": "Secret",
@@ -382,7 +394,7 @@ impl Suite {
             "stringData": { "key": AGENT_KEY },
         });
         self.api.create(&secrets, &secret).await?;
-        let mut obj = vmi(&self.env, AGENT, root, says_id);
+        let mut obj = vmi(&self.env, AGENT, root, &agent_may_write_keys());
         obj["spec"]["accessCredentials"] = agent_credentials();
         self.boot_vmi(AGENT, obj, BOOT, |c| machine_id(c).is_some()).await
     }
@@ -543,7 +555,7 @@ pub async fn run(env: Arc<Env>, api: Api, r: &mut Report) {
     let (src, noagent, agent_vm, podnet) = tokio::join!(
         suite.boot(SOURCE, &root, &says_id, |c| machine_id(c).is_some()),
         suite.boot(NO_AGENT, &root, &no_agent, |c| c.contains(NO_AGENT_MARKER)),
-        suite.boot_agent_vm(&root, &says_id),
+        suite.boot_agent_vm(&root),
         suite.boot_vmi(PODNET, podnet_vmi(&env, &root), BOOT, |c| c.contains(PODNET_MARKER)),
     );
 
@@ -1085,6 +1097,11 @@ mod tests {
         assert!(has_no_agent().contains("systemctl mask stormvm-seal.service"));
         // The command text carries the marker but no id after it.
         assert_eq!(machine_id(&says_its_id()), None);
+        // #405: the agent VM turns on qemu-ga's ssh switch, then says its id.
+        let a = agent_may_write_keys();
+        assert!(a.starts_with("#cloud-config\nbootcmd:\n  - [ sh, -c, \"setsebool -P virt_qemu_ga_manage_ssh on || true\" ]\nruncmd:\n"), "{a}");
+        assert_eq!(a.matches("#cloud-config").count(), 1);
+        assert!(a.contains(ID_MARKER));
     }
 
     #[test]

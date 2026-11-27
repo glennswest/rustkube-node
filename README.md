@@ -1027,6 +1027,19 @@ with `CAP_IPC_LOCK` effective. A pod that doesn't ask must see neither.
     once it answers. They're applied again whenever the Secret's keys change,
     with `reset`, so the Secret is the truth. A missing or empty Secret leaves
     the guest's keys alone rather than locking it out.
+  - **The guest must let its agent write keys** (#405). Fedora and RHEL
+    confine qemu-ga, and their SELinux switch `virt_qemu_ga_manage_ssh` is
+    off by default, so the agent cannot reach `~/.ssh`. A VM that wants
+    agent keys turns it on in its own cloud-init, as in KubeVirt:
+
+    ```yaml
+    #cloud-config
+    bootcmd:
+      - [ sh, -c, "setsebool -P virt_qemu_ga_manage_ssh on || true" ]
+    ```
+
+    The vendor's image is left as it is. When the agent's error is this
+    refusal, the condition names the switch.
   - **Status:** the VMI carries `AccessCredentialsSynchronized`, with every
     reason when it is False: a missing Secret, no seed, or an agent not
     answering yet.

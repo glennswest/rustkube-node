@@ -559,6 +559,29 @@ fn access_outcome(
     Some(if problems.is_empty() { Ok(()) } else { Err(problems.join("; ")) })
 }
 
+/// The guest's SELinux switch that lets qemu-ga write ssh keys (#405).
+pub const QGA_SSH_SWITCH: &str = "virt_qemu_ga_manage_ssh";
+
+/// What to add to an agent's key error when it is the guest's policy
+/// refusing qemu-ga the user's `~/.ssh` (#405): Fedora and RHEL confine
+/// qemu-ga, and only the tunable [`QGA_SSH_SWITCH`] (default off) lets it
+/// in. qemu-ga then sees no `~/.ssh` and its `mkdir` answers "File exists",
+/// or it is denied outright. The guest turns the switch on, as in KubeVirt;
+/// the kubelet only names it. Empty for any other error.
+fn ssh_policy_hint(err: &str) -> String {
+    let l = err.to_ascii_lowercase();
+    let refused = (l.contains(".ssh") && (l.contains("file exists") || l.contains("permission denied")))
+        || (l.contains("authorized_keys") && l.contains("permission denied"));
+    if refused {
+        format!(
+            " (the guest's SELinux policy keeps qemu-ga out of ~/.ssh: turn on {QGA_SSH_SWITCH} in the guest, \
+             e.g. cloud-init bootcmd `setsebool -P {QGA_SSH_SWITCH} on`)"
+        )
+    } else {
+        String::new()
+    }
+}
+
 /// The condition for `outcome`, keeping `prev`'s `lastTransitionTime` when the
 /// status has not changed: the time is when it became true or false, not
 /// when it was last looked at.
@@ -2016,7 +2039,7 @@ impl VmManager {
                                   "authorized keys set through the guest agent");
                             applied.push((secret.to_string(), user.clone(), keys.clone()));
                         }
-                        Err(e) => problems.push(format!("user {user} (Secret {secret}): {e}")),
+                        Err(e) => problems.push(format!("user {user} (Secret {secret}): {e}{}", ssh_policy_hint(&e.to_string()))),
                     }
                 }
             }
@@ -8202,6 +8225,21 @@ mod tests {
         assert_eq!(first_look(false, true), Some(AGENT_FIRST));
         assert_eq!(first_look(true, true), None);
         assert_eq!(first_look(false, false), None);
+    }
+
+    /// The guest's ssh policy refusing qemu-ga is named with its switch;
+    /// other agent errors are left as they are (#405).
+    #[test]
+    fn a_guest_policy_refusal_names_the_switch() {
+        // As qemu-ga 10.2.2 said on Fedora 44 (golden a6f8151cb8, pvetest3).
+        let seen = "failed to create directory '/root/.ssh': File exists";
+        let h = ssh_policy_hint(seen);
+        assert!(h.contains("setsebool -P virt_qemu_ga_manage_ssh on"), "{h}");
+        assert!(!ssh_policy_hint("failed to open file '/home/u/.ssh/authorized_keys': Permission denied").is_empty());
+        assert!(!ssh_policy_hint("failed to create directory '/home/u/.ssh': Permission denied").is_empty());
+        assert_eq!(ssh_policy_hint("user 'nobody' does not exist"), "");
+        assert_eq!(ssh_policy_hint("guest-ping: no answer within 2 s"), "");
+        assert_eq!(ssh_policy_hint("failed to create directory '/tmp/x': File exists"), "");
     }
 
     /// `AccessCredentialsSynchronized`: every problem named, an agent not yet
