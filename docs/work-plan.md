@@ -580,7 +580,7 @@ sc-build 08ee2681ea passed (733 kubelet tests, the TLS one included; no warning 
 83d6c11ed85e. Held `--after stormcos#374` (no node's stormblock serves TLS yet). Resume: on a node with an https engine,
 a VirtualMachineSnapshot and a VirtualMachineRestore succeed → close #318.
 
-### Parked after stormcentral#1798 (no test machine free): #334 (P1), a kubelet restart adopts no pods on stormpump
+### Done (seen on a node): #334 (P1), a kubelet restart adopts no pods on stormpump
 2026-11-20. Cause (issue): StormpumpRuntime's sandbox/container maps are memory only; the engine keeps the workloads and
 their handles across a reattach with the same TOKEN and hands back exits held while away (stormpump DESIGN "That gap is
 closed"). Plan:
@@ -620,6 +620,10 @@ run was refused again (pvetest1/2 at :5100, pvetest3 by stormrdp#70). Held also 
 38ac3dd903 on pvetest1 (14.07-flowsdn), 814e9593d0 on pvetest3 (held by stormipmi#121). Resume: `stormcentral test show <id>`;
 `csi-kubelet-restart` pass (not a NOT ADOPTING skip) → close #334.
 Parked `--after-run 38ac3dd903`.
+2026-11-27: 38ac3dd903 (pvetest1, 14.07-flowsdn) csi passed 6/6. `csi-kubelet-restart` pass (not a NOT ADOPTING skip): kubelet
+[3658] → [1219] after 1518 ms; the holder Running with the same containerID and restartCount 0, a new pod read the data, the
+holder's delete unpublished by the restarted kubelet. Static pods are not checked by the case (same adoption path; said so on
+close). Closed #334.
 
 ### Done: #428 (P0), four critical review findings
 2026-11-20. From stormcentral's Findings (`/api/v1/findings?project=rustkube-node`). Plan, one commit per finding:
